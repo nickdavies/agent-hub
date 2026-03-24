@@ -76,7 +76,7 @@ pub async fn basic_auth_login<N: Notifier>(
     };
 
     if !oauth.check_basic_auth(&form.username, &form.password) {
-        return Redirect::temporary("/auth/login?error=invalid").into_response();
+        return Redirect::to("/auth/login?error=invalid").into_response();
     }
 
     // Use the username as the "email" for session identity
@@ -85,7 +85,7 @@ pub async fn basic_auth_login<N: Notifier>(
         return (StatusCode::INTERNAL_SERVER_ERROR, "Session error").into_response();
     }
 
-    Redirect::temporary("/approvals").into_response()
+    Redirect::to("/approvals").into_response()
 }
 
 /// GET /approvals — dashboard (auth enforced by middleware)
@@ -158,7 +158,7 @@ pub async fn resolve_approval<N: Notifier>(
     };
 
     match state.approvals.resolve(id, status).await {
-        Some(_) => axum::response::Redirect::temporary("/approvals").into_response(),
+        Some(_) => Redirect::to("/approvals").into_response(),
         None => (StatusCode::NOT_FOUND, "Approval not found").into_response(),
     }
 }
@@ -192,7 +192,7 @@ pub async fn toggle_approval_mode<N: Notifier>(
     };
 
     state.sessions.update_config(&session_id, &update).await;
-    axum::response::Redirect::temporary("/approvals").into_response()
+    Redirect::to("/approvals").into_response()
 }
 
 /// Extract email from session. Middleware guarantees this exists on authed routes.

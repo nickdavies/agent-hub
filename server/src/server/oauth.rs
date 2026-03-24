@@ -341,13 +341,13 @@ pub async fn callback<N: Notifier>(
     let _ = session.remove::<String>(SESSION_NONCE_KEY).await;
 
     info!(email, "OAuth login successful");
-    Redirect::temporary("/approvals").into_response()
+    Redirect::to("/approvals").into_response()
 }
 
 /// POST /auth/logout
 pub async fn logout(session: Session) -> Response {
     let _ = session.delete().await;
-    Redirect::temporary("/auth/login").into_response()
+    Redirect::to("/auth/login").into_response()
 }
 
 /// Extract authenticated email from session. Returns None if not logged in.
