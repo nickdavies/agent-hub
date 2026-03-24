@@ -47,6 +47,7 @@
         {% if readwrite && !approval.status.is_resolved() %}
         <hr>
         <form method="post" action="/approvals/{{ approval.id }}/resolve">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <label for="message">Message (optional for approve, required for deny)</label>
             <textarea id="message" name="message" rows="3"></textarea>
             <div class="grid">

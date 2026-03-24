@@ -248,7 +248,8 @@ pub async fn approval<N: Notifier>(
 fn truncate_input(input: &serde_json::Value) -> String {
     let s = input.to_string();
     if s.len() > 100 {
-        format!("{}...", &s[..100])
+        let end = s.char_indices().nth(100).map_or(s.len(), |(i, _)| i);
+        format!("{}...", &s[..end])
     } else {
         s
     }

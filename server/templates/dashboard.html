@@ -62,6 +62,7 @@
                 {% if readwrite %}
                 <td>
                     <form method="post" action="/approvals/toggle-mode/{{ s.session_id }}" style="margin:0;display:inline">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                         {% if s.config.approval_mode == crate::server::sessions::SessionApprovalMode::Remote %}
                         <input type="hidden" name="mode" value="terminal">
                         <button type="submit" class="outline" style="margin:0;padding:0.25rem 0.5rem">remote (switch to terminal)</button>
