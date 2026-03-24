@@ -32,6 +32,11 @@ impl Presence {
         }
     }
 
+    /// Returns the stored presence state without TTL fallback.
+    pub async fn raw_state(&self) -> PresenceState {
+        self.inner.read().await.state
+    }
+
     /// Returns the current presence state, falling back to Away if stale.
     pub async fn get(&self) -> PresenceState {
         let inner = self.inner.read().await;

@@ -4,6 +4,7 @@ pub mod hooks;
 pub mod presence;
 pub mod pushover;
 pub mod sessions;
+pub mod storage;
 
 use std::sync::Arc;
 
@@ -125,6 +126,26 @@ impl AppState {
             pushover: Arc::new(pushover),
             notify_config: Arc::new(RwLock::new(notify_config)),
             pending: Arc::new(PendingNotifications::new()),
+        }
+    }
+
+    /// Capture current state for persistence.
+    pub async fn snapshot(&self) -> storage::PersistedState {
+        storage::PersistedState {
+            sessions: self.sessions.snapshot().await,
+            notify_config: Some(self.notify_config.read().await.clone()),
+            presence: Some(self.presence.raw_state().await),
+        }
+    }
+
+    /// Restore state from a persisted snapshot.
+    pub async fn restore(&self, state: storage::PersistedState) {
+        self.sessions.restore(state.sessions).await;
+        if let Some(cfg) = state.notify_config {
+            *self.notify_config.write().await = cfg;
+        }
+        if let Some(presence) = state.presence {
+            self.presence.set(presence).await;
         }
     }
 }

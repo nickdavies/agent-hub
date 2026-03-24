@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::info;
 
+use super::storage::PersistedSession;
+
 pub struct SessionInner {
     pub project: String,
     pub last_seen: Instant,
@@ -136,6 +138,44 @@ impl SessionRegistry {
 
     pub async fn count(&self) -> usize {
         self.sessions.read().await.len()
+    }
+
+    /// Export all sessions for persistence.
+    pub async fn snapshot(&self) -> HashMap<String, PersistedSession> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .iter()
+            .map(|(id, s)| {
+                (
+                    id.clone(),
+                    PersistedSession {
+                        project: s.project.clone(),
+                        config: s.config.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Restore sessions from persisted state. Sets last_seen to now for fresh TTL.
+    pub async fn restore(&self, sessions: HashMap<String, PersistedSession>) {
+        let mut map = self.sessions.write().await;
+        let now = Instant::now();
+        for (id, persisted) in sessions {
+            info!(
+                session_id = id,
+                project = persisted.project,
+                "session restored"
+            );
+            map.insert(
+                id,
+                SessionInner {
+                    project: persisted.project,
+                    last_seen: now,
+                    config: persisted.config,
+                },
+            );
+        }
     }
 
     /// Evict sessions that haven't been seen within the TTL.
