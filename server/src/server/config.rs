@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::error::AppError;
+use super::sessions::SessionApprovalMode;
+
+/// Feature mode for the approval system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalFeatureMode {
+    Disabled,
+    Readonly,
+    Readwrite,
+}
 
 /// Immutable server configuration loaded from environment at startup.
 pub struct ServerConfig {
@@ -13,6 +22,9 @@ pub struct ServerConfig {
     pub presence_ttl_secs: u64,
     pub session_ttl_secs: u64,
     pub notification_delay_secs: u64,
+    pub approval_mode: ApprovalFeatureMode,
+    pub base_url: Option<String>,
+    pub default_approval_mode: SessionApprovalMode,
 }
 
 pub struct Token {
@@ -43,12 +55,37 @@ impl ServerConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
+        let approval_mode = match env::var("APPROVAL_MODE").unwrap_or_default().as_str() {
+            "readonly" => ApprovalFeatureMode::Readonly,
+            "readwrite" => ApprovalFeatureMode::Readwrite,
+            _ => ApprovalFeatureMode::Disabled,
+        };
+
+        let base_url = env::var("BASE_URL").ok().map(|u| u.trim_end_matches('/').to_string());
+
+        if approval_mode != ApprovalFeatureMode::Disabled && base_url.is_none() {
+            return Err(AppError::Config(
+                "BASE_URL is required when APPROVAL_MODE is not disabled".into(),
+            ));
+        }
+
+        let default_approval_mode = match env::var("DEFAULT_APPROVAL_MODE")
+            .unwrap_or_default()
+            .as_str()
+        {
+            "terminal" => SessionApprovalMode::Terminal,
+            _ => SessionApprovalMode::Remote,
+        };
+
         Ok(Self {
             tokens,
             listen_addr,
             presence_ttl_secs,
             session_ttl_secs,
             notification_delay_secs,
+            approval_mode,
+            base_url,
+            default_approval_mode,
         })
     }
 }

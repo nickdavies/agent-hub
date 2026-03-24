@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="5">
+    <title>Dashboard — Claude Notify</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><strong>Claude Notify</strong></li></ul>
+    <ul>
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+    </ul>
+</nav>
+<main class="container">
+    <h3>Pending Approvals</h3>
+    {% if pending_approvals.is_empty() %}
+    <p>No pending approvals.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Tool</th>
+                <th>Time</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for a in pending_approvals %}
+            <tr>
+                <td>{{ a.project }}</td>
+                <td>{{ a.tool_name }}</td>
+                <td>{{ a.created_at.format("%H:%M:%S") }}</td>
+                <td><a href="/approvals/{{ a.id }}">Review</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    <h3>Sessions</h3>
+    {% if sessions.is_empty() %}
+    <p>No active sessions.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Session ID</th>
+                {% if readwrite %}<th>Approval Mode</th>{% endif %}
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in sessions %}
+            <tr>
+                <td>{{ s.project }}</td>
+                <td><code>{{ s.session_id }}</code></td>
+                {% if readwrite %}
+                <td>
+                    <form method="post" action="/approvals/toggle-mode/{{ s.session_id }}" style="margin:0;display:inline">
+                        {% if s.config.approval_mode == crate::server::sessions::SessionApprovalMode::Remote %}
+                        <input type="hidden" name="mode" value="terminal">
+                        <button type="submit" class="outline" style="margin:0;padding:0.25rem 0.5rem">remote (switch to terminal)</button>
+                        {% else %}
+                        <input type="hidden" name="mode" value="remote">
+                        <button type="submit" class="outline" style="margin:0;padding:0.25rem 0.5rem">terminal (switch to remote)</button>
+                        {% endif %}
+                    </form>
+                </td>
+                {% endif %}
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</main>
+</body>
+</html>

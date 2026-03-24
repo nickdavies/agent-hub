@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% if !approval.status.is_resolved() %}
+    <meta http-equiv="refresh" content="5">
+    {% endif %}
+    <title>Approval — Claude Notify</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/approvals"><strong>Claude Notify</strong></a></li></ul>
+    <ul>
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+    </ul>
+</nav>
+<main class="container">
+    <article>
+        <header>
+            <h3>{{ approval.tool_name }}</h3>
+            <p>Project: <strong>{{ approval.project }}</strong> &middot; Session: <code>{{ approval.session_id }}</code></p>
+        </header>
+
+        {% if let Some(ctx) = approval.context.as_ref() %}
+        <p><em>{{ ctx }}</em></p>
+        {% endif %}
+
+        <h4>Tool Input</h4>
+        <pre><code>{{ tool_input_pretty }}</code></pre>
+
+        <p>Status:
+            {% match approval.status %}
+            {% when crate::server::approvals::ApprovalStatus::Pending %}
+                <mark>Pending</mark>
+            {% when crate::server::approvals::ApprovalStatus::Approved with { message } %}
+                <ins>Approved</ins>{% if let Some(m) = message.as_ref() %} — {{ m }}{% endif %}
+            {% when crate::server::approvals::ApprovalStatus::Denied with { reason } %}
+                <del>Denied</del>{% if !reason.is_empty() %} — {{ reason }}{% endif %}
+            {% when crate::server::approvals::ApprovalStatus::Superseded %}
+                <s>Superseded</s>
+            {% endmatch %}
+        </p>
+
+        {% if readwrite && !approval.status.is_resolved() %}
+        <hr>
+        <form method="post" action="/approvals/{{ approval.id }}/resolve">
+            <label for="message">Message (optional for approve, required for deny)</label>
+            <textarea id="message" name="message" rows="3"></textarea>
+            <div class="grid">
+                <button type="submit" name="decision" value="approve">Approve</button>
+                <button type="submit" name="decision" value="deny" class="secondary">Deny</button>
+            </div>
+        </form>
+        {% endif %}
+    </article>
+
+    <a href="/approvals">&larr; Back to dashboard</a>
+</main>
+</body>
+</html>

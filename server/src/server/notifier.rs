@@ -6,11 +6,12 @@ pub trait Notifier: Send + Sync + 'static {
     /// Backend name for logging.
     fn name(&self) -> &'static str;
 
-    /// Deliver a notification.
+    /// Deliver a notification. `url` is an optional link for the notification.
     fn send(
         &self,
         title: &str,
         message: &str,
+        url: Option<&str>,
     ) -> impl std::future::Future<Output = Result<(), NotifyError>> + Send;
 }
 

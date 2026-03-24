@@ -83,6 +83,7 @@ impl NotifyMcp {
         let update = SessionConfigUpdate {
             stop_enabled: params.stop_enabled,
             permission_enabled: params.permission_enabled,
+            approval_mode: None,
         };
 
         match self.sessions.update_config(&target_id, &update).await {

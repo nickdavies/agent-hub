@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Login — Claude Notify</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<main class="container">
+    <article style="max-width: 400px; margin: 4rem auto;">
+        <h2>Claude Notify</h2>
+        <p>Sign in to manage approval requests.</p>
+        {% for provider in providers %}
+        <a href="/auth/start/{{ provider }}" role="button" style="display: block; margin-bottom: 0.5rem;">
+            Sign in with {{ provider }}
+        </a>
+        {% endfor %}
+        {% if providers.is_empty() %}
+        <p><em>No OAuth providers configured.</em></p>
+        {% endif %}
+    </article>
+</main>
+</body>
+</html>

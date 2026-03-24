@@ -21,14 +21,19 @@ impl Notifier for WebhookClient {
         "webhook"
     }
 
-    async fn send(&self, title: &str, message: &str) -> Result<(), NotifyError> {
+    async fn send(&self, title: &str, message: &str, url: Option<&str>) -> Result<(), NotifyError> {
+        let mut payload = serde_json::json!({
+            "title": title,
+            "message": message,
+        });
+        if let Some(u) = url {
+            payload["url"] = serde_json::Value::String(u.to_string());
+        }
+
         let resp = self
             .client
             .post(&self.url)
-            .json(&serde_json::json!({
-                "title": title,
-                "message": message,
-            }))
+            .json(&payload)
             .send()
             .await
             .map_err(|e| NotifyError {

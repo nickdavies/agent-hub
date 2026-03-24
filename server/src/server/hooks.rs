@@ -5,12 +5,13 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::AppState;
+use super::approvals::ApprovalStatus;
 use super::notifier::Notifier;
 use crate::server::presence::PresenceState;
 
@@ -91,7 +92,7 @@ pub async fn stop<N: Notifier>(
         let title = "Claude Code".to_string();
         let message = format!("[{project}] Claude finished");
         tokio::spawn(async move {
-            fire_and_forget(&*notifier, &title, &message).await;
+            fire_and_forget(&*notifier, &title, &message, None).await;
         });
     } else {
         info!(
@@ -145,7 +146,7 @@ pub async fn notification<N: Notifier>(
 
     if delay_secs == 0 {
         tokio::spawn(async move {
-            fire_and_forget(&*notifier, &title, &message).await;
+            fire_and_forget(&*notifier, &title, &message, None).await;
         });
     } else {
         let cancel = state.pending.insert(&session_id).await;
@@ -155,7 +156,7 @@ pub async fn notification<N: Notifier>(
             tokio::select! {
                 () = cancel.cancelled() => {}
                 () = tokio::time::sleep(Duration::from_secs(delay_secs)) => {
-                    fire_and_forget(&*notifier, &title, &message).await;
+                    fire_and_forget(&*notifier, &title, &message, None).await;
                     pending.remove(&sid).await;
                 }
             }
@@ -184,8 +185,77 @@ fn extract_session(payload: &HookPayload) -> Option<(String, String)> {
     }
 }
 
-async fn fire_and_forget<N: Notifier>(notifier: &N, title: &str, message: &str) {
-    if let Err(e) = notifier.send(title, message).await {
+/// Request body for POST /hooks/approval
+#[derive(Deserialize)]
+pub struct ApprovalRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub cwd: String,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub context: Option<String>,
+}
+
+/// Response for POST /hooks/approval
+#[derive(Serialize)]
+pub struct ApprovalResponse {
+    pub id: uuid::Uuid,
+    #[serde(flatten)]
+    pub status: ApprovalStatus,
+}
+
+/// POST /api/v1/hooks/approval — register a pending approval request.
+pub async fn approval<N: Notifier>(
+    State(state): State<AppState<N>>,
+    Json(req): Json<ApprovalRequest>,
+) -> Json<ApprovalResponse> {
+    let project = state
+        .sessions
+        .get_or_register(&req.session_id, &req.cwd)
+        .await;
+
+    let approval = state
+        .approvals
+        .register(
+            req.request_id,
+            req.session_id,
+            project.clone(),
+            req.tool_name.clone(),
+            req.tool_input.clone(),
+            req.context.clone(),
+        )
+        .await;
+
+    // Send push notification with link if pending and base_url configured
+    if !approval.status.is_resolved() {
+        if let Some(base_url) = &state.config.base_url {
+            let url = format!("{}/approvals/{}", base_url, approval.id);
+            let notifier = Arc::clone(&state.notifier);
+            let title = "Claude Code (approval)".to_string();
+            let message = format!("[{project}] {} — {}", req.tool_name, truncate_input(&req.tool_input));
+            tokio::spawn(async move {
+                fire_and_forget(&*notifier, &title, &message, Some(&url)).await;
+            });
+        }
+    }
+
+    Json(ApprovalResponse {
+        id: approval.id,
+        status: approval.status,
+    })
+}
+
+fn truncate_input(input: &serde_json::Value) -> String {
+    let s = input.to_string();
+    if s.len() > 100 {
+        format!("{}...", &s[..100])
+    } else {
+        s
+    }
+}
+
+async fn fire_and_forget<N: Notifier>(notifier: &N, title: &str, message: &str, url: Option<&str>) {
+    if let Err(e) = notifier.send(title, message, url).await {
         warn!("{} notification failed: {e}", notifier.name());
     }
 }

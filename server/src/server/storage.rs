@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::approvals::Approval;
 use super::config::NotifyConfig;
 use super::presence::PresenceState;
 use super::sessions::SessionNotifyConfig;
@@ -15,6 +16,8 @@ pub struct PersistedState {
     pub sessions: HashMap<String, PersistedSession>,
     pub notify_config: Option<NotifyConfig>,
     pub presence: Option<PresenceState>,
+    #[serde(default)]
+    pub pending_approvals: Vec<Approval>,
 }
 
 /// A single session's persisted data (excludes last_seen which is runtime-only).

@@ -11,7 +11,9 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use server::config::ApprovalFeatureMode;
 use server::notifier::Notifier;
+use server::oauth::OAuthManager;
 use server::pushover::PushoverClient;
 use server::storage::{LocalFileStorage, NullStorage, Storage};
 use server::webhook::WebhookClient;
@@ -120,7 +122,28 @@ async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result
         server::config::ServerConfig::from_env().context("failed to load server config")?;
     let listen_addr = config.listen_addr.clone();
 
-    let state = server::AppState::new(config, notifier);
+    // Initialize OAuth if approval mode requires it
+    let oauth = if config.approval_mode != ApprovalFeatureMode::Disabled {
+        let base_url = config
+            .base_url
+            .as_ref()
+            .expect("BASE_URL validated in config");
+        let oauth = OAuthManager::from_env(base_url)
+            .await
+            .context("failed to initialize OAuth")?;
+
+        if oauth.is_none() {
+            anyhow::bail!(
+                "APPROVAL_MODE={:?} requires at least one OAuth provider (GOOGLE_CLIENT_ID/SECRET or OIDC_ISSUER_URL/CLIENT_ID/SECRET)",
+                config.approval_mode
+            );
+        }
+        oauth
+    } else {
+        None
+    };
+
+    let state = server::AppState::new(config, notifier, oauth);
 
     if let Some(persisted) = persisted {
         info!(
@@ -132,11 +155,15 @@ async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result
 
     // Spawn session eviction background task
     let sessions = Arc::clone(&state.sessions);
+    let approvals = Arc::clone(&state.approvals);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            sessions.evict_stale().await;
+            let evicted = sessions.evict_stale().await;
+            for session_id in &evicted {
+                approvals.evict_session(session_id).await;
+            }
         }
     });
 

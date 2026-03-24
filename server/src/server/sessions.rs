@@ -14,10 +14,35 @@ pub struct SessionInner {
     pub config: SessionNotifyConfig,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionApprovalMode {
+    Remote,
+    Terminal,
+}
+
+impl Default for SessionApprovalMode {
+    fn default() -> Self {
+        Self::Remote
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SessionNotifyConfig {
     pub stop_enabled: bool,
     pub permission_enabled: bool,
+    #[serde(default)]
+    pub approval_mode: SessionApprovalMode,
+}
+
+impl SessionNotifyConfig {
+    pub fn with_default_approval_mode(mode: SessionApprovalMode) -> Self {
+        Self {
+            stop_enabled: true,
+            permission_enabled: true,
+            approval_mode: mode,
+        }
+    }
 }
 
 impl Default for SessionNotifyConfig {
@@ -25,6 +50,7 @@ impl Default for SessionNotifyConfig {
         Self {
             stop_enabled: true,
             permission_enabled: true,
+            approval_mode: SessionApprovalMode::default(),
         }
     }
 }
@@ -34,6 +60,7 @@ impl Default for SessionNotifyConfig {
 pub struct SessionConfigUpdate {
     pub stop_enabled: Option<bool>,
     pub permission_enabled: Option<bool>,
+    pub approval_mode: Option<SessionApprovalMode>,
 }
 
 impl SessionNotifyConfig {
@@ -44,11 +71,14 @@ impl SessionNotifyConfig {
         if let Some(v) = update.permission_enabled {
             self.permission_enabled = v;
         }
+        if let Some(v) = update.approval_mode {
+            self.approval_mode = v;
+        }
     }
 }
 
 /// API response for a session.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SessionView {
     pub session_id: String,
     pub project: String,
@@ -58,6 +88,7 @@ pub struct SessionView {
 pub struct SessionRegistry {
     sessions: RwLock<HashMap<String, SessionInner>>,
     ttl: Duration,
+    default_approval_mode: SessionApprovalMode,
 }
 
 impl SessionRegistry {
@@ -65,7 +96,13 @@ impl SessionRegistry {
         Self {
             sessions: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(ttl_secs),
+            default_approval_mode: SessionApprovalMode::default(),
         }
+    }
+
+    pub fn with_default_approval_mode(mut self, mode: SessionApprovalMode) -> Self {
+        self.default_approval_mode = mode;
+        self
     }
 
     /// Upserts a session. Returns the project name extracted from cwd.
@@ -73,6 +110,7 @@ impl SessionRegistry {
         let project = extract_project_name(cwd);
         let mut sessions = self.sessions.write().await;
         let now = Instant::now();
+        let default_mode = self.default_approval_mode;
         sessions
             .entry(session_id.to_owned())
             .and_modify(|s| s.last_seen = now)
@@ -81,7 +119,7 @@ impl SessionRegistry {
                 SessionInner {
                     project: project.clone(),
                     last_seen: now,
-                    config: SessionNotifyConfig::default(),
+                    config: SessionNotifyConfig::with_default_approval_mode(default_mode),
                 }
             });
         project
@@ -179,24 +217,26 @@ impl SessionRegistry {
     }
 
     /// Evict sessions that haven't been seen within the TTL.
-    pub async fn evict_stale(&self) {
+    /// Returns the IDs of evicted sessions.
+    pub async fn evict_stale(&self) -> Vec<String> {
         let mut sessions = self.sessions.write().await;
-        let before = sessions.len();
+        let mut evicted_ids = Vec::new();
         sessions.retain(|id, s| {
             let alive = s.last_seen.elapsed() < self.ttl;
             if !alive {
                 info!(session_id = id, "session evicted (stale)");
+                evicted_ids.push(id.clone());
             }
             alive
         });
-        let evicted = before - sessions.len();
-        if evicted > 0 {
+        if !evicted_ids.is_empty() {
             info!(
-                evicted,
+                evicted = evicted_ids.len(),
                 remaining = sessions.len(),
                 "session eviction complete"
             );
         }
+        evicted_ids
     }
 }
 
@@ -256,6 +296,7 @@ mod tests {
                 &SessionConfigUpdate {
                     stop_enabled: Some(false),
                     permission_enabled: None,
+                    approval_mode: None,
                 },
             )
             .await
