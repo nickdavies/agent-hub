@@ -11,7 +11,10 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use server::notifier::Notifier;
+use server::pushover::PushoverClient;
 use server::storage::{LocalFileStorage, NullStorage, Storage};
+use server::webhook::WebhookClient;
 
 #[derive(Parser)]
 #[command(name = "claude-notify", version)]
@@ -24,6 +27,34 @@ struct Cli {
 enum Command {
     /// Start the notification server
     Serve {
+        #[command(subcommand)]
+        notifier: NotifierArgs,
+    },
+}
+
+/// Notification backend to use.
+#[derive(Subcommand)]
+enum NotifierArgs {
+    /// Send notifications via Pushover (https://pushover.net)
+    Pushover {
+        /// Pushover API token
+        #[arg(long, env = "PUSHOVER_TOKEN")]
+        token: String,
+
+        /// Pushover user key
+        #[arg(long, env = "PUSHOVER_USER")]
+        user: String,
+
+        #[command(subcommand)]
+        storage: Option<StorageArgs>,
+    },
+
+    /// Send notifications via HTTP webhook (POST JSON to a URL)
+    Webhook {
+        /// URL to POST notifications to
+        #[arg(long, env = "WEBHOOK_URL")]
+        url: String,
+
         #[command(subcommand)]
         storage: Option<StorageArgs>,
     },
@@ -49,17 +80,37 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { storage } => match storage {
-            None => serve(NullStorage).await,
-            Some(StorageArgs::LocalFile { path }) => {
-                info!(?path, "using local file storage");
-                serve(LocalFileStorage::new(path)).await
+        Command::Serve { notifier } => match notifier {
+            NotifierArgs::Pushover {
+                token,
+                user,
+                storage,
+            } => {
+                let notifier = PushoverClient::new(token, user);
+                serve_with_storage(notifier, storage).await
+            }
+            NotifierArgs::Webhook { url, storage } => {
+                let notifier = WebhookClient::new(url);
+                serve_with_storage(notifier, storage).await
             }
         },
     }
 }
 
-async fn serve(storage: impl Storage) -> anyhow::Result<()> {
+async fn serve_with_storage(
+    notifier: impl Notifier,
+    storage: Option<StorageArgs>,
+) -> anyhow::Result<()> {
+    match storage {
+        None => serve(notifier, NullStorage).await,
+        Some(StorageArgs::LocalFile { path }) => {
+            info!(?path, "using local file storage");
+            serve(notifier, LocalFileStorage::new(path)).await
+        }
+    }
+}
+
+async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result<()> {
     let persisted = storage
         .load()
         .await
@@ -69,7 +120,7 @@ async fn serve(storage: impl Storage) -> anyhow::Result<()> {
         server::config::ServerConfig::from_env().context("failed to load server config")?;
     let listen_addr = config.listen_addr.clone();
 
-    let state = server::AppState::new(config);
+    let state = server::AppState::new(config, notifier);
 
     if let Some(persisted) = persisted {
         info!(

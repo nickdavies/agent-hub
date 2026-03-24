@@ -2,7 +2,7 @@
 
 > **Experimental** — This project is under active development. APIs, configuration, and behavior may change without notice.
 
-A notification server for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). It receives webhook events from Claude Code sessions (permission prompts, task completions), gates them against your physical presence, and forwards notifications via [Pushover](https://pushover.net/).
+A notification server for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). It receives webhook events from Claude Code sessions (permission prompts, task completions), gates them against your physical presence, and forwards notifications via a pluggable backend (Pushover, webhook, or bring your own).
 
 ## Why
 
@@ -14,32 +14,70 @@ claude-notify solves this by running as a server (designed for k8s, works anywhe
 - **Tracks sessions** — auto-registers Claude Code sessions on first hook contact, with per-session notification control
 - **Exposes MCP tools** — Claude itself can query and configure its own notification preferences mid-session
 - **Supports multiple clients** — any number of Claude Code instances across machines can report to the same server
+- **Pluggable notification backends** — ships with Pushover and webhook support, easy to add more
 
 ## Architecture
 
 ```
-Claude Code  ──HTTP hooks──▶  claude-notify  ──Pushover API──▶  Phone
-     │                             ▲
+                                              ┌──Pushover API──▶  Phone
+Claude Code  ──HTTP hooks──▶  claude-notify  ─┤
+     │                             ▲          └──Webhook POST──▶  Your service
      ├──MCP (HTTP)──▶  /mcp       │
      │                             │
 Motion sensor  ────────────────────┘  POST /presence
 ```
 
-Single binary (`claude-notify serve`), single process. REST API and MCP protocol are served together.
+Single binary (`claude-notify serve <backend>`), single process. REST API and MCP protocol are served together.
 
 ## Setup
 
 ### Requirements
 
 - Rust 1.80+ (or Docker)
-- A [Pushover](https://pushover.net/) account (API token + user key)
+- A notification backend (see below)
 
-### Environment variables
+### Notification backends
+
+#### Pushover
+
+Uses the [Pushover](https://pushover.net/) API to send push notifications to your phone.
+
+| Variable | Description |
+|----------|-------------|
+| `PUSHOVER_TOKEN` | Pushover API token |
+| `PUSHOVER_USER` | Pushover user key |
+
+```sh
+claude-notify serve pushover
+# or explicitly:
+claude-notify serve pushover --token "..." --user "..."
+```
+
+#### Webhook
+
+POSTs a JSON payload to any URL. Useful for integrating with Slack, Discord, Home Assistant, or any custom service.
+
+| Variable | Description |
+|----------|-------------|
+| `WEBHOOK_URL` | URL to POST notifications to |
+
+```sh
+claude-notify serve webhook --url "https://example.com/notify"
+```
+
+The payload is:
+
+```json
+{
+  "title": "Claude Code",
+  "message": "[my-project] Claude finished"
+}
+```
+
+### Common environment variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PUSHOVER_TOKEN` | yes | — | Pushover API token |
-| `PUSHOVER_USER` | yes | — | Pushover user key |
 | `CLAUDE_NOTIFY_TOKENS` | yes | — | Auth tokens (see [Authentication](#authentication)) |
 | `LISTEN_ADDR` | no | `0.0.0.0:8080` | Bind address |
 | `PRESENCE_TTL` | no | `120` | Seconds before presence degrades to `away` |
@@ -53,7 +91,24 @@ export PUSHOVER_TOKEN="..."
 export PUSHOVER_USER="..."
 export CLAUDE_NOTIFY_TOKENS="desktop:some-secret-token"
 
-cargo run -- serve
+cargo run -- serve pushover
+```
+
+Or with webhook:
+
+```sh
+export WEBHOOK_URL="https://example.com/notify"
+export CLAUDE_NOTIFY_TOKENS="desktop:some-secret-token"
+
+cargo run -- serve webhook
+```
+
+### State persistence
+
+By default, state is not persisted across restarts. To persist sessions, config, and presence:
+
+```sh
+claude-notify serve pushover local-file --path state.json
 ```
 
 ### Run with Docker
@@ -64,7 +119,7 @@ docker run -p 8080:8080 \
   -e PUSHOVER_TOKEN="..." \
   -e PUSHOVER_USER="..." \
   -e CLAUDE_NOTIFY_TOKENS="desktop:some-secret-token" \
-  claude-notify
+  claude-notify serve pushover
 ```
 
 ### Configure Claude Code
@@ -246,3 +301,63 @@ curl -X PUT https://your-server/config \
 ```
 
 Stop notifications are always sent immediately — the delay only applies to permission prompts.
+
+## Contributing a notification channel
+
+Adding a new notification backend takes three steps:
+
+### 1. Implement the `Notifier` trait
+
+Create a new file in `src/server/` (e.g., `discord.rs`):
+
+```rust
+use super::notifier::{Notifier, NotifyError};
+
+pub struct DiscordClient {
+    // your fields
+}
+
+impl Notifier for DiscordClient {
+    fn name(&self) -> &'static str {
+        "discord"
+    }
+
+    async fn send(&self, title: &str, message: &str) -> Result<(), NotifyError> {
+        // Send the notification. Return NotifyError on failure.
+        todo!()
+    }
+}
+```
+
+The trait contract is intentionally minimal — `name()` for logging and `send()` for delivery. See `pushover.rs` and `webhook.rs` for working examples.
+
+### 2. Register the module and CLI subcommand
+
+In `src/server/mod.rs`, add `pub mod discord;`.
+
+In `src/main.rs`, add a variant to `NotifierArgs`:
+
+```rust
+Discord {
+    #[arg(long, env = "DISCORD_WEBHOOK_URL")]
+    url: String,
+
+    #[command(subcommand)]
+    storage: Option<StorageArgs>,
+},
+```
+
+And handle it in the `main()` match:
+
+```rust
+NotifierArgs::Discord { url, storage } => {
+    let notifier = DiscordClient::new(url);
+    serve_with_storage(notifier, storage).await
+}
+```
+
+### 3. Update docs
+
+Add your backend to the "Notification backends" section in this README.
+
+That's it — the rest of the system (presence gating, session tracking, delay logic, MCP) works automatically with any `Notifier` implementation.

@@ -1,5 +1,7 @@
 use tracing::{error, info};
 
+use super::notifier::{Notifier, NotifyError};
+
 pub struct PushoverClient {
     client: reqwest::Client,
     token: String,
@@ -14,8 +16,14 @@ impl PushoverClient {
             user,
         }
     }
+}
 
-    pub async fn send(&self, title: &str, message: &str) -> Result<(), PushoverError> {
+impl Notifier for PushoverClient {
+    fn name(&self) -> &'static str {
+        "pushover"
+    }
+
+    async fn send(&self, title: &str, message: &str) -> Result<(), NotifyError> {
         let resp = self
             .client
             .post("https://api.pushover.net/1/messages.json")
@@ -27,20 +35,22 @@ impl PushoverClient {
             ])
             .send()
             .await
-            .map_err(|e| PushoverError(format!("request failed: {e}")))?;
+            .map_err(|e| NotifyError {
+                backend: "pushover",
+                message: format!("request failed: {e}"),
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             error!(status = %status, body, "pushover API error");
-            return Err(PushoverError(format!("API returned {status}: {body}")));
+            return Err(NotifyError {
+                backend: "pushover",
+                message: format!("API returned {status}: {body}"),
+            });
         }
 
         info!(title, "pushover notification sent");
         Ok(())
     }
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("pushover: {0}")]
-pub struct PushoverError(pub String);

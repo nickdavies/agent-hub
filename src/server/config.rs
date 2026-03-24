@@ -8,8 +8,6 @@ use crate::error::AppError;
 
 /// Immutable server configuration loaded from environment at startup.
 pub struct ServerConfig {
-    pub pushover_token: String,
-    pub pushover_user: String,
     pub tokens: Vec<Token>,
     pub listen_addr: String,
     pub presence_ttl_secs: u64,
@@ -24,11 +22,6 @@ pub struct Token {
 
 impl ServerConfig {
     pub fn from_env() -> Result<Self, AppError> {
-        let pushover_token = env::var("PUSHOVER_TOKEN")
-            .map_err(|_| AppError::Config("PUSHOVER_TOKEN not set".into()))?;
-        let pushover_user = env::var("PUSHOVER_USER")
-            .map_err(|_| AppError::Config("PUSHOVER_USER not set".into()))?;
-
         let raw_tokens = env::var("CLAUDE_NOTIFY_TOKENS")
             .map_err(|_| AppError::Config("CLAUDE_NOTIFY_TOKENS not set".into()))?;
         let tokens = parse_tokens(&raw_tokens)?;
@@ -51,8 +44,6 @@ impl ServerConfig {
             .unwrap_or(0);
 
         Ok(Self {
-            pushover_token,
-            pushover_user,
             tokens,
             listen_addr,
             presence_ttl_secs,

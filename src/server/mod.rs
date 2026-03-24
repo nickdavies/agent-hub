@@ -1,10 +1,12 @@
 pub mod auth;
 pub mod config;
 pub mod hooks;
+pub mod notifier;
 pub mod presence;
 pub mod pushover;
 pub mod sessions;
 pub mod storage;
+pub mod webhook;
 
 use std::sync::Arc;
 
@@ -16,33 +18,52 @@ use tokio::sync::RwLock;
 use crate::mcp;
 use config::{NotifyConfig, NotifyConfigUpdate, ServerConfig, SharedNotifyConfig};
 use hooks::PendingNotifications;
+use notifier::Notifier;
 use presence::{Presence, PresenceUpdate};
-use pushover::PushoverClient;
 use sessions::{SessionConfigUpdate, SessionRegistry};
 
-#[derive(Clone)]
-pub struct AppState {
+pub struct AppState<N: Notifier> {
     pub config: Arc<ServerConfig>,
     pub presence: Arc<Presence>,
     pub sessions: Arc<SessionRegistry>,
-    pub pushover: Arc<PushoverClient>,
+    pub notifier: Arc<N>,
     pub notify_config: SharedNotifyConfig,
     pub pending: Arc<PendingNotifications>,
 }
 
-pub fn router(state: AppState) -> Router {
-    let mcp_service = mcp::service(state.clone());
+impl<N: Notifier> Clone for AppState<N> {
+    fn clone(&self) -> Self {
+        Self {
+            config: Arc::clone(&self.config),
+            presence: Arc::clone(&self.presence),
+            sessions: Arc::clone(&self.sessions),
+            notifier: Arc::clone(&self.notifier),
+            notify_config: Arc::clone(&self.notify_config),
+            pending: Arc::clone(&self.pending),
+        }
+    }
+}
+
+pub fn router<N: Notifier>(state: AppState<N>) -> Router {
+    let mcp_service = mcp::service(
+        Arc::clone(&state.sessions),
+        Arc::clone(&state.notify_config),
+        Arc::clone(&state.presence),
+    );
 
     let authed = Router::new()
-        .route("/hooks/stop", post(hooks::stop))
-        .route("/hooks/notification", post(hooks::notification))
-        .route("/hooks/session-end", post(hooks::session_end))
-        .route("/presence", post(handle_presence_update))
-        .route("/sessions", get(handle_list_sessions))
-        .route("/sessions/{id}", put(handle_update_session))
-        .route("/config", get(handle_get_config).put(handle_put_config))
+        .route("/hooks/stop", post(hooks::stop::<N>))
+        .route("/hooks/notification", post(hooks::notification::<N>))
+        .route("/hooks/session-end", post(hooks::session_end::<N>))
+        .route("/presence", post(handle_presence_update::<N>))
+        .route("/sessions", get(handle_list_sessions::<N>))
+        .route("/sessions/{id}", put(handle_update_session::<N>))
+        .route(
+            "/config",
+            get(handle_get_config::<N>).put(handle_put_config::<N>),
+        )
         .nest_service("/mcp", mcp_service)
-        .layer(from_fn_with_state(state.clone(), auth::require_auth))
+        .layer(from_fn_with_state(state.clone(), auth::require_auth::<N>))
         .with_state(state.clone());
 
     let public = Router::new().route("/health", get(health));
@@ -57,8 +78,8 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn handle_presence_update(
-    axum::extract::State(state): axum::extract::State<AppState>,
+async fn handle_presence_update<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
     Json(body): Json<PresenceUpdate>,
 ) -> axum::http::StatusCode {
     state.presence.set(body.state).await;
@@ -66,14 +87,14 @@ async fn handle_presence_update(
     axum::http::StatusCode::OK
 }
 
-async fn handle_list_sessions(
-    axum::extract::State(state): axum::extract::State<AppState>,
+async fn handle_list_sessions<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
 ) -> Json<Vec<sessions::SessionView>> {
     Json(state.sessions.list().await)
 }
 
-async fn handle_update_session(
-    axum::extract::State(state): axum::extract::State<AppState>,
+async fn handle_update_session<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(update): Json<SessionConfigUpdate>,
 ) -> Result<Json<sessions::SessionNotifyConfig>, crate::error::AppError> {
@@ -92,16 +113,16 @@ struct ConfigResponse {
     presence: presence::PresenceState,
 }
 
-async fn handle_get_config(
-    axum::extract::State(state): axum::extract::State<AppState>,
+async fn handle_get_config<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
 ) -> Json<ConfigResponse> {
     let notify = state.notify_config.read().await.clone();
     let presence = state.presence.get().await;
     Json(ConfigResponse { notify, presence })
 }
 
-async fn handle_put_config(
-    axum::extract::State(state): axum::extract::State<AppState>,
+async fn handle_put_config<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
     Json(update): Json<NotifyConfigUpdate>,
 ) -> Json<NotifyConfig> {
     let mut cfg = state.notify_config.write().await;
@@ -109,12 +130,8 @@ async fn handle_put_config(
     Json(cfg.clone())
 }
 
-impl AppState {
-    pub fn new(server_config: ServerConfig) -> Self {
-        let pushover = PushoverClient::new(
-            server_config.pushover_token.clone(),
-            server_config.pushover_user.clone(),
-        );
+impl<N: Notifier> AppState<N> {
+    pub fn new(server_config: ServerConfig, notifier: N) -> Self {
         let presence = Presence::new(server_config.presence_ttl_secs);
         let sessions = SessionRegistry::new(server_config.session_ttl_secs);
         let notify_config = NotifyConfig::with_delay(server_config.notification_delay_secs);
@@ -123,7 +140,7 @@ impl AppState {
             config: Arc::new(server_config),
             presence: Arc::new(presence),
             sessions: Arc::new(sessions),
-            pushover: Arc::new(pushover),
+            notifier: Arc::new(notifier),
             notify_config: Arc::new(RwLock::new(notify_config)),
             pending: Arc::new(PendingNotifications::new()),
         }
