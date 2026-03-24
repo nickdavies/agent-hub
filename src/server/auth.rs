@@ -5,10 +5,11 @@ use axum::response::Response;
 use tracing::debug;
 
 use super::AppState;
+use super::notifier::Notifier;
 
 /// Auth middleware: validates Bearer token against configured tokens.
-pub async fn require_auth(
-    state: axum::extract::State<AppState>,
+pub async fn require_auth<N: Notifier>(
+    state: axum::extract::State<AppState<N>>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {

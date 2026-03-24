@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::AppState;
+use super::notifier::Notifier;
 use crate::server::presence::PresenceState;
-use crate::server::pushover::PushoverClient;
 
 /// Common fields from hook payloads. Serde ignores unknown fields by default.
 #[derive(Deserialize)]
@@ -62,7 +62,10 @@ impl PendingNotifications {
 }
 
 /// POST /hooks/stop
-pub async fn stop(State(state): State<AppState>, Json(payload): Json<HookPayload>) -> StatusCode {
+pub async fn stop<N: Notifier>(
+    State(state): State<AppState<N>>,
+    Json(payload): Json<HookPayload>,
+) -> StatusCode {
     let (session_id, cwd) = match extract_session(&payload) {
         Some(v) => v,
         None => {
@@ -84,11 +87,11 @@ pub async fn stop(State(state): State<AppState>, Json(payload): Json<HookPayload
         && session_cfg.as_ref().is_some_and(|c| c.stop_enabled);
 
     if should_notify {
-        let pushover = Arc::clone(&state.pushover);
+        let notifier = Arc::clone(&state.notifier);
         let title = "Claude Code".to_string();
         let message = format!("[{project}] Claude finished");
         tokio::spawn(async move {
-            fire_and_forget(&pushover, &title, &message).await;
+            fire_and_forget(&*notifier, &title, &message).await;
         });
     } else {
         info!(
@@ -104,8 +107,8 @@ pub async fn stop(State(state): State<AppState>, Json(payload): Json<HookPayload
 }
 
 /// POST /hooks/notification
-pub async fn notification(
-    State(state): State<AppState>,
+pub async fn notification<N: Notifier>(
+    State(state): State<AppState<N>>,
     Json(payload): Json<HookPayload>,
 ) -> StatusCode {
     let (session_id, cwd) = match extract_session(&payload) {
@@ -134,7 +137,7 @@ pub async fn notification(
         return StatusCode::OK;
     }
 
-    let pushover = Arc::clone(&state.pushover);
+    let notifier = Arc::clone(&state.notifier);
     let title = "Claude Code (waiting)".to_string();
     let msg_body = payload.message.as_deref().unwrap_or("Permission prompt");
     let message = format!("[{project}] {msg_body}");
@@ -142,7 +145,7 @@ pub async fn notification(
 
     if delay_secs == 0 {
         tokio::spawn(async move {
-            fire_and_forget(&pushover, &title, &message).await;
+            fire_and_forget(&*notifier, &title, &message).await;
         });
     } else {
         let cancel = state.pending.insert(&session_id).await;
@@ -152,7 +155,7 @@ pub async fn notification(
             tokio::select! {
                 () = cancel.cancelled() => {}
                 () = tokio::time::sleep(Duration::from_secs(delay_secs)) => {
-                    fire_and_forget(&pushover, &title, &message).await;
+                    fire_and_forget(&*notifier, &title, &message).await;
                     pending.remove(&sid).await;
                 }
             }
@@ -163,8 +166,8 @@ pub async fn notification(
 }
 
 /// POST /hooks/session-end
-pub async fn session_end(
-    State(state): State<AppState>,
+pub async fn session_end<N: Notifier>(
+    State(state): State<AppState<N>>,
     Json(payload): Json<HookPayload>,
 ) -> StatusCode {
     if let Some(session_id) = &payload.session_id {
@@ -181,8 +184,8 @@ fn extract_session(payload: &HookPayload) -> Option<(String, String)> {
     }
 }
 
-async fn fire_and_forget(pushover: &PushoverClient, title: &str, message: &str) {
-    if let Err(e) = pushover.send(title, message).await {
-        warn!("pushover failed: {e}");
+async fn fire_and_forget<N: Notifier>(notifier: &N, title: &str, message: &str) {
+    if let Err(e) = notifier.send(title, message).await {
+        warn!("{} notification failed: {e}", notifier.name());
     }
 }

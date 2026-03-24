@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -8,19 +10,31 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::{ServerHandler, tool_handler, tool_router};
 use serde::Serialize;
 
-use crate::server::AppState;
-use crate::server::presence::PresenceState;
-use crate::server::sessions::SessionConfigUpdate;
+use crate::server::config::SharedNotifyConfig;
+use crate::server::presence::{Presence, PresenceState};
+use crate::server::sessions::{SessionConfigUpdate, SessionRegistry};
 
 #[derive(Clone)]
 pub struct NotifyMcp {
-    state: AppState,
+    sessions: Arc<SessionRegistry>,
+    notify_config: SharedNotifyConfig,
+    presence: Arc<Presence>,
     tool_router: ToolRouter<Self>,
 }
 
-pub fn service(state: AppState) -> StreamableHttpService<NotifyMcp> {
+pub fn service(
+    sessions: Arc<SessionRegistry>,
+    notify_config: SharedNotifyConfig,
+    presence: Arc<Presence>,
+) -> StreamableHttpService<NotifyMcp> {
     StreamableHttpService::new(
-        move || Ok(NotifyMcp::new(state.clone())),
+        move || {
+            Ok(NotifyMcp::new(
+                Arc::clone(&sessions),
+                Arc::clone(&notify_config),
+                Arc::clone(&presence),
+            ))
+        },
         LocalSessionManager::default().into(),
         Default::default(),
     )
@@ -40,9 +54,15 @@ struct ConfigureSessionParams {
 
 #[tool_router]
 impl NotifyMcp {
-    fn new(state: AppState) -> Self {
+    fn new(
+        sessions: Arc<SessionRegistry>,
+        notify_config: SharedNotifyConfig,
+        presence: Arc<Presence>,
+    ) -> Self {
         Self {
-            state,
+            sessions,
+            notify_config,
+            presence,
             tool_router: Self::tool_router(),
         }
     }
@@ -54,18 +74,18 @@ impl NotifyMcp {
         &self,
         Parameters(params): Parameters<ConfigureSessionParams>,
     ) -> String {
-        let target_id = match resolve_session(&self.state, params.session_id, params.project).await
-        {
-            Ok(id) => id,
-            Err(msg) => return msg,
-        };
+        let target_id =
+            match resolve_session(&self.sessions, params.session_id, params.project).await {
+                Ok(id) => id,
+                Err(msg) => return msg,
+            };
 
         let update = SessionConfigUpdate {
             stop_enabled: params.stop_enabled,
             permission_enabled: params.permission_enabled,
         };
 
-        match self.state.sessions.update_config(&target_id, &update).await {
+        match self.sessions.update_config(&target_id, &update).await {
             Some(cfg) => serde_json::to_string_pretty(&cfg).unwrap_or_else(|e| e.to_string()),
             None => format!("Session '{target_id}' not found"),
         }
@@ -73,7 +93,7 @@ impl NotifyMcp {
 
     #[tool(description = "List all active Claude sessions with their notification configuration.")]
     async fn list_sessions(&self) -> String {
-        let sessions = self.state.sessions.list().await;
+        let sessions = self.sessions.list().await;
         serde_json::to_string_pretty(&sessions).unwrap_or_else(|e| e.to_string())
     }
 
@@ -81,9 +101,9 @@ impl NotifyMcp {
         description = "Get current notification server status including presence state, global notification config, and active session count."
     )]
     async fn get_status(&self) -> String {
-        let presence = self.state.presence.get().await;
-        let config = self.state.notify_config.read().await.clone();
-        let session_count = self.state.sessions.count().await;
+        let presence = self.presence.get().await;
+        let config = self.notify_config.read().await.clone();
+        let session_count = self.sessions.count().await;
 
         let status = StatusResponse {
             presence,
@@ -121,7 +141,7 @@ struct StatusResponse {
 }
 
 async fn resolve_session(
-    state: &AppState,
+    sessions: &SessionRegistry,
     session_id: Option<String>,
     project: Option<String>,
 ) -> Result<String, String> {
@@ -134,7 +154,7 @@ async fn resolve_session(
         None => return Err("Either 'project' or 'session_id' is required".into()),
     };
 
-    let matches = state.sessions.find_by_project(&project).await;
+    let matches = sessions.find_by_project(&project).await;
     match matches.len() {
         0 => Err(format!("No sessions found for project '{project}'")),
         1 => Ok(matches[0].session_id.clone()),
