@@ -109,6 +109,12 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
 
     let mut app = Router::new().nest("/api/v1", api_v1).merge(public);
 
+    // Redirect root to the dashboard
+    app = app.route(
+        "/",
+        get(|| async { axum::response::Redirect::permanent("/approvals") }),
+    );
+
     // Mount web UI and OAuth routes when approval mode is not disabled
     if state.config.approval_mode != ApprovalFeatureMode::Disabled {
         // Web UI routes
