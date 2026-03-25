@@ -79,7 +79,7 @@ The payload is:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `CLAUDE_NOTIFY_TOKENS` | yes | — | Auth tokens (see [Authentication](#authentication)) |
-| `LISTEN_ADDR` | no | `0.0.0.0:8080` | Bind address |
+| `LISTEN_ADDR` | no | `127.0.0.1:8080` (no-auth) / `0.0.0.0:8080` (token) | Bind address |
 | `PRESENCE_TTL` | no | `120` | Seconds before presence degrades to `away` |
 | `SESSION_TTL` | no | `7200` | Seconds before idle sessions are evicted |
 | `NOTIFICATION_DELAY` | no | `0` | Seconds to wait before sending permission notifications (0 = immediate) |

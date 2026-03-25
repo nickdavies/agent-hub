@@ -33,7 +33,7 @@ src/
 | `PUSHOVER_TOKEN` | Pushover API token (if using `serve pushover`) |
 | `PUSHOVER_USER` | Pushover user key (if using `serve pushover`) |
 | `WEBHOOK_URL` | Webhook URL (if using `serve webhook`) |
-| `LISTEN_ADDR` | (optional) Default: `0.0.0.0:8080` |
+| `LISTEN_ADDR` | (optional) Default: `127.0.0.1:8080` (no-auth) / `0.0.0.0:8080` (token) |
 | `PRESENCE_TTL` | (optional) Seconds before presence falls back to `away`. Default: `120` |
 | `SESSION_TTL` | (optional) Seconds before idle sessions are evicted. Default: `7200` |
 | `NOTIFICATION_DELAY` | (optional) Seconds to delay permission notifications. Default: `0` (immediate). |

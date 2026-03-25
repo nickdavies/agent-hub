@@ -61,7 +61,11 @@ impl ServerConfig {
             Vec::new()
         };
 
-        let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+        let default_addr = match auth_mode {
+            AuthMode::None => "127.0.0.1:8080",
+            AuthMode::Token => "0.0.0.0:8080",
+        };
+        let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| default_addr.into());
         let presence_ttl_secs = env::var("PRESENCE_TTL")
             .ok()
             .and_then(|v| v.parse().ok())
