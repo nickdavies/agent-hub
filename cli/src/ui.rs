@@ -484,7 +484,15 @@ fn build_expanded_lines(
 ) -> Vec<ExpandedLine> {
     let mut lines = Vec::new();
 
-    if !show_raw && approval.tool_name == "Write" {
+    if show_raw {
+        let json = serde_json::to_string_pretty(&approval.tool_input).unwrap_or_default();
+        for line in json.lines() {
+            lines.push(ExpandedLine {
+                text: truncate_str(line, max_line_width),
+                kind: LineKind::Normal,
+            });
+        }
+    } else if approval.tool_name == "Write" {
         build_write_diff_lines(&approval.tool_input, max_line_width, &mut lines);
     } else {
         let input_str = format_tool_input(&approval.tool_input);
