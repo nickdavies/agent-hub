@@ -78,6 +78,7 @@ struct HookInput {
     tool_name: Option<String>,
     tool_input: Option<serde_json::Value>,
     cwd: Option<String>,
+    workspace_roots: Option<Vec<String>>,
 }
 
 impl HookInput {
@@ -131,17 +132,22 @@ struct ToolConfigJson {
     rules: Vec<RuleJson>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct RuleJson {
     tools: Vec<String>,
     action: RuleAction,
     command: Option<String>,
     message: Option<String>,
+    /// Pattern applied to all tools in this rule (e.g. "**/.ssh/**").
+    /// Tools with inline patterns like "Write(src/**)" override this.
+    pattern: Option<String>,
+    /// If set, rule only matches paths inside (true) or outside (false) workspace roots.
+    in_workspace: Option<bool>,
 }
 
 // Compiled config types
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 enum DefaultAction {
     Allow,
@@ -149,7 +155,7 @@ enum DefaultAction {
     Ask,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RuleAction {
     Allow,
@@ -190,11 +196,10 @@ impl ToolMatcher {
         match &self.pattern {
             None => true,
             Some(pattern) => {
-                let arg = tool_input.and_then(|input| get_matchable_arg(tool_name, input, cwd));
-                match arg {
-                    Some(ref value) => pattern.is_match(value),
-                    None => false,
-                }
+                let args = tool_input
+                    .map(|input| get_matchable_args(tool_name, input, cwd))
+                    .unwrap_or_default();
+                args.iter().any(|value| pattern.is_match(value))
             }
         }
     }
@@ -205,6 +210,8 @@ struct Rule {
     action: RuleAction,
     command: Option<String>,
     message: Option<String>,
+    in_workspace: Option<bool>,
+    source_json: String,
 }
 
 struct ToolConfig {
@@ -255,55 +262,196 @@ fn parse_tool_entry(entry: &str) -> Result<ToolMatcher, String> {
     }
 }
 
-fn is_path_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "Read"
-            | "Write"
-            | "StrReplace"
-            | "Delete"
-            | "Edit"
-            | "MultiEdit"
-            | "EditNotebook"
-            | "NotebookEdit"
-    )
+// --- Tool registry ---
+//
+// Single source of truth for tool names, categories, and argument extraction.
+// Adding a new tool means adding ONE entry here — group aliases, is_path_tool,
+// and argument extraction all derive from this table.
+
+#[derive(Clone, Copy, PartialEq)]
+enum ToolCategory {
+    FileRead,
+    FileWrite,
+    Shell,
+    Other,
 }
 
-/// Extract the argument to match against from tool_input, based on tool type.
-/// For path-based tools, relative paths are resolved against cwd.
-fn get_matchable_arg(
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-    cwd: Option<&str>,
-) -> Option<String> {
-    let raw = match tool_name {
-        "Read" | "Write" | "StrReplace" | "Delete" | "Edit" | "MultiEdit" => tool_input
-            .get("path")
-            .or_else(|| tool_input.get("file_path"))
-            .and_then(|v| v.as_str()),
-        "EditNotebook" | "NotebookEdit" => {
-            tool_input.get("target_notebook").and_then(|v| v.as_str())
-        }
-        "Bash" | "Shell" => tool_input.get("command").and_then(|v| v.as_str()),
-        "WebFetch" => tool_input.get("url").and_then(|v| v.as_str()),
-        _ => None,
-    }?;
+struct ToolDef {
+    name: &'static str,
+    category: ToolCategory,
+    /// JSON field names to try in order for scalar arg extraction.
+    fields: &'static [&'static str],
+    /// If set, extract from this JSON array field instead of scalar fields.
+    array_field: Option<&'static str>,
+}
 
+const TOOL_DEFS: &[ToolDef] = &[
+    // File read
+    ToolDef { name: "Read", category: ToolCategory::FileRead, fields: &["path", "file_path"], array_field: None },
+    ToolDef { name: "Grep", category: ToolCategory::FileRead, fields: &["path"], array_field: None },
+    ToolDef { name: "Glob", category: ToolCategory::FileRead, fields: &["target_directory"], array_field: None },
+    ToolDef { name: "SemanticSearch", category: ToolCategory::FileRead, fields: &[], array_field: Some("target_directories") },
+    // File write
+    ToolDef { name: "Write", category: ToolCategory::FileWrite, fields: &["path", "file_path"], array_field: None },
+    ToolDef { name: "StrReplace", category: ToolCategory::FileWrite, fields: &["path", "file_path"], array_field: None },
+    ToolDef { name: "Delete", category: ToolCategory::FileWrite, fields: &["path", "file_path"], array_field: None },
+    ToolDef { name: "Edit", category: ToolCategory::FileWrite, fields: &["path", "file_path"], array_field: None },
+    ToolDef { name: "MultiEdit", category: ToolCategory::FileWrite, fields: &["path", "file_path"], array_field: None },
+    ToolDef { name: "EditNotebook", category: ToolCategory::FileWrite, fields: &["target_notebook"], array_field: None },
+    ToolDef { name: "NotebookEdit", category: ToolCategory::FileWrite, fields: &["target_notebook"], array_field: None },
+    // Shell
+    ToolDef { name: "Bash", category: ToolCategory::Shell, fields: &["command"], array_field: None },
+    ToolDef { name: "Shell", category: ToolCategory::Shell, fields: &["command"], array_field: None },
+    // Other (has arg extraction but not in a file/shell group)
+    ToolDef { name: "WebFetch", category: ToolCategory::Other, fields: &["url"], array_field: None },
+];
+
+fn find_tool_def(name: &str) -> Option<&'static ToolDef> {
+    TOOL_DEFS.iter().find(|d| d.name == name)
+}
+
+fn tools_in_category(cat: ToolCategory) -> Vec<&'static str> {
+    TOOL_DEFS
+        .iter()
+        .filter(|d| d.category == cat)
+        .map(|d| d.name)
+        .collect()
+}
+
+fn is_path_tool(tool_name: &str) -> bool {
+    find_tool_def(tool_name)
+        .is_some_and(|d| matches!(d.category, ToolCategory::FileRead | ToolCategory::FileWrite))
+}
+
+fn expand_tool_group(name: &str) -> Option<Vec<&'static str>> {
+    match name {
+        "@file" => {
+            let mut v = tools_in_category(ToolCategory::FileRead);
+            v.extend(tools_in_category(ToolCategory::FileWrite));
+            Some(v)
+        }
+        "@file_read" => Some(tools_in_category(ToolCategory::FileRead)),
+        "@file_write" => Some(tools_in_category(ToolCategory::FileWrite)),
+        "@shell" => Some(tools_in_category(ToolCategory::Shell)),
+        _ => None,
+    }
+}
+
+/// Split "Write(src/**)" into ("Write", Some("src/**")), or "Write" into ("Write", None).
+fn split_entry(entry: &str) -> (&str, Option<&str>) {
+    if let Some(paren_start) = entry.find('(') {
+        if entry.ends_with(')') {
+            let name = &entry[..paren_start];
+            let pat = &entry[paren_start + 1..entry.len() - 1];
+            return (name, Some(pat));
+        }
+    }
+    (entry, None)
+}
+
+/// Expand group aliases and apply rule-level patterns, producing entries ready
+/// for `parse_tool_entry`. Returns an error if an `@`-prefixed name doesn't
+/// match any known group (catches typos like `@Shell` or `@files_write`).
+fn expand_tools(tools: &[String], rule_pattern: Option<&str>) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    for entry in tools {
+        let (name, inline_pat) = split_entry(entry);
+
+        let names: Vec<&str> = if name.starts_with('@') {
+            expand_tool_group(name).ok_or_else(|| {
+                format!("unknown tool group '{name}' (valid groups: @file, @file_read, @file_write, @shell)")
+            })?
+        } else {
+            vec![name]
+        };
+
+        let effective_pat = inline_pat.or(rule_pattern);
+
+        for tool_name in names {
+            match effective_pat {
+                Some(pat) => result.push(format!("{tool_name}({pat})")),
+                None => result.push(tool_name.to_string()),
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Normalize a path by resolving `.` and `..` segments without filesystem access.
+fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if matches!(components.last(), Some(std::path::Component::Normal(_))) {
+                    components.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => components.push(other),
+        }
+    }
+    components.iter().collect()
+}
+
+fn resolve_path(raw: &str, tool_name: &str, cwd: Option<&str>) -> String {
     if is_path_tool(tool_name) {
         if let Some(cwd) = cwd {
             let path = std::path::Path::new(raw);
             if path.is_relative() {
-                return Some(
-                    std::path::Path::new(cwd)
-                        .join(path)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                let joined = std::path::Path::new(cwd).join(path);
+                return normalize_path(&joined).to_string_lossy().into_owned();
             }
         }
+        return normalize_path(std::path::Path::new(raw))
+            .to_string_lossy()
+            .into_owned();
     }
+    raw.to_string()
+}
 
-    Some(raw.to_string())
+/// Extract the arguments to match against from tool_input, based on tool type.
+/// For path-based tools, relative paths are resolved against cwd.
+/// Returns multiple values for tools like SemanticSearch that accept an array of paths.
+fn get_matchable_args(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    cwd: Option<&str>,
+) -> Vec<String> {
+    let def = match find_tool_def(tool_name) {
+        Some(d) => d,
+        None => return vec![],
+    };
+
+    if let Some(array_field) = def.array_field {
+        tool_input
+            .get(array_field)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| resolve_path(s, tool_name, cwd))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        let raw = def
+            .fields
+            .iter()
+            .find_map(|field| tool_input.get(*field).and_then(|v| v.as_str()));
+        match raw {
+            Some(s) => vec![resolve_path(s, tool_name, cwd)],
+            None => vec![],
+        }
+    }
+}
+
+fn is_in_workspace(path: &str, workspace_roots: &[String]) -> bool {
+    workspace_roots.iter().any(|root| {
+        let root = root.trim_end_matches('/');
+        path == root || path.starts_with(&format!("{root}/"))
+    })
 }
 
 fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
@@ -320,8 +468,9 @@ fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
                 raw_rule.tools
             ));
         }
-        let matchers = raw_rule
-            .tools
+        let source_json = serde_json::to_string(&raw_rule).unwrap_or_default();
+        let expanded = expand_tools(&raw_rule.tools, raw_rule.pattern.as_deref())?;
+        let matchers = expanded
             .iter()
             .map(|t| parse_tool_entry(t))
             .collect::<Result<Vec<_>, _>>()?;
@@ -330,6 +479,8 @@ fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
             action: raw_rule.action,
             command: raw_rule.command,
             message: raw_rule.message,
+            in_workspace: raw_rule.in_workspace,
+            source_json,
         });
     }
 
@@ -344,26 +495,53 @@ fn resolve_action(
     tool_name: &str,
     tool_input: Option<&serde_json::Value>,
     cwd: Option<&str>,
+    workspace_roots: Option<&[String]>,
 ) -> ResolvedAction {
-    // For path-based tools, deny if the resolved path is not absolute
-    if is_path_tool(tool_name) {
-        if let Some(input) = tool_input {
-            if let Some(ref resolved) = get_matchable_arg(tool_name, input, cwd) {
-                if !resolved.starts_with('/') {
-                    return ResolvedAction::Deny(Some(
-                        "path-based tool arguments must be absolute paths".to_string(),
-                    ));
-                }
-            }
-        }
+    // For path-based tools, resolve paths and deny if any is not absolute
+    let resolved_paths: Vec<String> = if is_path_tool(tool_name) {
+        tool_input
+            .map(|input| get_matchable_args(tool_name, input, cwd))
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    if resolved_paths.iter().any(|p| !p.starts_with('/')) {
+        return ResolvedAction::Deny(Some(
+            "path-based tool arguments must be absolute paths".to_string(),
+        ));
     }
 
-    for rule in &config.rules {
+    // Pre-compute workspace membership (None if no paths or no workspace_roots)
+    let path_in_workspace: Option<bool> = if resolved_paths.is_empty() {
+        None
+    } else {
+        workspace_roots
+            .map(|roots| resolved_paths.iter().all(|p| is_in_workspace(p, roots)))
+    };
+
+    eprintln!(
+        "claude-approve: [debug] tool={tool_name} workspace_roots={workspace_roots:?} path_in_workspace={path_in_workspace:?}"
+    );
+
+    for (i, rule) in config.rules.iter().enumerate() {
+        if let Some(required) = rule.in_workspace {
+            match path_in_workspace {
+                Some(actual) if actual != required => continue,
+                None => continue,
+                _ => {}
+            }
+        }
+
         if rule
             .matchers
             .iter()
             .any(|m| m.matches(tool_name, tool_input, cwd))
         {
+            eprintln!(
+                "claude-approve: [debug] matched rule[{i}]: {}",
+                rule.source_json
+            );
             return match &rule.action {
                 RuleAction::Allow => ResolvedAction::Allow,
                 RuleAction::Deny => ResolvedAction::Deny(rule.message.clone()),
@@ -372,6 +550,7 @@ fn resolve_action(
             };
         }
     }
+    eprintln!("claude-approve: [debug] no rule matched, using default");
     default_to_resolved(&config.default)
 }
 
@@ -482,6 +661,7 @@ async fn run_delegate(args: &DelegateArgs) -> Result<(), String> {
         tool_name,
         payload.tool_input.as_ref(),
         payload.cwd.as_deref(),
+        payload.workspace_roots.as_deref(),
     );
 
     match action {
@@ -928,68 +1108,103 @@ mod tests {
         assert!(!m.matches("WebFetch", Some(&no), None));
     }
 
-    // --- get_matchable_arg ---
+    // --- get_matchable_args ---
 
     #[test]
     fn matchable_arg_file_tools() {
         let input = serde_json::json!({"path": "/foo/bar"});
+        assert_eq!(get_matchable_args("Read", &input, None), vec!["/foo/bar"]);
+        assert_eq!(get_matchable_args("Write", &input, None), vec!["/foo/bar"]);
         assert_eq!(
-            get_matchable_arg("Read", &input, None),
-            Some("/foo/bar".into())
+            get_matchable_args("StrReplace", &input, None),
+            vec!["/foo/bar"]
         );
         assert_eq!(
-            get_matchable_arg("Write", &input, None),
-            Some("/foo/bar".into())
-        );
-        assert_eq!(
-            get_matchable_arg("StrReplace", &input, None),
-            Some("/foo/bar".into())
-        );
-        assert_eq!(
-            get_matchable_arg("Delete", &input, None),
-            Some("/foo/bar".into())
+            get_matchable_args("Delete", &input, None),
+            vec!["/foo/bar"]
         );
     }
 
     #[test]
     fn matchable_arg_file_path_fallback() {
         let input = serde_json::json!({"file_path": "/foo/bar"});
-        assert_eq!(
-            get_matchable_arg("Edit", &input, None),
-            Some("/foo/bar".into())
-        );
-        assert_eq!(
-            get_matchable_arg("Read", &input, None),
-            Some("/foo/bar".into())
-        );
+        assert_eq!(get_matchable_args("Edit", &input, None), vec!["/foo/bar"]);
+        assert_eq!(get_matchable_args("Read", &input, None), vec!["/foo/bar"]);
     }
 
     #[test]
     fn matchable_arg_shell() {
         let input = serde_json::json!({"command": "ls -la"});
-        assert_eq!(
-            get_matchable_arg("Bash", &input, None),
-            Some("ls -la".into())
-        );
-        assert_eq!(
-            get_matchable_arg("Shell", &input, None),
-            Some("ls -la".into())
-        );
+        assert_eq!(get_matchable_args("Bash", &input, None), vec!["ls -la"]);
+        assert_eq!(get_matchable_args("Shell", &input, None), vec!["ls -la"]);
     }
 
     #[test]
     fn matchable_arg_notebook() {
         let input = serde_json::json!({"target_notebook": "analysis.ipynb"});
         assert_eq!(
-            get_matchable_arg("EditNotebook", &input, None),
-            Some("analysis.ipynb".into())
+            get_matchable_args("EditNotebook", &input, None),
+            vec!["analysis.ipynb"]
         );
     }
 
     #[test]
     fn matchable_arg_unknown_tool() {
         let input = serde_json::json!({"whatever": "value"});
-        assert_eq!(get_matchable_arg("UnknownTool", &input, None), None);
+        assert!(get_matchable_args("UnknownTool", &input, None).is_empty());
+    }
+
+    #[test]
+    fn matchable_arg_grep() {
+        let input = serde_json::json!({"pattern": "TODO", "path": "/home/user/project"});
+        assert_eq!(
+            get_matchable_args("Grep", &input, None),
+            vec!["/home/user/project"]
+        );
+    }
+
+    #[test]
+    fn matchable_arg_grep_no_path() {
+        let input = serde_json::json!({"pattern": "TODO"});
+        assert!(get_matchable_args("Grep", &input, None).is_empty());
+    }
+
+    #[test]
+    fn matchable_arg_glob() {
+        let input =
+            serde_json::json!({"glob_pattern": "*.rs", "target_directory": "/home/user/project"});
+        assert_eq!(
+            get_matchable_args("Glob", &input, None),
+            vec!["/home/user/project"]
+        );
+    }
+
+    #[test]
+    fn matchable_arg_semantic_search() {
+        let input = serde_json::json!({
+            "query": "auth flow",
+            "target_directories": ["/home/user/project", "/home/user/lib"]
+        });
+        assert_eq!(
+            get_matchable_args("SemanticSearch", &input, None),
+            vec!["/home/user/project", "/home/user/lib"]
+        );
+    }
+
+    #[test]
+    fn matchable_arg_semantic_search_empty_array() {
+        let input = serde_json::json!({"query": "auth flow", "target_directories": []});
+        assert!(get_matchable_args("SemanticSearch", &input, None).is_empty());
+    }
+
+    #[test]
+    fn matchable_arg_semantic_search_filters_empty_strings() {
+        let input =
+            serde_json::json!({"query": "auth", "target_directories": ["", "/home/user/project"]});
+        assert_eq!(
+            get_matchable_args("SemanticSearch", &input, None),
+            vec!["/home/user/project"]
+        );
     }
 
     // --- cwd resolution ---
@@ -998,8 +1213,8 @@ mod tests {
     fn cwd_resolves_relative_path() {
         let input = serde_json::json!({"path": "id_rsa"});
         assert_eq!(
-            get_matchable_arg("Read", &input, Some("/home/user/.ssh")),
-            Some("/home/user/.ssh/id_rsa".into())
+            get_matchable_args("Read", &input, Some("/home/user/.ssh")),
+            vec!["/home/user/.ssh/id_rsa"]
         );
     }
 
@@ -1007,8 +1222,8 @@ mod tests {
     fn cwd_leaves_absolute_path_unchanged() {
         let input = serde_json::json!({"path": "/etc/passwd"});
         assert_eq!(
-            get_matchable_arg("Read", &input, Some("/home/user")),
-            Some("/etc/passwd".into())
+            get_matchable_args("Read", &input, Some("/home/user")),
+            vec!["/etc/passwd"]
         );
     }
 
@@ -1016,8 +1231,8 @@ mod tests {
     fn cwd_not_applied_to_shell_commands() {
         let input = serde_json::json!({"command": "cat id_rsa"});
         assert_eq!(
-            get_matchable_arg("Bash", &input, Some("/home/user/.ssh")),
-            Some("cat id_rsa".into())
+            get_matchable_args("Bash", &input, Some("/home/user/.ssh")),
+            vec!["cat id_rsa"]
         );
     }
 
@@ -1025,18 +1240,79 @@ mod tests {
     fn cwd_not_applied_to_urls() {
         let input = serde_json::json!({"url": "https://example.com"});
         assert_eq!(
-            get_matchable_arg("WebFetch", &input, Some("/home/user")),
-            Some("https://example.com".into())
+            get_matchable_args("WebFetch", &input, Some("/home/user")),
+            vec!["https://example.com"]
         );
     }
 
     #[test]
     fn cwd_resolves_dotdot_in_relative_path() {
         let input = serde_json::json!({"path": "../.ssh/id_rsa"});
-        let resolved = get_matchable_arg("Read", &input, Some("/home/user/project")).unwrap();
-        // Path::join preserves .. segments (no canonicalization), but the string
-        // still contains .ssh so regex/glob patterns match
-        assert!(resolved.contains(".ssh"));
+        let resolved = get_matchable_args("Read", &input, Some("/home/user/project"));
+        assert_eq!(resolved, vec!["/home/user/.ssh/id_rsa"]);
+    }
+
+    #[test]
+    fn normalize_removes_dot_segments() {
+        let input = serde_json::json!({"path": "/home/user/./project/./main.rs"});
+        assert_eq!(
+            get_matchable_args("Read", &input, None),
+            vec!["/home/user/project/main.rs"]
+        );
+    }
+
+    #[test]
+    fn normalize_absolute_path_with_dotdot() {
+        let input = serde_json::json!({"path": "/home/user/project/../.ssh/id_rsa"});
+        assert_eq!(
+            get_matchable_args("Read", &input, None),
+            vec!["/home/user/.ssh/id_rsa"]
+        );
+    }
+
+    #[test]
+    fn dotdot_traversal_not_in_workspace() {
+        // Verify that ../ traversal out of workspace is correctly detected
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["Read"], RuleAction::Allow, Some(true)),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+        let input = serde_json::json!({"path": "../.ssh/id_rsa"});
+
+        // With cwd inside workspace, ../. resolves outside => not in workspace => denied
+        assert!(matches!(
+            resolve_action(
+                &config,
+                "Read",
+                Some(&input),
+                Some("/home/user/project"),
+                Some(&roots)
+            ),
+            ResolvedAction::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn cwd_resolves_relative_grep_path() {
+        let input = serde_json::json!({"pattern": "secret", "path": "subdir"});
+        assert_eq!(
+            get_matchable_args("Grep", &input, Some("/home/user/project")),
+            vec!["/home/user/project/subdir"]
+        );
+    }
+
+    #[test]
+    fn cwd_resolves_semantic_search_relative_dirs() {
+        let input = serde_json::json!({
+            "query": "auth",
+            "target_directories": ["src/", "/absolute/path"]
+        });
+        let resolved =
+            get_matchable_args("SemanticSearch", &input, Some("/home/user/project"));
+        assert_eq!(resolved, vec!["/home/user/project/src", "/absolute/path"]);
     }
 
     // --- resolve_action (end-to-end) ---
@@ -1051,6 +1327,8 @@ mod tests {
             action,
             command: None,
             message: None,
+            in_workspace: None,
+            source_json: String::new(),
         }
     }
 
@@ -1060,6 +1338,8 @@ mod tests {
             action: RuleAction::Deny,
             command: None,
             message: Some(message.to_string()),
+            in_workspace: None,
+            source_json: String::new(),
         }
     }
 
@@ -1077,11 +1357,11 @@ mod tests {
         let normal = serde_json::json!({"path": "/src/main.rs"});
 
         assert!(matches!(
-            resolve_action(&config, "Write", Some(&env), None),
+            resolve_action(&config, "Write", Some(&env), None, None),
             ResolvedAction::Deny(_)
         ));
         assert!(matches!(
-            resolve_action(&config, "Write", Some(&normal), None),
+            resolve_action(&config, "Write", Some(&normal), None, None),
             ResolvedAction::Allow
         ));
     }
@@ -1093,7 +1373,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(&config, "Read", None, None),
+            resolve_action(&config, "Read", None, None, None),
             ResolvedAction::Ask
         ));
     }
@@ -1105,15 +1385,15 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(&config, "Read", None, None),
+            resolve_action(&config, "Read", None, None, None),
             ResolvedAction::Allow
         ));
         assert!(matches!(
-            resolve_action(&config, "Grep", None, None),
+            resolve_action(&config, "Grep", None, None, None),
             ResolvedAction::Allow
         ));
         assert!(matches!(
-            resolve_action(&config, "Write", None, None),
+            resolve_action(&config, "Write", None, None, None),
             ResolvedAction::Ask
         ));
     }
@@ -1129,7 +1409,7 @@ mod tests {
         );
         // No tool_input: pattern rule can't match, falls through to bare "Write" -> Deny
         assert!(matches!(
-            resolve_action(&config, "Write", None, None),
+            resolve_action(&config, "Write", None, None, None),
             ResolvedAction::Deny(_)
         ));
     }
@@ -1143,7 +1423,7 @@ mod tests {
             DefaultAction::Ask,
         );
         let input = serde_json::json!({"path": "relative/path.txt"});
-        match resolve_action(&config, "Read", Some(&input), None) {
+        match resolve_action(&config, "Read", Some(&input), None, None) {
             ResolvedAction::Deny(Some(msg)) => {
                 assert!(msg.contains("absolute"), "expected absolute path error: {msg}");
             }
@@ -1159,7 +1439,7 @@ mod tests {
         );
         let input = serde_json::json!({"path": "src/main.rs"});
         assert!(matches!(
-            resolve_action(&config, "Read", Some(&input), Some("/home/user/project")),
+            resolve_action(&config, "Read", Some(&input), Some("/home/user/project"), None),
             ResolvedAction::Allow
         ));
     }
@@ -1172,7 +1452,7 @@ mod tests {
         );
         let input = serde_json::json!({"command": "ls relative/path"});
         assert!(matches!(
-            resolve_action(&config, "Bash", Some(&input), None),
+            resolve_action(&config, "Bash", Some(&input), None, None),
             ResolvedAction::Allow
         ));
     }
@@ -1182,7 +1462,7 @@ mod tests {
         let config = make_config(vec![], DefaultAction::Allow);
         let input = serde_json::json!({"whatever": "relative/path"});
         assert!(matches!(
-            resolve_action(&config, "UnknownTool", Some(&input), None),
+            resolve_action(&config, "UnknownTool", Some(&input), None, None),
             ResolvedAction::Allow
         ));
     }
@@ -1198,7 +1478,7 @@ mod tests {
             )],
             DefaultAction::Ask,
         );
-        match resolve_action(&config, "Delete", None, None) {
+        match resolve_action(&config, "Delete", None, None, None) {
             ResolvedAction::Deny(Some(msg)) => {
                 assert_eq!(msg, "Use trash instead of delete");
             }
@@ -1213,7 +1493,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(&config, "Delete", None, None),
+            resolve_action(&config, "Delete", None, None, None),
             ResolvedAction::Deny(None)
         ));
     }
@@ -1222,7 +1502,7 @@ mod tests {
     fn deny_default_has_no_message() {
         let config = make_config(vec![], DefaultAction::Deny);
         assert!(matches!(
-            resolve_action(&config, "Write", None, None),
+            resolve_action(&config, "Write", None, None, None),
             ResolvedAction::Deny(None)
         ));
     }
@@ -1241,8 +1521,459 @@ mod tests {
         // Relative path "id_rsa" with cwd ~/.ssh -> resolved to /home/user/.ssh/id_rsa
         let input = serde_json::json!({"path": "id_rsa"});
         assert!(matches!(
-            resolve_action(&config, "Read", Some(&input), Some("/home/user/.ssh")),
+            resolve_action(&config, "Read", Some(&input), Some("/home/user/.ssh"), None),
             ResolvedAction::Deny(_)
+        ));
+    }
+
+    // --- expand_tools / group aliases ---
+
+    #[test]
+    fn expand_file_group_bare() {
+        let file_read = tools_in_category(ToolCategory::FileRead);
+        let file_write = tools_in_category(ToolCategory::FileWrite);
+        let tools = vec!["@file".to_string()];
+        let expanded = expand_tools(&tools, None).unwrap();
+        assert_eq!(expanded.len(), file_read.len() + file_write.len());
+        assert!(expanded.contains(&"Read".to_string()));
+        assert!(expanded.contains(&"Write".to_string()));
+        assert!(expanded.contains(&"Delete".to_string()));
+    }
+
+    #[test]
+    fn expand_file_read_group() {
+        let tools = vec!["@file_read".to_string()];
+        let expanded = expand_tools(&tools, None).unwrap();
+        assert_eq!(
+            expanded.len(),
+            tools_in_category(ToolCategory::FileRead).len()
+        );
+        assert!(expanded.contains(&"Read".to_string()));
+        assert!(!expanded.contains(&"Write".to_string()));
+    }
+
+    #[test]
+    fn expand_file_write_group() {
+        let tools = vec!["@file_write".to_string()];
+        let expanded = expand_tools(&tools, None).unwrap();
+        assert_eq!(
+            expanded.len(),
+            tools_in_category(ToolCategory::FileWrite).len()
+        );
+        assert!(expanded.contains(&"Write".to_string()));
+        assert!(expanded.contains(&"StrReplace".to_string()));
+        assert!(!expanded.contains(&"Read".to_string()));
+    }
+
+    #[test]
+    fn expand_file_group_with_inline_pattern() {
+        let file_read = tools_in_category(ToolCategory::FileRead);
+        let file_write = tools_in_category(ToolCategory::FileWrite);
+        let tools = vec!["@file(**/.ssh/**)".to_string()];
+        let expanded = expand_tools(&tools, None).unwrap();
+        assert_eq!(expanded.len(), file_read.len() + file_write.len());
+        assert!(expanded.contains(&"Read(**/.ssh/**)".to_string()));
+        assert!(expanded.contains(&"Write(**/.ssh/**)".to_string()));
+    }
+
+    #[test]
+    fn expand_file_group_with_rule_pattern() {
+        let tools = vec!["@file".to_string()];
+        let expanded = expand_tools(&tools, Some("**/.env*")).unwrap();
+        assert!(expanded.contains(&"Read(**/.env*)".to_string()));
+        assert!(expanded.contains(&"Write(**/.env*)".to_string()));
+    }
+
+    #[test]
+    fn expand_shell_group() {
+        let tools = vec!["@shell".to_string()];
+        let expanded = expand_tools(&tools, None).unwrap();
+        assert_eq!(expanded, vec!["Bash", "Shell"]);
+    }
+
+    #[test]
+    fn expand_mixed_groups_and_names() {
+        let file_read = tools_in_category(ToolCategory::FileRead);
+        let file_write = tools_in_category(ToolCategory::FileWrite);
+        let tools = vec!["@file".to_string(), "WebFetch".to_string()];
+        let expanded = expand_tools(&tools, None).unwrap();
+        assert_eq!(expanded.len(), file_read.len() + file_write.len() + 1);
+        assert!(expanded.contains(&"WebFetch".to_string()));
+    }
+
+    #[test]
+    fn rule_pattern_applied_to_bare_names() {
+        let tools = vec!["Read".to_string(), "Write".to_string()];
+        let expanded = expand_tools(&tools, Some("**/.ssh/**")).unwrap();
+        assert_eq!(
+            expanded,
+            vec!["Read(**/.ssh/**)", "Write(**/.ssh/**)"]
+        );
+    }
+
+    #[test]
+    fn inline_pattern_overrides_rule_pattern() {
+        let tools = vec!["Read(/src/**)".to_string(), "Write".to_string()];
+        let expanded = expand_tools(&tools, Some("**/.ssh/**")).unwrap();
+        assert_eq!(
+            expanded,
+            vec!["Read(/src/**)", "Write(**/.ssh/**)"]
+        );
+    }
+
+    #[test]
+    fn expand_unknown_group_is_error() {
+        let tools = vec!["@Shell".to_string()];
+        assert!(expand_tools(&tools, None).is_err());
+
+        let tools = vec!["@files_write".to_string()];
+        assert!(expand_tools(&tools, None).is_err());
+    }
+
+    // --- end-to-end with groups ---
+
+    #[test]
+    fn file_group_deny_ssh() {
+        let config = make_config(
+            vec![
+                Rule {
+                    matchers: expand_tools(
+                        &["@file".to_string()],
+                        Some(r"regex:\.ssh"),
+                    )
+                    .expect("valid group")
+                    .iter()
+                    .map(|t| parse_tool_entry(t).expect("valid entry"))
+                    .collect(),
+                    action: RuleAction::Deny,
+                    command: None,
+                    message: Some("Access to .ssh is not allowed".into()),
+                    in_workspace: None,
+                    source_json: String::new(),
+                },
+                make_rule(&["Read", "Write"], RuleAction::Allow),
+            ],
+            DefaultAction::Ask,
+        );
+
+        let ssh_input = serde_json::json!({"path": "/home/user/.ssh/id_rsa"});
+        let normal_input = serde_json::json!({"path": "/home/user/project/main.rs"});
+
+        match resolve_action(&config, "Read", Some(&ssh_input), None, None) {
+            ResolvedAction::Deny(Some(msg)) => assert!(msg.contains(".ssh")),
+            other => panic!("expected Deny for .ssh read, got {other:?}"),
+        }
+        assert!(matches!(
+            resolve_action(&config, "Write", Some(&ssh_input), None, None),
+            ResolvedAction::Deny(_)
+        ));
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&normal_input), None, None),
+            ResolvedAction::Allow
+        ));
+    }
+
+    // --- is_in_workspace ---
+
+    #[test]
+    fn path_inside_workspace() {
+        let roots = vec!["/home/user/project".to_string()];
+        assert!(is_in_workspace("/home/user/project/src/main.rs", &roots));
+        assert!(is_in_workspace("/home/user/project", &roots));
+    }
+
+    #[test]
+    fn path_outside_workspace() {
+        let roots = vec!["/home/user/project".to_string()];
+        assert!(!is_in_workspace("/home/user/.ssh/id_rsa", &roots));
+        assert!(!is_in_workspace("/etc/passwd", &roots));
+    }
+
+    #[test]
+    fn path_prefix_not_confused_with_workspace() {
+        let roots = vec!["/home/user/project".to_string()];
+        // "/home/user/project-other/foo" starts with "/home/user/project"
+        // but is NOT inside the workspace
+        assert!(!is_in_workspace("/home/user/project-other/foo", &roots));
+    }
+
+    #[test]
+    fn multiple_workspace_roots() {
+        let roots = vec![
+            "/home/user/project-a".to_string(),
+            "/home/user/project-b".to_string(),
+        ];
+        assert!(is_in_workspace("/home/user/project-a/src/main.rs", &roots));
+        assert!(is_in_workspace("/home/user/project-b/lib.rs", &roots));
+        assert!(!is_in_workspace("/home/user/other/file.rs", &roots));
+    }
+
+    #[test]
+    fn workspace_root_with_trailing_slash() {
+        let roots = vec!["/home/user/project/".to_string()];
+        assert!(is_in_workspace("/home/user/project/src/main.rs", &roots));
+    }
+
+    // --- in_workspace rule filter ---
+
+    fn make_workspace_rule(
+        entries: &[&str],
+        action: RuleAction,
+        in_workspace: Option<bool>,
+    ) -> Rule {
+        Rule {
+            matchers: entries.iter().map(|e| parse_tool_entry(e).unwrap()).collect(),
+            action,
+            command: None,
+            message: None,
+            in_workspace,
+            source_json: String::new(),
+        }
+    }
+
+    #[test]
+    fn in_workspace_true_allows_workspace_paths() {
+        let config = make_config(
+            vec![make_workspace_rule(&["Read"], RuleAction::Allow, Some(true))],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+        let input = serde_json::json!({"path": "/home/user/project/src/main.rs"});
+
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, Some(&roots)),
+            ResolvedAction::Allow
+        ));
+    }
+
+    #[test]
+    fn in_workspace_true_skips_outside_paths() {
+        let config = make_config(
+            vec![make_workspace_rule(&["Read"], RuleAction::Allow, Some(true))],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+        let input = serde_json::json!({"path": "/etc/passwd"});
+
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, Some(&roots)),
+            ResolvedAction::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn in_workspace_false_matches_outside_paths() {
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["Write"], RuleAction::Ask, Some(false)),
+                make_workspace_rule(&["Write"], RuleAction::Allow, None),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+
+        let outside = serde_json::json!({"path": "/tmp/scratch.txt"});
+        let inside = serde_json::json!({"path": "/home/user/project/src/main.rs"});
+
+        assert!(matches!(
+            resolve_action(&config, "Write", Some(&outside), None, Some(&roots)),
+            ResolvedAction::Ask
+        ));
+        assert!(matches!(
+            resolve_action(&config, "Write", Some(&inside), None, Some(&roots)),
+            ResolvedAction::Allow
+        ));
+    }
+
+    #[test]
+    fn in_workspace_skipped_for_non_path_tools() {
+        let config = make_config(
+            vec![make_workspace_rule(&["Bash"], RuleAction::Allow, Some(true))],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+        let input = serde_json::json!({"command": "ls"});
+
+        // Can't determine workspace membership for Bash, workspace rule skipped, falls to default
+        assert!(matches!(
+            resolve_action(&config, "Bash", Some(&input), None, Some(&roots)),
+            ResolvedAction::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn in_workspace_skipped_without_roots() {
+        let config = make_config(
+            vec![make_workspace_rule(&["Read"], RuleAction::Allow, Some(true))],
+            DefaultAction::Deny,
+        );
+        let input = serde_json::json!({"path": "/home/user/project/src/main.rs"});
+
+        // No workspace_roots provided, workspace rule skipped, falls to default
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, None),
+            ResolvedAction::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn in_workspace_combined_with_deny_pattern() {
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["Write(**/.git/**)"], RuleAction::Deny, Some(true)),
+                make_workspace_rule(&["Write"], RuleAction::Allow, Some(true)),
+                make_workspace_rule(&["Write"], RuleAction::Ask, Some(false)),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+
+        let git_file = serde_json::json!({"path": "/home/user/project/.git/config"});
+        let src_file = serde_json::json!({"path": "/home/user/project/src/main.rs"});
+        let outside = serde_json::json!({"path": "/tmp/scratch.txt"});
+
+        assert!(matches!(
+            resolve_action(&config, "Write", Some(&git_file), None, Some(&roots)),
+            ResolvedAction::Deny(_)
+        ));
+        assert!(matches!(
+            resolve_action(&config, "Write", Some(&src_file), None, Some(&roots)),
+            ResolvedAction::Allow
+        ));
+        assert!(matches!(
+            resolve_action(&config, "Write", Some(&outside), None, Some(&roots)),
+            ResolvedAction::Ask
+        ));
+    }
+
+    // --- search tools end-to-end ---
+
+    #[test]
+    fn grep_outside_workspace_triggers_in_workspace_rule() {
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["Grep"], RuleAction::Allow, Some(true)),
+                make_workspace_rule(&["Grep"], RuleAction::Ask, Some(false)),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+
+        let inside = serde_json::json!({"pattern": "TODO", "path": "/home/user/project/src"});
+        let outside = serde_json::json!({"pattern": "secret", "path": "/home/user/.ssh"});
+
+        assert!(matches!(
+            resolve_action(&config, "Grep", Some(&inside), None, Some(&roots)),
+            ResolvedAction::Allow
+        ));
+        assert!(matches!(
+            resolve_action(&config, "Grep", Some(&outside), None, Some(&roots)),
+            ResolvedAction::Ask
+        ));
+    }
+
+    #[test]
+    fn grep_without_path_skips_workspace_rules() {
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["Grep"], RuleAction::Allow, Some(true)),
+                make_workspace_rule(&["Grep"], RuleAction::Ask, Some(false)),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+        let input = serde_json::json!({"pattern": "TODO"});
+
+        // No path arg means no workspace determination, both rules skipped
+        assert!(matches!(
+            resolve_action(&config, "Grep", Some(&input), None, Some(&roots)),
+            ResolvedAction::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn semantic_search_all_dirs_in_workspace() {
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["SemanticSearch"], RuleAction::Allow, Some(true)),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+        let input = serde_json::json!({
+            "query": "auth",
+            "target_directories": ["/home/user/project/src", "/home/user/project/lib"]
+        });
+
+        assert!(matches!(
+            resolve_action(&config, "SemanticSearch", Some(&input), None, Some(&roots)),
+            ResolvedAction::Allow
+        ));
+    }
+
+    #[test]
+    fn semantic_search_one_dir_outside_workspace_taints() {
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["SemanticSearch"], RuleAction::Allow, Some(true)),
+                make_workspace_rule(&["SemanticSearch"], RuleAction::Ask, Some(false)),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+        let input = serde_json::json!({
+            "query": "secrets",
+            "target_directories": ["/home/user/project/src", "/home/user/.ssh"]
+        });
+
+        // One dir outside workspace => not in_workspace => Ask
+        assert!(matches!(
+            resolve_action(&config, "SemanticSearch", Some(&input), None, Some(&roots)),
+            ResolvedAction::Ask
+        ));
+    }
+
+    #[test]
+    fn semantic_search_empty_dirs_skips_workspace_rules() {
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["SemanticSearch"], RuleAction::Allow, Some(true)),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+        let input = serde_json::json!({"query": "auth", "target_directories": []});
+
+        // Empty dirs = can't determine workspace, rule skipped
+        assert!(matches!(
+            resolve_action(&config, "SemanticSearch", Some(&input), None, Some(&roots)),
+            ResolvedAction::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn glob_in_workspace_check() {
+        let config = make_config(
+            vec![
+                make_workspace_rule(&["Glob"], RuleAction::Allow, Some(true)),
+                make_workspace_rule(&["Glob"], RuleAction::Ask, Some(false)),
+            ],
+            DefaultAction::Deny,
+        );
+        let roots = vec!["/home/user/project".to_string()];
+
+        let inside =
+            serde_json::json!({"glob_pattern": "*.rs", "target_directory": "/home/user/project/src"});
+        let outside =
+            serde_json::json!({"glob_pattern": "id_*", "target_directory": "/home/user/.ssh"});
+
+        assert!(matches!(
+            resolve_action(&config, "Glob", Some(&inside), None, Some(&roots)),
+            ResolvedAction::Allow
+        ));
+        assert!(matches!(
+            resolve_action(&config, "Glob", Some(&outside), None, Some(&roots)),
+            ResolvedAction::Ask
         ));
     }
 }
