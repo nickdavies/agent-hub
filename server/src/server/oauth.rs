@@ -3,10 +3,10 @@ use std::env;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
-use openidconnect::core::{CoreClient, CoreProviderMetadata};
+use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreUserInfoClaims};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
-    EndpointSet, IssuerUrl, Nonce, RedirectUrl, Scope, TokenResponse,
+    EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, RedirectUrl, Scope, TokenResponse,
 };
 use serde::Deserialize;
 use tower_sessions::Session;
@@ -323,10 +323,32 @@ pub async fn callback<N: Notifier>(
         }
     };
 
-    let email = claims.email().map(|e| e.to_string()).unwrap_or_default();
+    // Try email from ID token first, fall back to userinfo endpoint
+    let mut email = claims.email().map(|e| e.to_string()).unwrap_or_default();
 
     if email.is_empty() {
-        return (StatusCode::UNAUTHORIZED, "No email in token").into_response();
+        let access_token = token_response.access_token().clone();
+        let subject = Some(claims.subject().clone());
+        match provider.client.user_info(access_token, subject) {
+            Ok(req) => {
+                let result: Result<CoreUserInfoClaims, _> = req.request_async(&http_client).await;
+                match result {
+                    Ok(userinfo) => {
+                        email = userinfo.email().map(|e| e.to_string()).unwrap_or_default();
+                    }
+                    Err(e) => {
+                        error!("Userinfo request failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Userinfo endpoint not configured: {e}");
+            }
+        }
+    }
+
+    if email.is_empty() {
+        return (StatusCode::UNAUTHORIZED, "No email in token or userinfo").into_response();
     }
 
     if !oauth.is_email_allowed(&email) {
