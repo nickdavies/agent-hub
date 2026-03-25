@@ -2168,7 +2168,10 @@ mod tests {
     fn claude_output_permissionrequest_pascal_case() {
         let out = format_claude_output("PermissionRequest", "denied", None, None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(
+            v["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
         assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "deny");
     }
 
@@ -2176,7 +2179,10 @@ mod tests {
     fn claude_output_permissionrequest_camel_case() {
         let out = format_claude_output("permissionRequest", "approved", None, None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(
+            v["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
         assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "allow");
     }
 
