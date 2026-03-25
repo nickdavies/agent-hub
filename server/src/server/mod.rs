@@ -84,6 +84,7 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
     if state.config.approval_mode != ApprovalFeatureMode::Disabled {
         api_v1 = api_v1
             .route("/hooks/approval", post(hooks::approval::<N>))
+            .route("/approvals/pending", get(handle_list_pending::<N>))
             .route("/approvals/{id}/wait", get(handle_approval_wait::<N>))
             .route(
                 "/approvals/{id}/resolve",
@@ -194,6 +195,13 @@ async fn handle_put_config<N: Notifier>(
 }
 
 // --- Approval API handlers ---
+
+/// GET /api/v1/approvals/pending — list all pending approvals.
+async fn handle_list_pending<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
+) -> Json<Vec<approvals::Approval>> {
+    Json(state.approvals.list_pending().await)
+}
 
 #[derive(Serialize)]
 struct ApprovalWaitResponse {
