@@ -24,6 +24,7 @@
         <thead>
             <tr>
                 <th>Project</th>
+                <th>Session</th>
                 <th>Tool</th>
                 <th>Time</th>
                 <th>Action</th>
@@ -33,6 +34,7 @@
             {% for a in pending_approvals %}
             <tr>
                 <td>{{ a.project }}</td>
+                <td>{{ a.session_display_name }}</td>
                 <td>{{ a.tool_name }}</td>
                 <td>{{ a.created_at.format("%H:%M:%S") }}</td>
                 <td><a href="/approvals/{{ a.id }}">Review</a></td>

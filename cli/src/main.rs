@@ -181,8 +181,7 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                             if offset > 0 {
                                 scroll_offsets.insert(a.id, offset - 1);
                             } else if approvals.len() > 1 {
-                                ui.selected =
-                                    (ui.selected + approvals.len() - 1) % approvals.len();
+                                ui.selected = (ui.selected + approvals.len() - 1) % approvals.len();
                                 if let Some(prev) = approvals.get(ui.selected) {
                                     scroll_offsets.insert(prev.id, usize::MAX);
                                 }
@@ -196,8 +195,7 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                             let max_offset = ui
                                 .last_content_lines
                                 .saturating_sub(ui.last_visible_rows.max(1));
-                            scroll_offsets
-                                .insert(a.id, (offset + half_page).min(max_offset));
+                            scroll_offsets.insert(a.id, (offset + half_page).min(max_offset));
                         }
                     }
                     Action::ScrollUp => {
@@ -214,8 +212,7 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                     }
                     Action::Prev => {
                         if !approvals.is_empty() {
-                            ui.selected =
-                                (ui.selected + approvals.len() - 1) % approvals.len();
+                            ui.selected = (ui.selected + approvals.len() - 1) % approvals.len();
                             if let Some(prev) = approvals.get(ui.selected) {
                                 scroll_offsets.insert(prev.id, usize::MAX);
                             }

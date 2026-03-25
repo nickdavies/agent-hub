@@ -9,6 +9,7 @@ pub struct Approval {
     pub id: Uuid,
     #[allow(dead_code)]
     pub session_id: String,
+    pub session_display_name: String,
     pub project: String,
     pub tool_name: String,
     pub tool_input: serde_json::Value,

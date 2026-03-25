@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::AppState;
+use super::approvals;
 use super::approvals::ApprovalStatus;
 use super::notifier::Notifier;
 use crate::server::presence::PresenceState;
@@ -190,6 +191,7 @@ fn extract_session(payload: &HookPayload) -> Option<(String, String)> {
 pub struct ApprovalRequest {
     pub request_id: String,
     pub session_id: String,
+    pub session_display_name: String,
     pub cwd: String,
     pub tool_name: String,
     pub tool_input: serde_json::Value,
@@ -216,14 +218,15 @@ pub async fn approval<N: Notifier>(
 
     let approval = state
         .approvals
-        .register(
-            req.request_id,
-            req.session_id,
-            project.clone(),
-            req.tool_name.clone(),
-            req.tool_input.clone(),
-            req.context.clone(),
-        )
+        .register(approvals::RegisterApproval {
+            request_id: req.request_id,
+            session_id: req.session_id,
+            session_display_name: req.session_display_name,
+            project: project.clone(),
+            tool_name: req.tool_name.clone(),
+            tool_input: req.tool_input.clone(),
+            context: req.context.clone(),
+        })
         .await;
 
     // Send push notification with link if pending and base_url configured

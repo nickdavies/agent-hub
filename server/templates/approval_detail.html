@@ -21,7 +21,7 @@
     <article>
         <header>
             <h3>{{ approval.tool_name }}</h3>
-            <p>Project: <strong>{{ approval.project }}</strong> &middot; Session: <code>{{ approval.session_id }}</code></p>
+            <p>Project: <strong>{{ approval.project }}</strong> &middot; {{ approval.session_display_name }}</p>
         </header>
 
         {% if let Some(ctx) = approval.context.as_ref() %}

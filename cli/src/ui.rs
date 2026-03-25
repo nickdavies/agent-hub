@@ -148,9 +148,7 @@ impl Ui {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::ScrollDown
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                Action::ScrollUp
-            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::ScrollUp,
             KeyCode::Char('a') | KeyCode::Char('1') => Action::Approve(self.selected),
             KeyCode::Char('d') | KeyCode::Char('2') => Action::StartDeny(self.selected),
             KeyCode::Char('r') => Action::ToggleRaw,
@@ -484,6 +482,11 @@ fn build_expanded_lines(
 ) -> Vec<ExpandedLine> {
     let mut lines = Vec::new();
 
+    lines.push(ExpandedLine {
+        text: truncate_str(&approval.session_display_name, max_line_width),
+        kind: LineKind::Info,
+    });
+
     if show_raw {
         let json = serde_json::to_string_pretty(&approval.tool_input).unwrap_or_default();
         for line in json.lines() {
@@ -580,10 +583,7 @@ fn build_write_diff_lines(
                 ChangeTag::Insert => ("+", LineKind::DiffAdd),
                 ChangeTag::Equal => (" ", LineKind::DiffContext),
             };
-            let line_content = change
-                .value()
-                .trim_end_matches('\n')
-                .trim_end_matches('\r');
+            let line_content = change.value().trim_end_matches('\n').trim_end_matches('\r');
             lines.push(ExpandedLine {
                 text: truncate_str(&format!("{prefix}{line_content}"), max_line_width),
                 kind,
