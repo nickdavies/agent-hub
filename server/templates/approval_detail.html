@@ -39,8 +39,8 @@
                 <ins>Approved</ins>{% if let Some(m) = message.as_ref() %} — {{ m }}{% endif %}
             {% when crate::server::approvals::ApprovalStatus::Denied with { reason } %}
                 <del>Denied</del>{% if !reason.is_empty() %} — {{ reason }}{% endif %}
-            {% when crate::server::approvals::ApprovalStatus::Superseded %}
-                <s>Superseded</s>
+            {% when crate::server::approvals::ApprovalStatus::Cancelled %}
+                <s>Cancelled</s>
             {% endmatch %}
         </p>
 

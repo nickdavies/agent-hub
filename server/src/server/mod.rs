@@ -284,7 +284,7 @@ async fn handle_approval_resolve<N: Notifier>(
         ApprovalDecision::Deny => ApprovalStatus::Denied {
             reason: req.message.unwrap_or_default(),
         },
-        ApprovalDecision::Cancel => ApprovalStatus::Superseded,
+        ApprovalDecision::Cancel => ApprovalStatus::Cancelled,
     };
 
     state

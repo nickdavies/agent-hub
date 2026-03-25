@@ -1046,7 +1046,7 @@ fn format_cursor_output(
 ) -> Result<String, String> {
     let perm = match status_type {
         "approved" => "allow",
-        "denied" => "deny",
+        "denied" | "cancelled" => "deny",
         other => return Err(format!("unexpected approval status: {other}")),
     };
     let msg = reason.or(message).unwrap_or("resolved via remote approval");
@@ -1072,7 +1072,7 @@ fn format_claude_output(
                         "behavior": "allow"
                     })
                 }
-                "denied" => {
+                "denied" | "cancelled" => {
                     serde_json::json!({
                         "behavior": "deny",
                         "message": reason.or(message).unwrap_or("denied via remote approval")
@@ -1091,7 +1091,7 @@ fn format_claude_output(
         "PreToolUse" => {
             let (perm_decision, perm_reason) = match status_type {
                 "approved" => ("allow", message.unwrap_or("")),
-                "denied" => (
+                "denied" | "cancelled" => (
                     "deny",
                     reason.or(message).unwrap_or("denied via remote approval"),
                 ),
