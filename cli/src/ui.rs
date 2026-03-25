@@ -19,6 +19,16 @@ pub enum Action {
     Next,
     /// Navigate to the previous item.
     Prev,
+    /// Toggle raw view of tool input.
+    ToggleRaw,
+    /// Scroll content down by one line, falling through to Next at bottom.
+    LineDown,
+    /// Scroll content up by one line, falling through to Prev at top.
+    LineUp,
+    /// Scroll expanded detail down by half a page.
+    ScrollDown,
+    /// Scroll expanded detail up by half a page.
+    ScrollUp,
     /// Quit the application.
     Quit,
     /// No action (unrecognized key, etc).
@@ -43,10 +53,39 @@ pub enum DenyInputResult {
     Continue,
 }
 
+#[derive(Clone, Copy)]
+enum LineKind {
+    /// Default color for raw tool_input key-value pairs.
+    Normal,
+    /// Green for diff insertions and new-file content.
+    DiffAdd,
+    /// Red for diff deletions.
+    DiffRemove,
+    /// Dark grey for diff context lines and "(no changes)".
+    DiffContext,
+    /// Cyan for @@ ... @@ hunk headers.
+    DiffHunkHeader,
+    /// Blue for path headers and context labels.
+    Info,
+    /// Empty line with just the │ bar.
+    Separator,
+}
+
+struct ExpandedLine {
+    text: String,
+    kind: LineKind,
+}
+
 pub struct Ui {
     pub selected: usize,
     pub mode: Mode,
     pub status_message: Option<String>,
+    pub show_raw: bool,
+    pub scroll_offset: usize,
+    /// Total lines of expanded content for the currently rendered approval.
+    pub last_content_lines: usize,
+    /// Visible rows available for expanded content in the last render.
+    pub last_visible_rows: usize,
     server_url: String,
 }
 
@@ -56,6 +95,10 @@ impl Ui {
             selected: 0,
             mode: Mode::Normal,
             status_message: None,
+            show_raw: false,
+            scroll_offset: 0,
+            last_content_lines: 0,
+            last_visible_rows: 0,
             server_url: server_url.to_string(),
         }
     }
@@ -102,10 +145,21 @@ impl Ui {
         }
 
         match key.code {
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::ScrollDown
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::ScrollUp
+            }
             KeyCode::Char('a') | KeyCode::Char('1') => Action::Approve(self.selected),
             KeyCode::Char('d') | KeyCode::Char('2') => Action::StartDeny(self.selected),
-            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => Action::Next,
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => Action::Prev,
+            KeyCode::Char('r') => Action::ToggleRaw,
+            KeyCode::Down | KeyCode::Char('j') => Action::LineDown,
+            KeyCode::Up | KeyCode::Char('k') => Action::LineUp,
+            KeyCode::Tab => Action::Next,
+            KeyCode::BackTab => Action::Prev,
+            KeyCode::PageDown => Action::ScrollDown,
+            KeyCode::PageUp => Action::ScrollUp,
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
             _ => Action::None,
@@ -141,12 +195,18 @@ impl Ui {
     }
 
     /// Render the full UI to the terminal.
-    pub fn render(&self, approvals: &[Approval]) -> io::Result<()> {
+    pub fn render(&mut self, approvals: &[Approval]) -> io::Result<()> {
         let mut stdout = io::stdout();
         let (cols, rows) = terminal::size()?;
         let width = cols as usize;
+        let max_content_row = (rows as usize).saturating_sub(3);
+        let separator: String = "\u{2501}".repeat(width);
+        let max_line_width = width.saturating_sub(6);
 
-        queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+        queue!(stdout, MoveTo(0, 0))?;
+        let mut row: usize = 0;
+        let mut content_total: usize = 0;
+        let mut content_visible: usize = 0;
 
         // Header
         let pending_text = format!("{} pending", approvals.len());
@@ -161,11 +221,12 @@ impl Ui {
             Print(&pending_text),
             SetAttribute(Attribute::Reset),
             ResetColor,
+            Clear(ClearType::UntilNewLine),
             Print("\r\n"),
         )?;
+        row += 1;
 
         // Separator
-        let separator: String = "\u{2501}".repeat(width);
         queue!(
             stdout,
             SetForegroundColor(Color::DarkGrey),
@@ -173,36 +234,52 @@ impl Ui {
             ResetColor,
             Print("\r\n"),
         )?;
+        row += 1;
 
         if approvals.is_empty() {
-            queue!(
-                stdout,
-                Print("\r\n"),
-                SetForegroundColor(Color::DarkGrey),
-                Print("  Waiting for approvals..."),
-                ResetColor,
-                Print("\r\n"),
-            )?;
+            if row < max_content_row {
+                queue!(stdout, Clear(ClearType::CurrentLine), Print("\r\n"))?;
+                row += 1;
+            }
+            if row < max_content_row {
+                queue!(
+                    stdout,
+                    SetForegroundColor(Color::DarkGrey),
+                    Print("  Waiting for approvals..."),
+                    ResetColor,
+                    Clear(ClearType::UntilNewLine),
+                    Print("\r\n"),
+                )?;
+                row += 1;
+            }
         } else {
             let now = Utc::now();
             for (i, approval) in approvals.iter().enumerate() {
+                if row >= max_content_row {
+                    break;
+                }
                 let is_selected = i == self.selected;
                 let age = format_age(now, approval.created_at);
 
+                // Spacer line
+                queue!(stdout, Clear(ClearType::CurrentLine), Print("\r\n"))?;
+                row += 1;
+                if row >= max_content_row {
+                    break;
+                }
+
+                // Summary line
                 if is_selected {
-                    // Selected indicator
                     queue!(
                         stdout,
-                        Print("\r\n"),
                         SetForegroundColor(Color::Yellow),
                         SetAttribute(Attribute::Bold),
                         Print("\u{25b8} "),
                     )?;
                 } else {
-                    queue!(stdout, Print("\r\n"), Print("  "),)?;
+                    queue!(stdout, Print("  "))?;
                 }
 
-                // Summary line: project > tool_name                    age
                 let summary = format!("{} \u{203a} {}", approval.project, approval.tool_name);
                 let summary_pad = width.saturating_sub(summary.len() + age.len() + 4);
                 if is_selected {
@@ -228,21 +305,38 @@ impl Ui {
                         ResetColor,
                     )?;
                 }
-                queue!(stdout, Print("\r\n"))?;
+                queue!(stdout, Clear(ClearType::UntilNewLine), Print("\r\n"))?;
+                row += 1;
 
-                // Expanded detail for selected item
                 if is_selected {
-                    render_expanded(&mut stdout, approval, width)?;
+                    let lines = build_expanded_lines(approval, max_line_width, self.show_raw);
+                    content_total = lines.len();
+                    self.last_content_lines = content_total;
+                    let remaining_rows = max_content_row.saturating_sub(row);
+                    self.last_visible_rows = remaining_rows;
+                    let max_offset = content_total.saturating_sub(remaining_rows.max(1));
+                    self.scroll_offset = self.scroll_offset.min(max_offset);
+                    for line in lines.iter().skip(self.scroll_offset) {
+                        if row >= max_content_row {
+                            break;
+                        }
+                        render_line(&mut stdout, line)?;
+                        row += 1;
+                        content_visible += 1;
+                    }
                 }
             }
         }
 
-        // Bottom area: status message + separator + key hints
-        // Calculate how many lines we've used and position at bottom
-        let bottom_row = rows.saturating_sub(3);
-        queue!(stdout, MoveTo(0, bottom_row))?;
+        // Clear remaining content area
+        while row < max_content_row {
+            queue!(stdout, Clear(ClearType::CurrentLine), Print("\r\n"))?;
+            row += 1;
+        }
 
-        // Status message (if any)
+        // Status bar
+        queue!(stdout, MoveTo(0, max_content_row as u16))?;
+
         if let Some(msg) = &self.status_message {
             queue!(
                 stdout,
@@ -250,10 +344,25 @@ impl Ui {
                 Print("  "),
                 Print(msg),
                 ResetColor,
+                Clear(ClearType::UntilNewLine),
+                Print("\r\n"),
+            )?;
+        } else if content_total > content_visible {
+            let start = self.scroll_offset + 1;
+            let end = (self.scroll_offset + content_visible).min(content_total);
+            let indicator = format!("lines {start}-{end} of {content_total}");
+            let ipad = width.saturating_sub(indicator.len() + 2);
+            queue!(
+                stdout,
+                Print(" ".repeat(ipad)),
+                SetForegroundColor(Color::DarkGrey),
+                Print(&indicator),
+                ResetColor,
+                Clear(ClearType::UntilNewLine),
                 Print("\r\n"),
             )?;
         } else {
-            queue!(stdout, Print("\r\n"))?;
+            queue!(stdout, Clear(ClearType::CurrentLine), Print("\r\n"))?;
         }
 
         // Separator
@@ -274,6 +383,7 @@ impl Ui {
                         SetForegroundColor(Color::DarkGrey),
                         Print(" (q)uit"),
                         ResetColor,
+                        Clear(ClearType::UntilNewLine),
                     )?;
                 } else {
                     queue!(
@@ -288,6 +398,14 @@ impl Ui {
                         ResetColor,
                         Print("eny  "),
                         SetForegroundColor(Color::DarkGrey),
+                        Print("(r)"),
+                        ResetColor,
+                        Print("aw  "),
+                        SetForegroundColor(Color::DarkGrey),
+                        Print("(\u{2191}\u{2193})"),
+                        ResetColor,
+                        Print(" scroll  "),
+                        SetForegroundColor(Color::DarkGrey),
                         Print("(Tab)"),
                         ResetColor,
                         Print(" next  "),
@@ -295,6 +413,7 @@ impl Ui {
                         Print("(q)"),
                         ResetColor,
                         Print("uit"),
+                        Clear(ClearType::UntilNewLine),
                     )?;
                 }
             }
@@ -306,6 +425,7 @@ impl Ui {
                     Print(buffer),
                     Print("\u{2588}"),
                     ResetColor,
+                    Clear(ClearType::UntilNewLine),
                 )?;
             }
         }
@@ -315,50 +435,161 @@ impl Ui {
     }
 }
 
-/// Render the expanded detail of a selected approval.
-fn render_expanded(stdout: &mut io::Stdout, approval: &Approval, width: usize) -> io::Result<()> {
-    let input_str = format_tool_input(&approval.tool_input);
-    let max_line_width = width.saturating_sub(6); // "  │ " prefix
-
-    for line in input_str.lines() {
-        // Truncate long lines
-        let display = if line.len() > max_line_width {
-            format!("{}...", &line[..max_line_width.saturating_sub(3)])
-        } else {
-            line.to_string()
-        };
-        queue!(
-            stdout,
-            SetForegroundColor(Color::DarkGrey),
-            Print("  \u{2502} "),
-            ResetColor,
-            Print(&display),
-            Print("\r\n"),
-        )?;
-    }
-
-    if let Some(context) = &approval.context {
+/// Render a single expanded-detail line with the │ prefix.
+fn render_line(stdout: &mut io::Stdout, line: &ExpandedLine) -> io::Result<()> {
+    if matches!(line.kind, LineKind::Separator) {
         queue!(
             stdout,
             SetForegroundColor(Color::DarkGrey),
             Print("  \u{2502}"),
             ResetColor,
+            Clear(ClearType::UntilNewLine),
             Print("\r\n"),
-            SetForegroundColor(Color::DarkGrey),
-            Print("  \u{2502} "),
-            SetForegroundColor(Color::Blue),
-            Print("Context: "),
-            ResetColor,
         )?;
-        let ctx_display = if context.len() > max_line_width.saturating_sub(9) {
-            format!("{}...", &context[..max_line_width.saturating_sub(12)])
-        } else {
-            context.clone()
-        };
-        queue!(stdout, Print(&ctx_display), Print("\r\n"))?;
+        return Ok(());
     }
 
+    queue!(
+        stdout,
+        SetForegroundColor(Color::DarkGrey),
+        Print("  \u{2502} "),
+    )?;
+
+    match line.kind {
+        LineKind::Normal => queue!(stdout, ResetColor)?,
+        LineKind::DiffAdd => queue!(stdout, SetForegroundColor(Color::Green))?,
+        LineKind::DiffRemove => queue!(stdout, SetForegroundColor(Color::Red))?,
+        LineKind::DiffContext => queue!(stdout, SetForegroundColor(Color::DarkGrey))?,
+        LineKind::DiffHunkHeader => queue!(stdout, SetForegroundColor(Color::Cyan))?,
+        LineKind::Info => queue!(stdout, SetForegroundColor(Color::Blue))?,
+        LineKind::Separator => unreachable!(),
+    }
+
+    queue!(
+        stdout,
+        Print(&line.text),
+        ResetColor,
+        Clear(ClearType::UntilNewLine),
+        Print("\r\n"),
+    )?;
+
     Ok(())
+}
+
+/// Build all expanded-detail lines for a selected approval.
+fn build_expanded_lines(
+    approval: &Approval,
+    max_line_width: usize,
+    show_raw: bool,
+) -> Vec<ExpandedLine> {
+    let mut lines = Vec::new();
+
+    if !show_raw && approval.tool_name == "Write" {
+        build_write_diff_lines(&approval.tool_input, max_line_width, &mut lines);
+    } else {
+        let input_str = format_tool_input(&approval.tool_input);
+        for line in input_str.lines() {
+            lines.push(ExpandedLine {
+                text: truncate_str(line, max_line_width),
+                kind: LineKind::Normal,
+            });
+        }
+    }
+
+    if let Some(context) = &approval.context {
+        lines.push(ExpandedLine {
+            text: String::new(),
+            kind: LineKind::Separator,
+        });
+        lines.push(ExpandedLine {
+            text: truncate_str(&format!("Context: {context}"), max_line_width),
+            kind: LineKind::Info,
+        });
+    }
+
+    lines
+}
+
+/// Build diff lines for a Write tool request.
+fn build_write_diff_lines(
+    tool_input: &serde_json::Value,
+    max_line_width: usize,
+    lines: &mut Vec<ExpandedLine>,
+) {
+    use similar::{ChangeTag, TextDiff};
+
+    let path = tool_input
+        .get("path")
+        .or_else(|| tool_input.get("file_path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let new_contents = tool_input
+        .get("contents")
+        .or_else(|| tool_input.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let path_display = truncate_str(path, max_line_width.saturating_sub(6));
+    lines.push(ExpandedLine {
+        text: format!("path: {path_display}"),
+        kind: LineKind::Info,
+    });
+
+    let file_exists = std::path::Path::new(path).exists();
+    let old_contents = if file_exists {
+        std::fs::read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if old_contents == new_contents {
+        lines.push(ExpandedLine {
+            text: "(no changes)".to_string(),
+            kind: LineKind::DiffContext,
+        });
+        return;
+    }
+
+    if !file_exists {
+        lines.push(ExpandedLine {
+            text: format!("(new file, {} lines)", new_contents.lines().count()),
+            kind: LineKind::DiffAdd,
+        });
+    }
+
+    let diff = TextDiff::from_lines(old_contents.as_str(), new_contents);
+    let udiff = diff.unified_diff();
+    for hunk in udiff.iter_hunks() {
+        let header = hunk.header().to_string();
+        lines.push(ExpandedLine {
+            text: truncate_str(header.trim_end(), max_line_width),
+            kind: LineKind::DiffHunkHeader,
+        });
+
+        for change in hunk.iter_changes() {
+            let (prefix, kind) = match change.tag() {
+                ChangeTag::Delete => ("-", LineKind::DiffRemove),
+                ChangeTag::Insert => ("+", LineKind::DiffAdd),
+                ChangeTag::Equal => (" ", LineKind::DiffContext),
+            };
+            let line_content = change
+                .value()
+                .trim_end_matches('\n')
+                .trim_end_matches('\r');
+            lines.push(ExpandedLine {
+                text: truncate_str(&format!("{prefix}{line_content}"), max_line_width),
+                kind,
+            });
+        }
+    }
+}
+
+fn truncate_str(s: &str, max_width: usize) -> String {
+    if s.len() <= max_width {
+        return s.to_string();
+    }
+    let end = s.floor_char_boundary(max_width.saturating_sub(1));
+    format!("{}\u{2026}", &s[..end])
 }
 
 /// Format tool_input as readable text. Shows key: value pairs for objects.

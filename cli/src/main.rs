@@ -1,7 +1,7 @@
 mod client;
 mod ui;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -64,6 +64,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
 async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> anyhow::Result<()> {
     let mut approvals: Vec<Approval> = Vec::new();
     let mut known_ids: HashSet<Uuid> = HashSet::new();
+    let mut scroll_offsets: HashMap<Uuid, usize> = HashMap::new();
     let mut last_poll = Instant::now() - Duration::from_secs(poll_interval_secs + 1);
     let poll_interval = Duration::from_secs(poll_interval_secs);
 
@@ -101,8 +102,18 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
             last_poll = Instant::now();
         }
 
+        // Sync per-approval scroll offset before rendering
+        if let Some(a) = approvals.get(ui.selected) {
+            ui.scroll_offset = scroll_offsets.get(&a.id).copied().unwrap_or(0);
+        }
+
         // Render
         ui.render(&approvals)?;
+
+        // Save back the (possibly clamped) scroll offset
+        if let Some(a) = approvals.get(ui.selected) {
+            scroll_offsets.insert(a.id, ui.scroll_offset);
+        }
 
         // Wait for event (short timeout so we re-poll regularly)
         let timeout = poll_interval
@@ -145,6 +156,57 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                             buffer: String::new(),
                         };
                     }
+                    Action::ToggleRaw => {
+                        ui.show_raw = !ui.show_raw;
+                        if let Some(a) = approvals.get(ui.selected) {
+                            scroll_offsets.insert(a.id, 0);
+                        }
+                    }
+                    Action::LineDown => {
+                        if let Some(a) = approvals.get(ui.selected) {
+                            let offset = scroll_offsets.get(&a.id).copied().unwrap_or(0);
+                            let max_offset = ui
+                                .last_content_lines
+                                .saturating_sub(ui.last_visible_rows.max(1));
+                            if offset < max_offset {
+                                scroll_offsets.insert(a.id, offset + 1);
+                            } else if approvals.len() > 1 {
+                                ui.selected = (ui.selected + 1) % approvals.len();
+                            }
+                        }
+                    }
+                    Action::LineUp => {
+                        if let Some(a) = approvals.get(ui.selected) {
+                            let offset = scroll_offsets.get(&a.id).copied().unwrap_or(0);
+                            if offset > 0 {
+                                scroll_offsets.insert(a.id, offset - 1);
+                            } else if approvals.len() > 1 {
+                                ui.selected =
+                                    (ui.selected + approvals.len() - 1) % approvals.len();
+                                if let Some(prev) = approvals.get(ui.selected) {
+                                    scroll_offsets.insert(prev.id, usize::MAX);
+                                }
+                            }
+                        }
+                    }
+                    Action::ScrollDown => {
+                        if let Some(a) = approvals.get(ui.selected) {
+                            let half_page = ui.last_visible_rows / 2;
+                            let offset = scroll_offsets.get(&a.id).copied().unwrap_or(0);
+                            let max_offset = ui
+                                .last_content_lines
+                                .saturating_sub(ui.last_visible_rows.max(1));
+                            scroll_offsets
+                                .insert(a.id, (offset + half_page).min(max_offset));
+                        }
+                    }
+                    Action::ScrollUp => {
+                        if let Some(a) = approvals.get(ui.selected) {
+                            let half_page = ui.last_visible_rows / 2;
+                            let offset = scroll_offsets.get(&a.id).copied().unwrap_or(0);
+                            scroll_offsets.insert(a.id, offset.saturating_sub(half_page));
+                        }
+                    }
                     Action::Next => {
                         if !approvals.is_empty() {
                             ui.selected = (ui.selected + 1) % approvals.len();
@@ -152,7 +214,11 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                     }
                     Action::Prev => {
                         if !approvals.is_empty() {
-                            ui.selected = (ui.selected + approvals.len() - 1) % approvals.len();
+                            ui.selected =
+                                (ui.selected + approvals.len() - 1) % approvals.len();
+                            if let Some(prev) = approvals.get(ui.selected) {
+                                scroll_offsets.insert(prev.id, usize::MAX);
+                            }
                         }
                     }
                     Action::Quit => return Ok(()),
