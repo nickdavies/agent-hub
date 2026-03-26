@@ -8,10 +8,20 @@ use tracing::info;
 
 use super::storage::PersistedSession;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorType {
+    Claude,
+    Cursor,
+    #[default]
+    Unknown,
+}
+
 pub struct SessionInner {
     pub project: String,
     pub last_seen: Instant,
     pub config: SessionNotifyConfig,
+    pub editor_type: EditorType,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +89,7 @@ pub struct SessionView {
     pub session_id: String,
     pub project: String,
     pub config: SessionNotifyConfig,
+    pub editor_type: EditorType,
 }
 
 pub struct SessionRegistry {
@@ -102,7 +113,13 @@ impl SessionRegistry {
     }
 
     /// Upserts a session. Returns the project name extracted from cwd.
-    pub async fn get_or_register(&self, session_id: &str, cwd: &str) -> String {
+    /// `editor_type` is set on first registration and not overwritten on subsequent calls.
+    pub async fn get_or_register(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        editor_type: Option<EditorType>,
+    ) -> String {
         let project = extract_project_name(cwd);
         let mut sessions = self.sessions.write().await;
         let now = Instant::now();
@@ -116,6 +133,7 @@ impl SessionRegistry {
                     project: project.clone(),
                     last_seen: now,
                     config: SessionNotifyConfig::with_default_approval_mode(default_mode),
+                    editor_type: editor_type.unwrap_or_default(),
                 }
             });
         project
@@ -153,6 +171,7 @@ impl SessionRegistry {
                 session_id: id.clone(),
                 project: s.project.clone(),
                 config: s.config.clone(),
+                editor_type: s.editor_type,
             })
             .collect()
     }
@@ -166,6 +185,7 @@ impl SessionRegistry {
                 session_id: id.clone(),
                 project: s.project.clone(),
                 config: s.config.clone(),
+                editor_type: s.editor_type,
             })
             .collect()
     }
@@ -185,6 +205,7 @@ impl SessionRegistry {
                     PersistedSession {
                         project: s.project.clone(),
                         config: s.config.clone(),
+                        editor_type: s.editor_type,
                     },
                 )
             })
@@ -207,6 +228,7 @@ impl SessionRegistry {
                     project: persisted.project,
                     last_seen: now,
                     config: persisted.config,
+                    editor_type: persisted.editor_type,
                 },
             );
         }
@@ -258,8 +280,10 @@ mod tests {
     #[tokio::test]
     async fn register_and_list() {
         let reg = SessionRegistry::new(7200);
-        reg.get_or_register("s1", "/home/nick/project-a").await;
-        reg.get_or_register("s2", "/home/nick/project-b").await;
+        reg.get_or_register("s1", "/home/nick/project-a", None)
+            .await;
+        reg.get_or_register("s2", "/home/nick/project-b", None)
+            .await;
         let sessions = reg.list().await;
         assert_eq!(sessions.len(), 2);
     }
@@ -267,7 +291,8 @@ mod tests {
     #[tokio::test]
     async fn deregister() {
         let reg = SessionRegistry::new(7200);
-        reg.get_or_register("s1", "/home/nick/project-a").await;
+        reg.get_or_register("s1", "/home/nick/project-a", None)
+            .await;
         reg.deregister("s1").await;
         assert_eq!(reg.count().await, 0);
     }
@@ -275,8 +300,8 @@ mod tests {
     #[tokio::test]
     async fn find_by_project() {
         let reg = SessionRegistry::new(7200);
-        reg.get_or_register("s1", "/home/nick/myapp").await;
-        reg.get_or_register("s2", "/home/nick/other").await;
+        reg.get_or_register("s1", "/home/nick/myapp", None).await;
+        reg.get_or_register("s2", "/home/nick/other", None).await;
         let found = reg.find_by_project("myapp").await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "s1");
@@ -285,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn update_session_config() {
         let reg = SessionRegistry::new(7200);
-        reg.get_or_register("s1", "/home/nick/proj").await;
+        reg.get_or_register("s1", "/home/nick/proj", None).await;
         let cfg = reg
             .update_config(
                 "s1",

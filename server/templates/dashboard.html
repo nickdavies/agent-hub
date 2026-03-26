@@ -3,24 +3,38 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="5">
     <title>Dashboard — Claude Notify</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        tr.selected td { background: rgba(24, 115, 204, 0.1) !important; }
+        #help-bar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--pico-card-background-color); border-top: 1px solid var(--pico-muted-border-color); padding: 0.25rem 1rem; font-size: 0.8rem; color: var(--pico-muted-color); z-index: 10; }
+        #help-bar kbd { font-size: 0.75rem; padding: 0.1rem 0.3rem; border: 1px solid var(--pico-muted-border-color); border-radius: 3px; background: var(--pico-background-color); color: var(--pico-color); font-weight: bold; }
+        #help-detail { display: none; margin-top: 0.5rem; }
+        #help-detail.visible { display: block; }
+        main.container { padding-bottom: 3rem; }
+        .deny-input { display: none; margin-top: 0.25rem; }
+        .deny-input.visible { display: flex; gap: 0.5rem; align-items: center; }
+        .deny-input input { margin: 0; padding: 0.25rem 0.5rem; font-size: 0.85rem; }
+        .deny-input button { margin: 0; padding: 0.25rem 0.5rem; font-size: 0.85rem; white-space: nowrap; }
+    </style>
 </head>
 <body>
 <nav class="container">
     <ul><li><strong>Claude Notify</strong></li></ul>
     <ul>
+        {% if has_auth %}
         <li>{{ email }}</li>
         <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
     </ul>
 </nav>
 <main class="container">
     <h3>Pending Approvals</h3>
+    <div id="approvals-container">
     {% if pending_approvals.is_empty() %}
-    <p>No pending approvals.</p>
+    <p id="no-approvals">No pending approvals.</p>
     {% else %}
-    <table>
+    <table id="approvals-table">
         <thead>
             <tr>
                 <th>Project</th>
@@ -32,23 +46,37 @@
         </thead>
         <tbody>
             {% for a in pending_approvals %}
-            <tr>
+            <tr data-id="{{ a.id }}">
                 <td>{{ a.project }}</td>
                 <td>{{ a.session_display_name }}</td>
                 <td>{{ a.tool_name }}</td>
                 <td>{{ a.created_at.format("%H:%M:%S") }}</td>
-                <td><a href="/approvals/{{ a.id }}">Review</a></td>
+                <td>
+                    <a href="/approvals/{{ a.id }}">Review</a>
+                    {% if readwrite %}
+                    <span style="margin-left:0.5rem">
+                        <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="approveRow('{{ a.id }}')">Approve</button>
+                        <button class="outline secondary" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showDenyInput('{{ a.id }}')">Deny</button>
+                    </span>
+                    <div class="deny-input" id="deny-{{ a.id }}">
+                        <input type="text" placeholder="Reason..." onkeydown="if(event.key==='Enter'){denyRow('{{ a.id }}',this.value);} if(event.key==='Escape'){hideDenyInputs();}">
+                        <button class="secondary" onclick="denyRow('{{ a.id }}',this.previousElementSibling.value)">Send</button>
+                    </div>
+                    {% endif %}
+                </td>
             </tr>
             {% endfor %}
         </tbody>
     </table>
     {% endif %}
+    </div>
 
     <h3>Sessions</h3>
+    <div id="sessions-container">
     {% if sessions.is_empty() %}
-    <p>No active sessions.</p>
+    <p id="no-sessions">No active sessions.</p>
     {% else %}
-    <table>
+    <table id="sessions-table">
         <thead>
             <tr>
                 <th>Project</th>
@@ -63,16 +91,18 @@
                 <td><code>{{ s.session_id }}</code></td>
                 {% if readwrite %}
                 <td>
-                    <form method="post" action="/approvals/toggle-mode/{{ s.session_id }}" style="margin:0;display:inline">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    {% if s.editor_type != crate::server::sessions::EditorType::Cursor %}
+                    <button class="outline" style="margin:0;padding:0.25rem 0.5rem"
+                        onclick="toggleMode('{{ s.session_id }}', '{% if s.config.approval_mode == crate::server::sessions::SessionApprovalMode::Remote %}terminal{% else %}remote{% endif %}')">
                         {% if s.config.approval_mode == crate::server::sessions::SessionApprovalMode::Remote %}
-                        <input type="hidden" name="mode" value="terminal">
-                        <button type="submit" class="outline" style="margin:0;padding:0.25rem 0.5rem">remote (switch to terminal)</button>
+                        remote (switch to terminal)
                         {% else %}
-                        <input type="hidden" name="mode" value="remote">
-                        <button type="submit" class="outline" style="margin:0;padding:0.25rem 0.5rem">terminal (switch to remote)</button>
+                        terminal (switch to remote)
                         {% endif %}
-                    </form>
+                    </button>
+                    {% else %}
+                    <span style="color:var(--pico-muted-color)">remote (cursor)</span>
+                    {% endif %}
                 </td>
                 {% endif %}
             </tr>
@@ -80,6 +110,241 @@
         </tbody>
     </table>
     {% endif %}
+    </div>
 </main>
+
+<div id="help-bar">
+    <span><kbd>j</kbd>/<kbd>k</kbd> navigate &nbsp; <kbd>Enter</kbd> review &nbsp;
+    {% if readwrite %}<kbd>a</kbd> approve &nbsp; <kbd>d</kbd> deny &nbsp;{% endif %}
+    <kbd>?</kbd> help</span>
+    <div id="help-detail">
+        <strong>Keyboard Shortcuts</strong><br>
+        <kbd>j</kbd> / <kbd>↓</kbd> — Select next approval<br>
+        <kbd>k</kbd> / <kbd>↑</kbd> — Select previous approval<br>
+        <kbd>Enter</kbd> — Open selected approval<br>
+        {% if readwrite %}
+        <kbd>a</kbd> / <kbd>1</kbd> — Approve selected<br>
+        <kbd>d</kbd> / <kbd>2</kbd> — Deny selected (prompts for reason)<br>
+        {% endif %}
+        <kbd>?</kbd> — Toggle this help
+    </div>
+</div>
+
+<script>
+(function() {
+    const READWRITE = {{ readwrite }};
+    const POLL_MS = 2000;
+    let selectedIdx = -1;
+    let denyActiveId = null;
+
+    // --- Polling ---
+    async function poll() {
+        try {
+            const [approvalsResp, sessionsResp] = await Promise.all([
+                fetch('/api/v1/approvals/pending', { credentials: 'same-origin' }),
+                fetch('/api/v1/sessions', { credentials: 'same-origin' })
+            ]);
+            if (approvalsResp.ok) {
+                const approvals = await approvalsResp.json();
+                renderApprovals(approvals);
+            }
+            if (sessionsResp.ok) {
+                const sessions = await sessionsResp.json();
+                renderSessions(sessions);
+            }
+        } catch (e) {
+            // silently ignore fetch errors
+        }
+    }
+
+    function renderApprovals(approvals) {
+        const container = document.getElementById('approvals-container');
+
+        // Don't blow away the DOM while user is typing a deny reason
+        if (denyActiveId) {
+            // Just update the known IDs so we can detect removals
+            const currentIds = new Set(approvals.map(a => a.id));
+            if (!currentIds.has(denyActiveId)) {
+                // The approval being denied was resolved externally — reset
+                denyActiveId = null;
+            } else {
+                return; // preserve input state, skip full rerender
+            }
+        }
+
+        if (approvals.length === 0) {
+            container.innerHTML = '<p>No pending approvals.</p>';
+            selectedIdx = -1;
+            return;
+        }
+        let html = `<table id="approvals-table"><thead><tr>
+            <th>Project</th><th>Session</th><th>Tool</th><th>Time</th><th>Action</th>
+            </tr></thead><tbody>`;
+        approvals.forEach((a, i) => {
+            const time = new Date(a.created_at).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+            const cls = i === selectedIdx ? ' class="selected"' : '';
+            html += `<tr data-id="${a.id}"${cls}>
+                <td>${esc(a.project)}</td>
+                <td>${esc(a.session_display_name)}</td>
+                <td>${esc(a.tool_name)}</td>
+                <td>${time}</td>
+                <td><a href="/approvals/${a.id}">Review</a>`;
+            if (READWRITE) {
+                html += ` <span style="margin-left:0.5rem">
+                    <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="approveRow('${a.id}')">Approve</button>
+                    <button class="outline secondary" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showDenyInput('${a.id}')">Deny</button>
+                </span>
+                <div class="deny-input" id="deny-${a.id}">
+                    <input type="text" placeholder="Reason..." onkeydown="if(event.key==='Enter'){denyRow('${a.id}',this.value);} if(event.key==='Escape'){hideDenyInputs();}">
+                    <button class="secondary" onclick="denyRow('${a.id}',this.previousElementSibling.value)">Send</button>
+                </div>`;
+            }
+            html += `</td></tr>`;
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+        // Clamp selection
+        if (selectedIdx >= approvals.length) selectedIdx = approvals.length - 1;
+        updateSelection();
+    }
+
+    function renderSessions(sessions) {
+        const container = document.getElementById('sessions-container');
+        if (sessions.length === 0) {
+            container.innerHTML = '<p>No active sessions.</p>';
+            return;
+        }
+        let html = `<table id="sessions-table"><thead><tr>
+            <th>Project</th><th>Session ID</th>`;
+        if (READWRITE) html += '<th>Approval Mode</th>';
+        html += '</tr></thead><tbody>';
+        sessions.forEach(s => {
+            const mode = s.config.approval_mode;
+            html += `<tr><td>${esc(s.project)}</td><td><code>${esc(s.session_id)}</code></td>`;
+            if (READWRITE) {
+                if (s.editor_type !== 'cursor') {
+                    const nextMode = mode === 'remote' ? 'terminal' : 'remote';
+                    const label = mode === 'remote' ? 'remote (switch to terminal)' : 'terminal (switch to remote)';
+                    html += `<td><button class="outline" style="margin:0;padding:0.25rem 0.5rem" onclick="toggleMode('${esc(s.session_id)}','${nextMode}')">${label}</button></td>`;
+                } else {
+                    html += '<td><span style="color:var(--pico-muted-color)">remote (cursor)</span></td>';
+                }
+            }
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    }
+
+    function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
+    }
+
+    // --- Selection ---
+    function getRows() {
+        const table = document.getElementById('approvals-table');
+        return table ? Array.from(table.querySelectorAll('tbody tr')) : [];
+    }
+
+    function updateSelection() {
+        const rows = getRows();
+        rows.forEach((r, i) => r.classList.toggle('selected', i === selectedIdx));
+    }
+
+    function moveSelection(delta) {
+        const rows = getRows();
+        if (rows.length === 0) return;
+        if (selectedIdx < 0) { selectedIdx = 0; }
+        else { selectedIdx = Math.max(0, Math.min(rows.length - 1, selectedIdx + delta)); }
+        updateSelection();
+    }
+
+    function getSelectedId() {
+        const rows = getRows();
+        if (selectedIdx >= 0 && selectedIdx < rows.length) {
+            return rows[selectedIdx].dataset.id;
+        }
+        return null;
+    }
+
+    // --- Actions ---
+    window.approveRow = async function(id) {
+        await fetch(`/api/v1/approvals/${id}/resolve`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'approve', message: null })
+        });
+        poll();
+    };
+
+    window.showDenyInput = function(id) {
+        hideDenyInputs();
+        denyActiveId = id;
+        const el = document.getElementById('deny-' + id);
+        if (el) {
+            el.classList.add('visible');
+            const input = el.querySelector('input');
+            if (input) input.focus();
+        }
+    };
+
+    window.hideDenyInputs = function() {
+        denyActiveId = null;
+        document.querySelectorAll('.deny-input').forEach(el => el.classList.remove('visible'));
+    };
+
+    window.denyRow = async function(id, reason) {
+        await fetch(`/api/v1/approvals/${id}/resolve`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'deny', message: reason || '' })
+        });
+        hideDenyInputs();
+        poll();
+    };
+
+    window.toggleMode = async function(sessionId, mode) {
+        await fetch(`/api/v1/sessions/${sessionId}`, {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approval_mode: mode })
+        });
+        poll();
+    };
+
+    // --- Keyboard shortcuts ---
+    document.addEventListener('keydown', function(e) {
+        // Skip when typing in an input
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+        const key = e.key;
+        if (key === 'j' || key === 'ArrowDown') { e.preventDefault(); moveSelection(1); }
+        else if (key === 'k' || key === 'ArrowUp') { e.preventDefault(); moveSelection(-1); }
+        else if (key === 'Enter') {
+            const id = getSelectedId();
+            if (id) { e.preventDefault(); window.location.href = '/approvals/' + id; }
+        }
+        else if (READWRITE && (key === 'a' || key === '1')) {
+            const id = getSelectedId();
+            if (id) { e.preventDefault(); approveRow(id); }
+        }
+        else if (READWRITE && (key === 'd' || key === '2')) {
+            const id = getSelectedId();
+            if (id) { e.preventDefault(); showDenyInput(id); }
+        }
+        else if (key === '?') {
+            document.getElementById('help-detail').classList.toggle('visible');
+        }
+    });
+
+    // Start polling
+    setInterval(poll, POLL_MS);
+})();
+</script>
 </body>
 </html>

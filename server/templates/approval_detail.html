@@ -3,35 +3,52 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    {% if !approval.status.is_resolved() %}
-    <meta http-equiv="refresh" content="5">
-    {% endif %}
     <title>Approval — Claude Notify</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        #help-bar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--pico-card-background-color); border-top: 1px solid var(--pico-muted-border-color); padding: 0.25rem 1rem; font-size: 0.8rem; color: var(--pico-muted-color); z-index: 10; }
+        #help-bar kbd { font-size: 0.75rem; padding: 0.1rem 0.3rem; border: 1px solid var(--pico-muted-border-color); border-radius: 3px; background: var(--pico-background-color); color: var(--pico-color); font-weight: bold; }
+        #help-detail { display: none; margin-top: 0.5rem; }
+        #help-detail.visible { display: block; }
+        main.container { padding-bottom: 3rem; }
+        .smart-view dt { font-weight: bold; margin-top: 0.5rem; color: var(--pico-primary); }
+        .smart-view dd { margin-left: 1rem; white-space: pre-wrap; word-break: break-word; }
+        #deny-inline { display: none; margin-top: 0.5rem; }
+        #deny-inline.visible { display: flex; gap: 0.5rem; align-items: center; }
+        #deny-inline input { margin: 0; }
+        #deny-inline button { margin: 0; white-space: nowrap; }
+        .view-toggle { font-size: 0.85rem; float: right; }
+    </style>
 </head>
 <body>
 <nav class="container">
     <ul><li><a href="/approvals"><strong>Claude Notify</strong></a></li></ul>
     <ul>
+        {% if has_auth %}
         <li>{{ email }}</li>
         <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
     </ul>
 </nav>
 <main class="container">
     <article>
         <header>
-            <h3>{{ approval.tool_name }}</h3>
-            <p>Project: <strong>{{ approval.project }}</strong> &middot; {{ approval.session_display_name }}</p>
+            <h3 id="tool-name">{{ approval.tool_name }}</h3>
+            <p id="meta">Project: <strong>{{ approval.project }}</strong> · {{ approval.session_display_name }}</p>
         </header>
 
+        <div id="context-section">
         {% if let Some(ctx) = approval.context.as_ref() %}
         <p><em>{{ ctx }}</em></p>
         {% endif %}
+        </div>
 
-        <h4>Tool Input</h4>
-        <pre><code>{{ tool_input_pretty }}</code></pre>
+        <h4>Tool Input <a href="#" class="view-toggle" id="view-toggle" onclick="toggleView(); return false;">show raw</a></h4>
 
-        <p>Status:
+        <div id="smart-view" class="smart-view"></div>
+        <pre id="raw-view" style="display:none"><code>{{ tool_input_pretty }}</code></pre>
+
+        <p id="status-line">Status:
             {% match approval.status %}
             {% when crate::server::approvals::ApprovalStatus::Pending %}
                 <mark>Pending</mark>
@@ -44,21 +61,181 @@
             {% endmatch %}
         </p>
 
+        <div id="action-buttons">
         {% if readwrite && !approval.status.is_resolved() %}
         <hr>
-        <form method="post" action="/approvals/{{ approval.id }}/resolve">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <label for="message">Message (optional for approve, required for deny)</label>
-            <textarea id="message" name="message" rows="3"></textarea>
-            <div class="grid">
-                <button type="submit" name="decision" value="approve">Approve</button>
-                <button type="submit" name="decision" value="deny" class="secondary">Deny</button>
-            </div>
-        </form>
+        <div class="grid">
+            <button onclick="doApprove()">Approve</button>
+            <button class="secondary" onclick="showDeny()">Deny</button>
+        </div>
+        <div id="deny-inline">
+            <input type="text" id="deny-reason" placeholder="Reason..." onkeydown="if(event.key==='Enter'){doDeny();} if(event.key==='Escape'){hideDeny();}">
+            <button class="secondary" onclick="doDeny()">Send</button>
+        </div>
         {% endif %}
+        </div>
     </article>
 
-    <a href="/approvals">&larr; Back to dashboard</a>
+    <a href="/approvals">← Back to dashboard</a>
 </main>
+
+<div id="help-bar">
+    <span>
+    {% if readwrite %}<kbd>a</kbd> approve &nbsp; <kbd>d</kbd> deny &nbsp;{% endif %}
+    <kbd>r</kbd> toggle raw &nbsp; <kbd>Esc</kbd> back &nbsp; <kbd>?</kbd> help</span>
+    <div id="help-detail">
+        <strong>Keyboard Shortcuts</strong><br>
+        {% if readwrite %}
+        <kbd>a</kbd> / <kbd>1</kbd> — Approve<br>
+        <kbd>d</kbd> / <kbd>2</kbd> — Deny (prompts for reason)<br>
+        {% endif %}
+        <kbd>r</kbd> — Toggle raw JSON / smart view<br>
+        <kbd>Esc</kbd> / <kbd>Backspace</kbd> — Back to dashboard<br>
+        <kbd>?</kbd> — Toggle this help
+    </div>
+</div>
+
+<script type="application/json" id="approval-data">{{ approval_json|safe }}</script>
+<script>
+(function() {
+    const READWRITE = {{ readwrite }};
+    const POLL_MS = 2000;
+    const approvalId = '{{ approval.id }}';
+    let rawMode = false;
+    let resolved = {{ approval.status.is_resolved() }};
+
+    // --- Smart formatting ---
+    function formatSmartView(input) {
+        if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+            return '<pre><code>' + esc(JSON.stringify(input, null, 2)) + '</code></pre>';
+        }
+        let html = '<dl>';
+        for (const [key, value] of Object.entries(input)) {
+            html += '<dt>' + esc(key) + '</dt>';
+            if (typeof value === 'string') {
+                html += '<dd>' + esc(value) + '</dd>';
+            } else {
+                html += '<dd><pre style="margin:0"><code>' + esc(JSON.stringify(value, null, 2)) + '</code></pre></dd>';
+            }
+        }
+        html += '</dl>';
+        return html;
+    }
+
+    function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = String(s);
+        return d.innerHTML;
+    }
+
+    // Initial smart view render
+    const initialData = JSON.parse(document.getElementById('approval-data').textContent);
+    document.getElementById('smart-view').innerHTML = formatSmartView(initialData.tool_input);
+
+    window.toggleView = function() {
+        rawMode = !rawMode;
+        document.getElementById('smart-view').style.display = rawMode ? 'none' : 'block';
+        document.getElementById('raw-view').style.display = rawMode ? 'block' : 'none';
+        document.getElementById('view-toggle').textContent = rawMode ? 'show smart' : 'show raw';
+    };
+
+    // --- Polling ---
+    async function poll() {
+        if (resolved) return;
+        try {
+            const resp = await fetch('/api/v1/approvals/' + approvalId, { credentials: 'same-origin' });
+            if (!resp.ok) return;
+            const approval = await resp.json();
+            updateStatus(approval);
+        } catch (e) {}
+    }
+
+    function updateStatus(approval) {
+        const st = approval.status;
+        let statusHtml = 'Status: ';
+        if (st.type === 'pending') {
+            statusHtml += '<mark>Pending</mark>';
+        } else if (st.type === 'approved') {
+            statusHtml += '<ins>Approved</ins>';
+            if (st.message) statusHtml += ' — ' + esc(st.message);
+            onResolved();
+        } else if (st.type === 'denied') {
+            statusHtml += '<del>Denied</del>';
+            if (st.reason) statusHtml += ' — ' + esc(st.reason);
+            onResolved();
+        } else if (st.type === 'cancelled') {
+            statusHtml += '<s>Cancelled</s>';
+            onResolved();
+        }
+        document.getElementById('status-line').innerHTML = statusHtml;
+
+        // Update raw view
+        const pretty = JSON.stringify(approval.tool_input, null, 2);
+        document.querySelector('#raw-view code').textContent = pretty;
+        document.getElementById('smart-view').innerHTML = formatSmartView(approval.tool_input);
+    }
+
+    function onResolved() {
+        resolved = true;
+        document.getElementById('action-buttons').innerHTML = '';
+    }
+
+    // --- Actions ---
+    window.doApprove = async function() {
+        await fetch('/api/v1/approvals/' + approvalId + '/resolve', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'approve', message: null })
+        });
+        poll();
+    };
+
+    window.showDeny = function() {
+        const el = document.getElementById('deny-inline');
+        if (el) {
+            el.classList.add('visible');
+            document.getElementById('deny-reason').focus();
+        }
+    };
+
+    window.hideDeny = function() {
+        const el = document.getElementById('deny-inline');
+        if (el) el.classList.remove('visible');
+    };
+
+    window.doDeny = async function() {
+        const reason = document.getElementById('deny-reason').value || '';
+        await fetch('/api/v1/approvals/' + approvalId + '/resolve', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'deny', message: reason })
+        });
+        hideDeny();
+        poll();
+    };
+
+    // --- Keyboard shortcuts ---
+    document.addEventListener('keydown', function(e) {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+        const key = e.key;
+        if (key === 'Escape' || key === 'Backspace') {
+            e.preventDefault();
+            window.location.href = '/approvals';
+        }
+        else if (key === 'r') { toggleView(); }
+        else if (READWRITE && !resolved && (key === 'a' || key === '1')) { e.preventDefault(); doApprove(); }
+        else if (READWRITE && !resolved && (key === 'd' || key === '2')) { e.preventDefault(); showDeny(); }
+        else if (key === '?') {
+            document.getElementById('help-detail').classList.toggle('visible');
+        }
+    });
+
+    // Start polling
+    setInterval(poll, POLL_MS);
+})();
+</script>
 </body>
 </html>

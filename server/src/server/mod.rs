@@ -86,6 +86,7 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
         api_v1 = api_v1
             .route("/hooks/approval", post(hooks::approval::<N>))
             .route("/approvals/pending", get(handle_list_pending::<N>))
+            .route("/approvals/{id}", get(handle_get_approval::<N>))
             .route("/approvals/{id}/wait", get(handle_approval_wait::<N>))
             .route(
                 "/approvals/{id}/resolve",
@@ -120,12 +121,7 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
         // Web UI routes
         let mut web_routes = Router::new()
             .route("/approvals", get(web::dashboard::<N>))
-            .route("/approvals/{id}", get(web::approval_detail::<N>))
-            .route("/approvals/{id}/resolve", post(web::resolve_approval::<N>))
-            .route(
-                "/approvals/toggle-mode/{session_id}",
-                post(web::toggle_approval_mode::<N>),
-            );
+            .route("/approvals/{id}", get(web::approval_detail::<N>));
 
         if state.config.auth_mode != AuthMode::None {
             // Auth routes (public, no auth required)
@@ -215,6 +211,19 @@ async fn handle_list_pending<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
 ) -> Json<Vec<approvals::Approval>> {
     Json(state.approvals.list_pending().await)
+}
+
+/// GET /api/v1/approvals/{id} — get a single approval by ID.
+async fn handle_get_approval<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<approvals::Approval>, AppError> {
+    state
+        .approvals
+        .get(id)
+        .await
+        .ok_or_else(|| AppError::ApprovalNotFound(id.to_string()))
+        .map(Json)
 }
 
 #[derive(Serialize)]

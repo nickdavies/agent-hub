@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::approvals::Approval;
 use super::config::NotifyConfig;
 use super::presence::PresenceState;
-use super::sessions::SessionNotifyConfig;
+use super::sessions::{EditorType, SessionNotifyConfig};
 
 /// Serializable snapshot of server state that survives restarts.
 #[derive(Serialize, Deserialize)]
@@ -25,6 +25,8 @@ pub struct PersistedState {
 pub struct PersistedSession {
     pub project: String,
     pub config: SessionNotifyConfig,
+    #[serde(default)]
+    pub editor_type: EditorType,
 }
 
 /// Encapsulates all storage operations for server state persistence.

@@ -14,6 +14,7 @@ use super::AppState;
 use super::approvals;
 use super::approvals::ApprovalStatus;
 use super::notifier::Notifier;
+use super::sessions::EditorType;
 use crate::server::presence::PresenceState;
 
 /// Common fields from hook payloads. Serde ignores unknown fields by default.
@@ -22,6 +23,7 @@ pub struct HookPayload {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
     pub message: Option<String>,
+    pub editor_type: Option<EditorType>,
 }
 
 /// Tracks pending delayed notifications so they can be cancelled.
@@ -79,7 +81,10 @@ pub async fn stop<N: Notifier>(
     // Cancel any pending permission notification before sending the stop notification
     state.pending.cancel(&session_id).await;
 
-    let project = state.sessions.get_or_register(&session_id, &cwd).await;
+    let project = state
+        .sessions
+        .get_or_register(&session_id, &cwd, payload.editor_type)
+        .await;
     let session_cfg = state.sessions.get_config(&session_id).await;
     let presence = state.presence.get().await;
     let global = state.notify_config.read().await;
@@ -121,7 +126,10 @@ pub async fn notification<N: Notifier>(
         }
     };
 
-    let project = state.sessions.get_or_register(&session_id, &cwd).await;
+    let project = state
+        .sessions
+        .get_or_register(&session_id, &cwd, payload.editor_type)
+        .await;
     let session_cfg = state.sessions.get_config(&session_id).await;
     let presence = state.presence.get().await;
     let global = state.notify_config.read().await;
@@ -196,6 +204,7 @@ pub struct ApprovalRequest {
     pub tool_name: String,
     pub tool_input: serde_json::Value,
     pub context: Option<String>,
+    pub editor_type: Option<EditorType>,
 }
 
 /// Response for POST /hooks/approval
@@ -213,7 +222,7 @@ pub async fn approval<N: Notifier>(
 ) -> Json<ApprovalResponse> {
     let project = state
         .sessions
-        .get_or_register(&req.session_id, &req.cwd)
+        .get_or_register(&req.session_id, &req.cwd, req.editor_type)
         .await;
 
     let approval = state
