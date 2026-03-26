@@ -51,6 +51,15 @@ enum OutputFormat {
     Claude,
 }
 
+impl OutputFormat {
+    fn editor_type(&self) -> &'static str {
+        match self {
+            OutputFormat::Claude => "claude",
+            OutputFormat::Cursor => "cursor",
+        }
+    }
+}
+
 #[derive(Args)]
 struct ApproveArgs {
     #[command(flatten)]
@@ -146,6 +155,7 @@ struct ApprovalRequest {
     cwd: String,
     tool_name: String,
     tool_input: serde_json::Value,
+    editor_type: String,
 }
 
 #[derive(Deserialize)]
@@ -948,6 +958,7 @@ async fn request_remote_approval(
             cwd: cwd.to_string(),
             tool_name: tool_name.to_string(),
             tool_input,
+            editor_type: shared.format.editor_type().to_string(),
         })
         .timeout(Duration::from_secs(10))
         .send()

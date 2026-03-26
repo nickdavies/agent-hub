@@ -5,37 +5,14 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use tower_sessions::Session;
-use tracing::warn;
 use uuid::Uuid;
 
 use super::AppState;
-use super::approvals::{Approval, ApprovalStatus};
+use super::approvals::Approval;
 use super::config::ApprovalFeatureMode;
 use super::notifier::Notifier;
 use super::oauth;
 use super::sessions::SessionView;
-
-const SESSION_CSRF_KEY: &str = "csrf_token";
-
-/// Get or create a CSRF token for the current session.
-async fn get_or_create_csrf(session: &Session) -> String {
-    if let Some(token) = session.get::<String>(SESSION_CSRF_KEY).await.ok().flatten() {
-        return token;
-    }
-    let token = Uuid::new_v4().to_string();
-    let _ = session.insert(SESSION_CSRF_KEY, &token).await;
-    token
-}
-
-/// Validate a submitted CSRF token against the session.
-async fn validate_csrf(session: &Session, submitted: &str) -> bool {
-    session
-        .get::<String>(SESSION_CSRF_KEY)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|stored| stored == submitted)
-}
 
 // --- Templates ---
 
@@ -53,7 +30,7 @@ struct DashboardTemplate {
     sessions: Vec<SessionView>,
     pending_approvals: Vec<Approval>,
     readwrite: bool,
-    csrf_token: String,
+    has_auth: bool,
 }
 
 #[derive(Template)]
@@ -62,8 +39,9 @@ struct ApprovalDetailTemplate {
     email: String,
     approval: Approval,
     tool_input_pretty: String,
+    approval_json: String,
     readwrite: bool,
-    csrf_token: String,
+    has_auth: bool,
 }
 
 // --- Handlers ---
@@ -119,17 +97,17 @@ pub async fn dashboard<N: Notifier>(
     session: Session,
 ) -> Response {
     let email = session_email(&session).await;
-    let csrf_token = get_or_create_csrf(&session).await;
     let sessions = state.sessions.list().await;
     let pending_approvals = state.approvals.list_pending().await;
     let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
+    let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
 
     into_html_response(DashboardTemplate {
         email,
         sessions,
         pending_approvals,
         readwrite,
-        csrf_token,
+        has_auth,
     })
 }
 
@@ -140,7 +118,6 @@ pub async fn approval_detail<N: Notifier>(
     Path(id): Path<Uuid>,
 ) -> Response {
     let email = session_email(&session).await;
-    let csrf_token = get_or_create_csrf(&session).await;
 
     let approval = match state.approvals.get(id).await {
         Some(a) => a,
@@ -149,93 +126,18 @@ pub async fn approval_detail<N: Notifier>(
 
     let tool_input_pretty =
         serde_json::to_string_pretty(&approval.tool_input).unwrap_or_else(|_| "{}".to_string());
+    let approval_json = serde_json::to_string(&approval).unwrap_or_else(|_| "{}".to_string());
     let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
+    let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
 
     into_html_response(ApprovalDetailTemplate {
         email,
         approval,
         tool_input_pretty,
+        approval_json,
         readwrite,
-        csrf_token,
+        has_auth,
     })
-}
-
-#[derive(Deserialize)]
-pub struct ResolveForm {
-    pub decision: String,
-    pub message: Option<String>,
-    pub csrf_token: String,
-}
-
-/// POST /approvals/{id}/resolve — form submission (auth enforced by middleware)
-pub async fn resolve_approval<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-    Path(id): Path<Uuid>,
-    Form(form): Form<ResolveForm>,
-) -> Response {
-    if !validate_csrf(&session, &form.csrf_token).await {
-        warn!("CSRF validation failed for approval {id}");
-        return (StatusCode::FORBIDDEN, "CSRF validation failed").into_response();
-    }
-
-    if state.config.approval_mode != ApprovalFeatureMode::Readwrite {
-        return (StatusCode::FORBIDDEN, "Read-only mode").into_response();
-    }
-
-    let status = match form.decision.as_str() {
-        "approve" => ApprovalStatus::Approved {
-            message: form.message.filter(|m| !m.is_empty()),
-        },
-        "deny" => ApprovalStatus::Denied {
-            reason: form.message.unwrap_or_default(),
-        },
-        _ => return (StatusCode::BAD_REQUEST, "Invalid decision").into_response(),
-    };
-
-    match state.approvals.resolve(id, status).await {
-        Some(_) => Redirect::to("/approvals").into_response(),
-        None => (StatusCode::NOT_FOUND, "Approval not found").into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ToggleModeForm {
-    pub mode: String,
-    pub csrf_token: String,
-}
-
-/// POST /approvals/toggle-mode/{session_id} (auth enforced by middleware)
-pub async fn toggle_approval_mode<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-    Path(session_id): Path<String>,
-    Form(form): Form<ToggleModeForm>,
-) -> Response {
-    if !validate_csrf(&session, &form.csrf_token).await {
-        warn!("CSRF validation failed for toggle-mode {session_id}");
-        return (StatusCode::FORBIDDEN, "CSRF validation failed").into_response();
-    }
-
-    if state.config.approval_mode != ApprovalFeatureMode::Readwrite {
-        return (StatusCode::FORBIDDEN, "Read-only mode").into_response();
-    }
-
-    use super::sessions::{SessionApprovalMode, SessionConfigUpdate};
-    let mode = match form.mode.as_str() {
-        "remote" => SessionApprovalMode::Remote,
-        "terminal" => SessionApprovalMode::Terminal,
-        _ => return (StatusCode::BAD_REQUEST, "Invalid mode").into_response(),
-    };
-
-    let update = SessionConfigUpdate {
-        stop_enabled: None,
-        permission_enabled: None,
-        approval_mode: Some(mode),
-    };
-
-    state.sessions.update_config(&session_id, &update).await;
-    Redirect::to("/approvals").into_response()
 }
 
 /// Extract email from session. Middleware guarantees this exists on authed routes.
