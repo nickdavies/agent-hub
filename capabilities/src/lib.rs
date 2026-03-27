@@ -2,12 +2,12 @@ mod rules;
 mod tools;
 
 pub use rules::{
-    default_to_resolved, load_tool_config, resolve_action, DefaultAction, ResolvedAction,
-    RuleAction, ToolConfig,
+    DefaultAction, ResolvedAction, RuleAction, ToolConfig, default_to_resolved, load_tool_config,
+    resolve_action,
 };
 pub use tools::{
-    expand_tool_group, find_tool_def, get_matchable_args, is_in_workspace, is_path_tool,
-    normalise_tool_name, tools_in_category, ToolCategory, ToolDef, TOOL_DEFS,
+    TOOL_DEFS, ToolCategory, ToolDef, expand_tool_group, find_tool_def, get_matchable_args,
+    is_in_workspace, is_path_tool, normalise_tool_name, tools_in_category,
 };
 
 // --- Canonical hook event representation ---

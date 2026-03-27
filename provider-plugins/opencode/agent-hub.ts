@@ -15,7 +15,7 @@
  *   { "plugin": ["file:///path/to/opencode-plugin"] }
  */
 
-import type { Hooks, PluginInput, PluginModule } from "@opencode-ai/plugin"
+import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import path from "path"
 import fs from "fs"
 import { spawn } from "child_process"
@@ -86,7 +86,7 @@ async function callGateway(payload: object): Promise<GatewayResult> {
     proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString() })
     proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString() })
 
-    proc.on("close", (code) => {
+    proc.on("close", (code: number | null) => {
       if (stderr) log("INFO ", "gateway stderr", { output: stderr.trim() })
       if (code === 2) return resolve({ allowed: false, reason: "gateway: fail-closed" })
       if (code !== 0) return resolve({ allowed: false, reason: `gateway: exit ${code}` })
@@ -98,7 +98,7 @@ async function callGateway(payload: object): Promise<GatewayResult> {
       }
     })
 
-    proc.on("error", (err) => {
+    proc.on("error", (err: Error) => {
       log("ERROR", "gateway spawn error", { err: err.message, bin })
       resolve({ allowed: false, reason: `gateway: ${err.message}` })
     })
@@ -132,13 +132,19 @@ function resolvePath(value: string, base: string): string {
   return path.isAbsolute(value) ? value : path.resolve(base, value)
 }
 
+// Normalise Permission.pattern (string | string[] | undefined) to an array.
+function toPatternArray(pattern: string | string[] | undefined): string[] {
+  if (!pattern) return []
+  return Array.isArray(pattern) ? pattern : [pattern]
+}
+
 // ---------------------------------------------------------------------------
-// Plugin export (new PluginModule format)
+// Plugin export
 // ---------------------------------------------------------------------------
 
 export const id = "agent-hub"
 
-const server: PluginModule["server"] = async (input: PluginInput): Promise<Hooks> => {
+const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const { directory, worktree } = input
 
   return {
@@ -147,28 +153,23 @@ const server: PluginModule["server"] = async (input: PluginInput): Promise<Hooks
       // is already handled by the gateway's in_workspace flag on file rules.
       // Auto-approve it here; the subsequent read/write permission will be
       // sent to the gateway with the correct path for rule evaluation.
-      if (info.permission === "external_directory") {
+      if (info.type === "external_directory") {
         output.status = "allow"
         return
       }
 
-      const tool = PERM_TO_TOOL[info.permission] ?? info.permission
+      const tool = PERM_TO_TOOL[info.type] ?? info.type
       const sid = info.sessionID
 
       // -----------------------------------------------------------------
       // bash: use the raw unparsed command from metadata rather than the
-      // per-subcommand tree-sitter fragments in patterns.
+      // per-subcommand tree-sitter fragments in pattern.
       // -----------------------------------------------------------------
-      if (info.permission === "bash" && typeof info.metadata.command === "string") {
+      if (info.type === "bash" && typeof info.metadata.command === "string") {
         const result = await callGateway(
           makePayload(sid, tool, { command: info.metadata.command }, directory),
         )
-        if (!result.allowed) {
-          output.status = "deny"
-          output.message = result.reason ?? "denied by agent-hub policy"
-        } else {
-          output.status = "allow"
-        }
+        output.status = result.allowed ? "allow" : "deny"
         return
       }
 
@@ -176,9 +177,9 @@ const server: PluginModule["server"] = async (input: PluginInput): Promise<Hooks
       // edit (write.ts / edit.ts / apply_patch.ts):
       //   metadata.filepath is the absolute path (scalar, for write/edit).
       //   metadata.files is an array of per-file objects (for apply_patch).
-      //   patterns contains worktree-relative paths as fallback.
+      //   pattern contains worktree-relative paths as fallback.
       // -----------------------------------------------------------------
-      if (info.permission === "edit") {
+      if (info.type === "edit") {
         // apply_patch: rich per-file metadata
         if (Array.isArray(info.metadata.files)) {
           for (const file of info.metadata.files as Array<{ filePath: string }>) {
@@ -187,7 +188,6 @@ const server: PluginModule["server"] = async (input: PluginInput): Promise<Hooks
             )
             if (!result.allowed) {
               output.status = "deny"
-              output.message = result.reason ?? "denied by agent-hub policy"
               return
             }
           }
@@ -200,23 +200,17 @@ const server: PluginModule["server"] = async (input: PluginInput): Promise<Hooks
           const result = await callGateway(
             makePayload(sid, tool, { path: info.metadata.filepath }, directory),
           )
-          if (!result.allowed) {
-            output.status = "deny"
-            output.message = result.reason ?? "denied by agent-hub policy"
-          } else {
-            output.status = "allow"
-          }
+          output.status = result.allowed ? "allow" : "deny"
           return
         }
 
-        // Fallback: patterns are worktree-relative — resolve against worktree
-        for (const pattern of info.patterns) {
+        // Fallback: pattern entries are worktree-relative — resolve against worktree
+        for (const pat of toPatternArray(info.pattern)) {
           const result = await callGateway(
-            makePayload(sid, tool, { path: resolvePath(pattern, worktree) }, directory),
+            makePayload(sid, tool, { path: resolvePath(pat, worktree) }, directory),
           )
           if (!result.allowed) {
             output.status = "deny"
-            output.message = result.reason ?? "denied by agent-hub policy"
             return
           }
         }
@@ -225,34 +219,25 @@ const server: PluginModule["server"] = async (input: PluginInput): Promise<Hooks
       }
 
       // -----------------------------------------------------------------
-      // read: patterns[0] is already an absolute path.
+      // read: pattern[0] is already an absolute path.
       // -----------------------------------------------------------------
-      if (info.permission === "read") {
+      if (info.type === "read") {
+        const patterns = toPatternArray(info.pattern)
         const result = await callGateway(
-          makePayload(sid, tool, { path: info.patterns[0] ?? "" }, directory),
+          makePayload(sid, tool, { path: patterns[0] ?? "" }, directory),
         )
-        if (!result.allowed) {
-          output.status = "deny"
-          output.message = result.reason ?? "denied by agent-hub policy"
-          return
-        }
-        output.status = "allow"
+        output.status = result.allowed ? "allow" : "deny"
         return
       }
 
       // -----------------------------------------------------------------
       // webfetch: metadata.url is the canonical arg the gateway expects.
       // -----------------------------------------------------------------
-      if (info.permission === "webfetch" && typeof info.metadata.url === "string") {
+      if (info.type === "webfetch" && typeof info.metadata.url === "string") {
         const result = await callGateway(
           makePayload(sid, tool, { url: info.metadata.url }, directory),
         )
-        if (!result.allowed) {
-          output.status = "deny"
-          output.message = result.reason ?? "denied by agent-hub policy"
-          return
-        }
-        output.status = "allow"
+        output.status = result.allowed ? "allow" : "deny"
         return
       }
 
@@ -262,18 +247,13 @@ const server: PluginModule["server"] = async (input: PluginInput): Promise<Hooks
       // Single call with empty tool_input. get_matchable_args returns []
       // for tools not in TOOL_DEFS and the rule engine falls to the
       // configured default (typically "ask", escalating to the server).
-      // We do NOT loop over info.patterns — those are opencode-internal
+      // We do NOT loop over info.pattern — those are opencode-internal
       // representations unrelated to what the gateway expects.
       // -----------------------------------------------------------------
       const result = await callGateway(makePayload(sid, tool, {}, directory))
-      if (!result.allowed) {
-        output.status = "deny"
-        output.message = result.reason ?? "denied by agent-hub policy"
-        return
-      }
-      output.status = "allow"
+      output.status = result.allowed ? "allow" : "deny"
     },
   }
 }
 
-export default { server } satisfies PluginModule
+export default { server }

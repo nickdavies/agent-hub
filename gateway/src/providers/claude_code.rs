@@ -1,6 +1,6 @@
 use capabilities::{
-    normalise_tool_name, DecisionStatus, HookDecision, ParseError, Provider, ProviderCapabilities,
-    ToolHookEvent,
+    DecisionStatus, HookDecision, ParseError, Provider, ProviderCapabilities, ToolHookEvent,
+    normalise_tool_name,
 };
 
 /// Tool name map for Claude Code. Claude Code uses its own canonical names natively.
@@ -51,7 +51,7 @@ impl Provider for ClaudeCode {
             .unwrap_or("PreToolUse")
             .to_string();
 
-        let session_display_name = build_display_name(&session_id, &[cwd.clone()]);
+        let session_display_name = build_display_name(&session_id, std::slice::from_ref(&cwd));
 
         Ok(ToolHookEvent {
             session_id,

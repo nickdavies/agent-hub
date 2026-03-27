@@ -144,12 +144,12 @@ pub(crate) fn parse_tool_entry(entry: &str) -> Result<ToolMatcher, String> {
 
 /// Split "Write(src/**)" into ("Write", Some("src/**")), or "Write" into ("Write", None).
 fn split_entry(entry: &str) -> (&str, Option<&str>) {
-    if let Some(paren_start) = entry.find('(') {
-        if entry.ends_with(')') {
-            let name = &entry[..paren_start];
-            let pat = &entry[paren_start + 1..entry.len() - 1];
-            return (name, Some(pat));
-        }
+    if let Some(paren_start) = entry.find('(')
+        && entry.ends_with(')')
+    {
+        let name = &entry[..paren_start];
+        let pat = &entry[paren_start + 1..entry.len() - 1];
+        return (name, Some(pat));
     }
     (entry, None)
 }
@@ -301,7 +301,7 @@ pub fn default_to_resolved(default: &DefaultAction) -> ResolvedAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{tools_in_category, ToolCategory};
+    use crate::tools::{ToolCategory, tools_in_category};
 
     // --- parse_tool_entry ---
 

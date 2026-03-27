@@ -247,10 +247,7 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
 ///
 /// The input is always in Claude Code wire format (see DelegatePayload), so delegates
 /// only need to understand one format regardless of which provider fired the hook.
-async fn spawn_delegate(
-    command: &str,
-    input: &str,
-) -> Result<DelegateResult, String> {
+async fn spawn_delegate(command: &str, input: &str) -> Result<DelegateResult, String> {
     let parts: Vec<&str> = command.split_whitespace().collect();
     let (cmd, cmd_args) = parts.split_first().ok_or("empty delegate command")?;
 
@@ -291,7 +288,12 @@ async fn spawn_delegate(
 
     let json: serde_json::Value = match serde_json::from_str(stdout.trim()) {
         Ok(v) => v,
-        Err(_) => return Ok(DelegateResult { permission: None, reason: None }),
+        Err(_) => {
+            return Ok(DelegateResult {
+                permission: None,
+                reason: None,
+            });
+        }
     };
 
     // Delegate always receives Claude Code format, so always parse hookSpecificOutput.
@@ -320,7 +322,10 @@ fn collect_extra(
 ) -> Option<serde_json::Value> {
     match tool_name {
         "Write" => {
-            let path = tool_input.get("path").or_else(|| tool_input.get("file_path"))?.as_str()?;
+            let path = tool_input
+                .get("path")
+                .or_else(|| tool_input.get("file_path"))?
+                .as_str()?;
             let new_content = tool_input.get("content")?.as_str()?;
             let old_content = std::fs::read_to_string(path).unwrap_or_default();
             let diff = make_unified_diff(&old_content, new_content, path);
@@ -329,7 +334,9 @@ fn collect_extra(
         "StrReplace" => {
             let old = tool_input.get("old_string")?.as_str()?;
             let new = tool_input.get("new_string")?.as_str()?;
-            let path = tool_input.get("path").or_else(|| tool_input.get("file_path"))
+            let path = tool_input
+                .get("path")
+                .or_else(|| tool_input.get("file_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("file");
             let diff = make_unified_diff(old, new, path);
@@ -338,14 +345,18 @@ fn collect_extra(
         "Edit" => {
             let old = tool_input.get("old_content")?.as_str()?;
             let new = tool_input.get("new_content")?.as_str()?;
-            let path = tool_input.get("path").or_else(|| tool_input.get("file_path"))
+            let path = tool_input
+                .get("path")
+                .or_else(|| tool_input.get("file_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("file");
             let diff = make_unified_diff(old, new, path);
             Some(serde_json::json!({ "diff": diff }))
         }
         "MultiEdit" => {
-            let path = tool_input.get("path").or_else(|| tool_input.get("file_path"))
+            let path = tool_input
+                .get("path")
+                .or_else(|| tool_input.get("file_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("file");
             let edits = tool_input.get("edits")?.as_array()?;
@@ -445,7 +456,11 @@ async fn escalate_to_server(
         .map_err(|e| format!("failed to parse approval response: {e}"))?;
 
     if approval.status_type != "pending" {
-        return Ok(status_to_decision(&approval.status_type, approval.message, approval.reason));
+        return Ok(status_to_decision(
+            &approval.status_type,
+            approval.message,
+            approval.reason,
+        ));
     }
 
     // Long-poll until resolved or global timeout
@@ -475,7 +490,11 @@ async fn escalate_to_server(
             continue;
         }
 
-        return Ok(status_to_decision(&wait.status_type, wait.message, wait.reason));
+        return Ok(status_to_decision(
+            &wait.status_type,
+            wait.message,
+            wait.reason,
+        ));
     }
 }
 
@@ -503,10 +522,10 @@ fn status_to_decision(
 }
 
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
     }
     path.to_string()
 }
