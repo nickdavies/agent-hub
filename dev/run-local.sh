@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Local test harness for claude-notify with remote approvals
+# Local test harness for agent-hub with remote approvals
 #
 # Uses basic auth by default. Set GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET
 # to also enable Google OIDC.

@@ -122,7 +122,7 @@ impl ServerHandler for NotifyMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                "claude-notify",
+                "agent-hub-server",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
