@@ -16,7 +16,7 @@ RUN mkdir -p server/src hook/src cli/src capabilities/src gateway/src \
     && echo 'pub fn dummy() {}' > capabilities/src/lib.rs \
     && echo 'fn main() {}' > gateway/src/main.rs \
     && cargo build --release -p agent-hub-server \
-    && rm -rf server/src hook/src cli/src capabilities/src gateway/src target/release/deps/agent_hub_server*
+    && rm -rf server/src hook/src cli/src capabilities/src gateway/src target/release/deps/agent_hub_server* target/release/deps/capabilities* target/release/deps/libcapabilities*
 
 # Build real source (server + capabilities dependency)
 COPY capabilities/src/ capabilities/src/
