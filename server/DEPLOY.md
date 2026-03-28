@@ -2,7 +2,7 @@
 
 ## What's built
 
-The server is complete at `~/workspaces/claude_notify/server/`. It builds cleanly, 12 tests pass, zero warnings.
+The server is complete at `~/workspaces/agent-hub/server/`. It builds cleanly, 12 tests pass, zero warnings.
 
 ### Project structure
 ```
@@ -41,7 +41,7 @@ src/
 ### Build & push image
 
 ```sh
-cd ~/workspaces/claude_notify/server
+cd ~/workspaces/agent-hub/server
 docker build -t <registry>/agent-hub-server:latest .
 docker push <registry>/agent-hub-server:latest
 ```

@@ -7,19 +7,24 @@ COPY Cargo.toml Cargo.lock ./
 COPY server/Cargo.toml server/Cargo.toml
 COPY hook/Cargo.toml hook/Cargo.toml
 COPY cli/Cargo.toml cli/Cargo.toml
-RUN mkdir -p server/src hook/src cli/src \
+COPY capabilities/Cargo.toml capabilities/Cargo.toml
+COPY gateway/Cargo.toml gateway/Cargo.toml
+RUN mkdir -p server/src hook/src cli/src capabilities/src gateway/src \
     && echo 'fn main() {}' > server/src/main.rs \
     && echo 'fn main() {}' > hook/src/main.rs \
     && echo 'fn main() {}' > cli/src/main.rs \
-    && cargo build --release -p claude-notify \
-    && rm -rf server/src hook/src cli/src target/release/deps/claude_notify*
+    && echo 'pub fn dummy() {}' > capabilities/src/lib.rs \
+    && echo 'fn main() {}' > gateway/src/main.rs \
+    && cargo build --release -p agent-hub-server \
+    && rm -rf server/src hook/src cli/src capabilities/src gateway/src target/release/deps/agent_hub_server* target/release/deps/capabilities* target/release/deps/libcapabilities*
 
-# Build real source (server only)
+# Build real source (server + capabilities dependency)
+COPY capabilities/src/ capabilities/src/
 COPY server/src/ server/src/
 COPY server/templates/ server/templates/
-RUN cargo build --release -p claude-notify
+RUN cargo build --release -p agent-hub-server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/claude-notify /usr/local/bin/claude-notify
-ENTRYPOINT ["claude-notify"]
+COPY --from=builder /app/target/release/agent-hub-server /usr/local/bin/agent-hub-server
+ENTRYPOINT ["agent-hub-server"]
