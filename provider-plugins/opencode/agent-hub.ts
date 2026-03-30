@@ -16,6 +16,7 @@
  */
 
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
+import type { PermissionRequest } from "@opencode-ai/sdk/v2"
 import path from "path"
 import fs from "fs"
 import { spawn } from "child_process"
@@ -62,6 +63,7 @@ const PERM_TO_TOOL: Record<string, string> = {
 
 interface GatewayResult {
   allowed: boolean
+  ask?: boolean   // true when gateway exited 1 (server unreachable — fall back to human)
   reason?: string
 }
 
@@ -105,7 +107,7 @@ async function callGateway(payload: object): Promise<GatewayResult> {
 
     proc.on("error", (err: Error) => {
       log("ERROR", "gateway spawn error — falling back to ask", { err: err.message, bin })
-      resolve({ allowed: false, reason: err.message })
+      resolve({ allowed: false, ask: true, reason: err.message })
     })
 
     proc.stdin.end(JSON.stringify(payload))
@@ -137,10 +139,10 @@ function resolvePath(value: string, base: string): string {
   return path.isAbsolute(value) ? value : path.resolve(base, value)
 }
 
-// Normalise Permission.pattern (string | string[] | undefined) to an array.
-function toPatternArray(pattern: string | string[] | undefined): string[] {
-  if (!pattern) return []
-  return Array.isArray(pattern) ? pattern : [pattern]
+// Apply a GatewayResult to the hook output object.
+function apply(r: GatewayResult, output: { status: "allow" | "deny" | "ask"; message?: string }) {
+  output.status = r.ask ? "ask" : r.allowed ? "allow" : "deny"
+  if (r.reason && !r.allowed && !r.ask) output.message = r.reason
 }
 
 // ---------------------------------------------------------------------------
@@ -153,28 +155,32 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const { directory, worktree } = input
 
   return {
-    "permission.ask": async (info, output) => {
+    "permission.ask": async (_info, output) => {
+      // The published Permission type from @opencode-ai/sdk still uses the old
+      // field names (type/pattern). Cast to PermissionRequest which matches what
+      // opencode actually sends at runtime (permission/patterns).
+      const info = _info as unknown as PermissionRequest
       // external_directory is opencode-internal — the in_workspace distinction
       // is already handled by the gateway's in_workspace flag on file rules.
       // Auto-approve it here; the subsequent read/write permission will be
       // sent to the gateway with the correct path for rule evaluation.
-      if (info.type === "external_directory") {
+      if (info.permission === "external_directory") {
         output.status = "allow"
         return
       }
 
-      const tool = PERM_TO_TOOL[info.type] ?? info.type
+      const tool = PERM_TO_TOOL[info.permission] ?? info.permission
       const sid = info.sessionID
 
       // -----------------------------------------------------------------
       // bash: use the raw unparsed command from metadata rather than the
-      // per-subcommand tree-sitter fragments in pattern.
+      // per-subcommand tree-sitter fragments in patterns.
       // -----------------------------------------------------------------
-      if (info.type === "bash" && typeof info.metadata.command === "string") {
+      if (info.permission === "bash" && typeof info.metadata.command === "string") {
         const result = await callGateway(
           makePayload(sid, tool, { command: info.metadata.command }, directory),
         )
-        output.status = result.allowed ? "allow" : "deny"
+        apply(result, output)
         return
       }
 
@@ -182,9 +188,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // edit (write.ts / edit.ts / apply_patch.ts):
       //   metadata.filepath is the absolute path (scalar, for write/edit).
       //   metadata.files is an array of per-file objects (for apply_patch).
-      //   pattern contains worktree-relative paths as fallback.
+      //   patterns contains worktree-relative paths as fallback.
       // -----------------------------------------------------------------
-      if (info.type === "edit") {
+      if (info.permission === "edit") {
         // apply_patch: rich per-file metadata
         if (Array.isArray(info.metadata.files)) {
           for (const file of info.metadata.files as Array<{ filePath: string }>) {
@@ -192,7 +198,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
               makePayload(sid, tool, { path: file.filePath }, directory),
             )
             if (!result.allowed) {
-              output.status = "deny"
+              apply(result, output)
               return
             }
           }
@@ -205,17 +211,17 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           const result = await callGateway(
             makePayload(sid, tool, { path: info.metadata.filepath }, directory),
           )
-          output.status = result.allowed ? "allow" : "deny"
+          apply(result, output)
           return
         }
 
-        // Fallback: pattern entries are worktree-relative — resolve against worktree
-        for (const pat of toPatternArray(info.pattern)) {
+        // Fallback: patterns entries are worktree-relative — resolve against worktree
+        for (const pat of info.patterns) {
           const result = await callGateway(
             makePayload(sid, tool, { path: resolvePath(pat, worktree) }, directory),
           )
           if (!result.allowed) {
-            output.status = "deny"
+            apply(result, output)
             return
           }
         }
@@ -224,25 +230,24 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       }
 
       // -----------------------------------------------------------------
-      // read: pattern[0] is already an absolute path.
+      // read: patterns[0] is already an absolute path.
       // -----------------------------------------------------------------
-      if (info.type === "read") {
-        const patterns = toPatternArray(info.pattern)
+      if (info.permission === "read") {
         const result = await callGateway(
-          makePayload(sid, tool, { path: patterns[0] ?? "" }, directory),
+          makePayload(sid, tool, { path: info.patterns[0] ?? "" }, directory),
         )
-        output.status = result.allowed ? "allow" : "deny"
+        apply(result, output)
         return
       }
 
       // -----------------------------------------------------------------
       // webfetch: metadata.url is the canonical arg the gateway expects.
       // -----------------------------------------------------------------
-      if (info.type === "webfetch" && typeof info.metadata.url === "string") {
+      if (info.permission === "webfetch" && typeof info.metadata.url === "string") {
         const result = await callGateway(
           makePayload(sid, tool, { url: info.metadata.url }, directory),
         )
-        output.status = result.allowed ? "allow" : "deny"
+        apply(result, output)
         return
       }
 
@@ -256,9 +261,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // representations unrelated to what the gateway expects.
       // -----------------------------------------------------------------
       const result = await callGateway(makePayload(sid, tool, {}, directory))
-      output.status = result.allowed ? "allow" : "deny"
+      apply(result, output)
     },
   }
 }
 
-export default { server }
+export default { id, server }
