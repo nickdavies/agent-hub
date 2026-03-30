@@ -18,7 +18,8 @@ use uuid::Uuid;
 ///
 /// Exit codes:
 ///   0 = success (approval decision written to stdout)
-///   2 = fail-closed (error occurred or timeout; agent should treat as deny)
+///   1 = server unreachable (connection error, timeout); agent should ask the user
+///   2 = fail-closed (bad input, config error, policy denial); agent should deny
 #[derive(Parser)]
 #[command(name = "agent-hub-gateway", version)]
 struct Cli {
@@ -124,6 +125,13 @@ struct DelegateResult {
 
 // --- Entrypoint ---
 
+enum RunError {
+    /// Hard failure — bad input, config error, etc. Agent should deny.
+    FailClosed(String),
+    /// Server unreachable — connection error, timeout, bad response. Agent should ask the user.
+    ServerUnreachable(String),
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -141,28 +149,30 @@ async fn main() -> ExitCode {
 
     let config_path = expand_tilde(&cli.config);
 
-    let result = run(&cli, &*provider, &config_path).await;
-
-    match result {
+    match run(&cli, &*provider, &config_path).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+        Err(RunError::ServerUnreachable(e)) => {
+            eprintln!("agent-hub-gateway: {e}");
+            ExitCode::from(1)
+        }
+        Err(RunError::FailClosed(e)) => {
             eprintln!("agent-hub-gateway: {e}");
             ExitCode::from(2)
         }
     }
 }
 
-async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<(), String> {
+async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<(), RunError> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
-        .map_err(|e| format!("failed to read stdin: {e}"))?;
+        .map_err(|e| RunError::FailClosed(format!("failed to read stdin: {e}")))?;
 
     let event = provider
         .parse_input(&input)
-        .map_err(|e| format!("failed to parse hook payload: {e}"))?;
+        .map_err(|e| RunError::FailClosed(format!("failed to parse hook payload: {e}")))?;
 
-    let config = load_tool_config(config_path)?;
+    let config = load_tool_config(config_path).map_err(RunError::FailClosed)?;
 
     let action = resolve_action(
         &config,
@@ -190,8 +200,12 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
         }
         ResolvedAction::Delegate(ref command) => {
             let delegate_input = serde_json::to_string(&DelegatePayload::from_event(&event))
-                .map_err(|e| format!("failed to serialise delegate payload: {e}"))?;
-            let result = spawn_delegate(command, &delegate_input).await?;
+                .map_err(|e| {
+                    RunError::FailClosed(format!("failed to serialise delegate payload: {e}"))
+                })?;
+            let result = spawn_delegate(command, &delegate_input)
+                .await
+                .map_err(RunError::FailClosed)?;
             match result.permission.as_deref() {
                 Some("allow") => HookDecision {
                     status: DecisionStatus::Approved,
@@ -412,7 +426,7 @@ async fn escalate_to_server(
     provider: &dyn Provider,
     event: &ToolHookEvent,
     extra: Option<serde_json::Value>,
-) -> Result<HookDecision, String> {
+) -> Result<HookDecision, RunError> {
     let client = reqwest::Client::new();
     let base = cli.server.trim_end_matches('/');
 
@@ -441,19 +455,18 @@ async fn escalate_to_server(
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| format!("failed to register approval: {e}"))?;
+        .map_err(|e| RunError::ServerUnreachable(format!("failed to register approval: {e}")))?;
 
     if !register_resp.status().is_success() {
-        return Err(format!(
+        return Err(RunError::ServerUnreachable(format!(
             "server returned {} for approval registration",
             register_resp.status()
-        ));
+        )));
     }
 
-    let approval: ApprovalResponse = register_resp
-        .json()
-        .await
-        .map_err(|e| format!("failed to parse approval response: {e}"))?;
+    let approval: ApprovalResponse = register_resp.json().await.map_err(|e| {
+        RunError::ServerUnreachable(format!("failed to parse approval response: {e}"))
+    })?;
 
     if approval.status_type != "pending" {
         return Ok(status_to_decision(
@@ -469,7 +482,9 @@ async fn escalate_to_server(
 
     loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err("approval timed out".to_string());
+            return Err(RunError::ServerUnreachable(
+                "approval timed out".to_string(),
+            ));
         }
 
         let resp = client
@@ -478,13 +493,12 @@ async fn escalate_to_server(
             .timeout(Duration::from_secs(60))
             .send()
             .await
-            .map_err(|e| format!("wait request failed: {e}"))?;
+            .map_err(|e| RunError::ServerUnreachable(format!("wait request failed: {e}")))?;
 
         let http_status = resp.status();
-        let wait: WaitResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("failed to parse wait response: {e}"))?;
+        let wait: WaitResponse = resp.json().await.map_err(|e| {
+            RunError::ServerUnreachable(format!("failed to parse wait response: {e}"))
+        })?;
 
         if http_status.as_u16() == 202 || wait.status_type == "pending" {
             continue;
