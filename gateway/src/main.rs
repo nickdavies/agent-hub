@@ -172,6 +172,11 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
         .parse_input(&input)
         .map_err(|e| RunError::FailClosed(format!("failed to parse hook payload: {e}")))?;
 
+    eprintln!(
+        "[info] tool={} session={} cwd={}",
+        event.tool_name, event.session_id, event.cwd
+    );
+
     let config = load_tool_config(config_path).map_err(RunError::FailClosed)?;
 
     let action = resolve_action(
@@ -182,23 +187,36 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
         Some(&event.workspace_roots),
     );
 
+    eprintln!("[info] resolved action: {:?}", action);
+
     let decision = match action {
-        ResolvedAction::Allow => HookDecision {
-            status: DecisionStatus::Approved,
-            message: None,
-        },
-        ResolvedAction::Deny(msg) => HookDecision {
-            status: match msg {
-                Some(m) => DecisionStatus::DeniedWithReason(m),
-                None => DecisionStatus::Denied,
-            },
-            message: None,
-        },
+        ResolvedAction::Allow => {
+            eprintln!("[info] allowing tool={}", event.tool_name);
+            HookDecision {
+                status: DecisionStatus::Approved,
+                message: None,
+            }
+        }
+        ResolvedAction::Deny(msg) => {
+            eprintln!("[info] denying tool={} reason={:?}", event.tool_name, msg);
+            HookDecision {
+                status: match msg {
+                    Some(m) => DecisionStatus::DeniedWithReason(m),
+                    None => DecisionStatus::Denied,
+                },
+                message: None,
+            }
+        }
         ResolvedAction::Ask => {
+            eprintln!(
+                "[info] escalating tool={} to server for human approval",
+                event.tool_name
+            );
             let extra = collect_extra(&event.tool_name, &event.tool_input, None);
             escalate_to_server(cli, provider, &event, extra).await?
         }
         ResolvedAction::Delegate(ref command) => {
+            eprintln!("[info] delegating tool={} to: {}", event.tool_name, command);
             let delegate_input = serde_json::to_string(&DelegatePayload::from_event(&event))
                 .map_err(|e| {
                     RunError::FailClosed(format!("failed to serialise delegate payload: {e}"))
@@ -206,6 +224,10 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
             let result = spawn_delegate(command, &delegate_input)
                 .await
                 .map_err(RunError::FailClosed)?;
+            eprintln!(
+                "[info] delegate returned: permission={:?} reason={:?}",
+                result.permission, result.reason
+            );
             match result.permission.as_deref() {
                 Some("allow") => HookDecision {
                     status: DecisionStatus::Approved,
@@ -217,6 +239,10 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
                 },
                 Some("ask") => {
                     // Delegate wants human review; escalate with original input for context
+                    eprintln!(
+                        "[info] delegate requested human review, escalating tool={} to server",
+                        event.tool_name
+                    );
                     let extra = collect_extra(
                         &event.tool_name,
                         &event.tool_input,
@@ -226,6 +252,10 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
                 }
                 _ => {
                     // Delegate returned nothing parseable; fall back to config default
+                    eprintln!(
+                        "[warn] delegate returned unrecognised permission={:?}, falling back to config default={:?}",
+                        result.permission, config.default
+                    );
                     let fallback = default_to_resolved(&config.default);
                     match fallback {
                         ResolvedAction::Allow => HookDecision {
@@ -240,6 +270,10 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
                             message: None,
                         },
                         ResolvedAction::Ask => {
+                            eprintln!(
+                                "[info] config default=ask, escalating tool={} to server",
+                                event.tool_name
+                            );
                             let extra = collect_extra(&event.tool_name, &event.tool_input, None);
                             escalate_to_server(cli, provider, &event, extra).await?
                         }
@@ -249,6 +283,11 @@ async fn run(cli: &Cli, provider: &dyn Provider, config_path: &str) -> Result<()
             }
         }
     };
+
+    eprintln!(
+        "[info] final decision for tool={}: {:?}",
+        event.tool_name, decision.status
+    );
 
     // If the provider cannot block inline, skip writing output for server-escalated denials —
     // the server was notified for observability but the agent will proceed regardless.
@@ -438,6 +477,10 @@ async fn escalate_to_server(
 
     let request_id = Uuid::new_v4().to_string();
     let register_url = format!("{base}/api/v1/hooks/approval");
+    eprintln!(
+        "[info] registering approval request: tool={} session={}",
+        event.tool_name, event.session_id
+    );
     let register_resp = client
         .post(&register_url)
         .bearer_auth(&cli.token)
@@ -458,6 +501,10 @@ async fn escalate_to_server(
         .map_err(|e| RunError::ServerUnreachable(format!("failed to register approval: {e}")))?;
 
     if !register_resp.status().is_success() {
+        eprintln!(
+            "[error] server returned {} for approval registration",
+            register_resp.status()
+        );
         return Err(RunError::ServerUnreachable(format!(
             "server returned {} for approval registration",
             register_resp.status()
@@ -469,6 +516,10 @@ async fn escalate_to_server(
     })?;
 
     if approval.status_type != "pending" {
+        eprintln!(
+            "[info] approval immediately resolved: status={}",
+            approval.status_type
+        );
         return Ok(status_to_decision(
             &approval.status_type,
             approval.message,
@@ -480,30 +531,95 @@ async fn escalate_to_server(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(cli.timeout);
     let wait_url = format!("{base}/api/v1/approvals/{}/wait", approval.id);
 
+    eprintln!(
+        "[info] waiting for approval (id={}, timeout={}s) — approve or deny in the web UI",
+        approval.id, cli.timeout
+    );
+
+    let mut attempt: u32 = 0;
     loop {
-        if tokio::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            eprintln!(
+                "[error] approval timed out after {}s with no decision — denying",
+                cli.timeout
+            );
             return Err(RunError::ServerUnreachable(
                 "approval timed out".to_string(),
             ));
         }
+
+        attempt += 1;
 
         let resp = client
             .get(&wait_url)
             .bearer_auth(&cli.token)
             .timeout(Duration::from_secs(60))
             .send()
-            .await
-            .map_err(|e| RunError::ServerUnreachable(format!("wait request failed: {e}")))?;
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[warn] wait request failed (attempt {attempt}, retrying in 2s): {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
 
         let http_status = resp.status();
-        let wait: WaitResponse = resp.json().await.map_err(|e| {
-            RunError::ServerUnreachable(format!("failed to parse wait response: {e}"))
-        })?;
 
-        if http_status.as_u16() == 202 || wait.status_type == "pending" {
+        // Non-success HTTP responses that indicate the approval is gone (4xx)
+        // are not retryable. Everything else (5xx, network weirdness) is.
+        if !http_status.is_success() {
+            if http_status.is_client_error() {
+                eprintln!(
+                    "[error] server returned {http_status} for approval wait — approval may have expired, denying"
+                );
+                return Err(RunError::ServerUnreachable(format!(
+                    "server returned {http_status} for approval wait"
+                )));
+            }
+            eprintln!(
+                "[warn] server returned {http_status} for approval wait (attempt {attempt}, retrying in 2s)"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
 
+        let body = resp.text().await;
+        let body = match body {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[warn] failed to read wait response body (attempt {attempt}, retrying in 2s): {e}"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        let wait: WaitResponse = match serde_json::from_str(&body) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!(
+                    "[warn] failed to parse wait response (attempt {attempt}, retrying in 2s): {e} — body: {body}"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        if http_status.as_u16() == 202 || wait.status_type == "pending" {
+            let secs_remaining = remaining.as_secs();
+            eprintln!(
+                "[info] approval still pending (attempt {attempt}, {secs_remaining}s remaining)"
+            );
+            // No sleep — server already held the connection open for its long-poll window.
+            continue;
+        }
+
+        eprintln!("[info] approval resolved: status={}", wait.status_type);
         return Ok(status_to_decision(
             &wait.status_type,
             wait.message,
