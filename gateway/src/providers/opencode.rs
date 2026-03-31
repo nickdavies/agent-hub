@@ -11,8 +11,14 @@ use super::claude_code::build_display_name;
 const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("bash", "Bash"),
     ("edit", "Write"),
+    ("glob", "Glob"),
+    ("grep", "Grep"),
+    ("multiedit", "MultiEdit"),
     ("read", "Read"),
+    ("task", "Task"),
+    ("todowrite", "TodoWrite"),
     ("webfetch", "WebFetch"),
+    ("write", "Write"),
 ];
 
 pub struct Opencode;
