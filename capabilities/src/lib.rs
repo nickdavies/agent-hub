@@ -10,6 +10,16 @@ pub use tools::{
     is_in_workspace, is_path_tool, normalise_tool_name, tools_in_category,
 };
 
+/// Expand a leading `~/` to the user's home directory.
+pub fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
+    path.to_string()
+}
+
 // --- Canonical hook event representation ---
 
 /// Internal canonical representation of a hook input event.

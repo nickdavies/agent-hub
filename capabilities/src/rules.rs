@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::expand_tilde;
 use crate::tools::{expand_tool_group, get_matchable_args, is_in_workspace, is_path_tool};
 
 // --- JSON deserialization types ---
@@ -23,6 +24,10 @@ struct RuleJson {
     pattern: Option<String>,
     /// If set, rule only matches paths inside (true) or outside (false) workspace roots.
     in_workspace: Option<bool>,
+    /// If set, rule only matches file-tool calls where ALL resolved paths fall under at least
+    /// one of these directory prefixes. Tilde (~) is expanded at load time.
+    /// Ignored for non-path tools (Shell, WebFetch, etc.).
+    in_paths: Option<Vec<String>>,
 }
 
 // --- Compiled config types ---
@@ -91,6 +96,7 @@ pub(crate) struct Rule {
     pub(crate) command: Option<String>,
     pub(crate) message: Option<String>,
     pub(crate) in_workspace: Option<bool>,
+    pub(crate) in_paths: Option<Vec<String>>,
     pub(crate) source_json: String,
 }
 
@@ -211,6 +217,9 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
             command: raw_rule.command,
             message: raw_rule.message,
             in_workspace: raw_rule.in_workspace,
+            in_paths: raw_rule
+                .in_paths
+                .map(|paths| paths.into_iter().map(|p| expand_tilde(&p)).collect()),
             source_json,
         });
     }
@@ -268,6 +277,20 @@ pub fn resolve_action(
                 _ => {}
             }
         }
+
+        if let Some(in_paths) = &rule.in_paths
+            && is_path_tool(tool_name)
+        {
+            if resolved_paths.is_empty() {
+                // No path extracted — can't check in_paths, skip rule.
+                continue;
+            }
+            let all_in_paths = resolved_paths.iter().all(|p| is_in_workspace(p, in_paths));
+            if !all_in_paths {
+                continue;
+            }
+        }
+        // Non-path tools: in_paths is ignored, rule applies normally.
 
         if rule
             .matchers
@@ -419,6 +442,7 @@ mod tests {
             command: None,
             message: None,
             in_workspace: None,
+            in_paths: None,
             source_json: String::new(),
         }
     }
@@ -433,6 +457,7 @@ mod tests {
             command: None,
             message: Some(message.to_string()),
             in_workspace: None,
+            in_paths: None,
             source_json: String::new(),
         }
     }
@@ -451,6 +476,7 @@ mod tests {
             command: None,
             message: None,
             in_workspace,
+            in_paths: None,
             source_json: String::new(),
         }
     }
@@ -758,6 +784,7 @@ mod tests {
                     command: None,
                     message: Some("Access to .ssh is not allowed".into()),
                     in_workspace: None,
+                    in_paths: None,
                     source_json: String::new(),
                 },
                 make_rule(&["Read", "Write"], RuleAction::Allow),
@@ -1079,6 +1106,262 @@ mod tests {
         assert!(matches!(
             resolve_action(&config, "SemanticSearch", Some(&input), None, Some(&roots)),
             ResolvedAction::Deny(_)
+        ));
+    }
+
+    // --- in_paths ---
+
+    fn make_in_paths_rule(entries: &[&str], dirs: &[&str], action: RuleAction) -> Rule {
+        Rule {
+            matchers: entries
+                .iter()
+                .map(|e| parse_tool_entry(e).unwrap())
+                .collect(),
+            action,
+            command: None,
+            message: None,
+            in_workspace: None,
+            in_paths: Some(dirs.iter().map(|s| s.to_string()).collect()),
+            source_json: String::new(),
+        }
+    }
+
+    #[test]
+    fn in_paths_allows_matching_path() {
+        let config = make_config(
+            vec![make_in_paths_rule(
+                &["Read"],
+                &["/home/user/oss"],
+                RuleAction::Allow,
+            )],
+            DefaultAction::Ask,
+        );
+        let input = serde_json::json!({"path": "/home/user/oss/cilium/main.go"});
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, None),
+            ResolvedAction::Allow
+        ));
+    }
+
+    #[test]
+    fn in_paths_skips_non_matching_path() {
+        let config = make_config(
+            vec![make_in_paths_rule(
+                &["Read"],
+                &["/home/user/oss"],
+                RuleAction::Allow,
+            )],
+            DefaultAction::Ask,
+        );
+        let input = serde_json::json!({"path": "/etc/passwd"});
+        // Rule skipped, falls to default Ask
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, None),
+            ResolvedAction::Ask
+        ));
+    }
+
+    #[test]
+    fn in_paths_no_path_extracted_skips_rule() {
+        let config = make_config(
+            vec![
+                make_in_paths_rule(&["Read"], &["/home/user/oss"], RuleAction::Allow),
+                make_rule(&["Read"], RuleAction::Deny),
+            ],
+            DefaultAction::Ask,
+        );
+        // No path field in input — can't check in_paths, rule skipped, falls to next rule
+        let input = serde_json::json!({"other": "value"});
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, None),
+            ResolvedAction::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn in_paths_semantic_search_all_in_paths() {
+        let config = make_config(
+            vec![make_in_paths_rule(
+                &["SemanticSearch"],
+                &["/home/user/oss"],
+                RuleAction::Allow,
+            )],
+            DefaultAction::Ask,
+        );
+        let input = serde_json::json!({
+            "query": "auth",
+            "target_directories": ["/home/user/oss/cilium/src", "/home/user/oss/linux/net"]
+        });
+        assert!(matches!(
+            resolve_action(&config, "SemanticSearch", Some(&input), None, None),
+            ResolvedAction::Allow
+        ));
+    }
+
+    #[test]
+    fn in_paths_semantic_search_mixed_skips_rule() {
+        let config = make_config(
+            vec![
+                make_in_paths_rule(&["SemanticSearch"], &["/home/user/oss"], RuleAction::Allow),
+                make_rule(&["SemanticSearch"], RuleAction::Ask),
+            ],
+            DefaultAction::Deny,
+        );
+        // One dir inside in_paths, one not — rule skipped, falls to next rule (Ask)
+        let input = serde_json::json!({
+            "query": "secrets",
+            "target_directories": ["/home/user/oss/cilium/src", "/home/user/.ssh"]
+        });
+        assert!(matches!(
+            resolve_action(&config, "SemanticSearch", Some(&input), None, None),
+            ResolvedAction::Ask
+        ));
+    }
+
+    #[test]
+    fn in_paths_multiple_dirs() {
+        let config = make_config(
+            vec![make_in_paths_rule(
+                &["Read"],
+                &["/home/user/oss", "/home/user/workspaces"],
+                RuleAction::Allow,
+            )],
+            DefaultAction::Ask,
+        );
+        let oss = serde_json::json!({"path": "/home/user/oss/cilium/main.go"});
+        let ws = serde_json::json!({"path": "/home/user/workspaces/project/src/lib.rs"});
+        let other = serde_json::json!({"path": "/home/user/.ssh/id_rsa"});
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&oss), None, None),
+            ResolvedAction::Allow
+        ));
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&ws), None, None),
+            ResolvedAction::Allow
+        ));
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&other), None, None),
+            ResolvedAction::Ask
+        ));
+    }
+
+    #[test]
+    fn in_paths_composes_with_in_workspace() {
+        // Rule requires BOTH in_workspace=true AND in_paths
+        let config = make_config(
+            vec![Rule {
+                matchers: vec![parse_tool_entry("Read").unwrap()],
+                action: RuleAction::Allow,
+                command: None,
+                message: None,
+                in_workspace: Some(true),
+                in_paths: Some(vec!["/home/user/oss".to_string()]),
+                source_json: String::new(),
+            }],
+            DefaultAction::Ask,
+        );
+        let roots = vec!["/home/user/oss/cilium".to_string()];
+
+        // Inside workspace AND inside in_paths → Allow
+        let inside_in_paths = serde_json::json!({"path": "/home/user/oss/cilium/main.go"});
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&inside_in_paths), None, Some(&roots)),
+            ResolvedAction::Allow
+        ));
+
+        // Inside workspace but NOT inside in_paths → rule skipped → Ask
+        let inside_not_in_paths =
+            serde_json::json!({"path": "/home/user/oss/cilium/../other/secret.txt"});
+        assert!(matches!(
+            resolve_action(
+                &config,
+                "Read",
+                Some(&inside_not_in_paths),
+                None,
+                Some(&roots)
+            ),
+            ResolvedAction::Ask
+        ));
+    }
+
+    #[test]
+    fn in_paths_tilde_expansion() {
+        // Simulate what load_tool_config does: expand_tilde at load time.
+        // We build the rule manually with the already-expanded path, matching
+        // what HOME would be set to in the test environment.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+        let expanded = format!("{home}/oss");
+        let config = make_config(
+            vec![Rule {
+                matchers: vec![parse_tool_entry("Read").unwrap()],
+                action: RuleAction::Allow,
+                command: None,
+                message: None,
+                in_workspace: None,
+                in_paths: Some(vec![expanded.clone()]),
+                source_json: String::new(),
+            }],
+            DefaultAction::Ask,
+        );
+        let path = format!("{home}/oss/cilium/main.go");
+        let input = serde_json::json!({"path": path});
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, None),
+            ResolvedAction::Allow
+        ));
+    }
+
+    #[test]
+    fn in_paths_prefix_not_confused_with_dir() {
+        // "/home/user/oss-other" should NOT match in_paths "/home/user/oss"
+        let config = make_config(
+            vec![make_in_paths_rule(
+                &["Read"],
+                &["/home/user/oss"],
+                RuleAction::Allow,
+            )],
+            DefaultAction::Ask,
+        );
+        let input = serde_json::json!({"path": "/home/user/oss-other/main.go"});
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, None),
+            ResolvedAction::Ask
+        ));
+    }
+
+    #[test]
+    fn in_paths_dotdot_traversal_blocked() {
+        // /home/user/oss/../unsafe normalises to /home/user/unsafe — must NOT match in_paths /home/user/oss
+        let config = make_config(
+            vec![make_in_paths_rule(
+                &["Read"],
+                &["/home/user/oss"],
+                RuleAction::Allow,
+            )],
+            DefaultAction::Ask,
+        );
+        let input = serde_json::json!({"path": "/home/user/oss/../unsafe/secret.txt"});
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, None),
+            ResolvedAction::Ask
+        ));
+    }
+
+    #[test]
+    fn in_paths_dotdot_within_dir_allowed() {
+        // /home/user/oss/cilium/../linux is still inside /home/user/oss — should be allowed
+        let config = make_config(
+            vec![make_in_paths_rule(
+                &["Read"],
+                &["/home/user/oss"],
+                RuleAction::Allow,
+            )],
+            DefaultAction::Ask,
+        );
+        let input = serde_json::json!({"path": "/home/user/oss/cilium/../linux/net/core.c"});
+        assert!(matches!(
+            resolve_action(&config, "Read", Some(&input), None, None),
+            ResolvedAction::Allow
         ));
     }
 

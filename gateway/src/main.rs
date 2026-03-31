@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use capabilities::{
     ApprovalContext, DecisionStatus, HookDecision, Provider, ResolvedAction, ToolCategory,
-    ToolHookEvent, default_to_resolved, find_tool_def, load_tool_config, resolve_action,
+    ToolHookEvent, default_to_resolved, expand_tilde, find_tool_def, load_tool_config,
+    resolve_action,
 };
 use clap::Parser;
 use providers::{claude_code::ClaudeCode, cursor::Cursor, opencode::Opencode};
@@ -649,13 +650,4 @@ fn status_to_decision(
             }
         }
     }
-}
-
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}/{rest}");
-    }
-    path.to_string()
 }
