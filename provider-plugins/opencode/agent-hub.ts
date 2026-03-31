@@ -88,8 +88,13 @@ async function callGateway(payload: object): Promise<GatewayResult> {
 
     proc.on("close", (code: number | null) => {
       if (stderr) log("INFO ", "gateway stderr", { output: stderr.trim() })
-      if (code === 2) return resolve({ allowed: false, reason: "gateway: fail-closed" })
-      if (code !== 0) return resolve({ allowed: false, reason: `gateway: exit ${code}` })
+      // Exit 1 = server unreachable or approval timed out — deny, do not fall back to opencode ask.
+      if (code === 1) {
+        log("WARN ", "gateway denied (server unreachable or approval timed out)", { reason: stderr.trim() })
+        return resolve({ allowed: false, reason: stderr.trim() || "gateway: server unreachable or timed out" })
+      }
+      // Exit 2 = fail-closed (bad input, config error, policy denial).
+      if (code !== 0) return resolve({ allowed: false, reason: "gateway: fail-closed" })
       try {
         resolve(JSON.parse(stdout.trim()) as GatewayResult)
       } catch {
