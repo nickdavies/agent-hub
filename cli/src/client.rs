@@ -107,4 +107,16 @@ impl Client {
         }
         Ok(())
     }
+
+    /// Check that the server accepts our auth token by hitting an authenticated endpoint.
+    /// Returns the HTTP status code on success, or an error string on connection failure.
+    pub async fn check_auth(&self) -> Result<u16, String> {
+        let url = format!("{}/api/v1/sessions", self.base_url);
+        let req = self.auth(self.http.get(&url));
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("connection failed: {e}"))?;
+        Ok(resp.status().as_u16())
+    }
 }

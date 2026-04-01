@@ -1,25 +1,3 @@
-mod rules;
-mod tools;
-
-pub use rules::{
-    DefaultAction, ResolvedAction, RuleAction, ToolConfig, default_to_resolved, load_tool_config,
-    resolve_action,
-};
-pub use tools::{
-    TOOL_DEFS, ToolCategory, ToolDef, expand_tool_group, find_tool_def, get_matchable_args,
-    is_in_workspace, is_path_tool, normalise_tool_name, tools_in_category,
-};
-
-/// Expand a leading `~/` to the user's home directory.
-pub fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}/{rest}");
-    }
-    path.to_string()
-}
-
 // --- Canonical hook event representation ---
 
 /// Internal canonical representation of a hook input event.
@@ -49,7 +27,7 @@ pub struct HookDecision {
     pub message: Option<String>,
 }
 
-// --- Approval context (sent to server with escalated requests) ---
+// --- Approval context (sent to server and review CLI) ---
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalContext {

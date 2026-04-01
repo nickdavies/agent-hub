@@ -4,12 +4,12 @@ use std::io::Read;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use capabilities::{
-    ApprovalContext, DecisionStatus, HookDecision, Provider, ResolvedAction, ToolCategory,
-    ToolHookEvent, default_to_resolved, expand_tilde, find_tool_def, load_tool_config,
-    resolve_action,
-};
+use capabilities::{ApprovalContext, DecisionStatus, HookDecision, Provider, ToolHookEvent};
 use clap::Parser;
+use config::{
+    ResolvedAction, ToolCategory, default_to_resolved, expand_tilde, find_tool_def,
+    load_tool_config, resolve_action,
+};
 use providers::{claude_code::ClaudeCode, cursor::Cursor, opencode::Opencode};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};

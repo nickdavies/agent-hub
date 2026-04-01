@@ -1,7 +1,7 @@
 use capabilities::{
     DecisionStatus, HookDecision, ParseError, Provider, ProviderCapabilities, ToolHookEvent,
-    normalise_tool_name,
 };
+use config::normalise_tool_name;
 
 /// Tool name map for Claude Code. Claude Code uses its own canonical names natively.
 const TOOL_NAME_MAP: &[(&str, &str)] = &[];

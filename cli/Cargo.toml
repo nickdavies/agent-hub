@@ -1,10 +1,10 @@
 [package]
-name = "agent-hub-review"
+name = "agent-hub"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "agent-hub-review"
+name = "agent-hub"
 path = "src/main.rs"
 
 [dependencies]
@@ -12,10 +12,13 @@ anyhow = "1"
 capabilities = { path = "../capabilities" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+config = { path = "../config" }
 crossterm = { version = "0.28", features = ["event-stream"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"
 tokio = { version = "1", features = ["full"] }
+url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+which = "7"

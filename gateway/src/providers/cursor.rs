@@ -1,7 +1,7 @@
 use capabilities::{
     DecisionStatus, HookDecision, ParseError, Provider, ProviderCapabilities, ToolHookEvent,
-    normalise_tool_name,
 };
+use config::normalise_tool_name;
 
 use super::claude_code::build_display_name;
 

@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 capabilities = { path = "../capabilities" }
+config = { path = "../config" }
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }

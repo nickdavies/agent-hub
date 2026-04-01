@@ -321,6 +321,102 @@ pub fn default_to_resolved(default: &DefaultAction) -> ResolvedAction {
     }
 }
 
+// --- Validation types ---
+
+/// Summary of a single rule for validation/display.
+pub struct RuleSummary {
+    pub index: usize,
+    pub tools: Vec<String>,
+    pub action: String,
+    pub command: Option<String>,
+    pub source_json: String,
+}
+
+impl ToolConfig {
+    /// Return summaries of all rules for validation/display purposes.
+    pub fn rule_summaries(&self) -> Vec<RuleSummary> {
+        self.rules
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| RuleSummary {
+                index: i,
+                tools: rule.matchers.iter().map(|m| m.name.clone()).collect(),
+                action: match &rule.action {
+                    RuleAction::Allow => "allow",
+                    RuleAction::Deny => "deny",
+                    RuleAction::Ask => "ask",
+                    RuleAction::Delegate => "delegate",
+                }
+                .to_string(),
+                command: rule.command.clone(),
+                source_json: rule.source_json.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Validate a config file with stricter checks than `load_tool_config`.
+/// Returns `(config, warnings)` on success, or an error string on failure.
+///
+/// In addition to the standard `load_tool_config` checks (JSON syntax, schema,
+/// group expansion, pattern compilation, delegate-without-command), this function
+/// detects:
+/// - Unknown top-level fields (typos like `"defualt"`)
+/// - Unknown per-rule fields
+/// - Non-delegate rules that have a `"command"` field (likely a mistake)
+pub fn validate_tool_config(path: &str) -> Result<(ToolConfig, Vec<String>), String> {
+    let config = load_tool_config(path)?;
+    let mut warnings = Vec::new();
+
+    // Re-read and parse as raw JSON to detect unknown fields
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read config {path}: {e}"))?;
+    let raw: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("failed to parse config {path}: {e}"))?;
+
+    // Check top-level fields
+    let known_top = ["version", "default", "rules"];
+    if let Some(obj) = raw.as_object() {
+        for key in obj.keys() {
+            if !known_top.contains(&key.as_str()) {
+                warnings.push(format!("unknown top-level field \"{key}\""));
+            }
+        }
+    }
+
+    // Check per-rule fields
+    let known_rule = [
+        "tools",
+        "action",
+        "command",
+        "message",
+        "pattern",
+        "in_workspace",
+        "in_paths",
+    ];
+    if let Some(rules) = raw.get("rules").and_then(|r| r.as_array()) {
+        for (i, rule) in rules.iter().enumerate() {
+            if let Some(obj) = rule.as_object() {
+                for key in obj.keys() {
+                    if !known_rule.contains(&key.as_str()) {
+                        warnings.push(format!("rule {}: unknown field \"{key}\"", i + 1));
+                    }
+                }
+                // Warn on non-delegate rule with command field
+                let is_delegate = obj.get("action").and_then(|a| a.as_str()) == Some("delegate");
+                if !is_delegate && obj.contains_key("command") {
+                    warnings.push(format!(
+                        "rule {}: has \"command\" but action is not \"delegate\"",
+                        i + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok((config, warnings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
