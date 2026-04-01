@@ -17,7 +17,7 @@
 
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import type { PermissionRequest } from "@opencode-ai/sdk/v2"
-import type { createOpencodeClient as createV2Client } from "@opencode-ai/sdk/v2"
+import type { OpencodeClient } from "@opencode-ai/sdk"
 import path from "path"
 import fs from "fs"
 import { spawn } from "child_process"
@@ -157,24 +157,38 @@ function apply(r: GatewayResult, output: { status: "allow" | "deny" | "ask"; mes
 
 const DEFAULT_TITLE_RE = /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T/
 
-type V2Client = ReturnType<typeof createV2Client>
+type V1Client = OpencodeClient
 
 const titles: Map<string, string> = new Map()
 
 async function fetchTitle(
-  client: V2Client,
+  client: V1Client,
   sid: string,
+  dir: string,
 ): Promise<string | undefined> {
   const cached = titles.get(sid)
-  if (cached) return cached
+  if (cached) {
+    log("INFO ", "fetchTitle cache hit", { sid, title: cached })
+    return cached
+  }
 
+  log("INFO ", "fetchTitle calling session.get", { sid, directory: dir })
   try {
-    const res = await client.session.get({ sessionID: sid })
+    // The plugin client is v1 — uses { path: { id }, query: { directory } }
+    // and URL template /session/{id}.
+    const res = await client.session.get({
+      path: { id: sid },
+      query: { directory: dir },
+    })
+    log("INFO ", "fetchTitle raw response", { sid, keys: Object.keys(res).join(","), hasData: String(!!res.data) })
     const title = res.data?.title
+    log("INFO ", "fetchTitle got response", { sid, title: title ?? "(none)", hasData: String(!!res.data) })
     if (title && !DEFAULT_TITLE_RE.test(title)) {
       titles.set(sid, title)
+      log("INFO ", "fetchTitle cached title", { sid, title })
       return title
     }
+    log("INFO ", "fetchTitle title is default/empty, skipping cache", { sid })
     return undefined
   } catch (err) {
     log("WARN ", "failed to fetch session title", { sid, err: String(err) })
@@ -189,12 +203,13 @@ async function fetchTitle(
 export const id = "agent-hub"
 
 const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
-  // The runtime client is a v2 client; PluginInput still references v1 types.
-  const client = input.client as unknown as V2Client
+  // The runtime client is a v1 client (opencode imports from @opencode-ai/sdk, not /v2).
+  const client = input.client as unknown as V1Client
   const { directory, worktree } = input
 
   return {
     "permission.ask": async (_info, output) => {
+      log("INFO ", "permission.ask handler entered [v2]", { permission: (_info as any).permission ?? "?" })
       // The published Permission type from @opencode-ai/sdk still uses the old
       // field names (type/pattern). Cast to PermissionRequest which matches what
       // opencode actually sends at runtime (permission/patterns).
@@ -210,7 +225,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
       const tool = PERM_TO_TOOL[info.permission] ?? info.permission
       const sid = info.sessionID
-      const title = await fetchTitle(client, sid)
+      log("INFO ", "about to call fetchTitle", { sid, tool })
+      const title = await fetchTitle(client, sid, directory)
+      log("INFO ", "fetchTitle returned", { sid, title: title ?? "(none)" })
 
       // -----------------------------------------------------------------
       // bash: use the raw unparsed command from metadata rather than the
