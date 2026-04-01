@@ -153,14 +153,16 @@ impl ApprovalRegistry {
         Some(entry.approval.clone())
     }
 
-    /// List only pending approvals.
+    /// List only pending approvals, sorted by creation time (oldest first).
     pub async fn list_pending(&self) -> Vec<Approval> {
         let entries = self.entries.read().await;
-        entries
+        let mut pending: Vec<Approval> = entries
             .values()
             .filter(|e| !e.approval.status.is_resolved())
             .map(|e| e.approval.clone())
-            .collect()
+            .collect();
+        pending.sort_by_key(|a| a.created_at);
+        pending
     }
 
     /// Remove all approvals for a session (on session eviction).
@@ -184,14 +186,16 @@ impl ApprovalRegistry {
         }
     }
 
-    /// Export pending approvals for persistence.
+    /// Export pending approvals for persistence, sorted by creation time.
     pub async fn snapshot(&self) -> Vec<Approval> {
         let entries = self.entries.read().await;
-        entries
+        let mut pending: Vec<Approval> = entries
             .values()
             .filter(|e| !e.approval.status.is_resolved())
             .map(|e| e.approval.clone())
-            .collect()
+            .collect();
+        pending.sort_by_key(|a| a.created_at);
+        pending
     }
 
     /// Restore approvals from persisted state.

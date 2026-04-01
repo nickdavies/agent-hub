@@ -196,10 +196,53 @@
         }
     }
 
+    // Build a fingerprint for an approval so we can detect data changes.
+    function approvalFingerprint(a) {
+        const time = new Date(a.created_at).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+        return [a.project, a.session_display_name, a.tool_name, time, JSON.stringify(a.tool_input)].join('\0');
+    }
+
+    // Create the pair of DOM rows (meta-row + tool-preview) for one approval.
+    function createApprovalRows(a, idx) {
+        const time = new Date(a.created_at).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+        const sel = idx === selectedIdx;
+
+        const metaRow = document.createElement('tr');
+        metaRow.className = sel ? 'meta-row selected' : 'meta-row';
+        metaRow.dataset.id = a.id;
+        metaRow.dataset.fp = approvalFingerprint(a);
+
+        let actionHtml = `<a href="/approvals/${a.id}">Review</a>`;
+        if (READWRITE) {
+            actionHtml += ` <span style="margin-left:0.5rem">
+                <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="approveRow('${a.id}')">Approve</button>
+                <button class="outline secondary" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showDenyInput('${a.id}')">Deny</button>
+            </span>
+            <div class="deny-input" id="deny-${a.id}">
+                <input type="text" placeholder="Reason..." onkeydown="if(event.key==='Enter'){denyRow('${a.id}',this.value);} if(event.key==='Escape'){hideDenyInputs();}">
+                <button class="secondary" onclick="denyRow('${a.id}',this.previousElementSibling.value)">Send</button>
+            </div>`;
+        }
+
+        metaRow.innerHTML =
+            `<td>${esc(a.project)}</td>` +
+            `<td>${esc(a.session_display_name)}</td>` +
+            `<td>${esc(a.tool_name)}</td>` +
+            `<td>${time}</td>` +
+            `<td>${actionHtml}</td>`;
+
+        const prevRow = document.createElement('tr');
+        prevRow.className = sel ? 'tool-preview selected visible' : 'tool-preview';
+        prevRow.dataset.id = a.id;
+        prevRow.innerHTML = `<td colspan="5"><code>${esc(inputSummary(a.tool_input))}</code></td>`;
+
+        return { metaRow, prevRow };
+    }
+
     function renderApprovals(approvals) {
         const container = document.getElementById('approvals-container');
 
-        // Don't blow away the DOM while user is typing a deny reason
+        // Don't touch the DOM while user is typing a deny reason
         if (denyActiveId) {
             const currentIds = new Set(approvals.map(a => a.id));
             if (!currentIds.has(denyActiveId)) {
@@ -216,36 +259,79 @@
             return;
         }
         if (wasEmpty) selectedIdx = 0;
-        let html = `<table id="approvals-table"><thead><tr>
-            <th>Project</th><th>Session</th><th>Tool</th><th>Time</th><th>Action</th>
-            </tr></thead><tbody>`;
-        approvals.forEach((a, i) => {
-            const time = new Date(a.created_at).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-            const sel = i === selectedIdx;
-            const metaCls = sel ? 'meta-row selected' : 'meta-row';
-            const prevCls = sel ? 'tool-preview selected visible' : 'tool-preview';
-            html += `<tr class="${metaCls}" data-id="${a.id}">
-                <td>${esc(a.project)}</td>
-                <td>${esc(a.session_display_name)}</td>
-                <td>${esc(a.tool_name)}</td>
-                <td>${time}</td>
-                <td><a href="/approvals/${a.id}">Review</a>`;
-            if (READWRITE) {
-                html += ` <span style="margin-left:0.5rem">
-                    <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="approveRow('${a.id}')">Approve</button>
-                    <button class="outline secondary" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showDenyInput('${a.id}')">Deny</button>
-                </span>
-                <div class="deny-input" id="deny-${a.id}">
-                    <input type="text" placeholder="Reason..." onkeydown="if(event.key==='Enter'){denyRow('${a.id}',this.value);} if(event.key==='Escape'){hideDenyInputs();}">
-                    <button class="secondary" onclick="denyRow('${a.id}',this.previousElementSibling.value)">Send</button>
-                </div>`;
-            }
-            html += `</td></tr>`;
-            html += `<tr class="${prevCls}" data-id="${a.id}"><td colspan="5"><code>${esc(inputSummary(a.tool_input))}</code></td></tr>`;
-        });
-        html += '</tbody></table>';
-        container.innerHTML = html;
         if (selectedIdx >= approvals.length) selectedIdx = approvals.length - 1;
+
+        // Ensure table structure exists
+        let table = document.getElementById('approvals-table');
+        if (!table) {
+            container.innerHTML = `<table id="approvals-table"><thead><tr>
+                <th>Project</th><th>Session</th><th>Tool</th><th>Time</th><th>Action</th>
+                </tr></thead><tbody></tbody></table>`;
+            table = document.getElementById('approvals-table');
+        }
+        const tbody = table.querySelector('tbody');
+
+        // Index existing DOM rows by approval id
+        const existingMeta = {};
+        const existingPreview = {};
+        tbody.querySelectorAll('tr.meta-row').forEach(r => { existingMeta[r.dataset.id] = r; });
+        tbody.querySelectorAll('tr.tool-preview').forEach(r => { existingPreview[r.dataset.id] = r; });
+
+        const newIds = new Set(approvals.map(a => a.id));
+
+        // Remove rows for approvals no longer present
+        for (const id of Object.keys(existingMeta)) {
+            if (!newIds.has(id)) {
+                existingMeta[id].remove();
+                if (existingPreview[id]) existingPreview[id].remove();
+                delete existingMeta[id];
+                delete existingPreview[id];
+            }
+        }
+
+        // Upsert rows in order and ensure correct DOM position
+        let insertBefore = tbody.firstChild;
+        approvals.forEach((a, i) => {
+            const fp = approvalFingerprint(a);
+            let metaRow = existingMeta[a.id];
+            let prevRow = existingPreview[a.id];
+
+            if (metaRow && metaRow.dataset.fp === fp) {
+                // Row exists and data unchanged — just update selection classes
+                const sel = i === selectedIdx;
+                metaRow.classList.toggle('selected', sel);
+                if (prevRow) {
+                    prevRow.classList.toggle('selected', sel);
+                    prevRow.classList.toggle('visible', sel);
+                }
+            } else if (metaRow) {
+                // Row exists but data changed — replace it
+                const created = createApprovalRows(a, i);
+                tbody.replaceChild(created.metaRow, metaRow);
+                if (prevRow) {
+                    tbody.replaceChild(created.prevRow, prevRow);
+                } else {
+                    created.metaRow.after(created.prevRow);
+                }
+                metaRow = created.metaRow;
+                prevRow = created.prevRow;
+            } else {
+                // New row — create and insert
+                const created = createApprovalRows(a, i);
+                metaRow = created.metaRow;
+                prevRow = created.prevRow;
+                tbody.insertBefore(metaRow, insertBefore);
+                metaRow.after(prevRow);
+            }
+
+            // Ensure correct ordering: metaRow should be at the current insertBefore position
+            if (metaRow !== insertBefore) {
+                tbody.insertBefore(metaRow, insertBefore);
+                metaRow.after(prevRow);
+            }
+            // Advance past both rows (meta + preview)
+            insertBefore = prevRow.nextSibling;
+        });
     }
 
     function renderSessions(sessions) {
