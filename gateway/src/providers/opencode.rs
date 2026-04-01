@@ -73,7 +73,12 @@ impl Provider for Opencode {
             .unwrap_or("tool.execute.before")
             .to_string();
 
-        let session_display_name = build_display_name(&session_id, &workspace_roots);
+        let session_display_name = v
+            .get("session_title")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| build_display_name(&session_id, &workspace_roots));
 
         Ok(ToolHookEvent {
             session_id,
