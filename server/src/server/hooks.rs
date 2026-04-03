@@ -336,3 +336,58 @@ async fn fire_and_forget<N: Notifier>(notifier: &N, title: &str, message: &str, 
         warn!("{} notification failed: {e}", notifier.name());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that the exact JSON the opencode plugin sends deserializes correctly.
+    /// This is the payload from spawnStatusReport() in agent-hub.ts.
+    #[test]
+    fn deserialize_status_report_from_opencode_plugin() {
+        let json = r#"{
+            "session_id": "ses_abc123",
+            "cwd": "/home/nick/workspaces/myapp",
+            "status": "idle",
+            "waiting_reason": null,
+            "display_name": "Fix auth bug",
+            "editor_type": "opencode"
+        }"#;
+        let report: StatusReport =
+            serde_json::from_str(json).expect("opencode status report should deserialize");
+        assert_eq!(report.session_id, "ses_abc123");
+        assert_eq!(report.status, SessionStatus::Idle);
+        assert_eq!(
+            report.editor_type,
+            Some(super::super::sessions::EditorType::Opencode)
+        );
+    }
+
+    /// Verify that a status report with editor_type omitted still works
+    /// (editor_type is Option<EditorType>).
+    #[test]
+    fn deserialize_status_report_without_editor_type() {
+        let json = r#"{
+            "session_id": "ses_abc123",
+            "cwd": "/home/nick/workspaces/myapp",
+            "status": "active"
+        }"#;
+        let report: StatusReport =
+            serde_json::from_str(json).expect("minimal status report should deserialize");
+        assert_eq!(report.status, SessionStatus::Active);
+        assert!(report.editor_type.is_none());
+    }
+
+    /// Every status variant the plugin can send should deserialize.
+    #[test]
+    fn deserialize_status_report_all_statuses() {
+        for status in ["active", "idle", "waiting", "ended"] {
+            let json = format!(
+                r#"{{"session_id":"s1","cwd":"/tmp","status":"{}","editor_type":"opencode"}}"#,
+                status
+            );
+            serde_json::from_str::<StatusReport>(&json)
+                .unwrap_or_else(|e| panic!("status={status} should work: {e}"));
+        }
+    }
+}

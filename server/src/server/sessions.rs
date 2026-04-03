@@ -13,6 +13,7 @@ use super::storage::PersistedSession;
 pub enum EditorType {
     Claude,
     Cursor,
+    Opencode,
     #[default]
     Unknown,
 }
@@ -371,6 +372,70 @@ mod tests {
         assert_eq!(extract_project_name("/home/nick/workspaces/myapp"), "myapp");
         assert_eq!(extract_project_name("/"), "/");
         assert_eq!(extract_project_name("relative/path"), "path");
+    }
+
+    // ---------------------------------------------------------------
+    // Serde deserialization tests — ensure every editor_type value
+    // that providers actually send is accepted by the server.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn deserialize_editor_type_all_variants() {
+        // These are the values each provider plugin sends as editor_type.
+        let cases = [
+            ("\"claude\"", EditorType::Claude),
+            ("\"cursor\"", EditorType::Cursor),
+            ("\"opencode\"", EditorType::Opencode),
+            ("\"unknown\"", EditorType::Unknown),
+        ];
+        for (json, expected) in cases {
+            let got: EditorType =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{json} => {e}"));
+            assert_eq!(got, expected, "deserialized {json}");
+        }
+    }
+
+    #[test]
+    fn deserialize_editor_type_rejects_unknown_variant() {
+        // A typo or new provider that hasn't been added should fail
+        // at deserialization time rather than silently being accepted.
+        let result = serde_json::from_str::<EditorType>("\"vscode\"");
+        assert!(result.is_err(), "unknown editor_type should fail");
+    }
+
+    #[test]
+    fn deserialize_session_status_all_variants() {
+        let cases = [
+            ("\"active\"", SessionStatus::Active),
+            ("\"idle\"", SessionStatus::Idle),
+            ("\"waiting\"", SessionStatus::Waiting),
+            ("\"ended\"", SessionStatus::Ended),
+        ];
+        for (json, expected) in cases {
+            let got: SessionStatus =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("{json} => {e}"));
+            assert_eq!(got, expected, "deserialized {json}");
+        }
+    }
+
+    #[test]
+    fn serialize_effective_status_tagged() {
+        // Verify the JSON shape the web UI expects (internally-tagged enum).
+        let active = serde_json::to_value(EffectiveSessionStatus::Active).unwrap();
+        assert_eq!(active["status"], "active");
+
+        let idle = serde_json::to_value(EffectiveSessionStatus::Idle).unwrap();
+        assert_eq!(idle["status"], "idle");
+
+        let waiting = serde_json::to_value(EffectiveSessionStatus::Waiting {
+            reason: Some("test".to_string()),
+        })
+        .unwrap();
+        assert_eq!(waiting["status"], "waiting");
+        assert_eq!(waiting["reason"], "test");
+
+        let ended = serde_json::to_value(EffectiveSessionStatus::Ended).unwrap();
+        assert_eq!(ended["status"], "ended");
     }
 
     #[tokio::test]
