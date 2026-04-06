@@ -34,7 +34,7 @@ pub struct RegisterApproval {
     pub tool: protocol::Tool,
     pub tool_input: serde_json::Value,
     pub provider: String,
-    pub request_type: String,
+    pub request_type: protocol::RequestType,
     pub context: ApprovalContext,
 }
 

@@ -296,7 +296,7 @@ async fn fire_and_forget<N: Notifier>(notifier: &N, title: &str, message: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::EditorType;
+    use protocol::Provider;
 
     /// Verify that the exact JSON the opencode plugin sends deserializes correctly.
     /// This is the payload from spawnStatusReport() in agent-hub.ts.
@@ -314,11 +314,11 @@ mod tests {
             serde_json::from_str(json).expect("opencode status report should deserialize");
         assert_eq!(report.session_id, "ses_abc123");
         assert_eq!(report.status, SessionStatus::Idle);
-        assert_eq!(report.editor_type, Some(EditorType::Opencode));
+        assert_eq!(report.editor_type, Some(Provider::Opencode));
     }
 
     /// Verify that a status report with editor_type omitted still works
-    /// (editor_type is Option<EditorType>).
+    /// (editor_type is Option<Provider>).
     #[test]
     fn deserialize_status_report_without_editor_type() {
         let json = r#"{

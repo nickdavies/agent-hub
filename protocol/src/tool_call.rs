@@ -44,7 +44,7 @@ pub enum ToolCallKind {
     // File write
     Write {
         path: String,
-        content: String,
+        content: Option<String>,
     },
     StrReplace {
         path: Option<String>,
@@ -389,7 +389,7 @@ struct SemanticSearchInput {
 struct WriteInput {
     #[serde(alias = "file_path")]
     path: String,
-    content: String,
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -538,7 +538,7 @@ mod tests {
             *tc.kind(),
             ToolCallKind::Write {
                 path: "/tmp/out.txt".into(),
-                content: "hello".into(),
+                content: Some("hello".into()),
             }
         );
         assert_eq!(tc.matchable_args(), vec!["/tmp/out.txt"]);
@@ -552,7 +552,7 @@ mod tests {
             *tc.kind(),
             ToolCallKind::Write {
                 path: "/tmp/out.txt".into(),
-                content: "hello".into(),
+                content: Some("hello".into()),
             }
         );
     }
@@ -736,11 +736,16 @@ mod tests {
     }
 
     #[test]
-    fn write_tool_missing_content_errors() {
+    fn write_tool_missing_content_parses_as_none() {
         let raw = json!({"path": "/tmp/file.txt"});
-        let result = ToolCall::try_from((Tool::Write, raw));
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().tool, "Write");
+        let tc = ToolCall::try_from((Tool::Write, raw)).unwrap();
+        assert_eq!(
+            *tc.kind(),
+            ToolCallKind::Write {
+                path: "/tmp/file.txt".into(),
+                content: None,
+            }
+        );
     }
 
     #[test]
@@ -819,7 +824,7 @@ mod tests {
             *tc.kind(),
             ToolCallKind::Write {
                 path: "/a".into(),
-                content: "c".into()
+                content: Some("c".into())
             }
         );
         // Raw preserves everything

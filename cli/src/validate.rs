@@ -57,7 +57,7 @@ pub async fn run(config_path: String, server: Option<String>, token: Option<Stri
 
         // Check 3: Delegate commands
         for s in &summaries {
-            if s.action == "delegate"
+            if s.action == config::RuleAction::Delegate
                 && let Some(cmd) = &s.command
             {
                 let executable = cmd.split_whitespace().next().unwrap_or(cmd);

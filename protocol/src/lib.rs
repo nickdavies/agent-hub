@@ -18,7 +18,8 @@ pub mod tool_call;
 // Re-export the most commonly used types at the crate root for convenience.
 pub use approval::{
     Approval, ApprovalContext, ApprovalDecision, ApprovalRequest, ApprovalResolveRequest,
-    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, ExtraContext,
+    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, ExtraContext, HookEventName,
+    KnownHookEvent, RequestType,
 };
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{
@@ -26,11 +27,12 @@ pub use gateway::{
     ClaudePermissionRequestOutput, ClaudePreToolUseDecision, ClaudePreToolUseOutput, ClaudeTool,
     CursorHookInput, CursorHookOutput, CursorTool, DelegateOutput, DelegateOutputDecision,
     DelegatePayload, DelegatePermission, OpenCodeHookInput, OpenCodeHookOutput, OpenCodeTool,
+    PermissionDecision,
 };
 pub use hooks::{HookPayload, StatusReport};
 pub use presence::{PresenceState, PresenceUpdate};
 pub use sessions::{
-    ApprovalModeResponse, EditorType, EffectiveSessionStatus, SessionApprovalMode,
+    ApprovalModeResponse, EditorType, EffectiveSessionStatus, Provider, SessionApprovalMode,
     SessionConfigUpdate, SessionNotifyConfig, SessionStatus, SessionView,
 };
 pub use tool::Tool;

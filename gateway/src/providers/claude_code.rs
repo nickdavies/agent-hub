@@ -1,8 +1,8 @@
-use crate::types::{DecisionStatus, HookOutput, ParseError, ToolHookEvent, build_display_name};
+use crate::types::{build_display_name, DecisionStatus, HookOutput, ParseError, ToolHookEvent};
 use protocol::{
     ClaudeCodeHookInput, ClaudePermissionBehavior, ClaudePermissionRequestDecision,
-    ClaudePermissionRequestOutput, ClaudePreToolUseDecision, ClaudePreToolUseOutput, Tool,
-    ToolCall,
+    ClaudePermissionRequestOutput, ClaudePreToolUseDecision, ClaudePreToolUseOutput,
+    PermissionDecision, Tool, ToolCall,
 };
 
 impl TryFrom<ClaudeCodeHookInput> for ToolHookEvent {
@@ -34,9 +34,9 @@ pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
     match event.hook_event_name.to_ascii_lowercase().as_str() {
         "permissionrequest" => {
             let (behavior, message) = match &decision.status {
-                DecisionStatus::Approved => ("allow".to_string(), None),
+                DecisionStatus::Approved => (PermissionDecision::Allow, None),
                 DecisionStatus::Denied | DecisionStatus::DeniedWithReason(_) => {
-                    ("deny".to_string(), Some(deny_message(decision)))
+                    (PermissionDecision::Deny, Some(deny_message(decision)))
                 }
             };
             let output = ClaudePermissionRequestOutput {
@@ -52,11 +52,13 @@ pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
         _ => {
             let (perm, reason) = match &decision.status {
                 DecisionStatus::Approved => (
-                    "allow".to_string(),
+                    PermissionDecision::Allow,
                     decision.message.clone().unwrap_or_default(),
                 ),
-                DecisionStatus::Denied => ("deny".to_string(), "denied by policy".to_string()),
-                DecisionStatus::DeniedWithReason(r) => ("deny".to_string(), r.clone()),
+                DecisionStatus::Denied => {
+                    (PermissionDecision::Deny, "denied by policy".to_string())
+                }
+                DecisionStatus::DeniedWithReason(r) => (PermissionDecision::Deny, r.clone()),
             };
             let output = ClaudePreToolUseOutput {
                 hook_specific_output: ClaudePreToolUseDecision {

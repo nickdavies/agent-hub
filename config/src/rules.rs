@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use strum::Display;
 
 use crate::expand_tilde;
 use crate::tools::{expand_tool_group, is_in_workspace, is_path_tool};
@@ -40,8 +41,9 @@ pub enum DefaultAction {
     Ask,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Display)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum RuleAction {
     Allow,
     Deny,
@@ -328,7 +330,7 @@ pub fn default_to_resolved(default: &DefaultAction) -> ConfigAction {
 pub struct RuleSummary {
     pub index: usize,
     pub tools: Vec<String>,
-    pub action: String,
+    pub action: RuleAction,
     pub command: Option<String>,
     pub source_json: String,
 }
@@ -342,13 +344,7 @@ impl ToolConfig {
             .map(|(i, rule)| RuleSummary {
                 index: i,
                 tools: rule.matchers.iter().map(|m| m.name.clone()).collect(),
-                action: match &rule.action {
-                    RuleAction::Allow => "allow",
-                    RuleAction::Deny => "deny",
-                    RuleAction::Ask => "ask",
-                    RuleAction::Delegate => "delegate",
-                }
-                .to_string(),
+                action: rule.action.clone(),
                 command: rule.command.clone(),
                 source_json: rule.source_json.clone(),
             })

@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use config::{ConfigAction, expand_tilde, load_tool_config, resolve_action};
 use protocol::{
     ApprovalContext, ApprovalRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
-    ExtraContext, StatusReport, ToolCallKind,
+    ExtraContext, RequestType, StatusReport, ToolCallKind,
 };
 use similar::{ChangeTag, TextDiff};
 use uuid::Uuid;
@@ -383,8 +383,13 @@ fn collect_extra(
     match tool_call.kind() {
         ToolCallKind::Write { path, content } => {
             let old_content = std::fs::read_to_string(path).unwrap_or_default();
-            let diff = make_unified_diff(&old_content, content, path);
-            Some(ExtraContext::Diff { diff })
+            match content {
+                Some(content) => {
+                    let diff = make_unified_diff(&old_content, content, path);
+                    Some(ExtraContext::Diff { diff })
+                }
+                None => None,
+            }
         }
         ToolCallKind::StrReplace {
             path,
@@ -460,7 +465,7 @@ async fn escalate_to_server(
 
     let context = ApprovalContext {
         workspace_roots: event.workspace_roots.clone(),
-        hook_event_name: event.hook_event_name.clone(),
+        hook_event_name: event.hook_event_name.clone().into(),
         extra,
     };
 
@@ -482,7 +487,7 @@ async fn escalate_to_server(
             tool: event.tool_call.tool(),
             tool_input: event.tool_call.raw_input().clone(),
             provider: provider_name.to_string(),
-            request_type: "tool_use".to_string(),
+            request_type: RequestType::ToolUse,
             context,
         })
         .timeout(Duration::from_secs(10))

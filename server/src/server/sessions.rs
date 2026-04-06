@@ -7,7 +7,7 @@ use tracing::info;
 
 // Re-export protocol types so existing `use super::sessions::X` imports work.
 pub use protocol::{
-    EditorType, EffectiveSessionStatus, SessionApprovalMode, SessionConfigUpdate,
+    EffectiveSessionStatus, Provider, SessionApprovalMode, SessionConfigUpdate,
     SessionNotifyConfig, SessionStatus, SessionView,
 };
 
@@ -17,7 +17,7 @@ pub struct SessionInner {
     pub project: String,
     pub last_seen: Instant,
     pub config: SessionNotifyConfig,
-    pub editor_type: EditorType,
+    pub editor_type: Provider,
     pub status: SessionStatus,
     pub waiting_reason: Option<String>,
     pub display_name: Option<String>,
@@ -30,7 +30,7 @@ pub struct RawSessionView {
     pub session_id: String,
     pub project: String,
     pub config: SessionNotifyConfig,
-    pub editor_type: EditorType,
+    pub editor_type: Provider,
     pub stored_status: SessionStatus,
     pub waiting_reason: Option<String>,
     pub display_name: Option<String>,
@@ -62,7 +62,7 @@ impl SessionRegistry {
         &self,
         session_id: &str,
         cwd: &str,
-        editor_type: Option<EditorType>,
+        editor_type: Option<Provider>,
     ) -> String {
         let project = extract_project_name(cwd);
         let mut sessions = self.sessions.write().await;
@@ -289,13 +289,13 @@ mod tests {
     fn deserialize_editor_type_all_variants() {
         // These are the values each provider plugin sends as editor_type.
         let cases = [
-            ("\"claude\"", EditorType::Claude),
-            ("\"cursor\"", EditorType::Cursor),
-            ("\"opencode\"", EditorType::Opencode),
-            ("\"unknown\"", EditorType::Unknown),
+            ("\"claude\"", Provider::Claude),
+            ("\"cursor\"", Provider::Cursor),
+            ("\"opencode\"", Provider::Opencode),
+            ("\"unknown\"", Provider::Unknown),
         ];
         for (json, expected) in cases {
-            let got: EditorType =
+            let got: Provider =
                 serde_json::from_str(json).unwrap_or_else(|e| panic!("{json} => {e}"));
             assert_eq!(got, expected, "deserialized {json}");
         }
@@ -305,7 +305,7 @@ mod tests {
     fn deserialize_editor_type_rejects_unknown_variant() {
         // A typo or new provider that hasn't been added should fail
         // at deserialization time rather than silently being accepted.
-        let result = serde_json::from_str::<EditorType>("\"vscode\"");
+        let result = serde_json::from_str::<Provider>("\"vscode\"");
         assert!(result.is_err(), "unknown editor_type should fail");
     }
 

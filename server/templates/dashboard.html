@@ -114,7 +114,7 @@
                 </td>
                 {% if readwrite %}
                 <td>
-                    {% if s.editor_type != crate::server::sessions::EditorType::Cursor %}
+                    {% if s.editor_type != crate::server::sessions::Provider::Cursor %}
                     <button class="outline" style="margin:0;padding:0.25rem 0.5rem"
                         onclick="toggleMode('{{ s.session_id }}', '{% if s.config.approval_mode == crate::server::sessions::SessionApprovalMode::Remote %}terminal{% else %}remote{% endif %}')">
                         {% if s.config.approval_mode == crate::server::sessions::SessionApprovalMode::Remote %}

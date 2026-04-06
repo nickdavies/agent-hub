@@ -15,8 +15,27 @@ use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use strum::{Display, EnumString};
 
 use crate::tool::Tool;
+
+// ===========================================================================
+// PermissionDecision — allow/deny for provider hook output fields
+// ===========================================================================
+
+/// Binary permission decision used in provider output wire formats.
+///
+/// This replaces bare `String` fields that previously held "allow" or "deny".
+/// Note: for delegate subprocess output, `DelegatePermission` adds an `Ask` variant.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Display, EnumString,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
 
 // ===========================================================================
 // Provider-specific tool enums
@@ -470,7 +489,7 @@ pub struct ClaudePreToolUseDecision {
     #[serde(rename = "hookEventName")]
     pub hook_event_name: String,
     #[serde(rename = "permissionDecision")]
-    pub permission_decision: String,
+    pub permission_decision: PermissionDecision,
     #[serde(rename = "permissionDecisionReason")]
     pub permission_decision_reason: String,
 }
@@ -491,7 +510,7 @@ pub struct ClaudePermissionRequestDecision {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ClaudePermissionBehavior {
-    pub behavior: String,
+    pub behavior: PermissionDecision,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -527,7 +546,7 @@ fn default_cursor_hook_event() -> String {
 /// Output to Cursor (stdout JSON).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CursorHookOutput {
-    pub permission: String,
+    pub permission: PermissionDecision,
     pub user_message: String,
     pub agent_message: String,
 }

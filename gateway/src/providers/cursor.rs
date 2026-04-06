@@ -1,5 +1,5 @@
-use crate::types::{DecisionStatus, HookOutput, ParseError, ToolHookEvent, build_display_name};
-use protocol::{CursorHookInput, CursorHookOutput, Tool, ToolCall};
+use crate::types::{build_display_name, DecisionStatus, HookOutput, ParseError, ToolHookEvent};
+use protocol::{CursorHookInput, CursorHookOutput, PermissionDecision, Tool, ToolCall};
 
 impl TryFrom<CursorHookInput> for ToolHookEvent {
     type Error = ParseError;
@@ -37,8 +37,8 @@ impl TryFrom<CursorHookInput> for ToolHookEvent {
 /// Format a HookOutput into Cursor's wire format (stdout JSON).
 pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
     let perm = match &decision.status {
-        DecisionStatus::Approved => "allow",
-        DecisionStatus::Denied | DecisionStatus::DeniedWithReason(_) => "deny",
+        DecisionStatus::Approved => PermissionDecision::Allow,
+        DecisionStatus::Denied | DecisionStatus::DeniedWithReason(_) => PermissionDecision::Deny,
     };
     let msg = match &decision.status {
         DecisionStatus::DeniedWithReason(r) => r.clone(),
@@ -48,7 +48,7 @@ pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
             .unwrap_or_else(|| "resolved via remote approval".to_string()),
     };
     let output = CursorHookOutput {
-        permission: perm.to_string(),
+        permission: perm,
         user_message: msg.clone(),
         agent_message: msg,
     };

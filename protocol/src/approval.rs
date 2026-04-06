@@ -3,6 +3,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use strum::{Display, EnumString};
 use uuid::Uuid;
 
 use crate::tool::Tool;
@@ -35,6 +36,95 @@ impl fmt::Display for ExtraContext {
 }
 
 // ===========================================================================
+// RequestType — what kind of approval request this is
+// ===========================================================================
+
+/// The type of approval request.
+///
+/// Currently only `ToolUse` exists; `PlanQuestion` is planned for Phase 2.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum RequestType {
+    ToolUse,
+}
+
+// ===========================================================================
+// HookEventName — which provider hook event triggered the request
+// ===========================================================================
+
+/// Provider hook event name (e.g. "PreToolUse", "preToolUse", "tool.execute.before").
+///
+/// Known variants are strongly typed; unknown provider events are captured as
+/// `Other(String)` so the system is forward-compatible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum HookEventName {
+    Known(KnownHookEvent),
+    Other(String),
+}
+
+/// The known hook event names across all providers.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Display, EnumString,
+)]
+pub enum KnownHookEvent {
+    /// Claude Code's pre-tool-use event.
+    PreToolUse,
+    /// Claude Code's permission-request event (camelCase alias handled via From).
+    PermissionRequest,
+    /// Cursor's pre-tool-use event (camelCase alias).
+    #[serde(rename = "preToolUse")]
+    #[strum(serialize = "preToolUse")]
+    PreToolUseCamel,
+    /// OpenCode's tool-execute event.
+    #[serde(rename = "tool.execute.before")]
+    #[strum(serialize = "tool.execute.before")]
+    ToolExecuteBefore,
+    /// OpenCode's permission-ask event.
+    #[serde(rename = "permission.ask")]
+    #[strum(serialize = "permission.ask")]
+    PermissionAsk,
+}
+
+impl HookEventName {
+    /// Returns the string representation of the event name.
+    pub fn as_str(&self) -> &str {
+        match self {
+            HookEventName::Known(k) => match k {
+                KnownHookEvent::PreToolUse => "PreToolUse",
+                KnownHookEvent::PermissionRequest => "PermissionRequest",
+                KnownHookEvent::PreToolUseCamel => "preToolUse",
+                KnownHookEvent::ToolExecuteBefore => "tool.execute.before",
+                KnownHookEvent::PermissionAsk => "permission.ask",
+            },
+            HookEventName::Other(s) => s.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for HookEventName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<String> for HookEventName {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "PreToolUse" => HookEventName::Known(KnownHookEvent::PreToolUse),
+            "PermissionRequest" => HookEventName::Known(KnownHookEvent::PermissionRequest),
+            "preToolUse" => HookEventName::Known(KnownHookEvent::PreToolUseCamel),
+            "tool.execute.before" => HookEventName::Known(KnownHookEvent::ToolExecuteBefore),
+            "permission.ask" => HookEventName::Known(KnownHookEvent::PermissionAsk),
+            _ => HookEventName::Other(s),
+        }
+    }
+}
+
+// ===========================================================================
 // ApprovalContext
 // ===========================================================================
 
@@ -47,7 +137,7 @@ pub struct ApprovalContext {
     /// Workspace roots known to the provider at hook time.
     pub workspace_roots: Vec<String>,
     /// The provider hook event name (e.g. "PreToolUse", "preToolUse", "tool.execute.before").
-    pub hook_event_name: String,
+    pub hook_event_name: HookEventName,
     /// Computed review artifacts: diffs for file-write tools, delegate reasoning, etc.
     pub extra: Option<ExtraContext>,
 }
@@ -68,7 +158,7 @@ pub struct Approval {
     /// Provider that originated this approval request (e.g. "claude-code", "cursor", "opencode").
     pub provider: String,
     /// Request type; currently always "tool_use". "plan_question" is Phase 2.
-    pub request_type: String,
+    pub request_type: RequestType,
     pub context: ApprovalContext,
     pub created_at: DateTime<Utc>,
     pub status: ApprovalStatus,
@@ -108,7 +198,7 @@ pub struct ApprovalRequest {
     /// Provider identifier: "claude-code" | "cursor" | "opencode"
     pub provider: String,
     /// Request type: "tool_use" (Phase 2 will add "plan_question")
-    pub request_type: String,
+    pub request_type: RequestType,
     pub context: ApprovalContext,
 }
 

@@ -1,16 +1,33 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use strum::{Display, EnumString};
 
 /// The editor/agent that owns a session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    JsonSchema,
+    Display,
+    EnumString,
+)]
 #[serde(rename_all = "snake_case")]
-pub enum EditorType {
+#[strum(serialize_all = "snake_case")]
+pub enum Provider {
     Claude,
     Cursor,
     Opencode,
     #[default]
     Unknown,
 }
+
+/// Backwards-compatible alias while downstream code migrates.
+pub type EditorType = Provider;
 
 /// Stored session status as reported by the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
@@ -100,7 +117,7 @@ pub struct SessionView {
     pub session_id: String,
     pub project: String,
     pub config: SessionNotifyConfig,
-    pub editor_type: EditorType,
+    pub editor_type: Provider,
     pub status: EffectiveSessionStatus,
     pub display_name: Option<String>,
 }
