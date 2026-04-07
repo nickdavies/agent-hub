@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SessionStatus",
+  "description": "Stored session status as reported by the client.",
+  "type": "string",
+  "enum": [
+    "active",
+    "idle",
+    "waiting",
+    "ended"
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StatusReport",
+  "description": "POST /api/v1/hooks/status — request body sent by the gateway (status-report subcommand).",
+  "type": "object",
+  "properties": {
+    "cwd": {
+      "type": "string"
+    },
+    "display_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "editor_type": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Provider"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "session_id": {
+      "$ref": "#/$defs/SessionId"
+    },
+    "status": {
+      "$ref": "#/$defs/SessionStatus"
+    },
+    "waiting_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "session_id",
+    "cwd",
+    "status"
+  ],
+  "$defs": {
+    "Provider": {
+      "description": "The editor/agent that owns a session.",
+      "type": "string",
+      "enum": [
+        "claude",
+        "cursor",
+        "opencode",
+        "unknown"
+      ]
+    },
+    "SessionId": {
+      "description": "Opaque session identifier.\n\nWraps a `String` with `#[serde(transparent)]` so the JSON wire format\nstays a bare string — no migration needed for TypeScript plugins, shell\nscripts, or persisted state files.",
+      "type": "string"
+    },
+    "SessionStatus": {
+      "description": "Stored session status as reported by the client.",
+      "type": "string",
+      "enum": [
+        "active",
+        "idle",
+        "waiting",
+        "ended"
+      ]
+    }
+  }
+}

@@ -36,9 +36,15 @@ jobs:
         working-directory: provider-plugins/opencode
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Regenerate schemas and types
+        run: bun run generate
+      - name: Check for stale generated files
+        run: git diff --exit-code -- generated/
       - name: Typecheck
         run: bun run typecheck
 

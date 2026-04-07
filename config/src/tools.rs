@@ -1,161 +1,10 @@
-// Tool registry — single source of truth for tool names, categories, and argument extraction.
-// Adding a new tool means adding ONE entry here — group aliases, is_path_tool, and argument
-// extraction all derive from this table.
+// Tool helpers for the config rule engine.
+//
+// Category, group expansion, and `is_path_tool` now live on `protocol::Tool`.
+// This module keeps the path-resolution and workspace-membership helpers that
+// the rule engine needs.
 
-use strum::{Display, EnumString};
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum ToolCategory {
-    FileRead,
-    FileWrite,
-    Shell,
-    Other,
-}
-
-/// Named groups that users can reference in config rules with an `@` prefix
-/// (e.g. `@file`, `@file_read`, `@shell`).
-#[derive(Debug, Clone, Copy, PartialEq, EnumString, Display)]
-pub enum ToolGroup {
-    #[strum(serialize = "@file")]
-    File,
-    #[strum(serialize = "@file_read")]
-    FileRead,
-    #[strum(serialize = "@file_write")]
-    FileWrite,
-    #[strum(serialize = "@shell")]
-    Shell,
-}
-
-impl ToolGroup {
-    /// Expand the group into its constituent tool names.
-    pub fn expand(self) -> Vec<&'static str> {
-        match self {
-            Self::File => {
-                let mut v = tools_in_category(ToolCategory::FileRead);
-                v.extend(tools_in_category(ToolCategory::FileWrite));
-                v
-            }
-            Self::FileRead => tools_in_category(ToolCategory::FileRead),
-            Self::FileWrite => tools_in_category(ToolCategory::FileWrite),
-            Self::Shell => tools_in_category(ToolCategory::Shell),
-        }
-    }
-}
-
-pub struct ToolDef {
-    pub name: &'static str,
-    pub category: ToolCategory,
-    /// JSON field names to try in order for scalar arg extraction.
-    pub fields: &'static [&'static str],
-    /// If set, extract from this JSON array field instead of scalar fields.
-    pub array_field: Option<&'static str>,
-}
-
-pub const TOOL_DEFS: &[ToolDef] = &[
-    // File read
-    ToolDef {
-        name: "Read",
-        category: ToolCategory::FileRead,
-        fields: &["path", "file_path"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "Grep",
-        category: ToolCategory::FileRead,
-        fields: &["path", "file_path"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "Glob",
-        category: ToolCategory::FileRead,
-        fields: &["target_directory"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "SemanticSearch",
-        category: ToolCategory::FileRead,
-        fields: &[],
-        array_field: Some("target_directories"),
-    },
-    // File write
-    ToolDef {
-        name: "Write",
-        category: ToolCategory::FileWrite,
-        fields: &["path", "file_path"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "StrReplace",
-        category: ToolCategory::FileWrite,
-        fields: &["path", "file_path"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "Delete",
-        category: ToolCategory::FileWrite,
-        fields: &["path", "file_path"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "Edit",
-        category: ToolCategory::FileWrite,
-        fields: &["path", "file_path"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "MultiEdit",
-        category: ToolCategory::FileWrite,
-        fields: &["path", "file_path"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "EditNotebook",
-        category: ToolCategory::FileWrite,
-        fields: &["target_notebook"],
-        array_field: None,
-    },
-    ToolDef {
-        name: "NotebookEdit",
-        category: ToolCategory::FileWrite,
-        fields: &["target_notebook"],
-        array_field: None,
-    },
-    // Shell
-    ToolDef {
-        name: "Bash",
-        category: ToolCategory::Shell,
-        fields: &["command"],
-        array_field: None,
-    },
-    // Other (has arg extraction but not in a file/shell group)
-    ToolDef {
-        name: "WebFetch",
-        category: ToolCategory::Other,
-        fields: &["url"],
-        array_field: None,
-    },
-];
-
-pub fn find_tool_def(name: &str) -> Option<&'static ToolDef> {
-    TOOL_DEFS.iter().find(|d| d.name == name)
-}
-
-pub fn tools_in_category(cat: ToolCategory) -> Vec<&'static str> {
-    TOOL_DEFS
-        .iter()
-        .filter(|d| d.category == cat)
-        .map(|d| d.name)
-        .collect()
-}
-
-pub fn is_path_tool(tool_name: &str) -> bool {
-    find_tool_def(tool_name)
-        .is_some_and(|d| matches!(d.category, ToolCategory::FileRead | ToolCategory::FileWrite))
-}
-
-pub fn expand_tool_group(name: &str) -> Option<Vec<&'static str>> {
-    name.parse::<ToolGroup>().ok().map(|g| g.expand())
-}
+use protocol::Tool;
 
 pub fn is_in_workspace(path: &str, workspace_roots: &[String]) -> bool {
     workspace_roots.iter().any(|root| {
@@ -181,8 +30,8 @@ pub fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     components.iter().collect()
 }
 
-pub fn resolve_path(raw: &str, tool_name: &str, cwd: Option<&str>) -> String {
-    if is_path_tool(tool_name) {
+pub fn resolve_path(raw: &str, tool: &Tool, cwd: Option<&str>) -> String {
+    if tool.is_path_tool() {
         if let Some(cwd) = cwd {
             let path = std::path::Path::new(raw);
             if path.is_relative() {
@@ -197,222 +46,89 @@ pub fn resolve_path(raw: &str, tool_name: &str, cwd: Option<&str>) -> String {
     raw.to_string()
 }
 
-/// Extract the arguments to match against from tool_input, based on tool type.
-/// For path-based tools, relative paths are resolved against cwd.
-/// Returns multiple values for tools like SemanticSearch that accept an array of paths.
-pub fn get_matchable_args(
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-    cwd: Option<&str>,
-) -> Vec<String> {
-    let def = match find_tool_def(tool_name) {
-        Some(d) => d,
-        None => return vec![],
-    };
-
-    if let Some(array_field) = def.array_field {
-        tool_input
-            .get(array_field)
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| resolve_path(s, tool_name, cwd))
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        let raw = def
-            .fields
-            .iter()
-            .find_map(|field| tool_input.get(*field).and_then(|v| v.as_str()));
-        match raw {
-            Some(s) => vec![resolve_path(s, tool_name, cwd)],
-            None => vec![],
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- get_matchable_args ---
-
-    #[test]
-    fn matchable_arg_file_tools() {
-        let input = serde_json::json!({"path": "/foo/bar"});
-        assert_eq!(get_matchable_args("Read", &input, None), vec!["/foo/bar"]);
-        assert_eq!(get_matchable_args("Write", &input, None), vec!["/foo/bar"]);
-        assert_eq!(
-            get_matchable_args("StrReplace", &input, None),
-            vec!["/foo/bar"]
-        );
-        assert_eq!(get_matchable_args("Delete", &input, None), vec!["/foo/bar"]);
-    }
-
-    #[test]
-    fn matchable_arg_file_path_fallback() {
-        let input = serde_json::json!({"file_path": "/foo/bar"});
-        assert_eq!(get_matchable_args("Edit", &input, None), vec!["/foo/bar"]);
-        assert_eq!(get_matchable_args("Read", &input, None), vec!["/foo/bar"]);
-    }
-
-    #[test]
-    fn matchable_arg_shell() {
-        let input = serde_json::json!({"command": "ls -la"});
-        assert_eq!(get_matchable_args("Bash", &input, None), vec!["ls -la"]);
-    }
-
-    #[test]
-    fn matchable_arg_notebook() {
-        let input = serde_json::json!({"target_notebook": "analysis.ipynb"});
-        assert_eq!(
-            get_matchable_args("EditNotebook", &input, None),
-            vec!["analysis.ipynb"]
-        );
-    }
-
-    #[test]
-    fn matchable_arg_unknown_tool() {
-        let input = serde_json::json!({"whatever": "value"});
-        assert!(get_matchable_args("UnknownTool", &input, None).is_empty());
-    }
-
-    #[test]
-    fn matchable_arg_grep() {
-        let input = serde_json::json!({"pattern": "TODO", "path": "/home/user/project"});
-        assert_eq!(
-            get_matchable_args("Grep", &input, None),
-            vec!["/home/user/project"]
-        );
-    }
-
-    #[test]
-    fn matchable_arg_grep_no_path() {
-        let input = serde_json::json!({"pattern": "TODO"});
-        assert!(get_matchable_args("Grep", &input, None).is_empty());
-    }
-
-    #[test]
-    fn matchable_arg_glob() {
-        let input =
-            serde_json::json!({"glob_pattern": "*.rs", "target_directory": "/home/user/project"});
-        assert_eq!(
-            get_matchable_args("Glob", &input, None),
-            vec!["/home/user/project"]
-        );
-    }
-
-    #[test]
-    fn matchable_arg_semantic_search() {
-        let input = serde_json::json!({
-            "query": "auth flow",
-            "target_directories": ["/home/user/project", "/home/user/lib"]
-        });
-        assert_eq!(
-            get_matchable_args("SemanticSearch", &input, None),
-            vec!["/home/user/project", "/home/user/lib"]
-        );
-    }
-
-    #[test]
-    fn matchable_arg_semantic_search_empty_array() {
-        let input = serde_json::json!({"query": "auth flow", "target_directories": []});
-        assert!(get_matchable_args("SemanticSearch", &input, None).is_empty());
-    }
-
-    #[test]
-    fn matchable_arg_semantic_search_filters_empty_strings() {
-        let input =
-            serde_json::json!({"query": "auth", "target_directories": ["", "/home/user/project"]});
-        assert_eq!(
-            get_matchable_args("SemanticSearch", &input, None),
-            vec!["/home/user/project"]
-        );
-    }
 
     // --- cwd resolution ---
 
     #[test]
     fn cwd_resolves_relative_path() {
-        let input = serde_json::json!({"path": "id_rsa"});
         assert_eq!(
-            get_matchable_args("Read", &input, Some("/home/user/.ssh")),
-            vec!["/home/user/.ssh/id_rsa"]
+            resolve_path("id_rsa", &Tool::Read, Some("/home/user/.ssh")),
+            "/home/user/.ssh/id_rsa"
         );
     }
 
     #[test]
     fn cwd_leaves_absolute_path_unchanged() {
-        let input = serde_json::json!({"path": "/etc/passwd"});
         assert_eq!(
-            get_matchable_args("Read", &input, Some("/home/user")),
-            vec!["/etc/passwd"]
+            resolve_path("/etc/passwd", &Tool::Read, Some("/home/user")),
+            "/etc/passwd"
         );
     }
 
     #[test]
     fn cwd_not_applied_to_shell_commands() {
-        let input = serde_json::json!({"command": "cat id_rsa"});
         assert_eq!(
-            get_matchable_args("Bash", &input, Some("/home/user/.ssh")),
-            vec!["cat id_rsa"]
+            resolve_path("cat id_rsa", &Tool::Bash, Some("/home/user/.ssh")),
+            "cat id_rsa"
         );
     }
 
     #[test]
     fn cwd_not_applied_to_urls() {
-        let input = serde_json::json!({"url": "https://example.com"});
         assert_eq!(
-            get_matchable_args("WebFetch", &input, Some("/home/user")),
-            vec!["https://example.com"]
+            resolve_path("https://example.com", &Tool::WebFetch, Some("/home/user")),
+            "https://example.com"
         );
     }
 
     #[test]
     fn cwd_resolves_dotdot_in_relative_path() {
-        let input = serde_json::json!({"path": "../.ssh/id_rsa"});
-        let resolved = get_matchable_args("Read", &input, Some("/home/user/project"));
-        assert_eq!(resolved, vec!["/home/user/.ssh/id_rsa"]);
+        let resolved = resolve_path("../.ssh/id_rsa", &Tool::Read, Some("/home/user/project"));
+        assert_eq!(resolved, "/home/user/.ssh/id_rsa");
     }
 
     #[test]
     fn normalize_removes_dot_segments() {
-        let input = serde_json::json!({"path": "/home/user/./project/./main.rs"});
         assert_eq!(
-            get_matchable_args("Read", &input, None),
-            vec!["/home/user/project/main.rs"]
+            resolve_path("/home/user/./project/./main.rs", &Tool::Read, None),
+            "/home/user/project/main.rs"
         );
     }
 
     #[test]
     fn normalize_absolute_path_with_dotdot() {
-        let input = serde_json::json!({"path": "/home/user/project/../.ssh/id_rsa"});
         assert_eq!(
-            get_matchable_args("Read", &input, None),
-            vec!["/home/user/.ssh/id_rsa"]
+            resolve_path("/home/user/project/../.ssh/id_rsa", &Tool::Read, None),
+            "/home/user/.ssh/id_rsa"
         );
     }
 
     #[test]
     fn cwd_resolves_relative_grep_path() {
-        let input = serde_json::json!({"pattern": "secret", "path": "subdir"});
         assert_eq!(
-            get_matchable_args("Grep", &input, Some("/home/user/project")),
-            vec!["/home/user/project/subdir"]
+            resolve_path("subdir", &Tool::Grep, Some("/home/user/project")),
+            "/home/user/project/subdir"
         );
     }
 
     #[test]
-    fn cwd_resolves_semantic_search_relative_dirs() {
-        let input = serde_json::json!({
-            "query": "auth",
-            "target_directories": ["src/", "/absolute/path"]
-        });
-        let resolved = get_matchable_args("SemanticSearch", &input, Some("/home/user/project"));
-        assert_eq!(resolved, vec!["/home/user/project/src", "/absolute/path"]);
+    fn cwd_not_applied_to_unknown_tools() {
+        let tool = Tool::Unknown("MyCoolTool".to_owned());
+        assert_eq!(
+            resolve_path("relative/path", &tool, Some("/home/user")),
+            "relative/path"
+        );
+    }
+
+    #[test]
+    fn cwd_not_applied_to_meta_tools() {
+        assert_eq!(
+            resolve_path("something", &Tool::Task, Some("/home/user")),
+            "something"
+        );
     }
 
     // --- is_in_workspace ---

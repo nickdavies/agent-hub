@@ -109,6 +109,52 @@ cat <<CURL
 
 CURL
 echo ""
+echo "--- Simulate status reports ---------------------------------"
+echo ""
+cat <<CURL2
+  # Report a session as active (e.g. agent working)
+  curl -s -X POST ${BASE_URL}/api/v1/hooks/status \\
+    -H "Authorization: Bearer ${TOKEN}" \\
+    -H "Content-Type: application/json" \\
+    -d '{
+      "session_id": "test-session-1",
+      "cwd": "/home/you/my-project",
+      "status": "active",
+      "editor_type": "opencode"
+    }' | python3 -m json.tool
+
+  # Report idle (agent finished working, waiting for user)
+  curl -s -X POST ${BASE_URL}/api/v1/hooks/status \\
+    -H "Authorization: Bearer ${TOKEN}" \\
+    -H "Content-Type: application/json" \\
+    -d '{
+      "session_id": "test-session-1",
+      "cwd": "/home/you/my-project",
+      "status": "idle",
+      "editor_type": "opencode"
+    }' | python3 -m json.tool
+
+  # Report ended (session closed)
+  curl -s -X POST ${BASE_URL}/api/v1/hooks/status \\
+    -H "Authorization: Bearer ${TOKEN}" \\
+    -H "Content-Type: application/json" \\
+    -d '{
+      "session_id": "test-session-1",
+      "cwd": "/home/you/my-project",
+      "status": "ended",
+      "editor_type": "opencode"
+    }' | python3 -m json.tool
+
+CURL2
+echo ""
+echo "--- Automated session simulator ------------------------------"
+echo ""
+echo "  For a full lifecycle test (active → idle → ended), use:"
+echo ""
+echo "    ./dev/simulate-session.sh --token ${TOKEN}"
+echo "    ./dev/simulate-session.sh --token ${TOKEN} --fast"
+echo "    ./dev/simulate-session.sh --token ${TOKEN} --with-approval"
+echo ""
 echo "--- What to test -------------------------------------------"
 echo ""
 echo "  1. Open ${BASE_URL}/auth/login in browser, sign in with admin/admin"
@@ -118,6 +164,8 @@ echo "  4. Open ${BASE_URL}/approvals in browser to see the pending approval"
 echo "  5. Click 'Review' to see detail, approve/deny from the web UI"
 echo "  6. Check that the /wait curl unblocks with the decision"
 echo "  7. Toggle session approval mode in the dashboard"
+echo "  8. Run the status report curls above and watch the dashboard update"
+echo "  9. Run ./dev/simulate-session.sh for a full automated lifecycle test"
 echo ""
 echo "  Ctrl+C to stop everything."
 echo "============================================================"

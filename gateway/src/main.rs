@@ -244,16 +244,17 @@ async fn run(
     let config = load_tool_config(config_path).map_err(RunError::FailClosed)?;
 
     // Extract matchable args from the typed tool call and resolve paths.
+    let tool = event.tool_call.tool();
     let resolved_args: Vec<String> = event
         .tool_call
         .matchable_args()
         .iter()
-        .map(|a| config::resolve_path(a, event.tool_call.tool_name(), Some(&event.cwd)))
+        .map(|a| config::resolve_path(a, &tool, Some(&event.cwd)))
         .collect();
 
     let action = resolve_action(
         &config,
-        event.tool_call.tool_name(),
+        &tool,
         &resolved_args,
         Some(&event.cwd),
         Some(&event.workspace_roots),

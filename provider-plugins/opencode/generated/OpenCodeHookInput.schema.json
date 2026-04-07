@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenCodeHookInput",
+  "description": "Input from the opencode hook (stdin JSON for both tool.execute.before and permission.ask).",
+  "type": "object",
+  "properties": {
+    "cwd": {
+      "type": "string",
+      "default": "."
+    },
+    "hook_event_name": {
+      "type": "string",
+      "default": "tool.execute.before"
+    },
+    "session_id": {
+      "$ref": "#/$defs/SessionId"
+    },
+    "session_title": {
+      "description": "Session title from opencode (may be absent).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_input": {
+      "default": null
+    },
+    "tool_name": {
+      "$ref": "#/$defs/OpenCodeTool"
+    },
+    "workspace_roots": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "default": null,
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "session_id",
+    "tool_name"
+  ],
+  "$defs": {
+    "OpenCodeTool": {
+      "description": "Tool name as sent by OpenCode (lowercase). Known: bash, edit, glob, grep, multiedit, read, task, todowrite, webfetch, write.",
+      "type": "string"
+    },
+    "SessionId": {
+      "description": "Opaque session identifier.\n\nWraps a `String` with `#[serde(transparent)]` so the JSON wire format\nstays a bare string — no migration needed for TypeScript plugins, shell\nscripts, or persisted state files.",
+      "type": "string"
+    }
+  }
+}

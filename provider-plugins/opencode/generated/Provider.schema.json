@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Provider",
+  "description": "The editor/agent that owns a session.",
+  "type": "string",
+  "enum": [
+    "claude",
+    "cursor",
+    "opencode",
+    "unknown"
+  ]
+}

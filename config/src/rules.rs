@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
+use protocol::{Tool, expand_tool_group};
+
 use crate::expand_tilde;
-use crate::tools::{expand_tool_group, is_in_workspace, is_path_tool};
+use crate::tools::is_in_workspace;
 
 // --- JSON deserialization types ---
 
@@ -277,14 +279,17 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
 
 pub fn resolve_action(
     config: &ToolConfig,
-    tool_name: &str,
+    tool: &Tool,
     resolved_args: &[String],
     cwd: Option<&str>,
     workspace_roots: Option<&[String]>,
 ) -> ConfigAction {
+    let tool_name = tool.as_str();
+    let is_path = tool.is_path_tool();
+
     // For path-based tools, resolved_args should already contain resolved paths.
     // Deny if any path is not absolute (caller must resolve relative paths first).
-    let resolved_paths: &[String] = if is_path_tool(tool_name) {
+    let resolved_paths: &[String] = if is_path {
         resolved_args
     } else {
         &[]
@@ -300,7 +305,7 @@ pub fn resolve_action(
     // For path-based tools with no explicit path arg, fall back to cwd.
     let path_in_workspace: Option<bool> = if !resolved_paths.is_empty() {
         workspace_roots.map(|roots| resolved_paths.iter().all(|p| is_in_workspace(p, roots)))
-    } else if is_path_tool(tool_name) {
+    } else if is_path {
         match (cwd, workspace_roots) {
             (Some(cwd), Some(roots)) => Some(is_in_workspace(cwd, roots)),
             _ => None,
@@ -323,7 +328,7 @@ pub fn resolve_action(
         }
 
         if let Some(in_paths) = &rule.in_paths
-            && is_path_tool(tool_name)
+            && is_path
         {
             if resolved_paths.is_empty() {
                 // No path extracted — can't check in_paths, skip rule.
@@ -460,7 +465,24 @@ pub fn validate_tool_config(path: &str) -> Result<(ToolConfig, Vec<String>), Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{ToolCategory, tools_in_category};
+    use protocol::ToolCategory;
+
+    /// Test convenience: parse a tool name string into a `Tool` and call `resolve_action`.
+    /// Keeps test call sites concise without changing every occurrence.
+    fn resolve_action_by_name(
+        config: &ToolConfig,
+        tool_name: &str,
+        resolved_args: &[String],
+        cwd: Option<&str>,
+        workspace_roots: Option<&[String]>,
+    ) -> ConfigAction {
+        let tool: Tool = serde_json::from_value(serde_json::json!(tool_name)).unwrap();
+        resolve_action(config, &tool, resolved_args, cwd, workspace_roots)
+    }
+
+    fn tools_in_category(cat: ToolCategory) -> &'static [&'static str] {
+        Tool::tools_in_category(cat)
+    }
 
     // --- parse_tool_entry ---
 
@@ -616,7 +638,7 @@ mod tests {
         );
 
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Write",
                 &["/config/.env.local".to_string()],
@@ -626,7 +648,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Deny(_))
         ));
         assert!(matches!(
-            resolve_action(&config, "Write", &["/src/main.rs".to_string()], None, None),
+            resolve_action_by_name(&config, "Write", &["/src/main.rs".to_string()], None, None),
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
     }
@@ -638,7 +660,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(&config, "Read", &[], None, None),
+            resolve_action_by_name(&config, "Read", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Ask)
         ));
     }
@@ -650,15 +672,15 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(&config, "Read", &[], None, None),
+            resolve_action_by_name(&config, "Read", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
         assert!(matches!(
-            resolve_action(&config, "Grep", &[], None, None),
+            resolve_action_by_name(&config, "Grep", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
         assert!(matches!(
-            resolve_action(&config, "Write", &[], None, None),
+            resolve_action_by_name(&config, "Write", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Ask)
         ));
     }
@@ -674,7 +696,7 @@ mod tests {
         );
         // No resolved_args: pattern rule can't match, falls through to bare "Write" -> Deny
         assert!(matches!(
-            resolve_action(&config, "Write", &[], None, None),
+            resolve_action_by_name(&config, "Write", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Deny(_))
         ));
     }
@@ -688,7 +710,7 @@ mod tests {
             DefaultAction::Ask,
         );
         // Caller passes unresolved relative path (no cwd to resolve against)
-        match resolve_action(
+        match resolve_action_by_name(
             &config,
             "Read",
             &["relative/path.txt".to_string()],
@@ -713,7 +735,7 @@ mod tests {
         );
         // Caller has already resolved "src/main.rs" against cwd "/home/user/project"
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/project/src/main.rs".to_string()],
@@ -731,7 +753,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Bash",
                 &["ls relative/path".to_string()],
@@ -746,7 +768,7 @@ mod tests {
     fn absolute_path_check_not_applied_to_unknown_tools() {
         let config = make_config(vec![], DefaultAction::Allow);
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "UnknownTool",
                 &["relative/path".to_string()],
@@ -765,7 +787,7 @@ mod tests {
             vec![make_deny_rule(&["Delete"], "Use trash instead of delete")],
             DefaultAction::Ask,
         );
-        match resolve_action(&config, "Delete", &[], None, None) {
+        match resolve_action_by_name(&config, "Delete", &[], None, None) {
             ConfigAction::Decision(ConfigDecision::Deny(Some(msg))) => {
                 assert_eq!(msg, "Use trash instead of delete");
             }
@@ -780,7 +802,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(&config, "Delete", &[], None, None),
+            resolve_action_by_name(&config, "Delete", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Deny(None))
         ));
     }
@@ -789,7 +811,7 @@ mod tests {
     fn deny_default_has_no_message() {
         let config = make_config(vec![], DefaultAction::Deny);
         assert!(matches!(
-            resolve_action(&config, "Write", &[], None, None),
+            resolve_action_by_name(&config, "Write", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Deny(None))
         ));
     }
@@ -807,7 +829,7 @@ mod tests {
         );
         // Caller resolved "id_rsa" with cwd ~/.ssh -> /home/user/.ssh/id_rsa
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/.ssh/id_rsa".to_string()],
@@ -939,7 +961,7 @@ mod tests {
             DefaultAction::Ask,
         );
 
-        match resolve_action(
+        match resolve_action_by_name(
             &config,
             "Read",
             &["/home/user/.ssh/id_rsa".to_string()],
@@ -952,7 +974,7 @@ mod tests {
             other => panic!("expected Deny for .ssh read, got {other:?}"),
         }
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Write",
                 &["/home/user/.ssh/id_rsa".to_string()],
@@ -962,7 +984,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Deny(_))
         ));
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/project/main.rs".to_string()],
@@ -988,7 +1010,7 @@ mod tests {
         let roots = vec!["/home/user/project".to_string()];
 
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/project/src/main.rs".to_string()],
@@ -1012,7 +1034,7 @@ mod tests {
         let roots = vec!["/home/user/project".to_string()];
 
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/etc/passwd".to_string()],
@@ -1035,7 +1057,7 @@ mod tests {
         let roots = vec!["/home/user/project".to_string()];
 
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Write",
                 &["/tmp/scratch.txt".to_string()],
@@ -1045,7 +1067,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Ask)
         ));
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Write",
                 &["/home/user/project/src/main.rs".to_string()],
@@ -1070,7 +1092,7 @@ mod tests {
 
         // Can't determine workspace membership for Bash, workspace rule skipped, falls to default
         assert!(matches!(
-            resolve_action(&config, "Bash", &["ls".to_string()], None, Some(&roots)),
+            resolve_action_by_name(&config, "Bash", &["ls".to_string()], None, Some(&roots)),
             ConfigAction::Decision(ConfigDecision::Deny(_))
         ));
     }
@@ -1088,7 +1110,7 @@ mod tests {
 
         // No workspace_roots provided, workspace rule skipped, falls to default
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/project/src/main.rs".to_string()],
@@ -1112,7 +1134,7 @@ mod tests {
         let roots = vec!["/home/user/project".to_string()];
 
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Write",
                 &["/home/user/project/.git/config".to_string()],
@@ -1122,7 +1144,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Deny(_))
         ));
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Write",
                 &["/home/user/project/src/main.rs".to_string()],
@@ -1132,7 +1154,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Write",
                 &["/tmp/scratch.txt".to_string()],
@@ -1158,7 +1180,7 @@ mod tests {
 
         // Caller resolved "../.ssh/id_rsa" with cwd /home/user/project -> /home/user/.ssh/id_rsa
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/.ssh/id_rsa".to_string()],
@@ -1183,7 +1205,7 @@ mod tests {
         let roots = vec!["/home/user/project".to_string()];
 
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Grep",
                 &["/home/user/project/src".to_string()],
@@ -1193,7 +1215,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Grep",
                 &["/home/user/.ssh".to_string()],
@@ -1217,7 +1239,7 @@ mod tests {
 
         // No path arg AND no cwd means no workspace determination, both rules skipped
         assert!(matches!(
-            resolve_action(&config, "Grep", &[], None, Some(&roots)),
+            resolve_action_by_name(&config, "Grep", &[], None, Some(&roots)),
             ConfigAction::Decision(ConfigDecision::Deny(_))
         ));
     }
@@ -1235,7 +1257,7 @@ mod tests {
 
         // No path arg but cwd is inside workspace => falls back to cwd
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Grep",
                 &[],
@@ -1247,7 +1269,7 @@ mod tests {
 
         // No path arg but cwd is outside workspace
         assert!(matches!(
-            resolve_action(&config, "Grep", &[], Some("/tmp"), Some(&roots)),
+            resolve_action_by_name(&config, "Grep", &[], Some("/tmp"), Some(&roots)),
             ConfigAction::Decision(ConfigDecision::Ask)
         ));
     }
@@ -1265,7 +1287,7 @@ mod tests {
         let roots = vec!["/home/user/project".to_string()];
 
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "SemanticSearch",
                 &[
@@ -1292,7 +1314,7 @@ mod tests {
 
         // One dir outside workspace => not in_workspace => Ask
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "SemanticSearch",
                 &[
@@ -1320,7 +1342,7 @@ mod tests {
 
         // Empty dirs = can't determine workspace, rule skipped
         assert!(matches!(
-            resolve_action(&config, "SemanticSearch", &[], None, Some(&roots)),
+            resolve_action_by_name(&config, "SemanticSearch", &[], None, Some(&roots)),
             ConfigAction::Decision(ConfigDecision::Deny(_))
         ));
     }
@@ -1352,7 +1374,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/oss/cilium/main.go".to_string()],
@@ -1375,7 +1397,7 @@ mod tests {
         );
         // Rule skipped, falls to default Ask
         assert!(matches!(
-            resolve_action(&config, "Read", &["/etc/passwd".to_string()], None, None),
+            resolve_action_by_name(&config, "Read", &["/etc/passwd".to_string()], None, None),
             ConfigAction::Decision(ConfigDecision::Ask)
         ));
     }
@@ -1391,7 +1413,7 @@ mod tests {
         );
         // No path field in input — can't check in_paths, rule skipped, falls to next rule
         assert!(matches!(
-            resolve_action(&config, "Read", &[], None, None),
+            resolve_action_by_name(&config, "Read", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Deny(_))
         ));
     }
@@ -1407,7 +1429,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "SemanticSearch",
                 &[
@@ -1436,7 +1458,7 @@ mod tests {
         );
         // One dir inside in_paths, one not — rule skipped, falls to next rule (Ask)
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "SemanticSearch",
                 &[
@@ -1461,7 +1483,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/oss/cilium/main.go".to_string()],
@@ -1471,7 +1493,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/workspaces/project/src/lib.rs".to_string()],
@@ -1481,7 +1503,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/.ssh/id_rsa".to_string()],
@@ -1510,7 +1532,7 @@ mod tests {
 
         // Inside workspace AND inside in_paths -> Allow
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/oss/cilium/main.go".to_string()],
@@ -1524,7 +1546,7 @@ mod tests {
         // /home/user/oss/cilium/../other/secret.txt normalises to /home/user/oss/other/secret.txt
         // which IS inside /home/user/oss. Use a path truly outside in_paths:
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/other/secret.txt".to_string()],
@@ -1555,7 +1577,7 @@ mod tests {
         );
         let path = format!("{home}/oss/cilium/main.go");
         assert!(matches!(
-            resolve_action(&config, "Read", &[path], None, None),
+            resolve_action_by_name(&config, "Read", &[path], None, None),
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
     }
@@ -1572,7 +1594,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/oss-other/main.go".to_string()],
@@ -1597,7 +1619,7 @@ mod tests {
         );
         // Caller has already normalized: /home/user/oss/../unsafe/secret.txt -> /home/user/unsafe/secret.txt
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/unsafe/secret.txt".to_string()],
@@ -1621,7 +1643,7 @@ mod tests {
             DefaultAction::Ask,
         );
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Read",
                 &["/home/user/oss/linux/net/core.c".to_string()],
@@ -1644,7 +1666,7 @@ mod tests {
         let roots = vec!["/home/user/project".to_string()];
 
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Glob",
                 &["/home/user/project/src".to_string()],
@@ -1654,7 +1676,7 @@ mod tests {
             ConfigAction::Decision(ConfigDecision::Allow)
         ));
         assert!(matches!(
-            resolve_action(
+            resolve_action_by_name(
                 &config,
                 "Glob",
                 &["/home/user/.ssh".to_string()],

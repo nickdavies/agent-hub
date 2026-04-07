@@ -468,6 +468,7 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "protocol",
  "regex",
  "serde",
  "serde_json",

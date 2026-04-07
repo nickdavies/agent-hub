@@ -13,6 +13,7 @@
  */
 
 import { describe, test, expect, mock } from "bun:test"
+import type { OpenCodeHookInput, OpenCodeTool } from "./generated/gateway-types"
 
 // ---------------------------------------------------------------------------
 // Replicate the key logic from agent-hub.ts (module-private functions)
@@ -23,21 +24,20 @@ const DEFAULT_TITLE_RE = /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T/
 
 function makePayload(
   sessionId: string,
-  tool: string,
-  toolInput: Record<string, string>,
+  tool: OpenCodeTool,
+  toolInput: Record<string, unknown>,
   cwd: string,
   title?: string,
-): object {
-  const payload: Record<string, unknown> = {
+): OpenCodeHookInput {
+  return {
     session_id: sessionId,
     tool_name: tool,
     tool_input: toolInput,
     cwd,
     workspace_roots: [cwd],
     hook_event_name: "permission.ask",
+    session_title: title ?? null,
   }
-  if (title) payload.session_title = title
-  return payload
 }
 
 // Simplified fetchTitle for testing — takes a mock get function that
@@ -70,22 +70,22 @@ async function fetchTitle(
 
 describe("makePayload", () => {
   test("includes session_title when title is provided", () => {
-    const p = makePayload("ses_abc", "Bash", { command: "ls" }, "/home/user", "Fix auth bug") as Record<string, unknown>
+    const p = makePayload("ses_abc", "Bash", { command: "ls" }, "/home/user", "Fix auth bug")
     expect(p.session_title).toBe("Fix auth bug")
     expect(p.session_id).toBe("ses_abc")
     expect(p.tool_name).toBe("Bash")
   })
 
-  test("omits session_title when title is undefined", () => {
-    const p = makePayload("ses_abc", "Read", { path: "/tmp" }, "/home/user") as Record<string, unknown>
-    expect(p.session_title).toBeUndefined()
-    expect("session_title" in p).toBe(false)
+  test("sets session_title to null when title is undefined", () => {
+    const p = makePayload("ses_abc", "Read", { path: "/tmp" }, "/home/user")
+    expect(p.session_title).toBeNull()
   })
 
-  test("omits session_title when title is empty string", () => {
-    const p = makePayload("ses_abc", "Read", { path: "/tmp" }, "/home/user", "") as Record<string, unknown>
-    // empty string is falsy, so if (title) is false
-    expect("session_title" in p).toBe(false)
+  test("sets session_title to empty string when title is empty string", () => {
+    const p = makePayload("ses_abc", "Read", { path: "/tmp" }, "/home/user", "")
+    // ?? only maps undefined/null to null; empty string passes through.
+    // In practice fetchTitle never returns "" — it returns undefined or a real title.
+    expect(p.session_title).toBe("")
   })
 })
 
