@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QuestionProxyResponse",
+  "description": "Immediate response returned to the gateway after registering a question.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  },
+  "oneOf": [
+    {
+      "description": "Waiting for the operator to answer.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "pending"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Operator submitted answers.",
+      "type": "object",
+      "properties": {
+        "answers": {
+          "description": "One `Answer` (array of selected labels) per question, in order.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "type": {
+          "type": "string",
+          "const": "answered"
+        }
+      },
+      "required": [
+        "type",
+        "answers"
+      ]
+    },
+    {
+      "description": "Operator dismissed the question.",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "const": "rejected"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    {
+      "description": "Gateway timed out or was killed without resolving.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "cancelled"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    }
+  ],
+  "required": [
+    "id"
+  ]
+}

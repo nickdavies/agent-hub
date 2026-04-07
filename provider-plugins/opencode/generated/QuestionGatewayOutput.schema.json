@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QuestionGatewayOutput",
+  "description": "JSON written to stdout by `agent-hub-gateway question` on exit 0.\n\nExit codes:\n  0 = answered   — stdout contains this struct\n  1 = rejected, cancelled, timed out, or server unreachable\n  2 = fail-closed (bad input / internal error)",
+  "type": "object",
+  "properties": {
+    "answers": {
+      "description": "One array of selected labels per question, in input order.",
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "required": [
+    "answers"
+  ]
+}

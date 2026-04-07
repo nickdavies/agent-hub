@@ -50,6 +50,94 @@ export interface OpenCodeHookOutput {
 export type Provider = "claude" | "cursor" | "opencode" | "unknown"
 
 /**
+ * JSON written to stdout by `agent-hub-gateway question` on exit 0.
+ *
+ * Exit codes:
+ *   0 = answered   — stdout contains this struct
+ *   1 = rejected, cancelled, timed out, or server unreachable
+ *   2 = fail-closed (bad input / internal error)
+ */
+export interface QuestionGatewayOutput {
+  /**
+   * One array of selected labels per question, in input order.
+   */
+  answers: string[][]
+}
+
+/**
+ * Request body sent by the gateway when a question needs proxying.
+ */
+export interface QuestionProxyRequest {
+  cwd: string
+  /**
+   * Gateway-generated UUID used as an idempotency key.
+   */
+  id: string
+  /**
+   * Provider that originated the question (always "opencode" for now).
+   */
+  provider: string
+  /**
+   * The opencode-native question ID (e.g. "que_01j...").
+   */
+  question_request_id: string
+  questions: QuestionInfo[]
+  session_display_name: string
+  session_id: SessionId
+}
+/**
+ * One question with its choices.
+ */
+export interface QuestionInfo {
+  /**
+   * If true (default), a free-text "Type your own answer" input is shown.
+   */
+  custom?: boolean | null
+  /**
+   * Short label (≤30 chars) shown as the tab/step heading.
+   */
+  header: string
+  /**
+   * If true, multiple options may be selected simultaneously.
+   */
+  multiple?: boolean | null
+  options: QuestionOption[]
+  question: string
+}
+/**
+ * A single selectable option within a question.
+ */
+export interface QuestionOption {
+  description: string
+  label: string
+}
+
+/**
+ * Immediate response returned to the gateway after registering a question.
+ */
+export type QuestionProxyResponse = {
+  id: string
+} & (
+  | {
+      type: "pending"
+    }
+  | {
+      /**
+       * One `Answer` (array of selected labels) per question, in order.
+       */
+      answers: string[][]
+      type: "answered"
+    }
+  | {
+      reason?: string | null
+      type: "rejected"
+    }
+  | {
+      type: "cancelled"
+    }
+)
+
+/**
  * Stored session status as reported by the client.
  */
 export type SessionStatus = "active" | "idle" | "waiting" | "ended"

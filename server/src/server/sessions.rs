@@ -234,7 +234,9 @@ impl SessionRegistry {
     }
 
     /// Evict sessions past their TTL.
-    /// Active/idle/waiting sessions use the default TTL; ended sessions use `ended_ttl`.
+    /// Active/idle sessions use the default TTL; ended sessions use `ended_ttl`.
+    /// Waiting sessions (which have a pending question or approval) are never evicted by TTL —
+    /// they are cleaned up only when their question/approval is resolved or orphaned.
     /// Returns the IDs of evicted sessions.
     pub async fn evict_stale(&self, ended_ttl: Duration) -> Vec<SessionId> {
         let mut sessions = self.sessions.write().await;
@@ -242,6 +244,8 @@ impl SessionRegistry {
         sessions.retain(|id, s| {
             let alive = match s.status {
                 SessionStatus::Ended => s.ended_at.is_some_and(|t| t.elapsed() < ended_ttl),
+                // Never evict a session that is actively waiting for a human response.
+                SessionStatus::Waiting => true,
                 _ => s.last_seen.elapsed() < self.ttl,
             };
             if !alive {
@@ -447,6 +451,121 @@ mod tests {
             .await;
         let sessions = reg.list().await;
         assert_eq!(sessions[0].stored_status, SessionStatus::Ended);
+    }
+
+    // ---------------------------------------------------------------
+    // Eviction behaviour — Waiting sessions must survive TTL eviction
+    // ---------------------------------------------------------------
+
+    /// Active/Idle sessions past their TTL must be evicted; Waiting sessions
+    /// must never be evicted by TTL regardless of `last_seen` staleness.
+    #[tokio::test]
+    async fn evict_stale_spares_waiting_sessions() {
+        // TTL of 0 means every session is immediately "stale" — useful for
+        // testing eviction without having to sleep.
+        let reg = SessionRegistry::new(0);
+
+        reg.get_or_register(&SessionId::new("s_active"), "/proj/a", None)
+            .await;
+        reg.get_or_register(&SessionId::new("s_idle"), "/proj/b", None)
+            .await;
+        reg.get_or_register(&SessionId::new("s_waiting"), "/proj/c", None)
+            .await;
+
+        reg.set_status(&SessionId::new("s_idle"), SessionStatus::Idle, None, None)
+            .await;
+        reg.set_status(
+            &SessionId::new("s_waiting"),
+            SessionStatus::Waiting,
+            Some("pending question".to_string()),
+            None,
+        )
+        .await;
+
+        // Use a very long ended_ttl so only the active/idle TTL triggers.
+        let evicted = reg.evict_stale(Duration::from_secs(9999)).await;
+
+        // Active and Idle should be evicted (TTL=0 makes them immediately stale).
+        assert!(
+            evicted.contains(&SessionId::new("s_active")),
+            "Active session should be evicted when stale"
+        );
+        assert!(
+            evicted.contains(&SessionId::new("s_idle")),
+            "Idle session should be evicted when stale"
+        );
+        // Waiting session must survive regardless of TTL.
+        assert!(
+            !evicted.contains(&SessionId::new("s_waiting")),
+            "Waiting session must never be evicted by TTL"
+        );
+
+        // Confirm the Waiting session is still in the registry.
+        let remaining = reg.list().await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, SessionId::new("s_waiting"));
+        assert_eq!(remaining[0].stored_status, SessionStatus::Waiting);
+    }
+
+    /// An Ended session uses `ended_ttl`, not the main TTL.
+    /// A stale Ended session must be evicted even when a fresh Waiting session exists.
+    #[tokio::test]
+    async fn evict_stale_ended_uses_ended_ttl() {
+        let reg = SessionRegistry::new(9999); // main TTL very long
+
+        reg.get_or_register(&SessionId::new("s_ended"), "/proj/e", None)
+            .await;
+        reg.set_status(&SessionId::new("s_ended"), SessionStatus::Ended, None, None)
+            .await;
+
+        reg.get_or_register(&SessionId::new("s_waiting"), "/proj/w", None)
+            .await;
+        reg.set_status(
+            &SessionId::new("s_waiting"),
+            SessionStatus::Waiting,
+            None,
+            None,
+        )
+        .await;
+
+        // ended_ttl=0 makes the Ended session immediately stale.
+        let evicted = reg.evict_stale(Duration::from_secs(0)).await;
+
+        assert!(
+            evicted.contains(&SessionId::new("s_ended")),
+            "Ended session past ended_ttl should be evicted"
+        );
+        assert!(
+            !evicted.contains(&SessionId::new("s_waiting")),
+            "Waiting session must not be evicted"
+        );
+    }
+
+    /// Once a Waiting session is reset to Idle it becomes eligible for eviction.
+    #[tokio::test]
+    async fn evict_stale_waiting_session_eligible_after_reset_to_idle() {
+        let reg = SessionRegistry::new(0); // TTL=0 so anything non-Waiting is immediately stale
+
+        reg.get_or_register(&SessionId::new("s1"), "/proj/x", None)
+            .await;
+        reg.set_status(&SessionId::new("s1"), SessionStatus::Waiting, None, None)
+            .await;
+
+        // While Waiting, must not be evicted.
+        let evicted = reg.evict_stale(Duration::from_secs(9999)).await;
+        assert!(evicted.is_empty(), "Waiting session must survive");
+
+        // Reset to Idle (simulating zombie cleanup in main.rs).
+        reg.set_status(&SessionId::new("s1"), SessionStatus::Idle, None, None)
+            .await;
+
+        // Now with TTL=0 it is stale and must be evicted.
+        let evicted = reg.evict_stale(Duration::from_secs(9999)).await;
+        assert!(
+            evicted.contains(&SessionId::new("s1")),
+            "Idle session should be evictable after reset from Waiting"
+        );
+        assert!(reg.list().await.is_empty(), "registry should be empty");
     }
 
     #[tokio::test]

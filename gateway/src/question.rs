@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::RunError;
 use protocol::{
-    QuestionDecision, QuestionProxyRequest, QuestionProxyResponse, QuestionResolveRequest,
-    QuestionStatus, QuestionWaitResponse, Secret,
+    QuestionDecision, QuestionGatewayOutput, QuestionProxyRequest, QuestionProxyResponse,
+    QuestionResolveRequest, QuestionStatus, QuestionWaitResponse, Secret,
 };
 
 /// Arguments for the `question` subcommand.
@@ -62,7 +62,8 @@ pub async fn run(args: QuestionArgs) -> ExitCode {
 
     match proxy_question(&args, &req).await {
         Ok(answers) => {
-            let out = serde_json::json!({ "answers": answers });
+            let out = serde_json::to_string(&QuestionGatewayOutput { answers })
+                .expect("QuestionGatewayOutput serialization failed");
             print!("{out}");
             ExitCode::SUCCESS
         }

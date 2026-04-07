@@ -828,4 +828,153 @@ mod integration_tests {
             "reason should mention pending approval, got: {reason}"
         );
     }
+
+    // ---------------------------------------------------------------
+    // Zombie Waiting session reset — sessions with no pending
+    // question or approval must be reset to Idle so TTL eviction can
+    // eventually clean them up.
+    // ---------------------------------------------------------------
+
+    /// A Waiting session that has a pending question must NOT be reset.
+    #[tokio::test]
+    async fn waiting_session_with_pending_question_is_not_reset() {
+        let app = test_app();
+
+        // Register a session and set it to Waiting.
+        post_json(
+            &app,
+            "/api/v1/hooks/status",
+            r#"{"session_id":"ses_q","cwd":"/tmp/proj","status":"active","editor_type":"opencode"}"#,
+        )
+        .await;
+
+        // Register a pending question via the hooks endpoint.
+        let (status, body) = {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/hooks/question")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{
+                        "id": "req-q1",
+                        "session_id": "ses_q",
+                        "session_display_name": "Test Session",
+                        "cwd": "/tmp/proj",
+                        "question_request_id": "oc-req-1",
+                        "questions": [{"question":"Continue?","header":"Plan","options":[{"label":"Yes","description":"Go ahead"},{"label":"No","description":"Stop"}]}],
+                        "provider": "opencode"
+                    }"#,
+                ))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let s = resp.status();
+            let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (s, String::from_utf8(b.to_vec()).unwrap())
+        };
+        assert_eq!(
+            status,
+            AxumStatus::OK,
+            "question registration failed: {body}"
+        );
+
+        // Session should be Waiting due to the pending question.
+        let (_, body) = get_json(&app, "/api/v1/sessions").await;
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let sess = sessions
+            .iter()
+            .find(|s| s["session_id"] == "ses_q")
+            .unwrap();
+        assert_eq!(
+            sess["status"]["status"], "waiting",
+            "session should be Waiting while question is pending"
+        );
+    }
+
+    /// A Waiting session whose question has been resolved must be eligible for
+    /// zombie reset (first_pending_for_session returns None after resolve).
+    #[tokio::test]
+    async fn waiting_session_becomes_zombie_after_question_resolved() {
+        use protocol::QuestionInfo;
+        use questions::{QuestionRegistry, QuestionStatus, RegisterQuestion};
+
+        let reg = SessionRegistry::new(9999);
+        let questions = QuestionRegistry::new();
+
+        // Register session in Waiting state.
+        reg.get_or_register(&SessionId::new("ses_zombie"), "/tmp/z", None)
+            .await;
+        reg.set_status(
+            &SessionId::new("ses_zombie"),
+            SessionStatus::Waiting,
+            Some("pending question".to_string()),
+            None,
+        )
+        .await;
+
+        // Register a question for this session.
+        let q = questions
+            .register(RegisterQuestion {
+                request_id: "req-zombie-1".to_string(),
+                session_id: SessionId::new("ses_zombie"),
+                session_display_name: "Zombie Test".to_string(),
+                project: "z".to_string(),
+                question_request_id: "oc-1".to_string(),
+                questions: vec![QuestionInfo {
+                    question: "Proceed?".to_string(),
+                    header: "Plan".to_string(),
+                    options: vec![],
+                    multiple: None,
+                    custom: None,
+                }],
+                provider: "opencode".to_string(),
+            })
+            .await;
+
+        // While question is pending, first_pending_for_session returns Some.
+        assert!(
+            questions
+                .first_pending_for_session(&SessionId::new("ses_zombie"))
+                .await
+                .is_some(),
+            "should have a pending question"
+        );
+
+        // Simulate gateway cancel (e.g. SIGTERM path).
+        questions.resolve(q.id, QuestionStatus::Cancelled).await;
+
+        // Now no pending question remains — zombie condition.
+        assert!(
+            questions
+                .first_pending_for_session(&SessionId::new("ses_zombie"))
+                .await
+                .is_none(),
+            "no pending question after cancel"
+        );
+
+        // The zombie reset logic in main.rs would call set_status(Idle) here.
+        reg.set_status(
+            &SessionId::new("ses_zombie"),
+            SessionStatus::Idle,
+            None,
+            None,
+        )
+        .await;
+
+        let sessions = reg.list().await;
+        let sess = sessions
+            .iter()
+            .find(|s| s.session_id == SessionId::new("ses_zombie"))
+            .unwrap();
+        assert_eq!(
+            sess.stored_status,
+            SessionStatus::Idle,
+            "zombie session should be reset to Idle"
+        );
+        assert!(
+            sess.waiting_reason.is_none(),
+            "waiting_reason should be cleared after reset"
+        );
+    }
 }

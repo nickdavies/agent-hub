@@ -16,7 +16,8 @@
  */
 
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
-import type { PermissionRequest } from "@opencode-ai/sdk/v2"
+import type { Event as EventV2, PermissionRequest } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import path from "path"
 import fs from "fs"
 import { spawn, spawnSync, type ChildProcess } from "child_process"
@@ -24,6 +25,8 @@ import type {
   OpenCodeHookInput,
   OpenCodeHookOutput,
   OpenCodeTool,
+  QuestionGatewayOutput,
+  QuestionProxyRequest,
   SessionStatus,
   StatusReport,
 } from "./generated/gateway-types"
@@ -86,6 +89,18 @@ const PERM_TO_TOOL: Record<string, OpenCodeTool> = {
 // ---------------------------------------------------------------------------
 
 const procs: Map<string, Set<ChildProcess>> = new Map()
+
+// Per-question gateway process tracking — keyed by opencode question requestId.
+// Used to detect when the OpenCode TUI answers a question locally (i.e. before
+// the agent-hub gateway gets a chance to answer it), so we can cancel the
+// in-flight gateway and clean up the pending question on the server.
+const questionGatewayProcs: Map<string, ChildProcess> = new Map()
+
+// Set of requestIds that were answered locally in the OpenCode TUI before the
+// gateway had a chance to answer.  When the gateway process exits (due to
+// SIGTERM from our kill) with code 1, the callGatewayQuestion callback checks
+// this set and skips the question.reject call to avoid a double-resolve error.
+const locallyAnsweredQuestions: Set<string> = new Set()
 
 function track(sid: string, proc: ChildProcess) {
   let set = procs.get(sid)
@@ -318,6 +333,84 @@ async function callGateway(sid: string, payload: OpenCodeHookInput): Promise<Gat
 }
 
 // ---------------------------------------------------------------------------
+// Question proxy — blocking gateway call for question.asked events
+// ---------------------------------------------------------------------------
+
+/** Result from the gateway `question` subcommand. */
+interface QuestionGatewayResult {
+  /** Answers returned when exit code is 0. */
+  answers?: string[][]
+  /** True when the question was rejected/cancelled (exit 1). */
+  rejected?: boolean
+  /** Error details for exit 2 (fail-closed). */
+  error?: string
+}
+
+async function callGatewayQuestion(
+  sid: string,
+  payload: QuestionProxyRequest,
+): Promise<QuestionGatewayResult> {
+  const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
+  const server = process.env.AGENT_HUB_SERVER
+  const token = process.env.AGENT_HUB_TOKEN
+
+  const args: string[] = ["question", "--opencode"]
+  args.push("--server", server ?? "http://localhost:8080")
+  args.push("--token", token ?? "")
+
+  log("INFO", "callGatewayQuestion", { bin, requestId: payload.question_request_id })
+
+  const requestId = payload.question_request_id
+
+  return new Promise((resolve) => {
+    const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] })
+    track(sid, proc)
+    questionGatewayProcs.set(requestId, proc)
+
+    let stdout = ""
+    let stderr = ""
+    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString() })
+    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString() })
+
+    proc.on("close", (code: number | null) => {
+      untrack(sid, proc)
+      questionGatewayProcs.delete(requestId)
+      if (stderr) log("INFO", "question gateway stderr", { output: stderr.trim() })
+
+      if (code === 0) {
+        try {
+          const parsed = JSON.parse(stdout.trim()) as QuestionGatewayOutput
+          resolve({ answers: parsed.answers })
+        } catch {
+          log("ERROR", "question gateway invalid JSON", { stdout: stdout.trim() })
+          resolve({ error: "gateway: invalid JSON response" })
+        }
+        return
+      }
+
+      if (code === 1) {
+        log("INFO", "question gateway rejected/cancelled", { reason: stderr.trim() })
+        resolve({ rejected: true })
+        return
+      }
+
+      // exit 2 or unexpected
+      log("WARN", "question gateway fail-closed", { code: String(code), stderr: stderr.trim() })
+      resolve({ error: `gateway: fail-closed (exit ${code})` })
+    })
+
+    proc.on("error", (err: Error) => {
+      untrack(sid, proc)
+      questionGatewayProcs.delete(requestId)
+      log("ERROR", "question gateway spawn error", { err: err.message, bin })
+      resolve({ error: err.message })
+    })
+
+    proc.stdin.end(JSON.stringify(payload))
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Build a gateway payload for a single tool_input value
 // ---------------------------------------------------------------------------
 
@@ -408,6 +501,23 @@ export const id = "agent-hub"
 const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const client = input.client
   const { directory, worktree } = input
+
+  // Create the v2 SDK client once at plugin-init time.  We reuse the same
+  // in-process fetch that input.client uses (extracted via the internal
+  // _client property) so that the request is routed through the Hono app
+  // handler in-process rather than making a real TCP connection.  In the
+  // default TUI mode no TCP server is started at all, so a real TCP fetch
+  // to input.serverUrl would fail with ECONNREFUSED.
+  const inProcessFetch: typeof fetch | undefined =
+    (input.client as any)?._client?.getConfig?.()?.fetch
+  log("INFO", "init clientV2", {
+    serverUrl: input.serverUrl.toString(),
+    hasInProcessFetch: String(!!inProcessFetch),
+  })
+  const clientV2 = createOpencodeClient({
+    baseUrl: input.serverUrl.toString(),
+    ...(inProcessFetch ? { fetch: inProcessFetch } : {}),
+  })
 
   return {
     "permission.ask": async (_info, output) => {
@@ -587,7 +697,12 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       apply(result, output)
     },
 
-    event: async ({ event }) => {
+    event: async ({ event: _event }) => {
+      // The published @opencode-ai/plugin types the event hook using the v1
+      // SDK Event union, which doesn't include question.* variants. Cast to
+      // the v2 Event type which does; the v2 bus is what fires at runtime.
+      const event = _event as unknown as EventV2
+
       // session.status — map opencode statuses to agent-hub statuses
       if (event.type === "session.status") {
         const sid = event.properties.sessionID
@@ -615,6 +730,115 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           killGateways(sid)
           reportStatus(sid, "ended")
         }
+        return
+      }
+
+      // question.asked — AI is blocked waiting for operator input.
+      // Proxy the question through the gateway so the operator can answer it
+      // from the web UI or TUI. Report Waiting immediately (bypass debounce).
+      if (event.type === "question.asked") {
+        const sid = event.properties.sessionID
+        const requestId = event.properties.id
+        const questions = event.properties.questions
+        const header = questions[0]?.header ?? "Plan question"
+
+        // Immediately report Waiting (bypass debounce — time-sensitive)
+        const existing = statusTimers.get(sid)
+        if (existing) clearTimeout(existing)
+        statusTimers.delete(sid)
+        spawnStatusReport(sid, "waiting", { waitingReason: `Plan question: ${header}` })
+
+        // Build the gateway request
+        const proxyReq: QuestionProxyRequest = {
+          id: `${sid}-${requestId}`,
+          session_id: sid,
+          session_display_name: titles.get(sid) ?? sid,
+          cwd: directory,
+          question_request_id: requestId,
+          questions: questions.map((q) => ({
+            question: q.question,
+            header: q.header,
+            options: q.options.map((o) => ({ label: o.label, description: o.description })),
+            multiple: q.multiple,
+            custom: q.custom,
+          })),
+          provider: "opencode",
+        }
+
+        // Proxy through gateway (async — the event hook is fire-and-forget from
+        // opencode's perspective, but question.ask() awaits the Deferred internally
+        // so the reply can arrive at any time).
+        callGatewayQuestion(sid, proxyReq).then(async (result) => {
+          // If the question was answered locally in the TUI while the gateway
+          // was in-flight, we killed the gateway (SIGTERM) which causes it to
+          // exit with code 1 (rejected).  Skip the question.reject call here —
+          // the question is already resolved and a second reject would fail.
+          if (locallyAnsweredQuestions.has(requestId)) {
+            log("INFO", "question already answered locally, skipping gateway callback", { sid, requestId })
+            locallyAnsweredQuestions.delete(requestId)
+            return
+          }
+          if (result.answers) {
+            log("INFO", "question answered via gateway, calling question.reply", { sid, requestId })
+            const resp = await clientV2.question.reply({
+              requestID: requestId,
+              directory,
+              answers: result.answers,
+            })
+            if (resp.error) {
+              log("WARN", "question.reply failed", { sid, requestId, err: String(resp.error) })
+            }
+          } else {
+            // Rejected, cancelled, or error — reject the question
+            log("INFO", "question rejected/cancelled via gateway, calling question.reject", { sid, requestId })
+            const resp = await clientV2.question.reject({
+              requestID: requestId,
+              directory,
+            })
+            if (resp.error) {
+              log("WARN", "question.reject failed", { sid, requestId, err: String(resp.error) })
+            }
+          }
+        }).catch((err: unknown) => {
+          log("WARN", "callGatewayQuestion threw", { sid, requestId, err: String(err) })
+        })
+
+        return
+      }
+
+      // question.replied — question was answered (locally or via proxy).
+      // Restore active status so the dashboard reflects the agent is running again.
+      // If a gateway process is still in-flight for this requestId, the question was
+      // answered locally in the OpenCode TUI — kill the gateway so it cancels the
+      // pending question on the agent-hub server.
+      if (event.type === "question.replied") {
+        const reqId = event.properties.requestID
+        const gwProc = questionGatewayProcs.get(reqId)
+        if (gwProc) {
+          log("INFO", "question answered locally, cancelling agent-hub gateway", { reqId })
+          locallyAnsweredQuestions.add(reqId)
+          try { gwProc.kill("SIGTERM") } catch (err: unknown) {
+            log("WARN", "failed to kill question gateway", { reqId, err: String(err) })
+          }
+        }
+        reportStatus(event.properties.sessionID, "active")
+        return
+      }
+
+      // question.rejected — question was dismissed in the OpenCode TUI. Same
+      // cleanup: kill the in-flight gateway if present so the server entry is cancelled.
+      if (event.type === "question.rejected") {
+        const reqId = event.properties.requestID
+        const gwProc = questionGatewayProcs.get(reqId)
+        if (gwProc) {
+          log("INFO", "question rejected locally, cancelling agent-hub gateway", { reqId })
+          locallyAnsweredQuestions.add(reqId)
+          try { gwProc.kill("SIGTERM") } catch (err: unknown) {
+            log("WARN", "failed to kill question gateway", { reqId, err: String(err) })
+          }
+        }
+        reportStatus(event.properties.sessionID, "active")
+        return
       }
     },
   }

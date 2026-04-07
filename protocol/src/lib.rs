@@ -34,8 +34,9 @@ pub use gateway::{
 pub use hooks::{NotificationPayload, SessionEndPayload, StatusReport, StopPayload};
 pub use presence::{PresenceState, PresenceUpdate};
 pub use question::{
-    PendingQuestion, QuestionDecision, QuestionInfo, QuestionOption, QuestionProxyRequest,
-    QuestionProxyResponse, QuestionResolveRequest, QuestionStatus, QuestionWaitResponse,
+    PendingQuestion, QuestionDecision, QuestionGatewayOutput, QuestionInfo, QuestionOption,
+    QuestionProxyRequest, QuestionProxyResponse, QuestionResolveRequest, QuestionStatus,
+    QuestionWaitResponse,
 };
 pub use secret::Secret;
 pub use sessions::{

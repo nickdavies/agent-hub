@@ -129,8 +129,20 @@ pub struct QuestionResolveRequest {
 }
 
 // ===========================================================================
-// Full stored record
+// Gateway stdout: exit-0 output of the `question` subcommand
 // ===========================================================================
+
+/// JSON written to stdout by `agent-hub-gateway question` on exit 0.
+///
+/// Exit codes:
+///   0 = answered   — stdout contains this struct
+///   1 = rejected, cancelled, timed out, or server unreachable
+///   2 = fail-closed (bad input / internal error)
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct QuestionGatewayOutput {
+    /// One array of selected labels per question, in input order.
+    pub answers: Vec<Vec<String>>,
+}
 
 /// A pending (or resolved) question as stored by the server.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

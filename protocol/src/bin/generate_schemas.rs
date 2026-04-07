@@ -51,5 +51,10 @@ fn main() {
     write_schema::<protocol::SessionStatus>(&out_dir, "SessionStatus");
     write_schema::<protocol::Provider>(&out_dir, "Provider");
 
+    // -- Question proxy types (gateway question subcommand) --
+    write_schema::<protocol::QuestionProxyRequest>(&out_dir, "QuestionProxyRequest");
+    write_schema::<protocol::QuestionProxyResponse>(&out_dir, "QuestionProxyResponse");
+    write_schema::<protocol::QuestionGatewayOutput>(&out_dir, "QuestionGatewayOutput");
+
     eprintln!("Done.");
 }
