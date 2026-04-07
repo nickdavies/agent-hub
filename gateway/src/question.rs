@@ -2,11 +2,11 @@ use std::io::Read;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use crate::RunError;
 use protocol::{
     QuestionDecision, QuestionProxyRequest, QuestionProxyResponse, QuestionResolveRequest,
     QuestionStatus, QuestionWaitResponse, Secret,
 };
-use crate::RunError;
 
 /// Arguments for the `question` subcommand.
 #[derive(clap::Args)]
@@ -162,10 +162,10 @@ async fn poll_for_answer(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            eprintln!(
-                "[error] question timed out after {timeout_secs}s with no answer"
-            );
-            return Err(RunError::ServerUnreachable("question timed out".to_string()));
+            eprintln!("[error] question timed out after {timeout_secs}s with no answer");
+            return Err(RunError::ServerUnreachable(
+                "question timed out".to_string(),
+            ));
         }
 
         attempt += 1;
@@ -259,7 +259,8 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
         tokio::select! {
             _ = sigterm.recv() => {}

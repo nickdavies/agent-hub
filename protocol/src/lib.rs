@@ -42,5 +42,5 @@ pub use sessions::{
     ApprovalModeResponse, EditorType, EffectiveSessionStatus, Provider, SessionApprovalMode,
     SessionConfigUpdate, SessionId, SessionNotifyConfig, SessionStatus, SessionView,
 };
-pub use tool::{expand_tool_group, Tool, ToolCategory};
+pub use tool::{Tool, ToolCategory, expand_tool_group};
 pub use tool_call::{MultiEditEntry, ToolCall, ToolCallKind, ToolCallParseError};

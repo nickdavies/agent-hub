@@ -87,7 +87,7 @@ pub enum Mode {
         #[allow(dead_code)]
         index: usize,
         /// The question data.
-        question: Question,
+        question: Box<Question>,
         /// Which sub-question we are currently on (0-based).
         q_idx: usize,
         /// For each sub-question: which option index is selected (None = none yet).

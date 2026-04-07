@@ -107,7 +107,10 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
             .route("/questions/pending", get(handle_list_questions::<N>))
             .route("/questions/{id}", get(handle_get_question::<N>))
             .route("/questions/{id}/wait", get(handle_question_wait::<N>))
-            .route("/questions/{id}/resolve", post(handle_question_resolve::<N>))
+            .route(
+                "/questions/{id}/resolve",
+                post(handle_question_resolve::<N>),
+            )
             .route(
                 "/sessions/{id}/approval-mode",
                 get(handle_get_approval_mode::<N>),
@@ -479,11 +482,9 @@ async fn handle_question_resolve<N: Notifier>(
     Json(req): Json<QuestionResolveRequest>,
 ) -> Result<Json<questions::PendingQuestion>, AppError> {
     let new_status = match req.decision {
-        QuestionDecision::Answer => {
-            questions::QuestionStatus::Answered {
-                answers: req.answers.unwrap_or_default(),
-            }
-        }
+        QuestionDecision::Answer => questions::QuestionStatus::Answered {
+            answers: req.answers.unwrap_or_default(),
+        },
         QuestionDecision::Reject => questions::QuestionStatus::Rejected { reason: req.reason },
         QuestionDecision::Cancel => questions::QuestionStatus::Cancelled,
     };

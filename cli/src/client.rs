@@ -95,17 +95,15 @@ impl Client {
         Ok(())
     }
 
-    pub async fn answer_question(
-        &self,
-        id: Uuid,
-        answers: Vec<Vec<String>>,
-    ) -> Result<(), String> {
+    pub async fn answer_question(&self, id: Uuid, answers: Vec<Vec<String>>) -> Result<(), String> {
         let url = format!("{}/api/v1/questions/{}/resolve", self.base_url, id);
-        let req = self.auth(self.http.post(&url)).json(&QuestionResolveRequest {
-            decision: QuestionDecision::Answer,
-            answers: Some(answers),
-            reason: None,
-        });
+        let req = self
+            .auth(self.http.post(&url))
+            .json(&QuestionResolveRequest {
+                decision: QuestionDecision::Answer,
+                answers: Some(answers),
+                reason: None,
+            });
         let resp = req
             .send()
             .await
@@ -118,11 +116,13 @@ impl Client {
 
     pub async fn reject_question(&self, id: Uuid) -> Result<(), String> {
         let url = format!("{}/api/v1/questions/{}/resolve", self.base_url, id);
-        let req = self.auth(self.http.post(&url)).json(&QuestionResolveRequest {
-            decision: QuestionDecision::Reject,
-            answers: None,
-            reason: None,
-        });
+        let req = self
+            .auth(self.http.post(&url))
+            .json(&QuestionResolveRequest {
+                decision: QuestionDecision::Reject,
+                answers: None,
+                reason: None,
+            });
         let resp = req
             .send()
             .await

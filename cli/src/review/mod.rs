@@ -40,10 +40,8 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
     loop {
         // Poll server if interval elapsed
         if last_poll.elapsed() >= poll_interval {
-            let (approvals_result, questions_result) = tokio::join!(
-                client.list_pending(),
-                client.list_pending_questions()
-            );
+            let (approvals_result, questions_result) =
+                tokio::join!(client.list_pending(), client.list_pending_questions());
 
             match (approvals_result, questions_result) {
                 (Ok(new_approvals), Ok(new_questions)) => {
@@ -101,7 +99,12 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                             let id = approval.id;
                             match client.approve(id, None).await {
                                 Ok(()) => {
-                                    remove_item(&mut items, &mut known_approval_ids, &mut known_question_ids, id);
+                                    remove_item(
+                                        &mut items,
+                                        &mut known_approval_ids,
+                                        &mut known_question_ids,
+                                        id,
+                                    );
                                     ui.clamp_selection(items.len());
                                     last_poll = Instant::now() - poll_interval;
                                 }
@@ -121,7 +124,7 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                         if let Some(ReviewItem::Question(q)) = items.get(idx) {
                             ui.mode = Mode::AnswerQuestion {
                                 index: idx,
-                                question: q.clone(),
+                                question: Box::new(q.clone()),
                                 // For each sub-question, track which option is selected (single-choice).
                                 // We'll build a per-question selected index.
                                 q_idx: 0,
@@ -135,7 +138,12 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                             let id = q.id;
                             match client.reject_question(id).await {
                                 Ok(()) => {
-                                    remove_item(&mut items, &mut known_approval_ids, &mut known_question_ids, id);
+                                    remove_item(
+                                        &mut items,
+                                        &mut known_approval_ids,
+                                        &mut known_question_ids,
+                                        id,
+                                    );
                                     ui.clamp_selection(items.len());
                                     last_poll = Instant::now() - poll_interval;
                                 }
@@ -218,10 +226,19 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                         ui.mode = Mode::Normal;
                         if let Some(ReviewItem::Approval(approval)) = items.get(index) {
                             let id = approval.id;
-                            let reason = if reason.is_empty() { None } else { Some(reason) };
+                            let reason = if reason.is_empty() {
+                                None
+                            } else {
+                                Some(reason)
+                            };
                             match client.deny(id, reason).await {
                                 Ok(()) => {
-                                    remove_item(&mut items, &mut known_approval_ids, &mut known_question_ids, id);
+                                    remove_item(
+                                        &mut items,
+                                        &mut known_approval_ids,
+                                        &mut known_question_ids,
+                                        id,
+                                    );
                                     ui.clamp_selection(items.len());
                                     last_poll = Instant::now() - poll_interval;
                                 }
@@ -244,7 +261,12 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                         ui.mode = Mode::Normal;
                         match client.answer_question(id, answers).await {
                             Ok(()) => {
-                                remove_item(&mut items, &mut known_approval_ids, &mut known_question_ids, id);
+                                remove_item(
+                                    &mut items,
+                                    &mut known_approval_ids,
+                                    &mut known_question_ids,
+                                    id,
+                                );
                                 ui.clamp_selection(items.len());
                                 last_poll = Instant::now() - poll_interval;
                             }
@@ -257,7 +279,12 @@ async fn event_loop(client: &Client, ui: &mut Ui, poll_interval_secs: u64) -> an
                         ui.mode = Mode::Normal;
                         match client.reject_question(id).await {
                             Ok(()) => {
-                                remove_item(&mut items, &mut known_approval_ids, &mut known_question_ids, id);
+                                remove_item(
+                                    &mut items,
+                                    &mut known_approval_ids,
+                                    &mut known_question_ids,
+                                    id,
+                                );
                                 ui.clamp_selection(items.len());
                                 last_poll = Instant::now() - poll_interval;
                             }
@@ -312,11 +339,23 @@ fn merge_items(
     // Rebuild known id sets
     *known_approval_ids = items
         .iter()
-        .filter_map(|i| if let ReviewItem::Approval(a) = i { Some(a.id) } else { None })
+        .filter_map(|i| {
+            if let ReviewItem::Approval(a) = i {
+                Some(a.id)
+            } else {
+                None
+            }
+        })
         .collect();
     *known_question_ids = items
         .iter()
-        .filter_map(|i| if let ReviewItem::Question(q) = i { Some(q.id) } else { None })
+        .filter_map(|i| {
+            if let ReviewItem::Question(q) = i {
+                Some(q.id)
+            } else {
+                None
+            }
+        })
         .collect();
 }
 
