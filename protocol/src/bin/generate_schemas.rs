@@ -7,12 +7,12 @@
 //! The generated schemas are consumed by `json-schema-to-typescript` to produce
 //! TypeScript type definitions for the provider plugins.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::Path, path::PathBuf};
 
-use schemars::{generate::SchemaSettings, JsonSchema};
+use schemars::{JsonSchema, generate::SchemaSettings};
 
 /// Generate a JSON Schema for type `T` and write it to `<dir>/<name>.schema.json`.
-fn write_schema<T: JsonSchema>(dir: &PathBuf, name: &str) {
+fn write_schema<T: JsonSchema>(dir: &Path, name: &str) {
     let settings = SchemaSettings::draft2020_12();
     let generator = settings.into_generator();
     let schema = generator.into_root_schema_for::<T>();

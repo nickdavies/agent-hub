@@ -289,11 +289,7 @@ pub fn resolve_action(
 
     // For path-based tools, resolved_args should already contain resolved paths.
     // Deny if any path is not absolute (caller must resolve relative paths first).
-    let resolved_paths: &[String] = if is_path {
-        resolved_args
-    } else {
-        &[]
-    };
+    let resolved_paths: &[String] = if is_path { resolved_args } else { &[] };
 
     if resolved_paths.iter().any(|p| !p.starts_with('/')) {
         return ConfigAction::Decision(ConfigDecision::Deny(Some(
