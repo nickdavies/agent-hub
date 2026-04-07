@@ -7,8 +7,39 @@ use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetFor
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 
-use crate::client::Approval;
+use crate::client::{Approval, Question};
 use protocol::tool_call::{ToolCall, ToolCallKind};
+use uuid::Uuid;
+
+// ===========================================================================
+// ReviewItem — unified item type for the TUI list
+// ===========================================================================
+
+/// A single item shown in the review list (either an approval or a question).
+pub enum ReviewItem {
+    Approval(Approval),
+    Question(Question),
+}
+
+impl ReviewItem {
+    pub fn id(&self) -> Uuid {
+        match self {
+            ReviewItem::Approval(a) => a.id,
+            ReviewItem::Question(q) => q.id,
+        }
+    }
+
+    pub fn created_at(&self) -> chrono::DateTime<Utc> {
+        match self {
+            ReviewItem::Approval(a) => a.created_at,
+            ReviewItem::Question(q) => q.created_at,
+        }
+    }
+}
+
+// ===========================================================================
+// Action
+// ===========================================================================
 
 /// What the user wants to do after a UI event.
 pub enum Action {
@@ -16,6 +47,10 @@ pub enum Action {
     Approve(usize),
     /// Deny the approval at the given index — enters reason input mode.
     StartDeny(usize),
+    /// Open the answer-question dialog for the question at the given index.
+    StartAnswer(usize),
+    /// Reject the question at the given index.
+    RejectQuestion(usize),
     /// Navigate to the next item.
     Next,
     /// Navigate to the previous item.
@@ -36,13 +71,35 @@ pub enum Action {
     None,
 }
 
+// ===========================================================================
+// Mode
+// ===========================================================================
+
 /// Mode of the UI.
 pub enum Mode {
     /// Normal browsing mode.
     Normal,
     /// Typing a deny reason for the approval at the given index.
     DenyInput { index: usize, buffer: String },
+    /// Answering a multi-step question.
+    AnswerQuestion {
+        /// Index in the items list of the question being answered.
+        #[allow(dead_code)]
+        index: usize,
+        /// The question data.
+        question: Question,
+        /// Which sub-question we are currently on (0-based).
+        q_idx: usize,
+        /// For each sub-question: which option index is selected (None = none yet).
+        selections: Vec<Option<usize>>,
+        /// For each sub-question: free-text custom answer buffer.
+        custom_inputs: Vec<String>,
+    },
 }
+
+// ===========================================================================
+// Result types
+// ===========================================================================
 
 /// Result of processing a key event in DenyInput mode.
 pub enum DenyInputResult {
@@ -53,6 +110,22 @@ pub enum DenyInputResult {
     /// Still typing.
     Continue,
 }
+
+/// Result of processing a key event in AnswerQuestion mode.
+pub enum AnswerQuestionResult {
+    /// User submitted answers. `answers[i]` is the list of selected labels for question `i`.
+    Submit { id: Uuid, answers: Vec<Vec<String>> },
+    /// User rejected the question.
+    Reject { id: Uuid },
+    /// User cancelled (Esc).
+    Cancel,
+    /// Still interacting.
+    Continue,
+}
+
+// ===========================================================================
+// Internal line types
+// ===========================================================================
 
 #[derive(Clone, Copy)]
 enum LineKind {
@@ -76,6 +149,10 @@ struct ExpandedLine {
     text: String,
     kind: LineKind,
 }
+
+// ===========================================================================
+// Ui struct
+// ===========================================================================
 
 pub struct Ui {
     pub selected: usize,
@@ -136,8 +213,8 @@ impl Ui {
     }
 
     /// Handle a key event in normal mode. Returns the action to take.
-    pub fn handle_normal_key(&self, key: KeyEvent, approval_count: usize) -> Action {
-        if approval_count == 0 {
+    pub fn handle_normal_key(&self, key: KeyEvent, items: &[ReviewItem]) -> Action {
+        if items.is_empty() {
             return match key.code {
                 KeyCode::Char('q') => Action::Quit,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
@@ -145,13 +222,28 @@ impl Ui {
             };
         }
 
+        // Dispatch based on the currently selected item type
+        let is_question = matches!(items.get(self.selected), Some(ReviewItem::Question(_)));
+
         match key.code {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::ScrollDown
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::ScrollUp,
-            KeyCode::Char('a') | KeyCode::Char('1') => Action::Approve(self.selected),
-            KeyCode::Char('d') | KeyCode::Char('2') => Action::StartDeny(self.selected),
+            KeyCode::Char('a') | KeyCode::Char('1') if !is_question => {
+                Action::Approve(self.selected)
+            }
+            KeyCode::Char('d') | KeyCode::Char('2') if !is_question => {
+                Action::StartDeny(self.selected)
+            }
+            // For questions: Enter or 'a' opens the answer dialog
+            KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('1') if is_question => {
+                Action::StartAnswer(self.selected)
+            }
+            // For questions: 'x' / 'd' rejects
+            KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Char('2') if is_question => {
+                Action::RejectQuestion(self.selected)
+            }
             KeyCode::Char('r') => Action::ToggleRaw,
             KeyCode::Down | KeyCode::Char('j') => Action::LineDown,
             KeyCode::Up | KeyCode::Char('k') => Action::LineUp,
@@ -193,8 +285,143 @@ impl Ui {
         }
     }
 
+    /// Handle a key event in answer-question mode.
+    pub fn handle_answer_key(&mut self, key: KeyEvent) -> AnswerQuestionResult {
+        let Mode::AnswerQuestion {
+            question,
+            q_idx,
+            selections,
+            custom_inputs,
+            ..
+        } = &mut self.mode
+        else {
+            return AnswerQuestionResult::Cancel;
+        };
+
+        let q_id = question.id;
+        let total_qs = question.questions.len();
+        let current_q = &question.questions[*q_idx];
+        let opt_count = current_q.options.len();
+        let allows_custom = current_q.custom.unwrap_or(true);
+
+        // The "custom" input slot is at index `opt_count` (after all options).
+        // selections[q_idx] stores Some(opt_index) where opt_index == opt_count means custom.
+        let custom_slot = opt_count;
+
+        match key.code {
+            KeyCode::Esc => return AnswerQuestionResult::Cancel,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return AnswerQuestionResult::Cancel;
+            }
+            // Reject with 'x'
+            KeyCode::Char('x') => {
+                return AnswerQuestionResult::Reject { id: q_id };
+            }
+            // Navigate options with up/down or number keys
+            KeyCode::Up | KeyCode::Char('k') => {
+                let cur = selections[*q_idx].unwrap_or(0);
+                let max_slot = if allows_custom {
+                    custom_slot
+                } else {
+                    opt_count.saturating_sub(1)
+                };
+                if cur > 0 {
+                    selections[*q_idx] = Some(cur - 1);
+                } else {
+                    selections[*q_idx] = Some(max_slot);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let cur = selections[*q_idx].unwrap_or(0);
+                let max_slot = if allows_custom {
+                    custom_slot
+                } else {
+                    opt_count.saturating_sub(1)
+                };
+                if cur < max_slot {
+                    selections[*q_idx] = Some(cur + 1);
+                } else {
+                    selections[*q_idx] = Some(0);
+                }
+            }
+            // Number key shortcuts (1-9)
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let n = (c as usize) - ('1' as usize);
+                if n < opt_count {
+                    selections[*q_idx] = Some(n);
+                } else if allows_custom && n == opt_count {
+                    selections[*q_idx] = Some(custom_slot);
+                }
+            }
+            // Enter confirms selection for this sub-question and advances / submits
+            KeyCode::Enter => {
+                let sel = selections[*q_idx];
+                let is_custom_selected = sel == Some(custom_slot) && allows_custom;
+                if is_custom_selected {
+                    // Custom text answer — only proceed if something was typed
+                    if custom_inputs[*q_idx].is_empty() {
+                        // Nothing typed yet, stay in this mode
+                        return AnswerQuestionResult::Continue;
+                    }
+                } else if sel.is_none() && opt_count > 0 {
+                    // Nothing selected yet, default to first option
+                    selections[*q_idx] = Some(0);
+                }
+
+                if *q_idx + 1 < total_qs {
+                    *q_idx += 1;
+                    return AnswerQuestionResult::Continue;
+                }
+
+                // All sub-questions answered — build answers vector
+                let answers: Vec<Vec<String>> = question
+                    .questions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| {
+                        let sel = selections[i];
+                        let is_custom = sel == Some(q.options.len()) && q.custom.unwrap_or(true);
+                        if is_custom {
+                            vec![custom_inputs[i].clone()]
+                        } else if let Some(idx) = sel {
+                            if idx < q.options.len() {
+                                vec![q.options[idx].label.clone()]
+                            } else {
+                                vec![]
+                            }
+                        } else if !q.options.is_empty() {
+                            // Default to first option
+                            vec![q.options[0].label.clone()]
+                        } else {
+                            vec![]
+                        }
+                    })
+                    .collect();
+
+                return AnswerQuestionResult::Submit { id: q_id, answers };
+            }
+            // Backspace for custom input when custom slot is selected
+            KeyCode::Backspace => {
+                let sel = selections[*q_idx];
+                if sel == Some(custom_slot) && allows_custom {
+                    custom_inputs[*q_idx].pop();
+                }
+            }
+            // Type characters into the custom input when custom slot is selected
+            KeyCode::Char(c) => {
+                let sel = selections[*q_idx];
+                if sel == Some(custom_slot) && allows_custom {
+                    custom_inputs[*q_idx].push(c);
+                }
+            }
+            _ => {}
+        }
+
+        AnswerQuestionResult::Continue
+    }
+
     /// Render the full UI to the terminal.
-    pub fn render(&mut self, approvals: &[Approval]) -> io::Result<()> {
+    pub fn render(&mut self, items: &[ReviewItem]) -> io::Result<()> {
         let mut stdout = io::stdout();
         let (cols, rows) = terminal::size()?;
         let width = cols as usize;
@@ -208,7 +435,24 @@ impl Ui {
         let mut content_visible: usize = 0;
 
         // Header
-        let pending_text = format!("{} pending", approvals.len());
+        let approvals_count = items
+            .iter()
+            .filter(|i| matches!(i, ReviewItem::Approval(_)))
+            .count();
+        let questions_count = items
+            .iter()
+            .filter(|i| matches!(i, ReviewItem::Question(_)))
+            .count();
+        let pending_text = match (approvals_count, questions_count) {
+            (0, 0) => "0 pending".to_string(),
+            (a, 0) => format!("{a} approval{}", if a == 1 { "" } else { "s" }),
+            (0, q) => format!("{q} question{}", if q == 1 { "" } else { "s" }),
+            (a, q) => format!(
+                "{a} approval{}, {q} question{}",
+                if a == 1 { "" } else { "s" },
+                if q == 1 { "" } else { "s" }
+            ),
+        };
         let header_left = format!("Claude Review \u{2014} {}", self.server_url);
         let pad = width.saturating_sub(header_left.len() + pending_text.len());
         queue!(
@@ -235,7 +479,7 @@ impl Ui {
         )?;
         row += 1;
 
-        if approvals.is_empty() {
+        if items.is_empty() {
             if row < max_content_row {
                 queue!(stdout, Clear(ClearType::CurrentLine), Print("\r\n"))?;
                 row += 1;
@@ -244,7 +488,7 @@ impl Ui {
                 queue!(
                     stdout,
                     SetForegroundColor(Color::DarkGrey),
-                    Print("  Waiting for approvals..."),
+                    Print("  Waiting for approvals or questions..."),
                     ResetColor,
                     Clear(ClearType::UntilNewLine),
                     Print("\r\n"),
@@ -253,12 +497,11 @@ impl Ui {
             }
         } else {
             let now = Utc::now();
-            for (i, approval) in approvals.iter().enumerate() {
+            for (i, item) in items.iter().enumerate() {
                 if row >= max_content_row {
                     break;
                 }
                 let is_selected = i == self.selected;
-                let age = format_age(now, approval.created_at);
 
                 // Spacer line
                 queue!(stdout, Clear(ClearType::CurrentLine), Print("\r\n"))?;
@@ -267,61 +510,134 @@ impl Ui {
                     break;
                 }
 
-                // Summary line
-                if is_selected {
-                    queue!(
-                        stdout,
-                        SetForegroundColor(Color::Yellow),
-                        SetAttribute(Attribute::Bold),
-                        Print("\u{25b8} "),
-                    )?;
-                } else {
-                    queue!(stdout, Print("  "))?;
-                }
+                match item {
+                    ReviewItem::Approval(approval) => {
+                        let age = format_age(now, approval.created_at);
 
-                let summary = format!("{} \u{203a} {}", approval.project, approval.tool);
-                let summary_pad = width.saturating_sub(summary.len() + age.len() + 4);
-                if is_selected {
-                    queue!(
-                        stdout,
-                        Print(&summary),
-                        SetAttribute(Attribute::Reset),
-                        ResetColor,
-                        SetForegroundColor(Color::DarkGrey),
-                        Print(" ".repeat(summary_pad)),
-                        Print(&age),
-                        ResetColor,
-                    )?;
-                } else {
-                    queue!(
-                        stdout,
-                        SetForegroundColor(Color::White),
-                        Print(&summary),
-                        ResetColor,
-                        SetForegroundColor(Color::DarkGrey),
-                        Print(" ".repeat(summary_pad)),
-                        Print(&age),
-                        ResetColor,
-                    )?;
-                }
-                queue!(stdout, Clear(ClearType::UntilNewLine), Print("\r\n"))?;
-                row += 1;
-
-                if is_selected {
-                    let lines = build_expanded_lines(approval, max_line_width, self.show_raw);
-                    content_total = lines.len();
-                    self.last_content_lines = content_total;
-                    let remaining_rows = max_content_row.saturating_sub(row);
-                    self.last_visible_rows = remaining_rows;
-                    let max_offset = content_total.saturating_sub(remaining_rows.max(1));
-                    self.scroll_offset = self.scroll_offset.min(max_offset);
-                    for line in lines.iter().skip(self.scroll_offset) {
-                        if row >= max_content_row {
-                            break;
+                        if is_selected {
+                            queue!(
+                                stdout,
+                                SetForegroundColor(Color::Yellow),
+                                SetAttribute(Attribute::Bold),
+                                Print("\u{25b8} "),
+                            )?;
+                        } else {
+                            queue!(stdout, Print("  "))?;
                         }
-                        render_line(&mut stdout, line)?;
+
+                        let summary = format!("{} \u{203a} {}", approval.project, approval.tool);
+                        let summary_pad = width.saturating_sub(summary.len() + age.len() + 4);
+                        if is_selected {
+                            queue!(
+                                stdout,
+                                Print(&summary),
+                                SetAttribute(Attribute::Reset),
+                                ResetColor,
+                                SetForegroundColor(Color::DarkGrey),
+                                Print(" ".repeat(summary_pad)),
+                                Print(&age),
+                                ResetColor,
+                            )?;
+                        } else {
+                            queue!(
+                                stdout,
+                                SetForegroundColor(Color::White),
+                                Print(&summary),
+                                ResetColor,
+                                SetForegroundColor(Color::DarkGrey),
+                                Print(" ".repeat(summary_pad)),
+                                Print(&age),
+                                ResetColor,
+                            )?;
+                        }
+                        queue!(stdout, Clear(ClearType::UntilNewLine), Print("\r\n"))?;
                         row += 1;
-                        content_visible += 1;
+
+                        if is_selected {
+                            let lines =
+                                build_expanded_lines(approval, max_line_width, self.show_raw);
+                            content_total = lines.len();
+                            self.last_content_lines = content_total;
+                            let remaining_rows = max_content_row.saturating_sub(row);
+                            self.last_visible_rows = remaining_rows;
+                            let max_offset = content_total.saturating_sub(remaining_rows.max(1));
+                            self.scroll_offset = self.scroll_offset.min(max_offset);
+                            for line in lines.iter().skip(self.scroll_offset) {
+                                if row >= max_content_row {
+                                    break;
+                                }
+                                render_line(&mut stdout, line)?;
+                                row += 1;
+                                content_visible += 1;
+                            }
+                        }
+                    }
+                    ReviewItem::Question(q) => {
+                        let age = format_age(now, q.created_at);
+
+                        if is_selected {
+                            queue!(
+                                stdout,
+                                SetForegroundColor(Color::Magenta),
+                                SetAttribute(Attribute::Bold),
+                                Print("\u{25b8} "),
+                            )?;
+                        } else {
+                            queue!(stdout, Print("  "))?;
+                        }
+
+                        let first_q = q
+                            .questions
+                            .first()
+                            .map(|qi| qi.header.as_str())
+                            .unwrap_or("question");
+                        let summary = format!("{} \u{203a} ? {}", q.session_display_name, first_q);
+                        let summary_pad = width.saturating_sub(summary.len() + age.len() + 4);
+                        if is_selected {
+                            queue!(
+                                stdout,
+                                SetForegroundColor(Color::Magenta),
+                                Print(&summary),
+                                SetAttribute(Attribute::Reset),
+                                ResetColor,
+                                SetForegroundColor(Color::DarkGrey),
+                                Print(" ".repeat(summary_pad)),
+                                Print(&age),
+                                ResetColor,
+                            )?;
+                        } else {
+                            queue!(
+                                stdout,
+                                SetForegroundColor(Color::White),
+                                Print(&summary),
+                                ResetColor,
+                                SetForegroundColor(Color::DarkGrey),
+                                Print(" ".repeat(summary_pad)),
+                                Print(&age),
+                                ResetColor,
+                            )?;
+                        }
+                        queue!(stdout, Clear(ClearType::UntilNewLine), Print("\r\n"))?;
+                        row += 1;
+
+                        if is_selected {
+                            // Show question text + options
+                            let lines = build_question_lines(q, max_line_width);
+                            content_total = lines.len();
+                            self.last_content_lines = content_total;
+                            let remaining_rows = max_content_row.saturating_sub(row);
+                            self.last_visible_rows = remaining_rows;
+                            let max_offset = content_total.saturating_sub(remaining_rows.max(1));
+                            self.scroll_offset = self.scroll_offset.min(max_offset);
+                            for line in lines.iter().skip(self.scroll_offset) {
+                                if row >= max_content_row {
+                                    break;
+                                }
+                                render_line(&mut stdout, line)?;
+                                row += 1;
+                                content_visible += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -373,15 +689,44 @@ impl Ui {
             Print("\r\n"),
         )?;
 
-        // Key hints or deny input
+        // Key hints / deny input / answer question
         match &self.mode {
             Mode::Normal => {
-                if approvals.is_empty() {
+                let selected_is_question =
+                    matches!(items.get(self.selected), Some(ReviewItem::Question(_)));
+
+                if items.is_empty() {
                     queue!(
                         stdout,
                         SetForegroundColor(Color::DarkGrey),
                         Print(" (q)uit"),
                         ResetColor,
+                        Clear(ClearType::UntilNewLine),
+                    )?;
+                } else if selected_is_question {
+                    queue!(
+                        stdout,
+                        Print(" "),
+                        SetForegroundColor(Color::Magenta),
+                        Print("(Enter)"),
+                        ResetColor,
+                        Print(" answer  "),
+                        SetForegroundColor(Color::Red),
+                        Print("(x)"),
+                        ResetColor,
+                        Print("reject  "),
+                        SetForegroundColor(Color::DarkGrey),
+                        Print("(\u{2191}\u{2193})"),
+                        ResetColor,
+                        Print(" scroll  "),
+                        SetForegroundColor(Color::DarkGrey),
+                        Print("(Tab)"),
+                        ResetColor,
+                        Print(" next  "),
+                        SetForegroundColor(Color::DarkGrey),
+                        Print("(q)"),
+                        ResetColor,
+                        Print("uit"),
                         Clear(ClearType::UntilNewLine),
                     )?;
                 } else {
@@ -427,11 +772,120 @@ impl Ui {
                     Clear(ClearType::UntilNewLine),
                 )?;
             }
+            Mode::AnswerQuestion {
+                question,
+                q_idx,
+                selections,
+                custom_inputs,
+                ..
+            } => {
+                let qi = &question.questions[*q_idx];
+                let total = question.questions.len();
+                let step_info = if total > 1 {
+                    format!(" [{}/{}]", q_idx + 1, total)
+                } else {
+                    String::new()
+                };
+                let sel = selections[*q_idx];
+                let opt_count = qi.options.len();
+                let allows_custom = qi.custom.unwrap_or(true);
+                let custom_slot = opt_count;
+                let is_custom = sel == Some(custom_slot) && allows_custom;
+
+                if is_custom {
+                    queue!(
+                        stdout,
+                        SetForegroundColor(Color::Magenta),
+                        Print(&format!(" {}{}> ", qi.header, step_info)),
+                        ResetColor,
+                        SetForegroundColor(Color::Yellow),
+                        Print(&custom_inputs[*q_idx]),
+                        Print("\u{2588}"),
+                        ResetColor,
+                        Print("  "),
+                        SetForegroundColor(Color::DarkGrey),
+                        Print("(Enter) confirm  (Esc) cancel  (x) reject"),
+                        ResetColor,
+                        Clear(ClearType::UntilNewLine),
+                    )?;
+                } else {
+                    let opt_label = sel
+                        .and_then(|i| qi.options.get(i))
+                        .map(|o| o.label.as_str())
+                        .unwrap_or("(none)");
+                    queue!(
+                        stdout,
+                        SetForegroundColor(Color::Magenta),
+                        Print(&format!(" {}{}> ", qi.header, step_info)),
+                        ResetColor,
+                        SetForegroundColor(Color::Yellow),
+                        Print(opt_label),
+                        ResetColor,
+                        Print("  "),
+                        SetForegroundColor(Color::DarkGrey),
+                        Print(
+                            "(\u{2191}\u{2193}) select  (Enter) confirm  (Esc) cancel  (x) reject"
+                        ),
+                        ResetColor,
+                        Clear(ClearType::UntilNewLine),
+                    )?;
+                }
+            }
         }
 
         stdout.flush()?;
         Ok(())
     }
+}
+
+// ===========================================================================
+// Line builders
+// ===========================================================================
+
+/// Build expanded-detail lines for a pending question.
+fn build_question_lines(q: &Question, max_line_width: usize) -> Vec<ExpandedLine> {
+    let mut lines = Vec::new();
+
+    lines.push(ExpandedLine {
+        text: truncate_str(&q.session_display_name, max_line_width),
+        kind: LineKind::Info,
+    });
+
+    for (i, qi) in q.questions.iter().enumerate() {
+        if i > 0 {
+            lines.push(ExpandedLine {
+                text: String::new(),
+                kind: LineKind::Separator,
+            });
+        }
+        lines.push(ExpandedLine {
+            text: truncate_str(&format!("Q: {}", qi.question), max_line_width),
+            kind: LineKind::Normal,
+        });
+        for (j, opt) in qi.options.iter().enumerate() {
+            lines.push(ExpandedLine {
+                text: truncate_str(&format!("  {}. {}", j + 1, opt.label), max_line_width),
+                kind: LineKind::DiffContext,
+            });
+            if !opt.description.is_empty() {
+                lines.push(ExpandedLine {
+                    text: truncate_str(&format!("     {}", opt.description), max_line_width),
+                    kind: LineKind::DiffContext,
+                });
+            }
+        }
+        if qi.custom.unwrap_or(true) {
+            lines.push(ExpandedLine {
+                text: truncate_str(
+                    &format!("  {}. (type your own answer)", qi.options.len() + 1),
+                    max_line_width,
+                ),
+                kind: LineKind::DiffContext,
+            });
+        }
+    }
+
+    lines
 }
 
 /// Render a single expanded-detail line with the │ prefix.

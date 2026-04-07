@@ -1,4 +1,5 @@
 mod providers;
+mod question;
 mod types;
 
 use std::io::Read;
@@ -35,6 +36,8 @@ enum Command {
     Approval(ApprovalArgs),
     /// Report session status to the server (reads status JSON from stdin)
     StatusReport(StatusReportArgs),
+    /// Proxy a plan-mode question to the server and wait for an answer (reads QuestionProxyRequest JSON from stdin)
+    Question(question::QuestionArgs),
 }
 
 #[derive(Args)]
@@ -95,6 +98,7 @@ async fn main() -> ExitCode {
     match cli.command {
         Command::Approval(args) => run_approval(args).await,
         Command::StatusReport(args) => run_status_report(args).await,
+        Command::Question(args) => question::run(args).await,
     }
 }
 

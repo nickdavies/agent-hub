@@ -1,10 +1,14 @@
 use std::time::Duration;
 
-use protocol::{ApprovalDecision, ApprovalResolveRequest, Secret};
+use protocol::{
+    ApprovalDecision, ApprovalResolveRequest, PendingQuestion, QuestionDecision,
+    QuestionResolveRequest, Secret,
+};
 use uuid::Uuid;
 
-// Re-export Approval so existing `use crate::client::Approval` imports work.
+// Re-export types so existing `use crate::client::X` imports work.
 pub use protocol::Approval;
+pub use protocol::PendingQuestion as Question;
 
 pub struct Client {
     http: reqwest::Client,
@@ -48,6 +52,21 @@ impl Client {
             .map_err(|e| format!("failed to parse response: {e}"))
     }
 
+    pub async fn list_pending_questions(&self) -> Result<Vec<PendingQuestion>, String> {
+        let url = format!("{}/api/v1/questions/pending", self.base_url);
+        let req = self.auth(self.http.get(&url));
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("{} returned {}", url, resp.status()));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("failed to parse response: {e}"))
+    }
+
     pub async fn approve(&self, id: Uuid, message: Option<String>) -> Result<(), String> {
         self.resolve(id, ApprovalDecision::Approve, message).await
     }
@@ -66,6 +85,44 @@ impl Client {
         let req = self
             .auth(self.http.post(&url))
             .json(&ApprovalResolveRequest { decision, message });
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("{} returned {}", url, resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn answer_question(
+        &self,
+        id: Uuid,
+        answers: Vec<Vec<String>>,
+    ) -> Result<(), String> {
+        let url = format!("{}/api/v1/questions/{}/resolve", self.base_url, id);
+        let req = self.auth(self.http.post(&url)).json(&QuestionResolveRequest {
+            decision: QuestionDecision::Answer,
+            answers: Some(answers),
+            reason: None,
+        });
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("{} returned {}", url, resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn reject_question(&self, id: Uuid) -> Result<(), String> {
+        let url = format!("{}/api/v1/questions/{}/resolve", self.base_url, id);
+        let req = self.auth(self.http.post(&url)).json(&QuestionResolveRequest {
+            decision: QuestionDecision::Reject,
+            answers: None,
+            reason: None,
+        });
         let resp = req
             .send()
             .await
