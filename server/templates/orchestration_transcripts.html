@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Orchestration Transcripts — Agent Hub</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><a href="/orchestration">Dashboard</a></li>
+        <li><a href="/orchestration/work-items">Work items</a></li>
+        <li><a href="/orchestration/jobs">Jobs</a></li>
+        <li><a href="/orchestration/workers">Workers</a></li>
+        <li><strong>Transcripts</strong></li>
+        {% if approvals_enabled %}
+        <li><a href="/approvals">Approvals</a></li>
+        {% endif %}
+        {% if has_auth %}
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
+    </ul>
+</nav>
+
+<main class="container">
+    <h3>Transcripts</h3>
+    {% if jobs.is_empty() %}
+    <p>No jobs with transcript directories found.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Job ID</th>
+                <th>Work Item</th>
+                <th>Step</th>
+                <th>State</th>
+                <th>Transcript Dir</th>
+                <th>Artifacts</th>
+                <th>Created</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for job in jobs %}
+            <tr>
+                <td><a href="/orchestration/jobs/{{ job.id }}"><code>{{ job.id }}</code></a></td>
+                <td><a href="/orchestration/work-items/{{ job.work_item_id }}"><code>{{ job.work_item_id }}</code></a></td>
+                <td>{{ job.step_id }}</td>
+                <td>{{ job.state }}</td>
+                <td><code>{{ job.transcript_dir }}</code></td>
+                <td>{{ job.artifact_summary }}</td>
+                <td>{{ job.created_at }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</main>
+</body>
+</html>

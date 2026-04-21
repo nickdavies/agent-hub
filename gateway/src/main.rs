@@ -1,3 +1,4 @@
+mod approval;
 mod providers;
 mod question;
 mod types;
@@ -10,11 +11,11 @@ use clap::{Args, Parser, Subcommand};
 use config::{ConfigAction, expand_tilde, load_tool_config, resolve_action};
 use protocol::{
     ApprovalContext, ApprovalRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
-    ExtraContext, RequestType, Secret, StatusReport, ToolCallKind,
+    ExtraContext, RequestType, Secret, StatusReport,
 };
-use similar::{ChangeTag, TextDiff};
 use uuid::Uuid;
 
+use approval::{collect_extra, status_to_output};
 use types::{DecisionStatus, HookDecision, HookOutput, ParseError, ToolHookEvent};
 
 /// Agent Hub gateway — provider-agnostic tool approval hook.
@@ -395,88 +396,6 @@ async fn spawn_delegate(command: &str, input: &str) -> Result<HookDecision, Stri
     Ok(HookDecision::from(delegate_output))
 }
 
-/// Build the `extra` context blob that is sent to the server for human review.
-///
-/// For FileWrite tools this is a unified diff so the reviewer can see exactly
-/// what would change. For shell calls escalated by Dippy the delegate's reason
-/// is forwarded. All other tools return None.
-fn collect_extra(
-    tool_call: &protocol::ToolCall,
-    dippy_reason: Option<&str>,
-) -> Option<ExtraContext> {
-    match tool_call.kind() {
-        ToolCallKind::Write { path, content } => {
-            let old_content = std::fs::read_to_string(path).unwrap_or_default();
-            match content {
-                Some(content) => {
-                    let diff = make_unified_diff(&old_content, content, path);
-                    Some(ExtraContext::Diff { diff })
-                }
-                None => None,
-            }
-        }
-        ToolCallKind::StrReplace {
-            path,
-            old_string,
-            new_string,
-        } => {
-            let label = path.as_deref().unwrap_or("file");
-            let diff = make_unified_diff(old_string, new_string, label);
-            Some(ExtraContext::Diff { diff })
-        }
-        ToolCallKind::Edit {
-            path,
-            old_content,
-            new_content,
-        } => {
-            let label = path.as_deref().unwrap_or("file");
-            let diff = make_unified_diff(old_content, new_content, label);
-            Some(ExtraContext::Diff { diff })
-        }
-        ToolCallKind::MultiEdit { path, edits } => {
-            let label = path.as_deref().unwrap_or("file");
-            let combined: String = edits
-                .iter()
-                .map(|edit| make_unified_diff(&edit.old_string, &edit.new_string, label))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if combined.is_empty() {
-                return None;
-            }
-            Some(ExtraContext::Diff { diff: combined })
-        }
-        _ => {
-            let reason = dippy_reason?;
-            Some(ExtraContext::DippyReason {
-                dippy_reason: reason.to_string(),
-            })
-        }
-    }
-}
-
-/// Produce a unified diff string from two text blobs.
-fn make_unified_diff(old: &str, new: &str, label: &str) -> String {
-    let diff = TextDiff::from_lines(old, new);
-    let mut out = format!("--- {label}\n+++ {label}\n");
-    for group in diff.grouped_ops(3) {
-        for op in &group {
-            for change in diff.iter_changes(op) {
-                let prefix = match change.tag() {
-                    ChangeTag::Delete => "-",
-                    ChangeTag::Insert => "+",
-                    ChangeTag::Equal => " ",
-                };
-                out.push_str(prefix);
-                out.push_str(change.value());
-                if change.missing_newline() {
-                    out.push('\n');
-                }
-            }
-        }
-    }
-    out
-}
-
 /// POST an approval request to the server and long-poll until resolved.
 async fn escalate_to_server(
     args: &ApprovalArgs,
@@ -759,7 +678,6 @@ async fn shutdown_signal() {
             .expect("failed to install ctrl+c handler");
     }
 }
-
 fn status_to_output(status: &ApprovalStatus) -> HookOutput {
     match status {
         ApprovalStatus::Approved { message } => HookOutput {

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Orchestration Dashboard — Agent Hub</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><strong>Dashboard</strong></li>
+        <li><a href="/orchestration/work-items">Work items</a></li>
+        <li><a href="/orchestration/jobs">Jobs</a></li>
+        <li><a href="/orchestration/workers">Workers</a></li>
+        <li><a href="/orchestration/transcripts">Transcripts</a></li>
+        {% if approvals_enabled %}
+        <li><a href="/approvals">Approvals</a></li>
+        {% endif %}
+        {% if has_auth %}
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
+    </ul>
+</nav>
+
+<main class="container">
+    <h3>Orchestration Dashboard</h3>
+
+    <section>
+        <h4>Queue depth</h4>
+        <table>
+            <thead>
+                <tr>
+                    <th>State</th>
+                    <th>Count</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in queue_depth %}
+                <tr>
+                    <td>{{ row.label }}</td>
+                    <td>{{ row.count }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </section>
+
+    <section>
+        <h4>Worker health</h4>
+        <table>
+            <thead>
+                <tr>
+                    <th>Worker state</th>
+                    <th>Count</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in worker_health %}
+                <tr>
+                    <td>{{ row.label }}</td>
+                    <td>{{ row.count }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        {% if workers.is_empty() %}
+        <p><small>No workers registered.</small></p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Worker</th>
+                    <th>Host</th>
+                    <th>State</th>
+                    <th>Last heartbeat</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for worker in workers %}
+                <tr>
+                    <td><code>{{ worker.id }}</code></td>
+                    <td>{{ worker.hostname }}</td>
+                    <td>{{ worker.state }}</td>
+                    <td>{{ worker.last_heartbeat_at }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </section>
+
+    <section>
+        <h4>Job stats</h4>
+        <table>
+            <thead>
+                <tr>
+                    <th>Queued</th>
+                    <th>Running</th>
+                    <th>Completed</th>
+                    <th>Failed</th>
+                    <th>Cancelled</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>{{ job_stats.queued }}</td>
+                    <td>{{ job_stats.running }}</td>
+                    <td>{{ job_stats.completed }}</td>
+                    <td>{{ job_stats.failed }}</td>
+                    <td>{{ job_stats.cancelled }}</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <section>
+        <h4>Recent activity</h4>
+        {% if recent_jobs.is_empty() %}
+        <p>No completed or failed jobs yet.</p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Job</th>
+                    <th>Work item</th>
+                    <th>Step</th>
+                    <th>State</th>
+                    <th>Updated</th>
+                    <th>Detail</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for job in recent_jobs %}
+                <tr>
+                    <td><code>{{ job.id }}</code></td>
+                    <td><code>{{ job.work_item_id }}</code></td>
+                    <td>{{ job.step_id }}</td>
+                    <td>{{ job.state }}</td>
+                    <td>{{ job.updated_at }}</td>
+                    <td><a href="/orchestration/jobs/{{ job.id }}">Open</a></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </section>
+
+    <section>
+        <h4>Blocked / human-gate work items</h4>
+        {% if blocked_work_items.is_empty() %}
+        <p>No blocked work items.</p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Work item</th>
+                    <th>Workflow</th>
+                    <th>Triage</th>
+                    <th>Blocked reason</th>
+                    <th>Last failure</th>
+                    <th>Required action</th>
+                    <th>Quick actions</th>
+                    <th>Allowed actions</th>
+                    <th>Detail</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in blocked_work_items %}
+                <tr>
+                    <td><code>{{ item.id }}</code><br>{{ item.title }}</td>
+                    <td>{{ item.workflow_id }}<br><small>{{ item.current_step }}</small></td>
+                    <td>{{ item.triage_status }}</td>
+                    <td>{{ item.blocked_reason }}</td>
+                    <td>{{ item.last_failure_reason }}</td>
+                    <td>{{ item.required_action_description }}</td>
+                    <td>
+                        {% if item.quick_actions.is_empty() %}
+                        <small>none</small>
+                        {% else %}
+                        {% for action in item.quick_actions %}
+                        <a href="/orchestration/work-items/{{ item.id }}"><code>{{ action }}</code></a>{% if !loop.last %} {% endif %}
+                        {% endfor %}
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if item.allowed_actions.is_empty() %}
+                        <small>none</small>
+                        {% else %}
+                        {% for action in item.allowed_actions %}
+                        <code>{{ action }}</code>{% if !loop.last %} {% endif %}
+                        {% endfor %}
+                        {% endif %}
+                    </td>
+                    <td><a href="/orchestration/work-items/{{ item.id }}">Open</a></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </section>
+
+    <section>
+        <h4>Triage summary</h4>
+        {% if triage_work_items.is_empty() %}
+        <p>No work items currently in triage.</p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Work item</th>
+                    <th>Workflow</th>
+                    <th>Triage</th>
+                    <th>Allowed actions</th>
+                    <th>Detail</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in triage_work_items %}
+                <tr>
+                    <td><code>{{ item.id }}</code><br>{{ item.title }}</td>
+                    <td>{{ item.workflow_id }}<br><small>{{ item.current_step }}</small></td>
+                    <td>{{ item.triage_status }}</td>
+                    <td>
+                        {% if item.allowed_actions.is_empty() %}
+                        <small>none</small>
+                        {% else %}
+                        {% for action in item.allowed_actions %}
+                        <code>{{ action }}</code>{% if !loop.last %} {% endif %}
+                        {% endfor %}
+                        {% endif %}
+                    </td>
+                    <td><a href="/orchestration/work-items/{{ item.id }}">Open</a></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </section>
+
+    {% if readwrite %}
+    <p><small>Read-write mode: quick actions are available from work-item detail pages.</small></p>
+    {% else %}
+    <p><small>Read-only mode: actions are disabled.</small></p>
+    {% endif %}
+</main>
+</body>
+</html>

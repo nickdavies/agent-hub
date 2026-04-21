@@ -1,0 +1,198 @@
+syntax = "proto3";
+
+package worker;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+service WorkerLifecycle {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc HeartbeatWorker(HeartbeatWorkerRequest) returns (HeartbeatWorkerResponse);
+  rpc PollJob(PollJobRequest) returns (PollJobResponse);
+  rpc UpdateJob(UpdateJobRequest) returns (UpdateJobResponse);
+  rpc StreamJobEvents(stream JobEventChunk) returns (StreamJobEventsResponse);
+}
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string hostname = 2;
+  repeated ExecutionMode supported_modes = 3;
+}
+
+message RegisterWorkerResponse {}
+
+message HeartbeatWorkerRequest {
+  string worker_id = 1;
+  WorkerState state = 2;
+}
+
+message HeartbeatWorkerResponse {}
+
+message PollJobRequest {
+  string worker_id = 1;
+}
+
+message PollJobResponse {
+  optional Job job = 1;
+}
+
+message UpdateJobRequest {
+  string worker_id = 1;
+  string job_id = 2;
+  JobState state = 3;
+  optional string transcript_dir = 4;
+  optional JobResult result = 5;
+}
+
+message UpdateJobResponse {}
+
+message JobEventChunk {
+  string worker_id = 1;
+  string job_id = 2;
+  google.protobuf.Timestamp at = 3;
+  JobEventKind kind = 4;
+  optional string stream = 5;
+  string message = 6;
+}
+
+message StreamJobEventsResponse {
+  uint32 accepted = 1;
+}
+
+enum JobEventKind {
+  JOB_EVENT_UNSPECIFIED = 0;
+  JOB_EVENT_SYSTEM = 1;
+  JOB_EVENT_STDOUT = 2;
+  JOB_EVENT_STDERR = 3;
+}
+
+enum ExecutionMode {
+  UNSPECIFIED = 0;
+  RAW = 1;
+  DOCKER = 2;
+}
+
+enum JobState {
+  JOB_UNSPECIFIED = 0;
+  PENDING = 1;
+  ASSIGNED = 2;
+  RUNNING = 3;
+  SUCCEEDED = 4;
+  FAILED = 5;
+  CANCELLED = 6;
+}
+
+enum WorkerState {
+  WORKER_UNSPECIFIED = 0;
+  IDLE = 1;
+  BUSY = 2;
+  OFFLINE = 3;
+}
+
+enum ExecutionOutcome {
+  OUTCOME_UNSPECIFIED = 0;
+  OUTCOME_SUCCEEDED = 1;
+  OUTCOME_FAILED = 2;
+  OUTCOME_TIMED_OUT = 3;
+  OUTCOME_CANCELLED = 4;
+}
+
+enum TerminationReason {
+  REASON_UNSPECIFIED = 0;
+  REASON_EXIT_CODE = 1;
+  REASON_TIMEOUT = 2;
+  REASON_CANCELLED = 3;
+  REASON_WORKER_ERROR = 4;
+}
+
+message PromptRef {
+  optional string system = 1;
+  string user = 2;
+}
+
+message RepoSource {
+  string repo_url = 1;
+  string base_ref = 2;
+  optional string branch_name = 3;
+}
+
+message ArtifactSummary {
+  string stdout_path = 1;
+  string stderr_path = 2;
+  optional string output_path = 3;
+  optional string transcript_dir = 4;
+  optional uint64 stdout_bytes = 5;
+  optional uint64 stderr_bytes = 6;
+  optional uint64 output_bytes = 7;
+  repeated StructuredTranscriptArtifact structured_transcript_artifacts = 8;
+}
+
+message StructuredTranscriptArtifact {
+  string key = 1;
+  string path = 2;
+  optional uint64 bytes = 3;
+  optional string schema = 4;
+  optional uint64 record_count = 5;
+  optional google.protobuf.Value inline_json = 6;
+}
+
+message ExecutionTiming {
+  google.protobuf.Timestamp started_at = 1;
+  google.protobuf.Timestamp finished_at = 2;
+  uint64 duration_ms = 3;
+}
+
+message RepoExecutionMetadata {
+  optional string base_ref = 1;
+  optional string target_branch = 2;
+  optional string branch = 3;
+  optional string head_sha = 4;
+  bool is_dirty = 5;
+  uint32 changed_files = 6;
+  uint32 untracked_files = 7;
+}
+
+message GithubPullRequestMetadata {
+  uint64 number = 1;
+  string url = 2;
+  optional string state = 3;
+  optional bool is_draft = 4;
+  optional string head_ref_name = 5;
+  optional string base_ref_name = 6;
+}
+
+message JobResult {
+  ExecutionOutcome outcome = 1;
+  TerminationReason termination_reason = 2;
+  optional int32 exit_code = 3;
+  ExecutionTiming timing = 4;
+  ArtifactSummary artifacts = 5;
+  optional google.protobuf.Value output_json = 6;
+  optional RepoExecutionMetadata repo = 7;
+  optional GithubPullRequestMetadata github_pr = 8;
+  optional string error_message = 9;
+}
+
+message Job {
+  string id = 1;
+  string work_item_id = 2;
+  string step_id = 3;
+  JobState state = 4;
+  optional string assigned_worker_id = 5;
+  ExecutionMode execution_mode = 6;
+  optional string container_image = 7;
+  string command = 8;
+  repeated string args = 9;
+  map<string, string> env = 10;
+  optional PromptRef prompt = 11;
+  google.protobuf.Value context = 12;
+  optional RepoSource repo = 13;
+  optional uint64 timeout_secs = 14;
+  uint32 max_retries = 15;
+  uint32 attempt = 16;
+  optional string transcript_dir = 17;
+  optional JobResult result = 18;
+  optional google.protobuf.Timestamp lease_expires_at = 19;
+  google.protobuf.Timestamp created_at = 20;
+  google.protobuf.Timestamp updated_at = 21;
+}

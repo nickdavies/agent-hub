@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Approval — Claude Notify</title>
+    <title>Approval — Agent Hub</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
     <style>
         #help-bar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--pico-card-background-color); border-top: 1px solid var(--pico-muted-border-color); padding: 0.25rem 1rem; font-size: 0.8rem; color: var(--pico-muted-color); z-index: 10; }
@@ -22,7 +22,15 @@
 </head>
 <body>
 <nav class="container">
-    <ul><li><a href="/approvals"><strong>Claude Notify</strong></a></li></ul>
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><a href="/orchestration">Work items</a></li>
+        <li><a href="/orchestration/jobs">Jobs</a></li>
+        <li><a href="/orchestration/workers">Workers</a></li>
+        {% if approvals_enabled %}
+        <li><strong>Approvals</strong></li>
+        {% endif %}
+    </ul>
     <ul>
         {% if has_auth %}
         <li>{{ email }}</li>
@@ -79,7 +87,7 @@
         </div>
     </article>
 
-    <a href="/approvals">← Back to dashboard</a>
+        <a href="/approvals">← Back to approvals</a>
 </main>
 
 <div id="help-bar">

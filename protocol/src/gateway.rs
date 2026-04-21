@@ -305,7 +305,8 @@ pub enum CursorTool {
     MultiEdit,
     EditNotebook,
     NotebookEdit,
-    Bash,
+    /// Cursor's shell tool. Maps to the canonical `Tool::Bash`.
+    Shell,
     Task,
     TodoWrite,
     WebFetch,
@@ -326,7 +327,7 @@ impl CursorTool {
             CursorTool::MultiEdit => "MultiEdit",
             CursorTool::EditNotebook => "EditNotebook",
             CursorTool::NotebookEdit => "NotebookEdit",
-            CursorTool::Bash => "Bash",
+            CursorTool::Shell => "Shell",
             CursorTool::Task => "Task",
             CursorTool::TodoWrite => "TodoWrite",
             CursorTool::WebFetch => "WebFetch",
@@ -347,7 +348,7 @@ impl CursorTool {
             "MultiEdit" => CursorTool::MultiEdit,
             "EditNotebook" => CursorTool::EditNotebook,
             "NotebookEdit" => CursorTool::NotebookEdit,
-            "Bash" => CursorTool::Bash,
+            "Shell" => CursorTool::Shell,
             "Task" => CursorTool::Task,
             "TodoWrite" => CursorTool::TodoWrite,
             "WebFetch" => CursorTool::WebFetch,
@@ -370,7 +371,7 @@ impl From<CursorTool> for Tool {
             CursorTool::MultiEdit => Tool::MultiEdit,
             CursorTool::EditNotebook => Tool::EditNotebook,
             CursorTool::NotebookEdit => Tool::NotebookEdit,
-            CursorTool::Bash => Tool::Bash,
+            CursorTool::Shell => Tool::Bash,
             CursorTool::Task => Tool::Task,
             CursorTool::TodoWrite => Tool::TodoWrite,
             CursorTool::WebFetch => Tool::WebFetch,
@@ -406,7 +407,7 @@ impl JsonSchema for CursorTool {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "Tool name as sent by Cursor (PascalCase). Known: Read, Grep, Glob, SemanticSearch, Write, StrReplace, Delete, Edit, MultiEdit, EditNotebook, NotebookEdit, Bash, Task, TodoWrite, WebFetch."
+            "description": "Tool name as sent by Cursor (PascalCase). Known: Read, Grep, Glob, SemanticSearch, Write, StrReplace, Delete, Edit, MultiEdit, EditNotebook, NotebookEdit, Shell, Task, TodoWrite, WebFetch."
         })
     }
 }
@@ -689,9 +690,15 @@ mod tests {
 
     #[test]
     fn cursor_tool_deserialize() {
-        let json = r#""Bash""#;
+        let json = r#""Shell""#;
         let tool: CursorTool = serde_json::from_str(json).unwrap();
-        assert_eq!(tool, CursorTool::Bash);
+        assert_eq!(tool, CursorTool::Shell);
+    }
+
+    #[test]
+    fn cursor_shell_maps_to_canonical_bash() {
+        let tool: Tool = CursorTool::Shell.into();
+        assert_eq!(tool, Tool::Bash);
     }
 
     // --- Input struct wire compat ---

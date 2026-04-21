@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Orchestration Jobs — Agent Hub</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><a href="/orchestration">Dashboard</a></li>
+        <li><a href="/orchestration/work-items">Work items</a></li>
+        <li><strong>Jobs</strong></li>
+        <li><a href="/orchestration/workers">Workers</a></li>
+        <li><a href="/orchestration/transcripts">Transcripts</a></li>
+        {% if approvals_enabled %}
+        <li><a href="/approvals">Approvals</a></li>
+        {% endif %}
+        {% if has_auth %}
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
+    </ul>
+</nav>
+
+<main class="container">
+    <h3>Jobs</h3>
+    {% if jobs.is_empty() %}
+    <p>No jobs found.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Job</th>
+                <th>Work item</th>
+                <th>Step</th>
+                <th>State</th>
+                <th>Mode</th>
+                <th>Worker</th>
+                <th>Updated</th>
+                <th>Detail</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for job in jobs %}
+            <tr>
+                <td><code>{{ job.id }}</code></td>
+                <td><code>{{ job.work_item_id }}</code></td>
+                <td>{{ job.step_id }}</td>
+                <td>{{ job.state }}</td>
+                <td>{{ job.execution_mode }}</td>
+                <td>{{ job.assigned_worker_id }}</td>
+                <td>{{ job.updated_at }}</td>
+                <td><a href="/orchestration/jobs/{{ job.id }}">Open</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</main>
+</body>
+</html>

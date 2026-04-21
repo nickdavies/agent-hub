@@ -1,3 +1,9 @@
 /target
 server/target
 hook/target
+
+*.sqlite3
+server/tasks/*.json
+dev-data/
+.env
+docker/opencode-bin/

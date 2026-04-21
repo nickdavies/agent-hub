@@ -1,16 +1,28 @@
 pub mod approvals;
+pub mod artifact_store;
 pub mod auth;
 pub mod config;
+pub mod environment;
+pub mod github_poller;
 pub mod hooks;
+pub mod job_events;
 pub mod notifier;
 pub mod oauth;
+pub mod orchestration;
 pub mod presence;
 pub mod pushover;
 pub mod questions;
+pub mod repo_discovery;
+pub mod session_views;
+pub mod scm;
 pub mod sessions;
 pub mod storage;
+pub mod task_adapter;
+pub mod task_files;
+pub mod task_vikunja;
 pub mod web;
 pub mod webhook;
+pub mod workflows;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,16 +37,24 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::mcp;
 use approvals::{ApprovalRegistry, ApprovalStatus};
+use artifact_store::{ArtifactStore, DirectoryStore};
 use config::{
-    ApprovalFeatureMode, AuthMode, NotifyConfig, NotifyConfigUpdate, ServerConfig,
-    SharedNotifyConfig,
+    ApprovalFeatureMode, AuthMode, LoadedConfigTree, NotifyConfig, NotifyConfigUpdate,
+    ServerConfig, SharedNotifyConfig,
 };
+use github_poller::GitHubPoller;
 use hooks::PendingNotifications;
+use job_events::JobEventHub;
 use notifier::Notifier;
 use oauth::OAuthManager;
+use orchestration::OrchestrationService;
 use presence::{Presence, PresenceUpdate};
 use questions::QuestionRegistry;
-use sessions::{EffectiveSessionStatus, SessionConfigUpdate, SessionRegistry, SessionStatus};
+use repo_discovery::discover_repositories_from_config;
+use session_views::build_session_views;
+use sessions::{SessionConfigUpdate, SessionRegistry};
+use task_adapter::TaskAdapter;
+use workflows::WorkflowCatalog;
 
 // Import protocol types used directly in this module's handlers.
 use protocol::{
@@ -42,8 +62,11 @@ use protocol::{
     ConfigResponse, QuestionDecision, QuestionResolveRequest, QuestionWaitResponse, SessionId,
 };
 
+pub(super) const DEFAULT_WEB_HOME: &str = "/orchestration";
+
 pub struct AppState<N: Notifier> {
     pub config: Arc<ServerConfig>,
+    pub artifact_store: Arc<dyn ArtifactStore>,
     pub presence: Arc<Presence>,
     pub sessions: Arc<SessionRegistry>,
     pub notifier: Arc<N>,
@@ -51,13 +74,17 @@ pub struct AppState<N: Notifier> {
     pub pending: Arc<PendingNotifications>,
     pub approvals: Arc<ApprovalRegistry>,
     pub questions: Arc<QuestionRegistry>,
+    pub orchestration: Arc<OrchestrationService>,
+    pub job_events: Arc<JobEventHub>,
     pub oauth: Arc<Option<OAuthManager>>,
+    pub loaded_config_tree: Arc<Option<LoadedConfigTree>>,
 }
 
 impl<N: Notifier> Clone for AppState<N> {
     fn clone(&self) -> Self {
         Self {
             config: Arc::clone(&self.config),
+            artifact_store: Arc::clone(&self.artifact_store),
             presence: Arc::clone(&self.presence),
             sessions: Arc::clone(&self.sessions),
             notifier: Arc::clone(&self.notifier),
@@ -65,7 +92,10 @@ impl<N: Notifier> Clone for AppState<N> {
             pending: Arc::clone(&self.pending),
             approvals: Arc::clone(&self.approvals),
             questions: Arc::clone(&self.questions),
+            orchestration: Arc::clone(&self.orchestration),
+            job_events: Arc::clone(&self.job_events),
             oauth: Arc::clone(&self.oauth),
+            loaded_config_tree: Arc::clone(&self.loaded_config_tree),
         }
     }
 }
@@ -86,6 +116,60 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
         .route("/presence", post(handle_presence_update::<N>))
         .route("/sessions", get(handle_list_sessions::<N>))
         .route("/sessions/{id}", put(handle_update_session::<N>))
+        .route(
+            "/orchestration/work-items",
+            get(orchestration::handlers::list_work_items::<N>)
+                .post(orchestration::handlers::create_work_item::<N>),
+        )
+        .route(
+            "/orchestration/workflows",
+            get(orchestration::handlers::list_workflows::<N>),
+        )
+        .route(
+            "/orchestration/workflows/all",
+            get(orchestration::handlers::list_workflow_documents::<N>),
+        )
+        .route(
+            "/orchestration/workflows/validate",
+            get(orchestration::handlers::validate_workflows::<N>),
+        )
+        .route(
+            "/orchestration/github/webhook",
+            post(orchestration::webhook::github_webhook::<N>),
+        )
+        .route(
+            "/orchestration/work-items/{id}/event",
+            post(orchestration::handlers::fire_work_item_event::<N>),
+        )
+        .route(
+            "/orchestration/jobs",
+            get(orchestration::handlers::list_jobs::<N>),
+        )
+        .route(
+            "/orchestration/jobs/{id}",
+            put(orchestration::handlers::update_job::<N>),
+        )
+        .route(
+            "/orchestration/jobs/{id}/events",
+            get(orchestration::handlers::job_events_sse::<N>),
+        )
+        .route(
+            "/orchestration/workers",
+            get(orchestration::handlers::list_workers::<N>)
+                .post(orchestration::handlers::register_worker::<N>),
+        )
+        .route(
+            "/orchestration/workers/{id}/heartbeat",
+            post(orchestration::handlers::heartbeat_worker::<N>),
+        )
+        .route(
+            "/orchestration/poll",
+            post(orchestration::handlers::poll_job::<N>),
+        )
+        .route(
+            "/orchestration/dispatch",
+            post(orchestration::handlers::dispatch::<N>),
+        )
         .route(
             "/config",
             get(handle_get_config::<N>).put(handle_put_config::<N>),
@@ -129,36 +213,68 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
 
     let mut app = Router::new().nest("/api/v1", api_v1).merge(public);
 
-    // Redirect root to the dashboard
+    // Redirect root to the orchestration shell
     app = app.route(
         "/",
-        get(|| async { axum::response::Redirect::permanent("/approvals") }),
+        get(|| async { axum::response::Redirect::permanent(DEFAULT_WEB_HOME) }),
     );
 
-    // Mount web UI and OAuth routes when approval mode is not disabled
+    // Mount orchestration web UI routes.
+    let mut web_routes = Router::new()
+        .route("/orchestration", get(web::orchestration_dashboard::<N>))
+        .route(
+            "/orchestration/work-items",
+            get(web::orchestration_work_items::<N>),
+        )
+        .route("/orchestration/jobs", get(web::orchestration_jobs::<N>))
+        .route(
+            "/orchestration/transcripts",
+            get(web::orchestration_transcripts::<N>),
+        )
+        .route(
+            "/orchestration/workers",
+            get(web::orchestration_workers::<N>),
+        )
+        .route(
+            "/orchestration/work-items/{id}",
+            get(web::orchestration_work_item_detail::<N>),
+        )
+        .route(
+            "/orchestration/jobs/{id}",
+            get(web::orchestration_job_detail::<N>),
+        )
+        .route(
+            "/orchestration/jobs/{id}/artifacts/{key}",
+            get(web::orchestration_job_artifact::<N>),
+        )
+        .route(
+            "/orchestration/work-items/{id}/action",
+            post(web::orchestration_fire_work_item_action::<N>),
+        );
+
+    // Keep approvals web UI available when approval mode is enabled.
     if state.config.approval_mode != ApprovalFeatureMode::Disabled {
-        // Web UI routes
-        let mut web_routes = Router::new()
+        web_routes = web_routes
             .route("/approvals", get(web::dashboard::<N>))
             .route("/approvals/queue", get(web::approval_queue::<N>))
             .route("/approvals/{id}", get(web::approval_detail::<N>));
-
-        if state.config.auth_mode != AuthMode::None {
-            // Auth routes (public, no auth required)
-            let auth_routes = Router::new()
-                .route("/auth/login", get(web::login_page::<N>))
-                .route("/auth/login/basic", post(web::basic_auth_login::<N>))
-                .route("/auth/start/{provider}", get(oauth::start_auth::<N>))
-                .route("/auth/callback/{provider}", get(oauth::callback::<N>))
-                .route("/auth/logout", post(oauth::logout))
-                .with_state(state.clone());
-
-            web_routes = web_routes.layer(from_fn(auth::require_web_auth));
-            app = app.merge(auth_routes);
-        }
-
-        app = app.merge(web_routes.with_state(state.clone()));
     }
+
+    if state.config.auth_mode != AuthMode::None {
+        // Auth routes (public, no auth required)
+        let auth_routes = Router::new()
+            .route("/auth/login", get(web::login_page::<N>))
+            .route("/auth/login/basic", post(web::basic_auth_login::<N>))
+            .route("/auth/start/{provider}", get(oauth::start_auth::<N>))
+            .route("/auth/callback/{provider}", get(oauth::callback::<N>))
+            .route("/auth/logout", post(oauth::logout))
+            .with_state(state.clone());
+
+        web_routes = web_routes.layer(from_fn(auth::require_web_auth));
+        app = app.merge(auth_routes);
+    }
+
+    app = app.merge(web_routes.with_state(state.clone()));
 
     // Session layer for OAuth (in-memory store, sessions lost on restart)
     let session_store = MemoryStore::default();
@@ -170,96 +286,6 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
 
 async fn health() -> &'static str {
     "ok"
-}
-
-/// Resolve the effective status for a session by combining its stored status
-/// with server-side knowledge (pending approvals, pending questions).
-pub(crate) fn resolve_effective_status(
-    stored: SessionStatus,
-    waiting_reason: Option<&str>,
-    pending_approval: Option<&approvals::Approval>,
-    pending_question: Option<&questions::PendingQuestion>,
-) -> EffectiveSessionStatus {
-    if stored == SessionStatus::Ended {
-        return EffectiveSessionStatus::Ended;
-    }
-    // Pending approvals always win — they're actionable in the UI
-    if let Some(approval) = pending_approval {
-        let input_str = approval.tool_input.to_string();
-        let truncated = if input_str.len() > 60 {
-            let end = input_str
-                .char_indices()
-                .nth(60)
-                .map_or(input_str.len(), |(i, _)| i);
-            format!("{}...", &input_str[..end])
-        } else {
-            input_str
-        };
-        let reason = format!("Pending approval: {} — {}", approval.tool, truncated);
-        return EffectiveSessionStatus::Waiting {
-            reason: Some(reason),
-        };
-    }
-    // Pending questions are also waiting
-    if let Some(pq) = pending_question {
-        let header = pq
-            .questions
-            .first()
-            .map(|q| q.header.as_str())
-            .unwrap_or("question");
-        let reason = format!("Plan question: {header}");
-        return EffectiveSessionStatus::Waiting {
-            reason: Some(reason),
-        };
-    }
-    // Client-reported waiting
-    if stored == SessionStatus::Waiting {
-        return EffectiveSessionStatus::Waiting {
-            reason: waiting_reason.map(|s| s.to_string()),
-        };
-    }
-    match stored {
-        SessionStatus::Active => EffectiveSessionStatus::Active,
-        SessionStatus::Idle => EffectiveSessionStatus::Idle,
-        // Ended and Waiting are handled by the early returns above.
-        // Listing them explicitly so adding a new SessionStatus variant
-        // produces a compile-time error instead of a runtime panic.
-        SessionStatus::Ended | SessionStatus::Waiting => {
-            debug_assert!(false, "Ended/Waiting should have been handled above");
-            EffectiveSessionStatus::Active
-        }
-    }
-}
-
-/// Build a list of SessionViews with effective status resolved.
-async fn build_session_views<N: Notifier>(state: &AppState<N>) -> Vec<sessions::SessionView> {
-    let raw = state.sessions.list().await;
-    let mut views = Vec::with_capacity(raw.len());
-    for s in raw {
-        let pending = state
-            .approvals
-            .first_pending_for_session(&s.session_id)
-            .await;
-        let pending_q = state
-            .questions
-            .first_pending_for_session(&s.session_id)
-            .await;
-        let status = resolve_effective_status(
-            s.stored_status,
-            s.waiting_reason.as_deref(),
-            pending.as_ref(),
-            pending_q.as_ref(),
-        );
-        views.push(sessions::SessionView {
-            session_id: s.session_id,
-            project: s.project,
-            config: s.config,
-            editor_type: s.editor_type,
-            status,
-            display_name: s.display_name,
-        });
-    }
-    views
 }
 
 async fn handle_presence_update<N: Notifier>(
@@ -500,13 +526,147 @@ async fn handle_question_resolve<N: Notifier>(
 
 impl<N: Notifier> AppState<N> {
     pub fn new(server_config: ServerConfig, notifier: N, oauth: Option<OAuthManager>) -> Self {
+        let artifact_store: Arc<dyn ArtifactStore> = Arc::new(DirectoryStore::new(
+            std::path::PathBuf::from(server_config.artifact_store_root.clone()),
+        ));
         let presence = Presence::new(server_config.presence_ttl_secs);
         let sessions = SessionRegistry::new(server_config.session_ttl_secs)
             .with_default_approval_mode(server_config.default_approval_mode);
         let notify_config = NotifyConfig::with_delay(server_config.notification_delay_secs);
+        let loaded = config::load_config_tree(std::path::Path::new(&server_config.config_root))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to load config tree from CONFIG_ROOT ({}): {error:?}",
+                    server_config.config_root
+                )
+            });
+        let system_operator_login = loaded
+            .system
+            .operator
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let installed_workflows = loaded
+            .system
+            .workflows
+            .as_ref()
+            .map(|workflows| workflows.installed.as_slice());
+        let workflows = Arc::new(
+            WorkflowCatalog::load_from_dir_with_installed(
+                &server_config.workflows_dir,
+                installed_workflows,
+            )
+            .unwrap_or_else(|_| WorkflowCatalog::empty()),
+        );
+        let task_adapter: Arc<dyn TaskAdapter> = match server_config.task_adapter.as_str() {
+            "vikunja" => {
+                let base_url = server_config
+                    .vikunja_base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://localhost:3456".to_string());
+                let auth = if let (Some(username), Some(password)) = (
+                    server_config.vikunja_bot_username.clone(),
+                    server_config.vikunja_bot_password.clone(),
+                ) {
+                    task_vikunja::VikunjaAuthConfig::BotCredentials { username, password }
+                } else {
+                    let token = server_config
+                        .vikunja_token
+                        .clone()
+                        .expect("VIKUNJA_TOKEN required when TASK_ADAPTER=vikunja and VIKUNJA_BOT_USERNAME/VIKUNJA_BOT_PASSWORD are not both set");
+                    task_vikunja::VikunjaAuthConfig::StaticToken(token)
+                };
+                let project_id = server_config
+                    .vikunja_project_id
+                    .expect("VIKUNJA_PROJECT_ID required when TASK_ADAPTER=vikunja");
+                let bot_username = server_config
+                    .vikunja_bot_username
+                    .clone()
+                    .expect("VIKUNJA_BOT_USERNAME required when TASK_ADAPTER=vikunja");
+                let operator_username = system_operator_login
+                    .clone()
+                    .expect("system.operator required in system.toml when TASK_ADAPTER=vikunja");
+                Arc::new(
+                    task_vikunja::VikunjaAdapter::new(
+                        base_url,
+                        auth,
+                        project_id,
+                        server_config.vikunja_label_prefix.clone(),
+                        bot_username,
+                        operator_username,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("failed to initialize Vikunja adapter: {error:#}")
+                    }),
+                )
+            }
+            _ => {
+                let store = task_files::TaskFileStore::new(server_config.task_dir.clone());
+                store.ensure_dir().expect("create task dir");
+                Arc::new(store)
+            }
+        };
+        let orchestration_db_path = if server_config.orchestration_db_path == ":memory:" {
+            std::env::temp_dir()
+                .join(format!(
+                    "orchestration-test-{}.sqlite3",
+                    uuid::Uuid::new_v4().simple()
+                ))
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            server_config.orchestration_db_path.clone()
+        };
+        // Build the SCM host registry. `[[system.scm_hosts]]` rows win;
+        // legacy `GITHUB_TOKEN`/`GITHUB_API_BASE_URL` env vars synthesize an
+        // implicit `github.com` row only if the registry is otherwise empty.
+        // Hard-fails (panics) on any malformed row or missing token env
+        // — silent skipping makes "polling stopped working" undebuggable.
+        let scm_registry = scm::ScmHostRegistry::from_configs(&loaded.system.scm_hosts)
+            .unwrap_or_else(|error| panic!("invalid [[system.scm_hosts]] config: {error}"))
+            .with_legacy_github_fallback(
+                server_config.github_token.as_deref(),
+                &server_config.github_api_base_url,
+            );
+        let github_poller = if server_config.github_polling_enabled && !scm_registry.is_empty() {
+            Some(Arc::new(GitHubPoller::new(scm_registry.clone())))
+        } else {
+            None
+        };
+        let environments = loaded
+            .environments
+            .iter()
+            .map(|environment| environment.to_definition())
+            .collect();
+        let overlays = loaded.overlays.clone();
+        let triage_prompt = loaded.triage_prompt.clone();
+        let discovered_repos =
+            discover_repositories_from_config(loaded.system.repo_discovery.as_ref())
+                .unwrap_or_else(|error| {
+                    panic!("failed to discover repositories from system.repo_discovery: {error:#}")
+                });
+        let loaded_config_tree = Some(loaded);
+        let orchestration = Arc::new(
+            OrchestrationService::new_with_github_poller_and_interval(
+                Arc::clone(&workflows),
+                task_adapter,
+                orchestration_db_path,
+                github_poller,
+                server_config.github_poll_interval_secs,
+            )
+            .with_environments(environments)
+            .with_overlays(overlays)
+            .with_discovered_repos(discovered_repos)
+            .with_operator_login(system_operator_login.clone())
+            .with_triage_prompt(triage_prompt)
+            .with_server_approval_mode(server_config.approval_mode),
+        );
+        let job_events = Arc::new(JobEventHub::new());
 
         Self {
             config: Arc::new(server_config),
+            artifact_store,
             presence: Arc::new(presence),
             sessions: Arc::new(sessions),
             notifier: Arc::new(notifier),
@@ -514,7 +674,10 @@ impl<N: Notifier> AppState<N> {
             pending: Arc::new(PendingNotifications::new()),
             approvals: Arc::new(ApprovalRegistry::new()),
             questions: Arc::new(QuestionRegistry::new()),
+            orchestration,
+            job_events,
             oauth: Arc::new(oauth),
+            loaded_config_tree: Arc::new(loaded_config_tree),
         }
     }
 
@@ -553,14 +716,60 @@ impl<N: Notifier> AppState<N> {
 mod integration_tests {
     use super::*;
     use axum::body::Body;
+    use axum::http::header;
     use axum::http::{Request, StatusCode as AxumStatus};
     use config::{ApprovalFeatureMode, AuthMode, ServerConfig, Token};
     use notifier::NullNotifier;
+    use serde_json::Value;
     use sessions::SessionApprovalMode;
     use tower::ServiceExt; // for oneshot
 
-    /// Build a test router with auth disabled (no Bearer tokens needed).
-    fn test_app_with_mode(approval_mode: ApprovalFeatureMode) -> Router {
+    /// Build a minimal hermetic config root for `AppState::new`. The integration
+    /// tests don't exercise environments, overlays, network policies, images, or
+    /// triage prompt loading, so we just need a `system.toml` that satisfies the
+    /// `installed = []` invariants `load_config_tree` enforces.
+    fn make_hermetic_config_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "ah-test-config-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).expect("create hermetic config root");
+        let body = r#"[system]
+
+[system.images]
+installed = []
+
+[system.network_policies]
+installed = []
+
+[system.environments]
+installed = []
+"#;
+        std::fs::write(root.join("system.toml"), body).expect("write hermetic system.toml");
+        root
+    }
+
+    /// Build a fresh empty workflows directory in tmp. Tests that need specific
+    /// workflows can populate it before constructing the router.
+    fn make_hermetic_workflows_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ah-test-workflows-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create hermetic workflows dir");
+        dir
+    }
+
+    /// Shared router builder that all `test_app*` helpers funnel through. Takes
+    /// explicit `workflows_dir`/`approval_mode` so a single test can drop in
+    /// custom workflow definitions without diverging from the standard config.
+    fn build_test_router(
+        approval_mode: ApprovalFeatureMode,
+        workflows_dir: std::path::PathBuf,
+    ) -> Router {
+        let task_dir =
+            std::env::temp_dir().join(format!("ah-test-tasks-{}", uuid::Uuid::new_v4().simple()));
+        let config_root = make_hermetic_config_root();
         let config = ServerConfig {
             auth_mode: AuthMode::None,
             tokens: vec![],
@@ -571,6 +780,24 @@ mod integration_tests {
             approval_mode,
             base_url: Some("http://localhost:8080".into()),
             default_approval_mode: SessionApprovalMode::Remote,
+            workflows_dir: workflows_dir.to_string_lossy().into_owned(),
+            config_root: config_root.to_string_lossy().into_owned(),
+            task_dir: task_dir.to_string_lossy().into_owned(),
+            task_adapter: "file".into(),
+            vikunja_base_url: None,
+            vikunja_token: None,
+            vikunja_bot_username: None,
+            vikunja_bot_password: None,
+            vikunja_project_id: None,
+            vikunja_label_prefix: None,
+            orchestration_db_path: ":memory:".into(),
+            artifact_store_root: "local-agent-data".into(),
+            grpc_listen_addr: None,
+            github_webhook_secret: None,
+            github_polling_enabled: false,
+            github_poll_interval_secs: 30,
+            github_token: None,
+            github_api_base_url: "https://api.github.com".into(),
         };
         let state = AppState::new(config, NullNotifier, None);
         router(state)
@@ -578,6 +805,10 @@ mod integration_tests {
 
     fn test_app() -> Router {
         test_app_with_mode(ApprovalFeatureMode::Readwrite)
+    }
+
+    fn test_app_with_mode(approval_mode: ApprovalFeatureMode) -> Router {
+        build_test_router(approval_mode, make_hermetic_workflows_dir())
     }
 
     /// Helper: POST JSON to a path and return the status code.
@@ -589,6 +820,35 @@ mod integration_tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    async fn post_json_response(app: &Router, path: &str, body: &str) -> axum::response::Response {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn put_json_response(app: &Router, path: &str, body: &str) -> axum::response::Response {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn get_response(app: &Router, path: &str) -> axum::response::Response {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap()
     }
 
     /// Helper: GET a path and return (status_code, body_string).
@@ -686,6 +946,78 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn root_redirects_to_orchestration() {
+        let app = test_app();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::PERMANENT_REDIRECT);
+        let location = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(location, Some("/orchestration"));
+    }
+
+    #[tokio::test]
+    async fn orchestration_web_routes_remain_available_when_approvals_disabled() {
+        let app = test_app_with_mode(ApprovalFeatureMode::Disabled);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/orchestration")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/orchestration/jobs")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/orchestration/workers")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(&format!(
+                "/orchestration/jobs/{}/artifacts/stdout_log",
+                uuid::Uuid::new_v4()
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn approvals_dashboard_remains_available_when_approval_mode_enabled() {
+        let app = test_app_with_mode(ApprovalFeatureMode::Readwrite);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/approvals")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), AxumStatus::OK);
+    }
+
+    #[tokio::test]
     async fn status_report_all_editor_types() {
         let app = test_app();
         for editor in ["opencode", "claude", "cursor", "unknown"] {
@@ -728,6 +1060,196 @@ mod integration_tests {
             AxumStatus::UNPROCESSABLE_ENTITY,
             "unknown editor_type should be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn job_artifact_route_serves_known_key_and_download_header() {
+        // This test drives the orchestration end-to-end (create item -> poll
+        // job -> finish job -> fetch artifact), so it needs a real workflow in
+        // the catalog. Drop a minimal `sample_local_exec` workflow into a
+        // hermetic workflows dir before booting the router.
+        let workflows_dir = make_hermetic_workflows_dir();
+        let workflow_dir = workflows_dir.join("sample_local_exec");
+        std::fs::create_dir_all(&workflow_dir).expect("mkdir sample_local_exec");
+        std::fs::write(
+            workflow_dir.join("workflow.toml"),
+            r#"
+[workflow]
+id = "sample_local_exec"
+entry_step = "run"
+
+[[workflow.steps]]
+id = "run"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["hello"]
+"#,
+        )
+        .expect("write sample_local_exec workflow");
+        let app = build_test_router(ApprovalFeatureMode::Readwrite, workflows_dir);
+
+        let create_resp = post_json_response(
+            &app,
+            "/api/v1/orchestration/work-items",
+            r#"{"workflow_id":"sample_local_exec","context":{"task":"artifact-test"}}"#,
+        )
+        .await;
+        assert_eq!(create_resp.status(), AxumStatus::OK);
+
+        let _ = post_json_response(
+            &app,
+            "/api/v1/orchestration/workers",
+            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["raw"]}"#,
+        )
+        .await;
+
+        let poll_resp = post_json_response(
+            &app,
+            "/api/v1/orchestration/poll",
+            r#"{"worker_id":"worker-artifacts"}"#,
+        )
+        .await;
+        assert_eq!(poll_resp.status(), AxumStatus::OK);
+        let poll_body = axum::body::to_bytes(poll_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let poll_json: Value = serde_json::from_slice(&poll_body).unwrap();
+        let job_id = poll_json
+            .get("job")
+            .and_then(|j| j.get("id"))
+            .and_then(Value::as_str)
+            .expect("poll should assign a job")
+            .to_string();
+
+        let transcript_rel = format!("transcripts/test-{}", uuid::Uuid::new_v4());
+        let artifact_root = std::path::PathBuf::from("local-agent-data").join(&transcript_rel);
+        std::fs::create_dir_all(&artifact_root).unwrap();
+        let stdout_path = artifact_root.join("stdout.log");
+        let stderr_path = artifact_root.join("stderr.log");
+        std::fs::write(&stdout_path, b"hello stdout\n").unwrap();
+        std::fs::write(&stderr_path, b"hello stderr\n").unwrap();
+
+        let running_body = serde_json::json!({
+            "worker_id": "worker-artifacts",
+            "state": "running",
+            "transcript_dir": artifact_root.to_string_lossy(),
+            "result": null
+        })
+        .to_string();
+
+        let running_resp = put_json_response(
+            &app,
+            &format!("/api/v1/orchestration/jobs/{job_id}"),
+            &running_body,
+        )
+        .await;
+        assert_eq!(running_resp.status(), AxumStatus::OK);
+
+        let update_body = serde_json::json!({
+            "worker_id": "worker-artifacts",
+            "state": "succeeded",
+            "transcript_dir": transcript_rel,
+            "result": {
+                "outcome": "succeeded",
+                "termination_reason": "exit_code",
+                "exit_code": 0,
+                "timing": {
+                    "started_at": chrono::Utc::now(),
+                    "finished_at": chrono::Utc::now(),
+                    "duration_ms": 5
+                },
+                "artifacts": {
+                    "stdout_path": format!("{transcript_rel}/stdout.log"),
+                    "stderr_path": format!("{transcript_rel}/stderr.log"),
+                    "output_path": null,
+                    "transcript_dir": transcript_rel,
+                    "stdout_bytes": 13,
+                    "stderr_bytes": 13,
+                    "output_bytes": null,
+                    "structured_transcript_artifacts": []
+                },
+                "output_json": null,
+                "repo": null,
+                "github_pr": null,
+                "error_message": null
+            }
+        })
+        .to_string();
+
+        let update_resp = put_json_response(
+            &app,
+            &format!("/api/v1/orchestration/jobs/{job_id}"),
+            &update_body,
+        )
+        .await;
+        assert_eq!(update_resp.status(), AxumStatus::OK);
+
+        let artifact_resp = get_response(
+            &app,
+            &format!("/orchestration/jobs/{job_id}/artifacts/stdout_log"),
+        )
+        .await;
+        assert_eq!(artifact_resp.status(), AxumStatus::OK);
+        assert_eq!(
+            artifact_resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+
+        let download_resp = get_response(
+            &app,
+            &format!("/orchestration/jobs/{job_id}/artifacts/stdout_log?download=1"),
+        )
+        .await;
+        assert_eq!(download_resp.status(), AxumStatus::OK);
+        let disposition = download_resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(disposition.starts_with("attachment; filename=\""));
+
+        std::fs::remove_file(&stdout_path).unwrap();
+        let stale_file_resp = get_response(
+            &app,
+            &format!("/orchestration/jobs/{job_id}/artifacts/stdout_log"),
+        )
+        .await;
+        assert_eq!(stale_file_resp.status(), AxumStatus::NOT_FOUND);
+
+        let missing_metadata_resp = get_response(
+            &app,
+            &format!("/orchestration/jobs/{job_id}/artifacts/output_json"),
+        )
+        .await;
+        assert_eq!(missing_metadata_resp.status(), AxumStatus::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&artifact_root);
+    }
+
+    #[tokio::test]
+    async fn job_artifact_route_rejects_unknown_or_unavailable_artifacts() {
+        let app = test_app();
+
+        let missing_job_id = uuid::Uuid::new_v4();
+
+        let bad_key_resp = get_response(
+            &app,
+            &format!("/orchestration/jobs/{missing_job_id}/artifacts/not_a_key"),
+        )
+        .await;
+        assert_eq!(bad_key_resp.status(), AxumStatus::BAD_REQUEST);
+
+        let dir_key_resp = get_response(
+            &app,
+            &format!("/orchestration/jobs/{missing_job_id}/artifacts/transcript_dir"),
+        )
+        .await;
+        assert_eq!(dir_key_resp.status(), AxumStatus::BAD_REQUEST);
     }
 
     // ---------------------------------------------------------------
@@ -957,6 +1479,7 @@ mod integration_tests {
     async fn waiting_session_becomes_zombie_after_question_resolved() {
         use protocol::QuestionInfo;
         use questions::{QuestionRegistry, QuestionStatus, RegisterQuestion};
+        use sessions::SessionStatus;
 
         let reg = SessionRegistry::new(9999);
         let questions = QuestionRegistry::new();
@@ -1037,3 +1560,4 @@ mod integration_tests {
         );
     }
 }
+pub(crate) use session_views::resolve_effective_status;

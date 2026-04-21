@@ -14,6 +14,27 @@ pub enum AppError {
 
     #[error("question not found: {0}")]
     QuestionNotFound(String),
+
+    #[error("workflow not found: {0}")]
+    WorkflowNotFound(String),
+
+    #[error("workflow invalid: {0}")]
+    WorkflowInvalid(String),
+
+    #[error("work item not found: {0}")]
+    WorkItemNotFound(String),
+
+    #[error("job not found: {0}")]
+    JobNotFound(String),
+
+    #[error("worker not found: {0}")]
+    WorkerNotFound(String),
+
+    #[error("job ownership violation: {0}")]
+    JobOwnership(String),
+
+    #[error("job already cancelled: {0}")]
+    JobCancelled(String),
 }
 
 impl IntoResponse for AppError {
@@ -22,6 +43,13 @@ impl IntoResponse for AppError {
             AppError::SessionNotFound(_) => StatusCode::NOT_FOUND,
             AppError::ApprovalNotFound(_) => StatusCode::NOT_FOUND,
             AppError::QuestionNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::WorkflowNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::WorkItemNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::JobNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::WorkerNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::WorkflowInvalid(_) => StatusCode::BAD_REQUEST,
+            AppError::JobOwnership(_) => StatusCode::CONFLICT,
+            AppError::JobCancelled(_) => StatusCode::CONFLICT,
             AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()

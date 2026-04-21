@@ -1,6 +1,8 @@
+mod build;
 mod client;
 mod review;
 mod validate;
+mod workflows;
 
 use clap::{Parser, Subcommand};
 
@@ -45,6 +47,34 @@ enum Commands {
         #[arg(long, env = "AGENT_HUB_TOKEN")]
         token: Option<String>,
     },
+    /// Validate orchestration workflow TOML definitions
+    ValidateWorkflows {
+        /// Directory containing workflow .toml files
+        #[arg(long, default_value = "workflows")]
+        dir: String,
+    },
+    /// Build Docker images and materialize environment artifacts
+    Build {
+        /// Path to config root (agent-hub-configs directory)
+        #[arg(long, env = "CONFIG_ROOT", default_value = "../agent-hub-configs")]
+        config_root: String,
+
+        /// Output directory for materialized artifacts
+        #[arg(long)]
+        output_dir: Option<String>,
+
+        /// What to build
+        #[command(subcommand)]
+        target: Option<BuildTarget>,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum BuildTarget {
+    /// Build Docker images only
+    Images,
+    /// Materialize environment artifacts only
+    Environments,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -62,6 +92,18 @@ fn main() -> anyhow::Result<()> {
             token,
         } => {
             let code = rt.block_on(validate::run(config, server, token));
+            std::process::exit(code);
+        }
+        Commands::ValidateWorkflows { dir } => {
+            let code = workflows::run(dir);
+            std::process::exit(code);
+        }
+        Commands::Build {
+            config_root,
+            output_dir,
+            target,
+        } => {
+            let code = build::run(config_root, output_dir, target);
             std::process::exit(code);
         }
     }

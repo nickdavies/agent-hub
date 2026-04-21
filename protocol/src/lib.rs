@@ -10,6 +10,8 @@ pub mod approval;
 pub mod config;
 pub mod gateway;
 pub mod hooks;
+pub mod job_events;
+pub mod orchestration;
 pub mod presence;
 pub mod question;
 pub mod secret;
@@ -32,6 +34,37 @@ pub use gateway::{
     OpenCodeHookOutput, OpenCodeTool, PermissionDecision,
 };
 pub use hooks::{NotificationPayload, SessionEndPayload, StatusReport, StopPayload};
+pub use job_events::{JOB_EVENT_SCHEMA_NAME, JobEvent, JobEventKind};
+pub use orchestration::{
+    AGENT_CONTEXT_SCHEMA_NAME, AGENT_CONTEXT_SCHEMA_VERSION, AGENT_OUTPUT_SCHEMA_NAME,
+    AgentContext, AgentContextArtifacts, AgentContextJob, AgentContextPaths, AgentContextRepos,
+    AgentContextWorkflow, AgentOutput, AgentOutputError, AgentOutputGitHubPr, ApprovalRuleSet,
+    ArtifactSummary, BlockReason, CanonicalRuntimeSpec, CreateWorkItemRequest,
+    EnvironmentDefinition, EnvironmentOverlay, EnvironmentSelection, EventSource, ExecutionMode,
+    ExecutionOutcome, ExecutionTiming, FireEventRequest, GithubPullRequestMetadata,
+    HeartbeatRequest, JOB_RUN_SCHEMA_NAME, Job, JobResult, JobState, JobUpdateRequest, MergePolicy,
+    NetworkResourceKind, NetworkResourceRequest, PlannedAgentJobView, PlannedEnvironmentSpec,
+    PlannedEnvironmentTier, PlannedPermissionSet, PlannedPermissionTier, PlannedRepoClaim,
+    PlannedWorkItemView, PollJobRequest, PollJobResponse, PromptBundle, PromptRef,
+    ReactiveAgentStateConfig, ReactiveAutoStateConfig, ReactiveCommandStateConfig,
+    ReactiveEventKind, ReactiveExecutionConfig, ReactiveHumanStateConfig,
+    ReactiveManagedStateConfig, ReactiveStateConfig, ReactiveStateKind, ReactiveTerminalOutcome,
+    ReactiveTerminalStateConfig, ReactiveWorkflowDefinition, ReactiveWorkflowState,
+    ReactiveWorkflowTransition, RegisterWorkerRequest, RepoExecutionMetadata, RepoSource,
+    StructuredTranscriptArtifact, TerminationReason, WorkItem, WorkItemState, WorkerInfo,
+    WorkerState, WorkflowDefinition, WorkflowDocument, WorkflowEvent, WorkflowEventKind,
+    WorkflowEventPayload, WorkflowStep, WorkflowStepKind, WorkflowValidationError,
+    WorkflowValidationReport, canonical_environment_for_execution,
+    canonical_permissions_for_environment, canonical_runtime_spec_for_job,
+    canonical_runtime_spec_for_job_effective, canonical_runtime_spec_from_legacy_job_fields,
+    default_approval_rules_for_tier, legacy_network_label_for_request,
+    network_request_from_legacy_label, parse_workflow_toml, parse_workflow_toml_document,
+    planned_agent_job_view_from_prototype, planned_work_item_view_from_prototype,
+    project_runtime_spec_into_job_context, reactive_event_kind_from_str,
+    runtime_spec_from_job_context, validate_agent_output_next_event, validate_reactive_workflow,
+    validate_reactive_workflows, validate_workflow, validate_workflow_document, validate_workflows,
+    workflow_event_is_externally_fireable, workflow_event_is_internal_system_only,
+};
 pub use presence::{PresenceState, PresenceUpdate};
 pub use question::{
     PendingQuestion, QuestionDecision, QuestionGatewayOutput, QuestionInfo, QuestionOption,

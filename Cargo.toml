@@ -1,3 +1,3 @@
 [workspace]
-members = ["server", "cli", "capabilities", "gateway", "config", "protocol"]
+members = ["server", "cli", "capabilities", "gateway", "config", "protocol", "local-agent"]
 resolver = "3"

@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Work Item — Agent Hub</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><a href="/orchestration">Dashboard</a></li>
+        <li><strong>Work items</strong></li>
+        <li><a href="/orchestration/jobs">Jobs</a></li>
+        <li><a href="/orchestration/workers">Workers</a></li>
+        <li><a href="/orchestration/transcripts">Transcripts</a></li>
+        {% if approvals_enabled %}
+        <li><a href="/approvals">Approvals</a></li>
+        {% endif %}
+        {% if has_auth %}
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
+    </ul>
+</nav>
+
+<main class="container">
+    <a href="/orchestration/work-items">← Back to work items</a>
+    <h3>Work Item</h3>
+    <article>
+        <p><strong>ID:</strong> <code>{{ row.id }}</code></p>
+        <p><strong>Title:</strong> {{ row.title }}</p>
+        <p><strong>Workflow:</strong> <code>{{ row.workflow_id }}</code> (step <code>{{ row.current_step }}</code>)</p>
+        <p><strong>State:</strong> {{ row.state }} · <strong>Projected:</strong> {{ row.projected_state }}</p>
+        <p><strong>Triage:</strong> {{ row.triage_status }}</p>
+        <p><strong>Blocked reason:</strong> {{ row.blocked_reason }}</p>
+        <p><strong>Last failure reason:</strong> {{ row.last_failure_reason }}</p>
+        <p><strong>Required action:</strong> {{ row.required_action_description }}</p>
+        <p><strong>Human gate:</strong> {{ row.human_gate_state }}</p>
+        <p><strong>Valid next events:</strong>
+            {% if row.valid_next_events.is_empty() %}
+            <small>none</small>
+            {% else %}
+            {% for event in row.valid_next_events %}
+            <code>{{ event }}</code>{% if !loop.last %} {% endif %}
+            {% endfor %}
+            {% endif %}
+        </p>
+        <p><strong>Allowed actions:</strong>
+            {% if row.allowed_actions.is_empty() %}
+            <small>none</small>
+            {% else %}
+            {% for action in row.allowed_actions %}
+            <code>{{ action }}</code>{% if !loop.last %} {% endif %}
+            {% endfor %}
+            {% endif %}
+        </p>
+    </article>
+
+    <article>
+        <h4>GitHub PR status</h4>
+        {% match github_pr_state %}
+        {% when Some with (pr) %}
+        <p><strong>PR:</strong> <a href="{{ pr.url }}" target="_blank" rel="noopener noreferrer">#{{ pr.number }}</a></p>
+        <p><strong>State:</strong> <code>{{ pr.state }}</code></p>
+        <p><strong>Approved:</strong> {% if pr.approved %}yes{% else %}no{% endif %}</p>
+        <p><strong>Checks passing:</strong> {% if pr.checks_passing %}yes{% else %}no{% endif %}</p>
+        <p><strong>Changes requested:</strong> {% if pr.changes_requested %}yes{% else %}no{% endif %}</p>
+        <p><strong>Mergeable:</strong> {% if pr.mergeable %}yes{% else %}no{% endif %}</p>
+        <p><strong>Last updated:</strong> {{ pr.last_updated }}</p>
+        {% when None %}
+        <p><small>No GitHub PR lifecycle state tracked yet.</small></p>
+        {% endmatch %}
+    </article>
+
+    <article>
+        <h4>Deterministic merge readiness</h4>
+        {% match merge_readiness %}
+        {% when Some with (readiness) %}
+        <p><strong>Ready to merge:</strong> {% if readiness.ready %}yes{% else %}no{% endif %}</p>
+        <ul>
+            <li>PR is open: {% if readiness.is_open %}met{% else %}unmet{% endif %}</li>
+            <li>PR is approved: {% if readiness.approved %}met{% else %}unmet{% endif %}</li>
+            <li>Required checks passing: {% if readiness.checks_passing %}met{% else %}unmet{% endif %}</li>
+            <li>No changes requested: {% if readiness.no_changes_requested %}met{% else %}unmet{% endif %}</li>
+        </ul>
+        {% when None %}
+        <p><small>Merge readiness unavailable: no tracked PR state.</small></p>
+        {% endmatch %}
+    </article>
+
+    <h4>Actions</h4>
+    {% if readwrite %}
+    {% if row.allowed_actions.is_empty() %}
+    <p><small>No actions currently available.</small></p>
+    {% else %}
+    <div class="grid">
+        {% for action in row.allowed_actions %}
+        {% if action == "choose_workflow" %}
+        <form method="post" action="/orchestration/work-items/{{ row.id }}/action">
+            <input type="hidden" name="action" value="choose_workflow">
+            <label>
+                Workflow
+                <select name="workflow_id" required>
+                    <option value="">Select workflow</option>
+                    {% for workflow in workflow_options %}
+                    <option value="{{ workflow.id }}">{{ workflow.id }} ({{ workflow.kind }})</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <button type="submit">choose_workflow</button>
+        </form>
+        {% else %}
+        <form method="post" action="/orchestration/work-items/{{ row.id }}/action">
+            <input type="hidden" name="action" value="{{ action }}">
+            {% if action == "request_changes" || action == "retry" || action == "cancel" || action == "unblock" %}
+            <label>
+                Reason
+                <input type="text" name="reason" placeholder="optional">
+            </label>
+            {% endif %}
+            <button type="submit">{{ action }}</button>
+        </form>
+        {% endif %}
+        {% endfor %}
+    </div>
+    {% endif %}
+    {% else %}
+    <p><small>Read-only mode: actions are disabled.</small></p>
+    {% endif %}
+
+    <h4>Linked jobs</h4>
+    {% if jobs.is_empty() %}
+    <p>No jobs for this work item yet.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Job ID</th>
+                <th>Step</th>
+                <th>State</th>
+                <th>Worker</th>
+                <th>Updated</th>
+                <th>Live</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for job in jobs %}
+            <tr>
+                <td><code>{{ job.id }}</code></td>
+                <td>{{ job.step_id }}</td>
+                <td>{{ job.state }}</td>
+                <td>{{ job.assigned_worker_id }}</td>
+                <td>{{ job.updated_at }}</td>
+                <td><a href="/orchestration/jobs/{{ job.id }}">Events</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    <article>
+        <h4>Structured artifact previews</h4>
+        <p><small>Read-only previews from <code>work_item.context.job_artifact_data</code> and <code>work_item.context.child_results.*.job_artifact_data</code> for known schema-gated artifacts.</small></p>
+
+        {% if structured_artifact_previews.is_empty() %}
+        <p><small>No known structured artifact previews currently projected.</small></p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Step</th>
+                    <th>Artifact</th>
+                    <th>Data alias</th>
+                    <th>Metadata alias</th>
+                    <th>Schema</th>
+                    <th>Inline preview</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for artifact in structured_artifact_previews %}
+                <tr>
+                    <td><code>{{ artifact.step_id }}</code></td>
+                    <td><code>{{ artifact.artifact_key }}</code></td>
+                    <td><code>{{ artifact.data_context_alias }}</code></td>
+                    <td><code>{{ artifact.metadata_context_alias }}</code></td>
+                    <td>{{ artifact.schema }}</td>
+                    <td>
+                        <details>
+                            <summary>Preview</summary>
+                            <pre style="margin-top:0.5rem; max-height:12rem; overflow:auto; white-space: pre-wrap;">{{ artifact.inline_preview|e }}</pre>
+                        </details>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </article>
+
+    <article>
+        <h4>Projected artifact aliases + metadata previews</h4>
+        <p><small>Read-only bounded previews for projected artifact path + metadata values in <code>job_artifact_paths</code>, <code>job_artifact_metadata</code>, <code>child_results.*.job_artifact_paths</code>, and <code>child_results.*.job_artifact_metadata</code>. This does not provide artifact retrieval/download.</small></p>
+
+        {% if structured_artifact_projection_previews.is_empty() %}
+        <p><small>No projected artifact path/metadata values currently available in these namespaces.</small></p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Namespace</th>
+                    <th>Step</th>
+                    <th>Alias</th>
+                    <th>Interpolation</th>
+                    <th>Kind</th>
+                    <th>Inline preview</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for value in structured_artifact_projection_previews %}
+                <tr>
+                    <td><code>{{ value.namespace }}</code></td>
+                    <td><code>{{ value.step_id }}</code></td>
+                    <td><code>{{ value.context_alias }}</code></td>
+                    <td><code>{{ value.interpolation }}</code></td>
+                    <td>{{ value.value_kind }}</td>
+                    <td>
+                        <details>
+                            <summary>Preview</summary>
+                            <pre style="margin-top:0.5rem; max-height:12rem; overflow:auto; white-space: pre-wrap;">{{ value.inline_preview|e }}</pre>
+                        </details>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </article>
+
+    <article>
+        <h4>Structured value previews</h4>
+        <p><small>Read-only bounded previews for projected structured values in <code>job_outputs</code>, <code>job_results</code>, <code>child_results.*.job_outputs</code>, and <code>child_results.*.job_results</code>.</small></p>
+
+        {% if structured_value_previews.is_empty() %}
+        <p><small>No projected structured values currently available in these namespaces.</small></p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Namespace</th>
+                    <th>Step</th>
+                    <th>Alias</th>
+                    <th>Interpolation</th>
+                    <th>Kind</th>
+                    <th>Inline preview</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for value in structured_value_previews %}
+                <tr>
+                    <td><code>{{ value.namespace }}</code></td>
+                    <td><code>{{ value.step_id }}</code></td>
+                    <td><code>{{ value.context_alias }}</code></td>
+                    <td><code>{{ value.interpolation }}</code></td>
+                    <td>{{ value.value_kind }}</td>
+                    <td>
+                        <details>
+                            <summary>Preview</summary>
+                            <pre style="margin-top:0.5rem; max-height:12rem; overflow:auto; white-space: pre-wrap;">{{ value.inline_preview|e }}</pre>
+                        </details>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </article>
+
+    <article>
+        <h4>Structured I/O inspector</h4>
+        <p><small>Read-only context aliases for workflow interpolation. This view shows only structured I/O namespaces and does not provide artifact retrieval.</small></p>
+
+        {% for namespace in structured_io_namespaces %}
+        <details>
+            <summary><code>{{ namespace.name }}</code> {% if namespace.aliases.is_empty() %}<small>— none projected</small>{% else %}<small>— {{ namespace.aliases.len() }} aliases</small>{% endif %}</summary>
+            {% if namespace.aliases.is_empty() %}
+            <p><small>No entries currently projected for this namespace.</small></p>
+            {% else %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Alias</th>
+                        <th>Interpolation</th>
+                        <th>Kind</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for alias in namespace.aliases %}
+                    <tr>
+                        <td><code>{{ alias.alias }}</code></td>
+                        <td><code>{{ alias.interpolation }}</code></td>
+                        <td>{{ alias.value_kind }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% if namespace.truncated %}
+            <p><small>Alias list truncated for safety; showing first {{ namespace.aliases.len() }} entries.</small></p>
+            {% endif %}
+            {% endif %}
+        </details>
+        {% endfor %}
+    </article>
+</main>
+</body>
+</html>

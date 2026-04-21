@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Orchestration Workers — Agent Hub</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><a href="/orchestration">Dashboard</a></li>
+        <li><a href="/orchestration/work-items">Work items</a></li>
+        <li><a href="/orchestration/jobs">Jobs</a></li>
+        <li><strong>Workers</strong></li>
+        <li><a href="/orchestration/transcripts">Transcripts</a></li>
+        {% if approvals_enabled %}
+        <li><a href="/approvals">Approvals</a></li>
+        {% endif %}
+        {% if has_auth %}
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
+    </ul>
+</nav>
+
+<main class="container">
+    <h3>Workers</h3>
+    {% if workers.is_empty() %}
+    <p>No workers found.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Worker ID</th>
+                <th>Host</th>
+                <th>State</th>
+                <th>Supported modes</th>
+                <th>Last heartbeat</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for worker in workers %}
+            <tr>
+                <td><code>{{ worker.id }}</code></td>
+                <td>{{ worker.hostname }}</td>
+                <td>{{ worker.state }}</td>
+                <td>{{ worker.supported_modes }}</td>
+                <td>{{ worker.last_heartbeat_at }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</main>
+</body>
+</html>

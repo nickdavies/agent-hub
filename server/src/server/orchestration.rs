@@ -1,0 +1,14486 @@
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use axum::http::HeaderMap;
+use chrono::{DateTime, Utc};
+use protocol::{
+    AgentOutput, BlockReason, CanonicalRuntimeSpec, CreateWorkItemRequest, EnvironmentDefinition,
+    EnvironmentOverlay, EnvironmentSelection, EventSource, FireEventRequest, HeartbeatRequest, Job,
+    JobState, JobUpdateRequest, NetworkResourceRequest, PlannedEnvironmentTier, PollJobRequest,
+    PollJobResponse, ReactiveTerminalOutcome, RegisterWorkerRequest, RepoSource, WorkItem,
+    WorkItemState, WorkerInfo, WorkerState, WorkflowDefinition, WorkflowDocument, WorkflowEvent,
+    WorkflowEventKind, WorkflowEventPayload, WorkflowStepKind, canonical_environment_for_execution,
+    canonical_permissions_for_environment, canonical_runtime_spec_for_job,
+    canonical_runtime_spec_for_job_effective, default_approval_rules_for_tier,
+    legacy_network_label_for_request, network_request_from_legacy_label,
+    project_runtime_spec_into_job_context, validate_agent_output_next_event,
+    workflow_event_is_externally_fireable,
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
+use tokio::process::Command;
+use tokio::sync::{Mutex, OnceCell};
+use uuid::Uuid;
+
+mod context;
+mod github;
+pub mod handlers;
+mod storage;
+pub mod webhook;
+
+use super::environment::validate_environment_selection;
+use super::github_poller::GitHubPoller;
+use super::repo_discovery::DiscoveredRepo;
+#[cfg(test)]
+use super::task_adapter::task_from_work_item;
+use super::task_adapter::{
+    AdapterIntent, HumanActionKind, TaskAdapter, TaskAdapterError, TaskAssignee, TaskCheckpoint,
+    TaskHumanAction, TaskHumanGateState, TaskLabels, TaskProjection, TaskToolRecord,
+    TaskTriageStatus, TriageResult, action_to_fire_event, choose_workflow_id, infer_intents,
+    legacy_human_gate_valid_next_events, task_from_work_item_with_valid_next_events,
+    task_requires_manual_triage, work_item_from_create, work_item_requires_manual_triage,
+};
+#[cfg(test)]
+use super::task_files::TaskFileStore;
+use super::workflows::WorkflowCatalog;
+use crate::error::AppError;
+pub(crate) use context::CONTEXT_GITHUB_PR_STATE_KEY;
+use context::{
+    CONTEXT_JOB_ARTIFACT_DATA_KEY, CONTEXT_JOB_ARTIFACT_METADATA_KEY,
+    CONTEXT_JOB_ARTIFACT_PATHS_KEY, CONTEXT_JOB_EXECUTION_KIND_KEY, CONTEXT_JOB_OUTPUTS_KEY,
+    CONTEXT_JOB_RESULTS_KEY, CONTEXT_MANAGED_OPERATION_KEY, CONTEXT_REPO_CATALOG_HINT_KEY,
+    CONTEXT_REPO_CATALOG_KEY, CONTEXT_VALID_NEXT_EVENTS_KEY, CONTEXT_WORK_ITEM_KEY,
+    CONTEXT_WORKFLOW_INPUTS_KEY, CONTEXT_WORKFLOW_KEY, TRIAGE_WORKFLOW_ID,
+};
+pub(crate) use github::{GithubPrLifecycleState, GithubPrState, MergeReadiness};
+use github::{
+    github_pr_state_from_context, merge_readiness_from_pr_state, parse_pr_number_from_url,
+    parse_pr_url_components, update_github_pr_state_in_context,
+};
+use storage::{
+    DbTable, column_exists, invalid_enum, invalid_json, parse_datetime, row_to_job,
+    row_to_work_item,
+};
+
+const LEASE_TTL_SECS: i64 = 120;
+const STALE_WORKER_SECS: u64 = 90;
+const WRITE_BACK_BASE_RETRY_SECS: i64 = 30;
+const WRITE_BACK_MAX_RETRY_SECS: i64 = 30 * 60;
+
+#[derive(Debug)]
+enum JobTransitionError {
+    InvalidTransition { from: JobState, to: JobState },
+}
+
+#[derive(Debug)]
+enum InterpolationError {
+    UnterminatedPlaceholder,
+    MissingPath(String),
+    NonScalarValue(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EventIngress {
+    ExternalPublic,
+    TrustedInternal,
+}
+
+impl EventIngress {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExternalPublic => "external-public",
+            Self::TrustedInternal => "trusted-internal",
+        }
+    }
+}
+
+impl std::fmt::Display for InterpolationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnterminatedPlaceholder => write!(f, "unterminated placeholder in template"),
+            Self::MissingPath(path) => write!(f, "missing interpolation path: {path}"),
+            Self::NonScalarValue(path) => write!(f, "interpolation path is non-scalar: {path}"),
+        }
+    }
+}
+
+impl std::error::Error for InterpolationError {}
+
+impl std::fmt::Display for JobTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTransition { from, to } => {
+                write!(f, "invalid job state transition: {from} -> {to}")
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct OrchestrationService {
+    pub workflows: Arc<WorkflowCatalog>,
+    pub task_adapter: Arc<dyn TaskAdapter>,
+    github_poller: Option<Arc<GitHubPoller>>,
+    github_poll_interval: Duration,
+    last_github_poll_at: Arc<Mutex<Option<Instant>>>,
+    db_path: Arc<PathBuf>,
+    init_once: Arc<OnceCell<()>>,
+    force_gateway_approval_mode: bool,
+    environments: Arc<Vec<EnvironmentDefinition>>,
+    overlays: Arc<Vec<EnvironmentOverlay>>,
+    discovered_repos: Arc<Vec<DiscoveredRepo>>,
+    operator_login: Option<String>,
+    /// Prompt used by the `__triage__` pseudo-workflow. Loaded from the
+    /// triage prompt manifest referenced by `system.toml` so triage is
+    /// decoupled from any specific selectable workflow.
+    triage_prompt: Arc<Option<super::config::LoadedTriagePrompt>>,
+}
+
+impl OrchestrationService {
+    #[allow(dead_code)]
+    pub fn new(
+        workflows: Arc<WorkflowCatalog>,
+        task_adapter: Arc<dyn TaskAdapter>,
+        db_path: String,
+    ) -> Self {
+        Self::new_with_github_poller_and_interval(workflows, task_adapter, db_path, None, 30)
+    }
+
+    #[allow(dead_code)]
+    pub fn new_with_github_poller(
+        workflows: Arc<WorkflowCatalog>,
+        task_adapter: Arc<dyn TaskAdapter>,
+        db_path: String,
+        github_poller: Option<Arc<GitHubPoller>>,
+    ) -> Self {
+        Self::new_with_github_poller_and_interval(
+            workflows,
+            task_adapter,
+            db_path,
+            github_poller,
+            30,
+        )
+    }
+
+    pub fn new_with_github_poller_and_interval(
+        workflows: Arc<WorkflowCatalog>,
+        task_adapter: Arc<dyn TaskAdapter>,
+        db_path: String,
+        github_poller: Option<Arc<GitHubPoller>>,
+        github_poll_interval_secs: u64,
+    ) -> Self {
+        Self {
+            workflows,
+            task_adapter,
+            github_poller,
+            github_poll_interval: Duration::from_secs(github_poll_interval_secs.max(1)),
+            last_github_poll_at: Arc::new(Mutex::new(None)),
+            db_path: Arc::new(PathBuf::from(db_path)),
+            init_once: Arc::new(OnceCell::new()),
+            force_gateway_approval_mode: false,
+            environments: Arc::new(Vec::new()),
+            overlays: Arc::new(Vec::new()),
+            discovered_repos: Arc::new(Vec::new()),
+            operator_login: None,
+            triage_prompt: Arc::new(None),
+        }
+    }
+
+    pub fn with_server_approval_mode(
+        mut self,
+        approval_mode: super::config::ApprovalFeatureMode,
+    ) -> Self {
+        self.force_gateway_approval_mode =
+            !matches!(approval_mode, super::config::ApprovalFeatureMode::Disabled);
+        self
+    }
+
+    pub fn with_environments(mut self, environments: Vec<EnvironmentDefinition>) -> Self {
+        self.environments = Arc::new(environments);
+        self
+    }
+
+    pub fn with_overlays(mut self, overlays: Vec<EnvironmentOverlay>) -> Self {
+        self.overlays = Arc::new(overlays);
+        self
+    }
+
+    pub fn with_discovered_repos(mut self, discovered_repos: Vec<DiscoveredRepo>) -> Self {
+        self.discovered_repos = Arc::new(discovered_repos);
+        self
+    }
+
+    pub fn with_operator_login(mut self, operator_login: Option<String>) -> Self {
+        self.operator_login = operator_login
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    pub fn with_triage_prompt(
+        mut self,
+        triage_prompt: Option<super::config::LoadedTriagePrompt>,
+    ) -> Self {
+        self.triage_prompt = Arc::new(triage_prompt);
+        self
+    }
+
+    fn ensure_repo_catalog_hint_context(&self, item: &mut WorkItem) {
+        // Repo catalog hint is exclusively a __triage__ concern: the triage agent
+        // uses it to discover candidate repositories. Selectable workflows
+        // receive a concrete repo selection via context once triage is approved.
+        if item.workflow_id != TRIAGE_WORKFLOW_ID {
+            return;
+        }
+
+        if !item.context.is_object() {
+            item.context = serde_json::json!({});
+        }
+        let Some(context) = item.context.as_object_mut() else {
+            return;
+        };
+
+        if !context.contains_key(CONTEXT_REPO_CATALOG_KEY) {
+            context.insert(
+                CONTEXT_REPO_CATALOG_KEY.to_string(),
+                serde_json::Value::Array(discovered_repo_catalog_entries(
+                    self.discovered_repos.as_slice(),
+                )),
+            );
+        }
+
+        context
+            .entry(CONTEXT_REPO_CATALOG_HINT_KEY.to_string())
+            .or_insert_with(|| {
+                serde_json::Value::String(discovered_repo_catalog_hint(
+                    self.discovered_repos.as_slice(),
+                ))
+            });
+    }
+
+    #[allow(dead_code)]
+    fn maybe_apply_environment_selection_for_work_item_context(
+        &self,
+        context: &mut serde_json::Value,
+    ) {
+        let Some(selection) = extract_environment_selection_from_context(context) else {
+            return;
+        };
+
+        match validate_environment_selection(
+            &selection,
+            self.environments.as_slice(),
+            self.overlays.as_slice(),
+        ) {
+            Ok(environment) => {
+                project_environment_selection_into_context(context, &selection, environment);
+            }
+            Err(error) => {
+                if let Some((default_selection, default_environment)) =
+                    self.default_environment_selection()
+                {
+                    tracing::warn!(
+                        environment_base = %selection.base,
+                        overlays = ?selection.overlays,
+                        error = %error,
+                        fallback_environment = %default_environment.name,
+                        "invalid environment selection; falling back to workflow default"
+                    );
+                    project_environment_selection_into_context(
+                        context,
+                        &default_selection,
+                        &default_environment,
+                    );
+                }
+            }
+        }
+    }
+
+    fn validate_triage_environment_selection_for_work_item_context(
+        &self,
+        context: &mut serde_json::Value,
+    ) -> Result<(), String> {
+        let Some(selection) = extract_environment_selection_from_context(context) else {
+            return Ok(());
+        };
+
+        let environment = validate_environment_selection(
+            &selection,
+            self.environments.as_slice(),
+            self.overlays.as_slice(),
+        )
+        .map_err(|error| {
+            format!(
+                "Triage produced invalid environment selection: {error}. Valid environments: {}",
+                self.valid_environment_names_for_error()
+            )
+        })?;
+        project_environment_selection_into_context(context, &selection, environment);
+        Ok(())
+    }
+
+    fn valid_environment_names_for_error(&self) -> String {
+        if self.environments.is_empty() {
+            return "<none configured>".to_string();
+        }
+        self.environments
+            .iter()
+            .map(|environment| environment.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn reject_triage_result_with_reason(&self, item: &mut WorkItem, reason: String) {
+        item.state = WorkItemState::Failed;
+        item.last_failure_reason = Some(reason.clone());
+        if !item.context.is_object() {
+            item.context = serde_json::json!({});
+        }
+        if let Some(obj) = item.context.as_object_mut() {
+            obj.insert(
+                "last_failure_reason".to_string(),
+                serde_json::Value::String(reason),
+            );
+        }
+        item.projected_state = Some(project_workflow_state(item));
+        item.blocked_on = block_reason_for_state_name(&item.current_step);
+    }
+
+    fn default_environment_selection(
+        &self,
+    ) -> Option<(EnvironmentSelection, EnvironmentDefinition)> {
+        let environment = self.environments.first()?.clone();
+        Some((
+            EnvironmentSelection {
+                base: environment.name.clone(),
+                overlays: Vec::new(),
+            },
+            environment,
+        ))
+    }
+
+    fn selected_environment_for_context(
+        &self,
+        context: &serde_json::Value,
+    ) -> Option<(EnvironmentSelection, EnvironmentDefinition)> {
+        let selection = extract_environment_selection_from_context(context)?;
+        match validate_environment_selection(
+            &selection,
+            self.environments.as_slice(),
+            self.overlays.as_slice(),
+        ) {
+            Ok(environment) => Some((selection, environment.clone())),
+            Err(error) => {
+                if let Some((default_selection, default_environment)) =
+                    self.default_environment_selection()
+                {
+                    tracing::warn!(
+                        environment_base = %selection.base,
+                        overlays = ?selection.overlays,
+                        error = %error,
+                        fallback_environment = %default_environment.name,
+                        "invalid environment selection during job creation; falling back"
+                    );
+                    eprintln!(
+                        "warning: invalid environment selection fell back during job creation; triage validation should reject invalid triage selections before this point"
+                    );
+                    Some((default_selection, default_environment))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn selected_environment_for_reactive_execution(
+        &self,
+        execution: Option<&protocol::ReactiveExecutionConfig>,
+        context: &serde_json::Value,
+    ) -> Result<Option<(EnvironmentSelection, EnvironmentDefinition)>, anyhow::Error> {
+        if let Some(base) = execution
+            .and_then(|config| config.environment.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let overlays = execution
+                .map(|config| {
+                    config
+                        .overlays
+                        .iter()
+                        .map(|overlay| overlay.trim())
+                        .filter(|overlay| !overlay.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let selection = EnvironmentSelection {
+                base: base.to_string(),
+                overlays,
+            };
+            let environment = validate_environment_selection(
+                &selection,
+                self.environments.as_slice(),
+                self.overlays.as_slice(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "state execution environment '{}' is invalid: {}",
+                    selection.base,
+                    error
+                )
+            })?
+            .clone();
+            return Ok(Some((selection, environment)));
+        }
+
+        Ok(self.selected_environment_for_context(context))
+    }
+
+    pub async fn init(&self) -> anyhow::Result<()> {
+        self.init_once
+            .get_or_try_init(|| async {
+                let path = Arc::clone(&self.db_path);
+                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let conn = Connection::open(path.as_path())?;
+                    conn.execute_batch(
+                        r#"
+                    CREATE TABLE IF NOT EXISTS work_items (
+                        id TEXT PRIMARY KEY,
+                        workflow_id TEXT NOT NULL,
+                        session_id TEXT,
+                        current_step TEXT NOT NULL,
+                        blocked_on TEXT,
+                        state TEXT NOT NULL,
+                        context_json TEXT NOT NULL,
+                        repo_json TEXT,
+                        parent_work_item_id TEXT,
+                        parent_step_id TEXT,
+                        child_work_item_id TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        last_written_at TEXT,
+                        write_back_failures INTEGER NOT NULL DEFAULT 0,
+                        write_back_retry_after TEXT,
+                        status_comment_id INTEGER,
+                        checkpoint_comment_id INTEGER,
+                        triage_comment_id INTEGER,
+                        job_result_comment_ids_json TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS jobs (
+                        id TEXT PRIMARY KEY,
+                        work_item_id TEXT NOT NULL,
+                        step_id TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        assigned_worker_id TEXT,
+                        execution_mode TEXT NOT NULL,
+                        container_image TEXT,
+                        command TEXT NOT NULL,
+                        args_json TEXT NOT NULL,
+                        env_json TEXT NOT NULL,
+                        prompt_json TEXT,
+                        context_json TEXT NOT NULL,
+                        repo_json TEXT,
+                        timeout_secs INTEGER,
+                        transcript_dir TEXT,
+                        result_json TEXT,
+                        lease_expires_at TEXT,
+                        runtime_spec_json TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+                    CREATE TABLE IF NOT EXISTS workers (
+                        id TEXT PRIMARY KEY,
+                        hostname TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        supported_modes_json TEXT NOT NULL,
+                        last_heartbeat_at TEXT NOT NULL
+                    );
+                    "#,
+                    )?;
+                    if !column_exists(&conn, DbTable::Jobs, "container_image")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN container_image TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "result_json")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN result_json TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "repo_json")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN repo_json TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "parent_work_item_id")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN parent_work_item_id TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "parent_step_id")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN parent_step_id TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "child_work_item_id")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN child_work_item_id TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "repo_json")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN repo_json TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "lease_expires_at")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "timeout_secs")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN timeout_secs INTEGER", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "max_retries")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN max_retries INTEGER", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "attempt")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN attempt INTEGER", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "runtime_spec_json")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN runtime_spec_json TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "external_task_id")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN external_task_id TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "external_task_source")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN external_task_source TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "title")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN title TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "description")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN description TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "labels_json")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN labels_json TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "priority")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN priority TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "projected_state")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN projected_state TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "last_failure_reason")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN last_failure_reason TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "required_action_description")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN required_action_description TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "triage_status")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN triage_status TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "human_gate")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN human_gate INTEGER", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "human_gate_state")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN human_gate_state TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "blocked_on")? {
+                        conn.execute("ALTER TABLE work_items ADD COLUMN blocked_on TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "last_written_at")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN last_written_at TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "write_back_failures")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN write_back_failures INTEGER NOT NULL DEFAULT 0",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "write_back_retry_after")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN write_back_retry_after TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "status_comment_id")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN status_comment_id INTEGER",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "checkpoint_comment_id")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN checkpoint_comment_id INTEGER",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "triage_comment_id")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN triage_comment_id INTEGER",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(&conn, DbTable::WorkItems, "job_result_comment_ids_json")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN job_result_comment_ids_json TEXT",
+                            [],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await??;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        self.sync_tasks_from_adapter().await?;
+        Ok(())
+    }
+
+    pub async fn create_work_item(&self, req: CreateWorkItemRequest) -> Result<WorkItem, AppError> {
+        self.ensure_ready().await?;
+        let initial_state = if let Some(workflow) = self.workflows.get(&req.workflow_id) {
+            workflow.entry_step.clone()
+        } else if let Some(reactive) = self.workflows.get_reactive(&req.workflow_id) {
+            reactive.initial_state.clone()
+        } else if req.workflow_id == "__triage__" {
+            "triage".to_string()
+        } else {
+            return Err(AppError::WorkflowNotFound(req.workflow_id.clone()));
+        };
+        let item = work_item_from_create(
+            &req,
+            Uuid::new_v4(),
+            req.workflow_id.clone(),
+            initial_state,
+            self.task_adapter.adapter_name(),
+        );
+        let mut item = item;
+        self.ensure_repo_catalog_hint_context(&mut item);
+        item.projected_state = Some(project_workflow_state(&item));
+        self.insert_work_item(&item).await.map_err(map_db)?;
+        self.persist_task_projection(&item, None)
+            .await
+            .map_err(map_config)?;
+        let created = self
+            .ensure_pending_for_current_state(&mut item)
+            .await
+            .map_err(map_db)?;
+        if created {
+            item = self
+                .get_work_item(item.id)
+                .await
+                .map_err(map_db)?
+                .ok_or_else(|| AppError::WorkItemNotFound(item.id.to_string()))?;
+        }
+        Ok(item)
+    }
+
+    pub async fn list_work_items(&self) -> Result<Vec<WorkItem>, AppError> {
+        self.ensure_ready().await?;
+        self.select_work_items().await.map_err(map_db)
+    }
+
+    pub async fn list_jobs(&self) -> Result<Vec<Job>, AppError> {
+        self.ensure_ready().await?;
+        self.select_jobs().await.map_err(map_db)
+    }
+
+    pub(crate) async fn list_jobs_with_transcripts(&self) -> anyhow::Result<Vec<Job>> {
+        self.ensure_ready().await?;
+        self.select_jobs_with_transcripts().await
+    }
+
+    pub async fn list_jobs_for_work_item(&self, work_item_id: Uuid) -> Result<Vec<Job>, AppError> {
+        self.ensure_ready().await?;
+        self.select_jobs_for_work_item(work_item_id)
+            .await
+            .map_err(map_db)
+    }
+
+    pub async fn register_worker(
+        &self,
+        req: RegisterWorkerRequest,
+    ) -> Result<WorkerInfo, AppError> {
+        self.ensure_ready().await?;
+        let worker = WorkerInfo {
+            id: req.id,
+            hostname: req.hostname,
+            state: WorkerState::Idle,
+            supported_modes: req.supported_modes,
+            last_heartbeat_at: Utc::now(),
+        };
+        self.upsert_worker(&worker).await.map_err(map_db)?;
+        Ok(worker)
+    }
+
+    pub async fn heartbeat(
+        &self,
+        worker_id: String,
+        req: HeartbeatRequest,
+    ) -> Result<WorkerInfo, AppError> {
+        self.ensure_ready().await?;
+        let mut worker = self
+            .get_worker(&worker_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkerNotFound(worker_id.clone()))?;
+        worker.state = req.state;
+        worker.last_heartbeat_at = Utc::now();
+        self.upsert_worker(&worker).await.map_err(map_db)?;
+        Ok(worker)
+    }
+
+    pub async fn list_workers(&self) -> Result<Vec<WorkerInfo>, AppError> {
+        self.ensure_ready().await?;
+        self.select_workers().await.map_err(map_db)
+    }
+
+    pub async fn work_item_state_counts(&self) -> Result<HashMap<String, usize>, AppError> {
+        self.ensure_ready().await?;
+        self.select_work_item_state_counts().await.map_err(map_db)
+    }
+
+    pub async fn job_state_counts(&self) -> Result<HashMap<String, usize>, AppError> {
+        self.ensure_ready().await?;
+        self.select_job_state_counts().await.map_err(map_db)
+    }
+
+    pub async fn worker_state_counts(&self) -> Result<HashMap<String, usize>, AppError> {
+        self.ensure_ready().await?;
+        self.select_worker_state_counts().await.map_err(map_db)
+    }
+
+    pub async fn list_recent_terminal_jobs(&self, limit: usize) -> Result<Vec<Job>, AppError> {
+        self.ensure_ready().await?;
+        self.select_recent_terminal_jobs(limit)
+            .await
+            .map_err(map_db)
+    }
+
+    pub async fn list_human_gate_work_items(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>, AppError> {
+        self.ensure_ready().await?;
+        self.select_human_gate_work_items(limit)
+            .await
+            .map_err(map_db)
+    }
+
+    pub async fn list_triage_work_items(&self, limit: usize) -> Result<Vec<WorkItem>, AppError> {
+        self.ensure_ready().await?;
+        self.select_triage_work_items(limit).await.map_err(map_db)
+    }
+
+    pub async fn poll_job(&self, req: PollJobRequest) -> Result<PollJobResponse, AppError> {
+        self.ensure_ready().await?;
+        self.reconcile_stale_workers(Duration::from_secs(STALE_WORKER_SECS))
+            .await?;
+        let mut worker = self
+            .get_worker(&req.worker_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkerNotFound(req.worker_id.clone()))?;
+
+        if let Some(job) = self
+            .assign_next_job(req.worker_id.clone(), worker.supported_modes.clone())
+            .await
+            .map_err(map_db)?
+        {
+            worker.state = WorkerState::Busy;
+            worker.last_heartbeat_at = Utc::now();
+            self.upsert_worker(&worker).await.map_err(map_db)?;
+            return Ok(PollJobResponse { job: Some(job) });
+        }
+
+        worker.state = WorkerState::Idle;
+        worker.last_heartbeat_at = Utc::now();
+        self.upsert_worker(&worker).await.map_err(map_db)?;
+        Ok(PollJobResponse { job: None })
+    }
+
+    pub async fn update_job(&self, job_id: Uuid, req: JobUpdateRequest) -> Result<Job, AppError> {
+        self.ensure_ready().await?;
+        let mut job = self
+            .get_job(job_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::JobNotFound(job_id.to_string()))?;
+
+        if job.assigned_worker_id.as_deref() != Some(req.worker_id.as_str()) {
+            if job.state == JobState::Cancelled {
+                return Err(AppError::JobCancelled(job_id.to_string()));
+            }
+            return Err(AppError::JobOwnership(format!(
+                "worker '{}' does not own job '{}'",
+                req.worker_id, job_id
+            )));
+        }
+
+        if job.state == JobState::Cancelled && req.state != JobState::Cancelled {
+            return Err(AppError::JobCancelled(job_id.to_string()));
+        }
+
+        if job.state != req.state {
+            validate_job_transition(job.state.clone(), req.state.clone())
+                .map_err(|e| AppError::WorkflowInvalid(e.to_string()))?;
+        } else if matches!(req.state, JobState::Running) {
+            // Allow running->running updates as lease renewals from the executing worker.
+        }
+
+        job.state = req.state.clone();
+        if matches!(job.state, JobState::Running) {
+            job.lease_expires_at = Some(Utc::now() + chrono::TimeDelta::seconds(LEASE_TTL_SECS));
+        }
+        if let Some(dir) = req.transcript_dir {
+            job.transcript_dir = Some(dir);
+        }
+        if let Some(result) = req.result {
+            job.result = Some(result);
+        }
+        if matches!(
+            job.state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            job.lease_expires_at = None;
+        }
+        job.updated_at = Utc::now();
+        self.update_job_row(&job).await.map_err(map_db)?;
+
+        if matches!(
+            job.state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            self.advance_workflow_for_job(&job).await?;
+            if let Some(worker_id) = job.assigned_worker_id.clone()
+                && let Some(mut worker) = self.get_worker(&worker_id).await.map_err(map_db)?
+            {
+                worker.state = WorkerState::Idle;
+                worker.last_heartbeat_at = Utc::now();
+                self.upsert_worker(&worker).await.map_err(map_db)?;
+            }
+        }
+
+        Ok(job)
+    }
+
+    async fn fire_event_internal(
+        &self,
+        work_item_id: Uuid,
+        req: FireEventRequest,
+        source: EventSource,
+    ) -> Result<WorkItem, AppError> {
+        let workflow_event = WorkflowEvent {
+            work_item_id: work_item_id.to_string(),
+            event_type: req.event.clone(),
+            payload: WorkflowEventPayload::None,
+            source: source.clone(),
+            timestamp: Utc::now(),
+        };
+        tracing::info!(workflow_event = ?workflow_event, "workflow event received");
+
+        let mut item = self
+            .get_work_item(work_item_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(work_item_id.to_string()))?;
+        if should_track_github_pr_state_for_event(&req.event)
+            && !matches!(source, EventSource::Webhook)
+        {
+            let current_pr_url = item_github_pr_urls(&item).next().map(ToOwned::to_owned);
+            if let Some(pr_url) = current_pr_url {
+                let pr_number = parse_pr_number_from_url(&pr_url);
+                update_github_pr_state_in_context(
+                    &mut item.context,
+                    &pr_url,
+                    pr_number,
+                    None,
+                    Some(&req.event),
+                    None,
+                    false,
+                    Utc::now(),
+                );
+            }
+        }
+        if item.workflow_id == "__triage__" {
+            match req.event {
+                WorkflowEventKind::Submit => {
+                    return Err(AppError::WorkflowInvalid(
+                        "submit requested while task is still in triage".to_string(),
+                    ));
+                }
+                WorkflowEventKind::HumanApproved => {
+                    let triage_environment_valid =
+                        self.apply_approved_triage_selection(&mut item).await?;
+                    if triage_environment_valid {
+                        let _ = self
+                            .ensure_pending_for_current_state(&mut item)
+                            .await
+                            .map_err(map_db)?;
+                    }
+                }
+                WorkflowEventKind::HumanChangesRequested => {
+                    item.current_step = "triage".to_string();
+                    item.human_gate = false;
+                    item.human_gate_state = Some("triage_rejected".to_string());
+                    item.state = WorkItemState::Pending;
+                    item.triage_status = Some("in_progress".to_string());
+                    if let Some(obj) = item.context.as_object_mut() {
+                        obj.remove("workflow_id");
+                    }
+                    let _ = self
+                        .ensure_pending_for_current_state(&mut item)
+                        .await
+                        .map_err(map_db)?;
+                }
+                WorkflowEventKind::Cancel => {
+                    item.state = WorkItemState::Cancelled;
+                    self.cancel_active_jobs_for_work_item(item.id)
+                        .await
+                        .map_err(map_db)?;
+                }
+                _ => {
+                    return Err(AppError::WorkflowInvalid(format!(
+                        "event '{}' is not supported for triage workflow",
+                        workflow_event_kind_name(&req.event)
+                    )));
+                }
+            }
+        } else if let Some(workflow) = self.workflows.get(&item.workflow_id).cloned() {
+            let step = workflow
+                .steps
+                .iter()
+                .find(|s| s.id == item.current_step)
+                .ok_or_else(|| {
+                    AppError::WorkflowInvalid(format!("missing step '{}'", item.current_step))
+                })?;
+
+            match req.event {
+                WorkflowEventKind::Start | WorkflowEventKind::Submit => {
+                    if item.state == WorkItemState::Pending {
+                        item.state = WorkItemState::Running;
+                    }
+                    self.ensure_pending_job_for_step(&item, &workflow)
+                        .await
+                        .map_err(map_db)?;
+                }
+                WorkflowEventKind::JobSucceeded => {
+                    clear_success_projection_fields(&mut item);
+                    if let Some(next) = &step.on_success {
+                        item.current_step = next.clone();
+                        item.state = WorkItemState::Running;
+                        self.ensure_pending_job_for_step(&item, &workflow)
+                            .await
+                            .map_err(map_db)?;
+                    } else {
+                        item.state = WorkItemState::Succeeded;
+                    }
+                }
+                WorkflowEventKind::JobFailed => {
+                    if let Some(next) = &step.on_failure {
+                        item.current_step = next.clone();
+                        item.state = WorkItemState::Running;
+                        self.ensure_pending_job_for_step(&item, &workflow)
+                            .await
+                            .map_err(map_db)?;
+                    } else {
+                        item.state = WorkItemState::Failed;
+                    }
+                }
+                WorkflowEventKind::HumanApproved => {
+                    clear_success_projection_fields(&mut item);
+                    if let Some(next) = &step.on_success {
+                        item.current_step = next.clone();
+                        item.state = WorkItemState::Running;
+                        self.ensure_pending_job_for_step(&item, &workflow)
+                            .await
+                            .map_err(map_db)?;
+                    } else {
+                        item.state = WorkItemState::Succeeded;
+                    }
+                }
+                WorkflowEventKind::HumanChangesRequested
+                | WorkflowEventKind::HumanUnblocked
+                | WorkflowEventKind::RetryRequested => {
+                    if let Some(next) = &step.on_failure {
+                        item.current_step = next.clone();
+                        item.state = WorkItemState::Running;
+                        self.ensure_pending_job_for_step(&item, &workflow)
+                            .await
+                            .map_err(map_db)?;
+                    } else {
+                        item.state = WorkItemState::Failed;
+                    }
+                }
+                WorkflowEventKind::AllChildrenCompleted => {
+                    clear_success_projection_fields(&mut item);
+                    item.child_work_item_id = None;
+                    if let Some(next) = &step.on_success {
+                        item.current_step = next.clone();
+                        item.state = WorkItemState::Running;
+                        self.ensure_pending_job_for_step(&item, &workflow)
+                            .await
+                            .map_err(map_db)?;
+                    } else {
+                        item.state = WorkItemState::Succeeded;
+                    }
+                }
+                WorkflowEventKind::ChildFailed => {
+                    item.child_work_item_id = None;
+                    if let Some(next) = &step.on_failure {
+                        item.current_step = next.clone();
+                        item.state = WorkItemState::Running;
+                        self.ensure_pending_job_for_step(&item, &workflow)
+                            .await
+                            .map_err(map_db)?;
+                    } else {
+                        item.state = WorkItemState::Failed;
+                    }
+                }
+                WorkflowEventKind::NeedsTriage => {
+                    item.state = WorkItemState::Pending;
+                }
+                WorkflowEventKind::WorkflowChosen => {
+                    if item.state == WorkItemState::Pending {
+                        item.state = WorkItemState::Running;
+                    }
+                }
+                event @ (WorkflowEventKind::TaskCreated
+                | WorkflowEventKind::TaskUpdated
+                | WorkflowEventKind::CommentAdded
+                | WorkflowEventKind::LabelChanged
+                | WorkflowEventKind::PrCreated
+                | WorkflowEventKind::PrApproved
+                | WorkflowEventKind::PrChangesRequested
+                | WorkflowEventKind::OwnerPrApproved
+                | WorkflowEventKind::OwnerChangesRequested
+                | WorkflowEventKind::CoworkerPrApproved
+                | WorkflowEventKind::CoworkerChangesRequested
+                | WorkflowEventKind::PrMerged
+                | WorkflowEventKind::ChecksPassed
+                | WorkflowEventKind::ChecksFailed
+                | WorkflowEventKind::CiFailureTrivial
+                | WorkflowEventKind::CiFailureEscalate
+                | WorkflowEventKind::Timeout) => {
+                    return Err(AppError::WorkflowInvalid(format!(
+                        "event '{}' is not supported for legacy workflow '{}'",
+                        workflow_event_kind_name(&event),
+                        item.workflow_id
+                    )));
+                }
+                WorkflowEventKind::Cancel => {
+                    item.state = WorkItemState::Cancelled;
+                    self.cancel_active_jobs_for_work_item(item.id)
+                        .await
+                        .map_err(map_db)?;
+                    if let Some(child_id) = item.child_work_item_id {
+                        self.cancel_work_item(child_id).await.map_err(map_db)?;
+                    }
+                }
+            }
+        } else if self.workflows.get_reactive(&item.workflow_id).is_some() {
+            self.fire_reactive_event(&mut item, req.event).await?;
+        } else {
+            return Err(AppError::WorkflowNotFound(item.workflow_id.clone()));
+        }
+
+        Box::pin(self.try_auto_merge_for_current_state(&mut item)).await;
+
+        item.updated_at = Utc::now();
+        item.blocked_on = block_reason_for_state_name(&item.current_step);
+        item.projected_state = Some(project_workflow_state(&item));
+        self.update_work_item(&item).await.map_err(map_db)?;
+        self.persist_task_projection(&item, None)
+            .await
+            .map_err(map_config)?;
+        Ok(item)
+    }
+
+    async fn guard_event_request_for_ingress(
+        &self,
+        work_item_id: Uuid,
+        requested_event: WorkflowEventKind,
+        ingress: EventIngress,
+    ) -> Result<(), AppError> {
+        let item = self
+            .get_work_item(work_item_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(work_item_id.to_string()))?;
+        let valid_next_events = match ingress {
+            EventIngress::ExternalPublic => self.valid_next_events_for_work_item(&item),
+            EventIngress::TrustedInternal => self.valid_next_events_for_work_item_internal(&item),
+        };
+        if valid_next_events.contains(&requested_event) {
+            return Ok(());
+        }
+
+        let allowed = valid_next_events
+            .into_iter()
+            .map(|event| format!("\"{}\"", workflow_event_kind_name(&event)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(AppError::WorkflowInvalid(format!(
+            "event '{}' is not currently valid for work item {} via {} ingress; valid_next_events=[{}]",
+            workflow_event_kind_name(&requested_event),
+            work_item_id,
+            ingress.label(),
+            allowed
+        )))
+    }
+
+    pub async fn fire_event(
+        &self,
+        work_item_id: Uuid,
+        req: FireEventRequest,
+    ) -> Result<WorkItem, AppError> {
+        self.ensure_ready().await?;
+        self.guard_event_request_for_ingress(
+            work_item_id,
+            req.event.clone(),
+            EventIngress::ExternalPublic,
+        )
+        .await?;
+        self.fire_event_internal(work_item_id, req, EventSource::Manual)
+            .await
+    }
+
+    pub async fn apply_operator_action(
+        &self,
+        work_item_id: Uuid,
+        action: TaskHumanAction,
+    ) -> Result<WorkItem, AppError> {
+        self.ensure_ready().await?;
+        self.apply_operator_action_ready_with_ingress(
+            work_item_id,
+            action,
+            EventIngress::ExternalPublic,
+            EventSource::Manual,
+        )
+        .await
+    }
+
+    pub async fn fire_event_trusted_internal(
+        &self,
+        work_item_id: Uuid,
+        req: FireEventRequest,
+    ) -> Result<WorkItem, AppError> {
+        self.ensure_ready().await?;
+        self.fire_event_trusted_internal_ready(work_item_id, req)
+            .await
+    }
+
+    pub async fn fire_event_trusted_internal_with_source(
+        &self,
+        work_item_id: Uuid,
+        req: FireEventRequest,
+        source: EventSource,
+    ) -> Result<WorkItem, AppError> {
+        self.ensure_ready().await?;
+        self.fire_event_trusted_internal_ready_with_source(work_item_id, req, source)
+            .await
+    }
+
+    async fn fire_event_trusted_internal_ready(
+        &self,
+        work_item_id: Uuid,
+        req: FireEventRequest,
+    ) -> Result<WorkItem, AppError> {
+        self.fire_event_trusted_internal_ready_with_source(work_item_id, req, EventSource::System)
+            .await
+    }
+
+    async fn fire_event_trusted_internal_ready_with_source(
+        &self,
+        work_item_id: Uuid,
+        req: FireEventRequest,
+        source: EventSource,
+    ) -> Result<WorkItem, AppError> {
+        self.guard_event_request_for_ingress(
+            work_item_id,
+            req.event.clone(),
+            EventIngress::TrustedInternal,
+        )
+        .await?;
+        self.fire_event_internal(work_item_id, req, source).await
+    }
+
+    async fn apply_operator_action_trusted_internal_ready(
+        &self,
+        work_item_id: Uuid,
+        action: TaskHumanAction,
+        source: EventSource,
+    ) -> Result<WorkItem, AppError> {
+        self.apply_operator_action_ready_with_ingress(
+            work_item_id,
+            action,
+            EventIngress::TrustedInternal,
+            source,
+        )
+        .await
+    }
+
+    async fn apply_operator_action_ready_with_ingress(
+        &self,
+        work_item_id: Uuid,
+        action: TaskHumanAction,
+        ingress: EventIngress,
+        source: EventSource,
+    ) -> Result<WorkItem, AppError> {
+        let mut item = self
+            .get_work_item(work_item_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(work_item_id.to_string()))?;
+
+        // Adapter-synthesized "assignment-to-bot" gestures always come in as
+        // Approve, but the natural meaning at a `*_failed` human gate is "I
+        // fixed it, try again" — i.e. Unblock. If the current state declines
+        // HumanApproved but accepts HumanUnblocked, retarget so the gesture
+        // does the obvious next thing instead of being rejected.
+        let action = self.adapt_approve_to_unblock_if_needed(&item, action);
+
+        if matches!(action.kind, HumanActionKind::Retry)
+            && self
+                .try_apply_operator_retry_override(&mut item, action.reason.as_deref())
+                .await?
+        {
+            return Ok(item);
+        }
+
+        if matches!(action.kind, HumanActionKind::Unblock)
+            && self
+                .try_apply_operator_unblock_override(&mut item, action.reason.as_deref())
+                .await?
+        {
+            return Ok(item);
+        }
+
+        let Some(req) = action_to_fire_event(&action) else {
+            return Err(AppError::WorkflowInvalid(
+                "Action is not event-mapped".to_string(),
+            ));
+        };
+
+        match ingress {
+            EventIngress::ExternalPublic => {
+                self.guard_event_request_for_ingress(work_item_id, req.event.clone(), ingress)
+                    .await?;
+                self.fire_event_internal(work_item_id, req, source).await
+            }
+            EventIngress::TrustedInternal => {
+                self.fire_event_trusted_internal_ready_with_source(work_item_id, req, source)
+                    .await
+            }
+        }
+    }
+
+    pub async fn dispatch_actionable(&self) -> Result<usize, AppError> {
+        self.ensure_ready().await?;
+        let items = self.select_work_items().await.map_err(map_db)?;
+        let mut created = 0usize;
+        for item in items {
+            let item_id = item.id;
+            let result: Result<usize, AppError> = async {
+                if !matches!(item.state, WorkItemState::Pending | WorkItemState::Running) {
+                    return Ok(0);
+                }
+                let workflow = match self.workflows.get(&item.workflow_id) {
+                    Some(w) => w.clone(),
+                    None => {
+                        let mut item = item;
+                        let created_for_item = self
+                            .ensure_pending_for_current_state(&mut item)
+                            .await
+                            .map_err(map_db)?;
+                        return Ok(if created_for_item { 1 } else { 0 });
+                    }
+                };
+                if self.has_active_job(item.id).await.map_err(map_db)? {
+                    return Ok(0);
+                }
+                self.ensure_pending_job_for_step(&item, &workflow)
+                    .await
+                    .map_err(map_db)?;
+                Ok(1)
+            }
+            .await;
+
+            match result {
+                Ok(count) => {
+                    created = created.saturating_add(count);
+                }
+                Err(error) => {
+                    tracing::warn!(work_item_id = %item_id, error = ?error, "dispatch actionable failed for work item; continuing");
+                }
+            }
+        }
+        Ok(created)
+    }
+
+    async fn try_apply_operator_retry_override(
+        &self,
+        item: &mut WorkItem,
+        reason: Option<&str>,
+    ) -> Result<bool, AppError> {
+        let reactive_state_kind =
+            self.workflows
+                .get_reactive(&item.workflow_id)
+                .and_then(|workflow| {
+                    workflow
+                        .states
+                        .iter()
+                        .find(|state| state.id == item.current_step)
+                        .map(protocol::ReactiveWorkflowState::kind)
+                });
+
+        let current_is_executable = matches!(
+            reactive_state_kind,
+            Some(
+                protocol::ReactiveStateKind::Agent
+                    | protocol::ReactiveStateKind::Command
+                    | protocol::ReactiveStateKind::Managed
+            )
+        );
+        let current_is_retry_eligible =
+            item.state == WorkItemState::Failed || current_is_executable;
+        if !current_is_retry_eligible {
+            return Ok(false);
+        }
+
+        let jobs = self
+            .select_jobs_for_work_item(item.id)
+            .await
+            .map_err(map_db)?;
+        let failed_for_current = jobs
+            .iter()
+            .rev()
+            .find(|job| job.step_id == item.current_step && job.state == JobState::Failed)
+            .cloned();
+        let failed_any = jobs
+            .iter()
+            .rev()
+            .find(|job| job.state == JobState::Failed)
+            .cloned();
+        let previous_failed = failed_for_current.or(failed_any);
+
+        let Some(previous_failed) = previous_failed else {
+            return Ok(false);
+        };
+        if self
+            .has_pending_job_for_step(item.id, &previous_failed.step_id)
+            .await
+            .map_err(map_db)?
+        {
+            return Err(AppError::WorkflowInvalid(format!(
+                "operator retry override unavailable: step '{}' already has an active job",
+                previous_failed.step_id
+            )));
+        }
+
+        self.retry_job(&previous_failed).await.map_err(map_db)?;
+        item.current_step = previous_failed.step_id.clone();
+        item.state = WorkItemState::Running;
+        item.human_gate = false;
+        item.human_gate_state = None;
+        if !item.context.is_object() {
+            item.context = serde_json::json!({});
+        }
+        if let Some(obj) = item.context.as_object_mut() {
+            obj.insert(
+                "operator_override".to_string(),
+                serde_json::json!({
+                    "action": "retry",
+                    "reason": reason,
+                    "step_id": previous_failed.step_id,
+                }),
+            );
+        }
+
+        item.updated_at = Utc::now();
+        item.blocked_on = block_reason_for_state_name(&item.current_step);
+        item.projected_state = Some(project_workflow_state(item));
+        self.update_work_item(item).await.map_err(map_db)?;
+        self.persist_task_projection(item, None)
+            .await
+            .map_err(map_config)?;
+        Ok(true)
+    }
+
+    /// "I fixed it, try again" — adapter assignments always arrive as
+    /// Approve, so when the current state can only be advanced via Unblock
+    /// (e.g. any `*_failed` step) we transparently retarget the action.
+    /// States that genuinely accept HumanApproved (review gates, triage
+    /// approval) keep the Approve semantics.
+    fn adapt_approve_to_unblock_if_needed(
+        &self,
+        item: &WorkItem,
+        action: TaskHumanAction,
+    ) -> TaskHumanAction {
+        if !matches!(action.kind, HumanActionKind::Approve) {
+            return action;
+        }
+        let valid = self.valid_next_events_for_work_item_internal(item);
+        let approve_ok = valid.contains(&WorkflowEventKind::HumanApproved);
+        let unblock_ok = valid.contains(&WorkflowEventKind::HumanUnblocked);
+        if !approve_ok && unblock_ok {
+            return TaskHumanAction {
+                kind: HumanActionKind::Unblock,
+                ..action
+            };
+        }
+        action
+    }
+
+    async fn try_apply_operator_unblock_override(
+        &self,
+        item: &mut WorkItem,
+        reason: Option<&str>,
+    ) -> Result<bool, AppError> {
+        let Some(reactive) = self.workflows.get_reactive(&item.workflow_id) else {
+            return Ok(false);
+        };
+        let Some(state) = reactive
+            .states
+            .iter()
+            .find(|state| state.id == item.current_step)
+        else {
+            return Ok(false);
+        };
+        if !matches!(state.kind(), protocol::ReactiveStateKind::Human) {
+            return Ok(false);
+        }
+
+        let transition = state
+            .on
+            .iter()
+            .find(|t| t.event.kind() == WorkflowEventKind::JobSucceeded)
+            .or_else(|| {
+                state
+                    .on
+                    .iter()
+                    .find(|t| t.event.kind() == WorkflowEventKind::Start)
+            })
+            .or_else(|| {
+                state
+                    .on
+                    .iter()
+                    .find(|t| t.event.kind() != WorkflowEventKind::Cancel)
+            })
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(format!(
+                    "operator unblock override unavailable: reactive state '{}' has no non-cancel transition",
+                    state.id
+                ))
+            })?;
+
+        item.current_step = transition.target.clone();
+        item.human_gate_state = Some(task_human_gate_state_name(&TaskHumanGateState::Unblocked));
+        item.context = mark_human_gate_state(item.context.clone(), TaskHumanGateState::Unblocked);
+        if !item.context.is_object() {
+            item.context = serde_json::json!({});
+        }
+        if let Some(obj) = item.context.as_object_mut() {
+            obj.insert(
+                "operator_override".to_string(),
+                serde_json::json!({
+                    "action": "unblock",
+                    "reason": reason,
+                    "from_state": state.id,
+                    "target_state": transition.target,
+                }),
+            );
+        }
+
+        self.ensure_pending_for_current_state(item)
+            .await
+            .map_err(map_db)?;
+        item.updated_at = Utc::now();
+        item.blocked_on = block_reason_for_state_name(&item.current_step);
+        item.projected_state = Some(project_workflow_state(item));
+        self.update_work_item(item).await.map_err(map_db)?;
+        self.persist_task_projection(item, None)
+            .await
+            .map_err(map_config)?;
+        Ok(true)
+    }
+
+    pub async fn maintenance_tick(&self) -> Result<MaintenanceStats, AppError> {
+        self.ensure_ready().await?;
+        self.sync_tasks_from_adapter().await?;
+        let requeued = self
+            .reconcile_stale_workers(Duration::from_secs(STALE_WORKER_SECS))
+            .await?;
+        let lease_requeued = self.requeue_expired_leases().await.map_err(map_db)?;
+
+        let mut github_fired_events = 0usize;
+        if let Some(poller) = &self.github_poller {
+            let should_poll_now = {
+                let mut last = self.last_github_poll_at.lock().await;
+                let now = Instant::now();
+                if let Some(previous) = *last {
+                    if now.duration_since(previous) < self.github_poll_interval {
+                        false
+                    } else {
+                        *last = Some(now);
+                        true
+                    }
+                } else {
+                    *last = Some(now);
+                    true
+                }
+            };
+
+            if should_poll_now {
+                let active_items = self
+                    .select_work_items()
+                    .await
+                    .map_err(map_db)?
+                    .into_iter()
+                    .filter(|item| {
+                        matches!(item.state, WorkItemState::Pending | WorkItemState::Running)
+                            && item
+                                .context
+                                .get("github_pr")
+                                .and_then(serde_json::Value::as_object)
+                                .is_some()
+                    })
+                    .collect::<Vec<_>>();
+
+                tracing::debug!(
+                    eligible_items = active_items.len(),
+                    "github poller: polling {} eligible work items",
+                    active_items.len()
+                );
+
+                let events = poller
+                    .poll_work_items(&active_items)
+                    .await
+                    .map_err(map_db)?;
+
+                if !events.is_empty() {
+                    tracing::info!(
+                        event_count = events.len(),
+                        "github poller: detected {} events",
+                        events.len()
+                    );
+                }
+                for poller_event in events {
+                    let work_item_id = poller_event.work_item_id;
+                    if let Some(patch) = poller_event.context_patch {
+                        // Merge before firing so the new state's job (if
+                        // any spawns immediately, e.g. triage_ci_failure
+                        // on ChecksFailed) sees the context.
+                        if let Err(error) = self
+                            .merge_work_item_context_patch(work_item_id, patch)
+                            .await
+                        {
+                            tracing::warn!(
+                                work_item_id = %work_item_id,
+                                "failed to merge poller context patch: {error}"
+                            );
+                        }
+                    }
+                    let req = FireEventRequest {
+                        event: poller_event.event,
+                        job_id: None,
+                        reason: Some("GitHub polling".to_string()),
+                    };
+                    match self.fire_event_trusted_internal(work_item_id, req).await {
+                        Ok(_) => {
+                            github_fired_events = github_fired_events.saturating_add(1);
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                work_item_id = %work_item_id,
+                                "github polling event skipped: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fire `Timeout` for human states that have been parked longer
+        // than their `timeout_secs`. Reference time is the most recent
+        // meaningful state change, taken as the max of:
+        //   - `context.state_entered_at` (set on every transition)
+        //   - the poller's per-PR `last_change_at` (only set for items
+        //     with a `github_pr` context, and bumped on head_sha /
+        //     check_status / merge / close changes)
+        // so a fresh push or genuine CI flip resets the timer.
+        let timeout_fired = self.evaluate_state_timeouts().await?;
+        github_fired_events = github_fired_events.saturating_add(timeout_fired);
+
+        let created_jobs = self.dispatch_actionable().await?;
+        Ok(MaintenanceStats {
+            requeued_jobs: requeued,
+            created_jobs,
+            lease_requeued_jobs: lease_requeued,
+            github_fired_events,
+        })
+    }
+
+    /// Walk all active work items, fire `Timeout` for any human state
+    /// whose `timeout_secs` window has elapsed since the last meaningful
+    /// state change.
+    ///
+    /// Workflows without a `timeout` transition on the affected state
+    /// will reject the event, which the orchestrator silently absorbs —
+    /// firing here is best-effort and self-rate-limited because the
+    /// state itself moves once the event lands.
+    async fn evaluate_state_timeouts(&self) -> Result<usize, AppError> {
+        let items = self.select_work_items().await.map_err(map_db)?;
+        let mut fired = 0usize;
+        let now = Utc::now();
+        for item in items {
+            if !matches!(item.state, WorkItemState::Pending | WorkItemState::Running) {
+                continue;
+            }
+            let Some(reactive) = self.workflows.get_reactive(&item.workflow_id) else {
+                continue;
+            };
+            let Some(state) = reactive.states.iter().find(|s| s.id == item.current_step) else {
+                continue;
+            };
+            let timeout_secs = match &state.config {
+                protocol::ReactiveStateConfig::Human(human) => human.timeout_secs,
+                _ => None,
+            };
+            let Some(timeout_secs) = timeout_secs else {
+                continue;
+            };
+            // Only fire if the workflow actually has a `timeout`
+            // transition on this state, otherwise we'd rev the event
+            // wheel pointlessly.
+            let has_timeout_transition = state
+                .on
+                .iter()
+                .any(|t| t.event.kind() == WorkflowEventKind::Timeout);
+            if !has_timeout_transition {
+                continue;
+            }
+
+            let entered_at = state_entered_at_from_context(&item.context);
+            let poller_last_change = self
+                .github_poller
+                .as_ref()
+                .and_then(|poller| poller.known_state_for_item(&item))
+                .and_then(|state| state.last_change_at);
+            let reference = match (entered_at, poller_last_change) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let Some(reference) = reference else {
+                // No timestamp to compare against (e.g. work items
+                // created before this codepath landed). Skip rather
+                // than firing the wrong event.
+                continue;
+            };
+            let elapsed = match (now - reference).to_std() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if elapsed.as_secs() < timeout_secs {
+                continue;
+            }
+
+            tracing::info!(
+                work_item_id = %item.id,
+                state = %state.id,
+                elapsed_secs = elapsed.as_secs(),
+                timeout_secs,
+                "state timeout reached; firing WorkflowEventKind::Timeout"
+            );
+            let req = FireEventRequest {
+                event: WorkflowEventKind::Timeout,
+                job_id: None,
+                reason: Some(format!(
+                    "state '{}' parked for {} seconds (limit {}s)",
+                    state.id,
+                    elapsed.as_secs(),
+                    timeout_secs
+                )),
+            };
+            match self.fire_event_trusted_internal(item.id, req).await {
+                Ok(_) => fired = fired.saturating_add(1),
+                Err(error) => {
+                    tracing::debug!(
+                        work_item_id = %item.id,
+                        "timeout event suppressed: {error}"
+                    );
+                }
+            }
+        }
+        Ok(fired)
+    }
+
+    pub fn list_workflows(&self) -> Vec<WorkflowDefinition> {
+        self.workflows.list()
+    }
+
+    pub fn list_workflow_documents(&self) -> Vec<WorkflowDocument> {
+        let mut docs = self
+            .workflows
+            .list()
+            .into_iter()
+            .map(|workflow| WorkflowDocument::LegacyV1 { workflow })
+            .collect::<Vec<_>>();
+        docs.extend(
+            self.workflows
+                .list_reactive()
+                .into_iter()
+                .map(|workflow| WorkflowDocument::ReactiveV2 { workflow }),
+        );
+        docs.sort_by(|a, b| workflow_document_id(a).cmp(workflow_document_id(b)));
+        docs
+    }
+
+    pub fn workflow_validation_report(&self) -> protocol::WorkflowValidationReport {
+        self.workflows.validation_report()
+    }
+
+    pub async fn choose_workflow(
+        &self,
+        work_item_id: Uuid,
+        workflow_id: String,
+    ) -> Result<WorkItem, AppError> {
+        self.ensure_ready().await?;
+        let mut item = self
+            .get_work_item(work_item_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(work_item_id.to_string()))?;
+        if item.workflow_id != "__triage__" {
+            return Err(AppError::WorkflowInvalid(
+                "choose_workflow is only valid for triage work items".to_string(),
+            ));
+        }
+        if work_item_requires_manual_triage(&item) {
+            return Err(AppError::WorkflowInvalid(
+                "cannot choose workflow while needs-triage is active".to_string(),
+            ));
+        }
+
+        let triage_environment_valid = self
+            .apply_triage_workflow_selection(&mut item, &workflow_id)
+            .await?;
+        item.updated_at = Utc::now();
+        item.projected_state = Some(project_workflow_state(&item));
+
+        self.update_work_item(&item).await.map_err(map_db)?;
+        if triage_environment_valid {
+            let _ = self
+                .ensure_pending_for_current_state(&mut item)
+                .await
+                .map_err(map_db)?;
+        }
+        self.get_work_item(item.id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(item.id.to_string()))
+    }
+
+    async fn apply_triage_workflow_selection(
+        &self,
+        item: &mut WorkItem,
+        workflow_id: &str,
+    ) -> Result<bool, AppError> {
+        let initial_state = if let Some(workflow) = self.workflows.get(workflow_id) {
+            workflow.entry_step.clone()
+        } else if let Some(workflow) = self.workflows.get_reactive(workflow_id) {
+            workflow.initial_state.clone()
+        } else {
+            return Err(AppError::WorkflowNotFound(workflow_id.to_string()));
+        };
+
+        item.workflow_id = workflow_id.to_string();
+        item.current_step = initial_state;
+        item.state = WorkItemState::Pending;
+        item.human_gate = false;
+        item.triage_status = Some("selected".to_string());
+        item.human_gate_state = Some("workflow_selected".to_string());
+        item.blocked_on = block_reason_for_state_name(&item.current_step);
+        item.context =
+            mark_human_gate_state(item.context.clone(), TaskHumanGateState::WorkflowSelected);
+        let triage_environment_error = self
+            .validate_triage_environment_selection_for_work_item_context(&mut item.context)
+            .err();
+        if let Some(reason) = triage_environment_error.as_ref() {
+            self.reject_triage_result_with_reason(item, reason.clone());
+        }
+        Ok(triage_environment_error.is_none())
+    }
+
+    async fn apply_approved_triage_selection(&self, item: &mut WorkItem) -> Result<bool, AppError> {
+        let workflow_id = item
+            .context
+            .get("workflow_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(
+                    "no workflow_id in context after triage approval".to_string(),
+                )
+            })?
+            .to_string();
+
+        // The selected workflow is entered at its declared initial_state. Triage
+        // is fully owned by `__triage__` (run + human approval gate), so reactive
+        // workflows reachable via __triage__ should NOT have triage states of their
+        // own — they declare their first work step (e.g. `implement`) as their
+        // initial_state. See reactive-agents-north-star.md § "Triage / Workflow
+        // Selection".
+        self.apply_triage_workflow_selection(item, &workflow_id)
+            .await
+    }
+
+    async fn ensure_ready(&self) -> Result<(), AppError> {
+        self.init().await.map_err(map_db)
+    }
+
+    async fn sync_tasks_from_adapter(&self) -> Result<(), AppError> {
+        tracing::trace!(
+            adapter = self.task_adapter.adapter_name(),
+            "syncing external tasks"
+        );
+        let adapter = Arc::clone(&self.task_adapter);
+        let tasks = tokio::task::spawn_blocking(move || adapter.pull_tasks())
+            .await
+            .map_err(|e| AppError::Config(format!("adapter task pull join error: {e}")))?
+            .map_err(map_config)?;
+        let existing_items = self
+            .select_work_items()
+            .await
+            .map_err(map_db)?
+            .into_iter()
+            .map(|i| (i.id, i))
+            .collect::<HashMap<_, _>>();
+        let mut workflow_ids = self
+            .workflows
+            .list()
+            .into_iter()
+            .map(|w| w.id)
+            .collect::<Vec<_>>();
+        workflow_ids.extend(self.workflows.list_reactive().into_iter().map(|w| w.id));
+
+        let intents = infer_intents(tasks, &existing_items, &workflow_ids);
+        for intent in intents {
+            let result: Result<(), AppError> = match intent {
+                AdapterIntent::Create { task } => {
+                    let workflow_id = match pick_workflow_for_task(&task, &workflow_ids) {
+                        WorkflowSelectionDecision::Selected(workflow_id) => workflow_id,
+                        WorkflowSelectionDecision::NeedsWorkflowSelection {
+                            reason,
+                            manual_triage_required,
+                        } => {
+                            let req = CreateWorkItemRequest {
+                                workflow_id: "__triage__".to_string(),
+                                session_id: None,
+                                context: task.context.clone(),
+                                repo: task.repo.clone(),
+                            };
+                            let mut item = work_item_from_create(
+                                &req,
+                                task.id,
+                                "__triage__".to_string(),
+                                "triage".to_string(),
+                                self.task_adapter.adapter_name(),
+                            );
+                            item.context = merge_task_metadata(&item.context, &task);
+                            item.context = with_operator_login_context(
+                                item.context,
+                                self.operator_login.as_deref(),
+                            );
+                            item.context = mark_human_gate_state(
+                                item.context,
+                                TaskHumanGateState::NeedsWorkflowSelection,
+                            );
+                            item = apply_task_fields(item, &task, self.task_adapter.adapter_name());
+                            if let Some(obj) = item.context.as_object_mut() {
+                                obj.insert(
+                                    "triage_reason".to_string(),
+                                    serde_json::Value::String(reason),
+                                );
+                                if manual_triage_required {
+                                    obj.insert(
+                                        "task_human_gate_state".to_string(),
+                                        serde_json::to_value(
+                                            TaskHumanGateState::AwaitingHumanAction,
+                                        )
+                                        .unwrap_or(serde_json::Value::Null),
+                                    );
+                                }
+                            }
+                            if manual_triage_required {
+                                item.human_gate_state = Some("awaiting_human_action".to_string());
+                            }
+                            self.insert_work_item(&item).await.map_err(map_db)?;
+                            self.persist_task_projection(&item, Some(&task))
+                                .await
+                                .map_err(map_config)?;
+                            continue;
+                        }
+                    };
+                    let initial_state = if let Some(workflow) = self.workflows.get(&workflow_id) {
+                        workflow.entry_step.clone()
+                    } else if let Some(reactive) = self.workflows.get_reactive(&workflow_id) {
+                        reactive.initial_state.clone()
+                    } else {
+                        continue;
+                    };
+
+                    let req = CreateWorkItemRequest {
+                        workflow_id: workflow_id.clone(),
+                        session_id: None,
+                        context: task.context.clone(),
+                        repo: task.repo.clone(),
+                    };
+                    let checkpoint = {
+                        let adapter = Arc::clone(&self.task_adapter);
+                        let task_id = task.id.to_string();
+                        match tokio::task::spawn_blocking(move || adapter.read_checkpoint(&task_id))
+                            .await
+                        {
+                            Ok(Ok(checkpoint)) => checkpoint,
+                            Ok(Err(error)) => {
+                                tracing::warn!(
+                                    task_id = %task.id,
+                                    error = ?error,
+                                    "failed to read checkpoint during create recovery; using initial state"
+                                );
+                                None
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    task_id = %task.id,
+                                    error = ?error,
+                                    "checkpoint recovery join error; using initial state"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    let triage_result =
+                        if checkpoint.as_ref().is_some_and(checkpoint_is_post_triage) {
+                            let adapter = Arc::clone(&self.task_adapter);
+                            let task_id = task.id.to_string();
+                            match tokio::task::spawn_blocking(move || {
+                                adapter.read_triage_result(&task_id)
+                            })
+                            .await
+                            {
+                                Ok(Ok(result)) => result,
+                                Ok(Err(error)) => {
+                                    tracing::warn!(
+                                        task_id = %task.id,
+                                        error = ?error,
+                                        "failed to read triage result during create recovery"
+                                    );
+                                    None
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        task_id = %task.id,
+                                        error = ?error,
+                                        "triage result recovery join error"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                    let mut item = work_item_from_create(
+                        &req,
+                        task.id,
+                        workflow_id,
+                        initial_state,
+                        self.task_adapter.adapter_name(),
+                    );
+                    item.context = merge_task_metadata(&item.context, &task);
+                    item.context =
+                        with_operator_login_context(item.context, self.operator_login.as_deref());
+                    item = apply_task_fields(item, &task, self.task_adapter.adapter_name());
+                    if let Some(triage_result) = triage_result.as_ref() {
+                        apply_triage_result_recovery_context(&mut item.context, triage_result);
+                    }
+                    let triage_environment_error = self
+                        .validate_triage_environment_selection_for_work_item_context(
+                            &mut item.context,
+                        )
+                        .err();
+                    if let Some(reason) = triage_environment_error.as_ref() {
+                        self.reject_triage_result_with_reason(&mut item, reason.clone());
+                    }
+                    if triage_environment_error.is_none()
+                        && let Some(checkpoint) = checkpoint.as_ref()
+                    {
+                        if checkpoint_matches_known_workflow(self, checkpoint) {
+                            item.workflow_id = checkpoint.workflow_id.clone();
+                            item.current_step = checkpoint.current_step.clone();
+                            item.human_gate = checkpoint.human_gate;
+                            if let Some(state) = checkpoint.human_gate_state.clone() {
+                                item.human_gate_state = Some(state);
+                            } else if item.human_gate && item.human_gate_state.is_none() {
+                                item.human_gate_state = Some("awaiting_human_action".to_string());
+                            }
+                            if let Some(status) = checkpoint.triage_status.clone() {
+                                item.triage_status = Some(status);
+                            }
+                            if let Some(repo) = checkpoint.repo.as_deref() {
+                                if let Some(parsed_repo) = repo_source_from_checkpoint_repo(repo) {
+                                    item.repo = Some(parsed_repo);
+                                } else {
+                                    tracing::warn!(
+                                        task_id = %task.id,
+                                        repo = %repo,
+                                        "checkpoint repo value could not be parsed; keeping existing repo"
+                                    );
+                                }
+                            }
+                            item.state = match checkpoint.phase.as_str() {
+                                "done" => WorkItemState::Succeeded,
+                                "failed" => WorkItemState::Failed,
+                                "cancelled" => WorkItemState::Cancelled,
+                                _ if checkpoint.human_gate => WorkItemState::Running,
+                                _ => WorkItemState::Pending,
+                            };
+                            item.blocked_on = block_reason_for_state_name(&item.current_step);
+                            item.projected_state = Some(project_workflow_state(&item));
+                            tracing::info!(
+                                work_item_id = %item.id,
+                                step = %item.current_step,
+                                "Recovered work item {} from checkpoint at step '{}'",
+                                item.id,
+                                item.current_step
+                            );
+                        } else {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                workflow_id = %checkpoint.workflow_id,
+                                step = %checkpoint.current_step,
+                                "checkpoint references unknown workflow or step; using initial state"
+                            );
+                        }
+                    }
+                    self.ensure_repo_catalog_hint_context(&mut item);
+                    self.insert_work_item(&item).await.map_err(map_db)?;
+                    if triage_environment_error.is_none() {
+                        let _ = self
+                            .ensure_pending_for_current_state(&mut item)
+                            .await
+                            .map_err(map_db)?;
+                    }
+                    self.persist_task_projection(&item, Some(&task))
+                        .await
+                        .map_err(map_config)?;
+                    Ok(())
+                }
+                AdapterIntent::UpdateProjection { work_item_id, task } => {
+                    let Some(mut item) = self.get_work_item(work_item_id).await.map_err(map_db)?
+                    else {
+                        continue;
+                    };
+                    item.context = merge_task_metadata(&item.context, &task);
+                    item.context =
+                        with_operator_login_context(item.context, self.operator_login.as_deref());
+                    item = apply_task_fields(item, &task, self.task_adapter.adapter_name());
+
+                    if item.workflow_id == "__triage__" {
+                        match pick_workflow_for_task(&task, &workflow_ids) {
+                            WorkflowSelectionDecision::Selected(workflow_id)
+                                if !work_item_requires_manual_triage(&item) =>
+                            {
+                                let initial_state =
+                                    if let Some(workflow) = self.workflows.get(&workflow_id) {
+                                        workflow.entry_step.clone()
+                                    } else if let Some(reactive) =
+                                        self.workflows.get_reactive(&workflow_id)
+                                    {
+                                        reactive.initial_state.clone()
+                                    } else {
+                                        continue;
+                                    };
+                                item.workflow_id = workflow_id;
+                                item.current_step = initial_state;
+                                item.state = WorkItemState::Pending;
+                                item.human_gate = false;
+                                item.triage_status = Some("selected".to_string());
+                                item.human_gate_state = Some("workflow_selected".to_string());
+                                item.context = mark_human_gate_state(
+                                    item.context,
+                                    TaskHumanGateState::WorkflowSelected,
+                                );
+                                let triage_environment_error = self
+                                    .validate_triage_environment_selection_for_work_item_context(
+                                        &mut item.context,
+                                    )
+                                    .err();
+                                if let Some(reason) = triage_environment_error.as_ref() {
+                                    self.reject_triage_result_with_reason(
+                                        &mut item,
+                                        reason.clone(),
+                                    );
+                                }
+                                if triage_environment_error.is_none() {
+                                    let _ = self
+                                        .ensure_pending_for_current_state(&mut item)
+                                        .await
+                                        .map_err(map_db)?;
+                                }
+                            }
+                            WorkflowSelectionDecision::NeedsWorkflowSelection {
+                                reason,
+                                manual_triage_required,
+                            } => {
+                                if let Some(obj) = item.context.as_object_mut() {
+                                    obj.insert(
+                                        "triage_reason".to_string(),
+                                        serde_json::Value::String(reason),
+                                    );
+                                    if manual_triage_required {
+                                        obj.insert(
+                                            "task_human_gate_state".to_string(),
+                                            serde_json::to_value(
+                                                TaskHumanGateState::AwaitingHumanAction,
+                                            )
+                                            .unwrap_or(serde_json::Value::Null),
+                                        );
+                                        item.human_gate_state =
+                                            Some("awaiting_human_action".to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    item.updated_at = task.updated_at;
+                    item.blocked_on = block_reason_for_state_name(&item.current_step);
+                    self.update_work_item(&item).await.map_err(map_db)?;
+                    self.persist_task_projection(&item, Some(&task))
+                        .await
+                        .map_err(map_config)?;
+                    Ok(())
+                }
+                AdapterIntent::ApplyAction {
+                    work_item_id,
+                    action,
+                    action_revision,
+                } => {
+                    let Some(mut item) = self.get_work_item(work_item_id).await.map_err(map_db)?
+                    else {
+                        continue;
+                    };
+                    let last_applied = item
+                        .context
+                        .get("task_adapter")
+                        .and_then(|v| v.get("last_action_revision"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    if action_revision <= last_applied {
+                        continue;
+                    }
+
+                    if matches!(action.kind, HumanActionKind::ChooseWorkflow) {
+                        if let Some(workflow_id) = action.workflow_id.clone() {
+                            if item.workflow_id == "__triage__" {
+                                if work_item_requires_manual_triage(&item) {
+                                    tracing::warn!(
+                                        work_item_id = %item.id,
+                                        workflow_id = %workflow_id,
+                                        "choose_workflow action ignored while needs-triage is active"
+                                    );
+                                    continue;
+                                }
+                                let initial_state = if let Some(w) =
+                                    self.workflows.get(&workflow_id)
+                                {
+                                    w.entry_step.clone()
+                                } else if let Some(w) = self.workflows.get_reactive(&workflow_id) {
+                                    w.initial_state.clone()
+                                } else {
+                                    continue;
+                                };
+                                item.workflow_id = workflow_id.clone();
+                                item.current_step = initial_state;
+                                item.state = WorkItemState::Pending;
+                                item.human_gate = false;
+                                item.triage_status = Some("selected".to_string());
+                                item.human_gate_state = Some("workflow_selected".to_string());
+                                item.context = mark_human_gate_state(
+                                    item.context,
+                                    TaskHumanGateState::WorkflowSelected,
+                                );
+                                let triage_environment_error = self
+                                    .validate_triage_environment_selection_for_work_item_context(
+                                        &mut item.context,
+                                    )
+                                    .err();
+                                if let Some(reason) = triage_environment_error.as_ref() {
+                                    self.reject_triage_result_with_reason(
+                                        &mut item,
+                                        reason.clone(),
+                                    );
+                                }
+                                if triage_environment_error.is_none() {
+                                    let _ = self
+                                        .ensure_pending_for_current_state(&mut item)
+                                        .await
+                                        .map_err(map_db)?;
+                                }
+                            } else if item.context.as_object_mut().is_some() {
+                                tracing::debug!(
+                                    work_item_id = %item.id,
+                                    workflow_id = %workflow_id,
+                                    "ignoring choose_workflow for non-triage work item"
+                                );
+                            }
+                        }
+                    } else if action_to_fire_event(&action).is_some() {
+                        if matches!(action.kind, HumanActionKind::Submit)
+                            && item.workflow_id == "__triage__"
+                            && work_item_requires_manual_triage(&item)
+                        {
+                            tracing::warn!(
+                                work_item_id = %item.id,
+                                "submit action ignored for triage item without selected workflow"
+                            );
+                            continue;
+                        }
+                        if matches!(
+                            action.kind,
+                            HumanActionKind::Approve
+                                | HumanActionKind::RequestChanges
+                                | HumanActionKind::Unblock
+                                | HumanActionKind::Retry
+                        ) {
+                            let state = match action.kind {
+                                HumanActionKind::Approve => TaskHumanGateState::Approved,
+                                HumanActionKind::RequestChanges => {
+                                    TaskHumanGateState::ChangesRequested
+                                }
+                                HumanActionKind::Unblock => TaskHumanGateState::Unblocked,
+                                HumanActionKind::Retry => TaskHumanGateState::RetryRequested,
+                                _ => TaskHumanGateState::WorkflowSelected,
+                            };
+                            item.human_gate_state = Some(task_human_gate_state_name(&state));
+                            item.context = mark_human_gate_state(item.context, state);
+                        }
+                        // Adapter actions are interpreted internal intents from the trusted
+                        // task projection path. Route through trusted ingress validation so
+                        // system/internal events remain available without using public ingress.
+                        item = self
+                            .apply_operator_action_trusted_internal_ready(
+                                work_item_id,
+                                action.clone(),
+                                EventSource::System,
+                            )
+                            .await?;
+                    }
+
+                    item.context = merge_task_action_revision(item.context, action_revision);
+                    item.updated_at = Utc::now();
+                    item.blocked_on = block_reason_for_state_name(&item.current_step);
+                    self.update_work_item(&item).await.map_err(map_db)?;
+                    let adapter = Arc::clone(&self.task_adapter);
+                    let item_id = item.id;
+                    let existing = tokio::task::spawn_blocking(move || adapter.get_task(item_id))
+                        .await
+                        .map_err(|e| {
+                            AppError::Config(format!("adapter task lookup join error: {e}"))
+                        })?
+                        .map_err(map_config)?;
+                    self.persist_task_projection(&item, existing.as_ref())
+                        .await
+                        .map_err(map_config)?;
+                    Ok(())
+                }
+                AdapterIntent::CancelMissingExternalTask {
+                    work_item_id,
+                    task_id,
+                } => {
+                    let Some(item) = self.get_work_item(work_item_id).await.map_err(map_db)? else {
+                        continue;
+                    };
+                    self.cancel_work_item_due_to_deleted_external_task(&item, &task_id)
+                        .await
+                        .map_err(map_config)?;
+                    Ok(())
+                }
+            };
+
+            if let Err(error) = result {
+                tracing::warn!(error = ?error, "task sync intent failed; continuing");
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_task_projection(
+        &self,
+        item: &WorkItem,
+        existing: Option<&TaskToolRecord>,
+    ) -> anyhow::Result<()> {
+        let valid_next_events = self.valid_next_events_for_work_item(item);
+        let task = task_from_work_item_with_valid_next_events(item, existing, &valid_next_events);
+        let adapter = Arc::clone(&self.task_adapter);
+        let status_comment_id = item.status_comment_id;
+        let persist_result = match tokio::task::spawn_blocking(move || {
+            adapter.persist_projection(&TaskProjection { task }, status_comment_id)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(
+                "adapter persist projection join error: {error}"
+            )),
+        };
+        let maybe_status_comment_id = match persist_result {
+            Ok(comment_id) => comment_id,
+            Err(error) => {
+                if let Some(task_id) = external_task_not_found_id(&error) {
+                    self.cancel_work_item_due_to_deleted_external_task(item, &task_id)
+                        .await?;
+                    return Ok(());
+                }
+                tracing::warn!(work_item_id = %item.id, error = ?error, "persist_projection failed");
+                return Err(error);
+            }
+        };
+        if let Some(status_comment_id) = maybe_status_comment_id
+            && item.status_comment_id != Some(status_comment_id)
+        {
+            self.set_work_item_status_comment_id(item.id, status_comment_id)
+                .await?;
+        }
+        if let Err(error) = self.write_back_state(item).await {
+            if let Some(task_id) = external_task_not_found_id(&error) {
+                self.cancel_work_item_due_to_deleted_external_task(item, &task_id)
+                    .await?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn cancel_work_item_due_to_deleted_external_task(
+        &self,
+        item: &WorkItem,
+        task_id: &str,
+    ) -> anyhow::Result<()> {
+        if item.state == WorkItemState::Cancelled {
+            return Ok(());
+        }
+
+        let mut updated = item.clone();
+        updated.state = WorkItemState::Cancelled;
+        updated.human_gate = false;
+        updated.human_gate_state = None;
+        updated.write_back_failures = 0;
+        updated.write_back_retry_after = None;
+        updated.updated_at = Utc::now();
+        updated.blocked_on = block_reason_for_state_name(&updated.current_step);
+        updated.projected_state = Some(project_workflow_state(&updated));
+
+        tracing::warn!(
+            "External task {task_id} was deleted, cancelling work item {}",
+            updated.id
+        );
+
+        self.update_work_item(&updated).await?;
+        let _ = self.cancel_active_jobs_for_work_item(updated.id).await?;
+        Ok(())
+    }
+
+    async fn write_back_state(&self, item: &WorkItem) -> anyhow::Result<()> {
+        if self.should_skip_write_back(item) {
+            return Ok(());
+        }
+
+        let Some(task_id) = item.external_task_id.clone() else {
+            return Ok(());
+        };
+        let now = Utc::now();
+
+        let checkpoint = TaskCheckpoint {
+            current_step: item.current_step.clone(),
+            phase: derive_phase(item),
+            workflow_id: item.workflow_id.clone(),
+            repo: item.repo.as_ref().map(|repo| repo.repo_url.clone()),
+            pr_url: item
+                .context
+                .get("github_pr")
+                .and_then(|pr| pr.get("html_url"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            pr_status: item
+                .context
+                .get("github_pr")
+                .and_then(|pr| pr.get("status"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            human_gate: item.human_gate,
+            failure_info: item.last_failure_reason.clone(),
+            updated_at: Utc::now(),
+            human_gate_state: item.human_gate_state.clone(),
+            triage_status: item.triage_status.clone(),
+        };
+
+        let labels = TaskLabels {
+            workflow: Some(item.workflow_id.clone()),
+            step: Some(item.current_step.clone()),
+            phase: Some(checkpoint.phase.clone()),
+            failed: item.state == WorkItemState::Failed || item.last_failure_reason.is_some(),
+        };
+
+        let assignee = if item.human_gate {
+            item.context
+                .get("owner_login")
+                .and_then(serde_json::Value::as_str)
+                .map(|login| TaskAssignee::Human(login.to_string()))
+                .unwrap_or(TaskAssignee::Unassigned)
+        } else {
+            TaskAssignee::Bot
+        };
+
+        let mut wrote_back = false;
+        let mut first_error: Option<anyhow::Error> = None;
+
+        match self.task_adapter.update_checkpoint(
+            &task_id,
+            &checkpoint,
+            item.id,
+            item.checkpoint_comment_id,
+        ) {
+            Ok(comment_id) => {
+                if let Some(comment_id) = comment_id
+                    && item.checkpoint_comment_id != Some(comment_id)
+                {
+                    self.set_work_item_checkpoint_comment_id(item.id, comment_id)
+                        .await?;
+                }
+                wrote_back = true;
+            }
+            Err(error) => {
+                if external_task_not_found_id(&error).is_some() {
+                    return Err(error);
+                }
+                eprintln!("write-back checkpoint failed for {task_id}: {error:#}");
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!(error.to_string()));
+                }
+            }
+        }
+        if let Err(error) = self.task_adapter.set_labels(&task_id, &labels) {
+            if external_task_not_found_id(&error).is_some() {
+                return Err(error);
+            }
+            eprintln!("write-back labels failed for {task_id}: {error:#}");
+            if first_error.is_none() {
+                first_error = Some(anyhow::anyhow!(error.to_string()));
+            }
+        } else {
+            wrote_back = true;
+        }
+        if let Err(error) = self.task_adapter.set_assignee(&task_id, &assignee) {
+            if external_task_not_found_id(&error).is_some() {
+                return Err(error);
+            }
+            eprintln!("write-back assignee failed for {task_id}: {error:#}");
+            if first_error.is_none() {
+                first_error = Some(anyhow::anyhow!(error.to_string()));
+            }
+        } else {
+            wrote_back = true;
+        }
+
+        if let Some(error) = first_error {
+            if wrote_back {
+                self.set_work_item_last_written_at_only(item.id, now)
+                    .await?;
+            }
+            self.record_write_back_failure(item, now, &error).await?;
+            return Err(error);
+        }
+
+        if wrote_back {
+            self.record_write_back_success(item.id, now).await?;
+        }
+        Ok(())
+    }
+
+    async fn set_work_item_last_written_at(
+        &self,
+        work_item_id: Uuid,
+        last_written_at: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "UPDATE work_items SET last_written_at = ?2, write_back_failures = 0, write_back_retry_after = NULL WHERE id = ?1",
+                params![work_item_id.to_string(), last_written_at.to_rfc3339(),],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn set_work_item_last_written_at_only(
+        &self,
+        work_item_id: Uuid,
+        last_written_at: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "UPDATE work_items SET last_written_at = ?2 WHERE id = ?1",
+                params![work_item_id.to_string(), last_written_at.to_rfc3339(),],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn set_work_item_status_comment_id(
+        &self,
+        work_item_id: Uuid,
+        status_comment_id: i64,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "UPDATE work_items SET status_comment_id = ?2 WHERE id = ?1",
+                params![work_item_id.to_string(), status_comment_id],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn set_work_item_checkpoint_comment_id(
+        &self,
+        work_item_id: Uuid,
+        checkpoint_comment_id: i64,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "UPDATE work_items SET checkpoint_comment_id = ?2 WHERE id = ?1",
+                params![work_item_id.to_string(), checkpoint_comment_id],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    fn should_skip_write_back(&self, item: &WorkItem) -> bool {
+        item.write_back_retry_after
+            .is_some_and(|retry_after| retry_after > Utc::now())
+    }
+
+    fn write_back_backoff_secs(failures: u32) -> i64 {
+        let exp = failures.saturating_sub(1).min(31);
+        let interval = WRITE_BACK_BASE_RETRY_SECS.saturating_mul(1_i64 << exp);
+        interval.min(WRITE_BACK_MAX_RETRY_SECS)
+    }
+
+    async fn record_write_back_success(
+        &self,
+        work_item_id: Uuid,
+        last_written_at: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        self.set_work_item_last_written_at(work_item_id, last_written_at)
+            .await
+    }
+
+    async fn record_write_back_failure(
+        &self,
+        item: &WorkItem,
+        now: chrono::DateTime<Utc>,
+        error: &anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let next_failures = item.write_back_failures.saturating_add(1);
+        let previous_interval = if item.write_back_failures == 0 {
+            None
+        } else {
+            Some(Self::write_back_backoff_secs(item.write_back_failures))
+        };
+        let next_interval = Self::write_back_backoff_secs(next_failures);
+        let retry_after = now + chrono::TimeDelta::seconds(next_interval);
+        let should_log = next_failures == 1 || previous_interval != Some(next_interval);
+        if should_log {
+            tracing::warn!(
+                work_item_id = %item.id,
+                failures = next_failures,
+                retry_after = %retry_after,
+                backoff_seconds = next_interval,
+                error = ?error,
+                "write-back failed; entering backoff"
+            );
+        }
+
+        self.set_work_item_write_back_failure(item.id, next_failures, retry_after)
+            .await
+    }
+
+    async fn set_work_item_write_back_failure(
+        &self,
+        work_item_id: Uuid,
+        write_back_failures: u32,
+        write_back_retry_after: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "UPDATE work_items SET write_back_failures = ?2, write_back_retry_after = ?3 WHERE id = ?1",
+                params![
+                    work_item_id.to_string(),
+                    write_back_failures,
+                    write_back_retry_after.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn write_job_result_comment_best_effort(&self, item: &mut WorkItem, job: &Job) {
+        if !matches!(job.state, JobState::Succeeded | JobState::Failed) {
+            return;
+        }
+        let Some(task_id) = item.external_task_id.as_deref() else {
+            return;
+        };
+
+        let step_id = job.step_id.clone();
+        let output = item
+            .context
+            .get(CONTEXT_JOB_OUTPUTS_KEY)
+            .and_then(|outputs| outputs.get(&step_id))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let context = item
+            .context
+            .get(CONTEXT_JOB_ARTIFACT_DATA_KEY)
+            .and_then(|artifact_data| artifact_data.get(&step_id))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let stored_comment_id = item.job_result_comment_ids.get(&step_id).copied();
+
+        match self.task_adapter.write_job_result_comment(
+            task_id,
+            &step_id,
+            &item.id.to_string(),
+            job.state == JobState::Succeeded,
+            &output,
+            &context,
+            stored_comment_id,
+        ) {
+            Ok(Some(comment_id)) => {
+                item.job_result_comment_ids.insert(step_id, comment_id);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    work_item_id = %item.id,
+                    step_id = %job.step_id,
+                    job_id = %job.id,
+                    error = ?error,
+                    "write_job_result_comment failed; continuing"
+                );
+            }
+        }
+    }
+
+    async fn append_failure_log(&self, item: &WorkItem) -> anyhow::Result<()> {
+        if self.should_skip_write_back(item) {
+            return Ok(());
+        }
+
+        let (Some(task_id), Some(reason)) = (
+            item.external_task_id.as_deref(),
+            item.last_failure_reason.as_deref(),
+        ) else {
+            return Ok(());
+        };
+        let now = Utc::now();
+        let message = format!("❌ Step '{}' failed: {}", item.current_step, reason);
+        if let Err(error) = self.task_adapter.append_log(task_id, &message) {
+            if external_task_not_found_id(&error).is_some() {
+                return Err(error);
+            }
+            eprintln!("write-back failure log failed for {task_id}: {error:#}");
+            let failure = anyhow::anyhow!(error.to_string());
+            self.record_write_back_failure(item, now, &failure).await?;
+            return Err(failure);
+        }
+        self.record_write_back_success(item.id, now).await?;
+        Ok(())
+    }
+
+    pub(crate) fn valid_next_events_for_work_item(
+        &self,
+        item: &WorkItem,
+    ) -> Vec<WorkflowEventKind> {
+        self.valid_next_events_for_work_item_internal(item)
+            .into_iter()
+            .filter(workflow_event_is_externally_fireable)
+            .collect()
+    }
+
+    fn refresh_operator_visibility_fields(&self, item: &mut WorkItem) {
+        clear_stale_human_gate_projection(item);
+        clear_stale_failure_projection(item);
+        let valid_next_events = self.valid_next_events_for_work_item(item);
+        item.required_action_description =
+            format_required_action_description(item, &valid_next_events);
+    }
+
+    fn projected_valid_next_events_for_job_context(
+        &self,
+        item: &WorkItem,
+    ) -> Vec<WorkflowEventKind> {
+        // Triage is a pseudo-workflow without a registered state machine, but its
+        // jobs still need the standard completion events so the agent can signal
+        // success or failure.
+        if item.workflow_id == "__triage__" {
+            return vec![
+                WorkflowEventKind::JobSucceeded,
+                WorkflowEventKind::JobFailed,
+                WorkflowEventKind::Cancel,
+            ];
+        }
+
+        if let Some(reactive) = self.workflows.get_reactive(&item.workflow_id)
+            && let Some(state) = reactive
+                .states
+                .iter()
+                .find(|state| state.id == item.current_step)
+            && matches!(
+                state.kind(),
+                protocol::ReactiveStateKind::Agent
+                    | protocol::ReactiveStateKind::Command
+                    | protocol::ReactiveStateKind::Managed
+            )
+        {
+            return self.valid_next_events_for_work_item_internal(item);
+        }
+
+        self.valid_next_events_for_work_item(item)
+    }
+
+    pub(crate) fn github_pr_state_for_work_item(&self, item: &WorkItem) -> Option<GithubPrState> {
+        github_pr_state_from_context(&item.context)
+    }
+
+    pub(crate) fn check_merge_readiness(&self, item: &WorkItem) -> Option<MergeReadiness> {
+        self.github_pr_state_for_work_item(item)
+            .as_ref()
+            .map(merge_readiness_from_pr_state)
+    }
+
+    fn reactive_state_auto_merge_enabled(&self, item: &WorkItem) -> bool {
+        self.workflows
+            .get_reactive(&item.workflow_id)
+            .and_then(|workflow| {
+                workflow
+                    .states
+                    .iter()
+                    .find(|state| state.id == item.current_step)
+            })
+            .map(|state| state.auto_merge)
+            .unwrap_or(false)
+    }
+
+    fn should_attempt_auto_merge_for_current_state(&self, item: &WorkItem) -> bool {
+        if !self.reactive_state_auto_merge_enabled(item) {
+            return false;
+        }
+
+        let Some(readiness) = self.check_merge_readiness(item) else {
+            return false;
+        };
+        if !readiness.ready {
+            return false;
+        }
+
+        let Some(pr_state) = self.github_pr_state_for_work_item(item) else {
+            return false;
+        };
+
+        !matches!(pr_state.state, GithubPrLifecycleState::Merged) && !pr_state.merge_attempted
+    }
+
+    async fn try_auto_merge_for_current_state(&self, item: &mut WorkItem) {
+        if !self.should_attempt_auto_merge_for_current_state(item) {
+            return;
+        }
+
+        if let Err(error) = self.try_auto_merge(item).await {
+            eprintln!(
+                "[info] deterministic auto-merge attempt errored: work_item={} error={error:#}",
+                item.id
+            );
+        }
+    }
+
+    /// Attempt to merge a PR when readiness conditions are met.
+    /// This is deterministic — no agent involvement.
+    /// Returns Ok(true) if merge was triggered, Ok(false) if not ready or already merged.
+    pub(crate) async fn try_auto_merge(&self, item: &mut WorkItem) -> anyhow::Result<bool> {
+        let Some(readiness) = self.check_merge_readiness(item) else {
+            return Ok(false);
+        };
+        if !readiness.ready {
+            return Ok(false);
+        }
+
+        let Some(mut pr_state) = self.github_pr_state_for_work_item(item) else {
+            return Ok(false);
+        };
+        if matches!(pr_state.state, GithubPrLifecycleState::Merged) || pr_state.merge_attempted {
+            return Ok(false);
+        }
+
+        eprintln!(
+            "[info] deterministic auto-merge attempt: work_item={} pr_url={}",
+            item.id, pr_state.url
+        );
+        let output = match Command::new("gh")
+            .arg("pr")
+            .arg("merge")
+            .arg(&pr_state.url)
+            .arg("--merge")
+            .arg("--auto")
+            .output()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!(
+                    "[info] deterministic auto-merge failed to execute gh: work_item={} pr_url={} error={error}",
+                    item.id, pr_state.url
+                );
+                return Ok(false);
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            eprintln!(
+                "[info] deterministic auto-merge command failed: work_item={} pr_url={} status={} stdout='{}' stderr='{}'",
+                item.id, pr_state.url, output.status, stdout, stderr
+            );
+            return Ok(false);
+        }
+
+        eprintln!(
+            "[info] deterministic auto-merge command succeeded: work_item={} pr_url={} stdout='{}' stderr='{}'",
+            item.id, pr_state.url, stdout, stderr
+        );
+
+        pr_state.merge_attempted = true;
+        pr_state.state = GithubPrLifecycleState::Merged;
+        pr_state.mergeable = false;
+        pr_state.last_updated = Utc::now();
+        if !item.context.is_object() {
+            item.context = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(obj) = item.context.as_object_mut()
+            && let Ok(value) = serde_json::to_value(pr_state)
+        {
+            obj.insert(CONTEXT_GITHUB_PR_STATE_KEY.to_string(), value);
+        }
+        item.updated_at = Utc::now();
+        self.update_work_item(item).await?;
+        self.persist_task_projection(item, None).await?;
+
+        if let Err(error) = self
+            .fire_event_trusted_internal(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::PrMerged,
+                    job_id: None,
+                    reason: Some("deterministic auto-merge completed".to_string()),
+                },
+            )
+            .await
+            .map(|updated| {
+                *item = updated;
+            })
+        {
+            eprintln!(
+                "[info] deterministic auto-merge fired merge command but could not fire PrMerged: work_item={} error={error}",
+                item.id
+            );
+        }
+
+        Ok(true)
+    }
+
+    fn valid_next_events_for_work_item_internal(&self, item: &WorkItem) -> Vec<WorkflowEventKind> {
+        if matches!(
+            item.state,
+            WorkItemState::Succeeded | WorkItemState::Cancelled
+        ) {
+            return Vec::new();
+        }
+        // Failed is intentionally not treated as terminal here: trusted/internal callers may still
+        // drive retry-oriented progression semantics from that state.
+
+        if item.workflow_id == "__triage__" {
+            return triage_valid_next_events(item);
+        }
+
+        if let Some(reactive) = self.workflows.get_reactive(&item.workflow_id)
+            && let Some(state) = reactive.states.iter().find(|s| s.id == item.current_step)
+        {
+            let mut out = state
+                .on
+                .iter()
+                .map(|transition| transition.event.kind())
+                .collect::<Vec<_>>();
+            if matches!(item.state, WorkItemState::Failed)
+                || (matches!(
+                    state.kind(),
+                    protocol::ReactiveStateKind::Agent
+                        | protocol::ReactiveStateKind::Command
+                        | protocol::ReactiveStateKind::Managed
+                ) && current_step_last_job_failed(item))
+            {
+                push_unique_event(&mut out, WorkflowEventKind::RetryRequested);
+            }
+            if matches!(state.kind(), protocol::ReactiveStateKind::Human) {
+                push_unique_event(&mut out, WorkflowEventKind::HumanUnblocked);
+            }
+            if !matches!(state.kind(), protocol::ReactiveStateKind::Terminal) {
+                push_unique_event(&mut out, WorkflowEventKind::Cancel);
+            }
+            return out;
+        }
+
+        let Some(workflow) = self.workflows.get(&item.workflow_id) else {
+            return Vec::new();
+        };
+        let Some(step) = workflow.steps.iter().find(|s| s.id == item.current_step) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        if item.state == WorkItemState::Pending {
+            push_unique_event(&mut out, WorkflowEventKind::Start);
+            push_unique_event(&mut out, WorkflowEventKind::Submit);
+        }
+        if item.state == WorkItemState::Failed {
+            push_unique_event(&mut out, WorkflowEventKind::RetryRequested);
+        }
+        if item.human_gate {
+            // Human-gate semantics fully determine the externally valid event set for this legacy
+            // item, so return the narrowed gate-state-aware contract directly.
+            out = legacy_human_gate_valid_next_events(item);
+            return out;
+        }
+        if step.kind == WorkflowStepKind::ChildWorkflow {
+            push_unique_event(&mut out, WorkflowEventKind::AllChildrenCompleted);
+            push_unique_event(&mut out, WorkflowEventKind::ChildFailed);
+        } else {
+            push_unique_event(&mut out, WorkflowEventKind::JobSucceeded);
+            push_unique_event(&mut out, WorkflowEventKind::JobFailed);
+        }
+        push_unique_event(&mut out, WorkflowEventKind::Cancel);
+        out
+    }
+
+    async fn reconcile_stale_workers(&self, stale_after: Duration) -> Result<usize, AppError> {
+        let workers = self.select_workers().await.map_err(map_db)?;
+        let mut total_requeued = 0usize;
+        let now = Utc::now();
+        for mut worker in workers {
+            let Ok(elapsed) = (now - worker.last_heartbeat_at).to_std() else {
+                continue;
+            };
+            if elapsed < stale_after {
+                continue;
+            }
+            let was_offline = worker.state == WorkerState::Offline;
+            if worker.state != WorkerState::Offline {
+                worker.state = WorkerState::Offline;
+            }
+            let requeued = self
+                .requeue_jobs_for_worker(&worker.id)
+                .await
+                .map_err(map_db)?;
+            total_requeued += requeued;
+            if requeued > 0 || !was_offline {
+                self.upsert_worker(&worker).await.map_err(map_db)?;
+            }
+        }
+        Ok(total_requeued)
+    }
+
+    async fn requeue_jobs_for_worker(&self, worker_id: &str) -> anyhow::Result<usize> {
+        let path = Arc::clone(&self.db_path);
+        let worker_id = worker_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = Connection::open(path.as_path())?;
+            let count = conn.execute(
+                "UPDATE jobs SET state = ?1, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE assigned_worker_id = ?3 AND state IN (?4, ?5)",
+                params![
+                    JobState::Pending.to_string(),
+                    Utc::now().to_rfc3339(),
+                    worker_id,
+                    JobState::Assigned.to_string(),
+                    JobState::Running.to_string(),
+                ],
+            )?;
+            Ok(count)
+        })
+        .await?
+    }
+
+    async fn requeue_expired_leases(&self) -> anyhow::Result<usize> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = Connection::open(path.as_path())?;
+            let now = Utc::now().to_rfc3339();
+            let count = conn.execute(
+                "UPDATE jobs SET state = ?1, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE state IN (?3, ?4) AND lease_expires_at IS NOT NULL AND lease_expires_at < ?5",
+                params![
+                    JobState::Pending.to_string(),
+                    now,
+                    JobState::Assigned.to_string(),
+                    JobState::Running.to_string(),
+                    now,
+                ],
+            )?;
+            Ok(count)
+        })
+        .await?
+    }
+
+    async fn advance_workflow_for_job(&self, job: &Job) -> Result<(), AppError> {
+        let mut item = self
+            .get_work_item(job.work_item_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(job.work_item_id.to_string()))?;
+        if item.workflow_id == "__triage__" {
+            self.merge_job_output_into_context(&mut item, job)
+                .map_err(AppError::WorkflowInvalid)?;
+            update_last_failure_reason_fields(&mut item, Some(job));
+            if job.state == JobState::Failed {
+                self.append_failure_log(&item).await.map_err(map_config)?;
+            }
+            self.write_job_result_comment_best_effort(&mut item, job)
+                .await;
+
+            match job.state {
+                JobState::Succeeded => {
+                    let workflow_id = item
+                        .context
+                        .get("workflow_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned);
+                    if work_item_requires_manual_triage(&item) {
+                        self.reject_triage_result_with_reason(
+                            &mut item,
+                            "cannot choose workflow while needs-triage is active".to_string(),
+                        );
+                    } else if let Some(workflow_id) = workflow_id {
+                        if !item.context.is_object() {
+                            item.context = serde_json::json!({});
+                        }
+                        if let Some(obj) = item.context.as_object_mut() {
+                            obj.insert(
+                                "workflow_id".to_string(),
+                                serde_json::Value::String(workflow_id),
+                            );
+                        }
+                        item.current_step = "await_triage_approval".to_string();
+                        item.human_gate = true;
+                        item.human_gate_state = Some("triage_completed".to_string());
+                        item.state = WorkItemState::Running;
+                        item.triage_status = Some("pending_approval".to_string());
+                    } else {
+                        self.reject_triage_result_with_reason(
+                            &mut item,
+                            "triage did not select a valid workflow".to_string(),
+                        );
+                    }
+                }
+                JobState::Failed => {
+                    let failure_reason = item
+                        .last_failure_reason
+                        .clone()
+                        .unwrap_or_else(|| "triage job failed".to_string());
+                    self.reject_triage_result_with_reason(&mut item, failure_reason);
+                }
+                JobState::Cancelled => {
+                    item.state = WorkItemState::Cancelled;
+                }
+                JobState::Pending | JobState::Assigned | JobState::Running => return Ok(()),
+            }
+
+            item.updated_at = Utc::now();
+            item.blocked_on = block_reason_for_state_name(&item.current_step);
+            item.projected_state = Some(project_workflow_state(&item));
+            self.update_work_item(&item).await.map_err(map_db)?;
+            self.persist_task_projection(&item, None)
+                .await
+                .map_err(map_config)?;
+            self.try_progress_parent(item.id).await?;
+            return Ok(());
+        }
+        if self.workflows.get_reactive(&item.workflow_id).is_some() {
+            self.merge_job_output_into_context(&mut item, job)
+                .map_err(AppError::WorkflowInvalid)?;
+            update_last_failure_reason_fields(&mut item, Some(job));
+            if job.state == JobState::Failed {
+                self.append_failure_log(&item).await.map_err(map_config)?;
+            }
+            self.write_job_result_comment_best_effort(&mut item, job)
+                .await;
+
+            let valid_next_events = self.valid_next_events_for_work_item_internal(&item);
+            let agent_next_event = reactive_next_event_from_agent_output(job, &valid_next_events)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        work_item_id = %item.id,
+                        job_id = %job.id,
+                        workflow_id = %item.workflow_id,
+                        state = %item.current_step,
+                        "{error}"
+                    );
+                })
+                .ok()
+                .flatten();
+
+            let default_event = match job.state {
+                JobState::Succeeded => WorkflowEventKind::JobSucceeded,
+                JobState::Failed | JobState::Cancelled => {
+                    // Cancelled jobs currently collapse onto the reactive failure lane; reactive
+                    // transition tables only distinguish job success vs non-success in this MVP.
+                    if job.state == JobState::Failed && job.attempt < job.max_retries {
+                        self.retry_job(job).await.map_err(map_db)?;
+                        item.state = WorkItemState::Running;
+                        item.updated_at = Utc::now();
+                        item.blocked_on = block_reason_for_state_name(&item.current_step);
+                        self.update_work_item(&item).await.map_err(map_db)?;
+                        self.persist_task_projection(&item, None)
+                            .await
+                            .map_err(map_config)?;
+                        return Ok(());
+                    }
+                    WorkflowEventKind::JobFailed
+                }
+                JobState::Pending | JobState::Assigned | JobState::Running => return Ok(()),
+            };
+            let ev = agent_next_event.unwrap_or(default_event);
+            self.fire_reactive_event(&mut item, ev).await?;
+            item.updated_at = Utc::now();
+            item.blocked_on = block_reason_for_state_name(&item.current_step);
+            item.projected_state = Some(project_workflow_state(&item));
+            self.update_work_item(&item).await.map_err(map_db)?;
+            self.persist_task_projection(&item, None)
+                .await
+                .map_err(map_config)?;
+            self.try_progress_parent(item.id).await?;
+            return Ok(());
+        }
+
+        let workflow = self
+            .workflows
+            .get(&item.workflow_id)
+            .ok_or_else(|| AppError::WorkflowNotFound(item.workflow_id.clone()))?
+            .clone();
+        let step = workflow
+            .steps
+            .iter()
+            .find(|s| s.id == item.current_step)
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(format!("missing step '{}'", item.current_step))
+            })?;
+
+        if step.id != job.step_id {
+            return Err(AppError::WorkflowInvalid(format!(
+                "job step '{}' does not match work item step '{}'",
+                job.step_id, item.current_step
+            )));
+        }
+
+        self.merge_job_output_into_context(&mut item, job)
+            .map_err(AppError::WorkflowInvalid)?;
+        update_last_failure_reason_fields(&mut item, Some(job));
+        if job.state == JobState::Failed {
+            self.append_failure_log(&item).await.map_err(map_config)?;
+        }
+        self.write_job_result_comment_best_effort(&mut item, job)
+            .await;
+
+        match job.state {
+            JobState::Succeeded => {
+                if let Some(next) = &step.on_success {
+                    item.current_step = next.clone();
+                    item.state = WorkItemState::Running;
+                    self.ensure_pending_job_for_step(&item, &workflow)
+                        .await
+                        .map_err(map_db)?;
+                } else {
+                    item.state = WorkItemState::Succeeded;
+                }
+            }
+            JobState::Failed | JobState::Cancelled => {
+                if job.state == JobState::Failed && job.attempt < job.max_retries {
+                    self.retry_job(job).await.map_err(map_db)?;
+                    item.state = WorkItemState::Running;
+                    item.updated_at = Utc::now();
+                    item.blocked_on = block_reason_for_state_name(&item.current_step);
+                    self.update_work_item(&item).await.map_err(map_db)?;
+                    self.persist_task_projection(&item, None)
+                        .await
+                        .map_err(map_config)?;
+                    return Ok(());
+                }
+                if let Some(next) = &step.on_failure {
+                    item.current_step = next.clone();
+                    item.state = WorkItemState::Running;
+                    self.ensure_pending_job_for_step(&item, &workflow)
+                        .await
+                        .map_err(map_db)?;
+                } else {
+                    item.state = WorkItemState::Failed;
+                }
+            }
+            JobState::Pending | JobState::Assigned | JobState::Running => return Ok(()),
+        }
+
+        item.updated_at = Utc::now();
+        item.blocked_on = block_reason_for_state_name(&item.current_step);
+        item.projected_state = Some(project_workflow_state(&item));
+        self.update_work_item(&item).await.map_err(map_db)?;
+        self.persist_task_projection(&item, None)
+            .await
+            .map_err(map_config)?;
+        self.try_progress_parent(item.id).await?;
+        Ok(())
+    }
+
+    async fn ensure_pending_for_current_state(&self, item: &mut WorkItem) -> anyhow::Result<bool> {
+        if let Some(workflow) = self.workflows.get(&item.workflow_id) {
+            self.ensure_pending_job_for_step(item, workflow).await?;
+            return Ok(true);
+        }
+
+        if item.workflow_id == "__triage__" {
+            return self.ensure_pending_triage_job(item).await;
+        }
+
+        let Some(reactive) = self.workflows.get_reactive(&item.workflow_id) else {
+            return Ok(false);
+        };
+
+        let mut created_job = false;
+        let mut auto_hops = 0usize;
+        loop {
+            let state = reactive
+                .states
+                .iter()
+                .find(|s| s.id == item.current_step)
+                .ok_or_else(|| anyhow::anyhow!("missing reactive state {}", item.current_step))?;
+
+            match state.kind() {
+                protocol::ReactiveStateKind::Terminal => {
+                    let terminal_outcome = match &state.config {
+                        protocol::ReactiveStateConfig::Terminal(config) => {
+                            config.terminal_outcome.as_ref()
+                        }
+                        _ => None,
+                    };
+                    item.state = reactive_terminal_work_item_state(terminal_outcome);
+                    item.human_gate = false;
+                    item.blocked_on = None;
+                    item.blocked_on = block_reason_for_state_name(&state.id);
+                    break;
+                }
+                protocol::ReactiveStateKind::Human => {
+                    item.state = WorkItemState::Running;
+                    item.human_gate = true;
+                    item.blocked_on = block_reason_for_state_name(&state.id);
+                    if item.human_gate_state.is_none() {
+                        item.human_gate_state = Some("awaiting_human_action".to_string());
+                    }
+                    break;
+                }
+                protocol::ReactiveStateKind::Auto => {
+                    item.human_gate = false;
+                    item.blocked_on = None;
+                    item.blocked_on = block_reason_for_state_name(&state.id);
+                    let child_workflow_id = match &state.config {
+                        protocol::ReactiveStateConfig::Auto(config) => config
+                            .child_workflow
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty()),
+                        _ => None,
+                    };
+                    if let Some(child_workflow_id) = child_workflow_id {
+                        if item.child_work_item_id.is_none() {
+                            let (child_workflow_id, child_initial_step) =
+                                if let Some(child_workflow) = self.workflows.get(child_workflow_id)
+                                {
+                                    (child_workflow.id.clone(), child_workflow.entry_step.clone())
+                                } else if let Some(child_workflow) =
+                                    self.workflows.get_reactive(child_workflow_id)
+                                {
+                                    (
+                                        child_workflow.id.clone(),
+                                        child_workflow.initial_state.clone(),
+                                    )
+                                } else {
+                                    return Err(anyhow::anyhow!(
+                                        "unknown child workflow {child_workflow_id}"
+                                    ));
+                                };
+                            let now = Utc::now();
+                            let child_id = Uuid::new_v4();
+                            let mut child = WorkItem {
+                                id: child_id,
+                                workflow_id: child_workflow_id,
+                                external_task_id: None,
+                                external_task_source: None,
+                                title: item.title.clone(),
+                                description: item.description.clone(),
+                                labels: item.labels.clone(),
+                                priority: item.priority.clone(),
+                                session_id: item.session_id.clone(),
+                                current_step: child_initial_step,
+                                projected_state: Some("pending".to_string()),
+                                last_failure_reason: item.last_failure_reason.clone(),
+                                required_action_description: None,
+                                triage_status: item.triage_status.clone(),
+                                human_gate: item.human_gate,
+                                human_gate_state: item.human_gate_state.clone(),
+                                blocked_on: None,
+                                state: WorkItemState::Pending,
+                                context: item.context.clone(),
+                                repo: item.repo.clone(),
+                                parent_work_item_id: Some(item.id),
+                                parent_step_id: Some(state.id.clone()),
+                                child_work_item_id: None,
+                                created_at: now,
+                                updated_at: now,
+                                last_written_at: None,
+                                write_back_failures: 0,
+                                write_back_retry_after: None,
+                                status_comment_id: None,
+                                checkpoint_comment_id: None,
+                                job_result_comment_ids: HashMap::new(),
+                            };
+                            self.insert_work_item(&child).await?;
+                            self.persist_task_projection(&child, None).await?;
+                            Box::pin(self.ensure_pending_for_current_state(&mut child)).await?;
+
+                            item.child_work_item_id = Some(child_id);
+                        }
+                        item.state = WorkItemState::Running;
+                        break;
+                    }
+                    auto_hops = auto_hops.saturating_add(1);
+                    if auto_hops > 32 {
+                        return Err(anyhow::anyhow!(
+                            "reactive auto state transition depth exceeded"
+                        ));
+                    }
+                    if let Some(next) = state
+                        .on
+                        .iter()
+                        .find(|t| t.event.kind() == protocol::ReactiveEventKind::Start)
+                    {
+                        item.current_step = next.target.clone();
+                        item.state = WorkItemState::Running;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "reactive auto state '{}' missing 'start' transition",
+                        state.id
+                    ));
+                }
+                protocol::ReactiveStateKind::Agent
+                | protocol::ReactiveStateKind::Command
+                | protocol::ReactiveStateKind::Managed => {
+                    item.human_gate = false;
+                    item.blocked_on = block_reason_for_state_name(&state.id);
+                    if !self.has_pending_job_for_step(item.id, &state.id).await? {
+                        let prompt_context = interpolation_context_for_work_item(item, &state.id);
+                        let prompt = state
+                            .config
+                            .prompt()
+                            .as_ref()
+                            .map(
+                                |prompt| -> Result<protocol::PromptRef, InterpolationError> {
+                                    Ok(protocol::PromptRef {
+                                        system: prompt
+                                            .system
+                                            .as_deref()
+                                            .map(|system| {
+                                                interpolate_template(system, &prompt_context)
+                                            })
+                                            .transpose()?,
+                                        user: interpolate_template(&prompt.user, &prompt_context)?,
+                                    })
+                                },
+                            )
+                            .transpose()?;
+                        let (command, args, env, managed_operation) = match &state.config {
+                            protocol::ReactiveStateConfig::Agent(_) => {
+                                (String::new(), Vec::new(), HashMap::new(), None)
+                            }
+                            protocol::ReactiveStateConfig::Command(config) => {
+                                let command = interpolate_template(&config.command, &item.context)?;
+                                let args = config
+                                    .args
+                                    .iter()
+                                    .map(|a| interpolate_template(a, &item.context))
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let env = config
+                                    .env
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        Ok((k.clone(), interpolate_template(v, &item.context)?))
+                                    })
+                                    .collect::<Result<HashMap<_, _>, InterpolationError>>()?;
+                                (command, args, env, None)
+                            }
+                            protocol::ReactiveStateConfig::Managed(config) => (
+                                String::new(),
+                                Vec::new(),
+                                HashMap::new(),
+                                Some(config.operation.clone()),
+                            ),
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "non-executable reactive state '{}' scheduled as executable",
+                                    state.id
+                                ));
+                            }
+                        };
+                        let now = Utc::now();
+                        let execution = state.config.execution();
+                        let selected_environment = self
+                            .selected_environment_for_reactive_execution(
+                                execution,
+                                &item.context,
+                            )?;
+                        let timeout_secs = execution
+                            .and_then(|config| config.timeout)
+                            .or(execution.and_then(|config| config.timeout_secs));
+                        let job = Job {
+                            id: Uuid::new_v4(),
+                            work_item_id: item.id,
+                            step_id: state.id.clone(),
+                            state: JobState::Pending,
+                            assigned_worker_id: None,
+                            execution_mode: execution
+                                .and_then(|config| config.executor.clone())
+                                .clone()
+                                .unwrap_or(protocol::ExecutionMode::Raw),
+                            container_image: execution
+                                .and_then(|config| config.container_image.clone()),
+                            command,
+                            args,
+                            env,
+                            prompt,
+                            context: item.context.clone(),
+                            repo: item.repo.clone(),
+                            timeout_secs,
+                            max_retries: execution.map(|config| config.max_retries).unwrap_or(0),
+                            attempt: 0,
+                            transcript_dir: None,
+                            result: None,
+                            lease_expires_at: None,
+                            created_at: now,
+                            updated_at: now,
+                        };
+                        let runtime = runtime_spec_for_reactive_agent_state(state, item, &job);
+                        let mut job = job;
+                        let mut runtime = runtime;
+                        if let Some((selection, environment)) = selected_environment.as_ref() {
+                            apply_environment_definition_to_runtime(
+                                &mut runtime,
+                                environment,
+                                execution
+                                    .and_then(|config| config.container_image.clone())
+                                    .is_some(),
+                            );
+                            project_environment_selection_into_job_context(
+                                &mut job.context,
+                                selection,
+                                self.overlays.as_slice(),
+                            );
+                            project_environment_runtime_into_job_context(
+                                &mut job.context,
+                                environment,
+                            );
+                        }
+                        job.execution_mode = runtime.environment.execution_mode.clone();
+                        job.container_image = runtime.environment.container_image.clone();
+                        job.timeout_secs = runtime.environment.timeout_secs;
+                        project_reactive_execution_markers_into_job_context(
+                            &mut job.context,
+                            state.kind(),
+                            managed_operation.as_deref(),
+                        );
+                        let valid_next_events =
+                            self.projected_valid_next_events_for_job_context(item);
+                        project_workflow_inputs_into_job_context(
+                            &mut job.context,
+                            &valid_next_events,
+                            item,
+                            &item.context,
+                        );
+                        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+                        project_approval_mode_into_job_context(
+                            &mut job.context,
+                            &item.context,
+                            self.force_gateway_approval_mode,
+                        );
+                        self.insert_job(&job).await?;
+                        created_job = true;
+                    }
+                    item.state = WorkItemState::Running;
+                    break;
+                }
+            }
+        }
+
+        item.updated_at = Utc::now();
+        item.projected_state = Some(project_workflow_state(item));
+        self.update_work_item(item).await?;
+        self.persist_task_projection(item, None).await?;
+        Ok(created_job)
+    }
+
+    async fn ensure_pending_triage_job(&self, item: &WorkItem) -> anyhow::Result<bool> {
+        if item.state != WorkItemState::Pending {
+            return Ok(false);
+        }
+        if work_item_requires_manual_triage(item) {
+            return Ok(false);
+        }
+        if self.has_active_job(item.id).await? {
+            return Ok(false);
+        }
+
+        let prompt = self.build_triage_prompt(item)?;
+        let now = Utc::now();
+        let mut job = Job {
+            id: Uuid::new_v4(),
+            work_item_id: item.id,
+            step_id: item.current_step.clone(),
+            state: JobState::Pending,
+            assigned_worker_id: None,
+            execution_mode: protocol::ExecutionMode::Docker,
+            container_image: None, // Let local-agent use its configured default image
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            prompt: Some(prompt),
+            context: item.context.clone(),
+            repo: item.repo.clone(),
+            timeout_secs: Some(900),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut runtime = canonical_runtime_spec_for_job(&job);
+        // Triage jobs need LLM + GitHub access for cloning repos and calling the model.
+        runtime.environment.network_resources =
+            Some(protocol::NetworkResourceRequest::Resources(vec![
+                protocol::NetworkResourceKind::Llm,
+                protocol::NetworkResourceKind::Github,
+            ]));
+        runtime.permissions.can_access_network = true;
+        let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+        project_workflow_inputs_into_job_context(
+            &mut job.context,
+            &valid_next_events,
+            item,
+            &item.context,
+        );
+        project_reactive_execution_markers_into_job_context(
+            &mut job.context,
+            protocol::ReactiveStateKind::Agent,
+            None,
+        );
+        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+        project_approval_mode_into_job_context(
+            &mut job.context,
+            &item.context,
+            self.force_gateway_approval_mode,
+        );
+        self.insert_job(&job).await?;
+        Ok(true)
+    }
+
+    fn build_triage_prompt(
+        &self,
+        item: &WorkItem,
+    ) -> Result<protocol::PromptRef, InterpolationError> {
+        let mut prompt_context = interpolation_context_for_work_item(item, &item.current_step);
+        if let Some(obj) = prompt_context.as_object_mut()
+            && !obj.contains_key(CONTEXT_REPO_CATALOG_HINT_KEY)
+        {
+            let catalog_hint = item
+                .context
+                .get(CONTEXT_REPO_CATALOG_HINT_KEY)
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_default();
+            obj.insert(
+                CONTEXT_REPO_CATALOG_HINT_KEY.to_string(),
+                serde_json::Value::String(catalog_hint),
+            );
+        }
+
+        let base_prompt = self.triage_prompt.as_ref().as_ref();
+
+        let base_system = base_prompt
+            .and_then(|prompt| prompt.system.as_deref())
+            .map(|system| interpolate_template(system, &prompt_context))
+            .transpose()?;
+        let base_user = base_prompt
+            .map(|prompt| interpolate_template(&prompt.user, &prompt_context))
+            .transpose()?
+            .unwrap_or_else(|| {
+                "Triage this task and propose a concrete workflow and environment selection."
+                    .to_string()
+            });
+
+        let workflows_summary = triage_workflow_summary(
+            self.workflows
+                .list()
+                .into_iter()
+                .map(|workflow| workflow.id)
+                .chain(
+                    self.workflows
+                        .list_reactive()
+                        .into_iter()
+                        .map(|workflow| workflow.id),
+                )
+                .map(|id| {
+                    let hint = self.workflows.triage_hint(&id).map(ToOwned::to_owned);
+                    (id, hint)
+                })
+                .collect(),
+        );
+        let environments_summary = triage_environment_summary(self.environments.as_slice());
+        let labels_summary = if item.labels.is_empty() {
+            "(none)".to_string()
+        } else {
+            item.labels.join(", ")
+        };
+        let task_context = serde_json::to_string_pretty(&item.context)
+            .unwrap_or_else(|_| item.context.to_string());
+
+        let user = format!(
+            "{base_user}\n\nCRITICAL: You MUST actually clone/fetch and inspect each candidate repository before selecting it.\n- If git clone/fetch fails (auth errors, network errors, repo not found), you MUST set next_event to \"job_failed\" and explain the access failure.\n- Do NOT assume a repo is correct based on its URL or name alone.\n- Do NOT return job_succeeded with a repo you could not access.\n\nIMPORTANT: Be conservative in your selections. When in doubt, FAIL rather than guess.\n- Only select a workflow and repo when you are highly confident they are correct for this task.\n- If the task description is ambiguous about which repo to use, set next_event to \"job_failed\" with a clear explanation of what's unclear.\n- If none of the candidate repositories seem to match the task, set next_event to \"job_failed\" explaining that no suitable repo was found. The human operator will manually assign the correct repo.\n- It is much better to ask a human to manually assign than to guess wrong and waste time on the wrong repo.\n\nSet next_event to \"job_succeeded\" ONLY when ALL of these are true:\n1. You successfully cloned/fetched a candidate repository\n2. You inspected its contents and confirmed it matches the task requirements\n3. You are confident in the workflow selection\n4. You have a concrete, verified implementation plan\n\nOtherwise, set next_event to \"job_failed\" with a detailed explanation. The system will present your findings to the human operator for manual assignment.\n\n---\nTriage target workflows available in this deployment:\n{workflows_summary}\n\nAvailable execution environments:\n{environments_summary}\n\nTask details:\n- title: {}\n- description: {}\n- labels: {labels_summary}\n\nTask context JSON:\n{task_context}\n\nOutput requirements:\n- Write valid AgentOutput JSON to $AGENT_OUTPUT_PATH\n- IMPORTANT: Include a top-level \"workflow_id\" field set to one of the workflow ids listed above\n- Include an environment selection using one of the environments above\n- Set next_event to one of the valid_next_events provided in context",
+            item.title.clone().unwrap_or_default(),
+            item.description.clone().unwrap_or_default(),
+        );
+
+        Ok(protocol::PromptRef {
+            system: base_system,
+            user,
+        })
+    }
+
+    async fn fire_reactive_event(
+        &self,
+        item: &mut WorkItem,
+        event: WorkflowEventKind,
+    ) -> Result<(), AppError> {
+        let reactive = self
+            .workflows
+            .get_reactive(&item.workflow_id)
+            .ok_or_else(|| AppError::WorkflowNotFound(item.workflow_id.clone()))?
+            .clone();
+        let state = reactive
+            .states
+            .iter()
+            .find(|s| s.id == item.current_step)
+            .ok_or_else(|| AppError::WorkflowInvalid("reactive state missing".into()))?;
+
+        if matches!(event, WorkflowEventKind::Cancel) {
+            item.state = WorkItemState::Cancelled;
+            self.cancel_active_jobs_for_work_item(item.id)
+                .await
+                .map_err(map_db)?;
+            if let Some(child_id) = item.child_work_item_id {
+                self.cancel_work_item(child_id).await.map_err(map_db)?;
+            }
+            Box::pin(self.try_progress_parent(item.id)).await?;
+            return Ok(());
+        }
+
+        let Some(transition) = state.on.iter().find(|t| t.event.kind() == event) else {
+            if matches!(state.kind(), protocol::ReactiveStateKind::Terminal) {
+                return Ok(());
+            }
+            return Err(AppError::WorkflowInvalid(format!(
+                "reactive state '{}' has no transition for event '{}'",
+                state.id, event
+            )));
+        };
+        if matches!(
+            event,
+            WorkflowEventKind::JobSucceeded
+                | WorkflowEventKind::HumanApproved
+                | WorkflowEventKind::AllChildrenCompleted
+        ) {
+            clear_success_projection_fields(item);
+        }
+        item.current_step = transition.target.clone();
+        self.ensure_pending_for_current_state(item)
+            .await
+            .map_err(map_db)?;
+        Ok(())
+    }
+
+    async fn try_progress_parent(&self, child_id: Uuid) -> Result<(), AppError> {
+        let child = match self.get_work_item(child_id).await.map_err(map_db)? {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let Some(parent_id) = child.parent_work_item_id else {
+            return Ok(());
+        };
+        let Some(parent_step_id) = child.parent_step_id.clone() else {
+            return Ok(());
+        };
+
+        if !matches!(
+            child.state,
+            WorkItemState::Succeeded | WorkItemState::Failed | WorkItemState::Cancelled
+        ) {
+            return Ok(());
+        }
+
+        let mut parent = self
+            .get_work_item(parent_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(parent_id.to_string()))?;
+        if self.workflows.get_reactive(&parent.workflow_id).is_some() {
+            let children = self
+                .select_children_for_parent_step(parent.id, &parent_step_id)
+                .await
+                .map_err(map_db)?;
+            if children.is_empty() {
+                return Ok(());
+            }
+            if !children.iter().all(|candidate| {
+                matches!(
+                    candidate.state,
+                    WorkItemState::Succeeded | WorkItemState::Failed | WorkItemState::Cancelled
+                )
+            }) {
+                return Ok(());
+            }
+
+            for candidate in &children {
+                merge_child_result_into_parent_context(&mut parent, candidate)
+                    .map_err(AppError::WorkflowInvalid)?;
+            }
+            parent.child_work_item_id = None;
+
+            let event = if children
+                .iter()
+                .any(|candidate| !matches!(candidate.state, WorkItemState::Succeeded))
+            {
+                WorkflowEventKind::ChildFailed
+            } else {
+                WorkflowEventKind::AllChildrenCompleted
+            };
+            Box::pin(self.fire_reactive_event(&mut parent, event)).await?;
+            parent.updated_at = Utc::now();
+            parent.blocked_on = block_reason_for_state_name(&parent.current_step);
+            parent.projected_state = Some(project_workflow_state(&parent));
+            self.update_work_item(&parent).await.map_err(map_db)?;
+            self.persist_task_projection(&parent, None)
+                .await
+                .map_err(map_config)?;
+            return Ok(());
+        }
+        let workflow = self
+            .workflows
+            .get(&parent.workflow_id)
+            .ok_or_else(|| AppError::WorkflowNotFound(parent.workflow_id.clone()))?
+            .clone();
+        let step = workflow
+            .steps
+            .iter()
+            .find(|s| s.id == parent_step_id)
+            .ok_or_else(|| AppError::WorkflowInvalid("parent step missing".into()))?;
+        merge_child_result_into_parent_context(&mut parent, &child)
+            .map_err(AppError::WorkflowInvalid)?;
+
+        match child.state {
+            WorkItemState::Succeeded => {
+                if let Some(next) = &step.on_success {
+                    parent.current_step = next.clone();
+                    parent.state = WorkItemState::Running;
+                    parent.child_work_item_id = None;
+                    self.ensure_pending_job_for_step(&parent, &workflow)
+                        .await
+                        .map_err(map_db)?;
+                } else {
+                    parent.state = WorkItemState::Succeeded;
+                    parent.child_work_item_id = None;
+                }
+            }
+            WorkItemState::Failed | WorkItemState::Cancelled => {
+                if let Some(next) = &step.on_failure {
+                    parent.current_step = next.clone();
+                    parent.state = WorkItemState::Running;
+                    parent.child_work_item_id = None;
+                    self.ensure_pending_job_for_step(&parent, &workflow)
+                        .await
+                        .map_err(map_db)?;
+                } else {
+                    parent.state = WorkItemState::Failed;
+                    parent.child_work_item_id = None;
+                }
+            }
+            _ => {}
+        }
+
+        parent.updated_at = Utc::now();
+        parent.blocked_on = block_reason_for_state_name(&parent.current_step);
+        parent.projected_state = Some(project_workflow_state(&parent));
+        self.update_work_item(&parent).await.map_err(map_db)?;
+        self.persist_task_projection(&parent, None)
+            .await
+            .map_err(map_config)?;
+        Ok(())
+    }
+
+    async fn cancel_work_item(&self, id: Uuid) -> anyhow::Result<()> {
+        if let Some(mut item) = self.get_work_item(id).await? {
+            item.state = WorkItemState::Cancelled;
+            item.updated_at = Utc::now();
+            item.blocked_on = block_reason_for_state_name(&item.current_step);
+            item.projected_state = Some(project_workflow_state(&item));
+            self.update_work_item(&item).await?;
+            let _ = self.cancel_active_jobs_for_work_item(id).await?;
+            let _ = self.persist_task_projection(&item, None).await;
+        }
+        Ok(())
+    }
+
+    async fn retry_job(&self, previous: &Job) -> anyhow::Result<()> {
+        let mut next = previous.clone();
+        next.id = Uuid::new_v4();
+        next.state = JobState::Pending;
+        next.assigned_worker_id = None;
+        next.transcript_dir = None;
+        next.result = None;
+        next.lease_expires_at = None;
+        next.attempt = previous.attempt.saturating_add(1);
+        next.created_at = Utc::now();
+        next.updated_at = next.created_at;
+        if let Some(item) = self.get_work_item(previous.work_item_id).await? {
+            let valid_next_events = self.projected_valid_next_events_for_job_context(&item);
+            project_workflow_inputs_into_job_context(
+                &mut next.context,
+                &valid_next_events,
+                &item,
+                &item.context,
+            );
+        }
+        self.insert_job(&next).await
+    }
+
+    fn merge_job_output_into_context(&self, item: &mut WorkItem, job: &Job) -> Result<(), String> {
+        let raw_output_json = job.result.as_ref().and_then(|r| r.output_json.clone());
+        let parsed_output = raw_output_json
+            .as_ref()
+            .and_then(|raw_output| serde_json::from_value::<AgentOutput>(raw_output.clone()).ok());
+        if let Some(parsed) = parsed_output.as_ref()
+            && let Some(repo) = parsed.repo.as_ref()
+        {
+            if is_valid_repo_source(repo) {
+                item.repo = Some(repo.clone());
+            } else {
+                tracing::warn!(
+                    work_item_id = %item.id,
+                    repo_url = %repo.repo_url,
+                    "ignoring invalid repo discovered in agent output"
+                );
+            }
+        }
+        let output = raw_output_json.clone().unwrap_or(serde_json::Value::Null);
+        let result_json = job
+            .result
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| format!("failed to serialize job result: {e}"))?
+            .unwrap_or(serde_json::Value::Null);
+
+        if !item.context.is_object() {
+            item.context = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let ctx_obj = item
+            .context
+            .as_object_mut()
+            .ok_or_else(|| "failed to normalize work item context object".to_string())?;
+
+        if let Some(parsed) = parsed_output.as_ref()
+            && let Some(env_selection) = &parsed.environment
+            && let Ok(env_json) = serde_json::to_value(env_selection)
+        {
+            ctx_obj.insert("environment".to_string(), env_json);
+        }
+
+        if item.workflow_id == "__triage__"
+            && let Some(workflow_id) = raw_output_json
+                .as_ref()
+                .and_then(triage_workflow_id_from_output)
+        {
+            ctx_obj.insert(
+                "workflow_id".to_string(),
+                serde_json::Value::String(workflow_id),
+            );
+        }
+
+        let outputs = ctx_obj
+            .entry(CONTEXT_JOB_OUTPUTS_KEY.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        let outputs_obj = outputs
+            .as_object_mut()
+            .ok_or_else(|| format!("context.{CONTEXT_JOB_OUTPUTS_KEY} must be a JSON object"))?;
+
+        outputs_obj.insert(job.step_id.clone(), output);
+
+        let results = ctx_obj
+            .entry(CONTEXT_JOB_RESULTS_KEY.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let results_obj = results
+            .as_object_mut()
+            .ok_or_else(|| format!("context.{CONTEXT_JOB_RESULTS_KEY} must be a JSON object"))?;
+        results_obj.insert(job.step_id.clone(), result_json);
+
+        if !ctx_obj.contains_key("github_pr")
+            && let Some(github_pr) = job
+                .result
+                .as_ref()
+                .and_then(|result| result.github_pr.as_ref())
+            && let Some(parts) = parse_pr_url_components(&github_pr.url)
+        {
+            // `host` is what lets the SCM registry pick the right
+            // api_base_url + token at poll time. Without it the poller
+            // falls back to github.com, which 404s for any PR on a
+            // GitHub Enterprise instance.
+            let mut promoted = serde_json::Map::new();
+            promoted.insert("host".to_string(), serde_json::Value::String(parts.host));
+            promoted.insert("owner".to_string(), serde_json::Value::String(parts.owner));
+            promoted.insert("repo".to_string(), serde_json::Value::String(parts.repo));
+            promoted.insert(
+                "number".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(github_pr.number)),
+            );
+            promoted.insert(
+                "html_url".to_string(),
+                serde_json::Value::String(github_pr.url.clone()),
+            );
+            if let Some(state) = github_pr.state.as_ref() {
+                promoted.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(state.clone()),
+                );
+            }
+            ctx_obj.insert("github_pr".to_string(), serde_json::Value::Object(promoted));
+        }
+
+        let step_artifact_paths = job
+            .result
+            .as_ref()
+            .map(job_structured_artifact_paths)
+            .unwrap_or_default();
+        let step_artifact_metadata = job
+            .result
+            .as_ref()
+            .map(job_structured_artifact_metadata)
+            .unwrap_or_default();
+        let step_artifact_data = job
+            .result
+            .as_ref()
+            .map(job_structured_artifact_data)
+            .unwrap_or_default();
+        let artifact_paths = ctx_obj
+            .entry(CONTEXT_JOB_ARTIFACT_PATHS_KEY.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let artifact_paths_obj = artifact_paths.as_object_mut().ok_or_else(|| {
+            format!("context.{CONTEXT_JOB_ARTIFACT_PATHS_KEY} must be a JSON object")
+        })?;
+        if step_artifact_paths.is_empty() {
+            artifact_paths_obj.remove(&job.step_id);
+        } else {
+            artifact_paths_obj.insert(
+                job.step_id.clone(),
+                serde_json::Value::Object(step_artifact_paths),
+            );
+        }
+
+        let artifact_metadata = ctx_obj
+            .entry(CONTEXT_JOB_ARTIFACT_METADATA_KEY.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let artifact_metadata_obj = artifact_metadata.as_object_mut().ok_or_else(|| {
+            format!("context.{CONTEXT_JOB_ARTIFACT_METADATA_KEY} must be a JSON object")
+        })?;
+        if step_artifact_metadata.is_empty() {
+            artifact_metadata_obj.remove(&job.step_id);
+        } else {
+            artifact_metadata_obj.insert(
+                job.step_id.clone(),
+                serde_json::Value::Object(step_artifact_metadata),
+            );
+        }
+
+        let artifact_data = ctx_obj
+            .entry(CONTEXT_JOB_ARTIFACT_DATA_KEY.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let artifact_data_obj = artifact_data.as_object_mut().ok_or_else(|| {
+            format!("context.{CONTEXT_JOB_ARTIFACT_DATA_KEY} must be a JSON object")
+        })?;
+        if step_artifact_data.is_empty() {
+            artifact_data_obj.remove(&job.step_id);
+        } else {
+            artifact_data_obj.insert(
+                job.step_id.clone(),
+                serde_json::Value::Object(step_artifact_data),
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn has_active_job(&self, work_item_id: Uuid) -> anyhow::Result<bool> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = Connection::open(path.as_path())?;
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM jobs WHERE work_item_id = ?1 AND state IN (?2, ?3, ?4) LIMIT 1",
+                    params![
+                        work_item_id.to_string(),
+                        JobState::Pending.to_string(),
+                        JobState::Assigned.to_string(),
+                        JobState::Running.to_string(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(exists.is_some())
+        })
+        .await?
+    }
+
+    async fn cancel_active_jobs_for_work_item(&self, work_item_id: Uuid) -> anyhow::Result<usize> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = Connection::open(path.as_path())?;
+            let count = conn.execute(
+                "UPDATE jobs SET state = ?1, lease_expires_at = NULL, updated_at = ?2 WHERE work_item_id = ?3 AND state IN (?4, ?5, ?6)",
+                params![
+                    JobState::Cancelled.to_string(),
+                    Utc::now().to_rfc3339(),
+                    work_item_id.to_string(),
+                    JobState::Pending.to_string(),
+                    JobState::Assigned.to_string(),
+                    JobState::Running.to_string(),
+                ],
+            )?;
+            Ok(count)
+        })
+        .await?
+    }
+
+    async fn ensure_pending_job_for_step(
+        &self,
+        item: &WorkItem,
+        workflow: &WorkflowDefinition,
+    ) -> anyhow::Result<()> {
+        let step = workflow
+            .steps
+            .iter()
+            .find(|s| s.id == item.current_step)
+            .ok_or_else(|| anyhow::anyhow!("missing step {}", item.current_step))?;
+
+        if self.has_pending_job_for_step(item.id, &step.id).await? {
+            return Ok(());
+        }
+
+        if step.kind == WorkflowStepKind::ChildWorkflow {
+            let child_workflow_id = step
+                .child_workflow_id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing child_workflow_id for step {}", step.id))?;
+            if item.child_work_item_id.is_some() {
+                return Ok(());
+            }
+            let child_workflow = self
+                .workflows
+                .get(child_workflow_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown child workflow {child_workflow_id}"))?
+                .clone();
+            // Belt-and-suspenders guard: catalog validation should reject nested child workflows,
+            // but we keep this runtime check to avoid silently stalling if invalid data slips through.
+            if child_workflow
+                .steps
+                .iter()
+                .any(|s| s.kind == WorkflowStepKind::ChildWorkflow)
+            {
+                return Err(anyhow::anyhow!(
+                    "nested child workflows are not supported for child workflow '{}'",
+                    child_workflow_id
+                ));
+            }
+            let now = Utc::now();
+            let child_id = Uuid::new_v4();
+            let child = WorkItem {
+                id: child_id,
+                workflow_id: child_workflow.id.clone(),
+                external_task_id: None,
+                external_task_source: None,
+                title: item.title.clone(),
+                description: item.description.clone(),
+                labels: item.labels.clone(),
+                priority: item.priority.clone(),
+                session_id: item.session_id.clone(),
+                current_step: child_workflow.entry_step.clone(),
+                projected_state: Some("pending".to_string()),
+                last_failure_reason: item.last_failure_reason.clone(),
+                required_action_description: None,
+                triage_status: item.triage_status.clone(),
+                human_gate: item.human_gate,
+                human_gate_state: item.human_gate_state.clone(),
+                blocked_on: None,
+                state: WorkItemState::Pending,
+                context: item.context.clone(),
+                repo: item.repo.clone(),
+                parent_work_item_id: Some(item.id),
+                parent_step_id: Some(step.id.clone()),
+                child_work_item_id: None,
+                created_at: now,
+                updated_at: now,
+                last_written_at: None,
+                write_back_failures: 0,
+                write_back_retry_after: None,
+                status_comment_id: None,
+                checkpoint_comment_id: None,
+                job_result_comment_ids: HashMap::new(),
+            };
+            self.insert_work_item(&child).await?;
+            self.persist_task_projection(&child, None)
+                .await
+                .map_err(map_config)?;
+
+            let mut parent = item.clone();
+            parent.state = WorkItemState::Running;
+            parent.child_work_item_id = Some(child_id);
+            parent.updated_at = now;
+            parent.blocked_on = block_reason_for_state_name(&parent.current_step);
+            self.update_work_item(&parent).await?;
+            self.persist_task_projection(&parent, None)
+                .await
+                .map_err(map_config)?;
+
+            let child_step = child_workflow
+                .steps
+                .iter()
+                .find(|s| s.id == child.current_step)
+                .ok_or_else(|| anyhow::anyhow!("missing child entry step"))?;
+            if child_step.kind == WorkflowStepKind::Agent {
+                let selected_environment = self.selected_environment_for_context(&child.context);
+                let command = interpolate_template(&child_step.command, &child.context)?;
+                let args = child_step
+                    .args
+                    .iter()
+                    .map(|a| interpolate_template(a, &child.context))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let env = child_step
+                    .env
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), interpolate_template(v, &child.context)?)))
+                    .collect::<Result<HashMap<_, _>, InterpolationError>>()?;
+                let job = Job {
+                    id: Uuid::new_v4(),
+                    work_item_id: child.id,
+                    step_id: child_step.id.clone(),
+                    state: JobState::Pending,
+                    assigned_worker_id: None,
+                    execution_mode: child_step.executor.clone(),
+                    container_image: child_step.container_image.clone().or_else(|| {
+                        selected_environment
+                            .as_ref()
+                            .map(|(_, environment)| environment.image.clone())
+                    }),
+                    command,
+                    args,
+                    env,
+                    prompt: child_step.prompt.clone(),
+                    context: child.context.clone(),
+                    repo: child.repo.clone(),
+                    timeout_secs: child_step.timeout_secs,
+                    max_retries: child_step.max_retries,
+                    attempt: 0,
+                    transcript_dir: None,
+                    result: None,
+                    lease_expires_at: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let mut runtime = canonical_runtime_spec_for_job(&job);
+                // Triage jobs need LLM access for the AI agent to call the model.
+                runtime.environment.network_resources =
+                    Some(protocol::NetworkResourceRequest::Resources(vec![
+                        protocol::NetworkResourceKind::Llm,
+                    ]));
+                runtime.permissions.can_access_network = true;
+                let mut job = job;
+                let mut runtime = runtime;
+                if let Some((selection, environment)) = selected_environment.as_ref() {
+                    apply_environment_definition_to_runtime(
+                        &mut runtime,
+                        environment,
+                        child_step.container_image.is_some(),
+                    );
+                    project_environment_selection_into_job_context(
+                        &mut job.context,
+                        selection,
+                        self.overlays.as_slice(),
+                    );
+                    project_environment_runtime_into_job_context(
+                        &mut job.context,
+                        environment,
+                    );
+                }
+                let valid_next_events = self.projected_valid_next_events_for_job_context(&child);
+                project_workflow_inputs_into_job_context(
+                    &mut job.context,
+                    &valid_next_events,
+                    &child,
+                    &child.context,
+                );
+                project_runtime_spec_into_job_context(&mut job.context, &runtime);
+                project_approval_mode_into_job_context(
+                    &mut job.context,
+                    &child.context,
+                    self.force_gateway_approval_mode,
+                );
+                self.insert_job(&job).await?;
+            }
+
+            return Ok(());
+        }
+
+        let interpolation_context = interpolation_context_for_work_item(item, &step.id);
+        let command = interpolate_template(&step.command, &interpolation_context)?;
+        let args = step
+            .args
+            .iter()
+            .map(|a| interpolate_template(a, &interpolation_context))
+            .collect::<Result<Vec<_>, _>>()?;
+        let env = step
+            .env
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), interpolate_template(v, &interpolation_context)?)))
+            .collect::<Result<HashMap<_, _>, InterpolationError>>()?;
+
+        let now = Utc::now();
+        let selected_environment = self.selected_environment_for_context(&item.context);
+        let job = Job {
+            id: Uuid::new_v4(),
+            work_item_id: item.id,
+            step_id: step.id.clone(),
+            state: JobState::Pending,
+            assigned_worker_id: None,
+            execution_mode: step.executor.clone(),
+            container_image: step.container_image.clone().or_else(|| {
+                selected_environment
+                    .as_ref()
+                    .map(|(_, environment)| environment.image.clone())
+            }),
+            command,
+            args,
+            env,
+            prompt: step.prompt.clone(),
+            context: item.context.clone(),
+            repo: item.repo.clone(),
+            timeout_secs: step.timeout_secs,
+            max_retries: step.max_retries,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let runtime = canonical_runtime_spec_for_job(&job);
+        let mut job = job;
+        let mut runtime = runtime;
+        if let Some((selection, environment)) = selected_environment.as_ref() {
+            apply_environment_definition_to_runtime(
+                &mut runtime,
+                environment,
+                step.container_image.is_some(),
+            );
+            project_environment_selection_into_job_context(
+                &mut job.context,
+                selection,
+                self.overlays.as_slice(),
+            );
+            project_environment_runtime_into_job_context(&mut job.context, environment);
+        }
+        let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+        project_workflow_inputs_into_job_context(
+            &mut job.context,
+            &valid_next_events,
+            item,
+            &item.context,
+        );
+        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+        project_approval_mode_into_job_context(
+            &mut job.context,
+            &item.context,
+            self.force_gateway_approval_mode,
+        );
+        self.insert_job(&job).await
+    }
+
+    async fn has_pending_job_for_step(
+        &self,
+        work_item_id: Uuid,
+        step_id: &str,
+    ) -> anyhow::Result<bool> {
+        let path = Arc::clone(&self.db_path);
+        let step_id = step_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = Connection::open(path.as_path())?;
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM jobs WHERE work_item_id = ?1 AND step_id = ?2 AND state IN (?3, ?4, ?5) LIMIT 1",
+                    params![
+                        work_item_id.to_string(),
+                        step_id,
+                        JobState::Pending.to_string(),
+                        JobState::Assigned.to_string(),
+                        JobState::Running.to_string(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(exists.is_some())
+        })
+        .await?
+    }
+
+    async fn insert_work_item(&self, item: &WorkItem) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let mut item = item.clone();
+        self.refresh_operator_visibility_fields(&mut item);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "INSERT INTO work_items (id, workflow_id, external_task_id, external_task_source, title, description, labels_json, priority, session_id, current_step, projected_state, last_failure_reason, required_action_description, triage_status, human_gate, human_gate_state, blocked_on, state, context_json, repo_json, parent_work_item_id, parent_step_id, child_work_item_id, created_at, updated_at, last_written_at, write_back_failures, write_back_retry_after, status_comment_id, checkpoint_comment_id, job_result_comment_ids_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
+                params![
+                    item.id.to_string(),
+                    item.workflow_id,
+                    item.external_task_id,
+                    item.external_task_source,
+                    item.title,
+                    item.description,
+                    serde_json::to_string(&item.labels)?,
+                    item.priority,
+                    item.session_id.map(|s| s.to_string()),
+                    item.current_step,
+                    item.projected_state,
+                    item.last_failure_reason,
+                    item.required_action_description,
+                    item.triage_status,
+                    if item.human_gate { 1 } else { 0 },
+                    item.human_gate_state,
+                    item.blocked_on
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    item.state.to_string(),
+                    serde_json::to_string(&item.context)?,
+                    item.repo.as_ref().map(serde_json::to_string).transpose()?,
+                    item.parent_work_item_id.map(|v| v.to_string()),
+                    item.parent_step_id,
+                    item.child_work_item_id.map(|v| v.to_string()),
+                    item.created_at.to_rfc3339(),
+                    item.updated_at.to_rfc3339(),
+                    item.last_written_at.map(|t| t.to_rfc3339()),
+                    item.write_back_failures,
+                    item.write_back_retry_after.map(|t| t.to_rfc3339()),
+                    item.status_comment_id,
+                    item.checkpoint_comment_id,
+                    serde_json::to_string(&item.job_result_comment_ids)?,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn update_work_item(&self, item: &WorkItem) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let mut item = item.clone();
+        self.refresh_operator_visibility_fields(&mut item);
+        // Stamp `state_entered_at` whenever the work item's `current_step`
+        // moves. Centralised here so every transition site picks it up
+        // without us having to thread bookkeeping through 20+ assignment
+        // points. Used by `await_ci`-style timeout escalation.
+        stamp_state_entered_if_changed(&mut item);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "UPDATE work_items SET workflow_id = ?2, external_task_id = ?3, external_task_source = ?4, title = ?5, description = ?6, labels_json = ?7, priority = ?8, current_step = ?9, projected_state = ?10, last_failure_reason = ?11, required_action_description = ?12, triage_status = ?13, human_gate = ?14, human_gate_state = ?15, blocked_on = ?16, state = ?17, context_json = ?18, repo_json = ?19, parent_work_item_id = ?20, parent_step_id = ?21, child_work_item_id = ?22, updated_at = ?23, last_written_at = ?24, write_back_failures = ?25, write_back_retry_after = ?26, status_comment_id = ?27, checkpoint_comment_id = ?28, job_result_comment_ids_json = ?29 WHERE id = ?1",
+                params![
+                    item.id.to_string(),
+                    item.workflow_id,
+                    item.external_task_id,
+                    item.external_task_source,
+                    item.title,
+                    item.description,
+                    serde_json::to_string(&item.labels)?,
+                    item.priority,
+                    item.current_step,
+                    item.projected_state,
+                    item.last_failure_reason,
+                    item.required_action_description,
+                    item.triage_status,
+                    if item.human_gate { 1 } else { 0 },
+                    item.human_gate_state,
+                    item.blocked_on
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    item.state.to_string(),
+                    serde_json::to_string(&item.context)?,
+                    item.repo.as_ref().map(serde_json::to_string).transpose()?,
+                    item.parent_work_item_id.map(|v| v.to_string()),
+                    item.parent_step_id,
+                    item.child_work_item_id.map(|v| v.to_string()),
+                    item.updated_at.to_rfc3339(),
+                    item.last_written_at.map(|t| t.to_rfc3339()),
+                    item.write_back_failures,
+                    item.write_back_retry_after.map(|t| t.to_rfc3339()),
+                    item.status_comment_id,
+                    item.checkpoint_comment_id,
+                    serde_json::to_string(&item.job_result_comment_ids)?,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Shallow-merge a JSON object patch into a work item's `context`.
+    /// Used by the GitHub poller to attach `last_ci_failure` (and any
+    /// future event-scoped metadata) before firing the corresponding
+    /// workflow event, so the next state's job can read it from
+    /// `$AGENT_CONTEXT_PATH`.
+    ///
+    /// Top-level keys are replaced wholesale; we don't recursively
+    /// merge nested objects because the patches we emit are always
+    /// "the new authoritative snapshot of this concept" (latest CI
+    /// failure, latest poller observation, etc.) rather than partial
+    /// edits.
+    async fn merge_work_item_context_patch(
+        &self,
+        work_item_id: Uuid,
+        patch: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), AppError> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let mut item = self
+            .get_work_item(work_item_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(work_item_id.to_string()))?;
+        if !item.context.is_object() {
+            item.context = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(ctx_obj) = item.context.as_object_mut() {
+            for (key, value) in patch {
+                ctx_obj.insert(key, value);
+            }
+        }
+        self.update_work_item(&item).await.map_err(map_db)?;
+        Ok(())
+    }
+
+    pub(crate) async fn get_work_item(&self, id: Uuid) -> anyhow::Result<Option<WorkItem>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<WorkItem>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, workflow_id, external_task_id, external_task_source, title, description, labels_json, priority, session_id, current_step, projected_state, last_failure_reason, required_action_description, triage_status, human_gate, human_gate_state, blocked_on, state, context_json, repo_json, parent_work_item_id, parent_step_id, child_work_item_id, created_at, updated_at, last_written_at, write_back_failures, write_back_retry_after, status_comment_id, checkpoint_comment_id, job_result_comment_ids_json FROM work_items WHERE id = ?1",
+            )?;
+            let item = stmt
+                .query_row([id.to_string()], row_to_work_item)
+                .optional()?;
+            Ok(item)
+        })
+        .await?
+    }
+
+    async fn select_work_items(&self) -> anyhow::Result<Vec<WorkItem>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<WorkItem>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, workflow_id, external_task_id, external_task_source, title, description, labels_json, priority, session_id, current_step, projected_state, last_failure_reason, required_action_description, triage_status, human_gate, human_gate_state, blocked_on, state, context_json, repo_json, parent_work_item_id, parent_step_id, child_work_item_id, created_at, updated_at, last_written_at, write_back_failures, write_back_retry_after, status_comment_id, checkpoint_comment_id, job_result_comment_ids_json FROM work_items ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], row_to_work_item)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_children_for_parent_step(
+        &self,
+        parent_id: Uuid,
+        parent_step_id: &str,
+    ) -> anyhow::Result<Vec<WorkItem>> {
+        let path = Arc::clone(&self.db_path);
+        let parent_step_id = parent_step_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<WorkItem>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, workflow_id, external_task_id, external_task_source, title, description, labels_json, priority, session_id, current_step, projected_state, last_failure_reason, required_action_description, triage_status, human_gate, human_gate_state, blocked_on, state, context_json, repo_json, parent_work_item_id, parent_step_id, child_work_item_id, created_at, updated_at, last_written_at, write_back_failures, write_back_retry_after, status_comment_id, checkpoint_comment_id, job_result_comment_ids_json FROM work_items WHERE parent_work_item_id = ?1 AND parent_step_id = ?2 ORDER BY created_at ASC",
+            )?;
+            let rows =
+                stmt.query_map(params![parent_id.to_string(), parent_step_id], row_to_work_item)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_work_item_state_counts(&self) -> anyhow::Result<HashMap<String, usize>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<HashMap<String, usize>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM work_items GROUP BY state")?;
+            let rows = stmt.query_map([], |row| {
+                let state: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((state, count))
+            })?;
+            let mut out = HashMap::new();
+            for row in rows {
+                let (state, count) = row?;
+                out.insert(state, usize::try_from(count).unwrap_or_default());
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn insert_job(&self, job: &Job) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let mut job = job.clone();
+        let runtime = canonical_runtime_spec_for_job_effective(&job);
+        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                params![
+                    job.id.to_string(),
+                    job.work_item_id.to_string(),
+                    job.step_id,
+                    job.state.to_string(),
+                    job.assigned_worker_id,
+                    job.execution_mode.to_string(),
+                    job.container_image,
+                    job.command,
+                    serde_json::to_string(&job.args)?,
+                    serde_json::to_string(&job.env)?,
+                    job.prompt.as_ref().map(serde_json::to_string).transpose()?,
+                    serde_json::to_string(&job.context)?,
+                    job.repo.as_ref().map(serde_json::to_string).transpose()?,
+                    job.timeout_secs,
+                    job.max_retries,
+                    job.attempt,
+                    job.transcript_dir,
+                    job.result.as_ref().map(serde_json::to_string).transpose()?,
+                    job.lease_expires_at.map(|t| t.to_rfc3339()),
+                    job.created_at.to_rfc3339(),
+                    job.updated_at.to_rfc3339(),
+                    serde_json::to_string(&runtime)?,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn select_jobs(&self) -> anyhow::Result<Vec<Job>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], row_to_job)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_jobs_with_transcripts(&self) -> anyhow::Result<Vec<Job>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE transcript_dir IS NOT NULL ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map([], row_to_job)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_job_state_counts(&self) -> anyhow::Result<HashMap<String, usize>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<HashMap<String, usize>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM jobs GROUP BY state")?;
+            let rows = stmt.query_map([], |row| {
+                let state: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((state, count))
+            })?;
+            let mut out = HashMap::new();
+            for row in rows {
+                let (state, count) = row?;
+                out.insert(state, usize::try_from(count).unwrap_or_default());
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_recent_terminal_jobs(&self, limit: usize) -> anyhow::Result<Vec<Job>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE state IN (?1, ?2) ORDER BY updated_at DESC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    JobState::Succeeded.to_string(),
+                    JobState::Failed.to_string(),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                row_to_job,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_jobs_for_work_item(&self, work_item_id: Uuid) -> anyhow::Result<Vec<Job>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE work_item_id = ?1 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([work_item_id.to_string()], row_to_job)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    pub(crate) async fn get_job(&self, id: Uuid) -> anyhow::Result<Option<Job>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Job>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE id = ?1",
+            )?;
+            let job = stmt.query_row([id.to_string()], row_to_job).optional()?;
+            Ok(job)
+        })
+        .await?
+    }
+
+    async fn assign_next_job(
+        &self,
+        worker_id: String,
+        supported_modes: Vec<protocol::ExecutionMode>,
+    ) -> anyhow::Result<Option<Job>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Job>> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE state = ?1 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([JobState::Pending.to_string()], row_to_job)?;
+            for row in rows {
+                let mut job = row?;
+                let runtime_environment = canonical_runtime_spec_for_job_effective(&job).environment;
+                if !supported_modes.contains(&runtime_environment.execution_mode) {
+                    continue;
+                }
+                job.execution_mode = runtime_environment.execution_mode;
+                job.container_image = runtime_environment.container_image;
+                job.timeout_secs = runtime_environment.timeout_secs;
+                job.state = JobState::Assigned;
+                job.assigned_worker_id = Some(worker_id.clone());
+                job.lease_expires_at =
+                    Some(Utc::now() + chrono::TimeDelta::seconds(LEASE_TTL_SECS));
+                job.updated_at = Utc::now();
+                let updated = conn.execute(
+                    "UPDATE jobs SET state = ?2, assigned_worker_id = ?3, lease_expires_at = ?4, updated_at = ?5 WHERE id = ?1 AND state = ?6",
+                    params![
+                        job.id.to_string(),
+                        job.state.to_string(),
+                        job.assigned_worker_id,
+                        job.lease_expires_at.map(|t| t.to_rfc3339()),
+                        job.updated_at.to_rfc3339(),
+                        JobState::Pending.to_string(),
+                    ],
+                )?;
+                if updated == 1 {
+                    conn.execute_batch("COMMIT")?;
+                    return Ok(Some(job));
+                }
+            }
+            conn.execute_batch("COMMIT")?;
+            Ok(None)
+        })
+        .await?
+    }
+
+    async fn update_job_row(&self, job: &Job) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let job = job.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "UPDATE jobs SET state = ?2, assigned_worker_id = ?3, transcript_dir = ?4, result_json = ?5, lease_expires_at = ?6, updated_at = ?7 WHERE id = ?1",
+                params![
+                    job.id.to_string(),
+                    job.state.to_string(),
+                    job.assigned_worker_id,
+                    job.transcript_dir,
+                    job.result.as_ref().map(serde_json::to_string).transpose()?,
+                    job.lease_expires_at.map(|t| t.to_rfc3339()),
+                    job.updated_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn upsert_worker(&self, worker: &WorkerInfo) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let worker = worker.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "INSERT INTO workers (id, hostname, state, supported_modes_json, last_heartbeat_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET hostname = excluded.hostname, state = excluded.state, supported_modes_json = excluded.supported_modes_json, last_heartbeat_at = excluded.last_heartbeat_at",
+                params![
+                    worker.id,
+                    worker.hostname,
+                    worker.state.to_string(),
+                    serde_json::to_string(&worker.supported_modes)?,
+                    worker.last_heartbeat_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn get_worker(&self, worker_id: &str) -> anyhow::Result<Option<WorkerInfo>> {
+        let path = Arc::clone(&self.db_path);
+        let worker_id = worker_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<WorkerInfo>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, hostname, state, supported_modes_json, last_heartbeat_at FROM workers WHERE id = ?1",
+            )?;
+            let worker = stmt
+                .query_row([worker_id], |row| {
+                    Ok(WorkerInfo {
+                        id: row.get(0)?,
+                        hostname: row.get(1)?,
+                        state: row.get::<_, String>(2)?.parse().map_err(invalid_enum)?,
+                        supported_modes: serde_json::from_str(&row.get::<_, String>(3)?)
+                            .map_err(invalid_json)?,
+                        last_heartbeat_at: parse_datetime(&row.get::<_, String>(4)?)?,
+                    })
+                })
+                .optional()?;
+            Ok(worker)
+        })
+        .await?
+    }
+
+    async fn select_workers(&self) -> anyhow::Result<Vec<WorkerInfo>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<WorkerInfo>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, hostname, state, supported_modes_json, last_heartbeat_at FROM workers ORDER BY id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(WorkerInfo {
+                    id: row.get(0)?,
+                    hostname: row.get(1)?,
+                    state: row.get::<_, String>(2)?.parse().map_err(invalid_enum)?,
+                    supported_modes: serde_json::from_str(&row.get::<_, String>(3)?)
+                        .map_err(invalid_json)?,
+                    last_heartbeat_at: parse_datetime(&row.get::<_, String>(4)?)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_worker_state_counts(&self) -> anyhow::Result<HashMap<String, usize>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<HashMap<String, usize>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM workers GROUP BY state")?;
+            let rows = stmt.query_map([], |row| {
+                let state: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((state, count))
+            })?;
+            let mut out = HashMap::new();
+            for row in rows {
+                let (state, count) = row?;
+                out.insert(state, usize::try_from(count).unwrap_or_default());
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_human_gate_work_items(&self, limit: usize) -> anyhow::Result<Vec<WorkItem>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<WorkItem>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, workflow_id, external_task_id, external_task_source, title, description, labels_json, priority, session_id, current_step, projected_state, last_failure_reason, required_action_description, triage_status, human_gate, human_gate_state, blocked_on, state, context_json, repo_json, parent_work_item_id, parent_step_id, child_work_item_id, created_at, updated_at, last_written_at, write_back_failures, write_back_retry_after, status_comment_id, checkpoint_comment_id, job_result_comment_ids_json FROM work_items WHERE required_action_description IS NOT NULL AND required_action_description != '' ORDER BY updated_at DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], row_to_work_item)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+
+    async fn select_triage_work_items(&self, limit: usize) -> anyhow::Result<Vec<WorkItem>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<WorkItem>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id, workflow_id, external_task_id, external_task_source, title, description, labels_json, priority, session_id, current_step, projected_state, last_failure_reason, required_action_description, triage_status, human_gate, human_gate_state, blocked_on, state, context_json, repo_json, parent_work_item_id, parent_step_id, child_work_item_id, created_at, updated_at, last_written_at, write_back_failures, write_back_retry_after, status_comment_id, checkpoint_comment_id, job_result_comment_ids_json FROM work_items WHERE triage_status IS NOT NULL AND triage_status != '' AND triage_status != 'ready' ORDER BY updated_at DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], row_to_work_item)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await?
+    }
+}
+
+fn triage_workflow_id_from_output(output: &serde_json::Value) -> Option<String> {
+    output
+        .get("workflow_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            output
+                .get("workflow")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|workflow| workflow.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn discovered_repo_catalog_entries(repos: &[DiscoveredRepo]) -> Vec<serde_json::Value> {
+    repos
+        .iter()
+        .map(|repo| {
+            let description = if let Some(remote) = repo.remote_url.as_deref() {
+                format!("{} (remote: {remote})", repo.name)
+            } else {
+                format!("{} (remote: none)", repo.name)
+            };
+            serde_json::json!({
+                "repo_url": repo.local_path,
+                "base_ref": "origin/main",
+                "description": description,
+            })
+        })
+        .collect()
+}
+
+fn discovered_repo_catalog_hint(repos: &[DiscoveredRepo]) -> String {
+    repos
+        .iter()
+        .map(|repo| {
+            if let Some(remote) = repo.remote_url.as_deref() {
+                format!("- {} — {} (remote: {remote})", repo.name, repo.local_path)
+            } else {
+                format!("- {} — {} (remote: none)", repo.name, repo.local_path)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_valid_repo_source(repo: &protocol::RepoSource) -> bool {
+    let repo_url = repo.repo_url.trim();
+    let base_ref = repo.base_ref.trim();
+    !repo_url.is_empty() && !is_placeholder_repo_url(repo_url) && !base_ref.is_empty()
+}
+
+fn is_placeholder_repo_url(repo_url: &str) -> bool {
+    let normalized = repo_url.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "unknown"
+            | "n/a"
+            | "none"
+            | "null"
+            | "placeholder"
+            | "repo"
+            | "repo_url"
+            | "todo"
+            | "tbd"
+            | "https://github.com/org/repo"
+            | "https://example/repo"
+            | "https://example/repo.git"
+    )
+}
+
+fn external_task_not_found_id(error: &anyhow::Error) -> Option<String> {
+    for cause in error.chain() {
+        if let Some(typed) = cause.downcast_ref::<TaskAdapterError>() {
+            return match typed {
+                TaskAdapterError::TaskNotFound { task_id } => Some(task_id.clone()),
+            };
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenanceStats {
+    pub requeued_jobs: usize,
+    pub created_jobs: usize,
+    pub lease_requeued_jobs: usize,
+    pub github_fired_events: usize,
+}
+
+fn map_db(e: anyhow::Error) -> AppError {
+    AppError::Config(format!("db operation failed: {e}"))
+}
+
+fn map_config(e: anyhow::Error) -> AppError {
+    AppError::Config(format!("orchestration adapter/config failed: {e}"))
+}
+
+fn validate_job_transition(from: JobState, to: JobState) -> Result<(), JobTransitionError> {
+    let valid = match from {
+        JobState::Pending => matches!(to, JobState::Assigned | JobState::Cancelled),
+        JobState::Assigned => matches!(to, JobState::Running | JobState::Cancelled),
+        JobState::Running => matches!(
+            to,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ),
+        JobState::Succeeded | JobState::Failed | JobState::Cancelled => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(JobTransitionError::InvalidTransition { from, to })
+    }
+}
+
+fn interpolate_template(
+    template: &str,
+    context: &serde_json::Value,
+) -> Result<String, InterpolationError> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find("}}")
+            .ok_or(InterpolationError::UnterminatedPlaceholder)?;
+        let path = after[..end].trim();
+        let value = resolve_context_path(context, path)
+            .ok_or_else(|| InterpolationError::MissingPath(path.to_string()))?;
+        let scalar = match value {
+            serde_json::Value::String(v) => v.clone(),
+            serde_json::Value::Bool(v) => v.to_string(),
+            serde_json::Value::Number(v) => v.to_string(),
+            serde_json::Value::Null => String::new(),
+            _ => return Err(InterpolationError::NonScalarValue(path.to_string())),
+        };
+        out.push_str(&scalar);
+        rest = &after[end + 2..];
+    }
+
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn interpolation_context_for_work_item(item: &WorkItem, state_name: &str) -> serde_json::Value {
+    let base_context = item
+        .context
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+
+    let mut context = serde_json::Map::new();
+    if item.workflow_id == TRIAGE_WORKFLOW_ID {
+        context.insert(
+            CONTEXT_REPO_CATALOG_HINT_KEY.to_string(),
+            base_context
+                .get(CONTEXT_REPO_CATALOG_HINT_KEY)
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(String::new())),
+        );
+        context.insert(
+            CONTEXT_REPO_CATALOG_KEY.to_string(),
+            base_context
+                .get(CONTEXT_REPO_CATALOG_KEY)
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        );
+    }
+    context.extend(base_context);
+
+    context.insert(
+        "title".to_string(),
+        serde_json::Value::String(item.title.clone().unwrap_or_default()),
+    );
+    context.insert(
+        "description".to_string(),
+        serde_json::Value::String(item.description.clone().unwrap_or_default()),
+    );
+    context.insert(
+        "repo".to_string(),
+        serde_json::Value::String(repo_name_for_interpolation(item.repo.as_ref())),
+    );
+    context.insert(
+        "branch".to_string(),
+        serde_json::Value::String(
+            item.repo
+                .as_ref()
+                .and_then(|repo| {
+                    repo.branch_name
+                        .clone()
+                        .or_else(|| Some(repo.base_ref.clone()))
+                })
+                .unwrap_or_default(),
+        ),
+    );
+    context.insert(
+        "work_item_id".to_string(),
+        serde_json::Value::String(item.id.to_string()),
+    );
+    context.insert(
+        "state".to_string(),
+        serde_json::Value::String(state_name.to_string()),
+    );
+
+    serde_json::Value::Object(context)
+}
+
+fn repo_name_for_interpolation(repo: Option<&protocol::RepoSource>) -> String {
+    let Some(repo) = repo else {
+        return String::new();
+    };
+
+    let trimmed = repo.repo_url.trim_end_matches('/');
+    trimmed
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .or_else(|| trimmed.rsplit_once(':').map(|(_, tail)| tail))
+        .unwrap_or(trimmed)
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+fn checkpoint_is_post_triage(checkpoint: &TaskCheckpoint) -> bool {
+    checkpoint.phase != "triage"
+        && checkpoint.workflow_id != "__triage__"
+        && checkpoint.current_step != "triage"
+}
+
+fn apply_triage_result_recovery_context(
+    context: &mut serde_json::Value,
+    triage_result: &TriageResult,
+) {
+    let Some(obj) = context.as_object_mut() else {
+        return;
+    };
+    if let Some(workflow_id) = triage_result.workflow_id.as_ref() {
+        obj.insert(
+            "workflow_id".to_string(),
+            serde_json::Value::String(workflow_id.clone()),
+        );
+    }
+    if let Some(repo) = triage_result.repo.as_ref() {
+        obj.insert("repo".to_string(), serde_json::Value::String(repo.clone()));
+    }
+    if let Some(environment) = triage_result.environment.as_ref()
+        && let Ok(value) = serde_json::to_value(environment)
+    {
+        obj.insert("environment".to_string(), value);
+    }
+    if let Some(agent_summary) = triage_result.agent_summary.as_ref() {
+        obj.insert(
+            "triage_agent_summary".to_string(),
+            serde_json::Value::String(agent_summary.clone()),
+        );
+    }
+    if let Some(scope) = triage_result.scope.as_ref() {
+        obj.insert(
+            "triage_scope".to_string(),
+            serde_json::Value::String(scope.clone()),
+        );
+    }
+    if let Some(complexity) = triage_result.complexity.as_ref() {
+        obj.insert(
+            "triage_complexity".to_string(),
+            serde_json::Value::String(complexity.clone()),
+        );
+    }
+    if let Some(plan_files) = triage_result.plan_files.as_ref()
+        && let Ok(value) = serde_json::to_value(plan_files)
+    {
+        obj.insert("triage_plan_files".to_string(), value);
+    }
+    if let Some(plan_approach) = triage_result.plan_approach.as_ref()
+        && let Ok(value) = serde_json::to_value(plan_approach)
+    {
+        obj.insert("triage_plan_approach".to_string(), value);
+    }
+    if let Some(plan_risks) = triage_result.plan_risks.as_ref()
+        && let Ok(value) = serde_json::to_value(plan_risks)
+    {
+        obj.insert("triage_plan_risks".to_string(), value);
+    }
+}
+
+fn checkpoint_matches_known_workflow(
+    service: &OrchestrationService,
+    checkpoint: &TaskCheckpoint,
+) -> bool {
+    if let Some(workflow) = service.workflows.get(&checkpoint.workflow_id) {
+        return workflow
+            .steps
+            .iter()
+            .any(|step| step.id == checkpoint.current_step);
+    }
+    if let Some(workflow) = service.workflows.get_reactive(&checkpoint.workflow_id) {
+        return workflow
+            .states
+            .iter()
+            .any(|state| state.id == checkpoint.current_step);
+    }
+    false
+}
+
+fn repo_source_from_checkpoint_repo(repo: &str) -> Option<RepoSource> {
+    let trimmed = repo.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (owner, name) = trimmed.split_once('/')?;
+    let owner = owner.trim();
+    let mut name = name.trim().trim_end_matches('/').to_string();
+    if name.ends_with(".git") {
+        name.truncate(name.len().saturating_sub(4));
+    }
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    Some(RepoSource {
+        repo_url: format!("https://github.com/{owner}/{name}.git"),
+        base_ref: "origin/main".to_string(),
+        branch_name: None,
+    })
+}
+
+fn resolve_context_path<'a>(
+    ctx: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = ctx;
+    for part in path.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        if let Ok(idx) = part.parse::<usize>() {
+            current = current.as_array()?.get(idx)?;
+        } else {
+            current = current.as_object()?.get(part)?;
+        }
+    }
+    Some(current)
+}
+
+fn extract_environment_selection_from_context(
+    context: &serde_json::Value,
+) -> Option<EnvironmentSelection> {
+    let obj = context.as_object()?;
+    if let Some(value) = obj.get("environment")
+        && let Some(selection) = parse_environment_selection_value(value)
+    {
+        return Some(selection);
+    }
+
+    if let Some(base) = obj
+        .get("environment_base")
+        .and_then(serde_json::Value::as_str)
+    {
+        let overlays = obj
+            .get("overlays")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return Some(EnvironmentSelection {
+            base: base.to_string(),
+            overlays,
+        });
+    }
+
+    None
+}
+
+fn parse_environment_selection_value(value: &serde_json::Value) -> Option<EnvironmentSelection> {
+    match value {
+        serde_json::Value::String(base) if !base.trim().is_empty() => Some(EnvironmentSelection {
+            base: base.trim().to_string(),
+            overlays: Vec::new(),
+        }),
+        serde_json::Value::Object(map) => {
+            let base = map.get("base")?.as_str()?.trim();
+            if base.is_empty() {
+                return None;
+            }
+            let overlays = map
+                .get("overlays")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Some(EnvironmentSelection {
+                base: base.to_string(),
+                overlays,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn project_environment_selection_into_context(
+    context: &mut serde_json::Value,
+    selection: &EnvironmentSelection,
+    environment: &EnvironmentDefinition,
+) {
+    if !context.is_object() {
+        *context = serde_json::json!({});
+    }
+    let Some(obj) = context.as_object_mut() else {
+        return;
+    };
+    let mut env_obj = serde_json::json!({
+        "base": selection.base,
+        "overlays": selection.overlays,
+        "approval_mode": environment.approval_mode,
+    });
+    if let Some(runtime) = &environment.runtime
+        && let Some(env_obj_map) = env_obj.as_object_mut()
+    {
+        env_obj_map.insert(
+            "runtime".to_string(),
+            serde_json::Value::String(runtime.clone()),
+        );
+    }
+    obj.insert("environment".to_string(), env_obj);
+}
+
+fn project_environment_selection_into_job_context(
+    context: &mut serde_json::Value,
+    selection: &EnvironmentSelection,
+    overlays_catalog: &[EnvironmentOverlay],
+) {
+    if !context.is_object() {
+        *context = serde_json::json!({});
+    }
+    let Some(obj) = context.as_object_mut() else {
+        return;
+    };
+    let overlays = selection
+        .overlays
+        .iter()
+        .filter_map(|overlay_name| {
+            overlays_catalog
+                .iter()
+                .find(|overlay| overlay.name == *overlay_name)
+                .and_then(|overlay| serde_json::to_value(overlay).ok())
+        })
+        .collect::<Vec<_>>();
+
+    obj.insert("overlays".to_string(), serde_json::Value::Array(overlays));
+    obj.insert(
+        "environment_base".to_string(),
+        serde_json::Value::String(selection.base.clone()),
+    );
+    // environment_runtime is set later by the caller when the EnvironmentDefinition
+    // is available; see callers of this function.
+}
+
+pub(super) fn project_environment_runtime_into_job_context(
+    context: &mut serde_json::Value,
+    environment: &EnvironmentDefinition,
+) {
+    let Some(runtime) = environment.runtime.as_ref() else {
+        return;
+    };
+    let trimmed = runtime.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !context.is_object() {
+        *context = serde_json::json!({});
+    }
+    let Some(obj) = context.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "environment_runtime".to_string(),
+        serde_json::Value::String(trimmed.to_string()),
+    );
+    if let Some(env_obj) = obj
+        .get_mut("environment")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        env_obj.insert(
+            "runtime".to_string(),
+            serde_json::Value::String(trimmed.to_string()),
+        );
+    }
+}
+
+fn apply_environment_definition_to_runtime(
+    runtime: &mut CanonicalRuntimeSpec,
+    environment: &EnvironmentDefinition,
+    container_image_overridden: bool,
+) {
+    if !container_image_overridden {
+        runtime.environment.container_image = Some(environment.image.clone());
+    }
+    // For raw-mode steps, skip environment network overrides since the local-agent
+    // cannot enforce restricted egress outside Docker containers.
+    //
+    // For Docker-mode steps, the workflow author can express an explicit
+    // `network_resources` (parsed from workflow.toml into
+    // `runtime.environment.network_resources` upstream). When they have, we
+    // honour it — workflow definitions are reviewed code, so they have
+    // authority over the environment's default `network_class`. The environment
+    // policy only fills in for steps that didn't ask for anything.
+    if runtime.environment.execution_mode != protocol::ExecutionMode::Raw {
+        if runtime.environment.network_resources.is_none() {
+            runtime.environment.network = Some(environment.network_class.clone());
+            runtime.environment.network_resources =
+                network_request_from_legacy_label(Some(environment.network_class.as_str()));
+        } else {
+            runtime.environment.network = legacy_network_label_for_request(
+                runtime.environment.network_resources.as_ref(),
+            );
+        }
+        runtime.permissions = canonical_permissions_for_environment(&runtime.environment);
+        if let Some(request) = &runtime.environment.network_resources {
+            runtime.permissions.can_access_network =
+                !matches!(request, NetworkResourceRequest::None);
+        }
+    }
+    runtime.approval_rules = Some(default_approval_rules_for_tier(
+        &runtime.environment.tier,
+        runtime.environment.network.as_deref(),
+    ));
+}
+
+#[allow(dead_code)]
+fn environment_base_from_context(context: &serde_json::Value) -> Option<String> {
+    context
+        .get("environment")
+        .and_then(|value| match value {
+            serde_json::Value::Object(map) => map.get("base").and_then(serde_json::Value::as_str),
+            serde_json::Value::String(base) => Some(base.as_str()),
+            _ => None,
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn merge_child_result_into_parent_context(
+    parent: &mut WorkItem,
+    child: &WorkItem,
+) -> Result<(), String> {
+    if !parent.context.is_object() {
+        parent.context = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let obj = parent
+        .context
+        .as_object_mut()
+        .ok_or_else(|| "failed to normalize parent context object".to_string())?;
+
+    let entry = obj
+        .entry("child_results".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let map = entry
+        .as_object_mut()
+        .ok_or_else(|| "context.child_results must be an object".to_string())?;
+
+    let key = child
+        .parent_step_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    map.insert(
+        key,
+        serde_json::json!({
+            "child_work_item_id": child.id,
+            "state": child.state,
+            "workflow_id": child.workflow_id,
+            "job_outputs": child.context.get(CONTEXT_JOB_OUTPUTS_KEY).cloned().unwrap_or(serde_json::Value::Null),
+            "job_results": child.context.get(CONTEXT_JOB_RESULTS_KEY).cloned().unwrap_or(serde_json::Value::Null),
+            "job_artifact_paths": child.context.get(CONTEXT_JOB_ARTIFACT_PATHS_KEY).cloned().unwrap_or(serde_json::Value::Null),
+            "job_artifact_metadata": child.context.get(CONTEXT_JOB_ARTIFACT_METADATA_KEY).cloned().unwrap_or(serde_json::Value::Null),
+            "job_artifact_data": child.context.get(CONTEXT_JOB_ARTIFACT_DATA_KEY).cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    );
+    Ok(())
+}
+
+fn job_structured_artifact_paths(
+    result: &protocol::JobResult,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    project_legacy_artifact_summary_paths(&result.artifacts, &mut out);
+    for artifact in &result.artifacts.structured_transcript_artifacts {
+        out.insert(
+            artifact.key.clone(),
+            serde_json::Value::String(artifact.path.clone()),
+        );
+    }
+    out
+}
+
+fn job_structured_artifact_metadata(
+    result: &protocol::JobResult,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    project_legacy_artifact_summary_metadata(&result.artifacts, &mut out);
+    for artifact in &result.artifacts.structured_transcript_artifacts {
+        let mut artifact_obj = serde_json::Map::new();
+        artifact_obj.insert(
+            "path".to_string(),
+            serde_json::Value::String(artifact.path.clone()),
+        );
+        if let Some(bytes) = artifact.bytes {
+            artifact_obj.insert("bytes".to_string(), serde_json::Value::Number(bytes.into()));
+        }
+        if let Some(schema) = &artifact.schema {
+            artifact_obj.insert(
+                "schema".to_string(),
+                serde_json::Value::String(schema.clone()),
+            );
+        }
+        if let Some(record_count) = artifact.record_count {
+            artifact_obj.insert(
+                "record_count".to_string(),
+                serde_json::Value::Number(record_count.into()),
+            );
+        }
+        out.insert(
+            artifact.key.clone(),
+            serde_json::Value::Object(artifact_obj),
+        );
+    }
+    out
+}
+
+fn job_structured_artifact_data(
+    result: &protocol::JobResult,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for artifact in &result.artifacts.structured_transcript_artifacts {
+        if let Some(inline) = structured_artifact_inline_data(artifact) {
+            out.insert(artifact.key.clone(), inline);
+        }
+    }
+    out
+}
+
+fn non_empty_artifact_path(path: Option<&str>) -> Option<String> {
+    path.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn project_legacy_artifact_summary_paths(
+    artifacts: &protocol::ArtifactSummary,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let entries = [
+        (
+            "stdout_log",
+            non_empty_artifact_path(Some(artifacts.stdout_path.as_str())),
+        ),
+        (
+            "stderr_log",
+            non_empty_artifact_path(Some(artifacts.stderr_path.as_str())),
+        ),
+        (
+            "output_json",
+            non_empty_artifact_path(artifacts.output_path.as_deref()),
+        ),
+        (
+            "transcript_dir",
+            non_empty_artifact_path(artifacts.transcript_dir.as_deref()),
+        ),
+    ];
+
+    for (key, path) in entries {
+        let Some(path) = path else {
+            continue;
+        };
+        out.insert(key.to_string(), serde_json::Value::String(path));
+    }
+}
+
+fn project_legacy_artifact_summary_metadata(
+    artifacts: &protocol::ArtifactSummary,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let entries = [
+        (
+            "stdout_log",
+            non_empty_artifact_path(Some(artifacts.stdout_path.as_str())),
+            artifacts.stdout_bytes,
+        ),
+        (
+            "stderr_log",
+            non_empty_artifact_path(Some(artifacts.stderr_path.as_str())),
+            artifacts.stderr_bytes,
+        ),
+        (
+            "output_json",
+            non_empty_artifact_path(artifacts.output_path.as_deref()),
+            artifacts.output_bytes,
+        ),
+        (
+            "transcript_dir",
+            non_empty_artifact_path(artifacts.transcript_dir.as_deref()),
+            None,
+        ),
+    ];
+
+    for (key, path, bytes) in entries {
+        let Some(path) = path else {
+            continue;
+        };
+        let mut artifact_obj = serde_json::Map::new();
+        artifact_obj.insert("path".to_string(), serde_json::Value::String(path));
+        if let Some(bytes) = bytes {
+            artifact_obj.insert("bytes".to_string(), serde_json::Value::Number(bytes.into()));
+        }
+        out.insert(key.to_string(), serde_json::Value::Object(artifact_obj));
+    }
+}
+
+fn structured_artifact_inline_data(
+    artifact: &protocol::StructuredTranscriptArtifact,
+) -> Option<serde_json::Value> {
+    match artifact.key.as_str() {
+        "transcript_jsonl" => artifact.inline_json.clone(),
+        "agent_context"
+            if artifact.schema.as_deref() == Some(protocol::AGENT_CONTEXT_SCHEMA_NAME) =>
+        {
+            artifact.inline_json.clone()
+        }
+        "run_json" if artifact.schema.as_deref() == Some(protocol::JOB_RUN_SCHEMA_NAME) => {
+            artifact.inline_json.clone()
+        }
+        "job_events" if artifact.schema.as_deref() == Some(protocol::JOB_EVENT_SCHEMA_NAME) => {
+            artifact.inline_json.clone()
+        }
+        _ => None,
+    }
+}
+
+/// Stamp `context.state_entered_at` to "now" when the work item's
+/// `current_step` field has moved relative to the snapshot recorded in
+/// `context.state_entered_for`. Used by `await_ci`-style timeout
+/// escalation to know how long we've been parked at the current state.
+///
+/// This is intentionally driven from the persistence path rather than
+/// the transition sites: every state change goes through
+/// `update_work_item`, so stamping here makes it impossible to forget.
+/// The bookkeeping cost is two JSON map inserts on transitions and zero
+/// otherwise (since the field already matches `current_step`).
+fn stamp_state_entered_if_changed(item: &mut WorkItem) {
+    let new_step = item.current_step.clone();
+    if !item.context.is_object() {
+        item.context = serde_json::json!({});
+    }
+    let Some(obj) = item.context.as_object_mut() else {
+        return;
+    };
+    let prior = obj
+        .get("state_entered_for")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if prior.as_deref() == Some(new_step.as_str()) {
+        return;
+    }
+    obj.insert(
+        "state_entered_for".to_string(),
+        serde_json::Value::String(new_step),
+    );
+    obj.insert(
+        "state_entered_at".to_string(),
+        serde_json::Value::String(Utc::now().to_rfc3339()),
+    );
+}
+
+/// Read `context.state_entered_at` if present.
+fn state_entered_at_from_context(context: &serde_json::Value) -> Option<DateTime<Utc>> {
+    context
+        .get("state_entered_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn merge_task_metadata(context: &serde_json::Value, task: &TaskToolRecord) -> serde_json::Value {
+    let mut out = if context.is_object() {
+        context.clone()
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "task_title".to_string(),
+            serde_json::Value::String(task.title.clone()),
+        );
+        if let Some(description) = &task.description {
+            obj.insert(
+                "task_description".to_string(),
+                serde_json::Value::String(description.clone()),
+            );
+        }
+        if let Some(owner_login) = task
+            .context
+            .get("owner_github_login")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            obj.insert(
+                "owner_github_login".to_string(),
+                serde_json::Value::String(owner_login.to_string()),
+            );
+        }
+    }
+    out
+}
+
+fn with_operator_login_context(
+    mut context: serde_json::Value,
+    operator_login: Option<&str>,
+) -> serde_json::Value {
+    let Some(login) = operator_login
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return context;
+    };
+    if !context.is_object() {
+        context = serde_json::json!({});
+    }
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert(
+            "owner_login".to_string(),
+            serde_json::Value::String(login.to_string()),
+        );
+    }
+    context
+}
+
+fn should_track_github_pr_state_for_event(event: &WorkflowEventKind) -> bool {
+    matches!(
+        event,
+        WorkflowEventKind::PrCreated
+            | WorkflowEventKind::PrApproved
+            | WorkflowEventKind::OwnerPrApproved
+            | WorkflowEventKind::CoworkerPrApproved
+            | WorkflowEventKind::PrChangesRequested
+            | WorkflowEventKind::OwnerChangesRequested
+            | WorkflowEventKind::CoworkerChangesRequested
+            | WorkflowEventKind::ChecksPassed
+            | WorkflowEventKind::ChecksFailed
+            | WorkflowEventKind::PrMerged
+    )
+}
+
+fn merge_task_action_revision(
+    context: serde_json::Value,
+    action_revision: u64,
+) -> serde_json::Value {
+    let mut ctx = if context.is_object() {
+        context
+    } else {
+        serde_json::json!({})
+    };
+    let obj = ctx.as_object_mut().expect("context normalized to object");
+    let adapter_entry = obj
+        .entry("task_adapter".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(adapter_obj) = adapter_entry.as_object_mut() {
+        adapter_obj.insert(
+            "last_action_revision".to_string(),
+            serde_json::Value::Number(action_revision.into()),
+        );
+    }
+    ctx
+}
+
+fn clone_context_object_field_or_empty(
+    context: &serde_json::Value,
+    key: &str,
+) -> serde_json::Value {
+    context
+        .as_object()
+        .and_then(|obj| obj.get(key))
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .map(serde_json::Value::Object)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+}
+
+fn project_workflow_inputs_into_job_context(
+    context: &mut serde_json::Value,
+    valid_next_events: &[WorkflowEventKind],
+    item: &WorkItem,
+    work_item_context: &serde_json::Value,
+) {
+    if !context.is_object() {
+        *context = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(ctx_obj) = context.as_object_mut() else {
+        return;
+    };
+
+    let workflow_entry = ctx_obj
+        .entry(CONTEXT_WORKFLOW_KEY.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !workflow_entry.is_object() {
+        *workflow_entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(workflow_obj) = workflow_entry.as_object_mut() else {
+        return;
+    };
+
+    let inputs_entry = workflow_obj
+        .entry(CONTEXT_WORKFLOW_INPUTS_KEY.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !inputs_entry.is_object() {
+        *inputs_entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(inputs_obj) = inputs_entry.as_object_mut() else {
+        return;
+    };
+
+    let valid_event_names = valid_next_events
+        .iter()
+        .map(workflow_event_kind_name)
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>();
+    inputs_obj.insert(
+        CONTEXT_VALID_NEXT_EVENTS_KEY.to_string(),
+        serde_json::Value::Array(valid_event_names),
+    );
+    inputs_obj.insert(
+        CONTEXT_JOB_ARTIFACT_PATHS_KEY.to_string(),
+        clone_context_object_field_or_empty(work_item_context, CONTEXT_JOB_ARTIFACT_PATHS_KEY),
+    );
+    inputs_obj.insert(
+        CONTEXT_JOB_ARTIFACT_METADATA_KEY.to_string(),
+        clone_context_object_field_or_empty(work_item_context, CONTEXT_JOB_ARTIFACT_METADATA_KEY),
+    );
+
+    ctx_obj.insert(
+        CONTEXT_WORK_ITEM_KEY.to_string(),
+        serde_json::json!({
+            "id": item.id,
+            "title": &item.title,
+            "description": &item.description,
+            "labels": &item.labels,
+            "priority": &item.priority,
+            "workflow_state": &item.current_step,
+            "workflow_id": &item.workflow_id,
+            "owner_github_login": work_item_context
+                .as_object()
+                .and_then(|obj| obj.get("owner_github_login"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "repo_catalog": work_item_context
+                .as_object()
+                .and_then(|obj| obj.get(CONTEXT_REPO_CATALOG_KEY))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+        }),
+    );
+}
+
+fn repo_source_from_repo_catalog_entry(entry: &serde_json::Value) -> Option<RepoSource> {
+    let obj = entry.as_object()?;
+    let repo_url = obj
+        .get("repo_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let base_ref = obj
+        .get("base_ref")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("origin/main")
+        .to_string();
+    let branch_name = obj
+        .get("branch_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Some(RepoSource {
+        repo_url,
+        base_ref,
+        branch_name,
+    })
+}
+
+fn repo_catalog_candidates_from_context(context: &serde_json::Value) -> Vec<RepoSource> {
+    context
+        .as_object()
+        .and_then(|obj| obj.get(CONTEXT_REPO_CATALOG_KEY))
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(repo_source_from_repo_catalog_entry)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn merged_reactive_candidate_repos(
+    execution: Option<&protocol::ReactiveExecutionConfig>,
+    context: &serde_json::Value,
+) -> Vec<RepoSource> {
+    let mut merged = Vec::new();
+    if let Some(configured) = execution.map(|cfg| cfg.candidate_repos.clone()) {
+        merged.extend(configured);
+    }
+    merged.extend(repo_catalog_candidates_from_context(context));
+
+    let mut seen = HashSet::new();
+    merged
+        .into_iter()
+        .filter(|repo| {
+            let key = repo.repo_url.trim().to_string();
+            !key.is_empty() && seen.insert(key)
+        })
+        .collect()
+}
+
+fn project_reactive_execution_markers_into_job_context(
+    context: &mut serde_json::Value,
+    state_kind: protocol::ReactiveStateKind,
+    managed_operation: Option<&str>,
+) {
+    if !context.is_object() {
+        *context = serde_json::json!({});
+    }
+    let Some(ctx_obj) = context.as_object_mut() else {
+        return;
+    };
+
+    let workflow_entry = ctx_obj
+        .entry(CONTEXT_WORKFLOW_KEY.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !workflow_entry.is_object() {
+        *workflow_entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(workflow_obj) = workflow_entry.as_object_mut() else {
+        return;
+    };
+
+    workflow_obj.insert(
+        CONTEXT_JOB_EXECUTION_KIND_KEY.to_string(),
+        serde_json::Value::String(reactive_state_kind_name(state_kind)),
+    );
+    match managed_operation {
+        Some(operation) if !operation.trim().is_empty() => {
+            workflow_obj.insert(
+                CONTEXT_MANAGED_OPERATION_KEY.to_string(),
+                serde_json::Value::String(operation.to_string()),
+            );
+        }
+        _ => {
+            workflow_obj.remove(CONTEXT_MANAGED_OPERATION_KEY);
+        }
+    }
+}
+
+fn runtime_spec_for_reactive_agent_state(
+    state: &protocol::ReactiveWorkflowState,
+    item: &WorkItem,
+    job: &Job,
+) -> CanonicalRuntimeSpec {
+    let execution = state.config.execution();
+    let execution_mode = match execution.and_then(|config| config.environment_tier.clone()) {
+        Some(PlannedEnvironmentTier::Docker) => protocol::ExecutionMode::Docker,
+        Some(PlannedEnvironmentTier::Raw) => protocol::ExecutionMode::Raw,
+        Some(PlannedEnvironmentTier::Kubernetes) => job.execution_mode.clone(),
+        None => execution
+            .and_then(|config| config.executor.clone())
+            .unwrap_or_else(|| job.execution_mode.clone()),
+    };
+    let timeout_secs = execution
+        .and_then(|config| config.timeout)
+        .or(execution.and_then(|config| config.timeout_secs))
+        .or(job.timeout_secs);
+    let mut environment = canonical_environment_for_execution(
+        execution_mode,
+        execution
+            .and_then(|config| config.container_image.clone())
+            .or_else(|| job.container_image.clone()),
+        timeout_secs,
+    );
+    if let Some(environment_tier) = execution.and_then(|config| config.environment_tier.clone()) {
+        environment.tier = environment_tier.clone();
+    }
+    environment.network_resources = execution
+        .and_then(|config| config.network_resources.clone())
+        .or_else(|| {
+            network_request_from_legacy_label(
+                execution.and_then(|config| config.network.as_deref()),
+            )
+        });
+    environment.network = legacy_network_label_for_request(environment.network_resources.as_ref());
+    environment.toolchains = execution
+        .and_then(|config| config.toolchains.clone())
+        .unwrap_or_default();
+
+    let mut permissions = canonical_permissions_for_environment(&environment);
+    if let Some(request) = &environment.network_resources {
+        permissions.can_access_network = !matches!(request, NetworkResourceRequest::None);
+    }
+
+    let mut runtime = CanonicalRuntimeSpec {
+        runtime_version: "v2".to_string(),
+        environment,
+        permissions,
+        approval_rules: None,
+        repos: Vec::new(),
+    };
+    runtime.approval_rules = execution
+        .and_then(|config| config.approval_rules.clone())
+        .or_else(|| {
+            Some(default_approval_rules_for_tier(
+                &runtime.environment.tier,
+                runtime.environment.network.as_deref(),
+            ))
+        });
+    if let Some(repo) = &job.repo {
+        runtime.repos.push(repo.into());
+    }
+    let mut seen_repo_urls = runtime
+        .repos
+        .iter()
+        .map(|repo| repo.repo_url.trim().to_string())
+        .filter(|repo_url| !repo_url.is_empty())
+        .collect::<HashSet<_>>();
+    for candidate in merged_reactive_candidate_repos(execution, &item.context) {
+        let repo_url = candidate.repo_url.trim().to_string();
+        if repo_url.is_empty() || !seen_repo_urls.insert(repo_url.clone()) {
+            continue;
+        }
+        runtime.repos.push(protocol::PlannedRepoClaim {
+            repo_url,
+            base_ref: candidate.base_ref,
+            read_only: true,
+            target_branch: candidate.branch_name.clone(),
+            claim_type: "read_only".to_string(),
+            branch_name: candidate.branch_name,
+        });
+    }
+    runtime
+}
+
+fn task_human_gate_state_name(state: &TaskHumanGateState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|v| v.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn project_approval_mode_into_job_context(
+    job_context: &mut serde_json::Value,
+    work_item_context: &serde_json::Value,
+    force_gateway_approval_mode: bool,
+) {
+    if !job_context.is_object() {
+        *job_context = serde_json::json!({});
+    }
+    let Some(context) = job_context.as_object_mut() else {
+        return;
+    };
+
+    let env_requests_gateway = work_item_context
+        .get("environment")
+        .and_then(|value| match value {
+            serde_json::Value::Object(map) => {
+                map.get("approval_mode").and_then(serde_json::Value::as_str)
+            }
+            serde_json::Value::String(mode) => Some(mode.as_str()),
+            _ => None,
+        })
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("gateway"));
+
+    let effective_mode = if force_gateway_approval_mode || env_requests_gateway {
+        "gateway"
+    } else {
+        "auto"
+    };
+    context.insert(
+        "approval_mode".to_string(),
+        serde_json::Value::String(effective_mode.to_string()),
+    );
+}
+
+fn triage_valid_next_events(item: &WorkItem) -> Vec<WorkflowEventKind> {
+    let mut out = Vec::new();
+    if work_item_requires_manual_triage(item) {
+        push_unique_event(&mut out, WorkflowEventKind::Cancel);
+        return out;
+    }
+
+    if item
+        .human_gate_state
+        .as_deref()
+        .is_some_and(|s| s == "triage_completed")
+    {
+        push_unique_event(&mut out, WorkflowEventKind::HumanApproved);
+        push_unique_event(&mut out, WorkflowEventKind::HumanChangesRequested);
+        push_unique_event(&mut out, WorkflowEventKind::Cancel);
+        return out;
+    }
+
+    // choose_workflow is a dedicated path; triage does not expose workflow_chosen via fire_event.
+    if item
+        .human_gate_state
+        .as_deref()
+        .is_some_and(|s| s == "workflow_selected")
+    {
+        push_unique_event(&mut out, WorkflowEventKind::Submit);
+    }
+    push_unique_event(&mut out, WorkflowEventKind::Cancel);
+    out
+}
+
+/// Render the workflow choices for the triage prompt. Each entry is a
+/// `(workflow_id, hint)` pair where `hint` is the trimmed contents of that
+/// workflow's `triage-hint.md` (if any). When a hint is present it is inlined
+/// after the bullet, indented two spaces, so the LLM has guidance for
+/// choosing between workflows that look similar by name alone.
+fn triage_workflow_summary(mut entries: Vec<(String, Option<String>)>) -> String {
+    if entries.is_empty() {
+        return "- (none)".to_string();
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.dedup_by(|a, b| a.0 == b.0);
+    entries
+        .into_iter()
+        .map(|(workflow_id, hint)| match hint {
+            Some(hint) if !hint.trim().is_empty() => {
+                let body = hint
+                    .lines()
+                    .map(|line| {
+                        if line.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {line}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("- {workflow_id}\n{body}")
+            }
+            _ => format!("- {workflow_id}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn triage_environment_summary(environments: &[EnvironmentDefinition]) -> String {
+    if environments.is_empty() {
+        return "- (none configured)".to_string();
+    }
+    environments
+        .iter()
+        .map(|environment| {
+            let overlays = if environment.allowed_overlays.is_empty() {
+                "none".to_string()
+            } else {
+                environment.allowed_overlays.join(", ")
+            };
+            format!(
+                "- {} (image: {}, overlays: {})",
+                environment.name, environment.image, overlays
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_unique_event(events: &mut Vec<WorkflowEventKind>, event: WorkflowEventKind) {
+    if !events.contains(&event) {
+        events.push(event);
+    }
+}
+
+fn current_step_last_job_failed(item: &WorkItem) -> bool {
+    item.context
+        .get(CONTEXT_JOB_RESULTS_KEY)
+        .and_then(|results| results.get(&item.current_step))
+        .and_then(|step_result| step_result.get("outcome"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|outcome| outcome.eq_ignore_ascii_case("failed"))
+}
+
+fn reactive_terminal_work_item_state(outcome: Option<&ReactiveTerminalOutcome>) -> WorkItemState {
+    match outcome.unwrap_or(&ReactiveTerminalOutcome::Succeeded) {
+        ReactiveTerminalOutcome::Succeeded => WorkItemState::Succeeded,
+        ReactiveTerminalOutcome::Failed => WorkItemState::Failed,
+    }
+}
+
+fn workflow_event_kind_name(event: &WorkflowEventKind) -> String {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|v| v.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("{event:?}"))
+}
+
+fn reactive_state_kind_name(kind: protocol::ReactiveStateKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn block_reason_for_state_name(state_name: &str) -> Option<BlockReason> {
+    let lower = state_name.to_ascii_lowercase();
+    if lower.contains("human") || lower.contains("review") {
+        Some(BlockReason::HumanReview)
+    } else if lower.contains("blocked") {
+        Some(BlockReason::Dependency)
+    } else if lower.contains("triage") {
+        Some(BlockReason::Clarification)
+    } else {
+        None
+    }
+}
+
+fn reactive_next_event_from_agent_output(
+    job: &Job,
+    valid_next_events: &[WorkflowEventKind],
+) -> Result<Option<WorkflowEventKind>, String> {
+    let Some(raw_output_json) = job
+        .result
+        .as_ref()
+        .and_then(|result| result.output_json.as_ref())
+    else {
+        return Ok(None);
+    };
+
+    let parsed = match serde_json::from_value::<AgentOutput>(raw_output_json.clone()) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(None),
+    };
+    let Some(next_event) = parsed.next_event.as_deref() else {
+        return Ok(None);
+    };
+
+    let valid_event_names = valid_next_events
+        .iter()
+        .map(workflow_event_kind_name)
+        .collect::<Vec<_>>();
+    validate_agent_output_next_event(&parsed, &valid_event_names)?;
+
+    next_event
+        .parse::<WorkflowEventKind>()
+        .map(Some)
+        .map_err(|_| {
+            format!(
+                "next_event '{}' could not be parsed as a workflow event kind",
+                next_event
+            )
+        })
+}
+
+fn mark_human_gate_state(
+    context: serde_json::Value,
+    state: TaskHumanGateState,
+) -> serde_json::Value {
+    let mut ctx = if context.is_object() {
+        context
+    } else {
+        serde_json::json!({})
+    };
+    let obj = ctx.as_object_mut().expect("context normalized to object");
+    obj.insert(
+        "task_human_gate_state".to_string(),
+        serde_json::to_value(state).unwrap_or(serde_json::Value::Null),
+    );
+    ctx
+}
+
+fn clear_stale_human_gate_projection(item: &mut WorkItem) {
+    if item.human_gate || item.workflow_id == "__triage__" {
+        return;
+    }
+    if !matches!(
+        item.state,
+        WorkItemState::Succeeded | WorkItemState::Failed | WorkItemState::Cancelled
+    ) {
+        return;
+    }
+    item.human_gate_state = None;
+    if let Some(obj) = item.context.as_object_mut() {
+        obj.remove("task_human_gate_state");
+    }
+}
+
+fn clear_stale_failure_projection(item: &mut WorkItem) {
+    if !matches!(
+        item.state,
+        WorkItemState::Succeeded | WorkItemState::Cancelled
+    ) {
+        return;
+    }
+    item.last_failure_reason = None;
+    if let Some(obj) = item.context.as_object_mut() {
+        obj.remove("last_failure_reason");
+    }
+}
+
+fn derive_phase(item: &WorkItem) -> String {
+    match item.state {
+        WorkItemState::Succeeded => "done",
+        WorkItemState::Failed => "failed",
+        WorkItemState::Cancelled => "cancelled",
+        _ => {
+            let step = &item.current_step;
+            if step.contains("triage") {
+                "triage"
+            } else if step.contains("review") || step.contains("await") {
+                "review"
+            } else {
+                "executing"
+            }
+        }
+    }
+    .to_string()
+}
+
+fn project_workflow_state(item: &WorkItem) -> String {
+    if item.workflow_id == "__triage__" {
+        return "triage".to_string();
+    }
+    match item.state {
+        WorkItemState::Pending => "pending".to_string(),
+        WorkItemState::Running => {
+            if item.human_gate {
+                "human_gate".to_string()
+            } else {
+                "running".to_string()
+            }
+        }
+        WorkItemState::Succeeded => "completed".to_string(),
+        WorkItemState::Failed => "failed".to_string(),
+        WorkItemState::Cancelled => "cancelled".to_string(),
+    }
+}
+
+fn last_failure_reason_from_result(result: &protocol::JobResult) -> Option<String> {
+    if let Some(message) = result
+        .error_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(message.to_string());
+    }
+
+    result
+        .output_json
+        .as_ref()
+        .and_then(|output| serde_json::from_value::<AgentOutput>(output.clone()).ok())
+        .and_then(|parsed| {
+            parsed
+                .error
+                .and_then(|error| error.message)
+                .or(parsed.summary)
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn format_required_action_description(
+    item: &WorkItem,
+    valid_next_events: &[WorkflowEventKind],
+) -> Option<String> {
+    if item.workflow_id == "__triage__" || work_item_requires_manual_triage(item) {
+        return Some("Needs triage: assign a workflow.".to_string());
+    }
+
+    if item.human_gate {
+        let waiting_on = valid_next_events
+            .iter()
+            .filter(|event| **event != WorkflowEventKind::Cancel)
+            .map(workflow_event_kind_name)
+            .collect::<Vec<_>>();
+        if waiting_on.is_empty() {
+            return Some("Waiting for operator action.".to_string());
+        }
+        return Some(format!("Waiting for: {}.", waiting_on.join(", ")));
+    }
+
+    if item.state == WorkItemState::Failed {
+        return Some(format!("Failed at {}. Retry or cancel.", item.current_step));
+    }
+
+    if !valid_next_events.is_empty() {
+        return Some("Waiting on automation.".to_string());
+    }
+
+    None
+}
+
+fn update_last_failure_reason_fields(item: &mut WorkItem, latest_job: Option<&Job>) {
+    if latest_job.is_some_and(|job| job.state == JobState::Succeeded) {
+        clear_success_projection_fields(item);
+        return;
+    }
+
+    let mut last_failure_reason = latest_job.and_then(|job| {
+        if job.state != JobState::Failed {
+            return None;
+        }
+        job.result
+            .as_ref()
+            .and_then(last_failure_reason_from_result)
+    });
+    if last_failure_reason.is_none() {
+        last_failure_reason = item.last_failure_reason.clone();
+    }
+
+    if let Some(reason) = last_failure_reason.as_ref()
+        && let Some(obj) = item.context.as_object_mut()
+    {
+        obj.insert(
+            "last_failure_reason".to_string(),
+            serde_json::Value::String(reason.clone()),
+        );
+    }
+
+    item.last_failure_reason = last_failure_reason;
+}
+
+fn clear_success_projection_fields(item: &mut WorkItem) {
+    item.last_failure_reason = None;
+    item.required_action_description = None;
+    if let Some(obj) = item.context.as_object_mut() {
+        obj.remove("last_failure_reason");
+    }
+}
+
+fn triage_status_to_str(status: &TaskTriageStatus) -> &'static str {
+    match status {
+        TaskTriageStatus::NeedsWorkflowSelection => "needs_workflow_selection",
+        TaskTriageStatus::Ready => "ready",
+        TaskTriageStatus::InProgress => "in_progress",
+        TaskTriageStatus::Blocked => "blocked",
+        TaskTriageStatus::Completed => "completed",
+        TaskTriageStatus::Cancelled => "cancelled",
+    }
+}
+
+fn apply_task_fields(mut item: WorkItem, task: &TaskToolRecord, adapter_name: &str) -> WorkItem {
+    item.external_task_id = Some(task.id.to_string());
+    item.external_task_source = Some(adapter_name.to_string());
+    item.title = Some(task.title.clone());
+    item.description = task.description.clone();
+    item.labels = task
+        .context
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // Keep `item.context["labels"]` in sync with the typed `item.labels`; both are
+    // checked by `work_item_requires_manual_triage` and we don't want them to drift
+    // when an external adapter mutates labels between syncs.
+    if let Some(obj) = item.context.as_object_mut() {
+        let labels_value = task
+            .context
+            .get("labels")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+        obj.insert("labels".to_string(), labels_value);
+    }
+    item.priority = task
+        .context
+        .get("priority")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    // When the adapter ships a `context.checkpoint` block, those raw strings
+    // are the authoritative orchestrator-owned values (they may include
+    // states that aren't variants of the `TaskHumanGateState` /
+    // `TaskTriageStatus` enums, e.g. `triage_completed`, `pending_approval`).
+    // Prefer them over the enum-derived projections so a successful triage
+    // result isn't clobbered on the next adapter poll.
+    let checkpoint_ctx = task
+        .context
+        .get("checkpoint")
+        .and_then(serde_json::Value::as_object);
+
+    item.human_gate = checkpoint_ctx
+        .and_then(|cp| cp.get("human_gate").and_then(serde_json::Value::as_bool))
+        .unwrap_or(task.pending_human_action);
+
+    item.human_gate_state = checkpoint_ctx
+        .and_then(|cp| {
+            cp.get("human_gate_state")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            task.human_gate_state
+                .as_ref()
+                .map(task_human_gate_state_name)
+        });
+
+    item.triage_status = checkpoint_ctx
+        .and_then(|cp| {
+            cp.get("triage_status")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| Some(triage_status_to_str(&task.triage_status).to_string()));
+    item.projected_state = Some(project_workflow_state(&item));
+    item.last_failure_reason = task.last_failure_reason.clone();
+    item.required_action_description = task.required_action_description.clone();
+    item
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRoutingRules {
+    #[serde(default)]
+    default_workflow_id: Option<String>,
+    #[serde(default)]
+    by_priority: HashMap<String, String>,
+    #[serde(default)]
+    by_label: HashMap<String, String>,
+}
+
+enum WorkflowSelectionDecision {
+    Selected(String),
+    NeedsWorkflowSelection {
+        reason: String,
+        manual_triage_required: bool,
+    },
+}
+
+fn pick_workflow_for_task(
+    task: &TaskToolRecord,
+    workflow_ids: &[String],
+) -> WorkflowSelectionDecision {
+    if task_requires_manual_triage(task) {
+        return WorkflowSelectionDecision::NeedsWorkflowSelection {
+            reason: "manual triage required".to_string(),
+            manual_triage_required: true,
+        };
+    }
+
+    if let Some(explicit) = choose_workflow_id(task, workflow_ids) {
+        return WorkflowSelectionDecision::Selected(explicit);
+    }
+
+    if let Some(rules) = task
+        .context
+        .get("workflow_rules")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<WorkflowRoutingRules>(v).ok())
+    {
+        let mut matches: HashMap<String, Vec<String>> = HashMap::new();
+        let mut unknown_refs = Vec::new();
+
+        if let Some(priority) = task
+            .context
+            .get("priority")
+            .and_then(serde_json::Value::as_str)
+            && let Some(workflow_id) = rules.by_priority.get(priority)
+        {
+            if workflow_ids.iter().any(|id| id == workflow_id) {
+                matches
+                    .entry(workflow_id.clone())
+                    .or_default()
+                    .push(format!("priority:{priority}"));
+            } else {
+                unknown_refs.push(format!("priority:{priority}->{workflow_id}"));
+            }
+        }
+
+        if let Some(labels) = task
+            .context
+            .get("labels")
+            .and_then(serde_json::Value::as_array)
+        {
+            for label in labels.iter().filter_map(serde_json::Value::as_str) {
+                if let Some(workflow_id) = rules.by_label.get(label) {
+                    if workflow_ids.iter().any(|id| id == workflow_id) {
+                        matches
+                            .entry(workflow_id.clone())
+                            .or_default()
+                            .push(format!("label:{label}"));
+                    } else {
+                        unknown_refs.push(format!("label:{label}->{workflow_id}"));
+                    }
+                }
+            }
+        }
+
+        if matches.len() == 1
+            && let Some(workflow_id) = matches.keys().next().cloned()
+        {
+            return WorkflowSelectionDecision::Selected(workflow_id);
+        }
+        if matches.len() > 1 {
+            let mut candidates = matches.keys().cloned().collect::<Vec<_>>();
+            candidates.sort();
+            return WorkflowSelectionDecision::NeedsWorkflowSelection {
+                reason: format!(
+                    "multiple workflow rules matched; choose one of: {}",
+                    candidates.join(", ")
+                ),
+                manual_triage_required: false,
+            };
+        }
+
+        if let Some(default_workflow_id) = rules.default_workflow_id {
+            if workflow_ids.iter().any(|id| id == &default_workflow_id) {
+                return WorkflowSelectionDecision::Selected(default_workflow_id);
+            }
+            unknown_refs.push(format!("default->{default_workflow_id}"));
+        }
+
+        if !unknown_refs.is_empty() {
+            unknown_refs.sort();
+            return WorkflowSelectionDecision::NeedsWorkflowSelection {
+                reason: format!(
+                    "workflow_rules referenced unknown workflow ids: {}",
+                    unknown_refs.join(", ")
+                ),
+                manual_triage_required: false,
+            };
+        }
+    }
+
+    if let Some(hint) = task
+        .context
+        .get("workflow_hint")
+        .and_then(serde_json::Value::as_str)
+        && workflow_ids.iter().any(|id| id == hint)
+    {
+        return WorkflowSelectionDecision::Selected(hint.to_string());
+    }
+
+    WorkflowSelectionDecision::NeedsWorkflowSelection {
+        reason: "no deterministic workflow rule matched".to_string(),
+        manual_triage_required: false,
+    }
+}
+
+fn item_github_pr_urls(item: &WorkItem) -> impl Iterator<Item = &str> {
+    let pr_state_url = item
+        .context
+        .get(CONTEXT_GITHUB_PR_STATE_KEY)
+        .and_then(serde_json::Value::as_object)
+        .and_then(|state| state.get("url"))
+        .and_then(serde_json::Value::as_str);
+
+    std::iter::once(pr_state_url).flatten().chain(
+        item.context
+            .get(CONTEXT_JOB_RESULTS_KEY)
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flat_map(|results| results.values())
+            .filter_map(|result| {
+                result
+                    .get("github_pr")
+                    .and_then(|pr| pr.get("url"))
+                    .and_then(serde_json::Value::as_str)
+            }),
+    )
+}
+
+#[cfg(test)]
+pub use handlers::{
+    DispatchResponse, create_work_item, dispatch, fire_work_item_event, heartbeat_worker,
+    job_events_sse, list_jobs, list_work_items, list_workers, list_workflow_documents,
+    list_workflows, poll_job, register_worker, terminal_job_event, update_job, validate_workflows,
+};
+#[cfg(test)]
+pub use webhook::{
+    GithubCheckRunWebhook, GithubCheckSuiteWebhook, GithubPullRequestRefWebhook,
+    GithubPullRequestWebhook, GithubReviewWebhook, GithubUserWebhook, GithubWebhookIngestResponse,
+    GithubWebhookPayload, github_webhook,
+};
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct GithubWebhookPrReference {
+    pr_url: Option<String>,
+    pr_number: Option<u64>,
+    head_branch: Option<String>,
+}
+
+#[cfg(test)]
+fn verify_github_signature(secret: &str, body: &[u8], signature_header: &str) -> bool {
+    webhook::verify_github_signature_for_tests(secret, body, signature_header)
+}
+
+#[cfg(test)]
+fn map_github_webhook_to_workflow_event(
+    headers: &HeaderMap,
+    payload: &GithubWebhookPayload,
+    owner_github_login: Option<&str>,
+) -> Option<WorkflowEventKind> {
+    webhook::map_github_webhook_to_workflow_event_for_tests(headers, payload, owner_github_login)
+}
+
+#[cfg(test)]
+fn github_webhook_pr_reference(
+    event_name: &str,
+    payload: &GithubWebhookPayload,
+) -> GithubWebhookPrReference {
+    let (pr_url, pr_number, head_branch) =
+        webhook::github_webhook_pr_reference_for_tests(event_name, payload);
+    GithubWebhookPrReference {
+        pr_url,
+        pr_number,
+        head_branch,
+    }
+}
+
+#[cfg(test)]
+fn item_matches_github_webhook(item: &WorkItem, webhook_pr: &GithubWebhookPrReference) -> bool {
+    webhook::item_matches_github_webhook_for_tests(
+        item,
+        webhook_pr.pr_url.clone(),
+        webhook_pr.pr_number,
+        webhook_pr.head_branch.clone(),
+    )
+}
+
+fn workflow_document_id(doc: &WorkflowDocument) -> &str {
+    match doc {
+        WorkflowDocument::LegacyV1 { workflow } => workflow.id.as_str(),
+        WorkflowDocument::ReactiveV2 { workflow } => workflow.id.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handlers::to_sse_event;
+    use super::webhook::{map_role_event_to_fallback_candidates, owner_github_login_from_context};
+    use super::*;
+    use crate::server::task_adapter::TaskTriageStatus;
+    use axum::Json;
+    use axum::extract::{Path, State};
+    use axum::http::HeaderValue;
+    use axum::http::StatusCode;
+    use axum::{Router, routing::get};
+    use protocol::JobResult;
+    use protocol::{EnvironmentDefinition, MergePolicy};
+    use tower::ServiceExt;
+
+    fn failed_job_result() -> JobResult {
+        JobResult {
+            outcome: protocol::ExecutionOutcome::Failed,
+            termination_reason: protocol::TerminationReason::ExitCode,
+            exit_code: Some(1),
+            timing: protocol::ExecutionTiming {
+                started_at: Utc::now(),
+                finished_at: Utc::now(),
+                duration_ms: 1,
+            },
+            artifacts: protocol::ArtifactSummary {
+                stdout_path: "/tmp/fail/stdout.log".into(),
+                stderr_path: "/tmp/fail/stderr.log".into(),
+                output_path: None,
+                transcript_dir: Some("/tmp/fail".into()),
+                stdout_bytes: None,
+                stderr_bytes: None,
+                output_bytes: None,
+                structured_transcript_artifacts: Vec::new(),
+            },
+            output_json: None,
+            repo: None,
+            github_pr: None,
+            error_message: Some("boom".into()),
+        }
+    }
+
+    fn successful_job_result() -> JobResult {
+        JobResult {
+            outcome: protocol::ExecutionOutcome::Succeeded,
+            termination_reason: protocol::TerminationReason::ExitCode,
+            exit_code: Some(0),
+            timing: protocol::ExecutionTiming {
+                started_at: Utc::now(),
+                finished_at: Utc::now(),
+                duration_ms: 1,
+            },
+            artifacts: protocol::ArtifactSummary {
+                stdout_path: "/tmp/success/stdout.log".into(),
+                stderr_path: "/tmp/success/stderr.log".into(),
+                output_path: None,
+                transcript_dir: Some("/tmp/success".into()),
+                stdout_bytes: None,
+                stderr_bytes: None,
+                output_bytes: None,
+                structured_transcript_artifacts: Vec::new(),
+            },
+            output_json: Some(serde_json::json!({ "next_event": "job_succeeded" })),
+            repo: None,
+            github_pr: None,
+            error_message: None,
+        }
+    }
+
+    /// Write a workflow TOML body under `<root>/<slug>/workflow.toml`, the
+    /// directory-per-workflow layout that `WorkflowCatalog::load_from_dir`
+    /// expects. The slug is just the tmp directory name; the workflow id used
+    /// at lookup time is parsed from the TOML body itself.
+    fn write_workflow(root: &std::path::Path, slug: &str, body: &str) {
+        let dir = root.join(slug);
+        std::fs::create_dir_all(&dir).expect("mkdir workflow");
+        std::fs::write(dir.join("workflow.toml"), body).expect("write workflow.toml");
+    }
+
+    fn workflow_catalog() -> Arc<WorkflowCatalog> {
+        let tmp = std::env::temp_dir().join(format!("wf-catalog-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "wf"
+entry_step = "build"
+
+[[workflow.steps]]
+id = "build"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["hello"]
+on_success = "test"
+
+[[workflow.steps]]
+id = "test"
+kind = "agent"
+executor = "docker"
+container_image = "alpine:3.20"
+command = "echo"
+args = ["ok"]
+"#;
+        write_workflow(&tmp, "wf", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn environments_fixture() -> Vec<EnvironmentDefinition> {
+        vec![EnvironmentDefinition {
+            name: "code-auto".to_string(),
+            image: "agent-hub/job-code:latest".to_string(),
+            network_class: "restricted".to_string(),
+            approval_mode: "auto".to_string(),
+            allowed_overlays: vec!["github".to_string()],
+            description: None,
+            runtime: None,
+        }]
+    }
+
+    fn overlays_fixture() -> Vec<EnvironmentOverlay> {
+        vec![EnvironmentOverlay {
+            name: "github".to_string(),
+            provider: "gh".to_string(),
+            config: serde_json::json!({}),
+        }]
+    }
+
+    fn reactive_workflow_catalog() -> Arc<WorkflowCatalog> {
+        let tmp = std::env::temp_dir().join(format!("wf-catalog-reactive-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "reactive_wf"
+schema = "reactive_v2"
+initial_state = "bootstrap"
+
+[[workflow.states]]
+id = "bootstrap"
+kind = "auto"
+
+[[workflow.states.on]]
+event = "start"
+target = "run_agent"
+
+[[workflow.states]]
+id = "run_agent"
+kind = "agent"
+executor = "raw"
+prompt = { user = "run agent" }
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "review"
+
+[[workflow.states.on]]
+event = "job_failed"
+target = "review"
+
+[[workflow.states]]
+id = "review"
+kind = "human"
+
+[[workflow.states.on]]
+event = "human_approved"
+target = "done"
+
+[[workflow.states.on]]
+event = "human_changes_requested"
+target = "run_agent"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "reactive_wf", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_candidate_repo_catalog() -> Arc<WorkflowCatalog> {
+        let tmp =
+            std::env::temp_dir().join(format!("wf-catalog-reactive-candidates-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "reactive_candidates"
+schema = "reactive_v2"
+initial_state = "bootstrap"
+
+[[workflow.states]]
+id = "bootstrap"
+kind = "auto"
+
+[[workflow.states.on]]
+event = "start"
+target = "run_agent"
+
+[[workflow.states]]
+id = "run_agent"
+kind = "agent"
+executor = "raw"
+prompt = { user = "triage" }
+candidate_repos = [
+  { repo_url = "https://github.com/reddit/agent-hub", base_ref = "origin/main" },
+  { repo_url = "https://github.com/reddit/opencode", base_ref = "origin/main" }
+]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states.on]]
+event = "job_failed"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "reactive_candidates", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    /// Catalog used to verify that workflows entered via `__triage__` start at
+    /// their declared `initial_state` (no implicit skip).
+    ///
+    /// In the post-decoupling design, the `__triage__` pseudo-workflow owns triage
+    /// and a workflow author is responsible for *not* duplicating triage at the
+    /// front of the selected workflow. So this fixture's first state is a normal
+    /// implementation step rather than a redundant triage step.
+    fn triage_approved_reactive_catalog() -> Arc<WorkflowCatalog> {
+        let tmp = std::env::temp_dir().join(format!("wf-catalog-triage-skip-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "triage-approved-reactive"
+schema = "reactive_v2"
+initial_state = "implement"
+
+[[workflow.states]]
+id = "implement"
+kind = "agent"
+executor = "raw"
+prompt = { user = "implement" }
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "review"
+
+[[workflow.states]]
+id = "review"
+kind = "human"
+
+[[workflow.states.on]]
+event = "human_approved"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "triage_approved_reactive", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_no_start_catalog() -> Arc<WorkflowCatalog> {
+        let tmp = std::env::temp_dir().join(format!("wf-catalog-reactive-ns-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "reactive_no_start"
+schema = "reactive_v2"
+initial_state = "bootstrap"
+
+[[workflow.states]]
+id = "bootstrap"
+kind = "auto"
+
+[[workflow.states.on]]
+event = "noop"
+target = "bootstrap"
+"#;
+        write_workflow(&tmp, "reactive_no_start", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_submit_catalog() -> Arc<WorkflowCatalog> {
+        let tmp =
+            std::env::temp_dir().join(format!("wf-catalog-reactive-submit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "reactive_submit"
+schema = "reactive_v2"
+initial_state = "draft"
+
+[[workflow.states]]
+id = "draft"
+kind = "human"
+
+[[workflow.states.on]]
+event = "submit"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+terminal_outcome = "failed"
+"#;
+        write_workflow(&tmp, "reactive_submit", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_failed_terminal_catalog() -> Arc<WorkflowCatalog> {
+        let tmp =
+            std::env::temp_dir().join(format!("wf-catalog-reactive-failed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "reactive_failed_terminal"
+schema = "reactive_v2"
+initial_state = "bootstrap"
+
+[[workflow.states]]
+id = "bootstrap"
+kind = "auto"
+
+[[workflow.states.on]]
+event = "start"
+target = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "agent"
+executor = "raw"
+prompt = { user = "run" }
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states.on]]
+event = "job_failed"
+target = "failed"
+
+[[workflow.states]]
+id = "failed"
+kind = "terminal"
+terminal_outcome = "failed"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "reactive_failed_terminal", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_managed_catalog() -> Arc<WorkflowCatalog> {
+        let tmp =
+            std::env::temp_dir().join(format!("wf-catalog-reactive-managed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "reactive_managed"
+schema = "reactive_v2"
+initial_state = "bootstrap"
+
+[[workflow.states]]
+id = "bootstrap"
+kind = "auto"
+
+[[workflow.states.on]]
+event = "start"
+target = "run_managed"
+
+[[workflow.states]]
+id = "run_managed"
+kind = "managed"
+operation = "open_pr"
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states.on]]
+event = "job_failed"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "reactive_managed", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_auto_merge_transition_catalog() -> Arc<WorkflowCatalog> {
+        let tmp = std::env::temp_dir().join(format!(
+            "wf-catalog-reactive-auto-merge-transition-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "reactive_auto_merge_transition"
+schema = "reactive_v2"
+initial_state = "await_owner_review"
+
+[[workflow.states]]
+id = "await_owner_review"
+kind = "human"
+
+[[workflow.states.on]]
+event = "pr_approved"
+target = "merge"
+
+[[workflow.states]]
+id = "merge"
+kind = "auto"
+auto_merge = true
+
+[[workflow.states.on]]
+event = "start"
+target = "await_merge_completion"
+
+[[workflow.states]]
+id = "await_merge_completion"
+kind = "human"
+auto_merge = true
+
+[[workflow.states.on]]
+event = "pr_merged"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "reactive_auto_merge_transition", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_child_only_catalog() -> Arc<WorkflowCatalog> {
+        let tmp =
+            std::env::temp_dir().join(format!("wf-catalog-child-reactive-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let parent = r#"
+[workflow]
+id = "wf"
+entry_step = "build"
+
+[[workflow.steps]]
+id = "build"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["parent"]
+on_success = "after"
+
+[[workflow.steps]]
+id = "after"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["after"]
+"#;
+        let child = r#"
+[workflow]
+id = "child_reactive"
+schema = "reactive_v2"
+initial_state = "bootstrap"
+
+[[workflow.states]]
+id = "bootstrap"
+kind = "auto"
+
+[[workflow.states.on]]
+event = "start"
+target = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "command"
+executor = "raw"
+command = "echo"
+args = ["child"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "wf", parent);
+        write_workflow(&tmp, "child_reactive", child);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_parent_child_catalog() -> Arc<WorkflowCatalog> {
+        let tmp = std::env::temp_dir().join(format!(
+            "wf-catalog-reactive-parent-child-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let parent = r#"
+[workflow]
+id = "reactive_parent"
+schema = "reactive_v2"
+initial_state = "spawn"
+
+[[workflow.states]]
+id = "spawn"
+kind = "auto"
+action = "spawn_children"
+child_workflow = "child_legacy"
+
+[[workflow.states.on]]
+event = "all_children_completed"
+target = "done"
+
+[[workflow.states.on]]
+event = "child_failed"
+target = "blocked"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+terminal_outcome = "succeeded"
+
+[[workflow.states]]
+id = "blocked"
+kind = "terminal"
+terminal_outcome = "failed"
+"#;
+        let child = r#"
+[workflow]
+id = "child_legacy"
+entry_step = "run"
+
+[[workflow.steps]]
+id = "run"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["child"]
+"#;
+        write_workflow(&tmp, "reactive_parent", parent);
+        write_workflow(&tmp, "child_legacy", child);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn multi_workflow_catalog() -> Arc<WorkflowCatalog> {
+        let tmp = std::env::temp_dir().join(format!("wf-catalog-multi-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf_a = r#"
+[workflow]
+id = "wf_alpha"
+entry_step = "run"
+
+[[workflow.steps]]
+id = "run"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["alpha"]
+"#;
+        let wf_b = r#"
+[workflow]
+id = "wf_beta"
+entry_step = "run"
+
+[[workflow.steps]]
+id = "run"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["beta"]
+"#;
+        write_workflow(&tmp, "wf_alpha", wf_a);
+        write_workflow(&tmp, "wf_beta", wf_b);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn docker_runtime_spec_with_network(
+        request: Option<NetworkResourceRequest>,
+    ) -> CanonicalRuntimeSpec {
+        CanonicalRuntimeSpec {
+            runtime_version: "v2".to_string(),
+            environment: protocol::PlannedEnvironmentSpec {
+                tier: protocol::PlannedEnvironmentTier::Docker,
+                execution_mode: protocol::ExecutionMode::Docker,
+                container_image: Some("agent-hub/job-code:latest".into()),
+                timeout_secs: Some(900),
+                memory_limit: None,
+                cpu_limit: None,
+                network: legacy_network_label_for_request(request.as_ref()),
+                network_resources: request,
+                filesystem: None,
+                file_mounts: vec![],
+                toolchains: vec!["gh".into()],
+            },
+            permissions: protocol::PlannedPermissionSet {
+                tier: protocol::PlannedPermissionTier::DockerDefault,
+                can_read_workspace: true,
+                can_write_workspace: true,
+                can_run_shell: true,
+                can_access_network: true,
+                auto_approve_tools: vec![],
+                escalate_tools: vec![],
+                kubernetes_access: None,
+                aws_access: None,
+            },
+            approval_rules: None,
+            repos: vec![],
+        }
+    }
+
+    fn restricted_environment_definition() -> EnvironmentDefinition {
+        // `code-auto` in environment.toml says `network_policy = "build"`,
+        // which `map_policy_to_network_class` rewrites to "restricted" before
+        // the value reaches `EnvironmentDefinition`. "restricted" is the only
+        // legacy network label below "full"/"none" that
+        // `network_request_from_legacy_label` understands.
+        EnvironmentDefinition {
+            name: "code-auto".to_string(),
+            image: "agent-hub/job-code:latest".to_string(),
+            network_class: "restricted".to_string(),
+            approval_mode: "auto".to_string(),
+            allowed_overlays: vec!["github".to_string()],
+            description: None,
+            runtime: None,
+        }
+    }
+
+    #[test]
+    fn workflow_full_network_resources_overrides_environment_default() {
+        // Workflow.toml asked for full network access on a Docker step. The
+        // environment's default `network_class = restricted` must NOT clobber
+        // it — workflow definitions are reviewed code, so they have authority.
+        let mut runtime = docker_runtime_spec_with_network(Some(NetworkResourceRequest::Full));
+        let env = restricted_environment_definition();
+        apply_environment_definition_to_runtime(&mut runtime, &env, true);
+
+        assert_eq!(
+            runtime.environment.network_resources,
+            Some(NetworkResourceRequest::Full),
+            "workflow's Full must survive env application",
+        );
+        // The legacy `network` string should reflect the workflow choice too,
+        // since downstream consumers (squid policy selection, approval rules)
+        // read it.
+        assert_eq!(runtime.environment.network.as_deref(), Some("full"));
+        assert!(runtime.permissions.can_access_network);
+    }
+
+    #[test]
+    fn workflow_with_no_network_resources_falls_back_to_environment_default() {
+        // No workflow opinion → environment policy fills in.
+        let mut runtime = docker_runtime_spec_with_network(None);
+        let env = restricted_environment_definition();
+        apply_environment_definition_to_runtime(&mut runtime, &env, true);
+
+        let env_resources = runtime
+            .environment
+            .network_resources
+            .clone()
+            .expect("environment default should populate network_resources");
+        assert!(matches!(env_resources, NetworkResourceRequest::Resources(_)));
+        assert_eq!(runtime.environment.network.as_deref(), Some("restricted"));
+    }
+
+    #[test]
+    fn workflow_explicit_none_network_resources_disables_env_network_access() {
+        // Workflow.toml asked for `none` — that's an authority statement we
+        // must honour even when the environment default is permissive.
+        let mut runtime = docker_runtime_spec_with_network(Some(NetworkResourceRequest::None));
+        let env = restricted_environment_definition();
+        apply_environment_definition_to_runtime(&mut runtime, &env, true);
+
+        assert_eq!(
+            runtime.environment.network_resources,
+            Some(NetworkResourceRequest::None),
+        );
+        assert_eq!(runtime.environment.network.as_deref(), Some("none"));
+        assert!(!runtime.permissions.can_access_network);
+    }
+
+    #[tokio::test]
+    async fn successful_job_advances_workflow() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![
+                protocol::ExecutionMode::Raw,
+                protocol::ExecutionMode::Docker,
+            ],
+        })
+        .await
+        .expect("reg worker");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job assigned");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/x".into()),
+                result: Some(JobResult {
+                    outcome: protocol::ExecutionOutcome::Succeeded,
+                    termination_reason: protocol::TerminationReason::ExitCode,
+                    exit_code: Some(0),
+                    timing: protocol::ExecutionTiming {
+                        started_at: Utc::now(),
+                        finished_at: Utc::now(),
+                        duration_ms: 1,
+                    },
+                    artifacts: protocol::ArtifactSummary {
+                        stdout_path: "/tmp/x/stdout.log".into(),
+                        stderr_path: "/tmp/x/stderr.log".into(),
+                        output_path: None,
+                        transcript_dir: Some("/tmp/x".into()),
+                        stdout_bytes: None,
+                        stderr_bytes: None,
+                        output_bytes: None,
+                        structured_transcript_artifacts: vec![
+                            protocol::StructuredTranscriptArtifact {
+                                key: "agent_context".into(),
+                                path: "/tmp/x/.agent-context.json".into(),
+                                bytes: Some(120),
+                                schema: Some(protocol::AGENT_CONTEXT_SCHEMA_NAME.into()),
+                                record_count: None,
+                                inline_json: Some(serde_json::json!({
+                                    "schema": protocol::AGENT_CONTEXT_SCHEMA_NAME,
+                                    "job": {
+                                        "step_id": "build"
+                                    }
+                                })),
+                            },
+                            protocol::StructuredTranscriptArtifact {
+                                key: "run_json".into(),
+                                path: "/tmp/x/run.json".into(),
+                                bytes: Some(99),
+                                schema: Some(protocol::JOB_RUN_SCHEMA_NAME.into()),
+                                record_count: None,
+                                inline_json: Some(serde_json::json!({
+                                    "schema": protocol::JOB_RUN_SCHEMA_NAME,
+                                    "mode": "docker",
+                                    "workspace": "/workspace"
+                                })),
+                            },
+                            protocol::StructuredTranscriptArtifact {
+                                key: "transcript_jsonl".into(),
+                                path: "/tmp/x/transcript.jsonl".into(),
+                                bytes: Some(456),
+                                schema: None,
+                                record_count: Some(3),
+                                inline_json: Some(serde_json::json!([
+                                    "{\"event\":\"start\"}",
+                                    "{\"event\":\"done\"}"
+                                ])),
+                            },
+                            protocol::StructuredTranscriptArtifact {
+                                key: "job_events".into(),
+                                path: "/tmp/x/job-events.jsonl".into(),
+                                bytes: Some(789),
+                                schema: Some(protocol::JOB_EVENT_SCHEMA_NAME.into()),
+                                record_count: Some(12),
+                                inline_json: Some(serde_json::json!([
+                                    {
+                                        "job_id": uuid::Uuid::new_v4(),
+                                        "worker_id": "w1",
+                                        "at": Utc::now(),
+                                        "kind": "system",
+                                        "message": "phase 1"
+                                    },
+                                    {
+                                        "job_id": uuid::Uuid::new_v4(),
+                                        "worker_id": "w1",
+                                        "at": Utc::now(),
+                                        "kind": "stdout",
+                                        "stream": "stdout",
+                                        "message": "phase 2"
+                                    }
+                                ])),
+                            },
+                        ],
+                    },
+                    output_json: Some(serde_json::json!({"build_ok": true})),
+                    repo: None,
+                    github_pr: None,
+                    error_message: None,
+                }),
+            },
+        )
+        .await
+        .expect("success");
+
+        let updated = svc
+            .list_work_items()
+            .await
+            .expect("items")
+            .into_iter()
+            .find(|w| w.id == item.id)
+            .expect("item exists");
+        assert_eq!(updated.current_step, "test");
+        assert_eq!(updated.state, WorkItemState::Running);
+
+        let jobs = svc.list_jobs().await.expect("jobs");
+        assert!(jobs.iter().any(|j| j.step_id == "test"));
+        assert_eq!(
+            jobs.iter()
+                .find(|j| j.step_id == "build")
+                .unwrap()
+                .timeout_secs,
+            None
+        );
+
+        let updated = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get item")
+            .expect("exists");
+        assert_eq!(
+            updated.context["job_outputs"]["build"],
+            serde_json::json!({"build_ok": true})
+        );
+        assert_eq!(
+            updated.context["job_results"]["build"]["outcome"],
+            serde_json::json!("succeeded")
+        );
+        assert_eq!(
+            updated.context["job_results"]["build"]["termination_reason"],
+            serde_json::json!("exit_code")
+        );
+        assert_eq!(
+            updated.context["job_artifact_paths"]["build"]["agent_context"],
+            serde_json::json!("/tmp/x/.agent-context.json")
+        );
+        assert_eq!(
+            updated.context["job_artifact_paths"]["build"]["stdout_log"],
+            serde_json::json!("/tmp/x/stdout.log")
+        );
+        assert_eq!(
+            updated.context["job_artifact_paths"]["build"]["stderr_log"],
+            serde_json::json!("/tmp/x/stderr.log")
+        );
+        assert_eq!(
+            updated.context["job_artifact_paths"]["build"]["transcript_dir"],
+            serde_json::json!("/tmp/x")
+        );
+        assert!(
+            updated.context["job_artifact_paths"]["build"]
+                .get("output_json")
+                .is_none()
+        );
+        assert_eq!(
+            updated.context["job_artifact_paths"]["build"]["transcript_jsonl"],
+            serde_json::json!("/tmp/x/transcript.jsonl")
+        );
+        assert_eq!(
+            updated.context["job_artifact_paths"]["build"]["job_events"],
+            serde_json::json!("/tmp/x/job-events.jsonl")
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["agent_context"]["path"],
+            serde_json::json!("/tmp/x/.agent-context.json")
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["stdout_log"]["path"],
+            serde_json::json!("/tmp/x/stdout.log")
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["stderr_log"]["path"],
+            serde_json::json!("/tmp/x/stderr.log")
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["transcript_dir"]["path"],
+            serde_json::json!("/tmp/x")
+        );
+        assert!(
+            updated.context["job_artifact_metadata"]["build"]
+                .get("output_json")
+                .is_none()
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["agent_context"]["schema"],
+            serde_json::json!(protocol::AGENT_CONTEXT_SCHEMA_NAME)
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["run_json"]["schema"],
+            serde_json::json!(protocol::JOB_RUN_SCHEMA_NAME)
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["transcript_jsonl"]["record_count"],
+            serde_json::json!(3)
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["job_events"]["schema"],
+            serde_json::json!(protocol::JOB_EVENT_SCHEMA_NAME)
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["job_events"]["record_count"],
+            serde_json::json!(12)
+        );
+        assert_eq!(
+            updated.context["job_artifact_data"]["build"]["agent_context"]["schema"],
+            serde_json::json!(protocol::AGENT_CONTEXT_SCHEMA_NAME)
+        );
+        assert_eq!(
+            updated.context["job_artifact_data"]["build"]["run_json"]["schema"],
+            serde_json::json!(protocol::JOB_RUN_SCHEMA_NAME)
+        );
+        assert_eq!(
+            updated.context["job_artifact_data"]["build"]["transcript_jsonl"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            updated.context["job_artifact_data"]["build"]["transcript_jsonl"][0],
+            serde_json::json!("{\"event\":\"start\"}")
+        );
+        assert_eq!(
+            updated.context["job_artifact_data"]["build"]["job_events"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            updated.context["job_artifact_data"]["build"]["job_events"][0]["kind"],
+            serde_json::json!("system")
+        );
+        assert!(
+            updated.context["job_artifact_data"]["build"]
+                .get("stdout_log")
+                .is_none()
+        );
+        assert!(
+            updated.context["job_artifact_data"]["build"]
+                .get("stderr_log")
+                .is_none()
+        );
+        assert!(
+            updated.context["job_artifact_data"]["build"]
+                .get("output_json")
+                .is_none()
+        );
+        assert!(
+            updated.context["job_artifact_data"]["build"]
+                .get("transcript_dir")
+                .is_none()
+        );
+
+        let next_job = jobs
+            .iter()
+            .find(|j| j.step_id == "test")
+            .expect("next step job");
+        assert_eq!(
+            next_job.context["workflow"]["inputs"]["valid_next_events"],
+            serde_json::json!(["cancel"])
+        );
+        assert_eq!(
+            next_job.context["workflow"]["inputs"]["job_artifact_paths"]["build"]["agent_context"],
+            serde_json::json!("/tmp/x/.agent-context.json")
+        );
+        assert_eq!(
+            next_job.context["workflow"]["inputs"]["job_artifact_metadata"]["build"]["agent_context"]
+                ["schema"],
+            serde_json::json!(protocol::AGENT_CONTEXT_SCHEMA_NAME)
+        );
+        assert_eq!(
+            next_job.context["work_item"]["id"],
+            serde_json::json!(item.id)
+        );
+        assert_eq!(
+            next_job.context["work_item"]["workflow_id"],
+            serde_json::json!(item.workflow_id)
+        );
+        assert_eq!(
+            next_job.context["work_item"]["workflow_state"],
+            serde_json::json!("test")
+        );
+        assert!(
+            next_job.context["workflow"]["inputs"]
+                .get("job_artifact_data")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn successful_job_promotes_github_pr_into_top_level_context() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("reg worker");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job assigned");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/x".into()),
+                result: Some(JobResult {
+                    github_pr: Some(protocol::GithubPullRequestMetadata {
+                        number: 42,
+                        url: "https://github.com/reddit/agent-hub/pull/42".into(),
+                        state: Some("open".into()),
+                        is_draft: Some(true),
+                        head_ref_name: Some("feature/test".into()),
+                        base_ref_name: Some("main".into()),
+                    }),
+                    ..successful_job_result()
+                }),
+            },
+        )
+        .await
+        .expect("succeeded");
+
+        let updated = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get item")
+            .expect("exists");
+        assert_eq!(
+            updated.context["github_pr"]["owner"],
+            serde_json::json!("reddit")
+        );
+        assert_eq!(
+            updated.context["github_pr"]["repo"],
+            serde_json::json!("agent-hub")
+        );
+        assert_eq!(
+            updated.context["github_pr"]["number"],
+            serde_json::json!(42)
+        );
+        assert_eq!(
+            updated.context["github_pr"]["html_url"],
+            serde_json::json!("https://github.com/reddit/agent-hub/pull/42")
+        );
+        assert_eq!(
+            updated.context["github_pr"]["status"],
+            serde_json::json!("open")
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn initial_job_context_includes_workflow_inputs_contract() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        let initial_job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|j| j.step_id == "build")
+            .expect("build job");
+
+        assert_eq!(
+            initial_job.context["workflow"]["inputs"]["valid_next_events"],
+            serde_json::json!(["submit", "cancel"])
+        );
+        assert_eq!(
+            initial_job.context["workflow"]["inputs"]["job_artifact_paths"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            initial_job.context["workflow"]["inputs"]["job_artifact_metadata"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            initial_job.context["work_item"]["id"],
+            serde_json::json!(item.id)
+        );
+        assert_eq!(
+            initial_job.context["work_item"]["workflow_id"],
+            serde_json::json!(item.workflow_id)
+        );
+        assert_eq!(
+            initial_job.context["work_item"]["workflow_state"],
+            serde_json::json!("build")
+        );
+        assert!(
+            initial_job.context["workflow"]["inputs"]
+                .get("job_artifact_data")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn sse_events_endpoint_replays_buffered_events() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let job_events = crate::server::job_events::JobEventHub::new();
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+        let job = svc
+            .list_jobs()
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|j| j.work_item_id == item.id)
+            .expect("job");
+
+        job_events
+            .push(protocol::JobEvent {
+                job_id: job.id,
+                worker_id: "w1".into(),
+                at: Utc::now(),
+                kind: protocol::JobEventKind::System,
+                stream: None,
+                message: "hello".into(),
+            })
+            .await;
+
+        let state = super::super::AppState {
+            config: Arc::new(super::super::config::ServerConfig {
+                auth_mode: super::super::config::AuthMode::None,
+                tokens: vec![],
+                listen_addr: "127.0.0.1:0".into(),
+                presence_ttl_secs: 120,
+                session_ttl_secs: 120,
+                notification_delay_secs: 0,
+                approval_mode: super::super::config::ApprovalFeatureMode::Disabled,
+                base_url: None,
+                default_approval_mode: super::super::sessions::SessionApprovalMode::Remote,
+                workflows_dir: "workflows".into(),
+                config_root: "../agent-hub-configs".into(),
+                task_dir: "tasks".into(),
+                task_adapter: "file".into(),
+                vikunja_base_url: None,
+                vikunja_token: None,
+                vikunja_bot_username: None,
+                vikunja_bot_password: None,
+                vikunja_project_id: None,
+                vikunja_label_prefix: None,
+                orchestration_db_path: ":memory:".into(),
+                artifact_store_root: "local-agent-data".into(),
+                grpc_listen_addr: None,
+                github_webhook_secret: None,
+                github_polling_enabled: false,
+                github_poll_interval_secs: 30,
+                github_token: None,
+                github_api_base_url: "https://api.github.com".into(),
+            }),
+            artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
+                std::path::PathBuf::from("local-agent-data"),
+            )),
+            presence: Arc::new(super::super::presence::Presence::new(120)),
+            sessions: Arc::new(super::super::sessions::SessionRegistry::new(120)),
+            notifier: Arc::new(super::super::notifier::NullNotifier),
+            notify_config: Arc::new(tokio::sync::RwLock::new(
+                protocol::NotifyConfig::with_delay(0),
+            )),
+            pending: Arc::new(super::super::hooks::PendingNotifications::new()),
+            approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
+            questions: Arc::new(super::super::questions::QuestionRegistry::new()),
+            orchestration: Arc::new(svc.clone()),
+            job_events: Arc::new(job_events),
+            oauth: Arc::new(None),
+            loaded_config_tree: Arc::new(None),
+        };
+
+        let app = Router::new()
+            .route(
+                "/api/v1/orchestration/jobs/{id}/events",
+                get(job_events_sse::<super::super::notifier::NullNotifier>),
+            )
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/orchestration/jobs/{}/events", job.id))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn empty_structured_transcript_artifacts_still_project_legacy_artifact_summary_aliases() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("reg worker");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job assigned");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/x".into()),
+                result: Some(JobResult {
+                    outcome: protocol::ExecutionOutcome::Succeeded,
+                    termination_reason: protocol::TerminationReason::ExitCode,
+                    exit_code: Some(0),
+                    timing: protocol::ExecutionTiming {
+                        started_at: Utc::now(),
+                        finished_at: Utc::now(),
+                        duration_ms: 1,
+                    },
+                    artifacts: protocol::ArtifactSummary {
+                        stdout_path: "/tmp/x/stdout.log".into(),
+                        stderr_path: "/tmp/x/stderr.log".into(),
+                        output_path: None,
+                        transcript_dir: Some("/tmp/x".into()),
+                        stdout_bytes: None,
+                        stderr_bytes: None,
+                        output_bytes: None,
+                        structured_transcript_artifacts: Vec::new(),
+                    },
+                    output_json: Some(serde_json::json!({"build_ok": true})),
+                    repo: None,
+                    github_pr: None,
+                    error_message: None,
+                }),
+            },
+        )
+        .await
+        .expect("success");
+
+        let updated = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get item")
+            .expect("exists");
+        let step_alias = updated
+            .context
+            .get("job_artifact_paths")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|v| v.get("build"));
+        assert_eq!(
+            step_alias
+                .and_then(serde_json::Value::as_object)
+                .and_then(|v| v.get("stdout_log")),
+            Some(&serde_json::json!("/tmp/x/stdout.log"))
+        );
+        assert_eq!(
+            updated.context["job_artifact_paths"]["build"]["stderr_log"],
+            serde_json::json!("/tmp/x/stderr.log")
+        );
+        assert_eq!(
+            updated.context["job_artifact_paths"]["build"]["transcript_dir"],
+            serde_json::json!("/tmp/x")
+        );
+        assert!(
+            updated.context["job_artifact_paths"]["build"]
+                .get("output_json")
+                .is_none()
+        );
+        assert!(
+            updated.context["job_artifact_paths"]["build"]
+                .get("agent_context")
+                .is_none()
+        );
+        let metadata_alias = updated
+            .context
+            .get("job_artifact_metadata")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|v| v.get("build"));
+        assert_eq!(
+            metadata_alias
+                .and_then(serde_json::Value::as_object)
+                .and_then(|v| v.get("stdout_log"))
+                .and_then(serde_json::Value::as_object)
+                .and_then(|v| v.get("path")),
+            Some(&serde_json::json!("/tmp/x/stdout.log"))
+        );
+        assert_eq!(
+            updated.context["job_artifact_metadata"]["build"]["transcript_dir"]["path"],
+            serde_json::json!("/tmp/x")
+        );
+        assert!(
+            updated.context["job_artifact_metadata"]["build"]
+                .get("output_json")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn update_job_terminal_marks_event_buffer_terminal() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let job_events = crate::server::job_events::JobEventHub::new();
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("reg");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job");
+
+        let state = super::super::AppState {
+            config: Arc::new(super::super::config::ServerConfig {
+                auth_mode: super::super::config::AuthMode::None,
+                tokens: vec![],
+                listen_addr: "127.0.0.1:0".into(),
+                presence_ttl_secs: 120,
+                session_ttl_secs: 120,
+                notification_delay_secs: 0,
+                approval_mode: super::super::config::ApprovalFeatureMode::Disabled,
+                base_url: None,
+                default_approval_mode: super::super::sessions::SessionApprovalMode::Remote,
+                workflows_dir: "workflows".into(),
+                config_root: "../agent-hub-configs".into(),
+                task_dir: "tasks".into(),
+                task_adapter: "file".into(),
+                vikunja_base_url: None,
+                vikunja_token: None,
+                vikunja_bot_username: None,
+                vikunja_bot_password: None,
+                vikunja_project_id: None,
+                vikunja_label_prefix: None,
+                orchestration_db_path: ":memory:".into(),
+                artifact_store_root: "local-agent-data".into(),
+                grpc_listen_addr: None,
+                github_webhook_secret: None,
+                github_polling_enabled: false,
+                github_poll_interval_secs: 30,
+                github_token: None,
+                github_api_base_url: "https://api.github.com".into(),
+            }),
+            artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
+                std::path::PathBuf::from("local-agent-data"),
+            )),
+            presence: Arc::new(super::super::presence::Presence::new(120)),
+            sessions: Arc::new(super::super::sessions::SessionRegistry::new(120)),
+            notifier: Arc::new(super::super::notifier::NullNotifier),
+            notify_config: Arc::new(tokio::sync::RwLock::new(
+                protocol::NotifyConfig::with_delay(0),
+            )),
+            pending: Arc::new(super::super::hooks::PendingNotifications::new()),
+            approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
+            questions: Arc::new(super::super::questions::QuestionRegistry::new()),
+            orchestration: Arc::new(svc.clone()),
+            job_events: Arc::new(job_events.clone()),
+            oauth: Arc::new(None),
+            loaded_config_tree: Arc::new(None),
+        };
+
+        let req = JobUpdateRequest {
+            worker_id: "w1".into(),
+            state: JobState::Running,
+            transcript_dir: Some("/tmp/t".into()),
+            result: None,
+        };
+
+        let _ = update_job::<super::super::notifier::NullNotifier>(
+            State(state.clone()),
+            Path(job.id),
+            Json(req),
+        )
+        .await
+        .expect("update");
+
+        let req = JobUpdateRequest {
+            worker_id: "w1".into(),
+            state: JobState::Succeeded,
+            transcript_dir: Some("/tmp/t".into()),
+            result: None,
+        };
+
+        let _ = update_job::<super::super::notifier::NullNotifier>(
+            State(state),
+            Path(job.id),
+            Json(req),
+        )
+        .await
+        .expect("update");
+
+        // Marked terminal entries should eventually be cleanable.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let _ = job_events.cleanup_terminal_expired().await;
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+        let _ = item;
+    }
+
+    #[test]
+    fn terminal_event_maps_to_done_sse_event_name() {
+        let job = Job {
+            id: Uuid::new_v4(),
+            work_item_id: Uuid::new_v4(),
+            step_id: "build".into(),
+            state: JobState::Succeeded,
+            assigned_worker_id: Some("w1".into()),
+            execution_mode: protocol::ExecutionMode::Raw,
+            container_image: None,
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: None,
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let terminal = terminal_job_event(&job);
+        let evt = to_sse_event(&terminal);
+        let rendered = format!("{:?}", evt);
+        assert!(rendered.contains("event: done"));
+    }
+
+    #[test]
+    fn maps_github_webhook_to_workflow_event() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("pull_request"));
+        let payload = GithubWebhookPayload {
+            action: Some("closed".into()),
+            pull_request: Some(GithubPullRequestWebhook {
+                html_url: "https://github.com/reddit/agent-hub/pull/1".into(),
+                number: None,
+                merged: Some(true),
+            }),
+            review: None,
+            sender: None,
+            check_suite: None,
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &payload, None),
+            Some(WorkflowEventKind::PrMerged)
+        );
+
+        let opened = GithubWebhookPayload {
+            action: Some("opened".into()),
+            pull_request: Some(GithubPullRequestWebhook {
+                html_url: "https://github.com/reddit/agent-hub/pull/2".into(),
+                number: None,
+                merged: None,
+            }),
+            review: None,
+            sender: None,
+            check_suite: None,
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &opened, None),
+            Some(WorkflowEventKind::PrCreated)
+        );
+    }
+
+    #[test]
+    fn maps_github_review_webhook_to_human_events() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-github-event",
+            HeaderValue::from_static("pull_request_review"),
+        );
+
+        let approved = GithubWebhookPayload {
+            action: Some("submitted".into()),
+            pull_request: Some(GithubPullRequestWebhook {
+                html_url: "https://github.com/reddit/agent-hub/pull/1".into(),
+                number: None,
+                merged: None,
+            }),
+            review: Some(GithubReviewWebhook {
+                state: Some("approved".into()),
+                user: None,
+            }),
+            sender: None,
+            check_suite: None,
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &approved, None),
+            Some(WorkflowEventKind::PrApproved)
+        );
+
+        let changes = GithubWebhookPayload {
+            action: Some("submitted".into()),
+            pull_request: Some(GithubPullRequestWebhook {
+                html_url: "https://github.com/reddit/agent-hub/pull/1".into(),
+                number: None,
+                merged: None,
+            }),
+            review: Some(GithubReviewWebhook {
+                state: Some("changes_requested".into()),
+                user: None,
+            }),
+            sender: None,
+            check_suite: None,
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &changes, None),
+            Some(WorkflowEventKind::PrChangesRequested)
+        );
+    }
+
+    #[test]
+    fn maps_github_review_webhook_to_role_aware_events_when_owner_known() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-github-event",
+            HeaderValue::from_static("pull_request_review"),
+        );
+
+        let owner_approved = GithubWebhookPayload {
+            action: Some("submitted".into()),
+            pull_request: Some(GithubPullRequestWebhook {
+                html_url: "https://github.com/reddit/agent-hub/pull/1".into(),
+                number: None,
+                merged: None,
+            }),
+            review: Some(GithubReviewWebhook {
+                state: Some("approved".into()),
+                user: Some(GithubUserWebhook {
+                    login: Some("owner-dev".into()),
+                }),
+            }),
+            sender: None,
+            check_suite: None,
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &owner_approved, Some("owner-dev")),
+            Some(WorkflowEventKind::OwnerPrApproved)
+        );
+
+        let coworker_changes = GithubWebhookPayload {
+            action: Some("submitted".into()),
+            pull_request: Some(GithubPullRequestWebhook {
+                html_url: "https://github.com/reddit/agent-hub/pull/1".into(),
+                number: None,
+                merged: None,
+            }),
+            review: Some(GithubReviewWebhook {
+                state: Some("changes_requested".into()),
+                user: Some(GithubUserWebhook {
+                    login: Some("teammate".into()),
+                }),
+            }),
+            sender: None,
+            check_suite: None,
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &coworker_changes, Some("owner-dev")),
+            Some(WorkflowEventKind::CoworkerChangesRequested)
+        );
+    }
+
+    #[test]
+    fn maps_github_review_webhook_uses_sender_login_when_review_user_missing() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-github-event",
+            HeaderValue::from_static("pull_request_review"),
+        );
+
+        let payload = GithubWebhookPayload {
+            action: Some("submitted".into()),
+            pull_request: Some(GithubPullRequestWebhook {
+                html_url: "https://github.com/reddit/agent-hub/pull/1".into(),
+                number: None,
+                merged: None,
+            }),
+            review: Some(GithubReviewWebhook {
+                state: Some("approved".into()),
+                user: None,
+            }),
+            sender: Some(GithubUserWebhook {
+                login: Some("owner-dev".into()),
+            }),
+            check_suite: None,
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &payload, Some("owner-dev")),
+            Some(WorkflowEventKind::OwnerPrApproved)
+        );
+    }
+
+    #[test]
+    fn role_aware_webhook_fallback_chain_maps_to_generic_and_human_events() {
+        assert_eq!(
+            map_role_event_to_fallback_candidates(&WorkflowEventKind::OwnerPrApproved),
+            vec![
+                WorkflowEventKind::OwnerPrApproved,
+                WorkflowEventKind::PrApproved,
+                WorkflowEventKind::HumanApproved,
+            ]
+        );
+        assert_eq!(
+            map_role_event_to_fallback_candidates(&WorkflowEventKind::CoworkerChangesRequested),
+            vec![
+                WorkflowEventKind::CoworkerChangesRequested,
+                WorkflowEventKind::PrChangesRequested,
+                WorkflowEventKind::HumanChangesRequested,
+            ]
+        );
+    }
+
+    #[test]
+    fn owner_github_login_is_read_from_context() {
+        let context = serde_json::json!({
+            "owner_github_login": "  owner-dev  "
+        });
+        assert_eq!(
+            owner_github_login_from_context(&context).as_deref(),
+            Some("owner-dev")
+        );
+
+        let missing = serde_json::json!({});
+        assert_eq!(owner_github_login_from_context(&missing), None);
+    }
+
+    #[test]
+    fn projects_owner_github_login_into_workflow_job_context() {
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: "wf".to_string(),
+            external_task_id: None,
+            external_task_source: None,
+            title: Some("title".to_string()),
+            description: Some("desc".to_string()),
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "review".to_string(),
+            projected_state: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: true,
+            human_gate_state: None,
+            blocked_on: Some(BlockReason::HumanReview),
+            state: WorkItemState::Running,
+            context: serde_json::json!({
+                "owner_github_login": "owner-dev"
+            }),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+
+        let mut context = serde_json::json!({});
+        project_workflow_inputs_into_job_context(
+            &mut context,
+            &[WorkflowEventKind::OwnerPrApproved],
+            &item,
+            &item.context,
+        );
+
+        assert_eq!(
+            context
+                .get("work_item")
+                .and_then(|value| value.get("owner_github_login"))
+                .cloned(),
+            Some(serde_json::json!("owner-dev"))
+        );
+    }
+
+    #[test]
+    fn merge_task_metadata_preserves_owner_github_login_from_task_context() {
+        let task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "title".to_string(),
+            description: Some("desc".to_string()),
+            workflow_id: Some("wf".to_string()),
+            triage_status: TaskTriageStatus::Ready,
+            pending_human_action: false,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: vec![],
+            allowed_actions: vec![],
+            context: serde_json::json!({
+                "owner_github_login": " owner-dev "
+            }),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+
+        let merged = merge_task_metadata(&serde_json::json!({}), &task);
+        assert_eq!(merged["owner_github_login"], serde_json::json!("owner-dev"));
+    }
+
+    /// After a successful triage, the orchestrator sets `human_gate=true`,
+    /// `human_gate_state="triage_completed"`, `triage_status="pending_approval"`.
+    /// On the next adapter poll the task record carries those raw strings via
+    /// `context.checkpoint`. `apply_task_fields` must preserve them rather
+    /// than overwriting with the enum-derived projection (which can't represent
+    /// `triage_completed` / `pending_approval`).
+    #[test]
+    fn apply_task_fields_after_triage_success_does_not_clobber() {
+        let task_id = Uuid::new_v4();
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: "__triage__".to_string(),
+            external_task_id: Some(task_id.to_string()),
+            external_task_source: Some("vikunja".to_string()),
+            title: Some("title".to_string()),
+            description: Some("desc".to_string()),
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "await_triage_approval".to_string(),
+            projected_state: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: Some("pending_approval".to_string()),
+            human_gate: true,
+            human_gate_state: Some("triage_completed".to_string()),
+            blocked_on: None,
+            state: WorkItemState::Running,
+            context: serde_json::json!({}),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+
+        // Simulate what vikunja_task_to_record produces when a post-triage
+        // checkpoint comment is round-tripped: enum-typed fields default
+        // (no enum variant for triage_completed / pending_approval) but the
+        // raw strings travel through context.checkpoint.
+        let task = TaskToolRecord {
+            id: task_id,
+            title: "title".to_string(),
+            description: Some("desc".to_string()),
+            workflow_id: None,
+            triage_status: TaskTriageStatus::NeedsWorkflowSelection,
+            pending_human_action: true,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: vec![],
+            allowed_actions: vec![],
+            context: serde_json::json!({
+                "checkpoint": {
+                    "human_gate": true,
+                    "human_gate_state": "triage_completed",
+                    "triage_status": "pending_approval",
+                }
+            }),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+
+        let updated = apply_task_fields(item, &task, "vikunja");
+
+        assert!(updated.human_gate, "human_gate must remain true");
+        assert_eq!(
+            updated.human_gate_state.as_deref(),
+            Some("triage_completed"),
+            "human_gate_state must round-trip the raw string",
+        );
+        assert_eq!(
+            updated.triage_status.as_deref(),
+            Some("pending_approval"),
+            "triage_status must round-trip the raw string",
+        );
+    }
+
+    /// When no checkpoint context is present (first poll of a brand-new
+    /// Vikunja task), apply_task_fields falls back to the enum-derived
+    /// projection. This locks in the existing behaviour for the
+    /// adapter-creates-work-item path.
+    #[test]
+    fn apply_task_fields_without_checkpoint_uses_enum_projection() {
+        let task_id = Uuid::new_v4();
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: "__triage__".to_string(),
+            external_task_id: None,
+            external_task_source: None,
+            title: None,
+            description: None,
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "triage".to_string(),
+            projected_state: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: Some("ignored".to_string()),
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Pending,
+            context: serde_json::json!({}),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+
+        let task = TaskToolRecord {
+            id: task_id,
+            title: "title".to_string(),
+            description: Some("desc".to_string()),
+            workflow_id: None,
+            triage_status: TaskTriageStatus::NeedsWorkflowSelection,
+            pending_human_action: false,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: vec![],
+            allowed_actions: vec![],
+            context: serde_json::json!({}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+
+        let updated = apply_task_fields(item, &task, "vikunja");
+
+        assert!(!updated.human_gate);
+        assert_eq!(updated.human_gate_state, None);
+        assert_eq!(
+            updated.triage_status.as_deref(),
+            Some("needs_workflow_selection"),
+        );
+    }
+
+    #[test]
+    fn maps_github_checks_webhooks_to_checks_events() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("check_suite"));
+        let check_suite_payload = GithubWebhookPayload {
+            action: Some("completed".into()),
+            pull_request: None,
+            review: None,
+            sender: None,
+            check_suite: Some(GithubCheckSuiteWebhook {
+                conclusion: Some("success".into()),
+                pull_requests: vec![],
+                head_branch: None,
+            }),
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &check_suite_payload, None),
+            Some(WorkflowEventKind::ChecksPassed)
+        );
+
+        let check_suite_failed = GithubWebhookPayload {
+            action: Some("completed".into()),
+            pull_request: None,
+            review: None,
+            sender: None,
+            check_suite: Some(GithubCheckSuiteWebhook {
+                conclusion: Some("failure".into()),
+                pull_requests: vec![],
+                head_branch: None,
+            }),
+            check_run: None,
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &check_suite_failed, None),
+            Some(WorkflowEventKind::ChecksFailed)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("check_run"));
+        let check_run_payload = GithubWebhookPayload {
+            action: Some("completed".into()),
+            pull_request: None,
+            review: None,
+            sender: None,
+            check_suite: None,
+            check_run: Some(GithubCheckRunWebhook {
+                name: None,
+                conclusion: Some("success".into()),
+                pull_requests: vec![],
+                head_branch: None,
+            }),
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &check_run_payload, None),
+            Some(WorkflowEventKind::ChecksPassed)
+        );
+
+        let check_run_cancelled = GithubWebhookPayload {
+            action: Some("completed".into()),
+            pull_request: None,
+            review: None,
+            sender: None,
+            check_suite: None,
+            check_run: Some(GithubCheckRunWebhook {
+                name: None,
+                conclusion: Some("cancelled".into()),
+                pull_requests: vec![],
+                head_branch: None,
+            }),
+        };
+        assert_eq!(
+            map_github_webhook_to_workflow_event(&headers, &check_run_cancelled, None),
+            Some(WorkflowEventKind::ChecksFailed)
+        );
+    }
+
+    #[test]
+    fn github_webhook_pr_reference_supports_checks_payload_shapes() {
+        let suite_payload = GithubWebhookPayload {
+            action: Some("completed".into()),
+            pull_request: None,
+            review: None,
+            sender: None,
+            check_suite: Some(GithubCheckSuiteWebhook {
+                conclusion: Some("success".into()),
+                pull_requests: vec![GithubPullRequestRefWebhook {
+                    url: "https://github.com/reddit/agent-hub/pull/123".into(),
+                }],
+                head_branch: Some("feature/test".into()),
+            }),
+            check_run: None,
+        };
+        let suite_ref = github_webhook_pr_reference("check_suite", &suite_payload);
+        assert_eq!(
+            suite_ref.pr_url.as_deref(),
+            Some("https://github.com/reddit/agent-hub/pull/123")
+        );
+        assert_eq!(suite_ref.pr_number, Some(123));
+        assert_eq!(suite_ref.head_branch.as_deref(), Some("feature/test"));
+
+        let run_payload = GithubWebhookPayload {
+            action: Some("completed".into()),
+            pull_request: None,
+            review: None,
+            sender: None,
+            check_suite: None,
+            check_run: Some(GithubCheckRunWebhook {
+                name: Some("ci".into()),
+                conclusion: Some("failure".into()),
+                pull_requests: vec![GithubPullRequestRefWebhook {
+                    url: "https://github.com/reddit/agent-hub/pull/124".into(),
+                }],
+                head_branch: Some("feature/run".into()),
+            }),
+        };
+        let run_ref = github_webhook_pr_reference("check_run", &run_payload);
+        assert_eq!(
+            run_ref.pr_url.as_deref(),
+            Some("https://github.com/reddit/agent-hub/pull/124")
+        );
+        assert_eq!(run_ref.pr_number, Some(124));
+        assert_eq!(run_ref.head_branch.as_deref(), Some("feature/run"));
+    }
+
+    #[test]
+    fn updates_pr_state_context_and_merge_readiness_deterministically() {
+        let mut context = serde_json::json!({});
+
+        update_github_pr_state_in_context(
+            &mut context,
+            "https://github.com/reddit/agent-hub/pull/42",
+            Some(42),
+            None,
+            Some(&WorkflowEventKind::PrCreated),
+            None,
+            false,
+            Utc::now(),
+        );
+
+        let state = github_pr_state_from_context(&context).expect("state persisted");
+        assert_eq!(state.number, 42);
+        assert!(matches!(state.state, GithubPrLifecycleState::Open));
+        assert!(!state.approved);
+        assert!(!state.checks_passing);
+        assert!(!state.changes_requested);
+        assert!(!state.mergeable);
+
+        update_github_pr_state_in_context(
+            &mut context,
+            "https://github.com/reddit/agent-hub/pull/42",
+            Some(42),
+            None,
+            Some(&WorkflowEventKind::PrApproved),
+            None,
+            false,
+            Utc::now(),
+        );
+        let approved = github_pr_state_from_context(&context).expect("approved state");
+        assert!(approved.approved);
+        assert!(!approved.changes_requested);
+        assert!(!approved.mergeable);
+
+        update_github_pr_state_in_context(
+            &mut context,
+            "https://github.com/reddit/agent-hub/pull/42",
+            Some(42),
+            None,
+            Some(&WorkflowEventKind::ChecksPassed),
+            None,
+            false,
+            Utc::now(),
+        );
+        let ready = github_pr_state_from_context(&context).expect("ready state");
+        assert!(ready.mergeable);
+
+        update_github_pr_state_in_context(
+            &mut context,
+            "https://github.com/reddit/agent-hub/pull/42",
+            Some(42),
+            None,
+            Some(&WorkflowEventKind::HumanChangesRequested),
+            None,
+            false,
+            Utc::now(),
+        );
+        let blocked = github_pr_state_from_context(&context).expect("blocked state");
+        assert!(!blocked.approved);
+        assert!(blocked.changes_requested);
+        assert!(!blocked.mergeable);
+
+        update_github_pr_state_in_context(
+            &mut context,
+            "https://github.com/reddit/agent-hub/pull/42",
+            Some(42),
+            None,
+            Some(&WorkflowEventKind::PrMerged),
+            None,
+            false,
+            Utc::now(),
+        );
+        let merged = github_pr_state_from_context(&context).expect("merged state");
+        assert!(matches!(merged.state, GithubPrLifecycleState::Merged));
+        assert!(!merged.mergeable);
+    }
+
+    #[test]
+    fn merge_readiness_respects_merge_policy_when_present() {
+        let pr_state = GithubPrState {
+            url: "https://github.com/reddit/agent-hub/pull/99".to_string(),
+            number: 99,
+            head_branch: None,
+            state: GithubPrLifecycleState::Open,
+            approval_count: 1,
+            approved: true,
+            passing_checks: vec!["lint".to_string()],
+            checks_passing: true,
+            changes_requested: false,
+            merge_policy: Some(MergePolicy {
+                required_checks: vec!["lint".to_string(), "test".to_string()],
+                required_approvals: 2,
+                dismiss_stale_reviews: false,
+                require_up_to_date: false,
+            }),
+            merge_attempted: false,
+            mergeable: false,
+            last_updated: Utc::now(),
+        };
+
+        let readiness = merge_readiness_from_pr_state(&pr_state);
+        assert!(!readiness.ready);
+        assert!(!readiness.approved);
+        assert!(!readiness.checks_passing);
+    }
+
+    #[test]
+    fn parse_pr_number_from_url_extracts_terminal_segment() {
+        assert_eq!(
+            parse_pr_number_from_url("https://github.com/reddit/agent-hub/pull/123"),
+            Some(123)
+        );
+        assert_eq!(
+            parse_pr_number_from_url("https://github.com/reddit/agent-hub/pull/not-a-number"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_components_extracts_host_owner_repo_number_for_github_com() {
+        let parts = parse_pr_url_components("https://github.com/reddit/agent-hub/pull/123")
+            .expect("parses");
+        assert_eq!(parts.host, "github.com");
+        assert_eq!(parts.owner, "reddit");
+        assert_eq!(parts.repo, "agent-hub");
+        assert_eq!(parts.number, Some(123));
+    }
+
+    #[test]
+    fn parse_pr_url_components_handles_github_enterprise_host() {
+        // Same shape, GHE host. The host is what lets the SCM registry
+        // pick the right api_base_url and token at poll time.
+        let parts = parse_pr_url_components(
+            "https://github.snooguts.net/reddit/achilles-gitops/pull/11619",
+        )
+        .expect("parses");
+        assert_eq!(parts.host, "github.snooguts.net");
+        assert_eq!(parts.owner, "reddit");
+        assert_eq!(parts.repo, "achilles-gitops");
+        assert_eq!(parts.number, Some(11619));
+    }
+
+    #[test]
+    fn parse_pr_url_components_strips_trailing_dot_git_on_repo_segment() {
+        let parts = parse_pr_url_components("https://github.com/owner/my-repo.git/pull/9")
+            .expect("parses");
+        assert_eq!(parts.repo, "my-repo");
+    }
+
+    #[test]
+    fn parse_pr_url_components_rejects_api_style_urls() {
+        // The API base URL is held in the SCM registry, not parsed back
+        // out of input strings — accepting `api.github.com/repos/...`
+        // here would mis-route polling.
+        assert!(
+            parse_pr_url_components("https://api.github.com/repos/reddit/agent-hub/pulls/123")
+                .is_none()
+        );
+    }
+
+
+    #[test]
+    fn stamp_state_entered_records_timestamp_only_when_step_changes() {
+        let mut item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: "wf".into(),
+            external_task_id: None,
+            external_task_source: None,
+            session_id: None,
+            title: Some("t".into()),
+            description: None,
+            labels: Vec::new(),
+            priority: None,
+            current_step: "implement".into(),
+            projected_state: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Pending,
+            context: serde_json::json!({}),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: std::collections::HashMap::new(),
+        };
+
+        // First call seeds both fields.
+        stamp_state_entered_if_changed(&mut item);
+        let first_at = item
+            .context
+            .get("state_entered_at")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .expect("first stamp");
+        assert_eq!(
+            item.context.get("state_entered_for"),
+            Some(&serde_json::json!("implement"))
+        );
+
+        // Same step → idempotent, timestamp unchanged.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        stamp_state_entered_if_changed(&mut item);
+        assert_eq!(
+            item.context
+                .get("state_entered_at")
+                .and_then(serde_json::Value::as_str),
+            Some(first_at.as_str())
+        );
+
+        // Different step → re-stamps.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        item.current_step = "await_ci".into();
+        stamp_state_entered_if_changed(&mut item);
+        let second_at = item
+            .context
+            .get("state_entered_at")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .expect("second stamp");
+        assert_ne!(first_at, second_at);
+        assert_eq!(
+            item.context.get("state_entered_for"),
+            Some(&serde_json::json!("await_ci"))
+        );
+    }
+
+    #[test]
+    fn closed_unmerged_pr_sets_closed_state_without_mapped_event() {
+        let mut context = serde_json::json!({});
+        update_github_pr_state_in_context(
+            &mut context,
+            "https://github.com/reddit/agent-hub/pull/77",
+            Some(77),
+            None,
+            None,
+            None,
+            true,
+            Utc::now(),
+        );
+        let state = github_pr_state_from_context(&context).expect("state persisted");
+        assert!(matches!(state.state, GithubPrLifecycleState::Closed));
+        assert!(!state.mergeable);
+    }
+
+    #[test]
+    fn item_github_pr_urls_includes_github_pr_state_url() {
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: "wf".to_string(),
+            external_task_id: None,
+            external_task_source: None,
+            title: None,
+            description: None,
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "build".to_string(),
+            projected_state: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Running,
+            context: serde_json::json!({
+                "github_pr_state": {
+                    "url": "https://github.com/reddit/agent-hub/pull/222"
+                },
+                "job_results": {
+                    "create_pr": {
+                        "github_pr": {
+                            "url": "https://github.com/reddit/agent-hub/pull/111"
+                        }
+                    }
+                }
+            }),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+
+        let urls = item_github_pr_urls(&item).collect::<Vec<_>>();
+        assert!(urls.contains(&"https://github.com/reddit/agent-hub/pull/222"));
+        assert!(urls.contains(&"https://github.com/reddit/agent-hub/pull/111"));
+    }
+
+    #[test]
+    fn item_matches_github_webhook_matches_branch_from_pr_state() {
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: "wf".to_string(),
+            external_task_id: None,
+            external_task_source: None,
+            title: None,
+            description: None,
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "build".to_string(),
+            projected_state: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Running,
+            context: serde_json::json!({
+                "github_pr_state": {
+                    "head_branch": "feature/from-pr-state"
+                }
+            }),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+
+        let webhook_pr = GithubWebhookPrReference {
+            pr_url: None,
+            pr_number: None,
+            head_branch: Some("feature/from-pr-state".to_string()),
+        };
+
+        assert!(item_matches_github_webhook(&item, &webhook_pr));
+    }
+
+    #[test]
+    fn item_matches_github_webhook_matches_branch_from_job_result_repo_metadata() {
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: "wf".to_string(),
+            external_task_id: None,
+            external_task_source: None,
+            title: None,
+            description: None,
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "build".to_string(),
+            projected_state: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Running,
+            context: serde_json::json!({
+                "job_results": {
+                    "build": {
+                        "repo": {
+                            "target_branch": "feature/from-job-result"
+                        }
+                    }
+                }
+            }),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+
+        let webhook_pr = GithubWebhookPrReference {
+            pr_url: None,
+            pr_number: None,
+            head_branch: Some("feature/from-job-result".to_string()),
+        };
+
+        assert!(item_matches_github_webhook(&item, &webhook_pr));
+    }
+
+    #[test]
+    fn verifies_github_signature_from_known_test_vector() {
+        let secret = "It's a Secret to Everybody";
+        let body = b"Hello, World!";
+        let signature = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+
+        assert!(verify_github_signature(secret, body, signature));
+    }
+
+    #[tokio::test]
+    async fn stale_worker_requeues_assigned_job() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        svc.create_work_item(CreateWorkItemRequest {
+            workflow_id: "wf".into(),
+            session_id: None,
+            context: serde_json::json!({}),
+            repo: None,
+        })
+        .await
+        .expect("create");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "stale".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("reg");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "stale".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned");
+
+        let mut stale_worker = svc
+            .get_worker("stale")
+            .await
+            .expect("get worker")
+            .expect("exists");
+        stale_worker.last_heartbeat_at = Utc::now() - chrono::TimeDelta::seconds(500);
+        svc.upsert_worker(&stale_worker).await.expect("backdate");
+
+        let requeued = svc
+            .reconcile_stale_workers(Duration::from_secs(30))
+            .await
+            .expect("reconcile");
+        assert!(requeued >= 1);
+
+        let refreshed = svc
+            .get_job(job.id)
+            .await
+            .expect("get job")
+            .expect("job exists");
+        assert_eq!(refreshed.state, JobState::Pending);
+        assert!(refreshed.assigned_worker_id.is_none());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_workflow_executes_agent_human_loop_to_terminal() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let first_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job");
+        assert_eq!(first_job.step_id, "run_agent");
+
+        svc.update_job(
+            first_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running first");
+
+        svc.update_job(
+            first_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("complete first");
+
+        let review = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(review.current_step, "review");
+        assert_eq!(review.state, WorkItemState::Running);
+
+        svc.fire_event(
+            item.id,
+            FireEventRequest {
+                event: WorkflowEventKind::HumanChangesRequested,
+                job_id: None,
+                reason: Some("changes requested".into()),
+            },
+        )
+        .await
+        .expect("loop back to agent");
+
+        let second_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("second job");
+        assert_eq!(second_job.step_id, "run_agent");
+
+        svc.update_job(
+            second_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running second");
+
+        svc.update_job(
+            second_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("complete second");
+
+        svc.fire_event(
+            item.id,
+            FireEventRequest {
+                event: WorkflowEventKind::HumanApproved,
+                job_id: None,
+                reason: Some("approved".into()),
+            },
+        )
+        .await
+        .expect("advance to terminal");
+
+        let done = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get done")
+            .expect("exists");
+        assert_eq!(done.current_step, "done");
+        assert_eq!(done.state, WorkItemState::Succeeded);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn manual_pr_approved_checks_auto_merge_on_resulting_state() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_auto_merge_transition_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_auto_merge_transition".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        update_github_pr_state_in_context(
+            &mut item.context,
+            "https://github.com/reddit/agent-hub/pull/not-a-number",
+            None,
+            Some("feature/auto-merge"),
+            Some(&WorkflowEventKind::PrCreated),
+            None,
+            false,
+            Utc::now(),
+        );
+        update_github_pr_state_in_context(
+            &mut item.context,
+            "https://github.com/reddit/agent-hub/pull/not-a-number",
+            None,
+            Some("feature/auto-merge"),
+            Some(&WorkflowEventKind::PrApproved),
+            None,
+            false,
+            Utc::now(),
+        );
+        update_github_pr_state_in_context(
+            &mut item.context,
+            "https://github.com/reddit/agent-hub/pull/not-a-number",
+            None,
+            Some("feature/auto-merge"),
+            Some(&WorkflowEventKind::ChecksPassed),
+            Some("ci"),
+            false,
+            Utc::now(),
+        );
+        assert!(!svc.should_attempt_auto_merge_for_current_state(&item));
+        svc.update_work_item(&item)
+            .await
+            .expect("persist seeded context");
+
+        let updated = svc
+            .fire_event(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::PrApproved,
+                    job_id: None,
+                    reason: Some("owner approved".into()),
+                },
+            )
+            .await
+            .expect("pr approved");
+
+        assert_eq!(updated.current_step, "await_merge_completion");
+        assert!(svc.reactive_state_auto_merge_enabled(&updated));
+        assert!(svc.should_attempt_auto_merge_for_current_state(&updated));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn webhook_source_pr_approved_checks_auto_merge_on_resulting_state() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_auto_merge_transition_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_auto_merge_transition".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        update_github_pr_state_in_context(
+            &mut item.context,
+            "https://github.com/reddit/agent-hub/pull/not-a-number",
+            None,
+            Some("feature/auto-merge"),
+            Some(&WorkflowEventKind::PrCreated),
+            None,
+            false,
+            Utc::now(),
+        );
+        update_github_pr_state_in_context(
+            &mut item.context,
+            "https://github.com/reddit/agent-hub/pull/not-a-number",
+            None,
+            Some("feature/auto-merge"),
+            Some(&WorkflowEventKind::PrApproved),
+            None,
+            false,
+            Utc::now(),
+        );
+        update_github_pr_state_in_context(
+            &mut item.context,
+            "https://github.com/reddit/agent-hub/pull/not-a-number",
+            None,
+            Some("feature/auto-merge"),
+            Some(&WorkflowEventKind::ChecksPassed),
+            Some("ci"),
+            false,
+            Utc::now(),
+        );
+        assert!(!svc.should_attempt_auto_merge_for_current_state(&item));
+        svc.update_work_item(&item)
+            .await
+            .expect("persist seeded context");
+
+        let updated = svc
+            .fire_event_trusted_internal_with_source(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::PrApproved,
+                    job_id: None,
+                    reason: Some("webhook approved".into()),
+                },
+                EventSource::Webhook,
+            )
+            .await
+            .expect("webhook pr approved");
+
+        assert_eq!(updated.current_step, "await_merge_completion");
+        assert!(svc.reactive_state_auto_merge_enabled(&updated));
+        assert!(svc.should_attempt_auto_merge_for_current_state(&updated));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn manual_pr_approved_updates_pr_state_for_auto_merge_readiness() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_auto_merge_transition_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_auto_merge_transition".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        update_github_pr_state_in_context(
+            &mut item.context,
+            "https://github.com/reddit/agent-hub/pull/not-a-number",
+            None,
+            Some("feature/auto-merge"),
+            Some(&WorkflowEventKind::PrCreated),
+            None,
+            false,
+            Utc::now(),
+        );
+        update_github_pr_state_in_context(
+            &mut item.context,
+            "https://github.com/reddit/agent-hub/pull/not-a-number",
+            None,
+            Some("feature/auto-merge"),
+            Some(&WorkflowEventKind::ChecksPassed),
+            Some("ci"),
+            false,
+            Utc::now(),
+        );
+        svc.update_work_item(&item)
+            .await
+            .expect("persist seeded context");
+
+        let updated = svc
+            .fire_event(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::PrApproved,
+                    job_id: None,
+                    reason: Some("approved".into()),
+                },
+            )
+            .await
+            .expect("pr approved");
+
+        assert_eq!(updated.current_step, "await_merge_completion");
+        assert!(svc.should_attempt_auto_merge_for_current_state(&updated));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_terminal_defaults_to_succeeded_when_outcome_missing() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        let after_create = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(after_create.current_step, "run_agent");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w-default-terminal".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w-default-terminal".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w-default-terminal".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w-default-terminal".into(),
+                state: JobState::Succeeded,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("succeeded");
+
+        svc.fire_event(
+            item.id,
+            FireEventRequest {
+                event: WorkflowEventKind::HumanApproved,
+                job_id: None,
+                reason: Some("approve".into()),
+            },
+        )
+        .await
+        .expect("approve");
+
+        let done = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get done")
+            .expect("exists");
+        assert_eq!(done.current_step, "done");
+        assert_eq!(done.state, WorkItemState::Succeeded);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_unmatched_non_terminal_event_errors() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        let err = svc
+            .fire_event(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::Start,
+                    job_id: None,
+                    reason: None,
+                },
+            )
+            .await
+            .expect_err("should fail on unmatched event");
+        assert!(matches!(err, AppError::WorkflowInvalid(_)));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_terminal_state_rejects_unmatched_late_external_events() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_submit_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_submit".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        svc.fire_event(
+            item.id,
+            FireEventRequest {
+                event: WorkflowEventKind::Submit,
+                job_id: None,
+                reason: Some("human submitted".into()),
+            },
+        )
+        .await
+        .expect("submit transitions workflow");
+
+        let done_before = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get done")
+            .expect("exists");
+        assert_eq!(done_before.current_step, "done");
+        assert_eq!(done_before.state, WorkItemState::Failed);
+
+        let err = svc
+            .fire_event(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::JobFailed,
+                    job_id: None,
+                    reason: Some("late event".into()),
+                },
+            )
+            .await
+            .expect_err("late terminal event should be rejected");
+        assert!(matches!(err, AppError::WorkflowInvalid(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("event 'job_failed' is not currently valid"));
+        assert!(msg.contains("valid_next_events=["));
+
+        let done_after = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get done after")
+            .expect("exists");
+        assert_eq!(done_after.current_step, "done");
+        assert_eq!(done_after.state, WorkItemState::Failed);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_submit_event_transitions_human_to_terminal() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_submit_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_submit".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        let before = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(before.current_step, "draft");
+        assert_eq!(before.state, WorkItemState::Running);
+
+        svc.fire_event(
+            item.id,
+            FireEventRequest {
+                event: WorkflowEventKind::Submit,
+                job_id: None,
+                reason: Some("human submitted".into()),
+            },
+        )
+        .await
+        .expect("submit transitions workflow");
+
+        let done = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get done")
+            .expect("exists");
+        assert_eq!(done.current_step, "done");
+        assert_eq!(done.state, WorkItemState::Failed);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_auto_without_start_rejected_by_catalog_validation() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_no_start_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let err = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_no_start".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect_err("should fail");
+        assert!(matches!(err, AppError::WorkflowNotFound(_)));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_child_completion_progresses_legacy_parent() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_child_only_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let now = Utc::now();
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+
+        let parent = WorkItem {
+            id: parent_id,
+            workflow_id: "wf".into(),
+            external_task_id: None,
+            external_task_source: None,
+            title: None,
+            description: None,
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "build".into(),
+            projected_state: Some("running".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Running,
+            context: serde_json::json!({}),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: Some(child_id),
+            created_at: now,
+            updated_at: now,
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+        svc.insert_work_item(&parent).await.expect("insert parent");
+
+        let mut child = WorkItem {
+            id: child_id,
+            workflow_id: "child_reactive".into(),
+            external_task_id: None,
+            external_task_source: None,
+            title: None,
+            description: None,
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "bootstrap".into(),
+            projected_state: Some("pending".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Pending,
+            context: serde_json::json!({}),
+            repo: None,
+            parent_work_item_id: Some(parent_id),
+            parent_step_id: Some("build".into()),
+            child_work_item_id: None,
+            created_at: now,
+            updated_at: now,
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+        svc.insert_work_item(&child).await.expect("insert child");
+        let _ = svc
+            .ensure_pending_for_current_state(&mut child)
+            .await
+            .expect("prepare child reactive state");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let child_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("child job");
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("child success");
+
+        let parent_after = svc
+            .get_work_item(parent_id)
+            .await
+            .expect("get parent")
+            .expect("exists");
+        assert_eq!(parent_after.current_step, "after");
+        assert!(parent_after.child_work_item_id.is_none());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_parent_child_progresses_on_child_success() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_parent_child_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let parent = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_parent".into(),
+                session_id: None,
+                context: serde_json::json!({"task": "x"}),
+                repo: None,
+            })
+            .await
+            .expect("create parent");
+
+        let items = svc.list_work_items().await.expect("items");
+        let parent_now = items
+            .iter()
+            .find(|i| i.id == parent.id)
+            .expect("parent exists");
+        let child_item = items
+            .iter()
+            .find(|i| {
+                i.parent_work_item_id == Some(parent.id)
+                    && i.parent_step_id.as_deref() == Some("spawn")
+            })
+            .expect("child exists")
+            .clone();
+        assert_eq!(parent_now.child_work_item_id, Some(child_item.id));
+        assert_eq!(child_item.workflow_id, "child_legacy");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let child_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("child job");
+        assert_eq!(child_job.work_item_id, child_item.id);
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("child success");
+
+        let parent_after = svc
+            .get_work_item(parent.id)
+            .await
+            .expect("get parent")
+            .expect("exists");
+        assert_eq!(parent_after.state, WorkItemState::Succeeded);
+        assert_eq!(parent_after.current_step, "done");
+        assert!(parent_after.child_work_item_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn reactive_parent_child_progresses_to_failure_on_child_failure() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_parent_child_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let parent = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_parent".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create parent");
+
+        let child_item = svc
+            .list_work_items()
+            .await
+            .expect("items")
+            .into_iter()
+            .find(|i| {
+                i.parent_work_item_id == Some(parent.id)
+                    && i.parent_step_id.as_deref() == Some("spawn")
+            })
+            .expect("child exists");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let child_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("child job");
+        assert_eq!(child_job.work_item_id, child_item.id);
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Failed,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("child failed");
+
+        let parent_after = svc
+            .get_work_item(parent.id)
+            .await
+            .expect("get parent")
+            .expect("exists");
+        assert_eq!(parent_after.state, WorkItemState::Failed);
+        assert_eq!(parent_after.current_step, "blocked");
+        assert!(parent_after.child_work_item_id.is_none());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn lease_expiry_requeues_running_job() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        svc.create_work_item(CreateWorkItemRequest {
+            workflow_id: "wf".into(),
+            session_id: None,
+            context: serde_json::json!({}),
+            repo: None,
+        })
+        .await
+        .expect("create");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let mut job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job");
+        job.state = JobState::Running;
+        job.lease_expires_at = Some(Utc::now() - chrono::TimeDelta::seconds(5));
+        svc.update_job_row(&job).await.expect("set expired lease");
+
+        let requeued = svc.requeue_expired_leases().await.expect("requeue");
+        assert_eq!(requeued, 1);
+
+        let refreshed = svc.get_job(job.id).await.expect("get").expect("exists");
+        assert_eq!(refreshed.state, JobState::Pending);
+        assert!(refreshed.assigned_worker_id.is_none());
+        assert!(refreshed.lease_expires_at.is_none());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn cancel_event_cancels_active_jobs() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        let mut jobs = svc.list_jobs().await.expect("jobs");
+        assert_eq!(jobs.len(), 1);
+        jobs[0].state = JobState::Running;
+        jobs[0].assigned_worker_id = Some("w1".into());
+        svc.update_job_row(&jobs[0]).await.expect("update running");
+
+        let _ = svc
+            .fire_event(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::Cancel,
+                    job_id: None,
+                    reason: None,
+                },
+            )
+            .await
+            .expect("cancel");
+
+        let refreshed = svc
+            .get_job(jobs[0].id)
+            .await
+            .expect("get job")
+            .expect("exists");
+        assert_eq!(refreshed.state, JobState::Cancelled);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_cancel_event_cascades_to_active_child_work_items() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_parent_child_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let parent = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_parent".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create parent");
+
+        let child_item = svc
+            .list_work_items()
+            .await
+            .expect("items")
+            .into_iter()
+            .find(|i| {
+                i.parent_work_item_id == Some(parent.id)
+                    && i.parent_step_id.as_deref() == Some("spawn")
+            })
+            .expect("child exists");
+
+        let cancelled_parent = svc
+            .fire_event(
+                parent.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::Cancel,
+                    job_id: None,
+                    reason: None,
+                },
+            )
+            .await
+            .expect("cancel parent");
+        assert_eq!(cancelled_parent.state, WorkItemState::Cancelled);
+
+        let refreshed_child = svc
+            .get_work_item(child_item.id)
+            .await
+            .expect("get child")
+            .expect("exists");
+        assert_eq!(refreshed_child.state, WorkItemState::Cancelled);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn update_job_returns_job_cancelled_when_server_cancelled_assigned_job() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        svc.create_work_item(CreateWorkItemRequest {
+            workflow_id: "wf".into(),
+            session_id: None,
+            context: serde_json::json!({}),
+            repo: None,
+        })
+        .await
+        .expect("create");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let assigned_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job");
+
+        let work_item = svc
+            .get_work_item(assigned_job.work_item_id)
+            .await
+            .expect("get work item")
+            .expect("exists");
+        let _ = svc
+            .fire_event(
+                work_item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::Cancel,
+                    job_id: None,
+                    reason: None,
+                },
+            )
+            .await
+            .expect("cancel");
+
+        let err = svc
+            .update_job(
+                assigned_job.id,
+                JobUpdateRequest {
+                    worker_id: "w1".into(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .expect_err("running renewal should surface cancellation");
+        assert!(matches!(err, AppError::JobCancelled(_)));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn running_to_running_renews_lease() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        svc.create_work_item(CreateWorkItemRequest {
+            workflow_id: "wf".into(),
+            session_id: None,
+            context: serde_json::json!({}),
+            repo: None,
+        })
+        .await
+        .expect("create");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job");
+
+        let running = svc
+            .update_job(
+                job.id,
+                JobUpdateRequest {
+                    worker_id: "w1".into(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .expect("set running");
+        let first_lease = running.lease_expires_at.expect("lease set");
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let renewed = svc
+            .update_job(
+                job.id,
+                JobUpdateRequest {
+                    worker_id: "w1".into(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .expect("renew");
+        let second_lease = renewed.lease_expires_at.expect("lease set");
+        assert!(second_lease > first_lease);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn retries_failed_step_before_on_failure() {
+        let tmp = std::env::temp_dir().join(format!("wf-retry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "wf_retry"
+entry_step = "build"
+
+[[workflow.steps]]
+id = "build"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["x"]
+max_retries = 1
+on_failure = "failstep"
+
+[[workflow.steps]]
+id = "failstep"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["f"]
+"#;
+        write_workflow(&tmp, "wf_retry", wf);
+
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        svc.create_work_item(CreateWorkItemRequest {
+            workflow_id: "wf_retry".into(),
+            session_id: None,
+            context: serde_json::json!({}),
+            repo: None,
+        })
+        .await
+        .expect("create");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let first = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("job");
+
+        svc.update_job(
+            first.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            first.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Failed,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("failed");
+
+        let jobs = svc.list_jobs().await.expect("jobs");
+        assert!(jobs.iter().any(|j| j.step_id == "build" && j.attempt == 1));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn interpolation_materializes_job_inputs() {
+        let tmp = std::env::temp_dir().join(format!("wf-interp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "wf_interp"
+entry_step = "s1"
+
+[[workflow.steps]]
+id = "s1"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["{{task.name}}", "{{task.count}}"]
+
+[workflow.steps.env]
+TASK_NAME = "{{task.name}}"
+"#;
+        write_workflow(&tmp, "wf_interp", wf);
+
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        svc.create_work_item(CreateWorkItemRequest {
+            workflow_id: "wf_interp".into(),
+            session_id: None,
+            context: serde_json::json!({"task": {"name": "demo", "count": 2}}),
+            repo: None,
+        })
+        .await
+        .expect("create");
+
+        let jobs = svc.list_jobs().await.expect("jobs");
+        let job = jobs.iter().find(|j| j.step_id == "s1").expect("job");
+        assert_eq!(job.args, vec!["demo".to_string(), "2".to_string()]);
+        assert_eq!(job.env.get("TASK_NAME").cloned(), Some("demo".to_string()));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn parent_waits_for_single_child_and_advances_on_child_success() {
+        let tmp = std::env::temp_dir().join(format!("wf-child-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "parent"
+entry_step = "spawn"
+
+[[workflow.steps]]
+id = "spawn"
+kind = "child_workflow"
+executor = "raw"
+child_workflow_id = "child"
+command = ""
+on_success = "after"
+
+[[workflow.steps]]
+id = "after"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["done"]
+"#;
+        let child = r#"
+[workflow]
+id = "child"
+entry_step = "run"
+
+[[workflow.steps]]
+id = "run"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["child"]
+"#;
+        write_workflow(&tmp, "parent", wf);
+        write_workflow(&tmp, "child", child);
+
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let parent = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "parent".into(),
+                session_id: None,
+                context: serde_json::json!({"task": "x"}),
+                repo: None,
+            })
+            .await
+            .expect("create parent");
+
+        let items = svc.list_work_items().await.expect("items");
+        let parent_now = items
+            .iter()
+            .find(|i| i.id == parent.id)
+            .expect("parent exists");
+        let child_item = items
+            .iter()
+            .find(|i| i.parent_work_item_id == Some(parent.id))
+            .expect("child exists")
+            .clone();
+        assert_eq!(parent_now.child_work_item_id, Some(child_item.id));
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let child_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("child job");
+        assert_eq!(child_job.work_item_id, child_item.id);
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: None,
+                result: Some(JobResult {
+                    outcome: protocol::ExecutionOutcome::Succeeded,
+                    termination_reason: protocol::TerminationReason::ExitCode,
+                    exit_code: Some(0),
+                    timing: protocol::ExecutionTiming {
+                        started_at: Utc::now(),
+                        finished_at: Utc::now(),
+                        duration_ms: 1,
+                    },
+                    artifacts: protocol::ArtifactSummary {
+                        stdout_path: "a".into(),
+                        stderr_path: "b".into(),
+                        output_path: None,
+                        transcript_dir: None,
+                        stdout_bytes: None,
+                        stderr_bytes: None,
+                        output_bytes: None,
+                        structured_transcript_artifacts: vec![
+                            protocol::StructuredTranscriptArtifact {
+                                key: "agent_context".into(),
+                                path: "/tmp/child/.agent-context.json".into(),
+                                bytes: Some(42),
+                                schema: Some(protocol::AGENT_CONTEXT_SCHEMA_NAME.into()),
+                                record_count: None,
+                                inline_json: Some(serde_json::json!({
+                                    "schema": protocol::AGENT_CONTEXT_SCHEMA_NAME,
+                                    "job": {
+                                        "step_id": "run"
+                                    }
+                                })),
+                            },
+                            protocol::StructuredTranscriptArtifact {
+                                key: "run_json".into(),
+                                path: "/tmp/child/run.json".into(),
+                                bytes: Some(64),
+                                schema: Some(protocol::JOB_RUN_SCHEMA_NAME.into()),
+                                record_count: None,
+                                inline_json: Some(serde_json::json!({
+                                    "schema": protocol::JOB_RUN_SCHEMA_NAME,
+                                    "workspace": "/workspace"
+                                })),
+                            },
+                        ],
+                    },
+                    output_json: Some(serde_json::json!({"child_ok": true})),
+                    repo: None,
+                    github_pr: None,
+                    error_message: None,
+                }),
+            },
+        )
+        .await
+        .expect("child success");
+
+        let parent_after = svc
+            .get_work_item(parent.id)
+            .await
+            .expect("get parent")
+            .expect("exists");
+        assert_eq!(parent_after.current_step, "after");
+        assert!(parent_after.context["child_results"]["spawn"].is_object());
+        assert_eq!(
+            parent_after.context["child_results"]["spawn"]["job_artifact_paths"]["run"]["agent_context"],
+            serde_json::json!("/tmp/child/.agent-context.json")
+        );
+        assert_eq!(
+            parent_after.context["child_results"]["spawn"]["job_artifact_metadata"]["run"]["agent_context"]
+                ["schema"],
+            serde_json::json!(protocol::AGENT_CONTEXT_SCHEMA_NAME)
+        );
+        assert_eq!(
+            parent_after.context["child_results"]["spawn"]["job_artifact_metadata"]["run"]["run_json"]
+                ["schema"],
+            serde_json::json!(protocol::JOB_RUN_SCHEMA_NAME)
+        );
+        assert_eq!(
+            parent_after.context["child_results"]["spawn"]["job_artifact_data"]["run"]["agent_context"]
+                ["schema"],
+            serde_json::json!(protocol::AGENT_CONTEXT_SCHEMA_NAME)
+        );
+        assert_eq!(
+            parent_after.context["child_results"]["spawn"]["job_artifact_data"]["run"]["run_json"]
+                ["schema"],
+            serde_json::json!(protocol::JOB_RUN_SCHEMA_NAME)
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn child_success_without_on_success_marks_parent_succeeded_via_system_event() {
+        let tmp = std::env::temp_dir().join(format!("wf-child-terminal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let parent = r#"
+[workflow]
+id = "parent_terminal"
+entry_step = "spawn"
+
+[[workflow.steps]]
+id = "spawn"
+kind = "child_workflow"
+executor = "raw"
+child_workflow_id = "child"
+command = ""
+"#;
+        let child = r#"
+[workflow]
+id = "child"
+entry_step = "run"
+
+[[workflow.steps]]
+id = "run"
+kind = "agent"
+executor = "raw"
+command = "echo"
+args = ["child"]
+"#;
+        write_workflow(&tmp, "parent_terminal", parent);
+        write_workflow(&tmp, "child", child);
+
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let parent = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "parent_terminal".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create parent");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("worker");
+
+        let child_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("child job");
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("running");
+
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("child success");
+
+        let parent_after = svc
+            .get_work_item(parent.id)
+            .await
+            .expect("get parent")
+            .expect("exists");
+        assert_eq!(parent_after.state, WorkItemState::Succeeded);
+        assert!(parent_after.child_work_item_id.is_none());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn sync_updates_existing_item_only_when_adapter_is_newer() {
+        // Asserts the "newer adapter projection wins" guard: the title is one of
+        // the metadata fields `merge_task_metadata`/`apply_task_fields` actually
+        // propagate from the task projection back to the work item, so we use it
+        // as a stable vehicle for the timestamp comparison this test cares about.
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        let mut external = task_from_work_item(&item, None);
+        external.title = "newer title".to_string();
+        // Bump well past the adapter sync write-back grace window so the newer
+        // projection is actually treated as newer.
+        external.updated_at = item.updated_at + chrono::TimeDelta::seconds(60);
+        adapter
+            .persist_projection(
+                &TaskProjection {
+                    task: external.clone(),
+                },
+                None,
+            )
+            .expect("write newer external");
+
+        svc.sync_tasks_from_adapter().await.expect("sync newer");
+        let refreshed = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(refreshed.title.as_deref(), Some("newer title"));
+
+        external.title = "stale title".to_string();
+        external.updated_at = refreshed.updated_at - chrono::TimeDelta::seconds(10);
+        adapter
+            .persist_projection(&TaskProjection { task: external }, None)
+            .expect("write stale external");
+
+        svc.sync_tasks_from_adapter().await.expect("sync stale");
+        let refreshed_again = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(refreshed_again.title.as_deref(), Some("newer title"));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn persists_runtime_spec_json_for_docker_job() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let now = Utc::now();
+        let job = Job {
+            id: Uuid::new_v4(),
+            work_item_id: Uuid::new_v4(),
+            step_id: "s1".into(),
+            state: JobState::Pending,
+            assigned_worker_id: None,
+            execution_mode: protocol::ExecutionMode::Docker,
+            container_image: Some("alpine:3.20".into()),
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: Some(60),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        svc.insert_job(&job).await.expect("insert job");
+        let loaded = svc.get_job(job.id).await.expect("get job").expect("exists");
+        assert_eq!(loaded.execution_mode, protocol::ExecutionMode::Docker);
+        assert_eq!(loaded.container_image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(loaded.timeout_secs, Some(60));
+
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let spec_json: String = conn
+            .query_row(
+                "SELECT runtime_spec_json FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("runtime spec row");
+        let spec: CanonicalRuntimeSpec =
+            serde_json::from_str(&spec_json).expect("parse runtime spec json");
+        assert_eq!(
+            spec.environment.tier,
+            protocol::PlannedEnvironmentTier::Docker
+        );
+        assert_eq!(
+            spec.permissions.tier,
+            protocol::PlannedPermissionTier::DockerDefault
+        );
+        assert!(!spec.permissions.can_access_network);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn insert_job_prefers_runtime_spec_from_context_when_present() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let now = Utc::now();
+        let mut job = Job {
+            id: Uuid::new_v4(),
+            work_item_id: Uuid::new_v4(),
+            step_id: "s1".into(),
+            state: JobState::Pending,
+            assigned_worker_id: None,
+            execution_mode: protocol::ExecutionMode::Raw,
+            container_image: None,
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: Some(10),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let runtime = CanonicalRuntimeSpec {
+            runtime_version: "v2".to_string(),
+            environment: protocol::PlannedEnvironmentSpec {
+                tier: protocol::PlannedEnvironmentTier::Docker,
+                execution_mode: protocol::ExecutionMode::Docker,
+                container_image: Some("alpine:3.20".into()),
+                timeout_secs: Some(99),
+                memory_limit: None,
+                cpu_limit: None,
+                network: None,
+                network_resources: None,
+                filesystem: None,
+                file_mounts: vec![],
+                toolchains: vec![],
+            },
+            permissions: protocol::PlannedPermissionSet {
+                tier: protocol::PlannedPermissionTier::DockerDefault,
+                can_read_workspace: true,
+                can_write_workspace: true,
+                can_run_shell: true,
+                can_access_network: false,
+                auto_approve_tools: vec![],
+                escalate_tools: vec![],
+                kubernetes_access: None,
+                aws_access: None,
+            },
+            approval_rules: None,
+            repos: vec![],
+        };
+        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+
+        svc.insert_job(&job).await.expect("insert job");
+
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let spec_json: String = conn
+            .query_row(
+                "SELECT runtime_spec_json FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("runtime spec row");
+        let persisted: CanonicalRuntimeSpec =
+            serde_json::from_str(&spec_json).expect("parse runtime spec json");
+        assert_eq!(persisted, runtime);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn assign_next_job_uses_runtime_spec_execution_mode_from_context() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let now = Utc::now();
+        let mut job = Job {
+            id: Uuid::new_v4(),
+            work_item_id: Uuid::new_v4(),
+            step_id: "s1".into(),
+            state: JobState::Pending,
+            assigned_worker_id: None,
+            execution_mode: protocol::ExecutionMode::Raw,
+            container_image: None,
+            command: "echo".into(),
+            args: vec!["hi".into()],
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: Some(12),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let runtime = CanonicalRuntimeSpec {
+            runtime_version: "v2".to_string(),
+            environment: protocol::PlannedEnvironmentSpec {
+                tier: protocol::PlannedEnvironmentTier::Docker,
+                execution_mode: protocol::ExecutionMode::Docker,
+                container_image: Some("alpine:3.20".into()),
+                timeout_secs: Some(99),
+                memory_limit: None,
+                cpu_limit: None,
+                network: None,
+                network_resources: None,
+                filesystem: None,
+                file_mounts: vec![],
+                toolchains: vec![],
+            },
+            permissions: protocol::PlannedPermissionSet {
+                tier: protocol::PlannedPermissionTier::DockerDefault,
+                can_read_workspace: true,
+                can_write_workspace: true,
+                can_run_shell: true,
+                can_access_network: false,
+                auto_approve_tools: vec![],
+                escalate_tools: vec![],
+                kubernetes_access: None,
+                aws_access: None,
+            },
+            approval_rules: None,
+            repos: vec![],
+        };
+        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+
+        svc.insert_job(&job).await.expect("insert");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "docker-worker".into(),
+            hostname: "h".into(),
+            supported_modes: vec![protocol::ExecutionMode::Docker],
+        })
+        .await
+        .expect("register worker");
+
+        let assigned = svc
+            .poll_job(PollJobRequest {
+                worker_id: "docker-worker".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned job");
+
+        assert_eq!(assigned.execution_mode, protocol::ExecutionMode::Docker);
+        assert_eq!(assigned.container_image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(assigned.timeout_secs, Some(99));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn adapter_sync_keeps_task_without_workflow_in_triage() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "triage me".into(),
+            description: Some("no workflow yet".into()),
+            workflow_id: None,
+            triage_status: TaskTriageStatus::Ready,
+            pending_human_action: false,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: vec![],
+            allowed_actions: vec![],
+            context: serde_json::json!({}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(&TaskProjection { task: task.clone() }, None)
+            .expect("write task");
+
+        svc.sync_tasks_from_adapter().await.expect("sync");
+        let items = svc.list_work_items().await.expect("items");
+        assert!(items.into_iter().any(|i| i.id == task.id));
+
+        let pulled = adapter.pull_tasks().expect("pull after sync");
+        let triaged = pulled
+            .into_iter()
+            .find(|r| r.external.id == task.id)
+            .expect("task exists");
+        assert!(matches!(
+            triaged.external.triage_status,
+            TaskTriageStatus::NeedsWorkflowSelection | TaskTriageStatus::Blocked
+        ));
+        assert!(matches!(
+            triaged.external.workflow_phase.as_deref(),
+            Some("triage") | Some("human_gate")
+        ));
+        assert!(
+            triaged
+                .external
+                .allowed_actions
+                .contains(&HumanActionKind::ChooseWorkflow)
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn deterministic_workflow_rules_select_single_matching_workflow() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            multi_workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "route me".into(),
+            description: None,
+            workflow_id: None,
+            triage_status: TaskTriageStatus::Ready,
+            pending_human_action: false,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: vec![],
+            allowed_actions: vec![],
+            context: serde_json::json!({
+                "priority": "high",
+                "labels": ["ops"],
+                "workflow_rules": {
+                    "by_priority": {"high": "wf_alpha"},
+                    "by_label": {"ops": "wf_alpha"}
+                }
+            }),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(&TaskProjection { task: task.clone() }, None)
+            .expect("persist task");
+
+        svc.sync_tasks_from_adapter().await.expect("sync");
+        let item = svc
+            .get_work_item(task.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(item.workflow_id, "wf_alpha");
+        assert_ne!(item.workflow_id, "__triage__");
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_workflow_rules_route_to_triage_with_explicit_reason() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            multi_workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "ambiguous".into(),
+            description: None,
+            workflow_id: None,
+            triage_status: TaskTriageStatus::Ready,
+            pending_human_action: false,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: vec![],
+            allowed_actions: vec![],
+            context: serde_json::json!({
+                "priority": "high",
+                "labels": ["ops"],
+                "workflow_rules": {
+                    "by_priority": {"high": "wf_alpha"},
+                    "by_label": {"ops": "wf_beta"}
+                }
+            }),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(&TaskProjection { task: task.clone() }, None)
+            .expect("persist task");
+
+        svc.sync_tasks_from_adapter().await.expect("sync");
+        let item = svc
+            .get_work_item(task.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(item.workflow_id, "__triage__");
+        assert_eq!(
+            item.context
+                .get("triage_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("multiple workflow rules matched; choose one of: wf_alpha, wf_beta")
+        );
+
+        let projected = adapter.pull_tasks().expect("pull tasks");
+        let rec = projected
+            .into_iter()
+            .find(|r| r.external.id == task.id)
+            .expect("projected task");
+        assert!(
+            rec.external
+                .allowed_actions
+                .contains(&HumanActionKind::ChooseWorkflow)
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn adapter_sync_applies_approve_action_to_work_item() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({"human_gate": true}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        // Move to human gate state before applying human approve action.
+        svc.fire_event_trusted_internal(
+            item.id,
+            FireEventRequest {
+                event: WorkflowEventKind::JobSucceeded,
+                job_id: None,
+                reason: Some("agent done".into()),
+            },
+        )
+        .await
+        .expect("move to review");
+        item = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+
+        let mut task = task_from_work_item(&item, None);
+        task.requested_action = Some(crate::server::task_adapter::TaskHumanAction {
+            kind: HumanActionKind::Approve,
+            workflow_id: None,
+            reason: Some("approved from task tool".into()),
+        });
+        task.action_revision = 1;
+        task.updated_at = Utc::now() + chrono::TimeDelta::seconds(2);
+        adapter
+            .persist_projection(&TaskProjection { task }, None)
+            .expect("persist action");
+
+        svc.sync_tasks_from_adapter().await.expect("sync action");
+        let updated = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_ne!(updated.current_step, item.current_step);
+        assert_eq!(updated.current_step, "done");
+        assert!(
+            !updated.human_gate,
+            "human_gate should be cleared on terminal state entry"
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn triage_choose_workflow_then_submit_starts_executable_path() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage_task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "needs selection".into(),
+            description: Some("pick workflow".into()),
+            workflow_id: None,
+            triage_status: TaskTriageStatus::NeedsWorkflowSelection,
+            pending_human_action: true,
+            current_human_gate: Some("workflow_selection".into()),
+            workflow_phase: Some("triage".into()),
+            blocked_reason: Some("workflow selection required".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: Some(TaskHumanGateState::NeedsWorkflowSelection),
+            valid_next_events: vec![],
+            allowed_actions: vec![HumanActionKind::ChooseWorkflow, HumanActionKind::Cancel],
+            context: serde_json::json!({}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(
+                &TaskProjection {
+                    task: triage_task.clone(),
+                },
+                None,
+            )
+            .expect("persist triage task");
+
+        svc.sync_tasks_from_adapter().await.expect("initial sync");
+
+        let mut choose = triage_task.clone();
+        choose.requested_action = Some(crate::server::task_adapter::TaskHumanAction {
+            kind: HumanActionKind::ChooseWorkflow,
+            workflow_id: Some("wf".into()),
+            reason: Some("selected".into()),
+        });
+        choose.action_revision = 1;
+        choose.updated_at = Utc::now() + chrono::TimeDelta::seconds(1);
+        adapter
+            .persist_projection(&TaskProjection { task: choose }, None)
+            .expect("persist choose workflow action");
+
+        svc.sync_tasks_from_adapter().await.expect("choose sync");
+        let selected = svc
+            .get_work_item(triage_task.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(selected.workflow_id, "wf");
+        assert_ne!(selected.current_step, "triage");
+        assert!(
+            !svc.valid_next_events_for_work_item(&selected)
+                .contains(&WorkflowEventKind::WorkflowChosen)
+        );
+
+        let mut submit = task_from_work_item(&selected, None);
+        submit.requested_action = Some(crate::server::task_adapter::TaskHumanAction {
+            kind: HumanActionKind::Submit,
+            workflow_id: None,
+            reason: Some("start it".into()),
+        });
+        submit.action_revision = 2;
+        submit.updated_at = Utc::now() + chrono::TimeDelta::seconds(2);
+        adapter
+            .persist_projection(&TaskProjection { task: submit }, None)
+            .expect("persist submit action");
+
+        svc.sync_tasks_from_adapter().await.expect("submit sync");
+        let jobs = svc.list_jobs().await.expect("jobs");
+        assert!(jobs.iter().any(|j| j.work_item_id == triage_task.id));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn triage_pending_job_projects_agent_execution_kind() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "__triage__".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create triage item");
+
+        let triage_job = svc
+            .list_jobs_for_work_item(triage.id)
+            .await
+            .expect("list jobs")
+            .into_iter()
+            .find(|job| job.step_id == "triage")
+            .expect("triage job exists");
+        assert_eq!(
+            triage_job.context["workflow"]["job_execution_kind"],
+            serde_json::json!("agent")
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn triage_failed_job_update_is_accepted_and_marks_work_item_failed() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "__triage__".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create triage item");
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![
+                protocol::ExecutionMode::Raw,
+                protocol::ExecutionMode::Docker,
+            ],
+        })
+        .await
+        .expect("register");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned triage job");
+        assert_eq!(job.work_item_id, triage.id);
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start triage job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Failed,
+                transcript_dir: Some("/tmp/t".into()),
+                result: Some(failed_job_result()),
+            },
+        )
+        .await
+        .expect("failed triage job should be accepted");
+
+        let updated = svc
+            .get_work_item(triage.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(updated.workflow_id, "__triage__");
+        assert_eq!(updated.state, WorkItemState::Failed);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn triage_success_job_can_select_workflow_from_output() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "__triage__".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create triage item");
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![
+                protocol::ExecutionMode::Raw,
+                protocol::ExecutionMode::Docker,
+            ],
+        })
+        .await
+        .expect("register");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned triage job");
+        assert_eq!(job.work_item_id, triage.id);
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start triage job");
+
+        let mut result = successful_job_result();
+        result.output_json = Some(serde_json::json!({
+            "next_event": "job_succeeded",
+            "workflow_id": "wf"
+        }));
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/t".into()),
+                result: Some(result),
+            },
+        )
+        .await
+        .expect("succeeded triage job should select workflow");
+
+        let updated = svc
+            .get_work_item(triage.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(updated.workflow_id, "__triage__");
+        assert_eq!(updated.current_step, "await_triage_approval");
+        assert!(updated.human_gate);
+        assert_eq!(
+            updated.human_gate_state.as_deref(),
+            Some("triage_completed")
+        );
+        assert_eq!(updated.triage_status.as_deref(), Some("pending_approval"));
+        assert_eq!(
+            updated
+                .context
+                .get("workflow_id")
+                .and_then(serde_json::Value::as_str),
+            Some("wf")
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    /// After __triage__ succeeds and a human approves the selection, the chosen
+    /// reactive workflow takes over and starts at its declared `initial_state`.
+    /// There is no implicit skip of any state — workflow authors are responsible
+    /// for not duplicating triage at the front of a workflow that's intended to
+    /// be entered via __triage__.
+    #[tokio::test]
+    async fn triage_approval_enters_selected_workflow_at_initial_state() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            triage_approved_reactive_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "__triage__".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create triage item");
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![
+                protocol::ExecutionMode::Raw,
+                protocol::ExecutionMode::Docker,
+            ],
+        })
+        .await
+        .expect("register");
+
+        let triage_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned triage job");
+        assert_eq!(triage_job.work_item_id, triage.id);
+        assert_eq!(triage_job.step_id, "triage");
+
+        svc.update_job(
+            triage_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start triage job");
+
+        let mut result = successful_job_result();
+        result.output_json = Some(serde_json::json!({
+            "next_event": "job_succeeded",
+            "workflow_id": "triage-approved-reactive"
+        }));
+        svc.update_job(
+            triage_job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/t".into()),
+                result: Some(result),
+            },
+        )
+        .await
+        .expect("succeeded triage job should select workflow");
+
+        let updated = svc
+            .get_work_item(triage.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(updated.workflow_id, "__triage__");
+        assert_eq!(updated.current_step, "await_triage_approval");
+        assert!(updated.human_gate);
+
+        svc.fire_event(
+            triage.id,
+            FireEventRequest {
+                event: WorkflowEventKind::HumanApproved,
+                job_id: None,
+                reason: Some("approve triage workflow selection".into()),
+            },
+        )
+        .await
+        .expect("approval should apply selected workflow");
+
+        let updated = svc
+            .get_work_item(triage.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(updated.workflow_id, "triage-approved-reactive");
+        assert_eq!(updated.current_step, "implement");
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn submit_on_triage_item_returns_workflow_invalid() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage_task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "needs selection".into(),
+            description: Some("pick workflow".into()),
+            workflow_id: None,
+            triage_status: TaskTriageStatus::NeedsWorkflowSelection,
+            pending_human_action: true,
+            current_human_gate: Some("workflow_selection".into()),
+            workflow_phase: Some("triage".into()),
+            blocked_reason: Some("workflow selection required".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: Some(TaskHumanGateState::NeedsWorkflowSelection),
+            valid_next_events: vec![],
+            allowed_actions: vec![HumanActionKind::ChooseWorkflow, HumanActionKind::Cancel],
+            context: serde_json::json!({}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(
+                &TaskProjection {
+                    task: triage_task.clone(),
+                },
+                None,
+            )
+            .expect("persist triage task");
+        svc.sync_tasks_from_adapter().await.expect("initial sync");
+
+        let mut submit = triage_task.clone();
+        submit.requested_action = Some(crate::server::task_adapter::TaskHumanAction {
+            kind: HumanActionKind::Submit,
+            workflow_id: None,
+            reason: Some("start without workflow".into()),
+        });
+        submit.action_revision = 1;
+        submit.updated_at = Utc::now() + chrono::TimeDelta::seconds(1);
+        adapter
+            .persist_projection(&TaskProjection { task: submit }, None)
+            .expect("persist submit");
+
+        let err = svc
+            .sync_tasks_from_adapter()
+            .await
+            .expect_err("submit on triage should fail");
+        assert!(matches!(err, AppError::WorkflowInvalid(_)));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn work_item_persists_first_class_task_fields() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "First class title".into(),
+            description: Some("desc".into()),
+            workflow_id: Some("wf".into()),
+            triage_status: TaskTriageStatus::Ready,
+            pending_human_action: false,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: vec![],
+            allowed_actions: vec![],
+            context: serde_json::json!({"labels": ["ops", "mvp"], "priority": "high"}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(&TaskProjection { task: task.clone() }, None)
+            .expect("persist task");
+
+        svc.sync_tasks_from_adapter().await.expect("sync");
+        let item = svc
+            .get_work_item(task.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(item.title.as_deref(), Some("First class title"));
+        assert_eq!(item.description.as_deref(), Some("desc"));
+        assert_eq!(item.priority.as_deref(), Some("high"));
+        assert_eq!(item.labels, vec!["ops".to_string(), "mvp".to_string()]);
+        assert_eq!(item.external_task_source.as_deref(), Some("file"));
+        assert!(item.projected_state.is_some());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_human_state_sets_human_gate_flag() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        svc.fire_event_trusted_internal(
+            item.id,
+            FireEventRequest {
+                event: WorkflowEventKind::JobSucceeded,
+                job_id: None,
+                reason: Some("agent done".into()),
+            },
+        )
+        .await
+        .expect("to human state");
+
+        let review = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(review.current_step, "review");
+        assert!(review.human_gate);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn github_webhook_matches_pr_from_terminal_originating_job_context() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({
+                    "job_results": {
+                        "create_pr": {
+                            "github_pr": {
+                                "url": "https://github.com/reddit/agent-hub/pull/42"
+                            }
+                        }
+                    }
+                }),
+                repo: None,
+            })
+            .await
+            .expect("create");
+        item.state = WorkItemState::Running;
+        svc.update_work_item(&item).await.expect("update item");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("pull_request"));
+
+        let state = super::super::AppState {
+            config: Arc::new(super::super::config::ServerConfig {
+                auth_mode: super::super::config::AuthMode::None,
+                tokens: vec![],
+                listen_addr: "127.0.0.1:0".into(),
+                presence_ttl_secs: 120,
+                session_ttl_secs: 120,
+                notification_delay_secs: 0,
+                approval_mode: super::super::config::ApprovalFeatureMode::Disabled,
+                base_url: None,
+                default_approval_mode: super::super::sessions::SessionApprovalMode::Remote,
+                workflows_dir: "workflows".into(),
+                config_root: "../agent-hub-configs".into(),
+                task_dir: "tasks".into(),
+                task_adapter: "file".into(),
+                vikunja_base_url: None,
+                vikunja_token: None,
+                vikunja_bot_username: None,
+                vikunja_bot_password: None,
+                vikunja_project_id: None,
+                vikunja_label_prefix: None,
+                orchestration_db_path: ":memory:".into(),
+                artifact_store_root: "local-agent-data".into(),
+                grpc_listen_addr: None,
+                github_webhook_secret: None,
+                github_polling_enabled: false,
+                github_poll_interval_secs: 30,
+                github_token: None,
+                github_api_base_url: "https://api.github.com".into(),
+            }),
+            artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
+                std::path::PathBuf::from("local-agent-data"),
+            )),
+            presence: Arc::new(super::super::presence::Presence::new(120)),
+            sessions: Arc::new(super::super::sessions::SessionRegistry::new(120)),
+            notifier: Arc::new(super::super::notifier::NullNotifier),
+            notify_config: Arc::new(tokio::sync::RwLock::new(
+                protocol::NotifyConfig::with_delay(0),
+            )),
+            pending: Arc::new(super::super::hooks::PendingNotifications::new()),
+            approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
+            questions: Arc::new(super::super::questions::QuestionRegistry::new()),
+            orchestration: Arc::new(svc.clone()),
+            job_events: Arc::new(crate::server::job_events::JobEventHub::new()),
+            oauth: Arc::new(None),
+            loaded_config_tree: Arc::new(None),
+        };
+
+        let resp = github_webhook::<super::super::notifier::NullNotifier>(
+            State(state),
+            headers,
+            axum::body::Bytes::from(
+                r#"{"action":"closed","pull_request":{"html_url":"https://github.com/reddit/agent-hub/pull/42","merged":true}}"#,
+            ),
+        )
+        .await
+        .expect("webhook");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json.get("fired_events"), Some(&serde_json::json!(1)));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn github_webhook_skips_terminal_items_even_if_pr_matches() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({
+                    "job_results": {
+                        "create_pr": {
+                            "github_pr": {
+                                "url": "https://github.com/reddit/agent-hub/pull/43"
+                            }
+                        }
+                    }
+                }),
+                repo: None,
+            })
+            .await
+            .expect("create");
+        item.state = WorkItemState::Succeeded;
+        svc.update_work_item(&item).await.expect("update item");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static("pull_request"));
+
+        let state = super::super::AppState {
+            config: Arc::new(super::super::config::ServerConfig {
+                auth_mode: super::super::config::AuthMode::None,
+                tokens: vec![],
+                listen_addr: "127.0.0.1:0".into(),
+                presence_ttl_secs: 120,
+                session_ttl_secs: 120,
+                notification_delay_secs: 0,
+                approval_mode: super::super::config::ApprovalFeatureMode::Disabled,
+                base_url: None,
+                default_approval_mode: super::super::sessions::SessionApprovalMode::Remote,
+                workflows_dir: "workflows".into(),
+                config_root: "../agent-hub-configs".into(),
+                task_dir: "tasks".into(),
+                task_adapter: "file".into(),
+                vikunja_base_url: None,
+                vikunja_token: None,
+                vikunja_bot_username: None,
+                vikunja_bot_password: None,
+                vikunja_project_id: None,
+                vikunja_label_prefix: None,
+                orchestration_db_path: ":memory:".into(),
+                artifact_store_root: "local-agent-data".into(),
+                grpc_listen_addr: None,
+                github_webhook_secret: None,
+                github_polling_enabled: false,
+                github_poll_interval_secs: 30,
+                github_token: None,
+                github_api_base_url: "https://api.github.com".into(),
+            }),
+            artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
+                std::path::PathBuf::from("local-agent-data"),
+            )),
+            presence: Arc::new(super::super::presence::Presence::new(120)),
+            sessions: Arc::new(super::super::sessions::SessionRegistry::new(120)),
+            notifier: Arc::new(super::super::notifier::NullNotifier),
+            notify_config: Arc::new(tokio::sync::RwLock::new(
+                protocol::NotifyConfig::with_delay(0),
+            )),
+            pending: Arc::new(super::super::hooks::PendingNotifications::new()),
+            approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
+            questions: Arc::new(super::super::questions::QuestionRegistry::new()),
+            orchestration: Arc::new(svc.clone()),
+            job_events: Arc::new(crate::server::job_events::JobEventHub::new()),
+            oauth: Arc::new(None),
+            loaded_config_tree: Arc::new(None),
+        };
+
+        let resp = github_webhook::<super::super::notifier::NullNotifier>(
+            State(state),
+            headers,
+            axum::body::Bytes::from(
+                r#"{"action":"closed","pull_request":{"html_url":"https://github.com/reddit/agent-hub/pull/43","merged":true}}"#,
+            ),
+        )
+        .await
+        .expect("webhook");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json.get("matched_jobs"), Some(&serde_json::json!(0)));
+        assert_eq!(json.get("fired_events"), Some(&serde_json::json!(0)));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn triage_needs_triage_flag_persists_manual_triage_reason() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage_task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "manual triage".into(),
+            description: Some("needs manual triage".into()),
+            workflow_id: None,
+            triage_status: TaskTriageStatus::NeedsWorkflowSelection,
+            pending_human_action: true,
+            current_human_gate: Some("workflow_selection".into()),
+            workflow_phase: Some("triage".into()),
+            blocked_reason: Some("manual triage required".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: Some(TaskHumanGateState::NeedsWorkflowSelection),
+            valid_next_events: vec![],
+            allowed_actions: vec![HumanActionKind::Cancel],
+            context: serde_json::json!({"needs_triage": true, "triage_reason": "manual triage required"}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(
+                &TaskProjection {
+                    task: triage_task.clone(),
+                },
+                None,
+            )
+            .expect("persist triage task");
+
+        svc.sync_tasks_from_adapter().await.expect("sync");
+        let projected = adapter.pull_tasks().expect("pull tasks");
+        let rec = projected
+            .into_iter()
+            .find(|r| r.external.id == triage_task.id)
+            .expect("task exists");
+        assert_eq!(
+            rec.external.blocked_reason.as_deref(),
+            Some("manual triage required")
+        );
+        assert!(
+            !rec.external
+                .allowed_actions
+                .contains(&HumanActionKind::ChooseWorkflow)
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn triage_needs_triage_label_is_manual_gate_authority() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage_task = TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "manual triage by label".into(),
+            description: Some("blocked by needs-triage label".into()),
+            workflow_id: Some("wf".into()),
+            triage_status: TaskTriageStatus::NeedsWorkflowSelection,
+            pending_human_action: true,
+            current_human_gate: Some("workflow_selection".into()),
+            workflow_phase: Some("triage".into()),
+            blocked_reason: Some("manual triage required".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: Some(TaskHumanGateState::NeedsWorkflowSelection),
+            valid_next_events: vec![],
+            allowed_actions: vec![HumanActionKind::Cancel],
+            context: serde_json::json!({"labels": ["needs-triage"], "triage_reason": "manual triage required"}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(
+                &TaskProjection {
+                    task: triage_task.clone(),
+                },
+                None,
+            )
+            .expect("persist triage task");
+
+        svc.sync_tasks_from_adapter().await.expect("sync");
+
+        let triage_item = svc
+            .get_work_item(triage_task.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(triage_item.workflow_id, "__triage__");
+
+        let triage_events = svc.valid_next_events_for_work_item(&triage_item);
+        assert_eq!(triage_events, vec![WorkflowEventKind::Cancel]);
+
+        let choose_err = svc
+            .choose_workflow(triage_item.id, "wf".to_string())
+            .await
+            .expect_err("manual triage gate should block choose_workflow");
+        assert!(matches!(choose_err, AppError::WorkflowInvalid(_)));
+        assert!(
+            choose_err
+                .to_string()
+                .contains("cannot choose workflow while needs-triage is active")
+        );
+
+        let projected = adapter.pull_tasks().expect("pull tasks");
+        let rec = projected
+            .into_iter()
+            .find(|r| r.external.id == triage_task.id)
+            .expect("projected task");
+        assert!(
+            !rec.external
+                .allowed_actions
+                .contains(&HumanActionKind::ChooseWorkflow)
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn adapter_choose_workflow_action_is_blocked_while_needs_triage_label_active() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let task_id = Uuid::new_v4();
+        let triage_task = TaskToolRecord {
+            id: task_id,
+            title: "manual triage choose action blocked".into(),
+            description: None,
+            workflow_id: Some("wf".into()),
+            triage_status: TaskTriageStatus::NeedsWorkflowSelection,
+            pending_human_action: true,
+            current_human_gate: Some("workflow_selection".into()),
+            workflow_phase: Some("triage".into()),
+            blocked_reason: Some("manual triage required".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: Some(TaskHumanGateState::NeedsWorkflowSelection),
+            valid_next_events: vec![],
+            allowed_actions: vec![HumanActionKind::Cancel],
+            context: serde_json::json!({"labels": ["needs-triage"]}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(
+                &TaskProjection {
+                    task: triage_task.clone(),
+                },
+                None,
+            )
+            .expect("persist initial");
+        svc.sync_tasks_from_adapter().await.expect("sync initial");
+
+        let action_task = TaskToolRecord {
+            updated_at: triage_task.updated_at + chrono::TimeDelta::seconds(1),
+            requested_action: Some(crate::server::task_adapter::TaskHumanAction {
+                kind: HumanActionKind::ChooseWorkflow,
+                workflow_id: Some("wf".into()),
+                reason: None,
+            }),
+            action_revision: 1,
+            ..triage_task
+        };
+        adapter
+            .persist_projection(&TaskProjection { task: action_task }, None)
+            .expect("persist action task");
+        svc.sync_tasks_from_adapter()
+            .await
+            .expect("sync action task");
+
+        let item = svc
+            .get_work_item(task_id)
+            .await
+            .expect("get item")
+            .expect("exists");
+        assert_eq!(item.workflow_id, "__triage__");
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn adapter_update_projection_removing_needs_triage_label_unlocks_workflow_selection() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let base_time = Utc::now();
+        let triage_task_id = Uuid::new_v4();
+        let triage_task = TaskToolRecord {
+            id: triage_task_id,
+            title: "unlock after label removed".into(),
+            description: Some("starts blocked by label".into()),
+            workflow_id: Some("wf".into()),
+            triage_status: TaskTriageStatus::NeedsWorkflowSelection,
+            pending_human_action: true,
+            current_human_gate: Some("workflow_selection".into()),
+            workflow_phase: Some("triage".into()),
+            blocked_reason: Some("manual triage required".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: Some(TaskHumanGateState::NeedsWorkflowSelection),
+            valid_next_events: vec![],
+            allowed_actions: vec![HumanActionKind::Cancel],
+            context: serde_json::json!({"labels": ["needs-triage"], "triage_reason": "manual triage required"}),
+            repo: None,
+            updated_at: base_time,
+            requested_action: None,
+            action_revision: 0,
+        };
+        adapter
+            .persist_projection(
+                &TaskProjection {
+                    task: triage_task.clone(),
+                },
+                None,
+            )
+            .expect("persist triage task");
+        svc.sync_tasks_from_adapter().await.expect("sync blocked");
+
+        let blocked = svc
+            .get_work_item(triage_task_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(blocked.workflow_id, "__triage__");
+
+        let unlocked_task = TaskToolRecord {
+            context: serde_json::json!({"labels": []}),
+            // Bump well past the adapter sync write-back grace window so
+            // `infer_intents` actually emits an UpdateProjection intent.
+            updated_at: base_time + chrono::TimeDelta::seconds(60),
+            ..triage_task
+        };
+        adapter
+            .persist_projection(
+                &TaskProjection {
+                    task: unlocked_task,
+                },
+                None,
+            )
+            .expect("persist unlocked task");
+        svc.sync_tasks_from_adapter().await.expect("sync unlocked");
+
+        let unlocked = svc
+            .get_work_item(triage_task_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(unlocked.workflow_id, "wf");
+        assert_ne!(unlocked.current_step, "triage");
+        let jobs = svc
+            .list_jobs_for_work_item(triage_task_id)
+            .await
+            .expect("jobs");
+        assert!(!jobs.is_empty());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn valid_next_events_for_reactive_item_follow_state_transitions() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        let initial_events = svc.valid_next_events_for_work_item(&item);
+        assert!(initial_events.contains(&WorkflowEventKind::Cancel));
+        assert!(!initial_events.contains(&WorkflowEventKind::HumanApproved));
+        assert!(!initial_events.contains(&WorkflowEventKind::JobSucceeded));
+        assert!(!initial_events.contains(&WorkflowEventKind::JobFailed));
+
+        let initial_internal = svc.valid_next_events_for_work_item_internal(&item);
+        assert!(initial_internal.contains(&WorkflowEventKind::JobSucceeded));
+        assert!(initial_internal.contains(&WorkflowEventKind::JobFailed));
+        assert!(initial_internal.contains(&WorkflowEventKind::Cancel));
+
+        svc.fire_event_trusted_internal(
+            item.id,
+            FireEventRequest {
+                event: WorkflowEventKind::JobSucceeded,
+                job_id: None,
+                reason: Some("advance to review".into()),
+            },
+        )
+        .await
+        .expect("fire");
+        item = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        let review_events = svc.valid_next_events_for_work_item(&item);
+        assert!(review_events.contains(&WorkflowEventKind::HumanApproved));
+        assert!(review_events.contains(&WorkflowEventKind::HumanChangesRequested));
+        assert!(review_events.contains(&WorkflowEventKind::Cancel));
+        assert!(!review_events.contains(&WorkflowEventKind::JobSucceeded));
+
+        let review_internal = svc.valid_next_events_for_work_item_internal(&item);
+        assert!(review_internal.contains(&WorkflowEventKind::HumanApproved));
+        assert!(review_internal.contains(&WorkflowEventKind::HumanChangesRequested));
+        assert!(review_internal.contains(&WorkflowEventKind::Cancel));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_executable_with_failed_last_job_exposes_retry_requested() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+        item.context = serde_json::json!({
+            "job_results": {
+                "run_agent": {
+                    "outcome": "failed"
+                }
+            }
+        });
+
+        let events = svc.valid_next_events_for_work_item(&item);
+        assert!(events.contains(&WorkflowEventKind::RetryRequested));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn operator_retry_requeues_last_failed_reactive_step_without_retry_transition() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_failed_terminal_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_failed_terminal".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("register");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Failed,
+                transcript_dir: Some("/tmp/fail".into()),
+                result: Some(JobResult {
+                    ..failed_job_result()
+                }),
+            },
+        )
+        .await
+        .expect("fail job");
+
+        let failed = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get item")
+            .expect("exists");
+        assert_eq!(failed.state, WorkItemState::Failed);
+        assert_eq!(failed.current_step, "failed");
+
+        let retried = svc
+            .apply_operator_action(
+                item.id,
+                TaskHumanAction {
+                    kind: HumanActionKind::Retry,
+                    workflow_id: None,
+                    reason: Some("operator retry".into()),
+                },
+            )
+            .await
+            .expect("operator retry");
+
+        assert_eq!(retried.state, WorkItemState::Running);
+        assert_eq!(retried.current_step, "run");
+        assert_eq!(retried.context["operator_override"]["action"], "retry");
+
+        let jobs = svc.list_jobs_for_work_item(item.id).await.expect("jobs");
+        assert!(
+            jobs.iter()
+                .any(|j| j.step_id == "run" && j.state == JobState::Pending && j.attempt == 1)
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn operator_unblock_advances_reactive_human_state_without_explicit_unblock_transition() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        let review = svc
+            .fire_event_trusted_internal(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::JobSucceeded,
+                    job_id: None,
+                    reason: Some("advance to review".into()),
+                },
+            )
+            .await
+            .expect("move to review");
+        assert_eq!(review.current_step, "review");
+
+        let events = svc.valid_next_events_for_work_item(&review);
+        assert!(events.contains(&WorkflowEventKind::HumanUnblocked));
+
+        let updated = svc
+            .apply_operator_action(
+                item.id,
+                TaskHumanAction {
+                    kind: HumanActionKind::Unblock,
+                    workflow_id: None,
+                    reason: Some("operator unblock".into()),
+                },
+            )
+            .await
+            .expect("operator unblock");
+
+        assert_eq!(updated.current_step, "done");
+        assert_eq!(updated.state, WorkItemState::Succeeded);
+        assert_eq!(updated.context["operator_override"]["action"], "unblock");
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    fn reactive_workflow_with_failed_human_state() -> Arc<WorkflowCatalog> {
+        let tmp = std::env::temp_dir().join(format!("wf-catalog-failed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let wf = r#"
+[workflow]
+id = "reactive_failed_wf"
+schema = "reactive_v2"
+initial_state = "bootstrap"
+
+[[workflow.states]]
+id = "bootstrap"
+kind = "auto"
+
+[[workflow.states.on]]
+event = "start"
+target = "run_failed"
+
+[[workflow.states]]
+id = "run_failed"
+kind = "human"
+
+[[workflow.states.on]]
+event = "human_unblocked"
+target = "done"
+
+[[workflow.states.on]]
+event = "human_changes_requested"
+target = "bootstrap"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "reactive_failed_wf", wf);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    #[tokio::test]
+    async fn approve_at_failed_state_is_retargeted_to_unblock() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_with_failed_human_state(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_failed_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        // bootstrap is an auto state that fires `start` on entry, parking the
+        // item directly at the human gate.
+        assert_eq!(item.current_step, "run_failed");
+
+        // Sanity: this state declines HumanApproved but accepts HumanUnblocked.
+        let valid = svc.valid_next_events_for_work_item(&item);
+        assert!(!valid.contains(&WorkflowEventKind::HumanApproved));
+        assert!(valid.contains(&WorkflowEventKind::HumanUnblocked));
+
+        // Adapter-synthesized assignment-to-bot lands as Approve. The orchestrator
+        // should treat it as Unblock here.
+        let advanced = svc
+            .apply_operator_action(
+                item.id,
+                TaskHumanAction {
+                    kind: HumanActionKind::Approve,
+                    workflow_id: None,
+                    reason: Some("retry from human-bot reassignment".into()),
+                },
+            )
+            .await
+            .expect("approve at failed state should be retargeted to unblock");
+
+        assert_eq!(advanced.current_step, "done");
+        assert_eq!(advanced.state, WorkItemState::Succeeded);
+        assert_eq!(advanced.context["operator_override"]["action"], "unblock");
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn approve_at_review_state_keeps_approve_semantics() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create");
+
+        let review = svc
+            .fire_event_trusted_internal(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::JobSucceeded,
+                    job_id: None,
+                    reason: Some("advance to review".into()),
+                },
+            )
+            .await
+            .expect("advance to review");
+        assert_eq!(review.current_step, "review");
+
+        // The review state accepts HumanApproved, so the polymorphism is a no-op.
+        let valid = svc.valid_next_events_for_work_item(&review);
+        assert!(valid.contains(&WorkflowEventKind::HumanApproved));
+
+        let advanced = svc
+            .apply_operator_action(
+                item.id,
+                TaskHumanAction {
+                    kind: HumanActionKind::Approve,
+                    workflow_id: None,
+                    reason: Some("approve review".into()),
+                },
+            )
+            .await
+            .expect("approve at review");
+
+        assert_eq!(advanced.current_step, "done");
+        // No operator_override should have been recorded — this took the ordinary path.
+        assert!(advanced.context.get("operator_override").is_none());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_agent_job_context_projects_internal_transition_events() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        let job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.step_id == "run_agent")
+            .expect("run_agent job");
+
+        assert_eq!(
+            job.context["workflow"]["inputs"]["valid_next_events"],
+            serde_json::json!(["job_succeeded", "job_failed", "cancel"])
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_runtime_spec_includes_workflow_and_context_candidate_repos() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_candidate_repo_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_candidates".into(),
+                session_id: None,
+                context: serde_json::json!({
+                    "repo_catalog": [
+                        { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/main" },
+                        { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" }
+                    ]
+                }),
+                repo: Some(protocol::RepoSource {
+                    repo_url: "https://github.com/reddit/agent-hub".to_string(),
+                    base_ref: "origin/main".to_string(),
+                    branch_name: Some("agent-hub/test-branch".to_string()),
+                }),
+            })
+            .await
+            .expect("create item");
+
+        let job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.step_id == "run_agent")
+            .expect("run_agent job");
+        let runtime = canonical_runtime_spec_for_job_effective(&job);
+        let repo_urls = runtime
+            .repos
+            .iter()
+            .map(|repo| repo.repo_url.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(repo_urls.len(), 3);
+        assert_eq!(repo_urls[0], "https://github.com/reddit/agent-hub");
+        assert_eq!(repo_urls[1], "https://github.com/reddit/opencode");
+        assert_eq!(repo_urls[2], "https://github.com/reddit/Dippy");
+        assert!(!runtime.repos[0].read_only);
+        assert!(runtime.repos[1].read_only);
+        assert!(runtime.repos[2].read_only);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_runtime_spec_candidate_repos_dedupes_by_repo_url() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_candidate_repo_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_candidates".into(),
+                session_id: None,
+                context: serde_json::json!({
+                    "repo_catalog": [
+                        { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/main" },
+                        { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/release" },
+                        { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" },
+                        { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" }
+                    ]
+                }),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        let job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.step_id == "run_agent")
+            .expect("run_agent job");
+        let runtime = canonical_runtime_spec_for_job_effective(&job);
+        let repo_urls = runtime
+            .repos
+            .iter()
+            .map(|repo| repo.repo_url.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(repo_urls.len(), 3);
+        assert_eq!(repo_urls[0], "https://github.com/reddit/agent-hub");
+        assert_eq!(repo_urls[1], "https://github.com/reddit/opencode");
+        assert_eq!(repo_urls[2], "https://github.com/reddit/Dippy");
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_agent_output_repo_is_promoted_to_work_item_repo() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("register");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/x".into()),
+                result: Some(JobResult {
+                    outcome: protocol::ExecutionOutcome::Succeeded,
+                    termination_reason: protocol::TerminationReason::ExitCode,
+                    exit_code: Some(0),
+                    timing: protocol::ExecutionTiming {
+                        started_at: Utc::now(),
+                        finished_at: Utc::now(),
+                        duration_ms: 1,
+                    },
+                    artifacts: protocol::ArtifactSummary {
+                        stdout_path: "/tmp/x/stdout.log".into(),
+                        stderr_path: "/tmp/x/stderr.log".into(),
+                        output_path: None,
+                        transcript_dir: Some("/tmp/x".into()),
+                        stdout_bytes: None,
+                        stderr_bytes: None,
+                        output_bytes: None,
+                        structured_transcript_artifacts: vec![],
+                    },
+                    output_json: Some(serde_json::json!({
+                        "next_event": "job_succeeded",
+                        "repo": {
+                            "repo_url": "https://github.com/reddit/agent-hub",
+                            "base_ref": "origin/main",
+                            "branch_name": "feature/discovered"
+                        }
+                    })),
+                    repo: None,
+                    github_pr: None,
+                    error_message: None,
+                }),
+            },
+        )
+        .await
+        .expect("finish job");
+
+        let updated = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        let repo = updated.repo.expect("repo promoted");
+        assert_eq!(repo.repo_url, "https://github.com/reddit/agent-hub");
+        assert_eq!(repo.base_ref, "origin/main");
+        assert_eq!(repo.branch_name.as_deref(), Some("feature/discovered"));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_agent_output_invalid_repo_is_not_promoted_to_work_item_repo() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("register");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/x".into()),
+                result: Some(JobResult {
+                    outcome: protocol::ExecutionOutcome::Succeeded,
+                    termination_reason: protocol::TerminationReason::ExitCode,
+                    exit_code: Some(0),
+                    timing: protocol::ExecutionTiming {
+                        started_at: Utc::now(),
+                        finished_at: Utc::now(),
+                        duration_ms: 1,
+                    },
+                    artifacts: protocol::ArtifactSummary {
+                        stdout_path: "/tmp/x/stdout.log".into(),
+                        stderr_path: "/tmp/x/stderr.log".into(),
+                        output_path: None,
+                        transcript_dir: Some("/tmp/x".into()),
+                        stdout_bytes: None,
+                        stderr_bytes: None,
+                        output_bytes: None,
+                        structured_transcript_artifacts: vec![],
+                    },
+                    output_json: Some(serde_json::json!({
+                        "next_event": "job_succeeded",
+                        "repo": {
+                            "repo_url": "unknown",
+                            "base_ref": "origin/main"
+                        }
+                    })),
+                    repo: None,
+                    github_pr: None,
+                    error_message: None,
+                }),
+            },
+        )
+        .await
+        .expect("finish job");
+
+        let updated = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(updated.repo.is_none());
+        assert_eq!(updated.current_step, "review");
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn triage_work_item_includes_repo_catalog_hint_context() {
+        // Repo discovery is a __triage__ concern after the triage-decoupling work:
+        // creating a work item directly under the __triage__ pseudo-workflow should
+        // surface the orchestration service's discovered repos as
+        // `repo_catalog_hint` and `repo_catalog` so the triage prompt can render
+        // them. Workflows entered post-triage receive the concrete repo as part of
+        // their interpolated context, not a discovery hint.
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_discovered_repos(vec![DiscoveredRepo {
+            name: "agent-hub".to_string(),
+            local_path: "/home/nick.davies/code/agent-hub".to_string(),
+            remote_url: Some("git@github.com:org/agent-hub.git".to_string()),
+        }]);
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "__triage__".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        let hint = item
+            .context
+            .get("repo_catalog_hint")
+            .and_then(serde_json::Value::as_str)
+            .expect("repo catalog hint present");
+        assert!(hint.contains("agent-hub"));
+        assert!(hint.contains("/home/nick.davies/code/agent-hub"));
+
+        let catalog = item
+            .context
+            .get("repo_catalog")
+            .and_then(serde_json::Value::as_array)
+            .expect("repo catalog present");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            catalog[0]["repo_url"],
+            serde_json::json!("/home/nick.davies/code/agent-hub")
+        );
+        assert_eq!(catalog[0]["base_ref"], serde_json::json!("origin/main"));
+        assert_eq!(
+            catalog[0]["description"],
+            serde_json::json!("agent-hub (remote: git@github.com:org/agent-hub.git)")
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[test]
+    fn triage_interpolation_context_includes_repo_catalog_hint() {
+        // Repo catalog hint context is exclusively a __triage__ concern: triage
+        // discovers the repo, then reactive workflows receive it as a concrete
+        // selection in their context. Verify the interpolation context honors
+        // that gating.
+        let item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: TRIAGE_WORKFLOW_ID.to_string(),
+            external_task_id: None,
+            external_task_source: None,
+            title: Some("Repo-less work item".to_string()),
+            description: Some("Needs repo discovery".to_string()),
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "triage".to_string(),
+            projected_state: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Pending,
+            context: serde_json::json!({
+                "repo_catalog_hint": "- agent-hub — /home/nick.davies/code/agent-hub (remote: git@github.com:org/agent-hub.git)",
+                "repo_catalog": [
+                    {
+                        "repo_url": "/home/nick.davies/code/agent-hub",
+                        "base_ref": "origin/main",
+                        "description": "agent-hub (remote: git@github.com:org/agent-hub.git)"
+                    }
+                ]
+            }),
+            repo: None,
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+
+        let prompt_context = interpolation_context_for_work_item(&item, &item.current_step);
+        let rendered = interpolate_template("triage {{repo_catalog_hint}}", &prompt_context)
+            .expect("repo catalog hint should interpolate");
+
+        assert!(rendered.contains("/home/nick.davies/code/agent-hub"));
+    }
+
+    #[tokio::test]
+    async fn triage_job_without_workflow_selection_is_rejected() {
+        // After the __triage__ decoupling, a triage agent that finishes without
+        // selecting a concrete workflow is a hard failure: the work item should
+        // not silently advance into a workflow. Instead the orchestration service
+        // marks the work item failed with a human-readable failure reason so an
+        // operator can re-trigger triage or fix the source data. This replaces
+        // the old `simple-code-change` triage flow which routed to its own
+        // `triage_failed` human state.
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "__triage__".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        // Triage jobs are Docker-mode, so the worker must advertise Docker.
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Docker],
+        })
+        .await
+        .expect("register");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned job");
+        assert_eq!(job.step_id, "triage");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/x".into()),
+                result: Some(JobResult {
+                    outcome: protocol::ExecutionOutcome::Succeeded,
+                    termination_reason: protocol::TerminationReason::ExitCode,
+                    exit_code: Some(0),
+                    timing: protocol::ExecutionTiming {
+                        started_at: Utc::now(),
+                        finished_at: Utc::now(),
+                        duration_ms: 1,
+                    },
+                    artifacts: protocol::ArtifactSummary {
+                        stdout_path: "/tmp/x/stdout.log".into(),
+                        stderr_path: "/tmp/x/stderr.log".into(),
+                        output_path: None,
+                        transcript_dir: Some("/tmp/x".into()),
+                        stdout_bytes: None,
+                        stderr_bytes: None,
+                        output_bytes: None,
+                        structured_transcript_artifacts: vec![],
+                    },
+                    output_json: Some(serde_json::json!({
+                        "next_event": "job_succeeded",
+                        "repo": {
+                            "repo_url": "unknown",
+                            "base_ref": "origin/main"
+                        }
+                    })),
+                    repo: None,
+                    github_pr: None,
+                    error_message: None,
+                }),
+            },
+        )
+        .await
+        .expect("finish job");
+
+        let updated = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(updated.workflow_id, "__triage__");
+        assert_eq!(updated.state, WorkItemState::Failed);
+        let reason = updated
+            .last_failure_reason
+            .as_deref()
+            .expect("failure reason set");
+        assert!(
+            reason.contains("workflow") || reason.contains("triage"),
+            "unexpected failure reason: {reason}"
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_managed_job_context_projects_internal_transition_events() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_managed_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_managed".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        let job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.step_id == "run_managed")
+            .expect("run_managed job");
+
+        assert_eq!(
+            job.context["workflow"]["inputs"]["valid_next_events"],
+            serde_json::json!(["job_succeeded", "job_failed", "cancel"])
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn reactive_command_job_context_projects_internal_transition_events() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_child_only_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "child_reactive".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        let job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.step_id == "run")
+            .expect("run command job");
+
+        assert_eq!(
+            job.context["workflow"]["inputs"]["valid_next_events"],
+            serde_json::json!(["job_succeeded", "cancel"])
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn valid_next_events_for_failed_legacy_item_include_retry_and_cancel() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![protocol::ExecutionMode::Raw],
+        })
+        .await
+        .expect("register");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start job");
+
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Failed,
+                transcript_dir: Some("/tmp/fail".into()),
+                result: Some(JobResult {
+                    ..failed_job_result()
+                }),
+            },
+        )
+        .await
+        .expect("fail job");
+
+        let failed_item = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get item")
+            .expect("exists");
+        assert_eq!(failed_item.state, WorkItemState::Failed);
+
+        let events = svc.valid_next_events_for_work_item(&failed_item);
+        assert!(events.contains(&WorkflowEventKind::RetryRequested));
+        assert!(events.contains(&WorkflowEventKind::Cancel));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn valid_next_events_for_legacy_human_gate_are_state_aware() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+        item.human_gate = true;
+        item.human_gate_state = Some("changes_requested".into());
+
+        let events = svc.valid_next_events_for_work_item(&item);
+        assert!(events.contains(&WorkflowEventKind::HumanUnblocked));
+        assert!(events.contains(&WorkflowEventKind::RetryRequested));
+        assert!(events.contains(&WorkflowEventKind::Cancel));
+        assert!(!events.contains(&WorkflowEventKind::HumanApproved));
+        assert!(!events.contains(&WorkflowEventKind::HumanChangesRequested));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn fire_event_rejects_external_events_not_in_valid_next_events() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        let err = svc
+            .fire_event(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::HumanApproved,
+                    job_id: None,
+                    reason: Some("should reject".into()),
+                },
+            )
+            .await
+            .expect_err("event should be rejected by ingress guard");
+        assert!(matches!(err, AppError::WorkflowInvalid(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("event 'human_approved' is not currently valid"));
+        assert!(msg.contains("submit"));
+        assert!(msg.contains("cancel"));
+        assert!(!msg.contains("job_succeeded"));
+
+        let err = svc
+            .fire_event(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::JobSucceeded,
+                    job_id: None,
+                    reason: Some("system event via public ingress should reject".into()),
+                },
+            )
+            .await
+            .expect_err("system event should be rejected on public ingress");
+        assert!(matches!(err, AppError::WorkflowInvalid(_)));
+
+        let progressed = svc
+            .fire_event_trusted_internal(
+                item.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::JobSucceeded,
+                    job_id: None,
+                    reason: Some("trusted internal progression".into()),
+                },
+            )
+            .await
+            .expect("trusted internal should allow system progression");
+        assert_eq!(progressed.current_step, "test");
+
+        let triage = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "__triage__".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create triage item");
+        let triage_events = svc.valid_next_events_for_work_item(&triage);
+        assert!(!triage_events.contains(&WorkflowEventKind::WorkflowChosen));
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn triage_workflow_chosen_is_not_fireable_via_public_or_trusted_event_ingress() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let triage = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "__triage__".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create triage");
+
+        let public_err = svc
+            .fire_event(
+                triage.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::WorkflowChosen,
+                    job_id: None,
+                    reason: Some("should reject".into()),
+                },
+            )
+            .await
+            .expect_err("public ingress must reject workflow_chosen");
+        assert!(matches!(public_err, AppError::WorkflowInvalid(_)));
+
+        let trusted_err = svc
+            .fire_event_trusted_internal(
+                triage.id,
+                FireEventRequest {
+                    event: WorkflowEventKind::WorkflowChosen,
+                    job_id: None,
+                    reason: Some("still reject; use choose_workflow".into()),
+                },
+            )
+            .await
+            .expect_err("trusted ingress should also reject triage workflow_chosen");
+        assert!(matches!(trusted_err, AppError::WorkflowInvalid(_)));
+
+        let selected = svc
+            .choose_workflow(triage.id, "wf".to_string())
+            .await
+            .expect("choose_workflow should remain dedicated path");
+        assert_eq!(selected.workflow_id, "wf");
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn succeeded_terminal_item_clears_stale_human_gate_and_failure_reason() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        item.current_step = "done".to_string();
+        item.state = WorkItemState::Succeeded;
+        item.human_gate = false;
+        item.human_gate_state = Some("awaiting_human_action".to_string());
+        item.last_failure_reason = Some("stale failure".to_string());
+        item.context = serde_json::json!({
+            "task_human_gate_state": "awaiting_human_action",
+            "last_failure_reason": "stale failure"
+        });
+        item.updated_at = Utc::now();
+        svc.update_work_item(&item).await.expect("update item");
+
+        let refreshed = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(refreshed.state, WorkItemState::Succeeded);
+        assert_eq!(refreshed.human_gate_state, None);
+        assert_eq!(refreshed.last_failure_reason, None);
+        assert!(refreshed.context.get("task_human_gate_state").is_none());
+        assert!(refreshed.context.get("last_failure_reason").is_none());
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_item_preserves_failure_reason() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            reactive_workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+
+        let mut item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "reactive_wf".into(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        item.current_step = "done".to_string();
+        item.state = WorkItemState::Failed;
+        item.human_gate = false;
+        item.human_gate_state = Some("awaiting_human_action".to_string());
+        item.last_failure_reason = Some("real failure".to_string());
+        item.context = serde_json::json!({
+            "task_human_gate_state": "awaiting_human_action",
+            "last_failure_reason": "real failure"
+        });
+        item.updated_at = Utc::now();
+        svc.update_work_item(&item).await.expect("update item");
+
+        let refreshed = svc
+            .get_work_item(item.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(refreshed.state, WorkItemState::Failed);
+        assert_eq!(
+            refreshed.last_failure_reason.as_deref(),
+            Some("real failure")
+        );
+        assert_eq!(
+            refreshed.context.get("last_failure_reason"),
+            Some(&serde_json::json!("real failure"))
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn workflow_job_uses_selected_environment_when_no_step_override() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_environments(environments_fixture())
+        .with_overlays(overlays_fixture());
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({
+                    "environment": {
+                        "base": "code-auto",
+                        "overlays": ["github"]
+                    }
+                }),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        let build_job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.step_id == "build")
+            .expect("build job");
+
+        assert_eq!(
+            build_job.container_image.as_deref(),
+            Some("agent-hub/job-code:latest")
+        );
+        assert_eq!(
+            build_job.context["environment_base"],
+            serde_json::json!("code-auto")
+        );
+        assert_eq!(
+            build_job.context["overlays"],
+            serde_json::json!([
+                {
+                    "name": "github",
+                    "provider": "gh",
+                    "config": {}
+                }
+            ])
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn workflow_job_keeps_step_container_override_with_environment_selection() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_environments(environments_fixture())
+        .with_overlays(overlays_fixture());
+        svc.init().await.expect("init");
+
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: "wf".into(),
+                session_id: None,
+                context: serde_json::json!({
+                    "environment": {
+                        "base": "code-auto",
+                        "overlays": ["github"]
+                    }
+                }),
+                repo: None,
+            })
+            .await
+            .expect("create item");
+
+        svc.register_worker(RegisterWorkerRequest {
+            id: "w1".into(),
+            hostname: "host".into(),
+            supported_modes: vec![
+                protocol::ExecutionMode::Raw,
+                protocol::ExecutionMode::Docker,
+            ],
+        })
+        .await
+        .expect("register");
+
+        let job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".into(),
+            })
+            .await
+            .expect("poll")
+            .job
+            .expect("assigned build job");
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start");
+        svc.update_job(
+            job.id,
+            JobUpdateRequest {
+                worker_id: "w1".into(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/x".into()),
+                result: Some(successful_job_result()),
+            },
+        )
+        .await
+        .expect("finish");
+
+        let test_job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.step_id == "test")
+            .expect("test job");
+
+        assert_eq!(test_job.container_image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(
+            test_job.context["environment_base"],
+            serde_json::json!("code-auto")
+        );
+        assert_eq!(
+            test_job.context["overlays"],
+            serde_json::json!([
+                {
+                    "name": "github",
+                    "provider": "gh",
+                    "config": {}
+                }
+            ])
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[test]
+    fn triage_workflow_summary_falls_back_when_no_hint() {
+        let summary = triage_workflow_summary(vec![
+            ("simple-code-change".to_string(), None),
+            ("github-pr".to_string(), None),
+        ]);
+        assert_eq!(summary, "- github-pr\n- simple-code-change");
+    }
+
+    #[test]
+    fn triage_workflow_summary_inlines_indented_hints() {
+        let summary = triage_workflow_summary(vec![
+            (
+                "simple-code-change".to_string(),
+                Some(
+                    "Use this when writing code end-to-end.\nFollow up with a PR step."
+                        .to_string(),
+                ),
+            ),
+            ("github-pr".to_string(), Some("PR-only flow.".to_string())),
+        ]);
+        assert_eq!(
+            summary,
+            "- github-pr\n  PR-only flow.\n- simple-code-change\n  Use this when writing code end-to-end.\n  Follow up with a PR step."
+        );
+    }
+
+    #[test]
+    fn triage_workflow_summary_handles_blank_lines_in_hints() {
+        let summary = triage_workflow_summary(vec![(
+            "wf".to_string(),
+            Some("paragraph one\n\nparagraph two".to_string()),
+        )]);
+        assert_eq!(summary, "- wf\n  paragraph one\n\n  paragraph two");
+    }
+
+    #[test]
+    fn triage_workflow_summary_dedupes_and_sorts_entries() {
+        let summary = triage_workflow_summary(vec![
+            ("b".to_string(), Some("hint b".to_string())),
+            ("a".to_string(), None),
+            ("b".to_string(), Some("dupe — should be dropped".to_string())),
+        ]);
+        assert_eq!(summary, "- a\n- b\n  hint b");
+    }
+
+    #[test]
+    fn triage_workflow_summary_empty_returns_none_marker() {
+        assert_eq!(triage_workflow_summary(vec![]), "- (none)");
+    }
+}

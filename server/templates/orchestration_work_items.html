@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Orchestration — Agent Hub</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><a href="/orchestration">Dashboard</a></li>
+        <li><strong>Work items</strong></li>
+        <li><a href="/orchestration/jobs">Jobs</a></li>
+        <li><a href="/orchestration/workers">Workers</a></li>
+        <li><a href="/orchestration/transcripts">Transcripts</a></li>
+        {% if approvals_enabled %}
+        <li><a href="/approvals">Approvals</a></li>
+        {% endif %}
+        {% if has_auth %}
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
+    </ul>
+</nav>
+
+<main class="container">
+    <h3>Orchestration Work Items</h3>
+    {% if work_items.is_empty() %}
+    <p>No work items found.</p>
+    {% else %}
+    <table>
+        <thead>
+            <tr>
+                <th>Title</th>
+                <th>Workflow</th>
+                <th>Projected</th>
+                <th>Triage</th>
+                <th>Blocked reason</th>
+                <th>Human gate</th>
+                <th>Allowed actions</th>
+                <th>Detail</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in work_items %}
+            <tr>
+                <td><code>{{ item.id }}</code><br>{{ item.title }}</td>
+                <td>{{ item.workflow_id }}<br><small>{{ item.current_step }}</small></td>
+                <td>{{ item.projected_state }}<br><small>{{ item.state }}</small></td>
+                <td>{{ item.triage_status }}</td>
+                <td>{{ item.blocked_reason }}</td>
+                <td>{{ item.human_gate_state }}</td>
+                <td>
+                    {% if item.allowed_actions.is_empty() %}
+                    <small>none</small>
+                    {% else %}
+                    {% for action in item.allowed_actions %}
+                    <code>{{ action }}</code>{% if !loop.last %} {% endif %}
+                    {% endfor %}
+                    {% endif %}
+                </td>
+                <td><a href="/orchestration/work-items/{{ item.id }}">Open</a></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    {% if readwrite %}
+    <p><small>Read-write mode: actions are available from work-item detail pages.</small></p>
+    {% else %}
+    <p><small>Read-only mode: actions are disabled.</small></p>
+    {% endif %}
+</main>
+</body>
+</html>

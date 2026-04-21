@@ -13,6 +13,7 @@ use tower_sessions::Session;
 use tracing::{error, info, warn};
 
 use super::AppState;
+use super::DEFAULT_WEB_HOME;
 use super::notifier::Notifier;
 use crate::error::AppError;
 use protocol::Secret;
@@ -369,7 +370,7 @@ pub async fn callback<N: Notifier>(
     let _ = session.remove::<String>(SESSION_NONCE_KEY).await;
 
     info!(email, "OAuth login successful");
-    Redirect::to("/approvals").into_response()
+    Redirect::to(DEFAULT_WEB_HOME).into_response()
 }
 
 /// POST /auth/logout

@@ -1,0 +1,3763 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize, de};
+
+/// Deserialize an `Option<u64>` that also accepts floating-point numbers (e.g. `900.0`).
+/// This is needed because protobuf `google.protobuf.Value` only has `double` for numbers,
+/// so integers become floats after a JSON→protobuf→JSON roundtrip.
+fn deserialize_optional_u64_lenient<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(i) = n.as_u64() {
+                Ok(Some(i))
+            } else if let Some(f) = n.as_f64() {
+                if f >= 0.0 && f <= u64::MAX as f64 && f.fract() == 0.0 {
+                    Ok(Some(f as u64))
+                } else {
+                    Err(de::Error::custom(format!("cannot convert {f} to u64")))
+                }
+            } else {
+                Err(de::Error::custom("invalid number"))
+            }
+        }
+        Some(other) => Err(de::Error::custom(format!(
+            "expected number or null, got {other}"
+        ))),
+    }
+}
+use strum::{Display, EnumString};
+use uuid::Uuid;
+
+use crate::sessions::SessionId;
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ExecutionMode {
+    Raw,
+    Docker,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum WorkItemState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub enum BlockReason {
+    HumanReview,
+    Dependency,
+    Clarification,
+    ExternalSystem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum JobState {
+    Pending,
+    Assigned,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum WorkerState {
+    Idle,
+    Busy,
+    Offline,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum WorkflowEventKind {
+    Start,
+    Submit,
+    TaskCreated,
+    TaskUpdated,
+    CommentAdded,
+    LabelChanged,
+    JobSucceeded,
+    JobFailed,
+    AllChildrenCompleted,
+    ChildFailed,
+    HumanApproved,
+    HumanChangesRequested,
+    HumanUnblocked,
+    RetryRequested,
+    NeedsTriage,
+    WorkflowChosen,
+    PrCreated,
+    PrApproved,
+    PrChangesRequested,
+    OwnerPrApproved,
+    OwnerChangesRequested,
+    CoworkerPrApproved,
+    CoworkerChangesRequested,
+    PrMerged,
+    ChecksPassed,
+    ChecksFailed,
+    /// Emitted by a CI-failure triage step (today: a stub command, soon:
+    /// an agent step that reads CI logs) when it determines the failure
+    /// is trivial (lint/format/obvious unit-test breakage in code we
+    /// authored) and the workflow should auto-loop back to `implement`.
+    CiFailureTrivial,
+    /// Emitted by the same triage step when the failure cause is unclear
+    /// or requires human judgment (flaky CI, infrastructure issues,
+    /// cross-PR dependencies). The workflow escalates to a human gate
+    /// rather than thrashing the implement loop.
+    CiFailureEscalate,
+    Timeout,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum WorkflowEventPayload {
+    None,
+    Comment {
+        body: String,
+    },
+    AgentResult {
+        exit_code: i32,
+        summary: Option<String>,
+    },
+    PullRequest {
+        number: u64,
+        url: String,
+        action: String,
+    },
+    Labels {
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum EventSource {
+    Webhook,
+    Agent,
+    System,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowEvent {
+    pub work_item_id: String,
+    pub event_type: WorkflowEventKind,
+    pub payload: WorkflowEventPayload,
+    pub source: EventSource,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+pub fn workflow_event_is_externally_fireable(event: &WorkflowEventKind) -> bool {
+    matches!(
+        event,
+        WorkflowEventKind::Submit
+            | WorkflowEventKind::TaskCreated
+            | WorkflowEventKind::TaskUpdated
+            | WorkflowEventKind::CommentAdded
+            | WorkflowEventKind::LabelChanged
+            | WorkflowEventKind::HumanApproved
+            | WorkflowEventKind::HumanChangesRequested
+            | WorkflowEventKind::HumanUnblocked
+            | WorkflowEventKind::RetryRequested
+            | WorkflowEventKind::PrCreated
+            | WorkflowEventKind::PrApproved
+            | WorkflowEventKind::PrChangesRequested
+            | WorkflowEventKind::OwnerPrApproved
+            | WorkflowEventKind::OwnerChangesRequested
+            | WorkflowEventKind::CoworkerPrApproved
+            | WorkflowEventKind::CoworkerChangesRequested
+            | WorkflowEventKind::PrMerged
+            | WorkflowEventKind::ChecksPassed
+            | WorkflowEventKind::ChecksFailed
+            | WorkflowEventKind::Cancel
+    )
+}
+
+pub fn workflow_event_is_internal_system_only(event: &WorkflowEventKind) -> bool {
+    !workflow_event_is_externally_fireable(event)
+}
+
+// TODO(reactive-events): consider a dedicated newtype/enum wrapper if reactive events diverge
+// from the shared workflow event taxonomy. For now they intentionally collapse to the same set.
+pub type ReactiveEventKind = WorkflowEventKind;
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ReactiveTransitionEvent(pub ReactiveEventKind);
+
+impl ReactiveTransitionEvent {
+    pub fn kind(&self) -> ReactiveEventKind {
+        self.0.clone()
+    }
+
+    pub fn is_kind(&self, expected: ReactiveEventKind) -> bool {
+        self.0 == expected
+    }
+}
+
+impl From<ReactiveEventKind> for ReactiveTransitionEvent {
+    fn from(value: ReactiveEventKind) -> Self {
+        Self(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReactiveTransitionEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let kind = reactive_event_kind_from_str(&raw).ok_or_else(|| {
+            de::Error::custom(format!(
+                "unknown reactive transition event '{raw}' (use canonical workflow event names like 'start', 'job_succeeded', 'human_approved', etc.)"
+            ))
+        })?;
+        Ok(Self(kind))
+    }
+}
+
+pub fn reactive_event_kind_from_str(event: &str) -> Option<ReactiveEventKind> {
+    event.parse().ok()
+}
+
+pub fn reactive_event_kind_for_workflow_event(event: WorkflowEventKind) -> ReactiveEventKind {
+    event
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum WorkflowStepKind {
+    Agent,
+    ChildWorkflow,
+}
+
+fn default_workflow_step_kind() -> WorkflowStepKind {
+    WorkflowStepKind::Agent
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationReason {
+    ExitCode,
+    Timeout,
+    Cancelled,
+    WorkerError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExecutionTiming {
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StructuredTranscriptArtifact {
+    pub key: String,
+    pub path: String,
+    #[serde(default)]
+    pub bytes: Option<u64>,
+    #[serde(default)]
+    pub schema: Option<String>,
+    #[serde(default)]
+    pub record_count: Option<u64>,
+    #[serde(default)]
+    pub inline_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactSummary {
+    pub stdout_path: String,
+    pub stderr_path: String,
+    #[serde(default)]
+    pub output_path: Option<String>,
+    #[serde(default)]
+    pub transcript_dir: Option<String>,
+    #[serde(default)]
+    pub stdout_bytes: Option<u64>,
+    #[serde(default)]
+    pub stderr_bytes: Option<u64>,
+    #[serde(default)]
+    pub output_bytes: Option<u64>,
+    #[serde(default)]
+    pub structured_transcript_artifacts: Vec<StructuredTranscriptArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RepoExecutionMetadata {
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub target_branch: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    pub is_dirty: bool,
+    pub changed_files: u32,
+    pub untracked_files: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GithubPullRequestMetadata {
+    pub number: u64,
+    pub url: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub is_draft: Option<bool>,
+    #[serde(default)]
+    pub head_ref_name: Option<String>,
+    #[serde(default)]
+    pub base_ref_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PromptRef {
+    pub system: Option<String>,
+    pub user: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RepoSource {
+    pub repo_url: String,
+    /// Git ref to check out in worktree (e.g. origin/main).
+    pub base_ref: String,
+    /// Desired branch name for job/work item lifecycle.
+    #[serde(default)]
+    pub branch_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentDefinition {
+    pub name: String,
+    pub image: String,
+    pub network_class: String,
+    pub approval_mode: String,
+    pub allowed_overlays: Vec<String>,
+    pub description: Option<String>,
+    /// Optional runtime preference for this environment. Names a managed-runner
+    /// id known to the local-agent (e.g. `cursor-default`, `opencode-default`),
+    /// or `auto`/`None` to defer to the local-agent's configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentOverlay {
+    pub name: String,
+    pub provider: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentSelection {
+    pub base: String,
+    pub overlays: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct WorkflowStep {
+    pub id: String,
+    #[serde(default = "default_workflow_step_kind")]
+    pub kind: WorkflowStepKind,
+    pub executor: ExecutionMode,
+    #[serde(default)]
+    pub container_image: Option<String>,
+    #[serde(default)]
+    pub child_workflow_id: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub prompt: Option<PromptRef>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_retries: u32,
+    pub on_success: Option<String>,
+    pub on_failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct WorkflowDefinition {
+    pub id: String,
+    pub entry_step: String,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReactiveStateKind {
+    Auto,
+    Agent,
+    Command,
+    Managed,
+    Human,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveExecutionConfig {
+    #[serde(default)]
+    pub executor: Option<ExecutionMode>,
+    #[serde(default)]
+    pub environment_tier: Option<PlannedEnvironmentTier>,
+    #[serde(default)]
+    pub container_image: Option<String>,
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub overlays: Vec<String>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub network_resources: Option<NetworkResourceRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_rules: Option<ApprovalRuleSet>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub toolchains: Option<Vec<String>>,
+    #[serde(default)]
+    pub candidate_repos: Vec<RepoSource>,
+    #[serde(default)]
+    pub max_retries: u32,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ReactiveAgentStateConfig {
+    #[serde(flatten)]
+    pub execution: ReactiveExecutionConfig,
+    #[serde(default)]
+    pub prompt: Option<PromptRef>,
+}
+
+impl<'de> Deserialize<'de> for ReactiveAgentStateConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawReactiveAgentStateConfig {
+            #[serde(default)]
+            executor: Option<ExecutionMode>,
+            #[serde(default)]
+            environment_tier: Option<PlannedEnvironmentTier>,
+            #[serde(default)]
+            container_image: Option<String>,
+            #[serde(default)]
+            environment: Option<String>,
+            #[serde(default)]
+            overlays: Vec<String>,
+            #[serde(default)]
+            network: Option<String>,
+            #[serde(default)]
+            network_resources: Option<NetworkResourceRequest>,
+            #[serde(default)]
+            approval_rules: Option<ApprovalRuleSet>,
+            #[serde(default)]
+            timeout: Option<u64>,
+            #[serde(default)]
+            timeout_secs: Option<u64>,
+            #[serde(default)]
+            toolchains: Option<Vec<String>>,
+            #[serde(default)]
+            candidate_repos: Vec<RepoSource>,
+            #[serde(default)]
+            max_retries: u32,
+            #[serde(default)]
+            prompt: Option<PromptRef>,
+        }
+
+        let raw = RawReactiveAgentStateConfig::deserialize(deserializer)?;
+        Ok(Self {
+            execution: ReactiveExecutionConfig {
+                executor: raw.executor,
+                environment_tier: raw.environment_tier,
+                container_image: raw.container_image,
+                environment: raw.environment,
+                overlays: raw.overlays,
+                network: raw.network,
+                network_resources: raw.network_resources,
+                approval_rules: raw.approval_rules,
+                timeout: raw.timeout,
+                timeout_secs: raw.timeout_secs,
+                toolchains: raw.toolchains,
+                candidate_repos: raw.candidate_repos,
+                max_retries: raw.max_retries,
+            },
+            prompt: raw.prompt,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ReactiveCommandStateConfig {
+    #[serde(flatten)]
+    pub execution: ReactiveExecutionConfig,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub prompt: Option<PromptRef>,
+}
+
+impl<'de> Deserialize<'de> for ReactiveCommandStateConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawReactiveCommandStateConfig {
+            #[serde(default)]
+            executor: Option<ExecutionMode>,
+            #[serde(default)]
+            environment_tier: Option<PlannedEnvironmentTier>,
+            #[serde(default)]
+            container_image: Option<String>,
+            #[serde(default)]
+            environment: Option<String>,
+            #[serde(default)]
+            overlays: Vec<String>,
+            #[serde(default)]
+            network: Option<String>,
+            #[serde(default)]
+            network_resources: Option<NetworkResourceRequest>,
+            #[serde(default)]
+            approval_rules: Option<ApprovalRuleSet>,
+            #[serde(default)]
+            timeout: Option<u64>,
+            #[serde(default)]
+            timeout_secs: Option<u64>,
+            #[serde(default)]
+            toolchains: Option<Vec<String>>,
+            #[serde(default)]
+            candidate_repos: Vec<RepoSource>,
+            #[serde(default)]
+            max_retries: u32,
+            command: String,
+            #[serde(default)]
+            args: Vec<String>,
+            #[serde(default)]
+            env: HashMap<String, String>,
+            #[serde(default)]
+            prompt: Option<PromptRef>,
+        }
+
+        let raw = RawReactiveCommandStateConfig::deserialize(deserializer)?;
+        Ok(Self {
+            execution: ReactiveExecutionConfig {
+                executor: raw.executor,
+                environment_tier: raw.environment_tier,
+                container_image: raw.container_image,
+                environment: raw.environment,
+                overlays: raw.overlays,
+                network: raw.network,
+                network_resources: raw.network_resources,
+                approval_rules: raw.approval_rules,
+                timeout: raw.timeout,
+                timeout_secs: raw.timeout_secs,
+                toolchains: raw.toolchains,
+                candidate_repos: raw.candidate_repos,
+                max_retries: raw.max_retries,
+            },
+            command: raw.command,
+            args: raw.args,
+            env: raw.env,
+            prompt: raw.prompt,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ReactiveManagedStateConfig {
+    #[serde(flatten)]
+    pub execution: ReactiveExecutionConfig,
+    pub operation: String,
+    #[serde(default)]
+    pub prompt: Option<PromptRef>,
+}
+
+impl<'de> Deserialize<'de> for ReactiveManagedStateConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawReactiveManagedStateConfig {
+            #[serde(default)]
+            executor: Option<ExecutionMode>,
+            #[serde(default)]
+            environment_tier: Option<PlannedEnvironmentTier>,
+            #[serde(default)]
+            container_image: Option<String>,
+            #[serde(default)]
+            environment: Option<String>,
+            #[serde(default)]
+            overlays: Vec<String>,
+            #[serde(default)]
+            network: Option<String>,
+            #[serde(default)]
+            network_resources: Option<NetworkResourceRequest>,
+            #[serde(default)]
+            approval_rules: Option<ApprovalRuleSet>,
+            #[serde(default)]
+            timeout: Option<u64>,
+            #[serde(default)]
+            timeout_secs: Option<u64>,
+            #[serde(default)]
+            toolchains: Option<Vec<String>>,
+            #[serde(default)]
+            candidate_repos: Vec<RepoSource>,
+            #[serde(default)]
+            max_retries: u32,
+            operation: String,
+            #[serde(default)]
+            prompt: Option<PromptRef>,
+        }
+
+        let raw = RawReactiveManagedStateConfig::deserialize(deserializer)?;
+        Ok(Self {
+            execution: ReactiveExecutionConfig {
+                executor: raw.executor,
+                environment_tier: raw.environment_tier,
+                container_image: raw.container_image,
+                environment: raw.environment,
+                overlays: raw.overlays,
+                network: raw.network,
+                network_resources: raw.network_resources,
+                approval_rules: raw.approval_rules,
+                timeout: raw.timeout,
+                timeout_secs: raw.timeout_secs,
+                toolchains: raw.toolchains,
+                candidate_repos: raw.candidate_repos,
+                max_retries: raw.max_retries,
+            },
+            operation: raw.operation,
+            prompt: raw.prompt,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveHumanStateConfig {
+    /// Optional escalation timeout. When the work item has been parked
+    /// at this human state for longer than `timeout_secs` (counted from
+    /// the most recent meaningful state change — entry, resumption, or
+    /// poller-observed PR head_sha bump), the orchestrator fires a
+    /// `WorkflowEventKind::Timeout` event so the workflow can transition
+    /// to a stuck/escalation state. Workflows without a `timeout`
+    /// transition simply ignore the fired event.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveAutoStateConfig {
+    #[serde(default)]
+    pub child_workflow: Option<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveTerminalStateConfig {
+    #[serde(default)]
+    pub terminal_outcome: Option<ReactiveTerminalOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReactiveStateConfig {
+    Agent(ReactiveAgentStateConfig),
+    Command(ReactiveCommandStateConfig),
+    Managed(ReactiveManagedStateConfig),
+    Human(ReactiveHumanStateConfig),
+    Auto(ReactiveAutoStateConfig),
+    Terminal(ReactiveTerminalStateConfig),
+}
+
+impl ReactiveStateConfig {
+    pub fn kind(&self) -> ReactiveStateKind {
+        match self {
+            Self::Agent(_) => ReactiveStateKind::Agent,
+            Self::Command(_) => ReactiveStateKind::Command,
+            Self::Managed(_) => ReactiveStateKind::Managed,
+            Self::Human(_) => ReactiveStateKind::Human,
+            Self::Auto(_) => ReactiveStateKind::Auto,
+            Self::Terminal(_) => ReactiveStateKind::Terminal,
+        }
+    }
+
+    pub fn execution(&self) -> Option<&ReactiveExecutionConfig> {
+        match self {
+            Self::Agent(config) => Some(&config.execution),
+            Self::Command(config) => Some(&config.execution),
+            Self::Managed(config) => Some(&config.execution),
+            Self::Human(_) | Self::Auto(_) | Self::Terminal(_) => None,
+        }
+    }
+
+    pub fn prompt(&self) -> Option<&PromptRef> {
+        match self {
+            Self::Agent(config) => config.prompt.as_ref(),
+            Self::Command(config) => config.prompt.as_ref(),
+            Self::Managed(config) => config.prompt.as_ref(),
+            Self::Human(_) | Self::Auto(_) | Self::Terminal(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReactiveTerminalOutcome {
+    // TODO(reactive-terminal-outcomes): extend if we need richer terminal semantics like timed_out
+    // without overloading generic failure.
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReactiveWorkflowTransition {
+    pub event: ReactiveTransitionEvent,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReactiveWorkflowState {
+    pub id: String,
+    #[serde(default)]
+    pub auto_merge: bool,
+    #[serde(flatten)]
+    pub config: ReactiveStateConfig,
+    #[serde(default)]
+    pub on: Vec<ReactiveWorkflowTransition>,
+}
+
+impl ReactiveWorkflowState {
+    pub fn kind(&self) -> ReactiveStateKind {
+        self.config.kind()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ApprovalRuleSet {
+    /// Tools that are auto-approved for this job
+    #[serde(default)]
+    pub auto_approve: Vec<String>,
+    /// Tools that always escalate to human for this job
+    #[serde(default)]
+    pub escalate: Vec<String>,
+    /// Tools that are denied entirely
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+pub struct MergePolicy {
+    /// Required status check names that must pass
+    #[serde(default)]
+    pub required_checks: Vec<String>,
+    /// Minimum number of approving reviews required
+    #[serde(default)]
+    pub required_approvals: u32,
+    /// Whether dismissal of stale reviews is enforced
+    #[serde(default)]
+    pub dismiss_stale_reviews: bool,
+    /// Whether the branch must be up-to-date with base
+    #[serde(default)]
+    pub require_up_to_date: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReactiveWorkflowDefinition {
+    pub id: String,
+    #[serde(default = "default_reactive_schema")]
+    pub schema: String,
+    pub initial_state: String,
+    #[serde(default)]
+    pub states: Vec<ReactiveWorkflowState>,
+}
+
+fn default_reactive_schema() -> String {
+    "reactive_v2".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "schema_variant", rename_all = "snake_case")]
+pub enum WorkflowDocument {
+    LegacyV1 {
+        workflow: WorkflowDefinition,
+    },
+    ReactiveV2 {
+        workflow: ReactiveWorkflowDefinition,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct WorkflowValidationError {
+    pub workflow_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct WorkflowValidationReport {
+    #[serde(default)]
+    pub errors: Vec<WorkflowValidationError>,
+}
+
+impl WorkflowValidationReport {
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkflowTomlFile {
+    pub workflow: WorkflowDefinition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReactiveWorkflowTomlFile {
+    pub workflow: ReactiveWorkflowDefinition,
+}
+
+pub fn parse_workflow_toml(input: &str) -> Result<WorkflowDefinition, toml::de::Error> {
+    let wrapped: WorkflowTomlFile = toml::from_str(input)?;
+    Ok(wrapped.workflow)
+}
+
+pub fn parse_workflow_toml_document(input: &str) -> Result<WorkflowDocument, toml::de::Error> {
+    let value: toml::Value = toml::from_str(input)?;
+    let schema = value
+        .get("workflow")
+        .and_then(|w| w.get("schema"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("legacy_v1");
+    if schema == "reactive_v2" {
+        let wrapped: ReactiveWorkflowTomlFile = value.try_into()?;
+        Ok(WorkflowDocument::ReactiveV2 {
+            workflow: wrapped.workflow,
+        })
+    } else {
+        let wrapped: WorkflowTomlFile = value.try_into()?;
+        Ok(WorkflowDocument::LegacyV1 {
+            workflow: wrapped.workflow,
+        })
+    }
+}
+
+pub fn validate_reactive_workflow(def: &ReactiveWorkflowDefinition) -> WorkflowValidationReport {
+    let mut errors = Vec::new();
+    if def.id.trim().is_empty() {
+        errors.push(WorkflowValidationError {
+            workflow_id: def.id.clone(),
+            message: "workflow id must not be empty".to_string(),
+        });
+    }
+    if def.schema != "reactive_v2" {
+        errors.push(WorkflowValidationError {
+            workflow_id: def.id.clone(),
+            message: format!(
+                "reactive workflow schema '{}' is not supported (expected reactive_v2)",
+                def.schema
+            ),
+        });
+    }
+
+    let mut ids = HashSet::new();
+    for state in &def.states {
+        let execution = state.config.execution();
+        if let Some(network) = execution.and_then(|cfg| cfg.network.as_deref())
+            && !matches!(network, "none" | "restricted" | "full")
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "state '{}' has unknown network '{}' (expected one of: none, restricted, full)",
+                    state.id, network
+                ),
+            });
+        }
+
+        if execution.and_then(|cfg| cfg.network.as_deref()).is_some()
+            && execution
+                .and_then(|cfg| cfg.network_resources.as_ref())
+                .is_some()
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "state '{}' must not set both network and network_resources",
+                    state.id
+                ),
+            });
+        }
+
+        if matches!(
+            execution.and_then(|cfg| cfg.environment_tier.clone()),
+            Some(PlannedEnvironmentTier::Kubernetes)
+        ) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "state '{}' has unknown environment_tier 'kubernetes' (expected one of: kube, docker, raw)",
+                    state.id
+                ),
+            });
+        }
+
+        let effective_network_request = execution
+            .and_then(|cfg| cfg.network_resources.clone())
+            .or_else(|| {
+                network_request_from_legacy_label(execution.and_then(|cfg| cfg.network.as_deref()))
+            });
+        if matches!(
+            effective_network_request,
+            Some(NetworkResourceRequest::None)
+        ) {
+            let network_required_toolchains = ["kubectl", "aws-cli", "gh"];
+            if let Some(toolchains) = execution.and_then(|cfg| cfg.toolchains.as_ref()) {
+                let blocked_toolchains = toolchains
+                    .iter()
+                    .filter(|tool| network_required_toolchains.contains(&tool.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !blocked_toolchains.is_empty() {
+                    errors.push(WorkflowValidationError {
+                        workflow_id: def.id.clone(),
+                        message: format!(
+                            "warning: state '{}' sets network_resources='none' but declares network-requiring toolchains: {}",
+                            state.id,
+                            blocked_toolchains.join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+
+        if state.id.trim().is_empty() {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: "state id must not be empty".to_string(),
+            });
+            continue;
+        }
+        if !ids.insert(state.id.clone()) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("duplicate state id '{}'", state.id),
+            });
+        }
+        if state.id.contains('.') {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "state '{}' must not contain '.' (reserved by dot-path interpolation aliases)",
+                    state.id
+                ),
+            });
+        }
+        if matches!(state.kind(), ReactiveStateKind::Agent) {
+            if execution.and_then(|cfg| cfg.executor.as_ref()).is_none() {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!("agent state '{}' must declare executor", state.id),
+                });
+            }
+            if let ReactiveStateConfig::Agent(_) = &state.config {
+            } else {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' kind '{}' has invalid config variant",
+                        state.id,
+                        state.kind()
+                    ),
+                });
+            }
+            if let Some(timeout_secs) = execution.and_then(|cfg| cfg.timeout_secs)
+                && timeout_secs == 0
+            {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!("agent state '{}' timeout_secs must be > 0", state.id),
+                });
+            }
+        }
+        if let ReactiveStateConfig::Command(config) = &state.config
+            && config.command.trim().is_empty()
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("command state '{}' must declare command", state.id),
+            });
+        }
+        if let ReactiveStateConfig::Managed(config) = &state.config
+            && config.operation.trim().is_empty()
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("managed state '{}' must declare operation", state.id),
+            });
+        }
+        if let Some(timeout_secs) = execution.and_then(|cfg| cfg.timeout_secs)
+            && timeout_secs == 0
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("state '{}' timeout_secs must be > 0", state.id),
+            });
+        }
+        let child_workflow = match &state.config {
+            ReactiveStateConfig::Auto(config) => config
+                .child_workflow
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty()),
+            _ => None,
+        };
+        let has_child_workflow = child_workflow.is_some();
+
+        if matches!(&state.config, ReactiveStateConfig::Auto(config) if config.child_workflow.is_some())
+            && !has_child_workflow
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("state '{}' child_workflow must not be empty", state.id),
+            });
+        }
+
+        if has_child_workflow && !matches!(state.kind(), ReactiveStateKind::Auto) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "state '{}' child_workflow is only supported for auto states",
+                    state.id
+                ),
+            });
+        }
+
+        if matches!(state.kind(), ReactiveStateKind::Auto)
+            && !has_child_workflow
+            && !state
+                .on
+                .iter()
+                .any(|tr| tr.event.is_kind(ReactiveEventKind::Start))
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("auto state '{}' must define a 'start' transition", state.id),
+            });
+        }
+        if has_child_workflow
+            && !state.on.iter().any(|tr| {
+                tr.event.is_kind(ReactiveEventKind::AllChildrenCompleted)
+                    || tr.event.is_kind(ReactiveEventKind::ChildFailed)
+            })
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "state '{}' with child_workflow must define 'all_children_completed' and/or 'child_failed' transitions",
+                    state.id
+                ),
+            });
+        }
+        if matches!(state.kind(), ReactiveStateKind::Auto)
+            && !has_child_workflow
+            && state
+                .on
+                .iter()
+                .any(|tr| !tr.event.is_kind(ReactiveEventKind::Start))
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "auto state '{}' may only define 'start' transitions",
+                    state.id
+                ),
+            });
+        }
+        if matches!(state.kind(), ReactiveStateKind::Terminal) && !state.on.is_empty() {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("terminal state '{}' must not define transitions", state.id),
+            });
+        }
+        let terminal_outcome = match &state.config {
+            ReactiveStateConfig::Terminal(config) => config.terminal_outcome.as_ref(),
+            _ => None,
+        };
+        if !matches!(state.kind(), ReactiveStateKind::Terminal) && terminal_outcome.is_some() {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "state '{}' kind '{}' must not define terminal_outcome",
+                    state.id,
+                    state.kind()
+                ),
+            });
+        }
+
+        let mut seen_events = HashSet::new();
+        for tr in &state.on {
+            let event_kind = tr.event.kind();
+            if !seen_events.insert(event_kind.clone()) {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' defines duplicate transition event '{}'",
+                        state.id, event_kind
+                    ),
+                });
+            }
+
+            if event_kind == ReactiveEventKind::Cancel {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' must not define explicit 'cancel' transition (cancel is implicit)",
+                        state.id
+                    ),
+                });
+                continue;
+            }
+
+            let event_allowed_for_state_kind = match state.kind() {
+                ReactiveStateKind::Auto => {
+                    if has_child_workflow {
+                        event_kind == ReactiveEventKind::AllChildrenCompleted
+                            || event_kind == ReactiveEventKind::ChildFailed
+                    } else {
+                        event_kind == ReactiveEventKind::Start
+                    }
+                }
+                ReactiveStateKind::Agent => {
+                    event_kind == ReactiveEventKind::JobSucceeded
+                        || event_kind == ReactiveEventKind::JobFailed
+                        || event_kind == ReactiveEventKind::Timeout
+                        // CI-triage outcome events: the triage step (whether
+                        // command-stub or future agent) selects one of these
+                        // in its `next_event` to route the workflow.
+                        || event_kind == ReactiveEventKind::CiFailureTrivial
+                        || event_kind == ReactiveEventKind::CiFailureEscalate
+                }
+                ReactiveStateKind::Command | ReactiveStateKind::Managed => {
+                    event_kind == ReactiveEventKind::JobSucceeded
+                        || event_kind == ReactiveEventKind::JobFailed
+                        || event_kind == ReactiveEventKind::Timeout
+                        || event_kind == ReactiveEventKind::CiFailureTrivial
+                        || event_kind == ReactiveEventKind::CiFailureEscalate
+                }
+                ReactiveStateKind::Human => {
+                    event_kind == ReactiveEventKind::Submit
+                        || event_kind == ReactiveEventKind::TaskCreated
+                        || event_kind == ReactiveEventKind::TaskUpdated
+                        || event_kind == ReactiveEventKind::CommentAdded
+                        || event_kind == ReactiveEventKind::LabelChanged
+                        || event_kind == ReactiveEventKind::HumanApproved
+                        || event_kind == ReactiveEventKind::HumanChangesRequested
+                        || event_kind == ReactiveEventKind::HumanUnblocked
+                        || event_kind == ReactiveEventKind::RetryRequested
+                        || event_kind == ReactiveEventKind::PrCreated
+                        || event_kind == ReactiveEventKind::PrApproved
+                        || event_kind == ReactiveEventKind::PrChangesRequested
+                        || event_kind == ReactiveEventKind::OwnerPrApproved
+                        || event_kind == ReactiveEventKind::OwnerChangesRequested
+                        || event_kind == ReactiveEventKind::CoworkerPrApproved
+                        || event_kind == ReactiveEventKind::CoworkerChangesRequested
+                        || event_kind == ReactiveEventKind::PrMerged
+                        || event_kind == ReactiveEventKind::ChecksPassed
+                        || event_kind == ReactiveEventKind::ChecksFailed
+                        // Allow human states to declare their own
+                        // escalation transition. The state-level
+                        // `timeout_secs` field on `ReactiveHumanStateConfig`
+                        // is the producer; without a `timeout` transition
+                        // the orchestrator simply doesn't fire it.
+                        || event_kind == ReactiveEventKind::Timeout
+                }
+                ReactiveStateKind::Terminal => false,
+            };
+            if !event_allowed_for_state_kind {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' kind '{}' does not allow transition event '{}'",
+                        state.id,
+                        state.kind(),
+                        event_kind
+                    ),
+                });
+            }
+        }
+        for tr in &state.on {
+            if tr.target.trim().is_empty() {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!("state '{}' has empty transition target", state.id),
+                });
+            }
+        }
+    }
+
+    if !ids.contains(&def.initial_state) {
+        errors.push(WorkflowValidationError {
+            workflow_id: def.id.clone(),
+            message: format!("initial_state '{}' does not exist", def.initial_state),
+        });
+    }
+
+    for state in &def.states {
+        for tr in &state.on {
+            if !ids.contains(&tr.target) {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' transition target '{}' does not exist",
+                        state.id, tr.target
+                    ),
+                });
+            }
+        }
+    }
+
+    // Semantic reachability checks.
+    let state_map = def
+        .states
+        .iter()
+        .map(|state| (state.id.as_str(), state))
+        .collect::<HashMap<_, _>>();
+    let mut transition_graph = HashMap::<&str, Vec<&str>>::new();
+    for state in &def.states {
+        let mut next_states = Vec::new();
+        for tr in &state.on {
+            if ids.contains(&tr.target) {
+                next_states.push(tr.target.as_str());
+            }
+        }
+        transition_graph.insert(state.id.as_str(), next_states);
+    }
+
+    let mut reachable = HashSet::<&str>::new();
+    if ids.contains(&def.initial_state) {
+        let mut queue = VecDeque::from([def.initial_state.as_str()]);
+        while let Some(current) = queue.pop_front() {
+            if !reachable.insert(current) {
+                continue;
+            }
+            if let Some(next_states) = transition_graph.get(current) {
+                for next in next_states {
+                    if !reachable.contains(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+
+        let has_reachable_terminal = reachable.iter().any(|state_id| {
+            state_map
+                .get(state_id)
+                .is_some_and(|state| matches!(state.kind(), ReactiveStateKind::Terminal))
+        });
+        if !has_reachable_terminal {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "no terminal state reachable from initial state '{}'",
+                    def.initial_state
+                ),
+            });
+        }
+
+        for state in &def.states {
+            if state.id != def.initial_state && !reachable.contains(state.id.as_str()) {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "warning: state '{}' is unreachable from initial state '{}'",
+                        state.id, def.initial_state
+                    ),
+                });
+            }
+        }
+    }
+
+    WorkflowValidationReport { errors }
+}
+
+pub fn validate_reactive_workflows(
+    defs: &[ReactiveWorkflowDefinition],
+    legacy_defs: &[WorkflowDefinition],
+) -> WorkflowValidationReport {
+    let mut errors = Vec::new();
+    let mut ids = HashSet::new();
+    let mut all_catalog_ids = legacy_defs
+        .iter()
+        .map(|d| d.id.as_str())
+        .collect::<HashSet<_>>();
+    for def in defs {
+        all_catalog_ids.insert(def.id.as_str());
+    }
+    for def in defs {
+        if !ids.insert(def.id.clone()) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("duplicate reactive workflow id '{}'", def.id),
+            });
+        }
+        errors.extend(validate_reactive_workflow(def).errors);
+        for state in &def.states {
+            let child_workflow_ref = match &state.config {
+                ReactiveStateConfig::Auto(config) => config.child_workflow.as_deref(),
+                _ => None,
+            };
+            let Some(child_workflow) = child_workflow_ref.map(str::trim).filter(|v| !v.is_empty())
+            else {
+                continue;
+            };
+            if !all_catalog_ids.contains(child_workflow) {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' references unknown child workflow '{}'",
+                        state.id, child_workflow
+                    ),
+                });
+            }
+            if child_workflow == def.id {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' child workflow must not reference itself",
+                        state.id
+                    ),
+                });
+            }
+        }
+    }
+    WorkflowValidationReport { errors }
+}
+
+pub fn validate_workflow_document(doc: &WorkflowDocument) -> WorkflowValidationReport {
+    match doc {
+        WorkflowDocument::LegacyV1 { workflow } => validate_workflow(workflow),
+        WorkflowDocument::ReactiveV2 { workflow } => validate_reactive_workflow(workflow),
+    }
+}
+
+pub fn validate_workflow(def: &WorkflowDefinition) -> WorkflowValidationReport {
+    let mut errors = Vec::new();
+    let mut ids = HashSet::new();
+    for step in &def.steps {
+        if step.id.trim().is_empty() {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: "step id must not be empty".to_string(),
+            });
+            continue;
+        }
+        if !ids.insert(step.id.clone()) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("duplicate step id '{}'", step.id),
+            });
+        }
+        if step.id.contains('.') {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "step '{}' must not contain '.' (reserved by dot-path interpolation aliases)",
+                    step.id
+                ),
+            });
+        }
+        if let Some(prompt) = &step.prompt
+            && prompt.user.trim().is_empty()
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("step '{}' has empty user prompt reference", step.id),
+            });
+        }
+        if step.kind == WorkflowStepKind::Agent && step.command.trim().is_empty() {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("step '{}' command must not be empty", step.id),
+            });
+        }
+        if step.kind == WorkflowStepKind::ChildWorkflow {
+            let child = step
+                .child_workflow_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            if child.is_empty() {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "step '{}' child_workflow_id must be set for child_workflow kind",
+                        step.id
+                    ),
+                });
+            }
+        }
+        if let Some(image) = &step.container_image
+            && image.trim().is_empty()
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("step '{}' has empty container_image", step.id),
+            });
+        }
+        if let Some(timeout_secs) = step.timeout_secs
+            && timeout_secs == 0
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("step '{}' timeout_secs must be > 0", step.id),
+            });
+        }
+    }
+
+    if !ids.contains(&def.entry_step) {
+        errors.push(WorkflowValidationError {
+            workflow_id: def.id.clone(),
+            message: format!("entry_step '{}' does not exist", def.entry_step),
+        });
+    }
+
+    for step in &def.steps {
+        if let Some(next) = &step.on_success
+            && !ids.contains(next)
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("step '{}' on_success '{}' does not exist", step.id, next),
+            });
+        }
+        if let Some(next) = &step.on_failure
+            && !ids.contains(next)
+        {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("step '{}' on_failure '{}' does not exist", step.id, next),
+            });
+        }
+    }
+
+    let step_map = def
+        .steps
+        .iter()
+        .map(|step| (step.id.as_str(), step))
+        .collect::<HashMap<_, _>>();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for step in &def.steps {
+        if has_cycle(step.id.as_str(), &step_map, &mut visiting, &mut visited) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "workflow contains a cycle reachable from step '{}'",
+                    step.id
+                ),
+            });
+            break;
+        }
+    }
+
+    WorkflowValidationReport { errors }
+}
+
+fn has_cycle<'a>(
+    step_id: &'a str,
+    step_map: &HashMap<&'a str, &'a WorkflowStep>,
+    visiting: &mut HashSet<&'a str>,
+    visited: &mut HashSet<&'a str>,
+) -> bool {
+    if visited.contains(step_id) {
+        return false;
+    }
+    if !visiting.insert(step_id) {
+        return true;
+    }
+
+    let has_cycle = step_map
+        .get(step_id)
+        .into_iter()
+        .flat_map(|step| [step.on_success.as_deref(), step.on_failure.as_deref()])
+        .flatten()
+        .any(|next| has_cycle(next, step_map, visiting, visited));
+
+    visiting.remove(step_id);
+    visited.insert(step_id);
+    has_cycle
+}
+
+pub fn validate_workflows(defs: &[WorkflowDefinition]) -> WorkflowValidationReport {
+    let mut errors = Vec::new();
+    let mut workflow_ids = HashSet::new();
+    for def in defs {
+        if def.id.trim().is_empty() {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: "workflow id must not be empty".to_string(),
+            });
+            continue;
+        }
+        if !workflow_ids.insert(def.id.clone()) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("duplicate workflow id '{}'", def.id),
+            });
+        }
+        errors.extend(validate_workflow(def).errors);
+    }
+    let ids = defs.iter().map(|d| d.id.as_str()).collect::<HashSet<_>>();
+    let mut child_edges = HashMap::<&str, Vec<&str>>::new();
+    for def in defs {
+        for step in &def.steps {
+            if step.kind != WorkflowStepKind::ChildWorkflow {
+                continue;
+            }
+            if let Some(child_id) = step.child_workflow_id.as_deref() {
+                if !ids.contains(child_id) {
+                    errors.push(WorkflowValidationError {
+                        workflow_id: def.id.clone(),
+                        message: format!(
+                            "step '{}' references unknown child workflow '{}'",
+                            step.id, child_id
+                        ),
+                    });
+                }
+                if child_id == def.id {
+                    errors.push(WorkflowValidationError {
+                        workflow_id: def.id.clone(),
+                        message: format!(
+                            "step '{}' child workflow must not reference itself",
+                            step.id
+                        ),
+                    });
+                }
+                child_edges
+                    .entry(def.id.as_str())
+                    .or_default()
+                    .push(child_id);
+            }
+        }
+    }
+
+    // Reject nested child workflows: a workflow referenced as child may not itself contain child steps.
+    for (parent_id, children) in &child_edges {
+        for child_id in children {
+            if let Some(child_def) = defs.iter().find(|d| d.id == *child_id)
+                && child_def
+                    .steps
+                    .iter()
+                    .any(|s| s.kind == WorkflowStepKind::ChildWorkflow)
+            {
+                errors.push(WorkflowValidationError {
+                    workflow_id: (*parent_id).to_string(),
+                    message: format!(
+                        "workflow '{}' references child workflow '{}' which itself contains child_workflow steps (nested child workflows not supported)",
+                        parent_id, child_id
+                    ),
+                });
+            }
+        }
+    }
+
+    // Cross-workflow cycle detection for child-workflow references (A -> B -> ... -> A).
+    let mut visiting = HashSet::<&str>::new();
+    let mut visited = HashSet::<&str>::new();
+    for def in defs {
+        if has_child_cycle(def.id.as_str(), &child_edges, &mut visiting, &mut visited) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!(
+                    "child workflow reference cycle detected starting at '{}'",
+                    def.id
+                ),
+            });
+        }
+    }
+    WorkflowValidationReport { errors }
+}
+
+fn has_child_cycle<'a>(
+    id: &'a str,
+    edges: &HashMap<&'a str, Vec<&'a str>>,
+    visiting: &mut HashSet<&'a str>,
+    visited: &mut HashSet<&'a str>,
+) -> bool {
+    if visited.contains(id) {
+        return false;
+    }
+    if !visiting.insert(id) {
+        return true;
+    }
+
+    let has_cycle = edges
+        .get(id)
+        .into_iter()
+        .flatten()
+        .any(|next| has_child_cycle(next, edges, visiting, visited));
+
+    visiting.remove(id);
+    visited.insert(id);
+    has_cycle
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkItem {
+    pub id: Uuid,
+    pub workflow_id: String,
+    #[serde(default)]
+    pub external_task_id: Option<String>,
+    #[serde(default)]
+    pub external_task_source: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    pub session_id: Option<SessionId>,
+    pub current_step: String,
+    #[serde(default)]
+    pub projected_state: Option<String>,
+    #[serde(default)]
+    pub last_failure_reason: Option<String>,
+    #[serde(default)]
+    pub required_action_description: Option<String>,
+    #[serde(default)]
+    pub triage_status: Option<String>,
+    #[serde(default)]
+    pub human_gate: bool,
+    #[serde(default)]
+    pub human_gate_state: Option<String>,
+    #[serde(default)]
+    pub blocked_on: Option<BlockReason>,
+    pub state: WorkItemState,
+    #[serde(default)]
+    pub context: serde_json::Value,
+    #[serde(default)]
+    pub repo: Option<RepoSource>,
+    #[serde(default)]
+    pub parent_work_item_id: Option<Uuid>,
+    #[serde(default)]
+    pub parent_step_id: Option<String>,
+    #[serde(default)]
+    pub child_work_item_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_written_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub write_back_failures: u32,
+    #[serde(default)]
+    pub write_back_retry_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub status_comment_id: Option<i64>,
+    #[serde(default)]
+    pub checkpoint_comment_id: Option<i64>,
+    #[serde(default)]
+    pub job_result_comment_ids: HashMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Job {
+    pub id: Uuid,
+    pub work_item_id: Uuid,
+    pub step_id: String,
+    pub state: JobState,
+    pub assigned_worker_id: Option<String>,
+    pub execution_mode: ExecutionMode,
+    #[serde(default)]
+    pub container_image: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub prompt: Option<PromptRef>,
+    #[serde(default)]
+    pub context: serde_json::Value,
+    #[serde(default)]
+    pub repo: Option<RepoSource>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_retries: u32,
+    pub attempt: u32,
+    pub transcript_dir: Option<String>,
+    #[serde(default)]
+    pub result: Option<JobResult>,
+    #[serde(default)]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkerInfo {
+    pub id: String,
+    pub hostname: String,
+    pub state: WorkerState,
+    #[serde(default)]
+    pub supported_modes: Vec<ExecutionMode>,
+    pub last_heartbeat_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CreateWorkItemRequest {
+    pub workflow_id: String,
+    pub session_id: Option<SessionId>,
+    #[serde(default)]
+    pub context: serde_json::Value,
+    #[serde(default)]
+    pub repo: Option<RepoSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FireEventRequest {
+    pub event: WorkflowEventKind,
+    pub job_id: Option<Uuid>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RegisterWorkerRequest {
+    pub id: String,
+    pub hostname: String,
+    #[serde(default)]
+    pub supported_modes: Vec<ExecutionMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeartbeatRequest {
+    pub state: WorkerState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PollJobRequest {
+    pub worker_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PollJobResponse {
+    pub job: Option<Job>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct JobUpdateRequest {
+    pub worker_id: String,
+    pub state: JobState,
+    pub transcript_dir: Option<String>,
+    #[serde(default)]
+    pub result: Option<JobResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct JobResult {
+    pub outcome: ExecutionOutcome,
+    pub termination_reason: TerminationReason,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    pub timing: ExecutionTiming,
+    pub artifacts: ArtifactSummary,
+    #[serde(default)]
+    pub output_json: Option<serde_json::Value>,
+    #[serde(default)]
+    pub repo: Option<RepoExecutionMetadata>,
+    #[serde(default)]
+    pub github_pr: Option<GithubPullRequestMetadata>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+/// Typed contract for agent output (output.json).
+/// Agents MAY include any of these fields. All are optional for backward compat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentOutput {
+    /// The workflow event the agent wants to fire (must be in valid_next_events)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_event: Option<String>,
+
+    /// Human-readable summary of what the agent did
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+
+    /// Structured key-value outputs for downstream steps
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// GitHub PR metadata if a PR was created/updated
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_pr: Option<AgentOutputGitHubPr>,
+
+    /// Repository selection/discovery for downstream workflow steps
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoSource>,
+
+    /// Environment selection/discovery for downstream workflow steps
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentSelection>,
+
+    /// Error details if the agent encountered an error
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AgentOutputError>,
+
+    /// Catch-all for additional untyped fields (forward compat)
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentOutputGitHubPr {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentOutputError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PromptBundle {
+    pub system_path: Option<String>,
+    pub user_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PlannedPermissionSet {
+    pub tier: PlannedPermissionTier,
+    #[serde(default)]
+    pub can_read_workspace: bool,
+    #[serde(default)]
+    pub can_write_workspace: bool,
+    #[serde(default)]
+    pub can_run_shell: bool,
+    #[serde(default)]
+    pub can_access_network: bool,
+    #[serde(default)]
+    pub auto_approve_tools: Vec<String>,
+    #[serde(default)]
+    pub escalate_tools: Vec<String>,
+    #[serde(default)]
+    pub kubernetes_access: Option<String>,
+    #[serde(default)]
+    pub aws_access: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedPermissionTier {
+    DockerDefault,
+    RawCompatible,
+    KubernetesStub,
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum NetworkResourceKind {
+    Llm,
+    Github,
+    GoRegistry,
+    CratesRegistry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkResourceRequest {
+    None,
+    Full,
+    Resources(Vec<NetworkResourceKind>),
+}
+
+impl NetworkResourceRequest {
+    pub fn resources(&self) -> Vec<NetworkResourceKind> {
+        match self {
+            Self::None | Self::Full => Vec::new(),
+            Self::Resources(resources) => {
+                let mut deduped = resources.clone();
+                deduped.sort_by_key(|a| a.to_string());
+                deduped.dedup();
+                deduped
+            }
+        }
+    }
+}
+
+pub fn network_request_from_legacy_label(label: Option<&str>) -> Option<NetworkResourceRequest> {
+    match label {
+        Some("none") => Some(NetworkResourceRequest::None),
+        Some("full") => Some(NetworkResourceRequest::Full),
+        Some("restricted") => Some(NetworkResourceRequest::Resources(vec![
+            NetworkResourceKind::Llm,
+            NetworkResourceKind::Github,
+            NetworkResourceKind::GoRegistry,
+            NetworkResourceKind::CratesRegistry,
+        ])),
+        _ => None,
+    }
+}
+
+pub fn legacy_network_label_for_request(
+    request: Option<&NetworkResourceRequest>,
+) -> Option<String> {
+    match request {
+        Some(NetworkResourceRequest::None) => Some("none".to_string()),
+        Some(NetworkResourceRequest::Full) => Some("full".to_string()),
+        Some(NetworkResourceRequest::Resources(_)) => Some("restricted".to_string()),
+        None => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PlannedEnvironmentSpec {
+    pub tier: PlannedEnvironmentTier,
+    pub execution_mode: ExecutionMode,
+    #[serde(default)]
+    pub container_image: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64_lenient")]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub memory_limit: Option<String>,
+    #[serde(default)]
+    pub cpu_limit: Option<String>,
+    #[serde(default)]
+    pub network: Option<String>,
+    #[serde(default)]
+    pub network_resources: Option<NetworkResourceRequest>,
+    #[serde(default)]
+    pub filesystem: Option<String>,
+    #[serde(default)]
+    pub file_mounts: Vec<PlannedFileMount>,
+    #[serde(default)]
+    pub toolchains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PlannedFileMount {
+    pub host_path: String,
+    pub container_path: String,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedEnvironmentTier {
+    Docker,
+    Raw,
+    Kubernetes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct PlannedRepoClaim {
+    pub repo_url: String,
+    pub base_ref: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub target_branch: Option<String>,
+    #[serde(default)]
+    pub claim_type: String,
+    #[serde(default)]
+    pub branch_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlannedWorkItemView {
+    pub id: Uuid,
+    pub workflow_id: String,
+    pub current_state_key: String,
+    pub prototype_state: WorkItemState,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    #[serde(default)]
+    pub context: serde_json::Value,
+    #[serde(default)]
+    pub repo_claim: Option<PlannedRepoClaim>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlannedAgentJobView {
+    pub id: Uuid,
+    pub work_item_id: Uuid,
+    pub state_key: String,
+    pub prototype_state: JobState,
+    #[serde(default)]
+    pub assigned_worker_id: Option<String>,
+    pub environment: PlannedEnvironmentSpec,
+    pub permission_set: PlannedPermissionSet,
+    #[serde(default)]
+    pub repo_claim: Option<PlannedRepoClaim>,
+    pub attempt: u32,
+    pub max_retries: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CanonicalRuntimeSpec {
+    #[serde(default = "default_runtime_version")]
+    pub runtime_version: String,
+    pub environment: PlannedEnvironmentSpec,
+    pub permissions: PlannedPermissionSet,
+    #[serde(default)]
+    pub approval_rules: Option<ApprovalRuleSet>,
+    #[serde(default)]
+    pub repos: Vec<PlannedRepoClaim>,
+}
+
+fn default_runtime_version() -> String {
+    "v2".to_string()
+}
+
+pub const CONTEXT_RUNTIME_SPEC_KEY: &str = "canonical_runtime_spec";
+pub const AGENT_CONTEXT_SCHEMA_NAME: &str = "agent_context_v1";
+pub const AGENT_CONTEXT_SCHEMA_VERSION: &str = "agent_context_v2";
+pub const AGENT_OUTPUT_SCHEMA_NAME: &str = "agent_output_v1";
+pub const JOB_RUN_SCHEMA_NAME: &str = "job_run_v1";
+
+/// Validate an AgentOutput's next_event against valid_next_events.
+/// Returns Ok(()) if next_event is None or is in the valid set.
+/// Returns Err with a message if next_event is set but not valid.
+pub fn validate_agent_output_next_event(
+    output: &AgentOutput,
+    valid_next_events: &[String],
+) -> Result<(), String> {
+    if let Some(ref event) = output.next_event
+        && !valid_next_events.is_empty()
+        && !valid_next_events.contains(event)
+    {
+        return Err(format!(
+            "next_event '{}' not in valid_next_events: {:?}",
+            event, valid_next_events
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentContext {
+    pub schema: String,
+    pub job: AgentContextJob,
+    pub paths: AgentContextPaths,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item: Option<serde_json::Value>,
+    pub workflow: AgentContextWorkflow,
+    pub artifacts: AgentContextArtifacts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<serde_json::Value>,
+    pub repos: AgentContextRepos,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PlannedPermissionSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_rules: Option<ApprovalRuleSet>,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub advisory: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentContextJob {
+    pub id: Uuid,
+    pub work_item_id: Option<Uuid>,
+    pub step_id: String,
+    pub attempt: u32,
+    pub max_retries: u32,
+    pub execution_mode: String,
+    pub timeout_secs: Option<u64>,
+    pub container_image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentContextPaths {
+    pub workspace_dir: String,
+    pub transcript_dir: String,
+    pub context_json: String,
+    pub agent_context_json: String,
+    pub output_json: String,
+    pub run_json: String,
+    pub transcript_jsonl: String,
+    pub job_events_jsonl: String,
+    pub stdout_log: String,
+    pub stderr_log: String,
+    pub prompt_user: String,
+    pub prompt_system: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentContextWorkflow {
+    pub inputs: serde_json::Value,
+    pub valid_next_events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentContextArtifacts {
+    pub paths: serde_json::Value,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentContextRepos {
+    pub primary: Option<serde_json::Value>,
+    #[serde(default)]
+    pub additional: Vec<serde_json::Value>,
+}
+
+pub fn canonical_environment_for_execution(
+    execution_mode: ExecutionMode,
+    container_image: Option<String>,
+    timeout_secs: Option<u64>,
+) -> PlannedEnvironmentSpec {
+    let tier = match execution_mode {
+        ExecutionMode::Docker => PlannedEnvironmentTier::Docker,
+        ExecutionMode::Raw => PlannedEnvironmentTier::Raw,
+    };
+    PlannedEnvironmentSpec {
+        tier,
+        execution_mode,
+        container_image,
+        timeout_secs,
+        memory_limit: None,
+        cpu_limit: None,
+        network: None,
+        network_resources: None,
+        filesystem: None,
+        file_mounts: Vec::new(),
+        toolchains: Vec::new(),
+    }
+}
+
+pub fn canonical_permissions_for_environment(
+    environment: &PlannedEnvironmentSpec,
+) -> PlannedPermissionSet {
+    match environment.tier {
+        PlannedEnvironmentTier::Docker => PlannedPermissionSet {
+            tier: PlannedPermissionTier::DockerDefault,
+            can_read_workspace: true,
+            can_write_workspace: true,
+            can_run_shell: true,
+            can_access_network: false,
+            auto_approve_tools: Vec::new(),
+            escalate_tools: Vec::new(),
+            kubernetes_access: Some("none".to_string()),
+            aws_access: Some("none".to_string()),
+        },
+        PlannedEnvironmentTier::Raw => PlannedPermissionSet {
+            tier: PlannedPermissionTier::RawCompatible,
+            can_read_workspace: true,
+            can_write_workspace: true,
+            can_run_shell: true,
+            can_access_network: true,
+            auto_approve_tools: Vec::new(),
+            escalate_tools: Vec::new(),
+            kubernetes_access: Some("none".to_string()),
+            aws_access: Some("none".to_string()),
+        },
+        PlannedEnvironmentTier::Kubernetes => PlannedPermissionSet {
+            tier: PlannedPermissionTier::KubernetesStub,
+            can_read_workspace: true,
+            can_write_workspace: false,
+            can_run_shell: false,
+            can_access_network: false,
+            auto_approve_tools: Vec::new(),
+            escalate_tools: Vec::new(),
+            kubernetes_access: Some("read_only".to_string()),
+            aws_access: Some("none".to_string()),
+        },
+    }
+}
+
+pub fn default_approval_rules_for_tier(
+    tier: &PlannedEnvironmentTier,
+    network: Option<&str>,
+) -> ApprovalRuleSet {
+    let all_tools = vec![
+        "file_read".to_string(),
+        "file_write".to_string(),
+        "shell_safe".to_string(),
+        "shell_unknown".to_string(),
+        "git".to_string(),
+        "network".to_string(),
+        "k8s_read".to_string(),
+        "k8s_write".to_string(),
+        "aws_read".to_string(),
+        "aws_write".to_string(),
+    ];
+
+    match tier {
+        PlannedEnvironmentTier::Kubernetes => ApprovalRuleSet {
+            auto_approve: all_tools,
+            escalate: Vec::new(),
+            deny: Vec::new(),
+        },
+        PlannedEnvironmentTier::Docker => {
+            let has_network = !matches!(network, None | Some("none"));
+            if has_network {
+                ApprovalRuleSet {
+                    auto_approve: vec![
+                        "file_read".to_string(),
+                        "file_write".to_string(),
+                        "shell_safe".to_string(),
+                        "git".to_string(),
+                        "network".to_string(),
+                    ],
+                    escalate: vec!["shell_unknown".to_string(), "k8s_read".to_string()],
+                    deny: vec!["k8s_write".to_string(), "aws_write".to_string()],
+                }
+            } else {
+                ApprovalRuleSet {
+                    auto_approve: vec![
+                        "file_read".to_string(),
+                        "file_write".to_string(),
+                        "shell_safe".to_string(),
+                        "git".to_string(),
+                    ],
+                    escalate: vec!["shell_unknown".to_string()],
+                    deny: Vec::new(),
+                }
+            }
+        }
+        PlannedEnvironmentTier::Raw => ApprovalRuleSet {
+            auto_approve: vec!["file_read".to_string(), "file_write".to_string()],
+            escalate: vec![
+                "shell_safe".to_string(),
+                "shell_unknown".to_string(),
+                "git".to_string(),
+                "network".to_string(),
+                "k8s_read".to_string(),
+                "k8s_write".to_string(),
+                "aws_read".to_string(),
+                "aws_write".to_string(),
+            ],
+            deny: Vec::new(),
+        },
+    }
+}
+
+pub fn canonical_runtime_spec_for_job(job: &Job) -> CanonicalRuntimeSpec {
+    let mut runtime = canonical_runtime_spec_from_legacy_job_fields(
+        job.execution_mode.clone(),
+        job.container_image.clone(),
+        job.timeout_secs,
+    );
+    if let Some(repo) = &job.repo {
+        runtime.repos.push(PlannedRepoClaim::from(repo));
+    }
+    runtime
+}
+
+pub fn canonical_runtime_spec_from_legacy_job_fields(
+    execution_mode: ExecutionMode,
+    container_image: Option<String>,
+    timeout_secs: Option<u64>,
+) -> CanonicalRuntimeSpec {
+    let environment =
+        canonical_environment_for_execution(execution_mode, container_image, timeout_secs);
+    let permissions = canonical_permissions_for_environment(&environment);
+    let network_label = environment
+        .network_resources
+        .as_ref()
+        .and_then(|request| legacy_network_label_for_request(Some(request)));
+    CanonicalRuntimeSpec {
+        runtime_version: default_runtime_version(),
+        approval_rules: Some(default_approval_rules_for_tier(
+            &environment.tier,
+            network_label.as_deref(),
+        )),
+        environment,
+        permissions,
+        repos: Vec::new(),
+    }
+}
+
+pub fn canonical_runtime_spec_for_job_effective(job: &Job) -> CanonicalRuntimeSpec {
+    runtime_spec_from_job_context(&job.context)
+        .unwrap_or_else(|| canonical_runtime_spec_for_job(job))
+}
+
+pub fn runtime_spec_from_job_context(context: &serde_json::Value) -> Option<CanonicalRuntimeSpec> {
+    context
+        .as_object()?
+        .get(CONTEXT_RUNTIME_SPEC_KEY)
+        .cloned()
+        .and_then(|v| serde_json::from_value::<CanonicalRuntimeSpec>(v).ok())
+}
+
+pub fn project_runtime_spec_into_job_context(
+    context: &mut serde_json::Value,
+    runtime: &CanonicalRuntimeSpec,
+) {
+    if !context.is_object() {
+        *context = serde_json::json!({});
+    }
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert(
+            CONTEXT_RUNTIME_SPEC_KEY.to_string(),
+            serde_json::to_value(runtime).unwrap_or(serde_json::Value::Null),
+        );
+    }
+}
+
+impl From<&RepoSource> for PlannedRepoClaim {
+    fn from(value: &RepoSource) -> Self {
+        Self {
+            repo_url: value.repo_url.clone(),
+            base_ref: value.base_ref.clone(),
+            read_only: false,
+            target_branch: value.branch_name.clone(),
+            claim_type: if value.branch_name.is_some() {
+                "existing_branch".to_string()
+            } else {
+                "read_only".to_string()
+            },
+            branch_name: value.branch_name.clone(),
+        }
+    }
+}
+
+pub fn planned_work_item_view_from_prototype(work_item: &WorkItem) -> PlannedWorkItemView {
+    PlannedWorkItemView {
+        id: work_item.id,
+        workflow_id: work_item.workflow_id.clone(),
+        current_state_key: work_item.current_step.clone(),
+        prototype_state: work_item.state.clone(),
+        session_id: work_item.session_id.clone(),
+        context: work_item.context.clone(),
+        repo_claim: work_item.repo.as_ref().map(PlannedRepoClaim::from),
+        created_at: work_item.created_at,
+        updated_at: work_item.updated_at,
+    }
+}
+
+pub fn planned_agent_job_view_from_prototype(job: &Job) -> PlannedAgentJobView {
+    let runtime = canonical_runtime_spec_for_job(job);
+    PlannedAgentJobView {
+        id: job.id,
+        work_item_id: job.work_item_id,
+        state_key: job.step_id.clone(),
+        prototype_state: job.state.clone(),
+        assigned_worker_id: job.assigned_worker_id.clone(),
+        environment: runtime.environment,
+        permission_set: runtime.permissions,
+        repo_claim: job.repo.as_ref().map(PlannedRepoClaim::from),
+        attempt: job.attempt,
+        max_retries: job.max_retries,
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_good_workflow() {
+        let def = WorkflowDefinition {
+            id: "basic".into(),
+            entry_step: "s1".into(),
+            steps: vec![WorkflowStep {
+                id: "s1".into(),
+                kind: WorkflowStepKind::Agent,
+                executor: ExecutionMode::Raw,
+                container_image: None,
+                child_workflow_id: None,
+                command: "echo".into(),
+                args: vec!["ok".into()],
+                env: HashMap::new(),
+                prompt: Some(PromptRef {
+                    system: None,
+                    user: "u.md".into(),
+                }),
+                timeout_secs: None,
+                max_retries: 0,
+                on_success: None,
+                on_failure: None,
+            }],
+        };
+
+        assert!(validate_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn parses_workflow_toml() {
+        let input = r#"
+[workflow]
+id = "wf1"
+entry_step = "s1"
+
+[[workflow.steps]]
+id = "s1"
+executor = "raw"
+command = "echo"
+args = ["hello"]
+"#;
+        let def = parse_workflow_toml(input).expect("valid toml");
+        assert_eq!(def.id, "wf1");
+        assert_eq!(def.steps.len(), 1);
+    }
+
+    #[test]
+    fn rejects_cycles() {
+        let def = WorkflowDefinition {
+            id: "cycle".into(),
+            entry_step: "a".into(),
+            steps: vec![
+                WorkflowStep {
+                    id: "a".into(),
+                    kind: WorkflowStepKind::Agent,
+                    executor: ExecutionMode::Raw,
+                    container_image: None,
+                    child_workflow_id: None,
+                    command: "echo".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: Some("b".into()),
+                    on_failure: None,
+                },
+                WorkflowStep {
+                    id: "b".into(),
+                    kind: WorkflowStepKind::Agent,
+                    executor: ExecutionMode::Docker,
+                    container_image: Some("alpine:3.20".into()),
+                    child_workflow_id: None,
+                    command: "echo".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: Some("a".into()),
+                    on_failure: None,
+                },
+            ],
+        };
+
+        assert!(!validate_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn rejects_zero_timeout() {
+        let def = WorkflowDefinition {
+            id: "bad_timeout".into(),
+            entry_step: "s1".into(),
+            steps: vec![WorkflowStep {
+                id: "s1".into(),
+                kind: WorkflowStepKind::Agent,
+                executor: ExecutionMode::Raw,
+                container_image: None,
+                child_workflow_id: None,
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+                prompt: None,
+                timeout_secs: Some(0),
+                max_retries: 0,
+                on_success: None,
+                on_failure: None,
+            }],
+        };
+        assert!(!validate_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn rejects_step_ids_with_dots() {
+        let def = WorkflowDefinition {
+            id: "bad_step_id".into(),
+            entry_step: "build.v1".into(),
+            steps: vec![WorkflowStep {
+                id: "build.v1".into(),
+                kind: WorkflowStepKind::Agent,
+                executor: ExecutionMode::Raw,
+                container_image: None,
+                child_workflow_id: None,
+                command: "echo".into(),
+                args: vec![],
+                env: HashMap::new(),
+                prompt: None,
+                timeout_secs: None,
+                max_retries: 0,
+                on_success: None,
+                on_failure: None,
+            }],
+        };
+
+        assert!(!validate_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn validates_child_workflow_reference() {
+        let defs = vec![
+            WorkflowDefinition {
+                id: "parent".into(),
+                entry_step: "invoke_child".into(),
+                steps: vec![WorkflowStep {
+                    id: "invoke_child".into(),
+                    kind: WorkflowStepKind::ChildWorkflow,
+                    executor: ExecutionMode::Raw,
+                    container_image: None,
+                    child_workflow_id: Some("child".into()),
+                    command: String::new(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: None,
+                    on_failure: None,
+                }],
+            },
+            WorkflowDefinition {
+                id: "child".into(),
+                entry_step: "run".into(),
+                steps: vec![WorkflowStep {
+                    id: "run".into(),
+                    kind: WorkflowStepKind::Agent,
+                    executor: ExecutionMode::Raw,
+                    container_image: None,
+                    child_workflow_id: None,
+                    command: "echo".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: None,
+                    on_failure: None,
+                }],
+            },
+        ];
+        assert!(validate_workflows(&defs).is_valid());
+    }
+
+    #[test]
+    fn rejects_cross_workflow_child_cycle() {
+        let defs = vec![
+            WorkflowDefinition {
+                id: "a".into(),
+                entry_step: "s".into(),
+                steps: vec![WorkflowStep {
+                    id: "s".into(),
+                    kind: WorkflowStepKind::ChildWorkflow,
+                    executor: ExecutionMode::Raw,
+                    container_image: None,
+                    child_workflow_id: Some("b".into()),
+                    command: String::new(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: None,
+                    on_failure: None,
+                }],
+            },
+            WorkflowDefinition {
+                id: "b".into(),
+                entry_step: "s".into(),
+                steps: vec![WorkflowStep {
+                    id: "s".into(),
+                    kind: WorkflowStepKind::ChildWorkflow,
+                    executor: ExecutionMode::Raw,
+                    container_image: None,
+                    child_workflow_id: Some("a".into()),
+                    command: String::new(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: None,
+                    on_failure: None,
+                }],
+            },
+        ];
+        assert!(!validate_workflows(&defs).is_valid());
+    }
+
+    #[test]
+    fn rejects_nested_child_workflow() {
+        let defs = vec![
+            WorkflowDefinition {
+                id: "parent".into(),
+                entry_step: "child".into(),
+                steps: vec![WorkflowStep {
+                    id: "child".into(),
+                    kind: WorkflowStepKind::ChildWorkflow,
+                    executor: ExecutionMode::Raw,
+                    container_image: None,
+                    child_workflow_id: Some("mid".into()),
+                    command: String::new(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: None,
+                    on_failure: None,
+                }],
+            },
+            WorkflowDefinition {
+                id: "mid".into(),
+                entry_step: "nested".into(),
+                steps: vec![WorkflowStep {
+                    id: "nested".into(),
+                    kind: WorkflowStepKind::ChildWorkflow,
+                    executor: ExecutionMode::Raw,
+                    container_image: None,
+                    child_workflow_id: Some("leaf".into()),
+                    command: String::new(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: None,
+                    on_failure: None,
+                }],
+            },
+            WorkflowDefinition {
+                id: "leaf".into(),
+                entry_step: "run".into(),
+                steps: vec![WorkflowStep {
+                    id: "run".into(),
+                    kind: WorkflowStepKind::Agent,
+                    executor: ExecutionMode::Raw,
+                    container_image: None,
+                    child_workflow_id: None,
+                    command: "echo".into(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    prompt: None,
+                    timeout_secs: None,
+                    max_retries: 0,
+                    on_success: None,
+                    on_failure: None,
+                }],
+            },
+        ];
+        assert!(!validate_workflows(&defs).is_valid());
+    }
+
+    #[test]
+    fn parses_reactive_workflow_document() {
+        let input = r#"
+[workflow]
+id = "reactive_demo"
+schema = "reactive_v2"
+initial_state = "draft"
+
+[[workflow.states]]
+id = "draft"
+kind = "human"
+
+[[workflow.states.on]]
+event = "submit"
+target = "running"
+
+[[workflow.states]]
+id = "running"
+kind = "auto"
+
+[[workflow.states.on]]
+event = "start"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+
+        let doc = parse_workflow_toml_document(input).expect("parse");
+        match doc {
+            WorkflowDocument::ReactiveV2 { workflow } => {
+                assert_eq!(workflow.id, "reactive_demo");
+                assert!(validate_reactive_workflow(&workflow).is_valid());
+            }
+            _ => panic!("expected reactive workflow"),
+        }
+    }
+
+    #[test]
+    fn reactive_transition_event_uses_only_canonical_names_on_deserialize() {
+        let typed: ReactiveTransitionEvent =
+            serde_json::from_str("\"start\"").expect("canonical event");
+        assert_eq!(typed.kind(), ReactiveEventKind::Start);
+        assert!(typed.is_kind(ReactiveEventKind::Start));
+
+        let submit: ReactiveTransitionEvent =
+            serde_json::from_str("\"submit\"").expect("submit event");
+        assert_eq!(submit.kind(), ReactiveEventKind::Submit);
+
+        let serialized = serde_json::to_string(&submit).expect("serialize canonical");
+        assert_eq!(serialized, "\"submit\"");
+    }
+
+    #[test]
+    fn reactive_transition_event_rejects_legacy_aliases_on_deserialize() {
+        let err = serde_json::from_str::<ReactiveTransitionEvent>("\"retry\"")
+            .expect_err("legacy alias should fail parse");
+        assert!(
+            err.to_string()
+                .contains("unknown reactive transition event 'retry'")
+        );
+    }
+
+    #[test]
+    fn reactive_transition_event_rejects_unknown_strings_on_deserialize() {
+        let err = serde_json::from_str::<ReactiveTransitionEvent>("\"totally_unknown\"")
+            .expect_err("unknown transition event must fail at parse boundary");
+        assert!(
+            err.to_string()
+                .contains("unknown reactive transition event")
+        );
+    }
+
+    #[test]
+    fn reactive_event_kind_is_unified_with_workflow_event_kind() {
+        let workflow_event = WorkflowEventKind::ChildFailed;
+        let reactive_event: ReactiveEventKind =
+            reactive_event_kind_for_workflow_event(workflow_event.clone());
+        assert_eq!(reactive_event, WorkflowEventKind::ChildFailed);
+        assert_eq!(
+            reactive_event_kind_from_str("child_failed"),
+            Some(workflow_event)
+        );
+    }
+
+    #[test]
+    fn classifies_external_vs_internal_workflow_events() {
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::Submit
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::TaskCreated
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::TaskUpdated
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::CommentAdded
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::LabelChanged
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::HumanApproved
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::HumanChangesRequested
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::HumanUnblocked
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::RetryRequested
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::PrCreated
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::PrApproved
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::PrChangesRequested
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::OwnerPrApproved
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::OwnerChangesRequested
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::CoworkerPrApproved
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::CoworkerChangesRequested
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::PrMerged
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::ChecksPassed
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::ChecksFailed
+        ));
+        assert!(workflow_event_is_externally_fireable(
+            &WorkflowEventKind::Cancel
+        ));
+
+        assert!(workflow_event_is_internal_system_only(
+            &WorkflowEventKind::WorkflowChosen
+        ));
+        assert!(workflow_event_is_internal_system_only(
+            &WorkflowEventKind::JobSucceeded
+        ));
+        assert!(workflow_event_is_internal_system_only(
+            &WorkflowEventKind::Start
+        ));
+        assert!(workflow_event_is_internal_system_only(
+            &WorkflowEventKind::Timeout
+        ));
+    }
+
+    #[test]
+    fn runtime_spec_roundtrip_via_job_context_projection() {
+        let runtime = CanonicalRuntimeSpec {
+            runtime_version: default_runtime_version(),
+            environment: PlannedEnvironmentSpec {
+                tier: PlannedEnvironmentTier::Docker,
+                execution_mode: ExecutionMode::Docker,
+                container_image: Some("alpine:3.20".into()),
+                timeout_secs: Some(45),
+                memory_limit: None,
+                cpu_limit: None,
+                network: None,
+                network_resources: None,
+                filesystem: None,
+                file_mounts: vec![],
+                toolchains: vec![],
+            },
+            permissions: PlannedPermissionSet {
+                tier: PlannedPermissionTier::DockerDefault,
+                can_read_workspace: true,
+                can_write_workspace: true,
+                can_run_shell: true,
+                can_access_network: false,
+                auto_approve_tools: vec![],
+                escalate_tools: vec![],
+                kubernetes_access: None,
+                aws_access: None,
+            },
+            approval_rules: None,
+            repos: vec![],
+        };
+
+        let mut ctx = serde_json::json!({"k": "v"});
+        project_runtime_spec_into_job_context(&mut ctx, &runtime);
+        let decoded = runtime_spec_from_job_context(&ctx).expect("runtime spec in context");
+        assert_eq!(decoded, runtime);
+    }
+
+    #[test]
+    fn reactive_human_states_allow_role_aware_pr_events() {
+        let input = r#"
+[workflow]
+id = "reactive_role_review"
+schema = "reactive_v2"
+initial_state = "await_review"
+
+[[workflow.states]]
+id = "await_review"
+kind = "human"
+
+[[workflow.states.on]]
+event = "owner_pr_approved"
+target = "done"
+
+[[workflow.states.on]]
+event = "owner_changes_requested"
+target = "done"
+
+[[workflow.states.on]]
+event = "coworker_pr_approved"
+target = "done"
+
+[[workflow.states.on]]
+event = "coworker_changes_requested"
+target = "done"
+
+[[workflow.states.on]]
+event = "pr_changes_requested"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+
+        let doc = parse_workflow_toml_document(input).expect("parse role-aware workflow");
+        let workflow = match doc {
+            WorkflowDocument::ReactiveV2 { workflow } => workflow,
+            WorkflowDocument::LegacyV1 { .. } => panic!("expected reactive workflow"),
+        };
+        assert!(
+            validate_reactive_workflow(&workflow).is_valid(),
+            "role-aware review events should be valid for human states"
+        );
+    }
+
+    #[test]
+    fn canonical_runtime_spec_for_job_effective_prefers_context() {
+        let now = Utc::now();
+        let mut job = Job {
+            id: Uuid::new_v4(),
+            work_item_id: Uuid::new_v4(),
+            step_id: "s1".into(),
+            state: JobState::Pending,
+            assigned_worker_id: None,
+            execution_mode: ExecutionMode::Raw,
+            container_image: None,
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: Some(5),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let from_context = CanonicalRuntimeSpec {
+            runtime_version: default_runtime_version(),
+            environment: PlannedEnvironmentSpec {
+                tier: PlannedEnvironmentTier::Docker,
+                execution_mode: ExecutionMode::Docker,
+                container_image: Some("alpine:3.20".into()),
+                timeout_secs: Some(42),
+                memory_limit: None,
+                cpu_limit: None,
+                network: None,
+                network_resources: None,
+                filesystem: None,
+                file_mounts: vec![],
+                toolchains: vec![],
+            },
+            permissions: PlannedPermissionSet {
+                tier: PlannedPermissionTier::DockerDefault,
+                can_read_workspace: true,
+                can_write_workspace: true,
+                can_run_shell: true,
+                can_access_network: false,
+                auto_approve_tools: vec![],
+                escalate_tools: vec![],
+                kubernetes_access: None,
+                aws_access: None,
+            },
+            approval_rules: None,
+            repos: vec![],
+        };
+        project_runtime_spec_into_job_context(&mut job.context, &from_context);
+        let effective = canonical_runtime_spec_for_job_effective(&job);
+        assert_eq!(effective, from_context);
+    }
+
+    fn exec_with_mode(mode: ExecutionMode) -> ReactiveExecutionConfig {
+        ReactiveExecutionConfig {
+            executor: Some(mode),
+            ..Default::default()
+        }
+    }
+
+    fn auto_state(id: &str, target: &str) -> ReactiveWorkflowState {
+        ReactiveWorkflowState {
+            id: id.to_string(),
+            auto_merge: false,
+            config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig::default()),
+            on: vec![ReactiveWorkflowTransition {
+                event: ReactiveEventKind::Start.into(),
+                target: target.to_string(),
+            }],
+        }
+    }
+
+    fn agent_state(id: &str, next: &str) -> ReactiveWorkflowState {
+        ReactiveWorkflowState {
+            id: id.to_string(),
+            auto_merge: false,
+            config: ReactiveStateConfig::Agent(ReactiveAgentStateConfig {
+                execution: exec_with_mode(ExecutionMode::Raw),
+                prompt: None,
+            }),
+            on: vec![ReactiveWorkflowTransition {
+                event: ReactiveEventKind::JobSucceeded.into(),
+                target: next.to_string(),
+            }],
+        }
+    }
+
+    fn terminal_state(id: &str) -> ReactiveWorkflowState {
+        ReactiveWorkflowState {
+            id: id.to_string(),
+            auto_merge: false,
+            config: ReactiveStateConfig::Terminal(ReactiveTerminalStateConfig::default()),
+            on: vec![],
+        }
+    }
+
+    #[test]
+    fn reactive_validation_accepts_agent_command_managed_kinds() {
+        let def = ReactiveWorkflowDefinition {
+            id: "kinds_ok".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "auto".into(),
+            states: vec![
+                auto_state("auto", "agent"),
+                ReactiveWorkflowState {
+                    id: "agent".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Agent(ReactiveAgentStateConfig {
+                        execution: exec_with_mode(ExecutionMode::Docker),
+                        prompt: Some(PromptRef {
+                            system: None,
+                            user: "u".into(),
+                        }),
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::JobSucceeded.into(),
+                        target: "command".into(),
+                    }],
+                },
+                ReactiveWorkflowState {
+                    id: "command".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Command(ReactiveCommandStateConfig {
+                        execution: exec_with_mode(ExecutionMode::Raw),
+                        command: "echo".into(),
+                        args: vec!["ok".into()],
+                        env: HashMap::new(),
+                        prompt: None,
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::JobSucceeded.into(),
+                        target: "managed".into(),
+                    }],
+                },
+                ReactiveWorkflowState {
+                    id: "managed".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Managed(ReactiveManagedStateConfig {
+                        execution: exec_with_mode(ExecutionMode::Docker),
+                        operation: "default-agent".into(),
+                        prompt: None,
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::JobSucceeded.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+        assert!(validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn reactive_validation_rejects_empty_command_or_operation() {
+        let command_bad = ReactiveWorkflowDefinition {
+            id: "command_bad".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "run".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "run".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Command(ReactiveCommandStateConfig {
+                        execution: exec_with_mode(ExecutionMode::Raw),
+                        command: " ".into(),
+                        args: vec![],
+                        env: HashMap::new(),
+                        prompt: None,
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::JobSucceeded.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+        assert!(
+            validate_reactive_workflow(&command_bad)
+                .errors
+                .iter()
+                .any(|e| e.message.contains("must declare command"))
+        );
+
+        let managed_bad = ReactiveWorkflowDefinition {
+            id: "managed_bad".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "run".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "run".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Managed(ReactiveManagedStateConfig {
+                        execution: exec_with_mode(ExecutionMode::Docker),
+                        operation: " ".into(),
+                        prompt: None,
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::JobSucceeded.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+        assert!(
+            validate_reactive_workflow(&managed_bad)
+                .errors
+                .iter()
+                .any(|e| e.message.contains("must declare operation"))
+        );
+    }
+
+    #[test]
+    fn reactive_validation_rejects_auto_state_without_start_transition() {
+        let def = ReactiveWorkflowDefinition {
+            id: "bad_auto".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "auto1".into(),
+            states: vec![ReactiveWorkflowState {
+                id: "auto1".into(),
+                auto_merge: false,
+                config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig::default()),
+                on: vec![ReactiveWorkflowTransition {
+                    event: ReactiveEventKind::WorkflowChosen.into(),
+                    target: "auto1".into(),
+                }],
+            }],
+        };
+        assert!(!validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn reactive_validation_enforces_event_compatibility_for_command_and_managed() {
+        let def = ReactiveWorkflowDefinition {
+            id: "bad_events".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "cmd".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "cmd".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Command(ReactiveCommandStateConfig {
+                        execution: exec_with_mode(ExecutionMode::Raw),
+                        command: "echo".into(),
+                        args: vec![],
+                        env: HashMap::new(),
+                        prompt: None,
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::HumanApproved.into(),
+                        target: "managed".into(),
+                    }],
+                },
+                ReactiveWorkflowState {
+                    id: "managed".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Managed(ReactiveManagedStateConfig {
+                        execution: exec_with_mode(ExecutionMode::Docker),
+                        operation: "foo".into(),
+                        prompt: None,
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::Submit.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+        let report = validate_reactive_workflow(&def);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.message.contains("does not allow transition event"))
+        );
+    }
+
+    #[test]
+    fn reactive_validation_requires_reachable_terminal_from_initial_state() {
+        let def = ReactiveWorkflowDefinition {
+            id: "no_terminal".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "a".into(),
+            states: vec![auto_state("a", "b"), agent_state("b", "a")],
+        };
+
+        let report = validate_reactive_workflow(&def);
+        assert!(report.errors.iter().any(|e| {
+            e.message
+                .contains("no terminal state reachable from initial state 'a'")
+        }));
+    }
+
+    #[test]
+    fn parse_reactive_workflow_rejects_unknown_transition_events_at_boundary() {
+        let input = r#"
+[workflow]
+id = "bad_events"
+schema = "reactive_v2"
+initial_state = "draft"
+
+[[workflow.states]]
+id = "draft"
+kind = "human"
+
+[[workflow.states.on]]
+event = "go_now"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+
+        let err = parse_workflow_toml_document(input).expect_err("unknown event should fail parse");
+        assert!(
+            err.to_string()
+                .contains("unknown reactive transition event 'go_now'")
+        );
+    }
+
+    #[test]
+    fn reactive_validation_rejects_terminal_transitions() {
+        let def = ReactiveWorkflowDefinition {
+            id: "bad_terminal".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "done".into(),
+            states: vec![ReactiveWorkflowState {
+                id: "done".into(),
+                auto_merge: false,
+                config: ReactiveStateConfig::Terminal(ReactiveTerminalStateConfig::default()),
+                on: vec![ReactiveWorkflowTransition {
+                    event: ReactiveEventKind::Cancel.into(),
+                    target: "done".into(),
+                }],
+            }],
+        };
+
+        assert!(!validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn reactive_validation_rejects_duplicate_transition_events_in_state() {
+        let def = ReactiveWorkflowDefinition {
+            id: "dupe_events".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "review".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "review".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Human(ReactiveHumanStateConfig::default()),
+                    on: vec![
+                        ReactiveWorkflowTransition {
+                            event: ReactiveEventKind::HumanApproved.into(),
+                            target: "done".into(),
+                        },
+                        ReactiveWorkflowTransition {
+                            event: ReactiveEventKind::HumanApproved.into(),
+                            target: "done_alt".into(),
+                        },
+                    ],
+                },
+                terminal_state("done"),
+                terminal_state("done_alt"),
+            ],
+        };
+
+        assert!(!validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn reactive_validation_enforces_agent_state_event_compatibility() {
+        let def = ReactiveWorkflowDefinition {
+            id: "bad_agent_event".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "run".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "run".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Agent(ReactiveAgentStateConfig {
+                        execution: exec_with_mode(ExecutionMode::Raw),
+                        prompt: None,
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::HumanApproved.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+
+        assert!(!validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn reactive_validation_enforces_human_state_event_compatibility() {
+        let def = ReactiveWorkflowDefinition {
+            id: "bad_human_event".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "review".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "review".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Human(ReactiveHumanStateConfig::default()),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::JobSucceeded.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+
+        assert!(!validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn reactive_validation_rejects_explicit_cancel_transition() {
+        let def = ReactiveWorkflowDefinition {
+            id: "bad_cancel".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "review".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "review".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Human(ReactiveHumanStateConfig::default()),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::Cancel.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+
+        assert!(!validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn reactive_validation_allows_terminal_outcome_on_terminal_state() {
+        let def = ReactiveWorkflowDefinition {
+            id: "terminal_outcome_ok".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "done".into(),
+            states: vec![ReactiveWorkflowState {
+                id: "done".into(),
+                auto_merge: false,
+                config: ReactiveStateConfig::Terminal(ReactiveTerminalStateConfig {
+                    terminal_outcome: Some(ReactiveTerminalOutcome::Failed),
+                }),
+                on: vec![],
+            }],
+        };
+
+        assert!(validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn parse_reactive_workflow_rejects_terminal_outcome_on_non_terminal_state() {
+        let input = r#"
+[workflow]
+id = "terminal_outcome_bad"
+schema = "reactive_v2"
+initial_state = "draft"
+
+[[workflow.states]]
+id = "draft"
+kind = "human"
+terminal_outcome = "failed"
+
+[[workflow.states.on]]
+event = "submit"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+
+        let err = parse_workflow_toml_document(input)
+            .expect_err("human state should reject terminal_outcome");
+        assert!(err.to_string().contains("unknown field `terminal_outcome`"));
+    }
+
+    #[test]
+    fn parse_reactive_workflow_rejects_child_workflow_on_non_auto_state() {
+        let input = r#"
+[workflow]
+id = "bad_child_kind"
+schema = "reactive_v2"
+initial_state = "review"
+
+[[workflow.states]]
+id = "review"
+kind = "human"
+child_workflow = "child"
+
+[[workflow.states.on]]
+event = "submit"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        let err = parse_workflow_toml_document(input)
+            .expect_err("human state should reject child_workflow");
+        assert!(err.to_string().contains("unknown field `child_workflow`"));
+    }
+
+    #[test]
+    fn parse_reactive_workflow_allows_top_level_execution_fields_for_command_state() {
+        let input = r#"
+[workflow]
+id = "command_top_level_exec"
+schema = "reactive_v2"
+initial_state = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "command"
+command = "echo"
+executor = "raw"
+timeout_secs = 30
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+
+        let doc = parse_workflow_toml_document(input).expect("parse command state");
+        match doc {
+            WorkflowDocument::ReactiveV2 { workflow } => {
+                let run = workflow
+                    .states
+                    .iter()
+                    .find(|state| state.id == "run")
+                    .expect("run state");
+                match &run.config {
+                    ReactiveStateConfig::Command(config) => {
+                        assert_eq!(config.command, "echo");
+                        assert_eq!(config.execution.executor, Some(ExecutionMode::Raw));
+                        assert_eq!(config.execution.timeout_secs, Some(30));
+                    }
+                    _ => panic!("expected command state"),
+                }
+            }
+            _ => panic!("expected reactive workflow"),
+        }
+    }
+
+    #[test]
+    fn parse_reactive_workflow_rejects_unknown_fields_on_agent_command_and_managed_states() {
+        let agent_input = r#"
+[workflow]
+id = "agent_unknown_field"
+schema = "reactive_v2"
+initial_state = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "agent"
+prompt_typo = "nope"
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        let err = parse_workflow_toml_document(agent_input)
+            .expect_err("agent state should reject unknown field");
+        assert!(err.to_string().contains("unknown field `prompt_typo`"));
+
+        let command_input = r#"
+[workflow]
+id = "command_unknown_field"
+schema = "reactive_v2"
+initial_state = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "command"
+command = "echo"
+argz = ["oops"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        let err = parse_workflow_toml_document(command_input)
+            .expect_err("command state should reject unknown field");
+        assert!(err.to_string().contains("unknown field `argz`"));
+
+        let managed_input = r#"
+[workflow]
+id = "managed_unknown_field"
+schema = "reactive_v2"
+initial_state = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "managed"
+operation = "default-agent"
+operation_typo = "oops"
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        let err = parse_workflow_toml_document(managed_input)
+            .expect_err("managed state should reject unknown field");
+        assert!(err.to_string().contains("unknown field `operation_typo`"));
+    }
+
+    #[test]
+    fn reactive_validation_rejects_child_workflow_without_child_outcome_transition() {
+        let def = ReactiveWorkflowDefinition {
+            id: "bad_child_transitions".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "spawn".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "spawn".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig {
+                        child_workflow: Some("child".into()),
+                        action: Some("spawn_children".into()),
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::Start.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+        assert!(!validate_reactive_workflow(&def).is_valid());
+    }
+
+    #[test]
+    fn reactive_validation_cross_checks_child_workflow_catalog_reference() {
+        let reactive = ReactiveWorkflowDefinition {
+            id: "parent".into(),
+            schema: "reactive_v2".into(),
+            initial_state: "spawn".into(),
+            states: vec![
+                ReactiveWorkflowState {
+                    id: "spawn".into(),
+                    auto_merge: false,
+                    config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig {
+                        child_workflow: Some("missing_child".into()),
+                        action: Some("spawn_children".into()),
+                    }),
+                    on: vec![ReactiveWorkflowTransition {
+                        event: ReactiveEventKind::AllChildrenCompleted.into(),
+                        target: "done".into(),
+                    }],
+                },
+                terminal_state("done"),
+            ],
+        };
+
+        let report = validate_reactive_workflows(&[reactive], &[]);
+        assert!(!report.is_valid());
+        assert!(report.errors.iter().any(|e| {
+            e.message
+                .contains("references unknown child workflow 'missing_child'")
+        }));
+    }
+
+    #[test]
+    fn maps_prototype_records_to_planned_views() {
+        let now = Utc::now();
+        let work_item = WorkItem {
+            id: Uuid::new_v4(),
+            workflow_id: "wf".into(),
+            external_task_id: None,
+            external_task_source: None,
+            title: None,
+            description: None,
+            labels: vec![],
+            priority: None,
+            session_id: None,
+            current_step: "build".into(),
+            projected_state: Some("running".into()),
+            last_failure_reason: None,
+            required_action_description: None,
+            triage_status: None,
+            human_gate: false,
+            human_gate_state: None,
+            blocked_on: None,
+            state: WorkItemState::Running,
+            context: serde_json::json!({"x": 1}),
+            repo: Some(RepoSource {
+                repo_url: "https://github.com/reddit/agent-hub.git".into(),
+                base_ref: "origin/main".into(),
+                branch_name: Some("agent-hub/demo".into()),
+            }),
+            parent_work_item_id: None,
+            parent_step_id: None,
+            child_work_item_id: None,
+            created_at: now,
+            updated_at: now,
+            last_written_at: None,
+            write_back_failures: 0,
+            write_back_retry_after: None,
+            status_comment_id: None,
+            checkpoint_comment_id: None,
+            job_result_comment_ids: HashMap::new(),
+        };
+
+        let planned_item = planned_work_item_view_from_prototype(&work_item);
+        assert_eq!(planned_item.current_state_key, "build");
+
+        let job = Job {
+            id: Uuid::new_v4(),
+            work_item_id: work_item.id,
+            step_id: "build".into(),
+            state: JobState::Running,
+            assigned_worker_id: Some("w1".into()),
+            execution_mode: ExecutionMode::Raw,
+            container_image: None,
+            command: "echo".into(),
+            args: vec![],
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: work_item.repo.clone(),
+            timeout_secs: Some(30),
+            max_retries: 1,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let planned_job = planned_agent_job_view_from_prototype(&job);
+        assert!(planned_job.permission_set.can_run_shell);
+        assert_eq!(planned_job.state_key, "build");
+    }
+
+    #[test]
+    fn docker_runtime_has_restricted_default_permissions() {
+        let env = canonical_environment_for_execution(
+            ExecutionMode::Docker,
+            Some("alpine:3.20".into()),
+            Some(30),
+        );
+        let permissions = canonical_permissions_for_environment(&env);
+        assert_eq!(env.tier, PlannedEnvironmentTier::Docker);
+        assert_eq!(permissions.tier, PlannedPermissionTier::DockerDefault);
+        assert!(!permissions.can_access_network);
+    }
+
+    #[test]
+    fn raw_runtime_uses_compatible_permission_tier() {
+        let env = canonical_environment_for_execution(ExecutionMode::Raw, None, None);
+        let permissions = canonical_permissions_for_environment(&env);
+        assert_eq!(env.tier, PlannedEnvironmentTier::Raw);
+        assert_eq!(permissions.tier, PlannedPermissionTier::RawCompatible);
+        assert!(permissions.can_access_network);
+    }
+}

@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Dashboard — Claude Notify</title>
+    <title>Dashboard — Agent Hub</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
     <style>
         tr.selected td { background: rgba(24, 115, 204, 0.1) !important; }
@@ -48,7 +48,15 @@
 </head>
 <body>
 <nav class="container">
-    <ul><li><strong>Claude Notify</strong></li></ul>
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><a href="/orchestration">Work items</a></li>
+        <li><a href="/orchestration/jobs">Jobs</a></li>
+        <li><a href="/orchestration/workers">Workers</a></li>
+        {% if approvals_enabled %}
+        <li><strong>Approvals</strong></li>
+        {% endif %}
+    </ul>
     <ul>
         {% if has_auth %}
         <li>{{ email }}</li>
@@ -656,8 +664,6 @@
         }
     });
 
-    // Start polling
-    setInterval(poll, POLL_MS);
 })();
 </script>
 </body>

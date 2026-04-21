@@ -126,9 +126,9 @@ run "Cursor Write outside workspace → deny" \
     '{"conversation_id":"cur123","tool_name":"Write","tool_input":{"path":"/tmp/evil.sh"},"cwd":"'"$WORKSPACE"'","workspace_roots":["'"$WORKSPACE"'"]}' \
     '.permission' "deny"
 
-run "Cursor Bash → allow" \
+run "Cursor Shell → allow" \
     "--cursor" \
-    '{"conversation_id":"cur123","tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"'"$WORKSPACE"'","workspace_roots":["'"$WORKSPACE"'"]}' \
+    '{"conversation_id":"cur123","tool_name":"Shell","tool_input":{"command":"ls"},"cwd":"'"$WORKSPACE"'","workspace_roots":["'"$WORKSPACE"'"]}' \
     '.permission' "allow"
 
 echo ""

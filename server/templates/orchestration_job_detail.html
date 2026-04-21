@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Job Events — Agent Hub</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/orchestration"><strong>Agent Hub</strong></a></li></ul>
+    <ul>
+        <li><a href="/orchestration">Dashboard</a></li>
+        <li><a href="/orchestration/work-items">Work items</a></li>
+        <li><strong>Jobs</strong></li>
+        <li><a href="/orchestration/workers">Workers</a></li>
+        <li><a href="/orchestration/transcripts">Transcripts</a></li>
+        {% if approvals_enabled %}
+        <li><a href="/approvals">Approvals</a></li>
+        {% endif %}
+        {% if has_auth %}
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
+    </ul>
+</nav>
+
+<main class="container">
+    <a href="/orchestration/work-items/{{ job.work_item_id }}">← Back to work item</a>
+    <h3>Job Events</h3>
+    <article>
+        <p><strong>Job:</strong> <code>{{ job.id }}</code></p>
+        <p><strong>Work item:</strong> <code>{{ job.work_item_id }}</code></p>
+        <p><strong>Step:</strong> {{ job.step_id }}</p>
+        <p><strong>State:</strong> <span id="job-state">{{ job.state }}</span></p>
+        <p><strong>Worker:</strong> {{ job.assigned_worker_id }}</p>
+        <p><strong>Updated:</strong> {{ job.updated_at }}</p>
+    </article>
+
+    <article>
+        <h4>Artifact retrieval</h4>
+        <p><small>Read-only retrieval for known artifact keys resolved from persisted job result metadata. Paths are not accepted from request input.</small></p>
+        {% if retrievable_artifacts.is_empty() %}
+        <p><small>No retrievable artifacts currently available for this job result.</small></p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Key</th>
+                    <th>Path (metadata)</th>
+                    <th>Content type</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for artifact in retrievable_artifacts %}
+                <tr>
+                    <td><code>{{ artifact.key }}</code></td>
+                    <td><code>{{ artifact.path }}</code></td>
+                    <td><code>{{ artifact.content_type }}</code></td>
+                    <td>
+                        <a href="{{ artifact.open_href }}" target="_blank" rel="noopener">Open</a>
+                        ·
+                        <a href="{{ artifact.download_href }}" target="_blank" rel="noopener">Download</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </article>
+
+    <article>
+        <h4>Structured value previews</h4>
+        <p><small>Read-only bounded previews for this job’s projected structured values in <code>job_outputs.{{ job.step_id }}</code> and <code>job_results.{{ job.step_id }}</code>.</small></p>
+
+        {% if structured_value_previews.is_empty() %}
+        <p><small>No projected structured values currently available for this job result.</small></p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Namespace</th>
+                    <th>Alias</th>
+                    <th>Interpolation</th>
+                    <th>Kind</th>
+                    <th>Inline preview</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for value in structured_value_previews %}
+                <tr>
+                    <td><code>{{ value.namespace }}</code></td>
+                    <td><code>{{ value.context_alias }}</code></td>
+                    <td><code>{{ value.interpolation }}</code></td>
+                    <td>{{ value.value_kind }}</td>
+                    <td>
+                        <details>
+                            <summary>Preview</summary>
+                            <pre style="margin-top:0.5rem; max-height:12rem; overflow:auto; white-space: pre-wrap;">{{ value.inline_preview|e }}</pre>
+                        </details>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </article>
+
+    <article>
+        <h4>Conventional projected artifacts</h4>
+        <p><small>Legacy artifact summary values projected into existing namespaces for this job step.</small></p>
+        {% if conventional_artifacts.is_empty() %}
+        <p><small>None recorded for this job.</small></p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Key</th>
+                    <th>Path alias</th>
+                    <th>Metadata alias</th>
+                    <th>Path</th>
+                    <th>Bytes</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for artifact in conventional_artifacts %}
+                <tr>
+                    <td><code>{{ artifact.key }}</code></td>
+                    <td><code>{{ artifact.context_alias }}</code></td>
+                    <td><code>{{ artifact.metadata_context_alias }}</code></td>
+                    <td><code>{{ artifact.path }}</code></td>
+                    <td>{{ artifact.bytes }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </article>
+
+    <article>
+        <h4>Structured transcript artifacts</h4>
+        {% if structured_transcript_artifacts.is_empty() %}
+        <p><small>None recorded for this job.</small></p>
+        {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Key</th>
+                    <th>Path alias</th>
+                    <th>Metadata alias</th>
+                    <th>Data alias</th>
+                    <th>Path</th>
+                    <th>Bytes</th>
+                    <th>Schema</th>
+                    <th>Record count</th>
+                    <th>Inline preview</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for artifact in structured_transcript_artifacts %}
+                <tr>
+                    <td><code>{{ artifact.key }}</code></td>
+                    <td><code>{{ artifact.context_alias }}</code></td>
+                    <td><code>{{ artifact.metadata_context_alias }}</code></td>
+                    <td><code>{{ artifact.data_context_alias }}</code></td>
+                    <td><code>{{ artifact.path }}</code></td>
+                    <td>{{ artifact.bytes }}</td>
+                    <td>{{ artifact.schema }}</td>
+                    <td>{{ artifact.record_count }}</td>
+                    <td>
+                        {% if artifact.has_inline_preview %}
+                        <details>
+                            <summary>Preview</summary>
+                            <pre style="margin-top:0.5rem; max-height:12rem; overflow:auto;">{{ artifact.inline_preview|e }}</pre>
+                        </details>
+                        {% else %}
+                        <small>Metadata only</small>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </article>
+
+    <pre id="events" style="height:26rem; overflow:auto;"></pre>
+</main>
+
+<script>
+(function () {
+    const jobId = '{{ job.id }}';
+    const out = document.getElementById('events');
+    const stateEl = document.getElementById('job-state');
+
+    function append(line) {
+        out.textContent += line + '\n';
+        out.scrollTop = out.scrollHeight;
+    }
+
+    append('[sse] connecting...');
+    const es = new EventSource('/api/v1/orchestration/jobs/' + jobId + '/events');
+
+    es.onopen = function () {
+        append('[sse] connected');
+    };
+
+    es.onerror = function () {
+        append('[sse] connection error');
+    };
+
+    function handleEvent(name, data) {
+        append('[' + name + '] ' + data);
+        if (name === 'done') {
+            try {
+                const parsed = JSON.parse(data);
+                if (parsed.state) {
+                    stateEl.textContent = parsed.state;
+                }
+            } catch (_) {}
+        }
+    }
+
+    ['system', 'stdout', 'stderr', 'done', 'events_lagged'].forEach(function (name) {
+        es.addEventListener(name, function (ev) {
+            handleEvent(name, ev.data);
+        });
+    });
+})();
+</script>
+</body>
+</html>
