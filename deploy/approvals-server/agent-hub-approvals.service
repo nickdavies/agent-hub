@@ -1,0 +1,20 @@
+[Unit]
+Description=Agent Hub approvals server
+
+[Service]
+Type=simple
+UMask=0077
+StateDirectory=agent-hub-approvals
+StateDirectoryMode=0700
+WorkingDirectory=%S/agent-hub-approvals
+ConfigurationDirectory=agent-hub
+EnvironmentFile=%E/agent-hub/approvals-server.env
+ExecStart=%h/.local/libexec/agent-hub-approvals/agent-hub-server serve noop local-file --path %S/agent-hub-approvals/server_data.json
+KillSignal=SIGINT
+TimeoutStopSec=30s
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
