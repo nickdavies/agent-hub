@@ -178,6 +178,28 @@ pub struct TaskCheckpoint {
     // fields will fail to parse and must be deleted.
     pub human_gate_state: Option<String>,
     pub triage_status: Option<String>,
+    /// Human who should regain provider ownership when checkpointing or
+    /// recovery fails. This is authoritative orchestration state, not merely
+    /// an informational assignee projection.
+    pub human_owner: Option<String>,
+    /// Stable provider-native identity for `human_owner` when available.
+    #[serde(default)]
+    pub human_owner_provider_id: Option<String>,
+    /// Exact staged jobs authorized by this checkpoint commit. A job staged
+    /// concurrently after the checkpoint snapshot remains gated.
+    #[serde(default)]
+    pub dispatch_job_ids: Vec<Uuid>,
+    /// Monotonic per-root generation used by the durable checkpoint outbox.
+    #[serde(default)]
+    pub generation: u64,
+    /// SHA-256 of the checkpoint with this field blank. Used to reconcile a
+    /// provider commit after a process crash without overwriting it.
+    #[serde(default)]
+    pub checkpoint_hash: String,
+    /// Stable hash of semantic state, excluding timestamps, generation, and
+    /// the exact-payload hash. Used to make reconciliation idempotent.
+    #[serde(default)]
+    pub semantic_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +235,7 @@ pub struct TaskLabels {
 pub enum TaskAssignee {
     Bot,
     Human(String),
+    HumanProviderId(String),
     Unassigned,
 }
 
@@ -261,7 +284,10 @@ pub trait TaskAdapter: Send + Sync {
         _work_item_id: Uuid,
         _comment_id: Option<i64>,
     ) -> anyhow::Result<Option<i64>> {
-        Ok(None)
+        Err(anyhow::anyhow!(
+            "task adapter '{}' does not support authoritative checkpoints",
+            self.adapter_name()
+        ))
     }
 
     /// Append a log entry comment to the task
@@ -285,7 +311,10 @@ pub trait TaskAdapter: Send + Sync {
 
     /// Read checkpoint from task (for recovery)
     fn read_checkpoint(&self, _task_id: &str) -> anyhow::Result<Option<TaskCheckpoint>> {
-        Ok(None)
+        Err(anyhow::anyhow!(
+            "task adapter '{}' does not support authoritative checkpoints",
+            self.adapter_name()
+        ))
     }
 
     /// Read triage result from task (for recovery)

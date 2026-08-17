@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
@@ -21,6 +21,7 @@ use protocol::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
@@ -88,6 +89,43 @@ enum EventIngress {
     TrustedInternal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointReconciliationMode {
+    Ordinary,
+    SqliteLoss,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointOutboxRecord {
+    generation: u64,
+    checkpoint_hash: String,
+    checkpoint: TaskCheckpoint,
+    state: String,
+    projection_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointCommit {
+    root: WorkItem,
+    generation: u64,
+    checkpoint_hash: String,
+    changed: bool,
+    projection_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointIntent {
+    Transition,
+    Verification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionResult {
+    Completed,
+    SkippedDueToBackoff,
+    Failed,
+}
+
 impl EventIngress {
     fn label(self) -> &'static str {
         match self {
@@ -137,6 +175,9 @@ pub struct OrchestrationService {
     /// triage prompt manifest referenced by `system.toml` so triage is
     /// decoupled from any specific selectable workflow.
     triage_prompt: Arc<Option<super::config::LoadedTriagePrompt>>,
+    checkpoint_locks: Arc<Mutex<HashMap<Uuid, Weak<Mutex<()>>>>>,
+    checkpoint_recovery_once: Arc<OnceCell<()>>,
+    writer_guard: Arc<OnceCell<std::fs::File>>,
 }
 
 impl OrchestrationService {
@@ -186,6 +227,9 @@ impl OrchestrationService {
             discovered_repos: Arc::new(Vec::new()),
             operator_login: None,
             triage_prompt: Arc::new(None),
+            checkpoint_locks: Arc::new(Mutex::new(HashMap::new())),
+            checkpoint_recovery_once: Arc::new(OnceCell::new()),
+            writer_guard: Arc::new(OnceCell::new()),
         }
     }
 
@@ -440,6 +484,42 @@ impl OrchestrationService {
     }
 
     pub async fn init(&self) -> anyhow::Result<()> {
+        // Deployment invariant: one orchestrator process is the sole writer
+        // for a database. In-memory root locks serialize tasks within that
+        // process; this OS lock prevents a second process from bypassing them.
+        self.writer_guard
+            .get_or_try_init(|| async {
+                let parent = self
+                    .db_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                std::fs::create_dir_all(parent)?;
+                let canonical_db_path = if self.db_path.exists() {
+                    std::fs::canonicalize(self.db_path.as_path())?
+                } else {
+                    let file_name = self
+                        .db_path
+                        .file_name()
+                        .ok_or_else(|| anyhow::anyhow!("database path has no file name"))?;
+                    std::fs::canonicalize(parent)?.join(file_name)
+                };
+                let mut lock_path = canonical_db_path.as_os_str().to_os_string();
+                lock_path.push(".writer.lock");
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .open(PathBuf::from(lock_path))?;
+                file.try_lock().map_err(|error| {
+                    anyhow::anyhow!(
+                        "orchestration database '{}' already has an active writer: {error}",
+                        self.db_path.display()
+                    )
+                })?;
+                Ok::<std::fs::File, anyhow::Error>(file)
+            })
+            .await?;
         self.init_once
             .get_or_try_init(|| async {
                 let path = Arc::clone(&self.db_path);
@@ -447,7 +527,9 @@ impl OrchestrationService {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    let conn = Connection::open(path.as_path())?;
+                    let mut database = Connection::open(path.as_path())?;
+                    let transaction = database.transaction()?;
+                    let conn = &transaction;
                     conn.execute_batch(
                         r#"
                     CREATE TABLE IF NOT EXISTS work_items (
@@ -491,10 +573,41 @@ impl OrchestrationService {
                         result_json TEXT,
                         lease_expires_at TEXT,
                         runtime_spec_json TEXT,
+                        checkpoint_owner_id TEXT NOT NULL,
+                        dispatch_released INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+                    CREATE TABLE IF NOT EXISTS checkpoint_outbox (
+                        root_work_item_id TEXT PRIMARY KEY,
+                        generation INTEGER NOT NULL,
+                        checkpoint_hash TEXT NOT NULL,
+                        checkpoint_json TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        last_error TEXT,
+                        ownership_return_pending INTEGER NOT NULL DEFAULT 0,
+                        human_owner TEXT,
+                        projection_pending INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS ownership_return_outbox (
+                        root_work_item_id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        human_owner TEXT,
+                        human_owner_provider_id TEXT,
+                        last_error TEXT,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS checkpoint_verification (
+                        root_work_item_id TEXT PRIMARY KEY,
+                        last_error TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        name TEXT PRIMARY KEY,
+                        applied_at TEXT NOT NULL
+                    );
                     CREATE TABLE IF NOT EXISTS workers (
                         id TEXT PRIMARY KEY,
                         hostname TEXT NOT NULL,
@@ -545,6 +658,30 @@ impl OrchestrationService {
                     }
                     if !column_exists(&conn, DbTable::Jobs, "runtime_spec_json")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN runtime_spec_json TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "checkpoint_owner_id")? {
+                        conn.execute(
+                            "ALTER TABLE jobs ADD COLUMN checkpoint_owner_id TEXT",
+                            [],
+                        )?;
+                        conn.execute(
+                            "UPDATE jobs SET checkpoint_owner_id = work_item_id WHERE checkpoint_owner_id IS NULL",
+                            [],
+                        )?;
+                    }
+                    let migrate_dispatch_gate: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM schema_migrations WHERE name = 'dispatch_checkpoint_gate_v1'",
+                            [],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_none();
+                    if !column_exists(&conn, DbTable::Jobs, "dispatch_released")? {
+                        conn.execute(
+                            "ALTER TABLE jobs ADD COLUMN dispatch_released INTEGER NOT NULL DEFAULT 0",
+                            [],
+                        )?;
                     }
                     if !column_exists(&conn, DbTable::WorkItems, "external_task_id")? {
                         conn.execute(
@@ -642,6 +779,144 @@ impl OrchestrationService {
                             [],
                         )?;
                     }
+                    if !column_exists(
+                        &conn,
+                        DbTable::OwnershipReturnOutbox,
+                        "human_owner_provider_id",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE ownership_return_outbox ADD COLUMN human_owner_provider_id TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(
+                        &conn,
+                        DbTable::CheckpointOutbox,
+                        "projection_pending",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE checkpoint_outbox ADD COLUMN projection_pending INTEGER NOT NULL DEFAULT 0",
+                            [],
+                        )?;
+                    }
+                    if migrate_dispatch_gate {
+                        // Capture ambiguity before cancellation. Historical
+                        // terminal jobs still get root ownership backfilled,
+                        // but must not cause an otherwise quiescent root to be
+                        // failed or reassigned.
+                        let active_job_ids = {
+                            let mut stmt = conn.prepare(
+                                "SELECT id FROM jobs WHERE state IN (?1, ?2, ?3)",
+                            )?;
+                            let rows = stmt.query_map(
+                                params![
+                                    JobState::Pending.to_string(),
+                                    JobState::Assigned.to_string(),
+                                    JobState::Running.to_string(),
+                                ],
+                                |row| row.get::<_, String>(0),
+                            )?;
+                            rows.collect::<rusqlite::Result<HashSet<_>>>()?
+                        };
+                        let parents = {
+                            let mut stmt = conn.prepare(
+                                "SELECT id, parent_work_item_id FROM work_items",
+                            )?;
+                            let rows = stmt.query_map([], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                            })?;
+                            rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
+                        };
+                        let jobs = {
+                            let mut stmt = conn.prepare("SELECT id, work_item_id FROM jobs")?;
+                            let rows = stmt.query_map([], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })?;
+                            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                        };
+                        let mut affected_roots = HashSet::new();
+                        for (job_id, work_item_id) in jobs {
+                            let mut root_id = work_item_id;
+                            let mut visited = HashSet::new();
+                            while let Some(Some(parent_id)) = parents.get(&root_id) {
+                                if !visited.insert(root_id.clone()) {
+                                    anyhow::bail!(
+                                        "work-item parent cycle while migrating job {job_id}"
+                                    );
+                                }
+                                root_id = parent_id.clone();
+                            }
+                            conn.execute(
+                                "UPDATE jobs SET checkpoint_owner_id = ?2 WHERE id = ?1",
+                                params![job_id, root_id],
+                            )?;
+                            if active_job_ids.contains(&job_id) {
+                                affected_roots.insert(root_id);
+                            }
+                        }
+                        conn.execute(
+                            "UPDATE jobs SET state = ?1, updated_at = ?2 WHERE state IN (?3, ?4, ?5)",
+                            params![
+                                JobState::Cancelled.to_string(),
+                                Utc::now().to_rfc3339(),
+                                JobState::Pending.to_string(),
+                                JobState::Assigned.to_string(),
+                                JobState::Running.to_string(),
+                            ],
+                        )?;
+                        for root_id in affected_roots {
+                            conn.execute(
+                                "WITH RECURSIVE checkpoint_owned(id) AS (
+                                    SELECT ?1
+                                    UNION ALL
+                                    SELECT work_items.id FROM work_items JOIN checkpoint_owned ON work_items.parent_work_item_id = checkpoint_owned.id
+                                )
+                                UPDATE work_items SET state = ?2, human_gate = 1, human_gate_state = 'awaiting_human_action', last_failure_reason = ?3, required_action_description = ?4, updated_at = ?5 WHERE id IN (SELECT id FROM checkpoint_owned)",
+                                params![
+                                    root_id,
+                                    WorkItemState::Failed.to_string(),
+                                    "Automation stopped during dispatch-gate migration because prior checkpoint authority was ambiguous",
+                                    "Confirm recovery and reassign this task to automation.",
+                                    Utc::now().to_rfc3339(),
+                                ],
+                            )?;
+                            let root = conn
+                                .query_row(
+                                    "SELECT external_task_id, context_json FROM work_items WHERE id = ?1",
+                                    [&root_id],
+                                    |row| {
+                                        Ok((
+                                            row.get::<_, Option<String>>(0)?,
+                                            row.get::<_, String>(1)?,
+                                        ))
+                                    },
+                                )?;
+                            if let (Some(task_id), context_json) = root {
+                                let context: serde_json::Value =
+                                    serde_json::from_str(&context_json)?;
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO ownership_return_outbox (root_work_item_id, task_id, human_owner, human_owner_provider_id, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                    params![
+                                        root_id,
+                                        task_id,
+                                        context
+                                            .get("remembered_human_owner")
+                                            .and_then(serde_json::Value::as_str),
+                                        context
+                                            .get("remembered_human_owner_provider_id")
+                                            .and_then(serde_json::Value::as_str),
+                                        "dispatch-gate migration requires human recovery",
+                                        Utc::now().to_rfc3339(),
+                                    ],
+                                )?;
+                            }
+                        }
+                        conn.execute(
+                            "INSERT INTO schema_migrations (name, applied_at) VALUES ('dispatch_checkpoint_gate_v1', ?1)",
+                            [Utc::now().to_rfc3339()],
+                        )?;
+                    }
+                    transaction.commit()?;
                     Ok(())
                 })
                 .await??;
@@ -649,6 +924,12 @@ impl OrchestrationService {
             })
             .await?;
 
+        self.checkpoint_recovery_once
+            .get_or_try_init(|| async {
+                self.reconcile_checkpoint_state().await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
         self.sync_tasks_from_adapter().await?;
         Ok(())
     }
@@ -682,6 +963,9 @@ impl OrchestrationService {
             .ensure_pending_for_current_state(&mut item)
             .await
             .map_err(map_db)?;
+        self.persist_task_projection(&item, None)
+            .await
+            .map_err(map_config)?;
         if created {
             item = self
                 .get_work_item(item.id)
@@ -1101,8 +1385,6 @@ impl OrchestrationService {
             return Err(AppError::WorkflowNotFound(item.workflow_id.clone()));
         }
 
-        Box::pin(self.try_auto_merge_for_current_state(&mut item)).await;
-
         item.updated_at = Utc::now();
         item.blocked_on = block_reason_for_state_name(&item.current_step);
         item.projected_state = Some(project_workflow_state(&item));
@@ -1110,6 +1392,9 @@ impl OrchestrationService {
         self.persist_task_projection(&item, None)
             .await
             .map_err(map_config)?;
+        // Commit the provider checkpoint authorizing this state before any
+        // deterministic side effect that bypasses worker dispatch.
+        Box::pin(self.try_auto_merge_for_current_state(&mut item)).await;
         Ok(item)
     }
 
@@ -1310,6 +1595,9 @@ impl OrchestrationService {
                             .ensure_pending_for_current_state(&mut item)
                             .await
                             .map_err(map_db)?;
+                        self.persist_task_projection(&item, None)
+                            .await
+                            .map_err(map_config)?;
                         return Ok(if created_for_item { 1 } else { 0 });
                     }
                 };
@@ -1319,6 +1607,9 @@ impl OrchestrationService {
                 self.ensure_pending_job_for_step(&item, &workflow)
                     .await
                     .map_err(map_db)?;
+                self.persist_task_projection(&item, None)
+                    .await
+                    .map_err(map_config)?;
                 Ok(1)
             }
             .await;
@@ -1525,6 +1816,7 @@ impl OrchestrationService {
     pub async fn maintenance_tick(&self) -> Result<MaintenanceStats, AppError> {
         self.ensure_ready().await?;
         self.sync_tasks_from_adapter().await?;
+        self.reconcile_checkpoint_state().await.map_err(map_db)?;
         let requeued = self
             .reconcile_stale_workers(Duration::from_secs(STALE_WORKER_SECS))
             .await?;
@@ -1793,6 +2085,9 @@ impl OrchestrationService {
                 .ensure_pending_for_current_state(&mut item)
                 .await
                 .map_err(map_db)?;
+            self.persist_task_projection(&item, None)
+                .await
+                .map_err(map_config)?;
         }
         self.get_work_item(item.id)
             .await
@@ -1888,7 +2183,42 @@ impl OrchestrationService {
         for intent in intents {
             let result: Result<(), AppError> = match intent {
                 AdapterIntent::Create { task } => {
-                    let workflow_id = match pick_workflow_for_task(&task, &workflow_ids) {
+                    // Recovery evidence must be read before workflow selection or
+                    // job construction. An unreadable checkpoint is not the same
+                    // as no history.
+                    let checkpoint = {
+                        let adapter = Arc::clone(&self.task_adapter);
+                        let task_id = task.id.to_string();
+                        match tokio::task::spawn_blocking(move || adapter.read_checkpoint(&task_id))
+                            .await
+                        {
+                            Ok(Ok(checkpoint)) => checkpoint,
+                            Ok(Err(error)) => {
+                                self.insert_recovery_failure(
+                                    &task,
+                                    format!("provider checkpoint read failed: {error:#}"),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            Err(error) => {
+                                self.insert_recovery_failure(
+                                    &task,
+                                    format!("provider checkpoint read join failed: {error}"),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                    };
+
+                    let selection = checkpoint
+                        .as_ref()
+                        .map(|checkpoint| {
+                            WorkflowSelectionDecision::Selected(checkpoint.workflow_id.clone())
+                        })
+                        .unwrap_or_else(|| pick_workflow_for_task(&task, &workflow_ids));
+                    let workflow_id = match selection {
                         WorkflowSelectionDecision::Selected(workflow_id) => workflow_id,
                         WorkflowSelectionDecision::NeedsWorkflowSelection {
                             reason,
@@ -1956,31 +2286,6 @@ impl OrchestrationService {
                         context: task.context.clone(),
                         repo: task.repo.clone(),
                     };
-                    let checkpoint = {
-                        let adapter = Arc::clone(&self.task_adapter);
-                        let task_id = task.id.to_string();
-                        match tokio::task::spawn_blocking(move || adapter.read_checkpoint(&task_id))
-                            .await
-                        {
-                            Ok(Ok(checkpoint)) => checkpoint,
-                            Ok(Err(error)) => {
-                                tracing::warn!(
-                                    task_id = %task.id,
-                                    error = ?error,
-                                    "failed to read checkpoint during create recovery; using initial state"
-                                );
-                                None
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    task_id = %task.id,
-                                    error = ?error,
-                                    "checkpoint recovery join error; using initial state"
-                                );
-                                None
-                            }
-                        }
-                    };
                     let triage_result =
                         if checkpoint.as_ref().is_some_and(checkpoint_is_post_triage) {
                             let adapter = Arc::clone(&self.task_adapter);
@@ -2022,6 +2327,26 @@ impl OrchestrationService {
                     item.context =
                         with_operator_login_context(item.context, self.operator_login.as_deref());
                     item = apply_task_fields(item, &task, self.task_adapter.adapter_name());
+                    if let Some(owner) = checkpoint
+                        .as_ref()
+                        .and_then(|checkpoint| checkpoint.human_owner.as_deref())
+                        && let Some(context) = item.context.as_object_mut()
+                    {
+                        context.insert(
+                            "remembered_human_owner".to_string(),
+                            serde_json::Value::String(owner.to_string()),
+                        );
+                    }
+                    if let Some(owner_id) = checkpoint
+                        .as_ref()
+                        .and_then(|checkpoint| checkpoint.human_owner_provider_id.as_deref())
+                        && let Some(context) = item.context.as_object_mut()
+                    {
+                        context.insert(
+                            "remembered_human_owner_provider_id".to_string(),
+                            serde_json::Value::String(owner_id.to_string()),
+                        );
+                    }
                     if let Some(triage_result) = triage_result.as_ref() {
                         apply_triage_result_recovery_context(&mut item.context, triage_result);
                     }
@@ -2033,7 +2358,20 @@ impl OrchestrationService {
                     if let Some(reason) = triage_environment_error.as_ref() {
                         self.reject_triage_result_with_reason(&mut item, reason.clone());
                     }
-                    if triage_environment_error.is_none()
+                    let mut recovery_allows_dispatch = checkpoint.is_none();
+                    if checkpoint.is_none()
+                        && task
+                            .context
+                            .get("assigned_to_bot")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    {
+                        mark_recovery_failure(
+                            &mut item,
+                            "SQLite state is absent while the provider task is bot-owned; human recovery confirmation is required",
+                        );
+                        recovery_allows_dispatch = false;
+                    } else if triage_environment_error.is_none()
                         && let Some(checkpoint) = checkpoint.as_ref()
                     {
                         if checkpoint_matches_known_workflow(self, checkpoint) {
@@ -2068,6 +2406,18 @@ impl OrchestrationService {
                             };
                             item.blocked_on = block_reason_for_state_name(&item.current_step);
                             item.projected_state = Some(project_workflow_state(&item));
+                            recovery_allows_dispatch = false;
+                            if !checkpoint.human_gate
+                                && !matches!(
+                                    checkpoint.phase.as_str(),
+                                    "done" | "failed" | "cancelled"
+                                )
+                            {
+                                mark_recovery_failure(
+                                    &mut item,
+                                    "Recovered checkpoint is inside an executable boundary; human recovery confirmation is required before repeating side effects",
+                                );
+                            }
                             tracing::info!(
                                 work_item_id = %item.id,
                                 step = %item.current_step,
@@ -2076,25 +2426,67 @@ impl OrchestrationService {
                                 item.current_step
                             );
                         } else {
-                            tracing::warn!(
-                                task_id = %task.id,
-                                workflow_id = %checkpoint.workflow_id,
-                                step = %checkpoint.current_step,
-                                "checkpoint references unknown workflow or step; using initial state"
+                            mark_recovery_failure(
+                                &mut item,
+                                &format!(
+                                    "checkpoint references unknown workflow '{}' or step '{}'",
+                                    checkpoint.workflow_id, checkpoint.current_step
+                                ),
+                            );
+                            recovery_allows_dispatch = false;
+                        }
+                    }
+                    let sqlite_loss_unverifiable = checkpoint
+                        .as_ref()
+                        .is_some_and(|checkpoint| !checkpoint.dispatch_job_ids.is_empty());
+                    if sqlite_loss_unverifiable {
+                        self.release_provider_authorized_jobs(
+                            item.id,
+                            &checkpoint.as_ref().expect("checked above").dispatch_job_ids,
+                            CheckpointReconciliationMode::SqliteLoss,
+                        )
+                        .await
+                        .map_err(map_db)?;
+                        if let Some(context) = item.context.as_object_mut() {
+                            context.insert(
+                                "unverifiable_authoritative_job_ids".to_string(),
+                                serde_json::json!(
+                                    &checkpoint.as_ref().expect("checked above").dispatch_job_ids
+                                ),
                             );
                         }
+                        mark_recovery_failure(
+                            &mut item,
+                            "provider checkpoint references job history lost with SQLite; authoritative IDs were recorded but require human confirmation",
+                        );
+                        recovery_allows_dispatch = false;
                     }
                     self.ensure_repo_catalog_hint_context(&mut item);
                     self.insert_work_item(&item).await.map_err(map_db)?;
-                    if triage_environment_error.is_none() {
+                    if triage_environment_error.is_none() && recovery_allows_dispatch {
                         let _ = self
                             .ensure_pending_for_current_state(&mut item)
                             .await
                             .map_err(map_db)?;
                     }
-                    self.persist_task_projection(&item, Some(&task))
-                        .await
-                        .map_err(map_config)?;
+                    if !sqlite_loss_unverifiable
+                        && (recovery_allows_dispatch
+                            || checkpoint.as_ref().is_some_and(|checkpoint| {
+                                checkpoint.human_gate
+                                    || matches!(
+                                        checkpoint.phase.as_str(),
+                                        "done" | "failed" | "cancelled"
+                                    )
+                            }))
+                    {
+                        self.persist_task_projection(&item, Some(&task))
+                            .await
+                            .map_err(map_config)?;
+                    } else {
+                        self.return_provider_to_remembered_human(&item)
+                            .await
+                            .map_err(map_db)?;
+                    }
                     Ok(())
                 }
                 AdapterIntent::UpdateProjection { work_item_id, task } => {
@@ -2338,11 +2730,149 @@ impl OrchestrationService {
         Ok(())
     }
 
+    async fn insert_recovery_failure(
+        &self,
+        task: &TaskToolRecord,
+        reason: String,
+    ) -> Result<(), AppError> {
+        let req = CreateWorkItemRequest {
+            workflow_id: "__triage__".to_string(),
+            session_id: None,
+            context: task.context.clone(),
+            repo: task.repo.clone(),
+        };
+        let mut item = work_item_from_create(
+            &req,
+            task.id,
+            "__triage__".to_string(),
+            "recovery_failed".to_string(),
+            self.task_adapter.adapter_name(),
+        );
+        item.context = merge_task_metadata(&item.context, task);
+        item.context = with_operator_login_context(item.context, self.operator_login.as_deref());
+        item = apply_task_fields(item, task, self.task_adapter.adapter_name());
+        mark_recovery_failure(&mut item, &reason);
+        self.insert_work_item(&item).await.map_err(map_db)?;
+        self.return_provider_to_remembered_human(&item)
+            .await
+            .map_err(map_db)?;
+        Ok(())
+    }
+
+    async fn return_provider_to_remembered_human(&self, item: &WorkItem) -> anyhow::Result<()> {
+        let Some(task_id) = item.external_task_id.as_deref() else {
+            return Ok(());
+        };
+        let human_owner = remembered_human_owner(item, self.operator_login.as_deref());
+        let human_owner_provider_id = remembered_human_owner_provider_id(item);
+        self.enqueue_ownership_return(
+            item.id,
+            task_id,
+            human_owner.as_deref(),
+            human_owner_provider_id.as_deref(),
+            None,
+        )
+        .await?;
+        let assignee = remembered_human_assignee(item, self.operator_login.as_deref());
+        let adapter = Arc::clone(&self.task_adapter);
+        let task_id_owned = task_id.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || adapter.set_assignee(&task_id_owned, &assignee))
+                .await
+                .map_err(|error| anyhow::anyhow!("ownership return task failed: {error}"))?;
+        if let Err(error) = result {
+            self.enqueue_ownership_return(
+                item.id,
+                task_id,
+                human_owner.as_deref(),
+                human_owner_provider_id.as_deref(),
+                Some(&format!("{error:#}")),
+            )
+            .await?;
+            tracing::warn!(work_item_id = %item.id, error = ?error, "failed to return provider task after recovery failure");
+        } else {
+            self.clear_ownership_return(item.id).await?;
+        }
+        Ok(())
+    }
+
     async fn persist_task_projection(
         &self,
         item: &WorkItem,
         existing: Option<&TaskToolRecord>,
     ) -> anyhow::Result<()> {
+        self.checkpoint_and_project(item, existing, CheckpointIntent::Transition)
+            .await
+    }
+
+    async fn checkpoint_and_project(
+        &self,
+        item: &WorkItem,
+        existing: Option<&TaskToolRecord>,
+        intent: CheckpointIntent,
+    ) -> anyhow::Result<()> {
+        let root_id = self.checkpoint_owner_for_work_item(item.id).await?.id;
+        let lock = self.checkpoint_lock(root_id).await;
+        // Intentionally hold the root lock across the bounded provider
+        // checkpoint and projection calls. This fences provider-visible
+        // generations: an older projection must finish (or remain durably
+        // pending) before a newer root generation can be published.
+        let _guard = lock.lock().await;
+        let root = self
+            .get_work_item(root_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint root {root_id} disappeared"))?;
+        let commit = match self.commit_checkpoint_and_release_locked(&root).await {
+            Ok(commit) => {
+                self.clear_checkpoint_verification_error(root_id).await?;
+                commit
+            }
+            Err(error) => {
+                let has_staged_jobs = !self.staged_job_ids(root_id).await?.is_empty();
+                let has_pending_outbox = self
+                    .get_checkpoint_outbox(root_id)
+                    .await?
+                    .is_some_and(|outbox| outbox.state == "pending");
+                self.record_checkpoint_verification_error(root_id, &error)
+                    .await?;
+                if intent == CheckpointIntent::Transition || has_staged_jobs || has_pending_outbox {
+                    let _ = self.record_checkpoint_outbox_error(root_id, &error).await;
+                    let _ = self.fail_checkpoint_owner(&root, &error).await;
+                    return Err(error);
+                }
+                tracing::warn!(work_item_id = %root_id, error = ?error, "provider checkpoint verification deferred without changing quiescent root");
+                return Ok(());
+            }
+        };
+        if !commit.changed && !commit.projection_pending {
+            return Ok(());
+        }
+        let existing = if item.id == root_id { existing } else { None };
+        if self
+            .persist_informational_projection(&commit.root, existing)
+            .await?
+            == ProjectionResult::Completed
+            && !commit.checkpoint_hash.is_empty()
+        {
+            let cleared = self
+                .mark_projection_complete(root_id, commit.generation, &commit.checkpoint_hash)
+                .await?;
+            if !cleared {
+                anyhow::bail!(
+                    "projection completion CAS lost root {root_id} generation {} hash {}",
+                    commit.generation,
+                    commit.checkpoint_hash
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_informational_projection(
+        &self,
+        item: &WorkItem,
+        existing: Option<&TaskToolRecord>,
+    ) -> anyhow::Result<ProjectionResult> {
         let valid_next_events = self.valid_next_events_for_work_item(item);
         let task = task_from_work_item_with_valid_next_events(item, existing, &valid_next_events);
         let adapter = Arc::clone(&self.task_adapter);
@@ -2363,10 +2893,10 @@ impl OrchestrationService {
                 if let Some(task_id) = external_task_not_found_id(&error) {
                     self.cancel_work_item_due_to_deleted_external_task(item, &task_id)
                         .await?;
-                    return Ok(());
+                    return Ok(ProjectionResult::Failed);
                 }
                 tracing::warn!(work_item_id = %item.id, error = ?error, "persist_projection failed");
-                return Err(error);
+                return Ok(ProjectionResult::Failed);
             }
         };
         if let Some(status_comment_id) = maybe_status_comment_id
@@ -2375,13 +2905,750 @@ impl OrchestrationService {
             self.set_work_item_status_comment_id(item.id, status_comment_id)
                 .await?;
         }
-        if let Err(error) = self.write_back_state(item).await {
-            if let Some(task_id) = external_task_not_found_id(&error) {
-                self.cancel_work_item_due_to_deleted_external_task(item, &task_id)
+        match self.write_back_projection(item).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if let Some(task_id) = external_task_not_found_id(&error) {
+                    self.cancel_work_item_due_to_deleted_external_task(item, &task_id)
+                        .await?;
+                    return Ok(ProjectionResult::Failed);
+                }
+                tracing::warn!(work_item_id = %item.id, error = ?error, "informational provider projection failed after checkpoint commit");
+                Ok(ProjectionResult::Failed)
+            }
+        }
+    }
+
+    fn checkpoint_from_work_item(&self, item: &WorkItem) -> TaskCheckpoint {
+        TaskCheckpoint {
+            current_step: item.current_step.clone(),
+            phase: derive_phase(item),
+            workflow_id: item.workflow_id.clone(),
+            repo: item.repo.as_ref().map(|repo| repo.repo_url.clone()),
+            pr_url: item
+                .context
+                .get("github_pr")
+                .and_then(|pr| pr.get("html_url"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            pr_status: item
+                .context
+                .get("github_pr")
+                .and_then(|pr| pr.get("status"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            human_gate: item.human_gate,
+            failure_info: item.last_failure_reason.clone(),
+            updated_at: Utc::now(),
+            human_gate_state: item.human_gate_state.clone(),
+            triage_status: item.triage_status.clone(),
+            human_owner: remembered_human_owner(item, self.operator_login.as_deref()),
+            human_owner_provider_id: remembered_human_owner_provider_id(item),
+            dispatch_job_ids: Vec::new(),
+            generation: 0,
+            checkpoint_hash: String::new(),
+            semantic_hash: String::new(),
+        }
+    }
+
+    async fn checkpoint_owner_for_work_item(&self, work_item_id: Uuid) -> anyhow::Result<WorkItem> {
+        let mut item = self
+            .get_work_item(work_item_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("work item {work_item_id} is missing"))?;
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = item.parent_work_item_id {
+            if !visited.insert(item.id) {
+                return Err(anyhow::anyhow!(
+                    "work item parent cycle while resolving checkpoint owner for {work_item_id}"
+                ));
+            }
+            item = self
+                .get_work_item(parent_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("parent work item {parent_id} is missing"))?;
+        }
+        Ok(item)
+    }
+
+    async fn checkpoint_lock(&self, root_id: Uuid) -> Arc<Mutex<()>> {
+        let mut locks = self.checkpoint_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&root_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(root_id, Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn commit_checkpoint_and_release_locked(
+        &self,
+        owner: &WorkItem,
+    ) -> anyhow::Result<CheckpointCommit> {
+        let Some(task_id) = owner.external_task_id.clone() else {
+            // Purely local work items have no provider checkpoint to commit.
+            // Provider-backed roots always carry external_task_id; children
+            // resolve to that root before reaching this branch.
+            let staged_job_ids = self.staged_job_ids(owner.id).await?;
+            self.release_staged_jobs_exact(owner.id, &staged_job_ids)
+                .await?;
+            return Ok(CheckpointCommit {
+                root: owner.clone(),
+                generation: 0,
+                checkpoint_hash: String::new(),
+                changed: !staged_job_ids.is_empty(),
+                projection_pending: !staged_job_ids.is_empty(),
+            });
+        };
+
+        let provider_checkpoint = self.read_provider_checkpoint(&task_id).await?;
+        let mut outbox = self.get_checkpoint_outbox(owner.id).await?;
+        self.reconcile_committed_checkpoint(owner, provider_checkpoint.as_ref(), outbox.as_ref())
+            .await?;
+        outbox = self.get_checkpoint_outbox(owner.id).await?;
+
+        if let Some(outbox) = outbox.as_ref()
+            && outbox.state == "pending"
+        {
+            if provider_checkpoint.as_ref().is_some_and(|provider| {
+                provider.generation == outbox.generation
+                    && provider.checkpoint_hash == outbox.checkpoint_hash
+            }) {
+                self.complete_checkpoint_outbox(owner.id, &outbox.checkpoint)
                     .await?;
+            } else {
+                if provider_checkpoint
+                    .as_ref()
+                    .is_some_and(|provider| provider.generation >= outbox.generation)
+                {
+                    anyhow::bail!(
+                        "provider checkpoint generation conflicts with pending local outbox for root {}",
+                        owner.id
+                    );
+                }
+                self.write_provider_checkpoint(owner, &task_id, &outbox.checkpoint)
+                    .await?;
+                self.complete_checkpoint_outbox(owner.id, &outbox.checkpoint)
+                    .await?;
+            }
+        }
+
+        let provider_checkpoint = self.read_provider_checkpoint(&task_id).await?;
+        let staged_job_ids = self.staged_job_ids(owner.id).await?;
+        let has_staged_jobs = !staged_job_ids.is_empty();
+        let mut authorized_job_ids = provider_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.dispatch_job_ids.clone())
+            .unwrap_or_default();
+        // Pre-product retention policy: checkpoint-authorized job evidence is
+        // permanent and cumulative. No cleanup path may delete job rows or
+        // remove IDs from this set; future compaction requires a separately
+        // authenticated summary protocol before job retention can change.
+        for job_id in staged_job_ids {
+            if !authorized_job_ids.contains(&job_id) {
+                authorized_job_ids.push(job_id);
+            }
+        }
+        authorized_job_ids.sort_unstable();
+        authorized_job_ids.dedup();
+        let committed_outbox = self.get_checkpoint_outbox(owner.id).await?;
+        let mut checkpoint = self.checkpoint_from_work_item(owner);
+        checkpoint.dispatch_job_ids = authorized_job_ids;
+        checkpoint.semantic_hash = checkpoint_semantic_hash(&checkpoint)?;
+        if !has_staged_jobs
+            && provider_checkpoint.as_ref().is_some_and(|provider| {
+                provider.semantic_hash == checkpoint.semantic_hash
+                    && committed_outbox.as_ref().is_some_and(|outbox| {
+                        outbox.state == "committed"
+                            && outbox.generation == provider.generation
+                            && outbox.checkpoint_hash == provider.checkpoint_hash
+                    })
+            })
+        {
+            let provider = provider_checkpoint
+                .as_ref()
+                .expect("semantic match requires provider checkpoint");
+            return Ok(CheckpointCommit {
+                root: owner.clone(),
+                generation: provider.generation,
+                checkpoint_hash: provider.checkpoint_hash.clone(),
+                changed: false,
+                projection_pending: committed_outbox
+                    .as_ref()
+                    .is_some_and(|outbox| outbox.projection_pending),
+            });
+        }
+        let generation = provider_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.generation)
+            .unwrap_or(0)
+            .max(
+                committed_outbox
+                    .map(|record| record.generation)
+                    .unwrap_or(0),
+            )
+            .saturating_add(1);
+        checkpoint.generation = generation;
+        checkpoint.updated_at = Utc::now();
+        checkpoint.checkpoint_hash = checkpoint_hash(&checkpoint)?;
+        self.put_checkpoint_outbox(owner.id, &checkpoint).await?;
+
+        match self
+            .write_provider_checkpoint(owner, &task_id, &checkpoint)
+            .await
+        {
+            Ok(comment_id) => {
+                if let Some(comment_id) = comment_id
+                    && owner.checkpoint_comment_id != Some(comment_id)
+                {
+                    self.set_work_item_checkpoint_comment_id(owner.id, comment_id)
+                        .await?;
+                }
+                self.complete_checkpoint_outbox(owner.id, &checkpoint)
+                    .await?;
+                Ok(CheckpointCommit {
+                    root: owner.clone(),
+                    generation: checkpoint.generation,
+                    checkpoint_hash: checkpoint.checkpoint_hash.clone(),
+                    changed: true,
+                    projection_pending: true,
+                })
+            }
+            Err(error) => {
+                let error = anyhow::anyhow!("provider checkpoint failed for {task_id}: {error:#}");
+                Err(error)
+            }
+        }
+    }
+
+    async fn read_provider_checkpoint(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<TaskCheckpoint>> {
+        let adapter = Arc::clone(&self.task_adapter);
+        let task_id = task_id.to_string();
+        tokio::task::spawn_blocking(move || adapter.read_checkpoint(&task_id))
+            .await
+            .map_err(|error| anyhow::anyhow!("checkpoint read task failed: {error}"))?
+    }
+
+    async fn write_provider_checkpoint(
+        &self,
+        owner: &WorkItem,
+        task_id: &str,
+        checkpoint: &TaskCheckpoint,
+    ) -> anyhow::Result<Option<i64>> {
+        let adapter = Arc::clone(&self.task_adapter);
+        let task_id = task_id.to_string();
+        let checkpoint = checkpoint.clone();
+        let owner_id = owner.id;
+        let comment_id = owner.checkpoint_comment_id;
+        tokio::task::spawn_blocking(move || {
+            adapter.update_checkpoint(&task_id, &checkpoint, owner_id, comment_id)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("checkpoint write task failed: {error}"))?
+    }
+
+    async fn staged_job_ids(&self, checkpoint_owner_id: Uuid) -> anyhow::Result<Vec<Uuid>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Uuid>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM jobs WHERE checkpoint_owner_id = ?1 AND state = ?2 AND dispatch_released = 0 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    checkpoint_owner_id.to_string(),
+                    JobState::Pending.to_string(),
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.map(|row| {
+                Uuid::parse_str(&row?).map_err(|error| anyhow::anyhow!(error.to_string()))
+            })
+            .collect()
+        })
+        .await?
+    }
+
+    async fn get_checkpoint_outbox(
+        &self,
+        root_id: Uuid,
+    ) -> anyhow::Result<Option<CheckpointOutboxRecord>> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<CheckpointOutboxRecord>> {
+            let conn = Connection::open(path.as_path())?;
+            conn.query_row(
+                "SELECT generation, checkpoint_hash, checkpoint_json, state, projection_pending FROM checkpoint_outbox WHERE root_work_item_id = ?1",
+                [root_id.to_string()],
+                |row| {
+                    let generation: u64 = row.get(0)?;
+                    let checkpoint_json: String = row.get(2)?;
+                    Ok(CheckpointOutboxRecord {
+                        generation,
+                        checkpoint_hash: row.get(1)?,
+                        checkpoint: serde_json::from_str(&checkpoint_json).map_err(invalid_json)?,
+                        state: row.get(3)?,
+                        projection_pending: row.get::<_, i64>(4)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?
+    }
+
+    async fn put_checkpoint_outbox(
+        &self,
+        root_id: Uuid,
+        checkpoint: &TaskCheckpoint,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let checkpoint = checkpoint.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "INSERT INTO checkpoint_outbox (root_work_item_id, generation, checkpoint_hash, checkpoint_json, state, last_error, ownership_return_pending, human_owner, updated_at) VALUES (?1, ?2, ?3, ?4, 'pending', NULL, 0, ?5, ?6)
+                 ON CONFLICT(root_work_item_id) DO UPDATE SET generation = excluded.generation, checkpoint_hash = excluded.checkpoint_hash, checkpoint_json = excluded.checkpoint_json, state = 'pending', last_error = NULL, ownership_return_pending = 0, human_owner = excluded.human_owner, projection_pending = 0, updated_at = excluded.updated_at",
+                params![
+                    root_id.to_string(),
+                    checkpoint.generation,
+                    checkpoint.checkpoint_hash,
+                    serde_json::to_string(&checkpoint)?,
+                    checkpoint.human_owner,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn record_checkpoint_outbox_error(
+        &self,
+        root_id: Uuid,
+        error: &anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let error = format!("{error:#}");
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "UPDATE checkpoint_outbox SET last_error = ?2, ownership_return_pending = 1, updated_at = ?3 WHERE root_work_item_id = ?1",
+                params![root_id.to_string(), error, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn record_checkpoint_verification_error(
+        &self,
+        root_id: Uuid,
+        error: &anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let error = format!("{error:#}");
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "INSERT INTO checkpoint_verification (root_work_item_id, last_error, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(root_work_item_id) DO UPDATE SET last_error = excluded.last_error, updated_at = excluded.updated_at",
+                params![root_id.to_string(), error, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn clear_checkpoint_verification_error(&self, root_id: Uuid) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "DELETE FROM checkpoint_verification WHERE root_work_item_id = ?1",
+                [root_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn mark_projection_complete(
+        &self,
+        root_id: Uuid,
+        generation: u64,
+        checkpoint_hash: &str,
+    ) -> anyhow::Result<bool> {
+        let path = Arc::clone(&self.db_path);
+        let checkpoint_hash = checkpoint_hash.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = Connection::open(path.as_path())?;
+            Ok(conn.execute(
+                "UPDATE checkpoint_outbox SET projection_pending = 0, updated_at = ?4 WHERE root_work_item_id = ?1 AND generation = ?2 AND checkpoint_hash = ?3 AND state = 'committed' AND projection_pending = 1",
+                params![
+                    root_id.to_string(),
+                    generation,
+                    checkpoint_hash,
+                    Utc::now().to_rfc3339(),
+                ],
+            )? == 1)
+        })
+        .await?
+    }
+
+    #[cfg(test)]
+    async fn projection_is_pending(&self, root_id: Uuid) -> anyhow::Result<bool> {
+        Ok(self
+            .get_checkpoint_outbox(root_id)
+            .await?
+            .is_some_and(|outbox| outbox.state == "committed" && outbox.projection_pending))
+    }
+
+    async fn reconcile_committed_checkpoint(
+        &self,
+        owner: &WorkItem,
+        provider: Option<&TaskCheckpoint>,
+        outbox: Option<&CheckpointOutboxRecord>,
+    ) -> anyhow::Result<()> {
+        let Some(provider) = provider else {
+            if outbox.is_some_and(|record| record.state == "committed") {
+                anyhow::bail!(
+                    "provider checkpoint is missing while a committed local generation exists for root {}",
+                    owner.id
+                );
+            }
+            return Ok(());
+        };
+        if provider.generation > 0 {
+            let actual_hash = checkpoint_hash(provider)?;
+            if provider.checkpoint_hash != actual_hash {
+                anyhow::bail!(
+                    "provider checkpoint hash mismatch for root {} generation {}",
+                    owner.id,
+                    provider.generation
+                );
+            }
+            if !provider.semantic_hash.is_empty()
+                && provider.semantic_hash != checkpoint_semantic_hash(provider)?
+            {
+                anyhow::bail!(
+                    "provider checkpoint semantic hash mismatch for root {} generation {}",
+                    owner.id,
+                    provider.generation
+                );
+            }
+        } else if !provider.dispatch_job_ids.is_empty() {
+            anyhow::bail!(
+                "provider checkpoint for root {} authorizes jobs without a generation",
+                owner.id
+            );
+        }
+        if let Some(outbox) = outbox {
+            if outbox.state == "committed" && outbox.generation > provider.generation {
+                anyhow::bail!(
+                    "provider checkpoint generation {} regressed behind committed local generation {} for root {}",
+                    provider.generation,
+                    outbox.generation,
+                    owner.id
+                );
+            }
+            if provider.generation == outbox.generation
+                && provider.checkpoint_hash != outbox.checkpoint_hash
+            {
+                anyhow::bail!(
+                    "provider and local checkpoint hashes conflict at generation {} for root {}",
+                    provider.generation,
+                    owner.id
+                );
+            }
+            if outbox.state == "pending" && provider.generation > outbox.generation {
+                self.adopt_provider_checkpoint(owner.id, provider).await?;
                 return Ok(());
             }
-            return Err(error);
+        }
+        self.release_provider_authorized_jobs(
+            owner.id,
+            &provider.dispatch_job_ids,
+            CheckpointReconciliationMode::Ordinary,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn adopt_provider_checkpoint(
+        &self,
+        root_id: Uuid,
+        checkpoint: &TaskCheckpoint,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let checkpoint = checkpoint.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction()?;
+            release_jobs_in_transaction(&tx, root_id, &checkpoint.dispatch_job_ids, true)?;
+            tx.execute(
+                "INSERT INTO checkpoint_outbox (root_work_item_id, generation, checkpoint_hash, checkpoint_json, state, last_error, ownership_return_pending, human_owner, projection_pending, updated_at) VALUES (?1, ?2, ?3, ?4, 'committed', NULL, 0, ?5, 1, ?6)
+                 ON CONFLICT(root_work_item_id) DO UPDATE SET generation = excluded.generation, checkpoint_hash = excluded.checkpoint_hash, checkpoint_json = excluded.checkpoint_json, state = 'committed', last_error = NULL, ownership_return_pending = 0, human_owner = excluded.human_owner, projection_pending = 1, updated_at = excluded.updated_at",
+                params![
+                    root_id.to_string(),
+                    checkpoint.generation,
+                    checkpoint.checkpoint_hash,
+                    serde_json::to_string(&checkpoint)?,
+                    checkpoint.human_owner,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn complete_checkpoint_outbox(
+        &self,
+        root_id: Uuid,
+        checkpoint: &TaskCheckpoint,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let checkpoint = checkpoint.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction()?;
+            release_jobs_in_transaction(&tx, root_id, &checkpoint.dispatch_job_ids, true)?;
+            let updated = tx.execute(
+                "UPDATE checkpoint_outbox SET state = 'committed', last_error = NULL, ownership_return_pending = 0, projection_pending = 1, updated_at = ?4 WHERE root_work_item_id = ?1 AND generation = ?2 AND checkpoint_hash = ?3",
+                params![
+                    root_id.to_string(),
+                    checkpoint.generation,
+                    checkpoint.checkpoint_hash,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            if updated != 1 {
+                anyhow::bail!(
+                    "checkpoint outbox completion lost generation {} for root {}",
+                    checkpoint.generation,
+                    root_id
+                );
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn release_staged_jobs_exact(
+        &self,
+        checkpoint_owner_id: Uuid,
+        job_ids: &[Uuid],
+    ) -> anyhow::Result<()> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let path = Arc::clone(&self.db_path);
+        let job_ids = job_ids.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction()?;
+            release_jobs_in_transaction(&tx, checkpoint_owner_id, &job_ids, true)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn release_provider_authorized_jobs(
+        &self,
+        checkpoint_owner_id: Uuid,
+        job_ids: &[Uuid],
+        mode: CheckpointReconciliationMode,
+    ) -> anyhow::Result<()> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let path = Arc::clone(&self.db_path);
+        let job_ids = job_ids.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction()?;
+            release_jobs_in_transaction(
+                &tx,
+                checkpoint_owner_id,
+                &job_ids,
+                mode == CheckpointReconciliationMode::Ordinary,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn fail_checkpoint_owner(
+        &self,
+        owner: &WorkItem,
+        error: &anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let owner_id = owner.id;
+        let reason =
+            format!("Automation stopped: authoritative provider checkpoint failed: {error:#}");
+        let reason_for_db = reason.clone();
+        let storage_result = match tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE jobs SET state = ?2, updated_at = ?3 WHERE checkpoint_owner_id = ?1 AND dispatch_released = 0 AND state = ?4",
+                params![
+                    owner_id.to_string(),
+                    JobState::Cancelled.to_string(),
+                    Utc::now().to_rfc3339(),
+                    JobState::Pending.to_string(),
+                ],
+            )?;
+            tx.execute(
+                "WITH RECURSIVE checkpoint_owned(id) AS (
+                    SELECT ?1
+                    UNION ALL
+                    SELECT work_items.id FROM work_items JOIN checkpoint_owned ON work_items.parent_work_item_id = checkpoint_owned.id
+                )
+                UPDATE work_items SET state = ?2, human_gate = 1, human_gate_state = 'awaiting_human_action', last_failure_reason = ?3, required_action_description = ?4, updated_at = ?5 WHERE id IN (SELECT id FROM checkpoint_owned)",
+                params![
+                    owner_id.to_string(),
+                    WorkItemState::Failed.to_string(),
+                    reason_for_db,
+                    "Provider checkpoint failed. Confirm recovery and reassign this task to automation.",
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!("checkpoint failure storage task failed: {error}")),
+        };
+
+        let ownership_result = self.return_provider_to_remembered_human(owner).await;
+        storage_result.and(ownership_result)
+    }
+
+    async fn enqueue_ownership_return(
+        &self,
+        root_id: Uuid,
+        task_id: &str,
+        human_owner: Option<&str>,
+        human_owner_provider_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let task_id = task_id.to_string();
+        let human_owner = human_owner.map(ToOwned::to_owned);
+        let human_owner_provider_id = human_owner_provider_id.map(ToOwned::to_owned);
+        let last_error = last_error.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "INSERT INTO ownership_return_outbox (root_work_item_id, task_id, human_owner, human_owner_provider_id, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(root_work_item_id) DO UPDATE SET task_id = excluded.task_id, human_owner = excluded.human_owner, human_owner_provider_id = excluded.human_owner_provider_id, last_error = excluded.last_error, updated_at = excluded.updated_at",
+                params![
+                    root_id.to_string(),
+                    task_id,
+                    human_owner,
+                    human_owner_provider_id,
+                    last_error,
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn clear_ownership_return(&self, root_id: Uuid) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            conn.execute(
+                "DELETE FROM ownership_return_outbox WHERE root_work_item_id = ?1",
+                [root_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn reconcile_checkpoint_state(&self) -> anyhow::Result<()> {
+        let items = self.select_work_items().await?;
+        for owner in items
+            .iter()
+            .filter(|item| item.parent_work_item_id.is_none() && item.external_task_id.is_some())
+        {
+            if let Err(error) = self
+                .checkpoint_and_project(owner, None, CheckpointIntent::Verification)
+                .await
+            {
+                tracing::warn!(work_item_id = %owner.id, error = ?error, "checkpoint reconciliation failed closed");
+            }
+        }
+        self.retry_ownership_returns().await
+    }
+
+    async fn retry_ownership_returns(&self) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let obligations = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Vec<(Uuid, String, Option<String>, Option<String>)>> {
+                let conn = Connection::open(path.as_path())?;
+                let mut stmt = conn.prepare(
+                    "SELECT root_work_item_id, task_id, human_owner, human_owner_provider_id FROM ownership_return_outbox ORDER BY updated_at ASC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    let root_id: String = row.get(0)?;
+                    Ok((root_id, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?;
+                rows.map(|row| {
+                    let (root_id, task_id, human_owner, human_owner_provider_id) = row?;
+                    Ok((
+                        Uuid::parse_str(&root_id)?,
+                        task_id,
+                        human_owner,
+                        human_owner_provider_id,
+                    ))
+                })
+                .collect()
+            },
+        )
+        .await??;
+        for (root_id, task_id, human_owner, human_owner_provider_id) in obligations {
+            let assignee = human_owner_provider_id
+                .clone()
+                .map(TaskAssignee::HumanProviderId)
+                .or_else(|| human_owner.clone().map(TaskAssignee::Human))
+                .unwrap_or(TaskAssignee::Unassigned);
+            let adapter = Arc::clone(&self.task_adapter);
+            let task_id_for_call = task_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                adapter.set_assignee(&task_id_for_call, &assignee)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("ownership retry task failed: {error}"))?;
+            match result {
+                Ok(()) => self.clear_ownership_return(root_id).await?,
+                Err(error) => {
+                    self.enqueue_ownership_return(
+                        root_id,
+                        &task_id,
+                        human_owner.as_deref(),
+                        human_owner_provider_id.as_deref(),
+                        Some(&format!("{error:#}")),
+                    )
+                    .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -2415,86 +3682,42 @@ impl OrchestrationService {
         Ok(())
     }
 
-    async fn write_back_state(&self, item: &WorkItem) -> anyhow::Result<()> {
+    async fn write_back_projection(&self, item: &WorkItem) -> anyhow::Result<ProjectionResult> {
         if self.should_skip_write_back(item) {
-            return Ok(());
+            return Ok(ProjectionResult::SkippedDueToBackoff);
         }
 
         let Some(task_id) = item.external_task_id.clone() else {
-            return Ok(());
+            return Ok(ProjectionResult::Completed);
         };
         let now = Utc::now();
-
-        let checkpoint = TaskCheckpoint {
-            current_step: item.current_step.clone(),
-            phase: derive_phase(item),
-            workflow_id: item.workflow_id.clone(),
-            repo: item.repo.as_ref().map(|repo| repo.repo_url.clone()),
-            pr_url: item
-                .context
-                .get("github_pr")
-                .and_then(|pr| pr.get("html_url"))
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-            pr_status: item
-                .context
-                .get("github_pr")
-                .and_then(|pr| pr.get("status"))
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-            human_gate: item.human_gate,
-            failure_info: item.last_failure_reason.clone(),
-            updated_at: Utc::now(),
-            human_gate_state: item.human_gate_state.clone(),
-            triage_status: item.triage_status.clone(),
-        };
 
         let labels = TaskLabels {
             workflow: Some(item.workflow_id.clone()),
             step: Some(item.current_step.clone()),
-            phase: Some(checkpoint.phase.clone()),
+            phase: Some(derive_phase(item)),
             failed: item.state == WorkItemState::Failed || item.last_failure_reason.is_some(),
         };
 
         let assignee = if item.human_gate {
-            item.context
-                .get("owner_login")
-                .and_then(serde_json::Value::as_str)
-                .map(|login| TaskAssignee::Human(login.to_string()))
-                .unwrap_or(TaskAssignee::Unassigned)
+            remembered_human_assignee(item, self.operator_login.as_deref())
         } else {
             TaskAssignee::Bot
         };
 
         let mut wrote_back = false;
         let mut first_error: Option<anyhow::Error> = None;
+        let adapter = Arc::clone(&self.task_adapter);
+        let projection_task_id = task_id.clone();
+        let (labels_result, assignee_result) = tokio::task::spawn_blocking(move || {
+            let labels_result = adapter.set_labels(&projection_task_id, &labels);
+            let assignee_result = adapter.set_assignee(&projection_task_id, &assignee);
+            (labels_result, assignee_result)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("provider projection task failed: {error}"))?;
 
-        match self.task_adapter.update_checkpoint(
-            &task_id,
-            &checkpoint,
-            item.id,
-            item.checkpoint_comment_id,
-        ) {
-            Ok(comment_id) => {
-                if let Some(comment_id) = comment_id
-                    && item.checkpoint_comment_id != Some(comment_id)
-                {
-                    self.set_work_item_checkpoint_comment_id(item.id, comment_id)
-                        .await?;
-                }
-                wrote_back = true;
-            }
-            Err(error) => {
-                if external_task_not_found_id(&error).is_some() {
-                    return Err(error);
-                }
-                eprintln!("write-back checkpoint failed for {task_id}: {error:#}");
-                if first_error.is_none() {
-                    first_error = Some(anyhow::anyhow!(error.to_string()));
-                }
-            }
-        }
-        if let Err(error) = self.task_adapter.set_labels(&task_id, &labels) {
+        if let Err(error) = labels_result {
             if external_task_not_found_id(&error).is_some() {
                 return Err(error);
             }
@@ -2505,7 +3728,7 @@ impl OrchestrationService {
         } else {
             wrote_back = true;
         }
-        if let Err(error) = self.task_adapter.set_assignee(&task_id, &assignee) {
+        if let Err(error) = assignee_result {
             if external_task_not_found_id(&error).is_some() {
                 return Err(error);
             }
@@ -2529,7 +3752,7 @@ impl OrchestrationService {
         if wrote_back {
             self.record_write_back_success(item.id, now).await?;
         }
-        Ok(())
+        Ok(ProjectionResult::Completed)
     }
 
     async fn set_work_item_last_written_at(
@@ -3408,10 +4631,12 @@ impl OrchestrationService {
                                 job_result_comment_ids: HashMap::new(),
                             };
                             self.insert_work_item(&child).await?;
+                            item.child_work_item_id = Some(child_id);
+                            item.state = WorkItemState::Running;
+                            item.updated_at = now;
+                            self.update_work_item(item).await?;
                             self.persist_task_projection(&child, None).await?;
                             Box::pin(self.ensure_pending_for_current_state(&mut child)).await?;
-
-                            item.child_work_item_id = Some(child_id);
                         }
                         item.state = WorkItemState::Running;
                         break;
@@ -4297,10 +5522,7 @@ impl OrchestrationService {
                         selection,
                         self.overlays.as_slice(),
                     );
-                    project_environment_runtime_into_job_context(
-                        &mut job.context,
-                        environment,
-                    );
+                    project_environment_runtime_into_job_context(&mut job.context, environment);
                 }
                 let valid_next_events = self.projected_valid_next_events_for_job_context(&child);
                 project_workflow_inputs_into_job_context(
@@ -4316,6 +5538,9 @@ impl OrchestrationService {
                     self.force_gateway_approval_mode,
                 );
                 self.insert_job(&job).await?;
+                // The parent was checkpointed before the child job existed;
+                // checkpoint its now-durable child boundary and release here.
+                self.persist_task_projection(&child, None).await?;
             }
 
             return Ok(());
@@ -4639,12 +5864,16 @@ impl OrchestrationService {
     async fn insert_job(&self, job: &Job) -> anyhow::Result<()> {
         let path = Arc::clone(&self.db_path);
         let mut job = job.clone();
+        let checkpoint_owner_id = self
+            .checkpoint_owner_for_work_item(job.work_item_id)
+            .await?
+            .id;
         let runtime = canonical_runtime_spec_for_job_effective(&job);
         project_runtime_spec_into_job_context(&mut job.context, &runtime);
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = Connection::open(path.as_path())?;
             conn.execute(
-                "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0)",
                 params![
                     job.id.to_string(),
                     job.work_item_id.to_string(),
@@ -4668,6 +5897,7 @@ impl OrchestrationService {
                     job.created_at.to_rfc3339(),
                     job.updated_at.to_rfc3339(),
                     serde_json::to_string(&runtime)?,
+                    checkpoint_owner_id.to_string(),
                 ],
             )?;
             Ok(())
@@ -4793,7 +6023,7 @@ impl OrchestrationService {
             let conn = Connection::open(path.as_path())?;
             conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
             let mut stmt = conn.prepare(
-                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE state = ?1 ORDER BY created_at ASC",
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE state = ?1 AND dispatch_released = 1 ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([JobState::Pending.to_string()], row_to_job)?;
             for row in rows {
@@ -4811,7 +6041,7 @@ impl OrchestrationService {
                     Some(Utc::now() + chrono::TimeDelta::seconds(LEASE_TTL_SECS));
                 job.updated_at = Utc::now();
                 let updated = conn.execute(
-                    "UPDATE jobs SET state = ?2, assigned_worker_id = ?3, lease_expires_at = ?4, updated_at = ?5 WHERE id = ?1 AND state = ?6",
+                    "UPDATE jobs SET state = ?2, assigned_worker_id = ?3, lease_expires_at = ?4, updated_at = ?5 WHERE id = ?1 AND state = ?6 AND dispatch_released = 1",
                     params![
                         job.id.to_string(),
                         job.state.to_string(),
@@ -5286,7 +6516,16 @@ fn checkpoint_matches_known_workflow(
         return workflow
             .states
             .iter()
-            .any(|state| state.id == checkpoint.current_step);
+            .find(|state| state.id == checkpoint.current_step)
+            .is_some_and(|state| {
+                let checkpoint_terminal =
+                    matches!(checkpoint.phase.as_str(), "done" | "failed" | "cancelled");
+                let state_terminal = matches!(state.kind(), protocol::ReactiveStateKind::Terminal);
+                let state_human = matches!(state.kind(), protocol::ReactiveStateKind::Human);
+                checkpoint_terminal == state_terminal
+                    && (!checkpoint.human_gate || state_human)
+                    && (checkpoint_terminal || checkpoint.human_gate || !state_human)
+            });
     }
     false
 }
@@ -5510,9 +6749,8 @@ fn apply_environment_definition_to_runtime(
             runtime.environment.network_resources =
                 network_request_from_legacy_label(Some(environment.network_class.as_str()));
         } else {
-            runtime.environment.network = legacy_network_label_for_request(
-                runtime.environment.network_resources.as_ref(),
-            );
+            runtime.environment.network =
+                legacy_network_label_for_request(runtime.environment.network_resources.as_ref());
         }
         runtime.permissions = canonical_permissions_for_environment(&runtime.environment);
         if let Some(request) = &runtime.environment.network_resources {
@@ -5812,6 +7050,37 @@ fn merge_task_metadata(context: &serde_json::Value, task: &TaskToolRecord) -> se
                 serde_json::Value::String(owner_login.to_string()),
             );
         }
+        if !task
+            .context
+            .get("assigned_to_bot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            && let Some((human_index, human_owner)) = task
+                .context
+                .get("assignees")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|assignees| {
+                    assignees
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, value)| value.as_str().map(|owner| (index, owner)))
+                })
+                .map(|(index, owner)| (index, owner.trim()))
+                .filter(|(_, owner)| !owner.is_empty())
+        {
+            obj.entry("remembered_human_owner".to_string())
+                .or_insert_with(|| serde_json::Value::String(human_owner.to_string()));
+            if let Some(provider_id) = task
+                .context
+                .get("assignee_ids")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|ids| ids.get(human_index))
+                .and_then(serde_json::Value::as_i64)
+            {
+                obj.entry("remembered_human_owner_provider_id".to_string())
+                    .or_insert_with(|| serde_json::Value::String(provider_id.to_string()));
+            }
+        }
     }
     out
 }
@@ -5830,12 +7099,44 @@ fn with_operator_login_context(
         context = serde_json::json!({});
     }
     if let Some(obj) = context.as_object_mut() {
-        obj.insert(
-            "owner_login".to_string(),
-            serde_json::Value::String(login.to_string()),
-        );
+        obj.entry("owner_login".to_string())
+            .or_insert_with(|| serde_json::Value::String(login.to_string()));
+        obj.entry("remembered_human_owner".to_string())
+            .or_insert_with(|| serde_json::Value::String(login.to_string()));
     }
     context
+}
+
+fn remembered_human_owner(item: &WorkItem, configured_operator: Option<&str>) -> Option<String> {
+    item.context
+        .get("remembered_human_owner")
+        .or_else(|| item.context.get("owner_login"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            configured_operator
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn remembered_human_owner_provider_id(item: &WorkItem) -> Option<String> {
+    item.context
+        .get("remembered_human_owner_provider_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn remembered_human_assignee(item: &WorkItem, configured_operator: Option<&str>) -> TaskAssignee {
+    remembered_human_owner_provider_id(item)
+        .map(TaskAssignee::HumanProviderId)
+        .or_else(|| remembered_human_owner(item, configured_operator).map(TaskAssignee::Human))
+        .unwrap_or(TaskAssignee::Unassigned)
 }
 
 fn should_track_github_pr_state_for_event(event: &WorkflowEventKind) -> bool {
@@ -6540,6 +7841,27 @@ fn clear_success_projection_fields(item: &mut WorkItem) {
     }
 }
 
+fn mark_recovery_failure(item: &mut WorkItem, reason: &str) {
+    let reason = format!("Automation recovery stopped: {reason}");
+    item.state = WorkItemState::Failed;
+    item.human_gate = true;
+    item.human_gate_state = Some("awaiting_human_action".to_string());
+    item.last_failure_reason = Some(reason.clone());
+    item.required_action_description = Some(
+        "Confirm recovery and reassign this task to automation before work can resume.".to_string(),
+    );
+    item.projected_state = Some(project_workflow_state(item));
+    if !item.context.is_object() {
+        item.context = serde_json::json!({});
+    }
+    if let Some(context) = item.context.as_object_mut() {
+        context.insert(
+            "recovery_failure".to_string(),
+            serde_json::Value::String(reason),
+        );
+    }
+}
+
 fn triage_status_to_str(status: &TaskTriageStatus) -> &'static str {
     match status {
         TaskTriageStatus::NeedsWorkflowSelection => "needs_workflow_selection",
@@ -6840,6 +8162,82 @@ fn workflow_document_id(doc: &WorkflowDocument) -> &str {
     }
 }
 
+fn checkpoint_hash(checkpoint: &TaskCheckpoint) -> anyhow::Result<String> {
+    let mut canonical = checkpoint.clone();
+    canonical.checkpoint_hash.clear();
+    let bytes = serde_json::to_vec(&canonical)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn checkpoint_semantic_hash(checkpoint: &TaskCheckpoint) -> anyhow::Result<String> {
+    let mut canonical = checkpoint.clone();
+    canonical.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+    canonical.generation = 0;
+    canonical.checkpoint_hash.clear();
+    canonical.semantic_hash.clear();
+    canonical.dispatch_job_ids.sort_unstable();
+    canonical.dispatch_job_ids.dedup();
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?)))
+}
+
+fn release_jobs_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    checkpoint_owner_id: Uuid,
+    job_ids: &[Uuid],
+    require_present: bool,
+) -> anyhow::Result<()> {
+    let mut expected_releases = 0usize;
+    for job_id in job_ids {
+        let row = tx
+            .query_row(
+                "SELECT checkpoint_owner_id, state, dispatch_released FROM jobs WHERE id = ?1",
+                [job_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner_id, state, released)) = row else {
+            if require_present {
+                anyhow::bail!("authorized checkpoint job {job_id} is missing locally");
+            }
+            continue;
+        };
+        if owner_id != checkpoint_owner_id.to_string() {
+            anyhow::bail!(
+                "authorized checkpoint job {job_id} belongs to {owner_id}, not root {checkpoint_owner_id}"
+            );
+        }
+        if released == 0 && state == JobState::Pending.to_string() {
+            expected_releases = expected_releases.saturating_add(1);
+        } else if released == 0 && matches!(state.as_str(), "assigned" | "running") {
+            anyhow::bail!("authorized job {job_id} is active without a durable dispatch release");
+        }
+    }
+    let mut actual_releases = 0usize;
+    for job_id in job_ids {
+        actual_releases = actual_releases.saturating_add(tx.execute(
+            "UPDATE jobs SET dispatch_released = 1, updated_at = ?3 WHERE id = ?1 AND checkpoint_owner_id = ?2 AND state = ?4 AND dispatch_released = 0",
+            params![
+                job_id.to_string(),
+                checkpoint_owner_id.to_string(),
+                Utc::now().to_rfc3339(),
+                JobState::Pending.to_string(),
+            ],
+        )?);
+    }
+    if actual_releases != expected_releases {
+        anyhow::bail!(
+            "checkpoint release was short for root {checkpoint_owner_id}: expected {expected_releases}, released {actual_releases}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::handlers::to_sse_event;
@@ -6853,7 +8251,2260 @@ mod tests {
     use axum::{Router, routing::get};
     use protocol::JobResult;
     use protocol::{EnvironmentDefinition, MergePolicy};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex as StdMutex};
     use tower::ServiceExt;
+
+    #[derive(Default)]
+    struct ControlledCheckpointAdapter {
+        checkpoint_calls: AtomicUsize,
+        checkpoint_entered: Condvar,
+        checkpoint_lock: StdMutex<bool>,
+        fail_checkpoint: AtomicBool,
+        commit_then_error: AtomicBool,
+        assignees: StdMutex<Vec<TaskAssignee>>,
+        events: StdMutex<Vec<String>>,
+        tasks: StdMutex<Vec<TaskToolRecord>>,
+        checkpoint_to_read: StdMutex<Option<TaskCheckpoint>>,
+        fail_checkpoint_read: AtomicBool,
+        fail_assignee: AtomicBool,
+        labels_calls: AtomicUsize,
+        block_projection: AtomicBool,
+        fail_projection: AtomicBool,
+        projection_calls: AtomicUsize,
+        projection_entered: Condvar,
+        projection_lock: StdMutex<bool>,
+        projected_steps: StdMutex<Vec<String>>,
+        projected_ids: StdMutex<Vec<Uuid>>,
+    }
+
+    impl ControlledCheckpointAdapter {
+        fn wait_for_checkpoint(&self) {
+            let mut entered = self.checkpoint_lock.lock().expect("checkpoint lock");
+            while self.checkpoint_calls.load(Ordering::SeqCst) == 0 {
+                entered = self
+                    .checkpoint_entered
+                    .wait(entered)
+                    .expect("checkpoint wait");
+            }
+        }
+
+        fn unblock(&self) {
+            *self.checkpoint_lock.lock().expect("checkpoint lock") = true;
+            self.checkpoint_entered.notify_all();
+        }
+
+        fn wait_for_projection(&self) {
+            let mut released = self.projection_lock.lock().expect("projection lock");
+            while self.projection_calls.load(Ordering::SeqCst) == 0 {
+                released = self
+                    .projection_entered
+                    .wait(released)
+                    .expect("projection wait");
+            }
+        }
+
+        fn unblock_projection(&self) {
+            *self.projection_lock.lock().expect("projection lock") = true;
+            self.projection_entered.notify_all();
+        }
+    }
+
+    impl TaskAdapter for ControlledCheckpointAdapter {
+        fn adapter_name(&self) -> &'static str {
+            "controlled"
+        }
+
+        fn pull_tasks(&self) -> anyhow::Result<Vec<super::super::task_adapter::TaskSyncRecord>> {
+            Ok(self
+                .tasks
+                .lock()
+                .expect("tasks")
+                .iter()
+                .cloned()
+                .map(|external| super::super::task_adapter::TaskSyncRecord { external })
+                .collect())
+        }
+
+        fn get_task(&self, _id: Uuid) -> anyhow::Result<Option<TaskToolRecord>> {
+            Ok(self
+                .tasks
+                .lock()
+                .expect("tasks")
+                .iter()
+                .find(|task| task.id == _id)
+                .cloned())
+        }
+
+        fn persist_projection(
+            &self,
+            projection: &TaskProjection,
+            _status_comment_id: Option<i64>,
+        ) -> anyhow::Result<Option<i64>> {
+            self.projection_calls.fetch_add(1, Ordering::SeqCst);
+            self.projected_steps.lock().expect("projected steps").push(
+                projection
+                    .task
+                    .context
+                    .get("current_step")
+                    .and_then(serde_json::Value::as_str)
+                    .or(projection.task.workflow_phase.as_deref())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            );
+            self.projected_ids
+                .lock()
+                .expect("projected ids")
+                .push(projection.task.id);
+            self.projection_entered.notify_all();
+            if self.block_projection.load(Ordering::SeqCst) {
+                let mut released = self.projection_lock.lock().expect("projection lock");
+                while !*released {
+                    released = self
+                        .projection_entered
+                        .wait(released)
+                        .expect("projection wait");
+                }
+            }
+            if self.fail_projection.load(Ordering::SeqCst) {
+                anyhow::bail!("controlled projection failure");
+            }
+            self.events.lock().expect("events").push(format!(
+                "projection:{}",
+                projection
+                    .task
+                    .workflow_phase
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ));
+            Ok(None)
+        }
+
+        fn update_checkpoint(
+            &self,
+            _task_id: &str,
+            checkpoint: &TaskCheckpoint,
+            _work_item_id: Uuid,
+            _comment_id: Option<i64>,
+        ) -> anyhow::Result<Option<i64>> {
+            self.events
+                .lock()
+                .expect("events")
+                .push(format!("checkpoint:{}", checkpoint.phase));
+            self.checkpoint_calls.fetch_add(1, Ordering::SeqCst);
+            self.checkpoint_entered.notify_all();
+            let mut allowed = self.checkpoint_lock.lock().expect("checkpoint lock");
+            while !*allowed {
+                allowed = self
+                    .checkpoint_entered
+                    .wait(allowed)
+                    .expect("checkpoint wait");
+            }
+            if self.fail_checkpoint.load(Ordering::SeqCst) {
+                anyhow::bail!("controlled checkpoint failure");
+            }
+            *self.checkpoint_to_read.lock().expect("checkpoint to read") = Some(checkpoint.clone());
+            if self.commit_then_error.load(Ordering::SeqCst) {
+                anyhow::bail!("controlled ambiguous checkpoint result after provider commit");
+            }
+            Ok(Some(42))
+        }
+
+        fn read_checkpoint(&self, _task_id: &str) -> anyhow::Result<Option<TaskCheckpoint>> {
+            if self.fail_checkpoint_read.load(Ordering::SeqCst) {
+                anyhow::bail!("controlled checkpoint read failure");
+            }
+            Ok(self
+                .checkpoint_to_read
+                .lock()
+                .expect("checkpoint to read")
+                .clone())
+        }
+
+        fn set_assignee(&self, _task_id: &str, assignee: &TaskAssignee) -> anyhow::Result<()> {
+            self.assignees
+                .lock()
+                .expect("assignees")
+                .push(assignee.clone());
+            if self.fail_assignee.load(Ordering::SeqCst) {
+                anyhow::bail!("controlled assignee failure");
+            }
+            Ok(())
+        }
+
+        fn set_labels(&self, _task_id: &str, _labels: &TaskLabels) -> anyhow::Result<()> {
+            self.labels_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct NoCheckpointAdapter;
+
+    impl TaskAdapter for NoCheckpointAdapter {
+        fn adapter_name(&self) -> &'static str {
+            "no-checkpoint"
+        }
+
+        fn pull_tasks(&self) -> anyhow::Result<Vec<super::super::task_adapter::TaskSyncRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn get_task(&self, _id: Uuid) -> anyhow::Result<Option<TaskToolRecord>> {
+            Ok(None)
+        }
+
+        fn persist_projection(
+            &self,
+            _projection: &TaskProjection,
+            _status_comment_id: Option<i64>,
+        ) -> anyhow::Result<Option<i64>> {
+            Ok(None)
+        }
+    }
+
+    async fn insert_checkpoint_test_item(
+        svc: &OrchestrationService,
+        id: Uuid,
+        parent_work_item_id: Option<Uuid>,
+    ) -> WorkItem {
+        let req = CreateWorkItemRequest {
+            workflow_id: "test".to_string(),
+            session_id: None,
+            context: serde_json::json!({"remembered_human_owner": "operator"}),
+            repo: None,
+        };
+        let mut item = work_item_from_create(
+            &req,
+            id,
+            "test".to_string(),
+            "execute".to_string(),
+            "controlled",
+        );
+        item.parent_work_item_id = parent_work_item_id;
+        if parent_work_item_id.is_some() {
+            item.external_task_id = None;
+        }
+        svc.insert_work_item(&item).await.expect("insert work item");
+        item
+    }
+
+    fn checkpoint_test_job(work_item_id: Uuid) -> Job {
+        let now = Utc::now();
+        Job {
+            id: Uuid::new_v4(),
+            work_item_id,
+            step_id: "execute".to_string(),
+            state: JobState::Pending,
+            assigned_worker_id: None,
+            execution_mode: protocol::ExecutionMode::Raw,
+            container_image: None,
+            command: "true".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: None,
+            max_retries: 1,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn recovery_test_task(assigned_to_bot: bool) -> TaskToolRecord {
+        TaskToolRecord {
+            id: Uuid::new_v4(),
+            title: "recovery task".to_string(),
+            description: Some("recover safely".to_string()),
+            workflow_id: Some("wf".to_string()),
+            triage_status: TaskTriageStatus::Ready,
+            pending_human_action: false,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: Vec::new(),
+            allowed_actions: Vec::new(),
+            context: serde_json::json!({
+                "labels": [],
+                "assigned_to_bot": assigned_to_bot,
+            }),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        }
+    }
+
+    #[test]
+    fn checkpoint_semantic_hash_is_stable_for_ordered_cumulative_ids_and_roundtrip() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut checkpoint = TaskCheckpoint {
+            current_step: "build".to_string(),
+            phase: "executing".to_string(),
+            workflow_id: "wf".to_string(),
+            repo: None,
+            pr_url: None,
+            pr_status: None,
+            human_gate: false,
+            failure_info: None,
+            updated_at: Utc::now(),
+            human_gate_state: None,
+            triage_status: Some("in_progress".to_string()),
+            human_owner: Some("alice".to_string()),
+            human_owner_provider_id: Some("42".to_string()),
+            dispatch_job_ids: vec![second, first, second],
+            generation: 7,
+            checkpoint_hash: String::new(),
+            semantic_hash: String::new(),
+        };
+        let semantic_hash = checkpoint_semantic_hash(&checkpoint).expect("semantic hash");
+        checkpoint.dispatch_job_ids = vec![first, second];
+        checkpoint.updated_at = checkpoint.updated_at + chrono::TimeDelta::seconds(30);
+        checkpoint.generation = 8;
+        assert_eq!(
+            checkpoint_semantic_hash(&checkpoint).expect("stable semantic hash"),
+            semantic_hash
+        );
+        checkpoint.semantic_hash = semantic_hash;
+        checkpoint.checkpoint_hash = checkpoint_hash(&checkpoint).expect("payload hash");
+        let roundtrip: TaskCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(roundtrip.checkpoint_hash, checkpoint.checkpoint_hash);
+        assert_eq!(
+            checkpoint_hash(&roundtrip).expect("roundtrip hash"),
+            checkpoint.checkpoint_hash
+        );
+        assert_eq!(
+            checkpoint_semantic_hash(&roundtrip).expect("roundtrip semantic hash"),
+            checkpoint.semantic_hash
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn staged_job_is_not_pollable_until_checkpoint_commit() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage job");
+
+        let checkpoint = {
+            let svc = svc.clone();
+            let item = item.clone();
+            tokio::spawn(async move { svc.persist_task_projection(&item, None).await })
+        };
+        let waiter = {
+            let adapter = Arc::clone(&adapter);
+            tokio::task::spawn_blocking(move || adapter.wait_for_checkpoint())
+        };
+        waiter.await.expect("waiter");
+
+        assert!(
+            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
+                .await
+                .expect("poll while blocked")
+                .is_none()
+        );
+        adapter.unblock();
+        checkpoint
+            .await
+            .expect("checkpoint task")
+            .expect("checkpoint");
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let (released, state, owner): (i64, String, String) = conn
+            .query_row(
+                "SELECT dispatch_released, state, checkpoint_owner_id FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("released row");
+        assert_eq!(
+            released,
+            1,
+            "state={state} owner={owner} expected_owner={} events={:?}",
+            item.id,
+            adapter.events.lock().expect("events"),
+        );
+        drop(conn);
+        assert_eq!(
+            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
+                .await
+                .expect("poll after commit")
+                .map(|assigned| assigned.id),
+            Some(job.id)
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_failure_cancels_staged_work_and_returns_human_ownership() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.fail_checkpoint.store(true, Ordering::SeqCst);
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage job");
+
+        assert!(svc.persist_task_projection(&item, None).await.is_err());
+        assert_eq!(adapter.checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            svc.get_job(job.id)
+                .await
+                .expect("job")
+                .expect("job row")
+                .state,
+            JobState::Cancelled
+        );
+        let failed = svc
+            .get_work_item(item.id)
+            .await
+            .expect("item")
+            .expect("item row");
+        assert_eq!(failed.state, WorkItemState::Failed);
+        assert!(failed.human_gate);
+        assert!(failed.last_failure_reason.is_some());
+        assert!(matches!(
+            adapter.assignees.lock().expect("assignees").last(),
+            Some(TaskAssignee::Human(owner)) if owner == "operator"
+        ));
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn adapter_without_authoritative_checkpoint_support_cannot_release_jobs() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(NoCheckpointAdapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        assert!(svc.persist_task_projection(&item, None).await.is_err());
+        let stored = svc.get_job(job.id).await.expect("job").expect("job row");
+        assert_eq!(stored.state, JobState::Cancelled);
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let released: i64 = conn
+            .query_row(
+                "SELECT dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("release state");
+        assert_eq!(released, 0);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn terminal_projection_follows_terminal_checkpoint_commit() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        item.state = WorkItemState::Succeeded;
+        svc.update_work_item(&item).await.expect("update terminal");
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("persist terminal");
+
+        let events = adapter.events.lock().expect("events").clone();
+        assert_eq!(events.first().map(String::as_str), Some("checkpoint:done"));
+        assert!(
+            events
+                .iter()
+                .skip(1)
+                .any(|event| event.starts_with("projection:")),
+            "events: {events:?}"
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn child_job_uses_and_releases_through_root_checkpoint_owner() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let root = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let child = insert_checkpoint_test_item(&svc, Uuid::new_v4(), Some(root.id)).await;
+        let job = checkpoint_test_job(child.id);
+        svc.insert_job(&job).await.expect("stage child job");
+
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let (owner, released): (String, i64) = conn
+            .query_row(
+                "SELECT checkpoint_owner_id, dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("gate row");
+        assert_eq!(owner, root.id.to_string());
+        assert_eq!(released, 0);
+        drop(conn);
+
+        svc.persist_task_projection(&child, None)
+            .await
+            .expect("root checkpoint");
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let released: i64 = conn
+            .query_row(
+                "SELECT dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("released row");
+        assert_eq!(released, 1);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_reconstruction_cannot_bypass_checkpoint_gate() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        item.workflow_id = "wf".to_string();
+        item.current_step = "build".to_string();
+        svc.update_work_item(&item)
+            .await
+            .expect("update actionable item");
+
+        let dispatch = {
+            let svc = svc.clone();
+            let item = item.clone();
+            let workflow = svc.workflows.get("wf").expect("workflow").clone();
+            tokio::spawn(async move {
+                svc.ensure_pending_job_for_step(&item, &workflow).await?;
+                svc.persist_task_projection(&item, None).await?;
+                Ok::<usize, anyhow::Error>(1)
+            })
+        };
+        let waiter = {
+            let adapter = Arc::clone(&adapter);
+            tokio::task::spawn_blocking(move || adapter.wait_for_checkpoint())
+        };
+        waiter.await.expect("waiter");
+        assert!(
+            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
+                .await
+                .expect("poll while maintenance checkpoint blocked")
+                .is_none()
+        );
+        adapter.unblock();
+        assert_eq!(dispatch.await.expect("dispatch task").expect("dispatch"), 1);
+        assert!(
+            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
+                .await
+                .expect("poll after maintenance checkpoint")
+                .is_some()
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn public_maintenance_reconstruction_commits_checkpoint_before_dispatch() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        item.workflow_id = "wf".to_string();
+        item.current_step = "build".to_string();
+        svc.update_work_item(&item).await.expect("actionable item");
+        let mut task = recovery_test_task(false);
+        task.id = item.id;
+        task.updated_at = item.updated_at - chrono::TimeDelta::seconds(1);
+        adapter.tasks.lock().expect("tasks").push(task);
+
+        let stats = svc.maintenance_tick().await.expect("maintenance");
+        assert_eq!(stats.created_jobs, 1);
+        let jobs = svc.select_jobs_for_work_item(item.id).await.expect("jobs");
+        assert_eq!(jobs.len(), 1);
+        let checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("checkpoint");
+        assert!(checkpoint.dispatch_job_ids.contains(&jobs[0].id));
+        assert!(
+            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw])
+                .await
+                .expect("poll")
+                .is_some()
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn repeated_maintenance_and_restart_are_checkpoint_noops_when_semantics_match() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("initial checkpoint");
+        let mut task = recovery_test_task(false);
+        task.id = item.id;
+        task.updated_at = item.updated_at - chrono::TimeDelta::seconds(1);
+        adapter.tasks.lock().expect("tasks").push(task);
+        let initial_checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("initial checkpoint");
+        let initial_calls = adapter.checkpoint_calls.load(Ordering::SeqCst);
+        let initial_item = svc
+            .get_work_item(item.id)
+            .await
+            .expect("item")
+            .expect("item row");
+        let initial_assignees = adapter.assignees.lock().expect("assignees").len();
+        let mut desired = svc.checkpoint_from_work_item(&initial_item);
+        desired.dispatch_job_ids = initial_checkpoint.dispatch_job_ids.clone();
+        desired.semantic_hash = checkpoint_semantic_hash(&desired).expect("desired semantic hash");
+        assert_eq!(desired.semantic_hash, initial_checkpoint.semantic_hash);
+        let initial_outbox = svc
+            .get_checkpoint_outbox(item.id)
+            .await
+            .expect("outbox")
+            .expect("outbox row");
+        assert_eq!(initial_outbox.state, "committed");
+        assert_eq!(
+            initial_outbox.checkpoint_hash,
+            initial_checkpoint.checkpoint_hash
+        );
+        assert!(
+            !svc.projection_is_pending(item.id)
+                .await
+                .expect("projection state")
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let ownership_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ownership_return_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("ownership rows");
+        assert_eq!(ownership_rows, 0);
+        drop(conn);
+
+        svc.maintenance_tick().await.expect("maintenance one");
+        let after_first = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("checkpoint after first");
+        assert_eq!(
+            adapter.checkpoint_calls.load(Ordering::SeqCst),
+            initial_calls,
+            "initial={initial_checkpoint:?} after={after_first:?} item={:?}",
+            svc.get_work_item(item.id).await.expect("item")
+        );
+        svc.maintenance_tick().await.expect("maintenance two");
+        assert_eq!(
+            adapter.checkpoint_calls.load(Ordering::SeqCst),
+            initial_calls
+        );
+        assert_eq!(
+            adapter.assignees.lock().expect("assignees").len(),
+            initial_assignees
+        );
+        assert_eq!(
+            svc.get_work_item(item.id)
+                .await
+                .expect("item")
+                .expect("item row")
+                .state,
+            initial_item.state
+        );
+        drop(svc);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted.init().await.expect("restart");
+        let final_checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("final checkpoint");
+        assert_eq!(final_checkpoint.generation, initial_checkpoint.generation);
+        assert_eq!(
+            adapter.checkpoint_calls.load(Ordering::SeqCst),
+            initial_calls
+        );
+        assert_eq!(
+            adapter.assignees.lock().expect("assignees").len(),
+            initial_assignees
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn database_rejects_a_second_live_orchestrator_writer() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let first = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(ControlledCheckpointAdapter::default()) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        first.init().await.expect("first writer");
+        let second = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(ControlledCheckpointAdapter::default()) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        let error = second.init().await.expect_err("second writer must fail");
+        assert!(error.to_string().contains("active writer"));
+        drop(first);
+        let replacement = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(ControlledCheckpointAdapter::default()) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        replacement.init().await.expect("replacement writer");
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_writer_guard_canonicalizes_symlink_path_aliases() {
+        let real_dir = std::env::temp_dir().join(format!("orch-real-{}", Uuid::new_v4()));
+        let alias_dir = std::env::temp_dir().join(format!("orch-alias-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&real_dir).expect("real dir");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).expect("symlink alias");
+        let real_db = real_dir.join("orchestration.sqlite3");
+        let alias_db = alias_dir.join("orchestration.sqlite3");
+        let first = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(ControlledCheckpointAdapter::default()) as Arc<dyn TaskAdapter>,
+            real_db.to_string_lossy().into_owned(),
+        );
+        first.init().await.expect("first writer");
+        let alias = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(ControlledCheckpointAdapter::default()) as Arc<dyn TaskAdapter>,
+            alias_db.to_string_lossy().into_owned(),
+        );
+        assert!(alias.init().await.is_err());
+        drop(first);
+        let _ = std::fs::remove_file(real_db);
+        let _ = std::fs::remove_file(alias_dir);
+        let _ = std::fs::remove_dir_all(real_dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_lock_registry_prunes_completed_roots() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            adapter as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        for _ in 0..20 {
+            let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+            svc.persist_task_projection(&item, None)
+                .await
+                .expect("checkpoint");
+        }
+        assert!(svc.checkpoint_locks.lock().await.len() <= 1);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_root_commits_serialize_and_final_checkpoint_authorizes_every_release() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let first_job = checkpoint_test_job(item.id);
+        svc.insert_job(&first_job).await.expect("stage first");
+
+        let first_commit = {
+            let svc = svc.clone();
+            let item = item.clone();
+            tokio::spawn(async move { svc.persist_task_projection(&item, None).await })
+        };
+        let waiter = {
+            let adapter = Arc::clone(&adapter);
+            tokio::task::spawn_blocking(move || adapter.wait_for_checkpoint())
+        };
+        waiter.await.expect("first checkpoint entered");
+
+        let mut newer_item = item.clone();
+        newer_item.current_step = "newer-state".to_string();
+        newer_item.updated_at = Utc::now();
+        svc.update_work_item(&newer_item)
+            .await
+            .expect("persist newer root state");
+        let second_job = checkpoint_test_job(item.id);
+        svc.insert_job(&second_job).await.expect("stage second");
+        let second_commit = {
+            let svc = svc.clone();
+            let item = item.clone();
+            tokio::spawn(async move { svc.persist_task_projection(&item, None).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(adapter.checkpoint_calls.load(Ordering::SeqCst), 1);
+
+        adapter.unblock();
+        first_commit
+            .await
+            .expect("first task")
+            .expect("first commit");
+        second_commit
+            .await
+            .expect("second task")
+            .expect("second commit");
+
+        let final_checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("final checkpoint");
+        assert!(final_checkpoint.generation >= 2);
+        assert!(final_checkpoint.dispatch_job_ids.contains(&first_job.id));
+        assert!(final_checkpoint.dispatch_job_ids.contains(&second_job.id));
+        assert_eq!(final_checkpoint.current_step, "newer-state");
+        assert_eq!(final_checkpoint.human_owner.as_deref(), Some("operator"));
+        assert_eq!(
+            final_checkpoint.checkpoint_hash,
+            checkpoint_hash(&final_checkpoint).expect("hash")
+        );
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        for job_id in [first_job.id, second_job.id] {
+            let released: i64 = conn
+                .query_row(
+                    "SELECT dispatch_released FROM jobs WHERE id = ?1",
+                    [job_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("job release");
+            assert_eq!(released, 1);
+        }
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delayed_old_projection_is_fenced_before_newer_checkpoint_and_projection() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        adapter.block_projection.store(true, Ordering::SeqCst);
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let first = {
+            let svc = svc.clone();
+            let item = item.clone();
+            tokio::spawn(async move { svc.persist_task_projection(&item, None).await })
+        };
+        let waiter = {
+            let adapter = Arc::clone(&adapter);
+            tokio::task::spawn_blocking(move || adapter.wait_for_projection())
+        };
+        waiter.await.expect("projection entered");
+
+        let mut newer = item.clone();
+        newer.state = WorkItemState::Succeeded;
+        newer.current_step = "terminal-new".to_string();
+        newer.updated_at = Utc::now();
+        svc.update_work_item(&newer).await.expect("newer root");
+        let second = {
+            let svc = svc.clone();
+            let stale_item = item.clone();
+            tokio::spawn(async move { svc.persist_task_projection(&stale_item, None).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(adapter.checkpoint_calls.load(Ordering::SeqCst), 1);
+
+        adapter.unblock_projection();
+        first.await.expect("first task").expect("first projection");
+        second
+            .await
+            .expect("second task")
+            .expect("second projection");
+        let checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("checkpoint");
+        assert_eq!(checkpoint.current_step, "terminal-new");
+        assert_eq!(checkpoint.phase, "done");
+        assert_eq!(adapter.projection_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            !svc.projection_is_pending(item.id)
+                .await
+                .expect("projection state")
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn newest_projection_failure_remains_generation_bound_and_retries() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        adapter.fail_projection.store(true, Ordering::SeqCst);
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        item.state = WorkItemState::Succeeded;
+        item.current_step = "terminal".to_string();
+        svc.update_work_item(&item).await.expect("terminal root");
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("checkpoint succeeds despite projection failure");
+        let pending = svc
+            .get_checkpoint_outbox(item.id)
+            .await
+            .expect("outbox")
+            .expect("outbox row");
+        assert!(pending.projection_pending);
+        let generation = pending.generation;
+        let hash = pending.checkpoint_hash.clone();
+        assert!(
+            !svc.mark_projection_complete(item.id, generation, "wrong-hash")
+                .await
+                .expect("false CAS")
+        );
+        assert!(
+            svc.projection_is_pending(item.id)
+                .await
+                .expect("projection state")
+        );
+
+        adapter.fail_projection.store(false, Ordering::SeqCst);
+        svc.reconcile_checkpoint_state()
+            .await
+            .expect("retry projection");
+        let completed = svc
+            .get_checkpoint_outbox(item.id)
+            .await
+            .expect("outbox")
+            .expect("outbox row");
+        assert_eq!(completed.generation, generation);
+        assert_eq!(completed.checkpoint_hash, hash);
+        assert!(!completed.projection_pending);
+        assert_eq!(adapter.checkpoint_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.projection_calls.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn projection_backoff_retains_obligation_until_all_operations_retry_successfully() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        adapter.fail_assignee.store(true, Ordering::SeqCst);
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("checkpoint with partial projection failure");
+        let pending = svc
+            .get_checkpoint_outbox(item.id)
+            .await
+            .expect("outbox")
+            .expect("outbox row");
+        assert!(pending.projection_pending);
+        assert_eq!(adapter.labels_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.assignees.lock().expect("assignees").len(), 1);
+
+        adapter.fail_assignee.store(false, Ordering::SeqCst);
+        svc.reconcile_checkpoint_state()
+            .await
+            .expect("reconcile before retry deadline");
+        assert!(
+            svc.projection_is_pending(item.id)
+                .await
+                .expect("projection state")
+        );
+        assert_eq!(adapter.labels_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.assignees.lock().expect("assignees").len(), 1);
+
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        conn.execute(
+            "UPDATE work_items SET write_back_retry_after = ?2 WHERE id = ?1",
+            params![
+                item.id.to_string(),
+                (Utc::now() - chrono::TimeDelta::seconds(1)).to_rfc3339(),
+            ],
+        )
+        .expect("expire backoff");
+        drop(conn);
+        svc.reconcile_checkpoint_state()
+            .await
+            .expect("retry after deadline");
+        assert!(
+            !svc.projection_is_pending(item.id)
+                .await
+                .expect("projection state")
+        );
+        assert_eq!(adapter.labels_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(adapter.assignees.lock().expect("assignees").len(), 2);
+        assert!(matches!(
+            adapter.assignees.lock().expect("assignees").last(),
+            Some(TaskAssignee::Bot)
+        ));
+        let refreshed = svc
+            .get_work_item(item.id)
+            .await
+            .expect("item")
+            .expect("item row");
+        assert_eq!(refreshed.write_back_failures, 0);
+        assert!(refreshed.write_back_retry_after.is_none());
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn child_triggered_checkpoint_projects_authoritative_root_snapshot() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let mut root = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        root.current_step = "root-authoritative".to_string();
+        svc.update_work_item(&root).await.expect("root state");
+        let mut child = insert_checkpoint_test_item(&svc, Uuid::new_v4(), Some(root.id)).await;
+        child.state = WorkItemState::Succeeded;
+        child.current_step = "child-terminal".to_string();
+        svc.update_work_item(&child).await.expect("child state");
+        let job = checkpoint_test_job(child.id);
+        svc.insert_job(&job).await.expect("stage child job");
+
+        svc.persist_task_projection(&child, None)
+            .await
+            .expect("child-triggered root checkpoint");
+        assert_eq!(
+            adapter.projected_ids.lock().expect("projected ids").last(),
+            Some(&root.id)
+        );
+        let checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("checkpoint");
+        assert_eq!(checkpoint.current_step, "root-authoritative");
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn later_checkpoint_generation_retains_authorized_terminal_job_evidence() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("authorize job");
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        conn.execute(
+            "UPDATE jobs SET state = ?2 WHERE id = ?1",
+            params![job.id.to_string(), JobState::Succeeded.to_string()],
+        )
+        .expect("complete job evidence");
+        drop(conn);
+        item.state = WorkItemState::Succeeded;
+        item.current_step = "terminal".to_string();
+        svc.update_work_item(&item).await.expect("terminal root");
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("later generation");
+
+        let checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("checkpoint");
+        assert!(checkpoint.dispatch_job_ids.contains(&job.id));
+        assert_eq!(
+            svc.get_job(job.id)
+                .await
+                .expect("job")
+                .expect("job row")
+                .state,
+            JobState::Succeeded
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_staged_before_checkpoint() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage before crash");
+        let mut task = recovery_test_task(false);
+        task.id = item.id;
+        task.updated_at = item.updated_at - chrono::TimeDelta::seconds(1);
+        adapter.tasks.lock().expect("tasks").push(task);
+        drop(svc);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted.init().await.expect("restart reconciliation");
+        let checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("checkpoint committed");
+        assert!(checkpoint.dispatch_job_ids.contains(&job.id));
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let released: i64 = conn
+            .query_row(
+                "SELECT dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("release");
+        assert_eq!(released, 1);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_provider_commit_before_local_release() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        let mut checkpoint = svc.checkpoint_from_work_item(&item);
+        checkpoint.generation = 1;
+        checkpoint.dispatch_job_ids = vec![job.id];
+        checkpoint.checkpoint_hash = checkpoint_hash(&checkpoint).expect("hash");
+        svc.put_checkpoint_outbox(item.id, &checkpoint)
+            .await
+            .expect("persist pending outbox");
+        *adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("provider checkpoint") = Some(checkpoint);
+        let mut task = recovery_test_task(false);
+        task.id = item.id;
+        task.updated_at = item.updated_at - chrono::TimeDelta::seconds(1);
+        adapter.tasks.lock().expect("tasks").push(task);
+        drop(svc);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted.init().await.expect("restart reconciliation");
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let (released, outbox_state): (i64, String) = conn
+            .query_row(
+                "SELECT jobs.dispatch_released, checkpoint_outbox.state FROM jobs JOIN checkpoint_outbox ON checkpoint_outbox.root_work_item_id = jobs.checkpoint_owner_id WHERE jobs.id = ?1",
+                [job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("reconciled state");
+        assert_eq!(released, 1);
+        assert_eq!(outbox_state, "committed");
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_provider_commit_then_error_without_releasing_cancelled_work() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.commit_then_error.store(true, Ordering::SeqCst);
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        assert!(svc.persist_task_projection(&item, None).await.is_err());
+        assert_eq!(
+            svc.get_job(job.id)
+                .await
+                .expect("job")
+                .expect("job row")
+                .state,
+            JobState::Cancelled
+        );
+        let mut task = recovery_test_task(false);
+        task.id = item.id;
+        task.updated_at = item.updated_at - chrono::TimeDelta::seconds(1);
+        adapter.tasks.lock().expect("tasks").push(task);
+        adapter.commit_then_error.store(false, Ordering::SeqCst);
+        drop(svc);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted.init().await.expect("restart reconcile ambiguity");
+        let final_checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("checkpoint");
+        assert!(final_checkpoint.dispatch_job_ids.contains(&job.id));
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let (state, released): (String, i64) = conn
+            .query_row(
+                "SELECT state, dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("job state");
+        assert_eq!(state, JobState::Cancelled.to_string());
+        assert_eq!(released, 0);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn short_exact_release_is_error_and_leaves_outbox_pending() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            adapter as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        let mut checkpoint = svc.checkpoint_from_work_item(&item);
+        checkpoint.generation = 1;
+        checkpoint.dispatch_job_ids = vec![job.id, Uuid::new_v4()];
+        checkpoint.checkpoint_hash = checkpoint_hash(&checkpoint).expect("hash");
+        svc.put_checkpoint_outbox(item.id, &checkpoint)
+            .await
+            .expect("outbox");
+
+        assert!(
+            svc.complete_checkpoint_outbox(item.id, &checkpoint)
+                .await
+                .is_err()
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let (released, state): (i64, String) = conn
+            .query_row(
+                "SELECT jobs.dispatch_released, checkpoint_outbox.state FROM jobs JOIN checkpoint_outbox ON checkpoint_outbox.root_work_item_id = jobs.checkpoint_owner_id WHERE jobs.id = ?1",
+                [job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("state");
+        assert_eq!(released, 0);
+        assert_eq!(state, "pending");
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn ordinary_reconciliation_rejects_unknown_provider_authorized_job_ids() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("initial checkpoint");
+        let initial_calls = adapter.checkpoint_calls.load(Ordering::SeqCst);
+        let mut provider = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("provider checkpoint");
+        provider.generation = provider.generation.saturating_add(1);
+        provider.dispatch_job_ids.push(Uuid::new_v4());
+        provider.semantic_hash = checkpoint_semantic_hash(&provider).expect("semantic hash");
+        provider.checkpoint_hash = checkpoint_hash(&provider).expect("checkpoint hash");
+        *adapter.checkpoint_to_read.lock().expect("checkpoint") = Some(provider);
+
+        svc.reconcile_checkpoint_state()
+            .await
+            .expect("reconcile loop");
+        assert_eq!(
+            adapter.checkpoint_calls.load(Ordering::SeqCst),
+            initial_calls
+        );
+        let unchanged = svc
+            .get_work_item(item.id)
+            .await
+            .expect("item")
+            .expect("item row");
+        assert_eq!(unchanged.state, WorkItemState::Pending);
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let verification_errors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM checkpoint_verification WHERE root_work_item_id = ?1",
+                [item.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("verification error");
+        assert_eq!(verification_errors, 1);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_read_outage_defers_quiescent_human_and_terminal_verification() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let mut human = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        human.human_gate = true;
+        human.state = WorkItemState::Running;
+        svc.update_work_item(&human).await.expect("human root");
+        let mut terminal = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        terminal.state = WorkItemState::Succeeded;
+        svc.update_work_item(&terminal)
+            .await
+            .expect("terminal root");
+        adapter.fail_checkpoint_read.store(true, Ordering::SeqCst);
+
+        svc.reconcile_checkpoint_state()
+            .await
+            .expect("defer verification");
+        assert_eq!(
+            svc.get_work_item(human.id)
+                .await
+                .expect("human")
+                .expect("human row")
+                .state,
+            WorkItemState::Running
+        );
+        assert_eq!(
+            svc.get_work_item(terminal.id)
+                .await
+                .expect("terminal")
+                .expect("terminal row")
+                .state,
+            WorkItemState::Succeeded
+        );
+        assert!(adapter.assignees.lock().expect("assignees").is_empty());
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let deferred: i64 = conn
+            .query_row("SELECT COUNT(*) FROM checkpoint_verification", [], |row| {
+                row.get(0)
+            })
+            .expect("verification rows");
+        assert_eq!(deferred, 2);
+        drop(conn);
+        adapter.fail_checkpoint_read.store(false, Ordering::SeqCst);
+        adapter.unblock();
+        svc.reconcile_checkpoint_state()
+            .await
+            .expect("provider recovery");
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM checkpoint_verification", [], |row| {
+                row.get(0)
+            })
+            .expect("verification rows after recovery");
+        assert_eq!(remaining, 0);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_read_outage_fails_closed_when_staged_transition_needs_authority() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        adapter.fail_checkpoint_read.store(true, Ordering::SeqCst);
+
+        assert!(svc.persist_task_projection(&item, None).await.is_err());
+        assert_eq!(
+            svc.get_job(job.id)
+                .await
+                .expect("job")
+                .expect("job row")
+                .state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            svc.get_work_item(item.id)
+                .await
+                .expect("item")
+                .expect("item row")
+                .state,
+            WorkItemState::Failed
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn restart_retries_terminal_checkpoint_before_projection() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        item.state = WorkItemState::Succeeded;
+        item.updated_at = Utc::now();
+        svc.update_work_item(&item)
+            .await
+            .expect("persist local terminal");
+        let mut task = recovery_test_task(false);
+        task.id = item.id;
+        task.updated_at = item.updated_at - chrono::TimeDelta::seconds(1);
+        adapter.tasks.lock().expect("tasks").push(task);
+        drop(svc);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted
+            .init()
+            .await
+            .expect("restart terminal reconciliation");
+        let checkpoint = adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint")
+            .clone()
+            .expect("terminal checkpoint");
+        assert_eq!(checkpoint.phase, "done");
+        assert_eq!(
+            adapter
+                .events
+                .lock()
+                .expect("events")
+                .first()
+                .map(String::as_str),
+            Some("checkpoint:done")
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let projection_pending: i64 = conn
+            .query_row(
+                "SELECT projection_pending FROM checkpoint_outbox WHERE root_work_item_id = ?1",
+                [item.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("projection state");
+        assert_eq!(projection_pending, 0);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn file_adapter_restart_reconciles_checkpoint_release_and_projection_retry() {
+        let db = std::env::temp_dir().join(format!("orch-file-{}.sqlite3", Uuid::new_v4()));
+        let tasks_dir = std::env::temp_dir().join(format!("orch-file-tasks-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks_dir.clone()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        let blocked_task_path = tasks_dir.join(format!("{}.json", item.id));
+        std::fs::create_dir_all(&blocked_task_path).expect("block projection path");
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("checkpoint commits while projection remains pending");
+        assert!(
+            svc.projection_is_pending(item.id)
+                .await
+                .expect("projection state")
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let released: i64 = conn
+            .query_row(
+                "SELECT dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("release");
+        assert_eq!(released, 1);
+        drop(conn);
+        std::fs::remove_dir(&blocked_task_path).expect("unblock projection path");
+        drop(svc);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted.init().await.expect("restart");
+        assert!(
+            !restarted
+                .projection_is_pending(item.id)
+                .await
+                .expect("projection state")
+        );
+        assert!(adapter.get_task(item.id).expect("task read").is_some());
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks_dir);
+    }
+
+    #[tokio::test]
+    async fn migration_fails_ambiguous_legacy_active_jobs_closed() {
+        let db = std::env::temp_dir().join(format!("orch-legacy-{}.sqlite3", Uuid::new_v4()));
+        let root_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        let conn = Connection::open(db.as_path()).expect("legacy db");
+        conn.execute_batch(
+            "CREATE TABLE work_items (
+                id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, session_id TEXT,
+                current_step TEXT NOT NULL, blocked_on TEXT, state TEXT NOT NULL,
+                context_json TEXT NOT NULL, repo_json TEXT, parent_work_item_id TEXT,
+                parent_step_id TEXT, child_work_item_id TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL, step_id TEXT NOT NULL,
+                state TEXT NOT NULL, assigned_worker_id TEXT, execution_mode TEXT NOT NULL,
+                command TEXT NOT NULL, args_json TEXT NOT NULL, env_json TEXT NOT NULL,
+                prompt_json TEXT, context_json TEXT NOT NULL, transcript_dir TEXT,
+                lease_expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );",
+        )
+        .expect("legacy schema");
+        conn.execute(
+            "INSERT INTO work_items (id, workflow_id, current_step, state, context_json, created_at, updated_at) VALUES (?1, 'wf', 'build', ?2, '{}', ?3, ?3)",
+            params![root_id.to_string(), WorkItemState::Running.to_string(), now],
+        )
+        .expect("legacy item");
+        conn.execute(
+            "INSERT INTO jobs (id, work_item_id, step_id, state, execution_mode, command, args_json, env_json, context_json, created_at, updated_at) VALUES (?1, ?2, 'build', ?3, 'raw', 'true', '[]', '{}', '{}', ?4, ?4)",
+            params![job_id.to_string(), root_id.to_string(), JobState::Pending.to_string(), now],
+        )
+        .expect("legacy job");
+        drop(conn);
+
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("migrate");
+        let job = svc.get_job(job_id).await.expect("job").expect("job row");
+        assert_eq!(job.state, JobState::Cancelled);
+        let item = svc
+            .get_work_item(root_id)
+            .await
+            .expect("item")
+            .expect("item row");
+        assert_eq!(item.state, WorkItemState::Failed);
+        assert!(item.human_gate);
+        assert!(
+            item.last_failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("migration"))
+        );
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn migration_resolves_nested_child_job_to_provider_root_and_fails_tree_closed() {
+        let db = std::env::temp_dir().join(format!("orch-legacy-{}.sqlite3", Uuid::new_v4()));
+        let root_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        let conn = Connection::open(db.as_path()).expect("legacy db");
+        conn.execute_batch(
+            "CREATE TABLE work_items (
+                id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, external_task_id TEXT,
+                session_id TEXT, current_step TEXT NOT NULL, blocked_on TEXT,
+                state TEXT NOT NULL, context_json TEXT NOT NULL, repo_json TEXT,
+                parent_work_item_id TEXT, parent_step_id TEXT, child_work_item_id TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL, step_id TEXT NOT NULL,
+                state TEXT NOT NULL, assigned_worker_id TEXT, execution_mode TEXT NOT NULL,
+                command TEXT NOT NULL, args_json TEXT NOT NULL, env_json TEXT NOT NULL,
+                prompt_json TEXT, context_json TEXT NOT NULL, transcript_dir TEXT,
+                lease_expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );",
+        )
+        .expect("legacy schema");
+        conn.execute(
+            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, child_work_item_id, created_at, updated_at) VALUES (?1, 'wf', ?1, 'build', ?2, ?3, ?4, ?5, ?5)",
+            params![
+                root_id.to_string(),
+                WorkItemState::Running.to_string(),
+                serde_json::json!({"remembered_human_owner": "alice"}).to_string(),
+                child_id.to_string(),
+                now,
+            ],
+        )
+        .expect("root");
+        conn.execute(
+            "INSERT INTO work_items (id, workflow_id, current_step, state, context_json, parent_work_item_id, created_at, updated_at) VALUES (?1, 'wf', 'build', ?2, '{}', ?3, ?4, ?4)",
+            params![
+                child_id.to_string(),
+                WorkItemState::Running.to_string(),
+                root_id.to_string(),
+                now,
+            ],
+        )
+        .expect("child");
+        conn.execute(
+            "INSERT INTO jobs (id, work_item_id, step_id, state, execution_mode, command, args_json, env_json, context_json, created_at, updated_at) VALUES (?1, ?2, 'build', ?3, 'raw', 'true', '[]', '{}', '{}', ?4, ?4)",
+            params![job_id.to_string(), child_id.to_string(), JobState::Running.to_string(), now],
+        )
+        .expect("child job");
+        drop(conn);
+
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let mut task = recovery_test_task(false);
+        task.id = root_id;
+        task.updated_at = Utc::now() - chrono::TimeDelta::hours(1);
+        adapter.tasks.lock().expect("tasks").push(task);
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("migrate nested tree");
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let owner: String = conn
+            .query_row(
+                "SELECT checkpoint_owner_id FROM jobs WHERE id = ?1",
+                [job_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("job owner");
+        assert_eq!(owner, root_id.to_string());
+        drop(conn);
+        assert_eq!(
+            svc.get_job(job_id)
+                .await
+                .expect("job")
+                .expect("job row")
+                .state,
+            JobState::Cancelled
+        );
+        for item_id in [root_id, child_id] {
+            let item = svc
+                .get_work_item(item_id)
+                .await
+                .expect("item")
+                .expect("item row");
+            assert_eq!(item.state, WorkItemState::Failed);
+            assert!(item.human_gate);
+        }
+        assert!(matches!(
+            adapter.assignees.lock().expect("assignees").last(),
+            Some(TaskAssignee::Human(owner)) if owner == "alice"
+        ));
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_roots_with_only_terminal_or_no_job_history() {
+        let cases = [
+            (Some(JobState::Succeeded), WorkItemState::Succeeded),
+            (Some(JobState::Failed), WorkItemState::Failed),
+            (Some(JobState::Cancelled), WorkItemState::Cancelled),
+            (None, WorkItemState::Succeeded),
+        ];
+        for (job_state, root_state) in cases {
+            let db = std::env::temp_dir().join(format!("orch-history-{}.sqlite3", Uuid::new_v4()));
+            let root_id = Uuid::new_v4();
+            let job_id = Uuid::new_v4();
+            let now = Utc::now().to_rfc3339();
+            let conn = Connection::open(db.as_path()).expect("legacy db");
+            conn.execute_batch(
+                "CREATE TABLE work_items (
+                    id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, session_id TEXT,
+                    current_step TEXT NOT NULL, blocked_on TEXT, state TEXT NOT NULL,
+                    context_json TEXT NOT NULL, repo_json TEXT, parent_work_item_id TEXT,
+                    parent_step_id TEXT, child_work_item_id TEXT, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL, step_id TEXT NOT NULL,
+                    state TEXT NOT NULL, assigned_worker_id TEXT, execution_mode TEXT NOT NULL,
+                    command TEXT NOT NULL, args_json TEXT NOT NULL, env_json TEXT NOT NULL,
+                    prompt_json TEXT, context_json TEXT NOT NULL, transcript_dir TEXT,
+                    lease_expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );",
+            )
+            .expect("legacy schema");
+            conn.execute(
+                "INSERT INTO work_items (id, workflow_id, current_step, state, context_json, created_at, updated_at) VALUES (?1, 'wf', 'terminal', ?2, '{}', ?3, ?3)",
+                params![root_id.to_string(), root_state.to_string(), now],
+            )
+            .expect("root");
+            if let Some(job_state) = job_state.as_ref() {
+                conn.execute(
+                    "INSERT INTO jobs (id, work_item_id, step_id, state, execution_mode, command, args_json, env_json, context_json, created_at, updated_at) VALUES (?1, ?2, 'build', ?3, 'raw', 'true', '[]', '{}', '{}', ?4, ?4)",
+                    params![job_id.to_string(), root_id.to_string(), job_state.to_string(), now],
+                )
+                .expect("historical job");
+            }
+            drop(conn);
+            let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+            let svc = OrchestrationService::new(
+                workflow_catalog(),
+                Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+                db.to_string_lossy().into_owned(),
+            );
+            svc.init().await.expect("migrate history");
+            let item = svc
+                .get_work_item(root_id)
+                .await
+                .expect("root")
+                .expect("root row");
+            assert_eq!(item.state, root_state);
+            assert!(!item.human_gate);
+            let conn = Connection::open(db.as_path()).expect("sqlite");
+            let obligations: i64 = conn
+                .query_row("SELECT COUNT(*) FROM ownership_return_outbox", [], |row| {
+                    row.get(0)
+                })
+                .expect("obligations");
+            assert_eq!(obligations, 0);
+            if job_state.is_some() {
+                let (stored_state, owner): (String, String) = conn
+                    .query_row(
+                        "SELECT state, checkpoint_owner_id FROM jobs WHERE id = ?1",
+                        [job_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .expect("historical job");
+                assert_eq!(
+                    stored_state,
+                    job_state.as_ref().expect("job state").to_string()
+                );
+                assert_eq!(owner, root_id.to_string());
+            }
+            let _ = std::fs::remove_file(db);
+            let _ = std::fs::remove_dir_all(tasks);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_gate_migration_rolls_back_and_resumes_before_ownership_obligation() {
+        let db = std::env::temp_dir().join(format!("orch-rollback-{}.sqlite3", Uuid::new_v4()));
+        let root_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        let conn = Connection::open(db.as_path()).expect("legacy db");
+        conn.execute_batch(
+            "CREATE TABLE work_items (
+                id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, external_task_id TEXT,
+                session_id TEXT, current_step TEXT NOT NULL, state TEXT NOT NULL,
+                context_json TEXT NOT NULL, parent_work_item_id TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL, step_id TEXT NOT NULL,
+                state TEXT NOT NULL, assigned_worker_id TEXT, execution_mode TEXT NOT NULL,
+                command TEXT NOT NULL,
+                args_json TEXT NOT NULL, env_json TEXT NOT NULL, context_json TEXT NOT NULL,
+                prompt_json TEXT, transcript_dir TEXT, lease_expires_at TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE ownership_return_outbox (
+                root_work_item_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, human_owner TEXT,
+                human_owner_provider_id TEXT, last_error TEXT, updated_at TEXT NOT NULL
+            );
+            CREATE TRIGGER reject_migration_obligation BEFORE INSERT ON ownership_return_outbox
+            BEGIN SELECT RAISE(ABORT, 'injected migration interruption'); END;",
+        )
+        .expect("legacy schema");
+        conn.execute(
+            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, created_at, updated_at) VALUES (?1, 'wf', ?1, 'build', ?2, ?3, ?4, ?4)",
+            params![
+                root_id.to_string(),
+                WorkItemState::Running.to_string(),
+                serde_json::json!({"remembered_human_owner": "alice"}).to_string(),
+                now,
+            ],
+        )
+        .expect("root");
+        conn.execute(
+            "INSERT INTO jobs (id, work_item_id, step_id, state, execution_mode, command, args_json, env_json, context_json, created_at, updated_at) VALUES (?1, ?2, 'build', ?3, 'raw', 'true', '[]', '{}', '{}', ?4, ?4)",
+            params![job_id.to_string(), root_id.to_string(), JobState::Pending.to_string(), now],
+        )
+        .expect("job");
+        drop(conn);
+
+        let interrupted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(ControlledCheckpointAdapter::default()) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        let error = interrupted
+            .init()
+            .await
+            .expect_err("injected migration must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("injected migration interruption")
+        );
+        drop(interrupted);
+        let conn = Connection::open(db.as_path()).expect("sqlite after rollback");
+        assert!(!column_exists(&conn, DbTable::Jobs, "dispatch_released").expect("columns"));
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM jobs WHERE id = ?1",
+                [job_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("job state");
+        assert_eq!(state, JobState::Pending.to_string());
+        conn.execute_batch("DROP TRIGGER reject_migration_obligation")
+            .expect("remove failpoint");
+        drop(conn);
+
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let mut task = recovery_test_task(false);
+        task.id = root_id;
+        adapter.tasks.lock().expect("tasks").push(task);
+        let resumed = OrchestrationService::new(
+            workflow_catalog(),
+            adapter as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        resumed.init().await.expect("migration resumes");
+        assert_eq!(
+            resumed
+                .get_job(job_id)
+                .await
+                .expect("job")
+                .expect("job row")
+                .state,
+            JobState::Cancelled
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = 'dispatch_checkpoint_gate_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("marker");
+        assert_eq!(marker, 1);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn ownership_return_retries_exact_remembered_human_without_releasing_work() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.fail_checkpoint.store(true, Ordering::SeqCst);
+        adapter.fail_assignee.store(true, Ordering::SeqCst);
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_operator_login(Some("configured-operator".to_string()));
+        svc.init().await.expect("init");
+        let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        item.context["remembered_human_owner"] = serde_json::json!("observed-human");
+        item.context["remembered_human_owner_provider_id"] = serde_json::json!("1234");
+        svc.update_work_item(&item).await.expect("remember owner");
+        let job = checkpoint_test_job(item.id);
+        svc.insert_job(&job).await.expect("stage");
+        assert!(svc.persist_task_projection(&item, None).await.is_err());
+
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let (obligation_owner, obligation_owner_id): (String, String) = conn
+            .query_row(
+                "SELECT human_owner, human_owner_provider_id FROM ownership_return_outbox WHERE root_work_item_id = ?1",
+                [item.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("ownership obligation");
+        assert_eq!(obligation_owner, "observed-human");
+        assert_eq!(obligation_owner_id, "1234");
+        drop(conn);
+        adapter.fail_assignee.store(false, Ordering::SeqCst);
+        svc.retry_ownership_returns()
+            .await
+            .expect("retry ownership");
+        assert!(matches!(
+            adapter.assignees.lock().expect("assignees").last(),
+            Some(TaskAssignee::HumanProviderId(owner_id)) if owner_id == "1234"
+        ));
+        let conn = Connection::open(db.as_path()).expect("open sqlite");
+        let obligations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ownership_return_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("obligation count");
+        assert_eq!(obligations, 0);
+        let released: i64 = conn
+            .query_row(
+                "SELECT dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("release state");
+        assert_eq!(released, 0);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn sqlite_loss_restores_terminal_checkpoint_without_dispatch() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let task = recovery_test_task(true);
+        adapter.tasks.lock().expect("tasks").push(task.clone());
+        *adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint to read") = Some(TaskCheckpoint {
+            current_step: "test".to_string(),
+            phase: "done".to_string(),
+            workflow_id: "wf".to_string(),
+            repo: None,
+            pr_url: None,
+            pr_status: None,
+            human_gate: false,
+            failure_info: None,
+            updated_at: Utc::now(),
+            human_gate_state: None,
+            triage_status: Some("completed".to_string()),
+            human_owner: Some("operator".to_string()),
+            human_owner_provider_id: None,
+            dispatch_job_ids: Vec::new(),
+            generation: 0,
+            checkpoint_hash: String::new(),
+            semantic_hash: String::new(),
+        });
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("recover terminal");
+
+        let recovered = svc
+            .get_work_item(task.id)
+            .await
+            .expect("item")
+            .expect("recovered item");
+        assert_eq!(recovered.state, WorkItemState::Succeeded);
+        assert!(
+            svc.select_jobs_for_work_item(task.id)
+                .await
+                .expect("jobs")
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn sqlite_loss_records_unverifiable_provider_job_ids_and_requires_human_confirmation() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let task = recovery_test_task(true);
+        adapter.tasks.lock().expect("tasks").push(task.clone());
+        let lost_job_id = Uuid::new_v4();
+        let mut checkpoint = TaskCheckpoint {
+            current_step: "test".to_string(),
+            phase: "done".to_string(),
+            workflow_id: "wf".to_string(),
+            repo: None,
+            pr_url: None,
+            pr_status: None,
+            human_gate: false,
+            failure_info: None,
+            updated_at: Utc::now(),
+            human_gate_state: None,
+            triage_status: Some("completed".to_string()),
+            human_owner: Some("operator".to_string()),
+            human_owner_provider_id: None,
+            dispatch_job_ids: vec![lost_job_id],
+            generation: 1,
+            checkpoint_hash: String::new(),
+            semantic_hash: String::new(),
+        };
+        checkpoint.semantic_hash = checkpoint_semantic_hash(&checkpoint).expect("semantic hash");
+        checkpoint.checkpoint_hash = checkpoint_hash(&checkpoint).expect("checkpoint hash");
+        *adapter
+            .checkpoint_to_read
+            .lock()
+            .expect("checkpoint to read") = Some(checkpoint);
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_operator_login(Some("operator".to_string()));
+        svc.init().await.expect("fail-closed SQLite-loss recovery");
+        let recovered = svc
+            .get_work_item(task.id)
+            .await
+            .expect("item")
+            .expect("item row");
+        assert_eq!(recovered.state, WorkItemState::Failed);
+        assert_eq!(
+            recovered
+                .context
+                .get("unverifiable_authoritative_job_ids")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            Some(lost_job_id.to_string())
+        );
+        assert!(
+            svc.select_jobs_for_work_item(task.id)
+                .await
+                .expect("jobs")
+                .is_empty()
+        );
+        assert!(matches!(
+            adapter.assignees.lock().expect("assignees").last(),
+            Some(TaskAssignee::Human(owner)) if owner == "operator"
+        ));
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn sqlite_loss_does_not_repeat_executable_checkpoint_or_bot_owned_no_history() {
+        for checkpoint in [
+            Some(TaskCheckpoint {
+                current_step: "build".to_string(),
+                phase: "executing".to_string(),
+                workflow_id: "wf".to_string(),
+                repo: None,
+                pr_url: None,
+                pr_status: None,
+                human_gate: false,
+                failure_info: None,
+                updated_at: Utc::now(),
+                human_gate_state: None,
+                triage_status: Some("in_progress".to_string()),
+                human_owner: Some("operator".to_string()),
+                human_owner_provider_id: None,
+                dispatch_job_ids: Vec::new(),
+                generation: 0,
+                checkpoint_hash: String::new(),
+                semantic_hash: String::new(),
+            }),
+            None,
+        ] {
+            let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+            let adapter = Arc::new(ControlledCheckpointAdapter::default());
+            let task = recovery_test_task(true);
+            adapter.tasks.lock().expect("tasks").push(task.clone());
+            *adapter
+                .checkpoint_to_read
+                .lock()
+                .expect("checkpoint to read") = checkpoint;
+            let svc = OrchestrationService::new(
+                workflow_catalog(),
+                Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+                db.to_string_lossy().into_owned(),
+            )
+            .with_operator_login(Some("operator".to_string()));
+            svc.init().await.expect("recover safely");
+
+            let recovered = svc
+                .get_work_item(task.id)
+                .await
+                .expect("item")
+                .expect("recovery failure item");
+            assert_eq!(recovered.state, WorkItemState::Failed);
+            assert!(recovered.human_gate);
+            assert!(
+                svc.select_jobs_for_work_item(task.id)
+                    .await
+                    .expect("jobs")
+                    .is_empty()
+            );
+            assert!(matches!(
+                adapter.assignees.lock().expect("assignees").last(),
+                Some(TaskAssignee::Human(owner)) if owner == "operator"
+            ));
+            let _ = std::fs::remove_file(db);
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_read_error_creates_no_initial_job() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.fail_checkpoint_read.store(true, Ordering::SeqCst);
+        let task = recovery_test_task(false);
+        adapter.tasks.lock().expect("tasks").push(task.clone());
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init fails closed locally");
+
+        let recovered = svc
+            .get_work_item(task.id)
+            .await
+            .expect("item")
+            .expect("recovery failure item");
+        assert_eq!(recovered.state, WorkItemState::Failed);
+        assert!(
+            svc.select_jobs_for_work_item(task.id)
+                .await
+                .expect("jobs")
+                .is_empty()
+        );
+        assert_eq!(adapter.checkpoint_calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_file(db);
+    }
 
     fn failed_job_result() -> JobResult {
         JobResult {
@@ -7509,7 +11160,10 @@ args = ["beta"]
             .network_resources
             .clone()
             .expect("environment default should populate network_resources");
-        assert!(matches!(env_resources, NetworkResourceRequest::Resources(_)));
+        assert!(matches!(
+            env_resources,
+            NetworkResourceRequest::Resources(_)
+        ));
         assert_eq!(runtime.environment.network.as_deref(), Some("restricted"));
     }
 
@@ -9177,8 +12831,8 @@ args = ["beta"]
 
     #[test]
     fn parse_pr_url_components_strips_trailing_dot_git_on_repo_segment() {
-        let parts = parse_pr_url_components("https://github.com/owner/my-repo.git/pull/9")
-            .expect("parses");
+        let parts =
+            parse_pr_url_components("https://github.com/owner/my-repo.git/pull/9").expect("parses");
         assert_eq!(parts.repo, "my-repo");
     }
 
@@ -9192,7 +12846,6 @@ args = ["beta"]
                 .is_none()
         );
     }
-
 
     #[test]
     fn stamp_state_entered_records_timestamp_only_when_step_changes() {
@@ -11312,6 +14965,7 @@ args = ["child"]
             updated_at: now,
         };
 
+        let _owner = insert_checkpoint_test_item(&svc, job.work_item_id, None).await;
         svc.insert_job(&job).await.expect("insert job");
         let loaded = svc.get_job(job.id).await.expect("get job").expect("exists");
         assert_eq!(loaded.execution_mode, protocol::ExecutionMode::Docker);
@@ -11408,6 +15062,7 @@ args = ["child"]
         };
         project_runtime_spec_into_job_context(&mut job.context, &runtime);
 
+        let _owner = insert_checkpoint_test_item(&svc, job.work_item_id, None).await;
         svc.insert_job(&job).await.expect("insert job");
 
         let conn = Connection::open(db.as_path()).expect("open sqlite");
@@ -11492,7 +15147,11 @@ args = ["child"]
         };
         project_runtime_spec_into_job_context(&mut job.context, &runtime);
 
+        let owner = insert_checkpoint_test_item(&svc, job.work_item_id, None).await;
         svc.insert_job(&job).await.expect("insert");
+        svc.persist_task_projection(&owner, None)
+            .await
+            .expect("release after checkpoint");
 
         svc.register_worker(RegisterWorkerRequest {
             id: "docker-worker".into(),
@@ -14448,8 +18107,7 @@ kind = "terminal"
             (
                 "simple-code-change".to_string(),
                 Some(
-                    "Use this when writing code end-to-end.\nFollow up with a PR step."
-                        .to_string(),
+                    "Use this when writing code end-to-end.\nFollow up with a PR step.".to_string(),
                 ),
             ),
             ("github-pr".to_string(), Some("PR-only flow.".to_string())),
@@ -14474,7 +18132,10 @@ kind = "terminal"
         let summary = triage_workflow_summary(vec![
             ("b".to_string(), Some("hint b".to_string())),
             ("a".to_string(), None),
-            ("b".to_string(), Some("dupe — should be dropped".to_string())),
+            (
+                "b".to_string(),
+                Some("dupe — should be dropped".to_string()),
+            ),
         ]);
         assert_eq!(summary, "- a\n- b\n  hint b");
     }

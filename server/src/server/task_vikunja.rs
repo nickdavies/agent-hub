@@ -351,12 +351,23 @@ fn extract_agent_hub_marker(comment: &str, marker_prefix: &str) -> Option<String
     Some(tail[..end + 3].to_string())
 }
 
-fn latest_checkpoint_from_comments(comments: &[VikunjaComment]) -> Option<TaskCheckpoint> {
-    comments.iter().rev().find_map(|comment| {
-        let marker = extract_agent_hub_marker(&comment.comment, "<!-- agent-hub:checkpoint")?;
-        let yaml = extract_yaml_block(&comment.comment, &marker)?;
-        serde_yaml::from_str::<TaskCheckpoint>(&yaml).ok()
-    })
+fn authoritative_checkpoint_from_comments(
+    comments: &[VikunjaComment],
+) -> anyhow::Result<Option<TaskCheckpoint>> {
+    for comment in comments.iter().rev() {
+        let Some(marker) = extract_agent_hub_marker(&comment.comment, "<!-- agent-hub:checkpoint")
+        else {
+            continue;
+        };
+        let yaml = extract_yaml_block(&comment.comment, &marker).ok_or_else(|| {
+            anyhow::anyhow!("checkpoint comment {} has no YAML block", comment.id)
+        })?;
+        let checkpoint = serde_yaml::from_str::<TaskCheckpoint>(&yaml).map_err(|error| {
+            anyhow::anyhow!("checkpoint comment {} is malformed: {error}", comment.id)
+        })?;
+        return Ok(Some(checkpoint));
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Serialize)]
@@ -1136,7 +1147,7 @@ impl VikunjaAdapter {
         task: &VikunjaTask,
         comments: &[VikunjaComment],
         assignment_to_bot_transition: bool,
-    ) -> TaskToolRecord {
+    ) -> anyhow::Result<TaskToolRecord> {
         let uuid = vikunja_task_uuid(&self.base_url, task.id);
         let (clean_desc, metadata) = parse_description_metadata(&task.description);
         let labels: Vec<String> = task.labels.iter().map(|l| l.title.clone()).collect();
@@ -1159,7 +1170,7 @@ impl VikunjaAdapter {
             })
             .unwrap_or(0);
 
-        let checkpoint = latest_checkpoint_from_comments(comments);
+        let checkpoint = authoritative_checkpoint_from_comments(comments)?;
         // A human → bot reassignment is only treated as an Approve when the
         // most recent checkpoint comment says `human_gate: true`. The
         // orchestrator writes the checkpoint *before* changing the assignee
@@ -1226,9 +1237,7 @@ impl VikunjaAdapter {
         let pending_human_action = needs_triage || checkpoint_human_gate;
         let human_gate_state: Option<TaskHumanGateState> = checkpoint_human_gate_state_raw
             .as_deref()
-            .and_then(|v| {
-                serde_json::from_value(serde_json::Value::String(v.to_string())).ok()
-            });
+            .and_then(|v| serde_json::from_value(serde_json::Value::String(v.to_string())).ok());
         let triage_status_from_checkpoint = checkpoint_triage_status_raw.as_deref().and_then(|v| {
             serde_json::from_value::<TaskTriageStatus>(serde_json::Value::String(v.to_string()))
                 .ok()
@@ -1249,6 +1258,7 @@ impl VikunjaAdapter {
             "labels": labels,
             "assignees": task.assignees.iter().map(|a| &a.username).collect::<Vec<_>>(),
             "assignee_ids": task.assignees.iter().map(|a| a.id).collect::<Vec<_>>(),
+            "assigned_to_bot": task.assignees.iter().any(|a| a.id == self.bot_user_id),
             "done": task.done,
             "priority": task.priority,
             "vikunja_created": task.created,
@@ -1272,12 +1282,30 @@ impl VikunjaAdapter {
                     serde_json::Value::String(status.clone()),
                 );
             }
+            if let Some(owner) = checkpoint.as_ref().and_then(|c| c.human_owner.as_ref()) {
+                cp_context.insert(
+                    "human_owner".to_string(),
+                    serde_json::Value::String(owner.clone()),
+                );
+            }
+            if let Some(owner_id) = checkpoint
+                .as_ref()
+                .and_then(|c| c.human_owner_provider_id.as_ref())
+            {
+                cp_context.insert(
+                    "human_owner_provider_id".to_string(),
+                    serde_json::Value::String(owner_id.clone()),
+                );
+            }
             if let Some(obj) = context.as_object_mut() {
-                obj.insert("checkpoint".to_string(), serde_json::Value::Object(cp_context));
+                obj.insert(
+                    "checkpoint".to_string(),
+                    serde_json::Value::Object(cp_context),
+                );
             }
         }
 
-        TaskToolRecord {
+        Ok(TaskToolRecord {
             id: uuid,
             title: task.title.clone(),
             description: Some(clean_desc),
@@ -1297,7 +1325,7 @@ impl VikunjaAdapter {
             updated_at,
             requested_action,
             action_revision,
-        }
+        })
     }
 
     fn assignee_ids(task: &VikunjaTask) -> Vec<i64> {
@@ -1410,7 +1438,8 @@ impl VikunjaAdapter {
             current_assignment_known.insert(task_id, assignee_ids);
 
             let comments = self.get_task_comments(task.id)?;
-            let record = self.vikunja_task_to_record(&task, &comments, transitioned_human_to_bot);
+            let record =
+                self.vikunja_task_to_record(&task, &comments, transitioned_human_to_bot)?;
             self.cache_task_id(record.id, task.id)?;
             records.push(TaskSyncRecord { external: record });
         }
@@ -1691,7 +1720,9 @@ fn summarize_json_value(value: &serde_json::Value) -> String {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Bool(v) => v.to_string(),
         serde_json::Value::Number(v) => v.to_string(),
-        serde_json::Value::String(v) => truncate_chars_with_ellipsis(v.trim(), SUMMARIZE_STRING_HARD_CAP),
+        serde_json::Value::String(v) => {
+            truncate_chars_with_ellipsis(v.trim(), SUMMARIZE_STRING_HARD_CAP)
+        }
         serde_json::Value::Array(values) => format!("array({})", values.len()),
         serde_json::Value::Object(values) => {
             let keys = values.keys().take(3).cloned().collect::<Vec<_>>();
@@ -2081,37 +2112,9 @@ impl TaskAdapter for VikunjaAdapter {
     fn read_checkpoint(&self, task_id: &str) -> anyhow::Result<Option<TaskCheckpoint>> {
         let vikunja_task_id = self.resolve_task_numeric_id(task_id)?;
         let comments = self.get_task_comments(vikunja_task_id)?;
-
-        for comment in comments.iter().rev() {
-            let Some(marker) =
-                extract_agent_hub_marker(&comment.comment, "<!-- agent-hub:checkpoint")
-            else {
-                continue;
-            };
-
-            let Some(yaml) = extract_yaml_block(&comment.comment, &marker) else {
-                tracing::warn!(
-                    comment_id = comment.id,
-                    task_id = vikunja_task_id,
-                    "checkpoint marker found but no YAML block present"
-                );
-                continue;
-            };
-
-            match serde_yaml::from_str::<TaskCheckpoint>(&yaml) {
-                Ok(parsed) => return Ok(Some(parsed)),
-                Err(error) => {
-                    tracing::warn!(
-                        comment_id = comment.id,
-                        task_id = vikunja_task_id,
-                        error = ?error,
-                        "failed to parse checkpoint YAML comment"
-                    );
-                }
-            }
-        }
-
-        Ok(None)
+        authoritative_checkpoint_from_comments(&comments).map_err(|error| {
+            anyhow::anyhow!("failed to read checkpoint for task {vikunja_task_id}: {error}")
+        })
     }
 
     fn read_triage_result(&self, task_id: &str) -> anyhow::Result<Option<TriageResult>> {
@@ -2194,7 +2197,12 @@ impl TaskAdapter for VikunjaAdapter {
 
         let target_user_id = match assignee {
             TaskAssignee::Bot => Some(self.bot_user_id),
-            TaskAssignee::Human(_) => Some(self.operator_user_id),
+            TaskAssignee::Human(username) => Some(self.resolve_required_user_id(username)?),
+            TaskAssignee::HumanProviderId(user_id) => Some(
+                user_id
+                    .parse::<i64>()
+                    .with_context(|| format!("invalid remembered Vikunja user id '{user_id}'"))?,
+            ),
             TaskAssignee::Unassigned => None,
         };
 
@@ -2283,14 +2291,7 @@ mod tests {
     use super::*;
 
     fn checkpoint_comment(human_gate: bool) -> String {
-        checkpoint_comment_full(
-            "wf",
-            "review",
-            "review",
-            human_gate,
-            None,
-            None,
-        )
+        checkpoint_comment_full("wf", "review", "review", human_gate, None, None)
     }
 
     fn checkpoint_comment_full(
@@ -2409,20 +2410,16 @@ mod tests {
 
     #[test]
     fn test_parse_comment_action_html_wrapped_approve_with_reason() {
-        let action = parse_comment_action(
-            "<p><code>/ah approve looks good to me</code></p>",
-        )
-        .expect("HTML-wrapped /ah approve should parse");
+        let action = parse_comment_action("<p><code>/ah approve looks good to me</code></p>")
+            .expect("HTML-wrapped /ah approve should parse");
         assert_eq!(action.kind, HumanActionKind::Approve);
         assert_eq!(action.reason.as_deref(), Some("looks good to me"));
     }
 
     #[test]
     fn test_parse_comment_action_html_entity_amp_in_reason() {
-        let action = parse_comment_action(
-            "<p>/ah request_changes fix &amp; retry</p>",
-        )
-        .expect("HTML-encoded entity should decode");
+        let action = parse_comment_action("<p>/ah request_changes fix &amp; retry</p>")
+            .expect("HTML-encoded entity should decode");
         assert_eq!(action.kind, HumanActionKind::RequestChanges);
         assert_eq!(action.reason.as_deref(), Some("fix & retry"));
     }
@@ -2518,8 +2515,54 @@ mod tests {
             },
         ];
 
-        let checkpoint = latest_checkpoint_from_comments(&comments).expect("checkpoint expected");
+        let checkpoint = authoritative_checkpoint_from_comments(&comments)
+            .expect("checkpoint parse")
+            .expect("checkpoint expected");
         assert!(checkpoint.human_gate);
+    }
+
+    #[test]
+    fn authoritative_checkpoint_rejects_marked_malformed_comment() {
+        let comments = vec![VikunjaComment {
+            id: 7,
+            comment: format!("{CHECKPOINT_MARKER}\n```yaml\nnot: [valid\n```"),
+            author: VikunjaUser {
+                id: 10,
+                username: "alice".to_string(),
+                email: None,
+            },
+            created: "2026-01-01T00:00:00Z".to_string(),
+            updated: "2026-01-01T00:00:00Z".to_string(),
+        }];
+
+        let error = authoritative_checkpoint_from_comments(&comments)
+            .expect_err("marked malformed checkpoint must fail closed");
+        assert!(error.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn task_sync_rejects_newest_malformed_checkpoint_even_with_older_valid_checkpoint() {
+        let adapter = test_adapter();
+        let task = test_task();
+        let comments = vec![
+            checkpoint_vikunja_comment(&checkpoint_comment(false)),
+            VikunjaComment {
+                id: 99,
+                comment: format!("{CHECKPOINT_MARKER}\n```yaml\ninvalid: [checkpoint\n```"),
+                author: VikunjaUser {
+                    id: 10,
+                    username: "alice".to_string(),
+                    email: None,
+                },
+                created: "2026-01-01T00:02:00Z".to_string(),
+                updated: "2026-01-01T00:02:00Z".to_string(),
+            },
+        ];
+
+        let error = adapter
+            .vikunja_task_to_record(&task, &comments, false)
+            .expect_err("sync conversion must fail closed on newest malformed marker");
+        assert!(error.to_string().contains("malformed"));
     }
 
     #[test]
@@ -2604,7 +2647,9 @@ mod tests {
             Some("pending_approval"),
         ))];
 
-        let record = adapter.vikunja_task_to_record(&task, &comments, false);
+        let record = adapter
+            .vikunja_task_to_record(&task, &comments, false)
+            .expect("task record");
 
         assert!(record.pending_human_action);
         assert_eq!(record.human_gate_state, None);
@@ -2634,7 +2679,9 @@ mod tests {
         let adapter = test_adapter();
         let task = test_task();
 
-        let record = adapter.vikunja_task_to_record(&task, &[], false);
+        let record = adapter
+            .vikunja_task_to_record(&task, &[], false)
+            .expect("task record");
 
         assert!(!record.pending_human_action);
         assert_eq!(record.human_gate_state, None);
@@ -2650,15 +2697,12 @@ mod tests {
         let adapter = test_adapter();
         let task = test_task();
         let comments = vec![checkpoint_vikunja_comment(&checkpoint_comment_full(
-            "wf",
-            "review",
-            "review",
-            false,
-            None,
-            None,
+            "wf", "review", "review", false, None, None,
         ))];
 
-        let record = adapter.vikunja_task_to_record(&task, &comments, true);
+        let record = adapter
+            .vikunja_task_to_record(&task, &comments, true)
+            .expect("task record");
 
         assert!(record.requested_action.is_none());
         assert_eq!(record.action_revision, 0);
@@ -2677,7 +2721,9 @@ mod tests {
             Some("pending_approval"),
         ))];
 
-        let record = adapter.vikunja_task_to_record(&task, &comments, true);
+        let record = adapter
+            .vikunja_task_to_record(&task, &comments, true)
+            .expect("task record");
 
         let action = record
             .requested_action

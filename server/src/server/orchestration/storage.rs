@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub(super) enum DbTable {
     WorkItems,
     Jobs,
+    OwnershipReturnOutbox,
+    CheckpointOutbox,
 }
 
 impl DbTable {
@@ -16,6 +18,8 @@ impl DbTable {
         match self {
             Self::WorkItems => "work_items",
             Self::Jobs => "jobs",
+            Self::OwnershipReturnOutbox => "ownership_return_outbox",
+            Self::CheckpointOutbox => "checkpoint_outbox",
         }
     }
 }
