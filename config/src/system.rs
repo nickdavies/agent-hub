@@ -93,7 +93,6 @@ pub struct SystemEnvironmentsConfig {
 pub struct SystemWorkflowsConfig {
     #[serde(default)]
     pub installed: Vec<String>,
-    pub triage_rules: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

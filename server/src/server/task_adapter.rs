@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use protocol::{
-    CreateWorkItemRequest, EnvironmentSelection, FireEventRequest, RepoSource, WorkItem,
-    WorkItemState, WorkflowEventKind,
+    CreateWorkItemRequest, EnvironmentSelection, FireEventRequest, ProviderIdentity,
+    ProviderOwnership, RepoSource, WorkItem, WorkItemState, WorkflowEventKind,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -57,6 +57,8 @@ pub struct TaskHumanAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskToolRecord {
     pub id: Uuid,
+    #[serde(default)]
+    pub ownership: ProviderOwnership,
     pub title: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -95,12 +97,39 @@ pub struct TaskToolRecord {
 #[derive(Debug, Clone)]
 pub struct TaskSyncRecord {
     pub external: TaskToolRecord,
+    pub ownership: ProviderOwnership,
+    pub previous_ownership: Option<ProviderOwnership>,
+    pub ownership_revision: u64,
+    pub provider_rejection: Option<TaskProviderRejection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskSyncError {
+    pub task_id: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskSyncSnapshot {
+    pub records: Vec<TaskSyncRecord>,
+    pub complete: bool,
+    pub errors: Vec<TaskSyncError>,
+    pub listed_task_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskProviderRejection {
+    pub action_revision: u64,
+    pub action_payload: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum AdapterIntent {
     Create {
         task: TaskToolRecord,
+        ownership: ProviderOwnership,
+        previous_ownership: Option<ProviderOwnership>,
     },
     UpdateProjection {
         work_item_id: Uuid,
@@ -111,9 +140,33 @@ pub enum AdapterIntent {
         action: TaskHumanAction,
         action_revision: u64,
     },
+    RejectAction {
+        work_item_id: Option<Uuid>,
+        task_id: String,
+        action_revision: u64,
+        action_payload: String,
+        reason: String,
+        source: ProviderActionRejectionSource,
+    },
+    OwnershipChanged {
+        work_item_id: Uuid,
+        task: TaskToolRecord,
+        ownership: ProviderOwnership,
+        baseline_only: bool,
+        ownership_revision: u64,
+    },
     CancelMissingExternalTask {
         work_item_id: Uuid,
         task_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ProviderActionRejectionSource {
+    Command,
+    Ownership {
+        ownership: ProviderOwnership,
+        intent: &'static str,
     },
 }
 
@@ -174,17 +227,24 @@ pub struct TaskCheckpoint {
     // are not variants of `TaskHumanGateState` / `TaskTriageStatus` (for
     // example `triage_completed`, `pending_approval`, `selected`). Storing
     // raw strings keeps the round-trip lossless without forcing enum
-    // surgery elsewhere. Pre-existing checkpoint comments without these
-    // fields will fail to parse and must be deleted.
+    // surgery elsewhere. Defaults preserve checkpoints written before these
+    // fields existed.
+    #[serde(default)]
     pub human_gate_state: Option<String>,
+    #[serde(default)]
     pub triage_status: Option<String>,
     /// Human who should regain provider ownership when checkpointing or
     /// recovery fails. This is authoritative orchestration state, not merely
     /// an informational assignee projection.
+    #[serde(default)]
     pub human_owner: Option<String>,
     /// Stable provider-native identity for `human_owner` when available.
     #[serde(default)]
     pub human_owner_provider_id: Option<String>,
+    /// Complete provider-native human owner set. Scalar owner fields remain
+    /// for backward compatibility with checkpoints written before this field.
+    #[serde(default)]
+    pub human_owners: Vec<ProviderIdentity>,
     /// Exact staged jobs authorized by this checkpoint commit. A job staged
     /// concurrently after the checkpoint snapshot remains gated.
     #[serde(default)]
@@ -231,12 +291,41 @@ pub struct TaskLabels {
     pub failed: bool,
 }
 
-#[derive(Debug, Clone)]
-pub enum TaskAssignee {
-    Bot,
-    Human(String),
-    HumanProviderId(String),
-    Unassigned,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderActionNamespace {
+    Command,
+    Ownership,
+}
+
+impl ProviderActionNamespace {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Ownership => "ownership",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "command" => Ok(Self::Command),
+            "ownership" => Ok(Self::Ownership),
+            _ => anyhow::bail!("unknown provider action namespace '{value}'"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ProviderActionIdentity {
+    pub namespace: ProviderActionNamespace,
+    pub revision: u64,
+}
+
+pub struct ProviderActionRejectionDelivery<'a> {
+    pub identity: &'a ProviderActionIdentity,
+    pub legacy_revision: Option<u64>,
+    pub reason: &'a str,
+    pub valid_actions: &'a [HumanActionKind],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +343,15 @@ pub enum TaskHumanGateState {
 pub trait TaskAdapter: Send + Sync {
     fn adapter_name(&self) -> &'static str;
     fn pull_tasks(&self) -> anyhow::Result<Vec<TaskSyncRecord>>;
+    fn pull_task_snapshot(&self) -> anyhow::Result<TaskSyncSnapshot> {
+        let records = self.pull_tasks()?;
+        Ok(TaskSyncSnapshot {
+            listed_task_ids: records.iter().map(|record| record.external.id).collect(),
+            records,
+            complete: true,
+            errors: Vec::new(),
+        })
+    }
     fn get_task(&self, id: Uuid) -> anyhow::Result<Option<TaskToolRecord>>;
     fn persist_projection(
         &self,
@@ -292,7 +390,10 @@ pub trait TaskAdapter: Send + Sync {
 
     /// Append a log entry comment to the task
     fn append_log(&self, _task_id: &str, _message: &str) -> anyhow::Result<()> {
-        Ok(())
+        Err(anyhow::anyhow!(
+            "task adapter '{}' does not support provider-visible logs",
+            self.adapter_name()
+        ))
     }
 
     /// Write/update a structured job result comment on the task
@@ -328,40 +429,35 @@ pub trait TaskAdapter: Send + Sync {
     }
 
     /// Set task assignee (bot or human)
-    fn set_assignee(&self, _task_id: &str, _assignee: &TaskAssignee) -> anyhow::Result<()> {
-        Ok(())
+    fn set_ownership(&self, _task_id: &str, _ownership: &ProviderOwnership) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "task adapter '{}' does not support assignment mutations",
+            self.adapter_name()
+        ))
     }
-}
 
-const NEEDS_TRIAGE_LABEL: &str = "needs-triage";
+    fn reject_action(
+        &self,
+        _task_id: &str,
+        _rejection: ProviderActionRejectionDelivery<'_>,
+    ) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "task adapter '{}' does not support durable action rejection",
+            self.adapter_name()
+        ))
+    }
 
-fn context_has_label(context: &serde_json::Value, label: &str) -> bool {
-    context
-        .get("labels")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|labels| {
-            labels
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .any(|value| value == label)
-        })
-}
-
-fn context_needs_triage_flag(context: &serde_json::Value) -> bool {
-    context
-        .get("needs_triage")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-pub(crate) fn task_requires_manual_triage(task: &TaskToolRecord) -> bool {
-    context_has_label(&task.context, NEEDS_TRIAGE_LABEL) || context_needs_triage_flag(&task.context)
-}
-
-pub(crate) fn work_item_requires_manual_triage(item: &WorkItem) -> bool {
-    item.labels.iter().any(|label| label == NEEDS_TRIAGE_LABEL)
-        || context_has_label(&item.context, NEEDS_TRIAGE_LABEL)
-        || context_needs_triage_flag(&item.context)
+    fn acknowledge_action(
+        &self,
+        _task_id: &str,
+        _identity: &ProviderActionIdentity,
+        _legacy_revision: Option<u64>,
+    ) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "task adapter '{}' does not support durable action acknowledgement",
+            self.adapter_name()
+        ))
+    }
 }
 
 pub fn work_item_from_create(
@@ -387,6 +483,8 @@ pub fn work_item_from_create(
         workflow_id,
         external_task_id: Some(id.to_string()),
         external_task_source: Some(adapter_name.to_string()),
+        provider_ownership: ProviderOwnership::Bot,
+        remembered_human_owners: vec![],
         title,
         description,
         labels: vec![],
@@ -418,16 +516,14 @@ pub fn work_item_from_create(
 }
 
 pub fn choose_workflow_id(task: &TaskToolRecord, workflow_ids: &[String]) -> Option<String> {
-    if let Some(explicit) = &task.workflow_id
-        && workflow_ids.iter().any(|id| id == explicit)
-    {
+    let _ = workflow_ids;
+    if let Some(explicit) = &task.workflow_id {
         return Some(explicit.clone());
     }
 
     task.context
         .get("workflow_id")
         .and_then(serde_json::Value::as_str)
-        .filter(|wf| workflow_ids.iter().any(|id| id == wf))
         .map(ToOwned::to_owned)
 }
 
@@ -458,6 +554,7 @@ pub fn task_from_work_item_with_valid_next_events(
     let gate_state = current_human_gate_state(item);
     TaskToolRecord {
         id: item.id,
+        ownership: item.provider_ownership.clone(),
         title,
         description,
         workflow_id: if is_triage {
@@ -583,7 +680,7 @@ fn project_required_action_description(
         return Some(description.clone());
     }
 
-    if item.workflow_id == "__triage__" || work_item_requires_manual_triage(item) {
+    if item.workflow_id == "__triage__" {
         return Some("Needs triage: assign a workflow.".to_string());
     }
 
@@ -614,6 +711,9 @@ fn compute_allowed_actions(
     item: &WorkItem,
     valid_next_events: &[WorkflowEventKind],
 ) -> Vec<HumanActionKind> {
+    if item.external_task_id.is_some() && !item.provider_ownership.is_bot_only() {
+        return vec![];
+    }
     if matches!(
         item.state,
         WorkItemState::Succeeded | WorkItemState::Cancelled
@@ -622,18 +722,20 @@ fn compute_allowed_actions(
     }
 
     let allows = |event: WorkflowEventKind| valid_next_events.contains(&event);
-    let requires_manual_triage = work_item_requires_manual_triage(item);
-
     if item.workflow_id == "__triage__" {
-        if requires_manual_triage {
-            return if allows(WorkflowEventKind::Cancel) {
-                vec![HumanActionKind::Cancel]
-            } else {
-                vec![]
-            };
-        }
-
         let mut actions = Vec::new();
+        if item
+            .human_gate_state
+            .as_deref()
+            .is_some_and(|state| state == "triage_completed")
+        {
+            if allows(WorkflowEventKind::HumanApproved) {
+                actions.push(HumanActionKind::Approve);
+            }
+            if allows(WorkflowEventKind::HumanChangesRequested) {
+                actions.push(HumanActionKind::RequestChanges);
+            }
+        }
         if item
             .human_gate_state
             .as_deref()
@@ -643,7 +745,9 @@ fn compute_allowed_actions(
             actions.push(HumanActionKind::Submit);
         }
 
-        if item.current_step.as_str().eq("triage") && !requires_manual_triage {
+        if item.current_step.as_str().eq("triage")
+            && item.triage_status.as_deref() != Some("in_progress")
+        {
             actions.push(HumanActionKind::ChooseWorkflow);
         }
 
@@ -711,9 +815,6 @@ fn infer_valid_next_events_for_projection(item: &WorkItem) -> Vec<WorkflowEventK
     }
 
     if item.workflow_id == "__triage__" {
-        if work_item_requires_manual_triage(item) {
-            return vec![WorkflowEventKind::Cancel];
-        }
         let mut events = Vec::new();
         if item
             .human_gate_state
@@ -793,14 +894,64 @@ pub fn infer_intents(
     records: Vec<TaskSyncRecord>,
     existing: &HashMap<Uuid, WorkItem>,
     workflow_ids: &[String],
+    snapshot_complete: bool,
+    listed_task_ids: &[Uuid],
 ) -> Vec<AdapterIntent> {
     let write_back_grace = chrono::TimeDelta::seconds(5);
     let mut intents = Vec::new();
-    let mut seen_tasks = std::collections::HashSet::new();
+    let mut seen_tasks = listed_task_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
     for record in records {
         let task = record.external;
+        let ownership = record.ownership;
+        let previous_ownership = record.previous_ownership;
+        let ownership_revision = record.ownership_revision;
         seen_tasks.insert(task.id);
         if let Some(item) = existing.get(&task.id) {
+            if ownership != item.provider_ownership {
+                intents.push(AdapterIntent::OwnershipChanged {
+                    work_item_id: item.id,
+                    task: task.clone(),
+                    ownership: ownership.clone(),
+                    baseline_only: previous_ownership.is_none(),
+                    ownership_revision,
+                });
+                if let Some(rejection) = record.provider_rejection {
+                    intents.push(AdapterIntent::RejectAction {
+                        work_item_id: Some(item.id),
+                        task_id: task.id.to_string(),
+                        action_revision: rejection.action_revision,
+                        action_payload: rejection.action_payload,
+                        reason: rejection.reason,
+                        source: ProviderActionRejectionSource::Command,
+                    });
+                } else if ownership.is_bot_only()
+                    && let Some(action) = &task.requested_action
+                {
+                    intents.push(AdapterIntent::ApplyAction {
+                        work_item_id: item.id,
+                        action: action.clone(),
+                        action_revision: task.action_revision,
+                    });
+                }
+                continue;
+            }
+            if let Some(rejection) = record.provider_rejection {
+                intents.push(AdapterIntent::RejectAction {
+                    work_item_id: Some(item.id),
+                    task_id: task.id.to_string(),
+                    action_revision: rejection.action_revision,
+                    action_payload: rejection.action_payload,
+                    reason: rejection.reason,
+                    source: ProviderActionRejectionSource::Command,
+                });
+                continue;
+            }
+            if !ownership.is_bot_only() {
+                continue;
+            }
             if let Some(action) = &task.requested_action {
                 // requested_action is a one-shot intent; dedupe is enforced by action_revision
                 // against context.task_adapter.last_action_revision on the orchestration side.
@@ -833,17 +984,50 @@ pub fn infer_intents(
             continue;
         }
 
-        let mut task = task;
-        if task_requires_manual_triage(&task) || choose_workflow_id(&task, workflow_ids).is_none() {
-            task.triage_status = TaskTriageStatus::NeedsWorkflowSelection;
-            task.pending_human_action = true;
-            task.current_human_gate = Some("workflow_selection".to_string());
-            intents.push(AdapterIntent::Create { task });
+        if matches!(ownership, ProviderOwnership::BotAndHuman { .. }) {
+            intents.push(AdapterIntent::RejectAction {
+                work_item_id: None,
+                task_id: task.id.to_string(),
+                action_revision: ownership_revision,
+                action_payload: serde_json::to_string(&ownership)
+                    .expect("provider ownership serializes"),
+                reason: "bot and human assignment cannot coexist".to_string(),
+                source: ProviderActionRejectionSource::Ownership {
+                    ownership: ownership.clone(),
+                    intent: "illegal_assignment",
+                },
+            });
             continue;
         }
-        intents.push(AdapterIntent::Create { task });
+        if !ownership.is_bot_only() {
+            continue;
+        }
+        if let Some(pin) = choose_workflow_id(&task, workflow_ids)
+            && !workflow_ids.iter().any(|workflow_id| workflow_id == &pin)
+        {
+            intents.push(AdapterIntent::RejectAction {
+                work_item_id: None,
+                task_id: task.id.to_string(),
+                action_revision: ownership_revision,
+                action_payload: pin.clone(),
+                reason: format!("unknown explicit workflow pin '{pin}'"),
+                source: ProviderActionRejectionSource::Ownership {
+                    ownership: ownership.clone(),
+                    intent: "illegal_workflow_pin",
+                },
+            });
+            continue;
+        }
+        intents.push(AdapterIntent::Create {
+            task,
+            ownership,
+            previous_ownership,
+        });
     }
 
+    if !snapshot_complete {
+        return intents;
+    }
     for item in existing.values() {
         if matches!(
             item.state,
@@ -909,10 +1093,240 @@ fn human_gate_label(item: &WorkItem) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn sync_test_task() -> TaskToolRecord {
+        TaskToolRecord {
+            id: Uuid::new_v4(),
+            ownership: ProviderOwnership::Bot,
+            title: "task".into(),
+            description: None,
+            workflow_id: None,
+            triage_status: TaskTriageStatus::Ready,
+            pending_human_action: false,
+            current_human_gate: None,
+            workflow_phase: None,
+            blocked_reason: None,
+            last_failure_reason: None,
+            required_action_description: None,
+            human_gate_state: None,
+            valid_next_events: vec![],
+            allowed_actions: vec![],
+            context: serde_json::json!({}),
+            repo: None,
+            updated_at: Utc::now(),
+            requested_action: None,
+            action_revision: 0,
+        }
+    }
+
+    #[test]
+    fn checkpoint_deserializes_pre_additive_fixture() {
+        let checkpoint: TaskCheckpoint = serde_json::from_value(serde_json::json!({
+            "current_step": "build",
+            "phase": "executing",
+            "workflow_id": "wf",
+            "repo": null,
+            "pr_url": null,
+            "pr_status": null,
+            "human_gate": false,
+            "failure_info": null,
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("pre-additive checkpoint fixture");
+        assert!(checkpoint.human_gate_state.is_none());
+        assert!(checkpoint.triage_status.is_none());
+        assert!(checkpoint.human_owner.is_none());
+        assert!(checkpoint.human_owners.is_empty());
+    }
+
+    #[test]
+    fn unassigned_task_is_not_ingress() {
+        let intents = infer_intents(
+            vec![TaskSyncRecord {
+                external: sync_test_task(),
+                ownership: ProviderOwnership::Unassigned,
+                previous_ownership: None,
+                ownership_revision: 1,
+                provider_rejection: None,
+            }],
+            &HashMap::new(),
+            &[],
+            true,
+            &[],
+        );
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn mixed_bot_and_human_assignment_is_rejected() {
+        let task = sync_test_task();
+        let intents = infer_intents(
+            vec![TaskSyncRecord {
+                external: task,
+                ownership: ProviderOwnership::BotAndHuman {
+                    owners: vec![protocol::ProviderIdentity {
+                        provider_id: Some("42".to_string()),
+                        display_name: Some("alice".to_string()),
+                    }],
+                },
+                previous_ownership: None,
+                ownership_revision: 1,
+                provider_rejection: None,
+            }],
+            &HashMap::new(),
+            &[],
+            true,
+            &[],
+        );
+        assert!(matches!(
+            intents.as_slice(),
+            [AdapterIntent::RejectAction { .. }]
+        ));
+    }
+
+    #[test]
+    fn invalid_command_does_not_outrank_deassignment() {
+        let task = sync_test_task();
+        let item = work_item_from_create(
+            &CreateWorkItemRequest {
+                workflow_id: "wf".to_string(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            },
+            task.id,
+            "wf".to_string(),
+            "build".to_string(),
+            "test",
+        );
+        let intents = infer_intents(
+            vec![TaskSyncRecord {
+                external: task.clone(),
+                ownership: ProviderOwnership::Unassigned,
+                previous_ownership: Some(ProviderOwnership::Bot),
+                ownership_revision: 7,
+                provider_rejection: Some(TaskProviderRejection {
+                    action_revision: 8,
+                    action_payload: "/ah unknown".to_string(),
+                    reason: "unknown /ah command 'unknown'".to_string(),
+                }),
+            }],
+            &HashMap::from([(task.id, item)]),
+            &[],
+            true,
+            &[],
+        );
+        assert!(matches!(
+            intents.as_slice(),
+            [
+                AdapterIntent::OwnershipChanged {
+                    ownership: ProviderOwnership::Unassigned,
+                    ..
+                },
+                AdapterIntent::RejectAction { .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn invalid_command_does_not_outrank_mixed_assignment() {
+        let task = sync_test_task();
+        let item = work_item_from_create(
+            &CreateWorkItemRequest {
+                workflow_id: "wf".to_string(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            },
+            task.id,
+            "wf".to_string(),
+            "build".to_string(),
+            "test",
+        );
+        let ownership = ProviderOwnership::BotAndHuman {
+            owners: vec![protocol::ProviderIdentity {
+                provider_id: Some("42".to_string()),
+                display_name: Some("alice".to_string()),
+            }],
+        };
+        let intents = infer_intents(
+            vec![TaskSyncRecord {
+                external: task.clone(),
+                ownership: ownership.clone(),
+                previous_ownership: Some(ProviderOwnership::Bot),
+                ownership_revision: 7,
+                provider_rejection: Some(TaskProviderRejection {
+                    action_revision: 8,
+                    action_payload: "/ah unknown".to_string(),
+                    reason: "unknown /ah command 'unknown'".to_string(),
+                }),
+            }],
+            &HashMap::from([(task.id, item)]),
+            &[],
+            true,
+            &[],
+        );
+        assert!(matches!(
+            intents.as_slice(),
+            [AdapterIntent::OwnershipChanged { ownership: actual, .. }, AdapterIntent::RejectAction { .. }]
+                if actual == &ownership
+        ));
+    }
+
+    #[test]
+    fn incomplete_snapshot_never_infers_deletion() {
+        let task_id = Uuid::new_v4();
+        let request = CreateWorkItemRequest {
+            workflow_id: "wf".to_string(),
+            session_id: None,
+            context: serde_json::json!({}),
+            repo: None,
+        };
+        let item = work_item_from_create(
+            &request,
+            task_id,
+            "wf".to_string(),
+            "build".to_string(),
+            "file",
+        );
+        let intents = infer_intents(
+            vec![],
+            &HashMap::from([(task_id, item)]),
+            &["wf".to_string()],
+            false,
+            &[],
+        );
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn unknown_explicit_workflow_pin_is_rejected_not_dropped() {
+        let mut task = sync_test_task();
+        task.workflow_id = Some("removed_workflow".to_string());
+        let intents = infer_intents(
+            vec![TaskSyncRecord {
+                external: task,
+                ownership: ProviderOwnership::Bot,
+                previous_ownership: Some(ProviderOwnership::Unassigned),
+                ownership_revision: 1,
+                provider_rejection: None,
+            }],
+            &HashMap::new(),
+            &["wf".to_string()],
+            true,
+            &[],
+        );
+        assert!(matches!(
+            intents.as_slice(),
+            [AdapterIntent::RejectAction { reason, .. }]
+                if reason.contains("unknown explicit workflow pin 'removed_workflow'")
+        ));
+    }
+
     #[test]
     fn choose_workflow_prefers_explicit() {
         let task = TaskToolRecord {
             id: Uuid::new_v4(),
+            ownership: ProviderOwnership::Bot,
             title: "t".into(),
             description: None,
             workflow_id: Some("wf1".into()),
@@ -942,6 +1356,7 @@ mod tests {
     fn infer_intents_marks_missing_workflow_for_triage() {
         let task = TaskToolRecord {
             id: Uuid::new_v4(),
+            ownership: ProviderOwnership::Bot,
             title: "t".into(),
             description: None,
             workflow_id: None,
@@ -965,8 +1380,14 @@ mod tests {
         let intents = infer_intents(
             vec![TaskSyncRecord {
                 external: task.clone(),
+                ownership: ProviderOwnership::Bot,
+                previous_ownership: None,
+                ownership_revision: 1,
+                provider_rejection: None,
             }],
             &HashMap::new(),
+            &[],
+            true,
             &[],
         );
         assert!(matches!(intents[0], AdapterIntent::Create { .. }));
@@ -1062,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn triage_needs_triage_flag_hides_choose_workflow_until_manual_unblock() {
+    fn needs_triage_flag_is_informational() {
         let mut item = work_item_from_create(
             &CreateWorkItemRequest {
                 workflow_id: "__triage__".into(),
@@ -1078,8 +1499,7 @@ mod tests {
         item.workflow_id = "__triage__".into();
         let task = task_from_work_item(&item, None);
         assert!(
-            !task
-                .allowed_actions
+            task.allowed_actions
                 .contains(&HumanActionKind::ChooseWorkflow)
         );
         assert_eq!(
@@ -1089,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn triage_needs_triage_label_hides_choose_workflow_until_label_removed() {
+    fn needs_triage_label_is_informational() {
         let mut item = work_item_from_create(
             &CreateWorkItemRequest {
                 workflow_id: "__triage__".into(),
@@ -1107,8 +1527,7 @@ mod tests {
 
         let task = task_from_work_item(&item, None);
         assert!(
-            !task
-                .allowed_actions
+            task.allowed_actions
                 .contains(&HumanActionKind::ChooseWorkflow)
         );
 
@@ -1126,6 +1545,7 @@ mod tests {
     fn infer_intents_respects_needs_triage_label() {
         let task = TaskToolRecord {
             id: Uuid::new_v4(),
+            ownership: ProviderOwnership::Bot,
             title: "t".into(),
             description: None,
             workflow_id: Some("wf".into()),
@@ -1147,9 +1567,17 @@ mod tests {
         };
 
         let intents = infer_intents(
-            vec![TaskSyncRecord { external: task }],
+            vec![TaskSyncRecord {
+                external: task,
+                ownership: ProviderOwnership::Bot,
+                previous_ownership: None,
+                ownership_revision: 1,
+                provider_rejection: None,
+            }],
             &HashMap::new(),
             &["wf".into()],
+            true,
+            &[],
         );
         assert!(matches!(intents[0], AdapterIntent::Create { .. }));
     }

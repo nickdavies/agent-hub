@@ -60,6 +60,41 @@ pub enum WorkItemState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ProviderIdentity {
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderOwnership {
+    #[default]
+    Unassigned,
+    Bot,
+    Human {
+        owners: Vec<ProviderIdentity>,
+    },
+    BotAndHuman {
+        owners: Vec<ProviderIdentity>,
+    },
+}
+
+impl ProviderOwnership {
+    pub fn is_bot_only(&self) -> bool {
+        matches!(self, Self::Bot)
+    }
+
+    pub fn human_owners(&self) -> &[ProviderIdentity] {
+        match self {
+            Self::Human { owners } | Self::BotAndHuman { owners } => owners,
+            Self::Unassigned | Self::Bot => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub enum BlockReason {
     HumanReview,
     Dependency,
@@ -1668,6 +1703,10 @@ pub struct WorkItem {
     pub external_task_id: Option<String>,
     #[serde(default)]
     pub external_task_source: Option<String>,
+    #[serde(default)]
+    pub provider_ownership: ProviderOwnership,
+    #[serde(default)]
+    pub remembered_human_owners: Vec<ProviderIdentity>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -3675,6 +3714,8 @@ kind = "terminal"
             workflow_id: "wf".into(),
             external_task_id: None,
             external_task_source: None,
+            provider_ownership: ProviderOwnership::Unassigned,
+            remembered_human_owners: vec![],
             title: None,
             description: None,
             labels: vec![],

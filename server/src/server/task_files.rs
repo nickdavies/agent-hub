@@ -5,13 +5,13 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::Utc;
-use protocol::WorkItem;
+use protocol::{ProviderOwnership, WorkItem};
 use uuid::Uuid;
 
 use super::task_adapter::{
-    TaskAdapter, TaskAssignee, TaskChange, TaskChangeType, TaskCheckpoint, TaskCreate,
-    TaskProjection, TaskSyncRecord, TaskToolRecord, TaskTriageStatus, TaskUpdate,
-    task_from_work_item,
+    ProviderActionIdentity, ProviderActionNamespace, ProviderActionRejectionDelivery, TaskAdapter,
+    TaskChange, TaskChangeType, TaskCheckpoint, TaskCreate, TaskProjection, TaskSyncRecord,
+    TaskToolRecord, TaskTriageStatus, TaskUpdate, task_from_work_item,
 };
 
 pub struct TaskFileStore {
@@ -150,6 +150,37 @@ fn durable_atomic_replace(path: &Path, temp_path: &Path, data: &[u8]) -> anyhow:
     Ok(())
 }
 
+fn file_action_result_matches(
+    result: &serde_json::Value,
+    identity: &ProviderActionIdentity,
+) -> bool {
+    result.get("namespace").and_then(serde_json::Value::as_str) == Some(identity.namespace.as_str())
+        && result.get("revision").and_then(|revision| {
+            revision
+                .as_str()
+                .and_then(|revision| revision.parse::<u64>().ok())
+                .or_else(|| revision.as_u64())
+        }) == Some(identity.revision)
+}
+
+fn legacy_file_action_result_matches(
+    result: &serde_json::Value,
+    revision: u64,
+    status: &str,
+) -> bool {
+    result.get("namespace").is_none()
+        && result.get("revision").and_then(serde_json::Value::as_u64) == Some(revision)
+        && result.get("status").and_then(serde_json::Value::as_str) == Some(status)
+}
+
+fn clear_matching_requested_command(task: &mut TaskToolRecord, identity: &ProviderActionIdentity) {
+    if identity.namespace == ProviderActionNamespace::Command
+        && task.action_revision == identity.revision
+    {
+        task.requested_action = None;
+    }
+}
+
 impl TaskAdapter for TaskFileStore {
     fn adapter_name(&self) -> &'static str {
         "file"
@@ -159,7 +190,17 @@ impl TaskAdapter for TaskFileStore {
         self.read_all_task_files().map(|items| {
             items
                 .into_iter()
-                .map(|external| TaskSyncRecord { external })
+                .map(|external| {
+                    let ownership = external.ownership.clone();
+                    TaskSyncRecord {
+                        ownership_revision: (external.updated_at.timestamp_millis().max(0) as u64)
+                            .saturating_mul(1_000),
+                        external,
+                        ownership,
+                        previous_ownership: None,
+                        provider_rejection: None,
+                    }
+                })
                 .collect()
         })
     }
@@ -204,22 +245,105 @@ impl TaskAdapter for TaskFileStore {
         Ok(Some(serde_json::from_slice(&std::fs::read(path)?)?))
     }
 
-    fn set_assignee(&self, task_id: &str, assignee: &TaskAssignee) -> anyhow::Result<()> {
+    fn set_ownership(&self, task_id: &str, ownership: &ProviderOwnership) -> anyhow::Result<()> {
         let Some(mut task) = self.read_task_file_by_task_id(task_id)? else {
-            return Ok(());
+            anyhow::bail!("task not found: {task_id}");
         };
+        task.ownership = ownership.clone();
+        task.updated_at = Utc::now();
+        self.write_task_file(&task)
+    }
+
+    fn append_log(&self, task_id: &str, message: &str) -> anyhow::Result<()> {
+        let mut task = self
+            .read_task_file_by_task_id(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
         let context = task
             .context
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("task context must be a JSON object"))?;
-        let value = match assignee {
-            TaskAssignee::Bot => serde_json::Value::String("bot".to_string()),
-            TaskAssignee::Human(owner) => serde_json::Value::String(owner.clone()),
-            TaskAssignee::HumanProviderId(owner_id) => serde_json::Value::String(owner_id.clone()),
-            TaskAssignee::Unassigned => serde_json::Value::Null,
-        };
-        context.insert("assignee".to_string(), value);
-        task.updated_at = Utc::now();
+        context
+            .entry("provider_logs")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("provider_logs must be an array"))?
+            .push(serde_json::json!({"message": message, "at": Utc::now()}));
+        self.write_task_file(&task)
+    }
+
+    fn reject_action(
+        &self,
+        task_id: &str,
+        rejection: ProviderActionRejectionDelivery<'_>,
+    ) -> anyhow::Result<()> {
+        let ProviderActionRejectionDelivery {
+            identity,
+            legacy_revision,
+            reason,
+            valid_actions,
+        } = rejection;
+        let mut task = self
+            .read_task_file_by_task_id(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+        let context = task
+            .context
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("task context must be a JSON object"))?;
+        let results = context
+            .entry("action_results")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("action_results must be an array"))?;
+        if !results.iter().any(|result| {
+            file_action_result_matches(result, identity)
+                || legacy_revision.is_some_and(|revision| {
+                    legacy_file_action_result_matches(result, revision, "rejected")
+                })
+        }) {
+            results.push(serde_json::json!({
+                "namespace": identity.namespace,
+                "revision": identity.revision.to_string(),
+                "status": "rejected",
+                "reason": reason,
+                "valid_actions": valid_actions,
+            }));
+        }
+        clear_matching_requested_command(&mut task, identity);
+        self.write_task_file(&task)
+    }
+
+    fn acknowledge_action(
+        &self,
+        task_id: &str,
+        identity: &ProviderActionIdentity,
+        legacy_revision: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let mut task = self
+            .read_task_file_by_task_id(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+        let context = task
+            .context
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("task context must be a JSON object"))?;
+        let results = context
+            .entry("action_results")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("action_results must be an array"))?;
+        if !results.iter().any(|result| {
+            (file_action_result_matches(result, identity)
+                && result.get("status").and_then(serde_json::Value::as_str) == Some("applied"))
+                || legacy_revision.is_some_and(|revision| {
+                    legacy_file_action_result_matches(result, revision, "applied")
+                })
+        }) {
+            results.push(serde_json::json!({
+                "namespace": identity.namespace,
+                "revision": identity.revision.to_string(),
+                "status": "applied",
+            }));
+        }
+        clear_matching_requested_command(&mut task, identity);
         self.write_task_file(&task)
     }
 
@@ -302,6 +426,7 @@ impl TaskAdapter for TaskFileStore {
         let id = Uuid::new_v4();
         let task = TaskToolRecord {
             id,
+            ownership: ProviderOwnership::Unassigned,
             title: create.title,
             description: Some(create.description),
             workflow_id: None,
@@ -432,6 +557,7 @@ mod tests {
             triage_status: Some("in_progress".to_string()),
             human_owner: Some("alice".to_string()),
             human_owner_provider_id: Some("42".to_string()),
+            human_owners: vec![],
             dispatch_job_ids: vec![Uuid::new_v4()],
             generation: 3,
             checkpoint_hash: "hash".to_string(),
@@ -457,6 +583,137 @@ mod tests {
                 > 0
         );
         assert!(store.pull_tasks().expect("tasks").is_empty());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn action_results_key_namespace_and_preserve_unrelated_command() {
+        let tmp = std::env::temp_dir().join(format!("task-files-{}", Uuid::new_v4()));
+        let store = TaskFileStore::new(tmp.clone());
+        let mut task = task_adapter::task_from_work_item(
+            &task_adapter::work_item_from_create(
+                &protocol::CreateWorkItemRequest {
+                    workflow_id: "wf".into(),
+                    session_id: None,
+                    context: serde_json::json!({}),
+                    repo: None,
+                },
+                Uuid::new_v4(),
+                "wf".into(),
+                "review".into(),
+                "file",
+            ),
+            None,
+        );
+        task.action_revision = u64::MAX;
+        task.requested_action = Some(task_adapter::TaskHumanAction {
+            kind: task_adapter::HumanActionKind::Approve,
+            workflow_id: None,
+            reason: None,
+        });
+        store.write_task_file(&task).expect("task file");
+        let ownership = ProviderActionIdentity {
+            namespace: ProviderActionNamespace::Ownership,
+            revision: u64::MAX,
+        };
+        let command = ProviderActionIdentity {
+            namespace: ProviderActionNamespace::Command,
+            revision: u64::MAX,
+        };
+
+        store
+            .acknowledge_action(&task.id.to_string(), &ownership, None)
+            .expect("ownership acknowledgement");
+        let after_ownership = store.read_task_file(task.id).expect("read").expect("task");
+        assert!(after_ownership.requested_action.is_some());
+        store
+            .reject_action(
+                &task.id.to_string(),
+                ProviderActionRejectionDelivery {
+                    identity: &command,
+                    legacy_revision: None,
+                    reason: "invalid",
+                    valid_actions: &[],
+                },
+            )
+            .expect("command rejection");
+        store
+            .acknowledge_action(&task.id.to_string(), &ownership, None)
+            .expect("ownership dedup");
+
+        let stored = store.read_task_file(task.id).expect("read").expect("task");
+        assert!(stored.requested_action.is_none());
+        let results = stored.context["action_results"]
+            .as_array()
+            .expect("action results");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|result| {
+            result["namespace"] == "ownership"
+                && result["revision"]
+                    .as_str()
+                    .and_then(|revision| revision.parse::<u64>().ok())
+                    == Some(u64::MAX)
+                && result["status"] == "applied"
+        }));
+        assert!(results.iter().any(|result| {
+            result["namespace"] == "command"
+                && result["revision"]
+                    .as_str()
+                    .and_then(|revision| revision.parse::<u64>().ok())
+                    == Some(u64::MAX)
+                && result["status"] == "rejected"
+        }));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn legacy_action_result_alias_prevents_duplicate_namespaced_result() {
+        let tmp = std::env::temp_dir().join(format!("task-files-{}", Uuid::new_v4()));
+        let store = TaskFileStore::new(tmp.clone());
+        let mut task = task_adapter::task_from_work_item(
+            &task_adapter::work_item_from_create(
+                &protocol::CreateWorkItemRequest {
+                    workflow_id: "wf".into(),
+                    session_id: None,
+                    context: serde_json::json!({
+                        "action_results": [{"revision": 99, "status": "applied"}]
+                    }),
+                    repo: None,
+                },
+                Uuid::new_v4(),
+                "wf".into(),
+                "review".into(),
+                "file",
+            ),
+            None,
+        );
+        task.action_revision = 7;
+        task.requested_action = Some(task_adapter::TaskHumanAction {
+            kind: task_adapter::HumanActionKind::Approve,
+            workflow_id: None,
+            reason: None,
+        });
+        store.write_task_file(&task).expect("task file");
+
+        store
+            .acknowledge_action(
+                &task.id.to_string(),
+                &ProviderActionIdentity {
+                    namespace: ProviderActionNamespace::Ownership,
+                    revision: 7,
+                },
+                Some(99),
+            )
+            .expect("legacy acknowledgement lookup");
+        let stored = store.read_task_file(task.id).expect("read").expect("task");
+        assert!(stored.requested_action.is_some());
+        assert_eq!(
+            stored.context["action_results"]
+                .as_array()
+                .expect("results")
+                .len(),
+            1
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

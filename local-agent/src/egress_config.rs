@@ -26,6 +26,8 @@ pub struct LocalAgentConfig {
     pub mcp_bridges: Vec<McpBridgeConfig>,
     #[serde(default)]
     pub triage_repos: Vec<String>,
+    #[serde(default)]
+    pub approved_repository_roots: Vec<PathBuf>,
     /// Hosts the local-agent treats as "GitHub-shaped" when parsing repo URLs
     /// for `AGENT_REPO_SLUG`, `GH_HOST`, and `gh auth token` resolution.
     /// Empty (or missing) means just `github.com`. Add GitHub Enterprise
@@ -46,6 +48,7 @@ impl Default for LocalAgentConfig {
             managed_runners: HashMap::new(),
             mcp_bridges: Vec::new(),
             triage_repos: Vec::new(),
+            approved_repository_roots: Vec::new(),
             github_hosts: Vec::new(),
             config_tree: None,
         }
@@ -73,7 +76,10 @@ impl LocalAgentConfig {
         override_id: Option<&str>,
     ) -> (&'a ManagedRunnerSpec, String) {
         let candidates = [
-            (override_id.map(str::trim).filter(|s| !s.is_empty()), "override"),
+            (
+                override_id.map(str::trim).filter(|s| !s.is_empty()),
+                "override",
+            ),
             (
                 self.default_agent_id
                     .as_deref()
@@ -91,7 +97,10 @@ impl LocalAgentConfig {
             }
         }
 
-        (&self.default_agent, "config:default_agent (inline)".to_string())
+        (
+            &self.default_agent,
+            "config:default_agent (inline)".to_string(),
+        )
     }
 
     pub fn config_tree(&self) -> Option<&ConfigTreeSnapshot> {
@@ -117,11 +126,10 @@ impl LocalAgentConfig {
         }
     }
 
-    pub fn network_policy_hosts(&self, policy_name: &str) -> Option<&[String]> {
+    pub fn network_policy(&self, policy_name: &str) -> Option<&ConfiguredNetworkPolicy> {
         self.config_tree
             .as_ref()
             .and_then(|tree| tree.network_policies.get(policy_name))
-            .map(|policy| policy.hosts.as_slice())
     }
 
     pub fn network_policy_env(&self, policy_name: &str) -> Option<&HashMap<String, String>> {
@@ -244,6 +252,8 @@ pub struct EgressConfig {
     pub build: BuildHostConfig,
     #[serde(default)]
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub preflight_image: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -571,6 +581,12 @@ fn normalize_config(config: &mut LocalAgentConfig) {
         .map(|entry| entry.trim().to_string())
         .filter(|entry| !entry.is_empty())
         .collect();
+    config.approved_repository_roots = config
+        .approved_repository_roots
+        .iter()
+        .filter(|root| !root.as_os_str().is_empty())
+        .cloned()
+        .collect();
 }
 
 fn normalize_runner_spec(spec: &mut ManagedRunnerSpec) {
@@ -632,7 +648,11 @@ pub fn normalize_hosts(hosts: &[String]) -> Vec<String> {
             continue;
         }
 
-        let normalized = host.trim_start_matches(['*', '.']).to_string();
+        let normalized = if let Some(suffix) = host.strip_prefix("*.") {
+            format!("*.{}", suffix.trim_start_matches('.'))
+        } else {
+            host.trim_start_matches('.').to_string()
+        };
         if normalized.is_empty() {
             continue;
         }
@@ -746,7 +766,7 @@ mod tests {
             hosts,
             vec![
                 "api.openai.com",
-                "github.com",
+                "*.github.com",
                 "objects.githubusercontent.com"
             ]
         );
@@ -794,6 +814,7 @@ mod tests {
                 " https://github.com/reddit/agent-hub.git ".to_string(),
                 " ".to_string(),
             ],
+            approved_repository_roots: Vec::new(),
             github_hosts: Vec::new(),
             config_tree: None,
         };

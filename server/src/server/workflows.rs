@@ -91,21 +91,25 @@ impl WorkflowCatalog {
                 &mut validation_errors,
             )?;
 
-            // Best-effort load of triage-hint.md alongside the workflow.toml.
-            // Missing or unreadable hints are silently ignored — the workflow
-            // still loads, it just won't surface a description in triage.
+            // A present triage hint is deployment configuration. Failure to
+            // read it must stop startup rather than silently changing routing
+            // context.
             if let Some(workflow_dir) = workflow_path.parent() {
                 let hint_path = workflow_dir.join("triage-hint.md");
                 if hint_path.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&hint_path) {
-                        let trimmed = content.trim().to_string();
-                        if !trimmed.is_empty() {
-                            if let Some(workflow_id) = workflow_dir
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                            {
-                                triage_hints.insert(workflow_id, trimmed);
-                            }
+                    let content = std::fs::read_to_string(&hint_path).map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to read configured triage hint '{}': {error}",
+                            hint_path.display()
+                        )
+                    })?;
+                    let trimmed = content.trim().to_string();
+                    if !trimmed.is_empty() {
+                        if let Some(workflow_id) = workflow_dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                        {
+                            triage_hints.insert(workflow_id, trimmed);
                         }
                     }
                 }
@@ -152,9 +156,8 @@ impl WorkflowCatalog {
 
         // Drop hints for workflow ids that didn't survive validation so the
         // triage prompt only mentions live workflows.
-        triage_hints.retain(|id, _| {
-            definitions.contains_key(id) || reactive_definitions.contains_key(id)
-        });
+        triage_hints
+            .retain(|id, _| definitions.contains_key(id) || reactive_definitions.contains_key(id));
 
         Ok(Self {
             definitions,
@@ -476,6 +479,30 @@ args = ["ok"]
     }
 
     #[test]
+    fn configured_unreadable_triage_hint_fails_catalog_load() {
+        let tmp = std::env::temp_dir().join(format!("wf-hint-{}", uuid::Uuid::new_v4()));
+        let workflow_dir = tmp.join("wf");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(
+            workflow_dir.join("workflow.toml"),
+            "[workflow]\nid = \"wf\"\nentry_step = \"done\"\n[[workflow.steps]]\nid = \"done\"\nkind = \"terminal\"\n",
+        )
+        .expect("workflow");
+        std::fs::write(workflow_dir.join("triage-hint.md"), [0xff, 0xfe])
+            .expect("invalid utf8 hint");
+        let error = match WorkflowCatalog::load_from_dir(tmp.to_str().expect("tmp path")) {
+            Ok(_) => panic!("configured unreadable hint must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read configured triage hint")
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn load_drops_triage_hint_for_invalid_workflow() {
         let dir =
             std::env::temp_dir().join(format!("wf-catalog-hint-invalid-{}", uuid::Uuid::new_v4()));
@@ -497,8 +524,7 @@ args = ["ok"]
         let bad_dir = dir.join("broken");
         std::fs::create_dir_all(&bad_dir).expect("mkdir broken");
         std::fs::write(bad_dir.join("workflow.toml"), bad).expect("write");
-        std::fs::write(bad_dir.join("triage-hint.md"), "should not surface")
-            .expect("write hint");
+        std::fs::write(bad_dir.join("triage-hint.md"), "should not surface").expect("write hint");
 
         let catalog = WorkflowCatalog::load_from_dir(dir.to_str().unwrap()).expect("load");
         assert!(catalog.list().is_empty());

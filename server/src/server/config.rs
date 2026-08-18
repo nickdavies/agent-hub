@@ -293,7 +293,6 @@ pub struct EnvironmentsConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WorkflowsConfig {
     pub installed: Vec<String>,
-    pub triage_rules: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

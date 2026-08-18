@@ -22,10 +22,13 @@ where
 }
 
 use super::task_adapter::{
-    HumanActionKind, TaskAdapter, TaskAdapterError, TaskAssignee, TaskChange, TaskChangeType,
+    HumanActionKind, ProviderActionIdentity, ProviderActionNamespace,
+    ProviderActionRejectionDelivery, TaskAdapter, TaskAdapterError, TaskChange, TaskChangeType,
     TaskCheckpoint, TaskCreate, TaskHumanAction, TaskHumanGateState, TaskLabels, TaskProjection,
-    TaskSyncRecord, TaskToolRecord, TaskTriageStatus, TaskUpdate, TriageResult,
+    TaskProviderRejection, TaskSyncError, TaskSyncRecord, TaskSyncSnapshot, TaskToolRecord,
+    TaskTriageStatus, TaskUpdate, TriageResult,
 };
+use protocol::{ProviderIdentity, ProviderOwnership};
 
 const VIKUNJA_UUID_NAMESPACE: Uuid = Uuid::from_bytes([
     0x76, 0x69, 0x6b, 0x75, 0x6e, 0x6a, 0x61, 0x2d, 0x74, 0x61, 0x73, 0x6b, 0x2d, 0x6e, 0x73, 0x00,
@@ -34,6 +37,36 @@ const VIKUNJA_UUID_NAMESPACE: Uuid = Uuid::from_bytes([
 const CHECKPOINT_MARKER: &str = "<!-- agent-hub:checkpoint -->";
 const TRIAGE_RESULT_MARKER: &str = "<!-- agent-hub:triage_result -->";
 const TRIAGE_RESULT_HEADING: &str = "## 📋 Triage Complete";
+const ACTION_REJECTION_MARKER: &str = "<!-- agent-hub:action-rejection:";
+const ACTION_APPLIED_MARKER: &str = "<!-- agent-hub:action-applied:";
+
+fn action_marker(prefix: &str, identity: &ProviderActionIdentity) -> String {
+    format!(
+        "{prefix}{}:{} -->",
+        identity.namespace.as_str(),
+        identity.revision
+    )
+}
+
+fn legacy_action_marker(prefix: &str, revision: u64) -> String {
+    format!("{prefix}{revision} -->")
+}
+
+fn action_delivery_recorded(
+    comments: &[VikunjaComment],
+    marker: &str,
+    legacy_prefix: &str,
+    legacy_revision: Option<u64>,
+) -> bool {
+    comments.iter().any(|comment| {
+        comment.comment.contains(marker)
+            || legacy_revision.is_some_and(|revision| {
+                comment
+                    .comment
+                    .contains(&legacy_action_marker(legacy_prefix, revision))
+            })
+    })
+}
 
 fn vikunja_task_uuid(base_url: &str, task_id: i64) -> Uuid {
     let key = format!("vikunja:{base_url}:task:{task_id}");
@@ -72,7 +105,7 @@ struct VikunjaUser {
     email: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct VikunjaComment {
     id: i64,
     comment: String,
@@ -181,82 +214,148 @@ fn html_to_plain_text(input: &str) -> String {
     html_escape::decode_html_entities(&stripped).into_owned()
 }
 
+#[cfg(test)]
 fn parse_comment_action(comment: &str) -> Option<TaskHumanAction> {
+    parse_comment_action_strict(comment).ok().flatten()
+}
+
+fn parse_comment_action_strict(comment: &str) -> Result<Option<TaskHumanAction>, String> {
     // Vikunja's rich-text editor wraps slash-commands in HTML; flatten the
     // input so the same line-prefix logic works for both raw API posts and
     // anything typed in the UI.
     let plain = html_to_plain_text(comment);
-    let line = plain.lines().find_map(|line| {
+    let Some(line) = plain.lines().find_map(|line| {
         let trimmed = line.trim();
         if trimmed
-            .get(..3)
-            .map(|prefix| prefix.eq_ignore_ascii_case("/ah"))
-            .unwrap_or(false)
+            .split_whitespace()
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("/ah"))
         {
             Some(trimmed.to_string())
         } else {
             None
         }
-    })?;
+    }) else {
+        return Ok(None);
+    };
 
-    let command = line.get(3..)?.trim();
-    let parts: Vec<&str> = line.trim().get(3..)?.split_whitespace().collect();
+    let command = line
+        .get(3..)
+        .ok_or_else(|| "malformed /ah command".to_string())?
+        .trim();
+    let parts: Vec<&str> = command.split_whitespace().collect();
     if command.is_empty() {
-        return None;
+        return Err("missing /ah command".to_string());
     }
 
-    match parts.first()?.to_lowercase().as_str() {
-        "workflow" => Some(TaskHumanAction {
+    let action = match parts[0].to_lowercase().as_str() {
+        "workflow" if parts.len() == 2 => TaskHumanAction {
             kind: HumanActionKind::ChooseWorkflow,
-            workflow_id: parts.get(1).map(|s| s.to_string()),
+            workflow_id: Some(parts[1].to_string()),
             reason: None,
-        }),
-        "submit" => Some(TaskHumanAction {
+        },
+        "workflow" => return Err("usage: /ah workflow <workflow_id>".to_string()),
+        "submit" => TaskHumanAction {
             kind: HumanActionKind::Submit,
             workflow_id: None,
             reason: rest_as_reason(&parts, 1),
-        }),
-        "approve" => Some(TaskHumanAction {
+        },
+        "approve" => TaskHumanAction {
             kind: HumanActionKind::Approve,
             workflow_id: None,
             reason: rest_as_reason(&parts, 1),
-        }),
-        "request_changes" => Some(TaskHumanAction {
+        },
+        "request_changes" => TaskHumanAction {
             kind: HumanActionKind::RequestChanges,
             workflow_id: None,
             reason: rest_as_reason(&parts, 1),
-        }),
-        "unblock" => Some(TaskHumanAction {
+        },
+        "unblock" => TaskHumanAction {
             kind: HumanActionKind::Unblock,
             workflow_id: None,
             reason: rest_as_reason(&parts, 1),
-        }),
-        "retry" => Some(TaskHumanAction {
+        },
+        "retry" => TaskHumanAction {
             kind: HumanActionKind::Retry,
             workflow_id: None,
             reason: rest_as_reason(&parts, 1),
-        }),
-        "cancel" => Some(TaskHumanAction {
+        },
+        "cancel" => TaskHumanAction {
             kind: HumanActionKind::Cancel,
             workflow_id: None,
             reason: rest_as_reason(&parts, 1),
-        }),
+        },
         // Manual override for the `await_ci` human gate when the SCM
         // poller can't observe the PR (token missing, host unreachable,
         // repo without CI configured). Workflows that don't use a CI
         // gate just won't accept these events.
-        "checks_passed" => Some(TaskHumanAction {
+        "checks_passed" => TaskHumanAction {
             kind: HumanActionKind::ChecksPassed,
             workflow_id: None,
             reason: rest_as_reason(&parts, 1),
-        }),
-        "checks_failed" => Some(TaskHumanAction {
+        },
+        "checks_failed" => TaskHumanAction {
             kind: HumanActionKind::ChecksFailed,
             workflow_id: None,
             reason: rest_as_reason(&parts, 1),
-        }),
-        _ => None,
-    }
+        },
+        _ => return Err(format!("unknown /ah command '{}'", parts[0])),
+    };
+    Ok(Some(action))
+}
+
+fn newest_comment_command(
+    comments: &[VikunjaComment],
+) -> Option<Result<(TaskHumanAction, u64), TaskProviderRejection>> {
+    let mut commands = comments
+        .iter()
+        .filter_map(|comment| {
+            let plain = html_to_plain_text(&comment.comment);
+            let command = plain.lines().find(|line| {
+                let line = line.trim();
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|token| token.eq_ignore_ascii_case("/ah"))
+            })?;
+            let timestamp = parse_rfc3339_to_utc(&comment.updated)
+                .or_else(|| parse_rfc3339_to_utc(&comment.created))
+                .unwrap_or_else(Utc::now);
+            let revision = action_revision_from_timestamp(timestamp, comment.id as u64);
+            Some((revision, command.trim().to_string()))
+        })
+        .collect::<Vec<_>>();
+    commands.sort_by_key(|(revision, _)| *revision);
+    let acknowledged = comments
+        .iter()
+        .map(|comment| comment.comment.as_str())
+        .collect::<Vec<_>>();
+    commands.into_iter().rev().find_map(|(revision, command)| {
+        let identity = ProviderActionIdentity {
+            namespace: ProviderActionNamespace::Command,
+            revision,
+        };
+        let marker = action_marker(ACTION_REJECTION_MARKER, &identity);
+        let applied_marker = action_marker(ACTION_APPLIED_MARKER, &identity);
+        let legacy_rejection_marker = legacy_action_marker(ACTION_REJECTION_MARKER, revision);
+        let legacy_applied_marker = legacy_action_marker(ACTION_APPLIED_MARKER, revision);
+        if acknowledged.iter().any(|comment| {
+            comment.contains(&marker)
+                || comment.contains(&applied_marker)
+                || comment.contains(&legacy_rejection_marker)
+                || comment.contains(&legacy_applied_marker)
+        }) {
+            return None;
+        }
+        Some(match parse_comment_action_strict(&command) {
+            Ok(Some(action)) => Ok((action, revision)),
+            Ok(None) => unreachable!("command line was selected"),
+            Err(reason) => Err(TaskProviderRejection {
+                action_revision: revision,
+                action_payload: command,
+                reason,
+            }),
+        })
+    })
 }
 
 fn parse_rfc3339_to_utc(value: &str) -> Option<DateTime<Utc>> {
@@ -1146,7 +1245,7 @@ impl VikunjaAdapter {
         &self,
         task: &VikunjaTask,
         comments: &[VikunjaComment],
-        assignment_to_bot_transition: bool,
+        _assignment_to_bot_transition: bool,
     ) -> anyhow::Result<TaskToolRecord> {
         let uuid = vikunja_task_uuid(&self.base_url, task.id);
         let (clean_desc, metadata) = parse_description_metadata(&task.description);
@@ -1154,21 +1253,11 @@ impl VikunjaAdapter {
 
         let updated_at = parse_rfc3339_to_utc(&task.updated).unwrap_or_else(Utc::now);
 
-        let comment_requested_action = comments
-            .iter()
-            .rev()
-            .find_map(|c| parse_comment_action(&c.comment));
-        let comment_action_revision = comments
-            .iter()
-            .rev()
-            .find(|c| parse_comment_action(&c.comment).is_some())
-            .map(|c| {
-                let timestamp = parse_rfc3339_to_utc(&c.updated)
-                    .or_else(|| parse_rfc3339_to_utc(&c.created))
-                    .unwrap_or(updated_at);
-                action_revision_from_timestamp(timestamp, c.id as u64)
-            })
-            .unwrap_or(0);
+        let (comment_requested_action, comment_action_revision) =
+            match newest_comment_command(comments) {
+                Some(Ok((action, revision))) => (Some(action), revision),
+                Some(Err(_)) | None => (None, 0),
+            };
 
         let checkpoint = authoritative_checkpoint_from_comments(comments)?;
         // A human → bot reassignment is only treated as an Approve when the
@@ -1179,31 +1268,8 @@ impl VikunjaAdapter {
         // checkpoint would say `human_gate: false` and this guard would
         // suppress the spurious Approve. Do not weaken this guard without
         // also reviewing the write-back ordering.
-        let assignment_requested_action = if assignment_to_bot_transition
-            && checkpoint
-                .as_ref()
-                .is_some_and(|checkpoint| checkpoint.human_gate)
-        {
-            Some(TaskHumanAction {
-                kind: HumanActionKind::Approve,
-                workflow_id: None,
-                reason: Some("approval inferred from assignment to bot".to_string()),
-            })
-        } else {
-            None
-        };
-        let assignment_action_revision = if assignment_requested_action.is_some() {
-            action_revision_from_timestamp(updated_at, 0)
-        } else {
-            0
-        };
-
         let (requested_action, action_revision) =
-            if assignment_action_revision > comment_action_revision {
-                (assignment_requested_action, assignment_action_revision)
-            } else {
-                (comment_requested_action, comment_action_revision)
-            };
+            (comment_requested_action, comment_action_revision);
 
         let workflow_id = metadata.as_ref().and_then(|m| m.workflow_id.clone());
         let repo = metadata
@@ -1217,8 +1283,6 @@ impl VikunjaAdapter {
                     .unwrap_or_else(|| "origin/main".to_string()),
                 branch_name: r.branch_name.clone(),
             });
-
-        let needs_triage = labels.iter().any(|l| l == "needs-triage");
 
         // When a checkpoint comment is present, it is the authoritative source
         // for the orchestrator-owned `human_gate`, `human_gate_state`, and
@@ -1234,7 +1298,7 @@ impl VikunjaAdapter {
         let checkpoint_triage_status_raw =
             checkpoint.as_ref().and_then(|c| c.triage_status.clone());
 
-        let pending_human_action = needs_triage || checkpoint_human_gate;
+        let pending_human_action = checkpoint_human_gate;
         let human_gate_state: Option<TaskHumanGateState> = checkpoint_human_gate_state_raw
             .as_deref()
             .and_then(|v| serde_json::from_value(serde_json::Value::String(v.to_string())).ok());
@@ -1243,7 +1307,7 @@ impl VikunjaAdapter {
                 .ok()
         });
         let triage_status = triage_status_from_checkpoint.unwrap_or_else(|| {
-            if needs_triage || workflow_id.is_none() {
+            if workflow_id.is_none() {
                 TaskTriageStatus::NeedsWorkflowSelection
             } else {
                 TaskTriageStatus::Ready
@@ -1258,7 +1322,6 @@ impl VikunjaAdapter {
             "labels": labels,
             "assignees": task.assignees.iter().map(|a| &a.username).collect::<Vec<_>>(),
             "assignee_ids": task.assignees.iter().map(|a| a.id).collect::<Vec<_>>(),
-            "assigned_to_bot": task.assignees.iter().any(|a| a.id == self.bot_user_id),
             "done": task.done,
             "priority": task.priority,
             "vikunja_created": task.created,
@@ -1307,6 +1370,7 @@ impl VikunjaAdapter {
 
         Ok(TaskToolRecord {
             id: uuid,
+            ownership: self.task_ownership(task),
             title: task.title.clone(),
             description: Some(clean_desc),
             workflow_id,
@@ -1382,7 +1446,7 @@ impl VikunjaAdapter {
             return Ok(*id);
         }
 
-        let records = self.pull_tasks_with_assignment_tracking(false)?;
+        let records = self.pull_tasks_with_assignment_tracking(false)?.records;
         let found = records
             .into_iter()
             .find(|r| r.external.id.to_string() == task_id)
@@ -1397,16 +1461,27 @@ impl VikunjaAdapter {
     fn pull_tasks_with_assignment_tracking(
         &self,
         track_assignment_transitions: bool,
-    ) -> anyhow::Result<Vec<TaskSyncRecord>> {
+    ) -> anyhow::Result<TaskSyncSnapshot> {
         let view_id = self.resolve_view_id()?;
         let per_page = 200;
         let mut page = 1;
         let mut tasks = Vec::new();
+        let mut snapshot_errors = Vec::new();
         loop {
-            let mut page_tasks: Vec<VikunjaTask> = self.api_get(&format!(
+            let page_result: anyhow::Result<Vec<VikunjaTask>> = self.api_get(&format!(
                 "projects/{}/views/{view_id}/tasks?page={page}&per_page={per_page}",
                 self.project_id
-            ))?;
+            ));
+            let mut page_tasks = match page_result {
+                Ok(tasks) => tasks,
+                Err(error) => {
+                    snapshot_errors.push(TaskSyncError {
+                        task_id: None,
+                        reason: format!("Vikunja task page fetch failed: {error:#}"),
+                    });
+                    break;
+                }
+            };
             let page_len = page_tasks.len();
             tasks.append(&mut page_tasks);
 
@@ -1427,21 +1502,56 @@ impl VikunjaAdapter {
         let mut current_assignment_known = HashMap::new();
 
         let mut records = Vec::with_capacity(tasks.len());
+        let mut listed_task_ids = Vec::with_capacity(tasks.len());
+        let listing_complete = snapshot_errors.is_empty();
+        let mut errors = snapshot_errors;
         for task in tasks {
             let task_id = vikunja_task_uuid(&self.base_url, task.id).to_string();
+            listed_task_ids.push(vikunja_task_uuid(&self.base_url, task.id));
             let assignee_ids = Self::assignee_ids(&task);
             let transitioned_human_to_bot = track_assignment_transitions
                 && self.transitioned_human_to_bot(
                     previous_assignment_known.get(&task_id).map(Vec::as_slice),
                     &assignee_ids,
                 );
-            current_assignment_known.insert(task_id, assignee_ids);
+            current_assignment_known.insert(task_id.clone(), assignee_ids);
 
-            let comments = self.get_task_comments(task.id)?;
+            let comments = match self.get_task_comments(task.id) {
+                Ok(comments) => comments,
+                Err(error) => {
+                    errors.push(TaskSyncError {
+                        task_id: Some(task_id),
+                        reason: format!("Vikunja task comments fetch failed: {error:#}"),
+                    });
+                    continue;
+                }
+            };
             let record =
-                self.vikunja_task_to_record(&task, &comments, transitioned_human_to_bot)?;
-            self.cache_task_id(record.id, task.id)?;
-            records.push(TaskSyncRecord { external: record });
+                match self.vikunja_task_to_record(&task, &comments, transitioned_human_to_bot) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        errors.push(TaskSyncError {
+                            task_id: Some(task_id),
+                            reason: format!("Vikunja task conversion failed: {error:#}"),
+                        });
+                        continue;
+                    }
+                };
+            if let Err(error) = self.cache_task_id(record.id, task.id) {
+                errors.push(TaskSyncError {
+                    task_id: Some(task_id),
+                    reason: format!("Vikunja task identity cache failed: {error:#}"),
+                });
+                continue;
+            }
+            records.push(TaskSyncRecord {
+                ownership_revision: (record.updated_at.timestamp_millis().max(0) as u64)
+                    .saturating_mul(1_000),
+                external: record,
+                ownership: self.task_ownership(&task),
+                previous_ownership: None,
+                provider_rejection: newest_comment_command(&comments).and_then(Result::err),
+            });
         }
 
         if track_assignment_transitions {
@@ -1452,7 +1562,34 @@ impl VikunjaAdapter {
             *assignment_known = current_assignment_known;
         }
 
-        Ok(records)
+        Ok(TaskSyncSnapshot {
+            complete: listing_complete,
+            records,
+            errors,
+            listed_task_ids,
+        })
+    }
+
+    fn task_ownership(&self, task: &VikunjaTask) -> ProviderOwnership {
+        let bot = task
+            .assignees
+            .iter()
+            .any(|assignee| assignee.id == self.bot_user_id);
+        let owners = task
+            .assignees
+            .iter()
+            .filter(|assignee| assignee.id != self.bot_user_id)
+            .map(|assignee| ProviderIdentity {
+                provider_id: Some(assignee.id.to_string()),
+                display_name: Some(assignee.username.clone()),
+            })
+            .collect::<Vec<_>>();
+        match (bot, owners.is_empty()) {
+            (false, true) => ProviderOwnership::Unassigned,
+            (true, true) => ProviderOwnership::Bot,
+            (false, false) => ProviderOwnership::Human { owners },
+            (true, false) => ProviderOwnership::BotAndHuman { owners },
+        }
     }
 
     fn projection_comment(&self, task: &TaskToolRecord) -> String {
@@ -1933,11 +2070,15 @@ impl TaskAdapter for VikunjaAdapter {
     }
 
     fn pull_tasks(&self) -> anyhow::Result<Vec<TaskSyncRecord>> {
+        Ok(self.pull_tasks_with_assignment_tracking(true)?.records)
+    }
+
+    fn pull_task_snapshot(&self) -> anyhow::Result<TaskSyncSnapshot> {
         self.pull_tasks_with_assignment_tracking(true)
     }
 
     fn get_task(&self, id: Uuid) -> anyhow::Result<Option<TaskToolRecord>> {
-        let tasks = self.pull_tasks_with_assignment_tracking(false)?;
+        let tasks = self.pull_tasks_with_assignment_tracking(false)?.records;
         Ok(tasks
             .into_iter()
             .map(|t| t.external)
@@ -2192,32 +2333,94 @@ impl TaskAdapter for VikunjaAdapter {
         self.set_task_labels(vikunja_task_id, &desired, &current_labels)
     }
 
-    fn set_assignee(&self, task_id: &str, assignee: &TaskAssignee) -> anyhow::Result<()> {
+    fn set_ownership(&self, task_id: &str, ownership: &ProviderOwnership) -> anyhow::Result<()> {
         let vikunja_task_id = self.resolve_task_numeric_id(task_id)?;
-
-        let target_user_id = match assignee {
-            TaskAssignee::Bot => Some(self.bot_user_id),
-            TaskAssignee::Human(username) => Some(self.resolve_required_user_id(username)?),
-            TaskAssignee::HumanProviderId(user_id) => Some(
-                user_id
-                    .parse::<i64>()
-                    .with_context(|| format!("invalid remembered Vikunja user id '{user_id}'"))?,
-            ),
-            TaskAssignee::Unassigned => None,
-        };
-
-        if let Some(target_user_id) = target_user_id {
-            let task: VikunjaTask = self.api_get(&format!("tasks/{vikunja_task_id}"))?;
-            if task.assignees.len() == 1 && task.assignees[0].id == target_user_id {
-                return Ok(());
+        let target_ids = match ownership {
+            ProviderOwnership::Unassigned => Vec::new(),
+            ProviderOwnership::Bot => vec![self.bot_user_id],
+            ProviderOwnership::Human { owners } => owners
+                .iter()
+                .map(|owner| {
+                    if let Some(provider_id) = owner.provider_id.as_deref() {
+                        provider_id.parse::<i64>().with_context(|| {
+                            format!("invalid remembered Vikunja user id '{provider_id}'")
+                        })
+                    } else if let Some(name) = owner.display_name.as_deref() {
+                        self.resolve_required_user_id(name)
+                    } else {
+                        anyhow::bail!("remembered Vikunja owner has no identity")
+                    }
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            ProviderOwnership::BotAndHuman { .. } => {
+                anyhow::bail!("refusing to create mixed bot and human assignment")
             }
-            self.clear_task_assignees(vikunja_task_id)?;
-            self.assign_user_to_task(vikunja_task_id, target_user_id)?;
-        } else {
-            self.clear_task_assignees(vikunja_task_id)?;
+        };
+        self.clear_task_assignees(vikunja_task_id)?;
+        for target_id in target_ids {
+            self.assign_user_to_task(vikunja_task_id, target_id)?;
         }
-
         Ok(())
+    }
+
+    fn reject_action(
+        &self,
+        task_id: &str,
+        rejection: ProviderActionRejectionDelivery<'_>,
+    ) -> anyhow::Result<()> {
+        let ProviderActionRejectionDelivery {
+            identity,
+            legacy_revision,
+            reason,
+            valid_actions,
+        } = rejection;
+        let vikunja_task_id = self.resolve_task_numeric_id(task_id)?;
+        let marker = action_marker(ACTION_REJECTION_MARKER, identity);
+        if action_delivery_recorded(
+            &self.get_task_comments(vikunja_task_id)?,
+            &marker,
+            ACTION_REJECTION_MARKER,
+            legacy_revision,
+        ) {
+            return Ok(());
+        }
+        let alternatives = valid_actions
+            .iter()
+            .map(|action| format!("`{}`", human_action_name(action)))
+            .collect::<Vec<_>>();
+        self.append_task_comment(
+            vikunja_task_id,
+            format!(
+                "{marker}\n## ❌ Agent Hub action rejected\n\n{reason}\n\n**Valid actions:** {}",
+                if alternatives.is_empty() {
+                    "none".to_string()
+                } else {
+                    alternatives.join(", ")
+                }
+            ),
+        )
+    }
+
+    fn acknowledge_action(
+        &self,
+        task_id: &str,
+        identity: &ProviderActionIdentity,
+        legacy_revision: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let vikunja_task_id = self.resolve_task_numeric_id(task_id)?;
+        let marker = action_marker(ACTION_APPLIED_MARKER, identity);
+        if action_delivery_recorded(
+            &self.get_task_comments(vikunja_task_id)?,
+            &marker,
+            ACTION_APPLIED_MARKER,
+            legacy_revision,
+        ) {
+            return Ok(());
+        }
+        self.append_task_comment(
+            vikunja_task_id,
+            format!("{marker}\n✅ Agent Hub action applied."),
+        )
     }
 
     fn poll_changes(&self) -> anyhow::Result<Vec<TaskChange>> {
@@ -2286,6 +2489,20 @@ impl TaskAdapter for VikunjaAdapter {
     }
 }
 
+fn human_action_name(action: &HumanActionKind) -> &'static str {
+    match action {
+        HumanActionKind::ChooseWorkflow => "choose_workflow",
+        HumanActionKind::Submit => "submit",
+        HumanActionKind::Approve => "approve",
+        HumanActionKind::RequestChanges => "request_changes",
+        HumanActionKind::Unblock => "unblock",
+        HumanActionKind::Retry => "retry",
+        HumanActionKind::Cancel => "cancel",
+        HumanActionKind::ChecksPassed => "checks_passed",
+        HumanActionKind::ChecksFailed => "checks_failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2348,6 +2565,38 @@ mod tests {
         assert_eq!(action.kind, HumanActionKind::Approve);
         assert_eq!(action.reason.as_deref(), Some("some reason"));
         assert!(action.workflow_id.is_none());
+    }
+
+    #[test]
+    fn malformed_workflow_command_is_rejected_strictly() {
+        let error =
+            parse_comment_action_strict("/ah workflow").expect_err("workflow id is required");
+        assert_eq!(error, "usage: /ah workflow <workflow_id>");
+    }
+
+    #[test]
+    fn newer_valid_command_wins_over_historical_invalid_command() {
+        let comments = vec![
+            test_command_comment(1, "/ah unknown", "2026-01-01T00:00:00Z"),
+            test_command_comment(2, "/ah approve", "2026-01-01T00:00:01Z"),
+        ];
+        let command = newest_comment_command(&comments).expect("newest command");
+        let (action, _) = command.expect("newest command is valid");
+        assert_eq!(action.kind, HumanActionKind::Approve);
+    }
+
+    fn test_command_comment(id: i64, comment: &str, timestamp: &str) -> VikunjaComment {
+        VikunjaComment {
+            id,
+            comment: comment.to_string(),
+            author: VikunjaUser {
+                id: 1,
+                username: "operator".to_string(),
+                email: None,
+            },
+            created: timestamp.to_string(),
+            updated: timestamp.to_string(),
+        }
     }
 
     #[test]
@@ -2486,6 +2735,118 @@ mod tests {
         // silently dropped — safer default for arbitrary user input.
         assert_eq!(html_to_plain_text("&unknown;"), "&unknown;");
         assert_eq!(html_to_plain_text("orphan & sign"), "orphan & sign");
+    }
+
+    #[test]
+    fn command_replay_ignores_same_revision_ownership_markers() {
+        let command = VikunjaComment {
+            id: 17,
+            comment: "/ah approve".to_string(),
+            author: VikunjaUser {
+                id: 42,
+                username: "nick".to_string(),
+                email: None,
+            },
+            created: "2026-01-01T00:00:00Z".to_string(),
+            updated: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let revision = action_revision_from_timestamp(
+            parse_rfc3339_to_utc(&command.updated).expect("timestamp"),
+            command.id as u64,
+        );
+        let ownership_marker = VikunjaComment {
+            id: 18,
+            comment: action_marker(
+                ACTION_APPLIED_MARKER,
+                &ProviderActionIdentity {
+                    namespace: ProviderActionNamespace::Ownership,
+                    revision,
+                },
+            ),
+            author: VikunjaUser {
+                id: 99,
+                username: "bot".to_string(),
+                email: None,
+            },
+            created: "2026-01-01T00:01:00Z".to_string(),
+            updated: "2026-01-01T00:01:00Z".to_string(),
+        };
+        assert!(matches!(
+            newest_comment_command(&[command.clone(), ownership_marker]),
+            Some(Ok((TaskHumanAction { kind: HumanActionKind::Approve, .. }, actual))) if actual == revision
+        ));
+
+        let command_marker = VikunjaComment {
+            id: 19,
+            comment: action_marker(
+                ACTION_REJECTION_MARKER,
+                &ProviderActionIdentity {
+                    namespace: ProviderActionNamespace::Command,
+                    revision,
+                },
+            ),
+            author: VikunjaUser {
+                id: 99,
+                username: "bot".to_string(),
+                email: None,
+            },
+            created: "2026-01-01T00:02:00Z".to_string(),
+            updated: "2026-01-01T00:02:00Z".to_string(),
+        };
+        assert!(newest_comment_command(&[command, command_marker]).is_none());
+    }
+
+    #[test]
+    fn vikunja_markers_preserve_full_identity_and_recognize_legacy_alias() {
+        let command = ProviderActionIdentity {
+            namespace: ProviderActionNamespace::Command,
+            revision: u64::MAX,
+        };
+        let ownership = ProviderActionIdentity {
+            namespace: ProviderActionNamespace::Ownership,
+            revision: u64::MAX,
+        };
+        assert_eq!(
+            action_marker(ACTION_APPLIED_MARKER, &command),
+            format!("{ACTION_APPLIED_MARKER}command:{} -->", u64::MAX)
+        );
+        assert_ne!(
+            action_marker(ACTION_APPLIED_MARKER, &command),
+            action_marker(ACTION_APPLIED_MARKER, &ownership)
+        );
+        let comments = vec![VikunjaComment {
+            id: 1,
+            comment: legacy_action_marker(ACTION_APPLIED_MARKER, 99),
+            author: VikunjaUser {
+                id: 99,
+                username: "bot".to_string(),
+                email: None,
+            },
+            created: "2026-01-01T00:00:00Z".to_string(),
+            updated: "2026-01-01T00:00:00Z".to_string(),
+        }];
+        assert!(action_delivery_recorded(
+            &comments,
+            &action_marker(ACTION_APPLIED_MARKER, &ownership),
+            ACTION_APPLIED_MARKER,
+            Some(99),
+        ));
+        assert!(!action_delivery_recorded(
+            &comments,
+            &action_marker(ACTION_APPLIED_MARKER, &ownership),
+            ACTION_APPLIED_MARKER,
+            None,
+        ));
+        let rejected_comments = vec![VikunjaComment {
+            comment: legacy_action_marker(ACTION_REJECTION_MARKER, 99),
+            ..comments[0].clone()
+        }];
+        assert!(action_delivery_recorded(
+            &rejected_comments,
+            &action_marker(ACTION_REJECTION_MARKER, &ownership),
+            ACTION_REJECTION_MARKER,
+            Some(99),
+        ));
     }
 
     #[test]
@@ -2709,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn test_assignment_to_bot_with_open_gate_synthesises_approve() {
+    fn test_assignment_transition_does_not_create_provider_specific_action() {
         let adapter = test_adapter();
         let task = test_task();
         let comments = vec![checkpoint_vikunja_comment(&checkpoint_comment_full(
@@ -2725,10 +3086,6 @@ mod tests {
             .vikunja_task_to_record(&task, &comments, true)
             .expect("task record");
 
-        let action = record
-            .requested_action
-            .as_ref()
-            .expect("approve action expected");
-        assert_eq!(action.kind, HumanActionKind::Approve);
+        assert!(record.requested_action.is_none());
     }
 }

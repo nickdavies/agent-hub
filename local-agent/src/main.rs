@@ -31,9 +31,9 @@ mod workspace;
 use artifacts::{
     AdditionalRepoMountView, AgentContextWriteParams, GITHUB_DEFAULT_HOST,
     collect_structured_transcript_artifacts, display_paths_for_runtime, file_len_u64,
-    normalize_github_repo_slug_with_allowlist, parse_github_pr_from_output,
-    parse_github_repo_url, work_item_contract_from_job_context,
-    workflow_valid_next_events_from_job_context, write_agent_context_file,
+    normalize_github_repo_slug_with_allowlist, parse_github_pr_from_output, parse_github_repo_url,
+    work_item_contract_from_job_context, workflow_valid_next_events_from_job_context,
+    write_agent_context_file,
 };
 use client::{
     Client, GrpcClient, HttpClient, JobUpdateOutcome, is_worker_not_found_error,
@@ -257,55 +257,77 @@ fn classify_repo_source(entry: &str) -> RepoSourceKind {
     }
 }
 
-fn ensure_repo_cloned(url: &str, cache_dir: &Path) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(cache_dir)
-        .with_context(|| format!("create repo cache directory {}", cache_dir.display()))?;
-
-    let repo_name = repo_name_from_url(url);
-    let repo_dir = cache_dir.join(&repo_name);
-
-    if repo_dir.exists() {
-        if !repo_dir.is_dir() {
-            anyhow::bail!(
-                "repo cache target '{}' exists but is not a directory",
-                repo_dir.display()
-            );
-        }
-        if !repo_dir.join(".git").is_dir() {
-            anyhow::bail!(
-                "repo cache target '{}' exists but is not a git repository",
-                repo_dir.display()
-            );
-        }
-        return Ok(repo_dir);
-    }
-
-    let clone = std::process::Command::new("git")
-        .arg("clone")
-        .arg(url)
-        .arg(&repo_dir)
-        .output()
-        .with_context(|| {
-            format!(
-                "run git clone '{}' into '{}'",
-                url,
-                repo_dir.to_string_lossy()
-            )
-        })?;
-    if !clone.status.success() {
-        let stderr = String::from_utf8_lossy(&clone.stderr);
+fn canonical_approved_repository_roots(
+    local_agent_config: &LocalAgentConfig,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if local_agent_config.approved_repository_roots.is_empty() {
         anyhow::bail!(
-            "git clone failed for '{}' into '{}': {}",
-            url,
-            repo_dir.display(),
-            stderr.trim()
+            "assignment-driven triage requires explicit approved_repository_roots in local-agent config"
         );
     }
 
-    Ok(repo_dir)
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(std::fs::canonicalize)
+        .transpose()
+        .context("canonicalize HOME")?;
+    let mut roots = Vec::new();
+    for configured_root in &local_agent_config.approved_repository_roots {
+        let absolute = resolve_to_absolute(configured_root).with_context(|| {
+            format!(
+                "resolve approved repository root {}",
+                configured_root.display()
+            )
+        })?;
+        let canonical = std::fs::canonicalize(&absolute).with_context(|| {
+            format!(
+                "canonicalize approved repository root {}",
+                absolute.display()
+            )
+        })?;
+        if !canonical.is_dir() {
+            anyhow::bail!(
+                "approved repository root '{}' is not a directory",
+                canonical.display()
+            );
+        }
+        if canonical == Path::new("/") || home.as_ref() == Some(&canonical) {
+            anyhow::bail!(
+                "approved repository root '{}' is too broad",
+                canonical.display()
+            );
+        }
+        if path_contains_credential_directory(&canonical) {
+            anyhow::bail!(
+                "approved repository root '{}' is credential-bearing",
+                canonical.display()
+            );
+        }
+        if roots.iter().any(|existing: &PathBuf| {
+            canonical.starts_with(existing) || existing.starts_with(&canonical)
+        }) {
+            anyhow::bail!(
+                "approved repository root '{}' duplicates or overlaps another root",
+                canonical.display()
+            );
+        }
+        roots.push(canonical);
+    }
+    Ok(roots)
 }
 
-fn validate_local_repo_dir(raw_dir: &str) -> anyhow::Result<PathBuf> {
+fn path_contains_credential_directory(path: &Path) -> bool {
+    path.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                ".ssh" | ".aws" | ".gnupg" | ".kube" | ".docker" | ".config"
+            )
+        })
+    })
+}
+
+fn validate_local_repo_dir(raw_dir: &str, approved_roots: &[PathBuf]) -> anyhow::Result<PathBuf> {
     let expanded = expand_home_path(raw_dir)
         .with_context(|| format!("expand triage_repos entry '{raw_dir}'"))?;
     let host_dir = resolve_to_absolute(&expanded).with_context(|| {
@@ -316,17 +338,31 @@ fn validate_local_repo_dir(raw_dir: &str) -> anyhow::Result<PathBuf> {
         )
     })?;
 
-    if !host_dir.exists() {
+    let host_dir = std::fs::canonicalize(&host_dir).with_context(|| {
+        format!(
+            "canonicalize triage_repos entry '{}' resolved as '{}'",
+            raw_dir,
+            host_dir.display()
+        )
+    })?;
+    if !host_dir.is_dir() {
         anyhow::bail!(
-            "triage_repos entry '{}' resolved to '{}' but does not exist",
+            "triage_repos entry '{}' resolved to '{}' but is not a directory",
             raw_dir,
             host_dir.display()
         );
     }
 
-    if !host_dir.is_dir() {
+    if !approved_roots.iter().any(|root| host_dir.starts_with(root)) {
         anyhow::bail!(
-            "triage_repos entry '{}' resolved to '{}' but is not a directory",
+            "triage_repos entry '{}' canonicalized to '{}' outside approved_repository_roots",
+            raw_dir,
+            host_dir.display()
+        );
+    }
+    if path_contains_credential_directory(&host_dir) {
+        anyhow::bail!(
+            "triage_repos entry '{}' canonicalized to credential-bearing path '{}'",
             raw_dir,
             host_dir.display()
         );
@@ -339,6 +375,30 @@ fn validate_local_repo_dir(raw_dir: &str) -> anyhow::Result<PathBuf> {
             host_dir.display()
         )
     })?;
+
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&host_dir)
+        .output()
+        .with_context(|| format!("validate git repository at {}", host_dir.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "triage_repos entry '{}' canonicalized to '{}' but is not a valid git repository",
+            raw_dir,
+            host_dir.display()
+        );
+    }
+    let top_level = String::from_utf8(output.stdout).context("git repository path is not UTF-8")?;
+    let top_level =
+        std::fs::canonicalize(top_level.trim()).context("canonicalize git repository top level")?;
+    if top_level != host_dir {
+        anyhow::bail!(
+            "triage_repos entry '{}' must name a repository root, not '{}' within '{}'",
+            raw_dir,
+            host_dir.display(),
+            top_level.display()
+        );
+    }
 
     Ok(host_dir)
 }
@@ -379,18 +439,25 @@ fn validate_triage_repos_and_prime_cache(
     local_agent_config: &LocalAgentConfig,
     repo_cache_dir: &Path,
 ) -> anyhow::Result<Vec<String>> {
+    if local_agent_config.triage_repos.is_empty() {
+        anyhow::bail!(
+            "assignment-driven triage requires at least one pre-materialized triage_repos directory"
+        );
+    }
+    let approved_roots = canonical_approved_repository_roots(local_agent_config)?;
     std::fs::create_dir_all(repo_cache_dir)
         .with_context(|| format!("create repo cache directory {}", repo_cache_dir.display()))?;
 
-    let mut remote_repos = Vec::new();
+    let remote_repos = Vec::new();
     for raw_entry in &local_agent_config.triage_repos {
         match classify_repo_source(raw_entry) {
             RepoSourceKind::LocalDirectory(raw_dir) => {
-                validate_local_repo_dir(&raw_dir)?;
+                validate_local_repo_dir(&raw_dir, &approved_roots)?;
             }
             RepoSourceKind::GitRemote(url) => {
-                ensure_repo_cloned(&url, repo_cache_dir)?;
-                remote_repos.push(url);
+                anyhow::bail!(
+                    "triage_repos entry '{url}' is remote; triage requires pre-materialized local directories"
+                );
             }
         }
     }
@@ -403,10 +470,15 @@ fn configured_repo_discovery_mounts(
     repo_cache_dir: &Path,
 ) -> anyhow::Result<Vec<protocol::orchestration::PlannedFileMount>> {
     let mut mounts = Vec::new();
+    let approved_roots = canonical_approved_repository_roots(local_agent_config)?;
+    let mut canonical_sources = Vec::new();
+    let mut aliases = HashSet::new();
 
     for raw_entry in &local_agent_config.triage_repos {
         let host_dir = match classify_repo_source(raw_entry) {
-            RepoSourceKind::LocalDirectory(raw_dir) => validate_local_repo_dir(&raw_dir)?,
+            RepoSourceKind::LocalDirectory(raw_dir) => {
+                validate_local_repo_dir(&raw_dir, &approved_roots)?
+            }
             RepoSourceKind::GitRemote(url) => {
                 let repo_dir = repo_cache_dir.join(repo_name_from_url(&url));
                 if !repo_dir.exists() {
@@ -439,6 +511,30 @@ fn configured_repo_discovery_mounts(
             .and_then(|name| name.to_str())
             .filter(|value| !value.is_empty())
             .unwrap_or("repos");
+        if !dirname
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            || matches!(dirname, "." | "..")
+        {
+            anyhow::bail!(
+                "triage_repos source '{}' has unsafe mount alias '{}'",
+                host_dir.display(),
+                dirname
+            );
+        }
+        if !aliases.insert(dirname.to_string()) {
+            anyhow::bail!("triage_repos contains duplicate mount alias '/repos/{dirname}'");
+        }
+        if canonical_sources
+            .iter()
+            .any(|source: &PathBuf| host_dir.starts_with(source) || source.starts_with(&host_dir))
+        {
+            anyhow::bail!(
+                "triage_repos source '{}' duplicates or overlaps another source",
+                host_dir.display()
+            );
+        }
+        canonical_sources.push(host_dir.clone());
         mounts.push(protocol::orchestration::PlannedFileMount {
             host_path: host_dir.to_string_lossy().into_owned(),
             container_path: format!("/repos/{dirname}"),
@@ -597,10 +693,7 @@ mod tests {
     #[test]
     fn local_agent_config_github_hosts_allowlists_extra_entries() {
         let mut cfg = LocalAgentConfig::default();
-        cfg.github_hosts = vec![
-            "github.com".to_string(),
-            "github.snooguts.net".to_string(),
-        ];
+        cfg.github_hosts = vec!["github.com".to_string(), "github.snooguts.net".to_string()];
         let allowlist = cfg.github_host_allowlist();
         assert_eq!(
             normalize_github_repo_slug_with_allowlist(
@@ -627,6 +720,114 @@ mod tests {
             vec!["github.com".to_string()],
             "blank entries should be ignored and fall back to the default",
         );
+    }
+
+    #[test]
+    fn triage_repo_validation_requires_pre_materialized_local_inputs() {
+        let tmp = std::env::temp_dir().join(format!("triage-local-{}", uuid::Uuid::new_v4()));
+        let approved = tmp.join("approved");
+        let repo = approved.join("repo");
+        std::fs::create_dir_all(&repo).expect("create local repo input");
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .expect("run git init");
+        assert!(init.status.success());
+        let cache = tmp.join("cache");
+
+        let empty = LocalAgentConfig::default();
+        assert!(validate_triage_repos_and_prime_cache(&empty, &cache).is_err());
+
+        let mut remote = LocalAgentConfig::default();
+        remote.triage_repos = vec!["https://github.com/reddit/agent-hub.git".to_string()];
+        remote.approved_repository_roots = vec![approved.clone()];
+        assert!(validate_triage_repos_and_prime_cache(&remote, &cache).is_err());
+
+        let mut local = LocalAgentConfig::default();
+        local.triage_repos = vec![repo.to_string_lossy().into_owned()];
+        local.approved_repository_roots = vec![approved];
+        assert!(
+            validate_triage_repos_and_prime_cache(&local, &cache)
+                .expect("local pre-materialized repo")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn triage_repo_mounts_reject_unapproved_sensitive_non_repo_and_alias_collisions() {
+        let tmp = std::env::temp_dir().join(format!("triage-mounts-{}", uuid::Uuid::new_v4()));
+        let approved = tmp.join("approved");
+        let repo = approved.join("same-name");
+        let other_parent = tmp.join("other");
+        let other_repo = other_parent.join("same-name");
+        let non_repo = approved.join("not-a-repo");
+        for path in [&repo, &other_repo, &non_repo] {
+            std::fs::create_dir_all(path).expect("create test directory");
+        }
+        for path in [&repo, &other_repo] {
+            let init = std::process::Command::new("git")
+                .arg("init")
+                .arg(path)
+                .output()
+                .expect("run git init");
+            assert!(init.status.success());
+        }
+
+        let mut config = LocalAgentConfig::default();
+        config.approved_repository_roots = vec![approved.clone()];
+
+        config.triage_repos = vec![other_repo.to_string_lossy().into_owned()];
+        assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
+
+        config.triage_repos = vec![non_repo.to_string_lossy().into_owned()];
+        assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
+
+        config.approved_repository_roots = vec![PathBuf::from("/etc")];
+        config.triage_repos = vec!["/etc".to_string()];
+        assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
+
+        config.approved_repository_roots = vec![approved.clone(), other_parent.clone()];
+        config.triage_repos = vec![
+            repo.to_string_lossy().into_owned(),
+            other_repo.to_string_lossy().into_owned(),
+        ];
+        assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
+
+        let credential_root = tmp.join(".ssh");
+        std::fs::create_dir_all(&credential_root).expect("create credential directory");
+        config.approved_repository_roots = vec![credential_root];
+        config.triage_repos.clear();
+        assert!(canonical_approved_repository_roots(&config).is_err());
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn triage_repo_mounts_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = std::env::temp_dir().join(format!("triage-symlink-{}", uuid::Uuid::new_v4()));
+        let approved = tmp.join("approved");
+        let outside = tmp.join("outside-repo");
+        std::fs::create_dir_all(&approved).expect("create approved root");
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg(&outside)
+            .output()
+            .expect("run git init");
+        assert!(init.status.success());
+        let escaped = approved.join("escaped");
+        symlink(&outside, &escaped).expect("create symlink");
+
+        let mut config = LocalAgentConfig::default();
+        config.approved_repository_roots = vec![approved];
+        config.triage_repos = vec![escaped.to_string_lossy().into_owned()];
+        assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
+
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
@@ -2724,6 +2925,10 @@ async fn main() -> anyhow::Result<()> {
     );
     let egress_manager = EgressManager::new(&cli.worker_id, &cli.data_dir, local_agent_config)
         .context("failed to initialize local-agent egress manager")?;
+    egress_manager
+        .preflight_llm_only()
+        .await
+        .context("assignment-driven triage requires enforceable agent/model API egress")?;
     let repos_root = cli.data_dir.join("repos");
     std::fs::create_dir_all(&repos_root)?;
     let worktrees_root = cli.data_dir.join("worktrees");
@@ -3050,23 +3255,30 @@ async fn run_job(
         environment_runtime.as_deref(),
         local_agent_config,
     )?;
+    let work_item_context = work_item_contract_from_job_context(&job.context);
+    let triage_job = is_triage_job(&work_item_context);
 
     let (runtime_spec, runtime_spec_source) = resolve_runtime_spec_and_source(job);
     let mut runtime_spec = runtime_spec;
+    validate_triage_mount_and_credential_requests(triage_job, &resolved_runner, &runtime_spec)?;
     if runtime_spec.environment.container_image.is_none() {
         runtime_spec.environment.container_image = resolved_runner.container_image.clone();
     }
-    runtime_spec
-        .environment
-        .file_mounts
-        .extend(resolved_runner.file_mounts.clone());
-    runtime_spec
-        .environment
-        .file_mounts
-        .extend(configured_repo_discovery_mounts(
-            local_agent_config,
-            &data_dir.join("repo-cache"),
-        )?);
+    if !triage_job {
+        runtime_spec
+            .environment
+            .file_mounts
+            .extend(resolved_runner.file_mounts.clone());
+    }
+    if triage_job {
+        runtime_spec
+            .environment
+            .file_mounts
+            .extend(configured_repo_discovery_mounts(
+                local_agent_config,
+                &data_dir.join("repo-cache"),
+            )?);
+    }
     let local_egress_plan = resolve_local_agent_egress_plan(&runtime_spec, local_agent_config)?;
     let runtime_source_label = runtime_spec_source.label();
     match runtime_spec_source {
@@ -4837,40 +5049,7 @@ async fn run_docker(
                     job.id
                 )
             })?;
-        args.push(format!("--network={}", restricted_runtime.network_name));
-
-        for key in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            docker_env.remove(key);
-        }
-        docker_env.insert(
-            "HTTP_PROXY".to_string(),
-            restricted_runtime.proxy_url.clone(),
-        );
-        docker_env.insert(
-            "HTTPS_PROXY".to_string(),
-            restricted_runtime.proxy_url.clone(),
-        );
-        docker_env.insert("NO_PROXY".to_string(), restricted_runtime.no_proxy.clone());
-        docker_env.insert(
-            "http_proxy".to_string(),
-            restricted_runtime.proxy_url.clone(),
-        );
-        docker_env.insert(
-            "https_proxy".to_string(),
-            restricted_runtime.proxy_url.clone(),
-        );
-        docker_env.insert("no_proxy".to_string(), restricted_runtime.no_proxy.clone());
-        docker_env.insert(
-            "AGENT_RESTRICTED_EGRESS_HOSTS".to_string(),
-            restricted_runtime.tier_hosts.join(","),
-        );
+        restricted_runtime.apply_container_network_controls(&mut args, &mut docker_env);
 
         if matches!(tier, LocalAgentEgressTier::Build) {
             apply_build_egress_env_defaults(&mut docker_env, local_agent_config);
@@ -4942,13 +5121,21 @@ async fn run_docker(
     }
 
     let job_gh_host = job_gh_host_override(job, local_agent_config);
-    append_gh_config_mount_for_toolchains(
-        &mut args,
-        &mut docker_env,
-        &runtime_spec.environment.toolchains,
-        job_gh_host.as_deref(),
-    );
-    let resolved_credentials = resolve_configured_credentials(local_agent_config).await?;
+    let work_item_context = work_item_contract_from_job_context(&job.context);
+    let allow_remote_credentials = job_allows_remote_credentials(&work_item_context);
+    if allow_remote_credentials {
+        append_gh_config_mount_for_toolchains(
+            &mut args,
+            &mut docker_env,
+            &runtime_spec.environment.toolchains,
+            job_gh_host.as_deref(),
+        );
+    }
+    let resolved_credentials = if allow_remote_credentials {
+        resolve_configured_credentials(local_agent_config).await?
+    } else {
+        ResolvedCredentials::default()
+    };
     append_resolved_credentials_to_docker_invocation(
         &resolved_credentials,
         &mut args,
@@ -4970,7 +5157,7 @@ async fn run_docker(
         job,
         events,
     )
-    .await;
+    .await?;
     for (k, v) in &docker_env {
         args.push("-e".to_string());
         args.push(format!("{k}={v}"));
@@ -5004,12 +5191,12 @@ async fn run_docker(
         events,
         cancel_rx,
     )
-    .await;
+    .await?;
     for bridge in &mcp_bridges {
         bridge.stop();
     }
     cleanup_credential_temp_files_best_effort(&resolved_credentials.temp_files);
-    run_result
+    Ok(run_result)
 }
 
 struct DockerRuntimeInvocation {
@@ -5462,6 +5649,32 @@ fn is_triage_job(work_item_context: &serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     workflow_id == "__triage__"
+}
+
+fn job_allows_remote_credentials(work_item_context: &serde_json::Value) -> bool {
+    !is_triage_job(work_item_context)
+}
+
+fn validate_triage_mount_and_credential_requests(
+    triage_job: bool,
+    runner: &ResolvedRunnerSpec,
+    runtime: &protocol::CanonicalRuntimeSpec,
+) -> anyhow::Result<()> {
+    if !triage_job {
+        return Ok(());
+    }
+    if !runner.file_mounts.is_empty() || !runner.requires_credentials.is_empty() {
+        anyhow::bail!(
+            "triage runner must not declare arbitrary file mounts or credential providers"
+        );
+    }
+    if !runtime.environment.file_mounts.is_empty() {
+        anyhow::bail!("triage runtime must not request arbitrary file mounts");
+    }
+    if !runtime.repos.is_empty() {
+        anyhow::bail!("triage runtime must not request arbitrary repository mounts");
+    }
+    Ok(())
 }
 
 fn validate_environment_selection_structure(
@@ -6111,40 +6324,7 @@ async fn build_docker_runtime_invocation(
                     job.id
                 )
             })?;
-        args.push(format!("--network={}", restricted_runtime.network_name));
-
-        for key in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            docker_env.remove(key);
-        }
-        docker_env.insert(
-            "HTTP_PROXY".to_string(),
-            restricted_runtime.proxy_url.clone(),
-        );
-        docker_env.insert(
-            "HTTPS_PROXY".to_string(),
-            restricted_runtime.proxy_url.clone(),
-        );
-        docker_env.insert("NO_PROXY".to_string(), restricted_runtime.no_proxy.clone());
-        docker_env.insert(
-            "http_proxy".to_string(),
-            restricted_runtime.proxy_url.clone(),
-        );
-        docker_env.insert(
-            "https_proxy".to_string(),
-            restricted_runtime.proxy_url.clone(),
-        );
-        docker_env.insert("no_proxy".to_string(), restricted_runtime.no_proxy.clone());
-        docker_env.insert(
-            "AGENT_RESTRICTED_EGRESS_HOSTS".to_string(),
-            restricted_runtime.tier_hosts.join(","),
-        );
+        restricted_runtime.apply_container_network_controls(&mut args, &mut docker_env);
 
         if matches!(tier, LocalAgentEgressTier::Build) {
             apply_build_egress_env_defaults(&mut docker_env, local_agent_config);
@@ -6216,13 +6396,21 @@ async fn build_docker_runtime_invocation(
     }
 
     let job_gh_host = job_gh_host_override(job, local_agent_config);
-    append_gh_config_mount_for_toolchains(
-        &mut args,
-        &mut docker_env,
-        &runtime_spec.environment.toolchains,
-        job_gh_host.as_deref(),
-    );
-    let resolved_credentials = resolve_configured_credentials(local_agent_config).await?;
+    let work_item_context = work_item_contract_from_job_context(&job.context);
+    let allow_remote_credentials = job_allows_remote_credentials(&work_item_context);
+    if allow_remote_credentials {
+        append_gh_config_mount_for_toolchains(
+            &mut args,
+            &mut docker_env,
+            &runtime_spec.environment.toolchains,
+            job_gh_host.as_deref(),
+        );
+    }
+    let resolved_credentials = if allow_remote_credentials {
+        resolve_configured_credentials(local_agent_config).await?
+    } else {
+        ResolvedCredentials::default()
+    };
     append_resolved_credentials_to_docker_invocation(
         &resolved_credentials,
         &mut args,
@@ -6244,7 +6432,7 @@ async fn build_docker_runtime_invocation(
         job,
         events,
     )
-    .await;
+    .await?;
     for (k, v) in &docker_env {
         args.push("-e".to_string());
         args.push(format!("{k}={v}"));
@@ -6274,7 +6462,11 @@ async fn configure_mcp_bridges_for_docker(
     local_agent_config: &LocalAgentConfig,
     job: &Job,
     events: Option<&JobEventSink>,
-) -> Vec<McpBridgeInstance> {
+) -> anyhow::Result<Vec<McpBridgeInstance>> {
+    let work_item_context = work_item_contract_from_job_context(&job.context);
+    if is_triage_job(&work_item_context) {
+        return Ok(Vec::new());
+    }
     let mut bridges = Vec::new();
 
     for bridge_config in &local_agent_config.mcp_bridges {
@@ -6302,21 +6494,18 @@ async fn configure_mcp_bridges_for_docker(
                 bridges.push(bridge);
             }
             Err(error) => {
-                let warning = format!(
-                    "warning: failed to start MCP bridge '{}' ({error:#}); continuing without it",
-                    bridge_config.name
-                );
-                eprintln!("{warning}");
-                if let Some(events) = events {
-                    events
-                        .emit(job.id, pb::JobEventKind::JobEventSystem, warning)
-                        .await;
-                }
+                let _ = events;
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to start required MCP bridge '{}'",
+                        bridge_config.name
+                    )
+                });
             }
         }
     }
 
-    bridges
+    Ok(bridges)
 }
 
 async fn resolve_configured_credentials(
@@ -7199,6 +7388,131 @@ mod multi_repo_tests {
 #[cfg(test)]
 mod triage_validation_tests {
     use super::*;
+
+    fn triage_job() -> Job {
+        let now = Utc::now();
+        Job {
+            id: uuid::Uuid::new_v4(),
+            work_item_id: uuid::Uuid::new_v4(),
+            step_id: "triage".to_string(),
+            state: JobState::Assigned,
+            assigned_worker_id: Some("worker".to_string()),
+            execution_mode: ExecutionMode::Docker,
+            container_image: Some("agent-image".to_string()),
+            command: "agent".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({"work_item": {"workflow_id": "__triage__"}}),
+            repo: None,
+            timeout_secs: None,
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn triage_jobs_never_receive_remote_credentials() {
+        let triage = serde_json::json!({"workflow_id": "__triage__"});
+        let normal = serde_json::json!({"workflow_id": "implementation"});
+        assert!(!job_allows_remote_credentials(&triage));
+        assert!(job_allows_remote_credentials(&normal));
+    }
+
+    #[test]
+    fn triage_rejects_runner_runtime_and_credential_provider_mounts() {
+        let job = triage_job();
+        let mut runtime = canonical_runtime_spec_for_job(&job);
+        let mut runner = ResolvedRunnerSpec {
+            kind: ResolvedRunnerKind::Generic,
+            command: "agent".to_string(),
+            args: Vec::new(),
+            container_image: Some("agent-image".to_string()),
+            file_mounts: vec![protocol::orchestration::PlannedFileMount {
+                host_path: "/home/user/.ssh".to_string(),
+                container_path: "/credentials".to_string(),
+                read_only: true,
+            }],
+            requires_credentials: Vec::new(),
+        };
+        assert!(validate_triage_mount_and_credential_requests(true, &runner, &runtime).is_err());
+
+        runner.file_mounts.clear();
+        runner.requires_credentials.push("github".to_string());
+        assert!(validate_triage_mount_and_credential_requests(true, &runner, &runtime).is_err());
+
+        runner.requires_credentials.clear();
+        runtime
+            .environment
+            .file_mounts
+            .push(protocol::orchestration::PlannedFileMount {
+                host_path: "/var/run/docker.sock".to_string(),
+                container_path: "/var/run/docker.sock".to_string(),
+                read_only: false,
+            });
+        assert!(validate_triage_mount_and_credential_requests(true, &runner, &runtime).is_err());
+
+        runtime.environment.file_mounts.clear();
+        runtime.repos.push(protocol::PlannedRepoClaim {
+            repo_url: "https://example.invalid/arbitrary/repo".to_string(),
+            base_ref: "origin/main".to_string(),
+            read_only: true,
+            target_branch: None,
+            claim_type: "read_only".to_string(),
+            branch_name: None,
+        });
+        assert!(validate_triage_mount_and_credential_requests(true, &runner, &runtime).is_err());
+    }
+
+    #[tokio::test]
+    async fn triage_docker_access_controls_add_no_mcp_gh_or_provider_material() {
+        let job = triage_job();
+        let mut config = LocalAgentConfig::default();
+        config.mcp_bridges.push(crate::mcp_bridge::McpBridgeConfig {
+            name: "forbidden".to_string(),
+            host_endpoint: crate::mcp_bridge::McpEndpoint::Unix {
+                path: "/run/forbidden.sock".to_string(),
+            },
+            container_socket_path: Some("/run/mcp.sock".to_string()),
+        });
+        let mut args = Vec::new();
+        let mut env = HashMap::new();
+        let bridges = configure_mcp_bridges_for_docker(&mut args, &mut env, &config, &job, None)
+            .await
+            .expect("triage should skip MCP configuration");
+        assert!(bridges.is_empty());
+        assert!(args.is_empty());
+        assert!(env.is_empty());
+
+        if job_allows_remote_credentials(&work_item_contract_from_job_context(&job.context)) {
+            append_gh_config_mount_for_toolchains(
+                &mut args,
+                &mut env,
+                &["gh".to_string()],
+                Some("github.com"),
+            );
+            append_resolved_credentials_to_docker_invocation(
+                &ResolvedCredentials {
+                    env_vars: HashMap::from([("GH_TOKEN".to_string(), "secret".to_string())]),
+                    file_mounts: vec![(
+                        "/credentials/provider".to_string(),
+                        "/credentials/provider".to_string(),
+                        true,
+                    )],
+                    temp_files: Vec::new(),
+                },
+                &mut args,
+                &mut env,
+            );
+        }
+        assert!(args.is_empty());
+        assert!(env.is_empty());
+    }
 
     #[test]
     fn triage_success_allows_any_concrete_repo_when_repo_catalog_missing() {

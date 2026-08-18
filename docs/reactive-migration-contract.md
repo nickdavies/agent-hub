@@ -129,7 +129,8 @@ Server orchestration now consumes external task records through an additive `Tas
 
 Sync behavior remains deterministic and compatible with current persistence/runtime:
 
-- Unknown external task IDs are inserted as internal work items.
+- Unknown external task IDs are ignored until a durable non-bot-to-bot ownership transition is
+  observed. A valid provider checkpoint is handled through the separate recovery path.
 - Existing internal items are updated only when external `updated_at` is newer.
 
 ### Task-tool driven management extensions
@@ -154,7 +155,7 @@ Task-native fields include (MVP):
 
 Behavior:
 
-- Missing workflow does not fail creation; task is projected as `needs_workflow_selection`.
+- Newly authorized tasks always enter `__triage__`; an explicit workflow is retained as a pin.
 - Missing workflow now creates a first-class internal triage placeholder (`workflow_id="__triage__"`,
   `current_step="triage"`) so workflow selection is a runtime path, not just metadata.
 - Explicit task actions are treated as intents (not full-record overwrite), including:
@@ -170,7 +171,8 @@ Action dedupe/clearing notes:
 
 - Adapter sync applies actions only when `action_revision` is newer than
   `context.task_adapter.last_action_revision`.
-- Applied actions are treated as one-shot intents; projection clears `requested_action`.
+- Applied and rejected actions receive durable provider-visible acknowledgements keyed by revision;
+  workflow state and the applied revision are persisted together before acknowledgement.
 
 Human-gate semantics (MVP):
 
@@ -184,7 +186,8 @@ Human-gate semantics (MVP):
   `workflow_selected`) for semantic clarity.
 - Submit while still in triage (`workflow_id="__triage__"`) is rejected with workflow-invalid
   rather than silently ignored.
-- `choose_workflow` on non-triage items is currently ignored with debug logging.
+- Invalid, unknown, unauthorized, or state-inapplicable actions are durably rejected with current
+  alternatives and do not mutate workflow state.
 
 Allowed-action projection (MVP):
 
@@ -234,19 +237,18 @@ Projection alignment:
   clickable operator actions).
 - Work-item detail UI renders `valid_next_events` read-only for operator/debug clarity.
 
-Deterministic triage rule-selection (MVP):
+Assignment-driven triage:
 
-- Manual-triage authority is now derived from either:
-  - task/work-item label `needs-triage` (authoritative)
-  - legacy compatibility flag `context.needs_triage=true`
-- When manual triage is required, triage remains non-dispatchable and `choose_workflow` is
-  withheld from projected `allowed_actions` and triage `valid_next_events` (cancel-only).
-- The dedicated `choose_workflow` path also rejects selection while manual triage is still active;
-  removing the label/legacy flag is required before workflow selection can proceed.
-- Removing `needs-triage` (and with no legacy `needs_triage=true`) deterministically re-runs
-  workflow selection on adapter update so triage items can leave `__triage__` automatically when
-  a workflow is now deterministically selectable.
-- `triage_reason` (when present) is projected as `blocked_reason` for operator clarity.
+- Provider assignment to the configured bot is the sole authorization and ingress signal.
+- Project membership, labels, priority, `needs_triage`, workflow rules, and `workflow_hint` do not
+  create, approve, stop, or route work.
+- Every newly authorized task enters exactly one `__triage__` job. Triage has no writable primary
+  repository; its workspace and every candidate/discovery repository mount are read-only.
+- An explicit workflow id is a pin on the triage result, not a bypass. A conflicting triage result
+  is rejected. Pins can change only before triage starts.
+- Human or unassigned provider tasks are ignored until bot assignment. Mixed bot+human assignment
+  is rejected visibly. Removing bot assignment cancels unreleased work and prevents checkpoint
+  release; already released external work is not represented as recallable.
 
 ## Canonical runtime vertical slice (docker-first)
 
