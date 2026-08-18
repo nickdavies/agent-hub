@@ -8,6 +8,8 @@ use chrono::Utc;
 use protocol::{ProviderOwnership, WorkItem};
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::task_adapter::CheckpointAuthorizationPending;
 use super::task_adapter::{
     ProviderActionIdentity, ProviderActionNamespace, ProviderActionRejectionDelivery, TaskAdapter,
     TaskChange, TaskChangeType, TaskCheckpoint, TaskCreate, TaskProjection, TaskSyncRecord,
@@ -543,6 +545,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("task-files-{}", Uuid::new_v4()));
         let store = TaskFileStore::new(tmp.clone());
         let task_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
         let checkpoint = TaskCheckpoint {
             current_step: "build".to_string(),
             phase: "executing".to_string(),
@@ -558,7 +561,17 @@ mod tests {
             human_owner: Some("alice".to_string()),
             human_owner_provider_id: Some("42".to_string()),
             human_owners: vec![],
-            dispatch_job_ids: vec![Uuid::new_v4()],
+            dispatch_job_ids: vec![job_id],
+            dispatch_authorizations: std::collections::BTreeMap::from([(
+                job_id,
+                "digest".to_string(),
+            )]),
+            authorization_pending: Some(CheckpointAuthorizationPending {
+                work_item_id: task_id,
+                request_digest: "pending-digest".to_string(),
+                request: serde_json::json!({"redacted":"request"}),
+            }),
+            proposed_authorizations: vec![serde_json::json!({"request_digest":"proposed"})],
             generation: 3,
             checkpoint_hash: "hash".to_string(),
             semantic_hash: "semantic".to_string(),
@@ -573,6 +586,21 @@ mod tests {
             .expect("checkpoint");
         assert_eq!(loaded.generation, 3);
         assert_eq!(loaded.dispatch_job_ids, checkpoint.dispatch_job_ids);
+        assert_eq!(
+            loaded.dispatch_authorizations,
+            checkpoint.dispatch_authorizations
+        );
+        assert_eq!(
+            loaded
+                .authorization_pending
+                .as_ref()
+                .map(|pending| pending.request_digest.as_str()),
+            Some("pending-digest")
+        );
+        assert_eq!(
+            loaded.proposed_authorizations,
+            checkpoint.proposed_authorizations
+        );
         assert!(!store.temp_checkpoint_path(task_id).exists());
         assert!(
             store

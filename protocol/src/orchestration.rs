@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
@@ -31,6 +32,196 @@ fn deserialize_optional_u64_lenient<'de, D: Deserializer<'de>>(
         ))),
     }
 }
+
+fn deserialize_u32_lenient<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_u64()
+                && let Ok(value) = u32::try_from(value)
+            {
+                return Ok(value);
+            }
+            if let Some(value) = number.as_f64()
+                && value >= 0.0
+                && value <= f64::from(u32::MAX)
+                && value.fract() == 0.0
+            {
+                return Ok(value as u32);
+            }
+            Err(de::Error::custom("expected an unsigned 32-bit integer"))
+        }
+        other => Err(de::Error::custom(format!("expected a number, got {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod immutable_authorization_tests {
+    use super::*;
+
+    fn request() -> ResolvedAuthorizationRequest {
+        let environment = canonical_environment_for_execution(
+            ExecutionMode::Docker,
+            Some("image@sha256:abc".to_string()),
+            Some(60),
+        );
+        let permissions = canonical_permissions_for_environment(&environment);
+        ResolvedAuthorizationRequest {
+            version: AUTHORIZATION_REQUEST_VERSION.to_string(),
+            invocation_id: Uuid::nil(),
+            work_unit_id: Uuid::nil(),
+            root_work_item_id: Uuid::nil(),
+            workflow_id: "workflow".to_string(),
+            workflow_snapshot: serde_json::json!({"b":2,"a":1}),
+            state_id: "build".to_string(),
+            state_kind: ReactiveStateKind::Command,
+            behavior: ResolvedAuthorizationBehavior {
+                execution_kind: "command".to_string(),
+                runner_profile: serde_json::json!({"config_digest":"command_v1","profile_name":"command"}),
+                command: "cargo".to_string(),
+                args: vec!["test".to_string()],
+                env: BTreeMap::from([("RUST_BACKTRACE".to_string(), "1".to_string())]),
+                prompt: None,
+                primary_repo: None,
+                primary_repo_branch: None,
+                execution_context: serde_json::json!({
+                    "state_invocation": {"state_id":"build", "id":Uuid::nil()}
+                }),
+                triage: false,
+                allow_remote_credentials: true,
+            },
+            permission_envelope: CanonicalRuntimeSpec {
+                runtime_version: "v2".to_string(),
+                environment,
+                permissions,
+                approval_rules: Some(ApprovalRuleSet {
+                    auto_approve: vec!["git".to_string(), "file_read".to_string()],
+                    escalate: vec!["shell_unknown".to_string()],
+                    deny: Vec::new(),
+                }),
+                repos: vec![PlannedRepoClaim {
+                    repo_url: "https://example/repo.git".to_string(),
+                    base_ref: "origin/main".to_string(),
+                    read_only: false,
+                    target_branch: Some("task/change".to_string()),
+                    claim_type: "workspace".to_string(),
+                    branch_name: Some("task/change".to_string()),
+                }],
+            },
+            resolved_environment: serde_json::json!({"network":"none"}),
+            provider: ResolvedAuthorizationProvider {
+                provider: Some("test".to_string()),
+                task_id: Some("task".to_string()),
+            },
+            resource_constraints: ResolvedAuthorizationResources {
+                timeout_secs: Some(60),
+                max_retries: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn digest_normalizes_set_like_permission_lists() {
+        let first = request();
+        let mut second = request();
+        second
+            .permission_envelope
+            .approval_rules
+            .as_mut()
+            .unwrap()
+            .auto_approve
+            .reverse();
+        assert_eq!(
+            first.request_digest().unwrap(),
+            second.request_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn read_only_repo_is_narrower_only_for_same_identity_and_base_ref() {
+        let baseline = request();
+        let mut narrower = request();
+        narrower.permission_envelope.repos[0].read_only = true;
+        narrower.permission_envelope.permissions.can_write_workspace = false;
+        assert!(narrower.permissions_are_subset_of(&baseline));
+        narrower.permission_envelope.repos[0].base_ref = "origin/other".to_string();
+        assert!(!narrower.permissions_are_subset_of(&baseline));
+    }
+
+    #[test]
+    fn behavior_changes_never_inherit_baseline() {
+        let baseline = request();
+        let mut changed = request();
+        changed.behavior.args.push("--release".to_string());
+        assert!(!changed.behavior_matches(&baseline));
+    }
+
+    #[test]
+    fn every_permission_field_fails_closed_when_widened_or_unknown() {
+        let baseline = request();
+
+        let mut changed = baseline.clone();
+        changed.permission_envelope.permissions.tier = PlannedPermissionTier::RawCompatible;
+        assert!(!changed.permissions_are_subset_of(&baseline));
+
+        let mut changed = baseline.clone();
+        changed
+            .permission_envelope
+            .permissions
+            .auto_approve_tools
+            .push("shell".to_string());
+        assert!(!changed.permissions_are_subset_of(&baseline));
+
+        let mut changed = baseline.clone();
+        changed
+            .permission_envelope
+            .permissions
+            .escalate_tools
+            .push("network".to_string());
+        assert!(!changed.permissions_are_subset_of(&baseline));
+
+        let mut changed = baseline.clone();
+        changed.permission_envelope.permissions.aws_access = Some("unknown".to_string());
+        assert!(!changed.permissions_are_subset_of(&baseline));
+
+        let mut changed = baseline.clone();
+        changed.permission_envelope.permissions.kubernetes_access = Some("read_write".to_string());
+        assert!(!changed.permissions_are_subset_of(&baseline));
+
+        let mut changed = baseline.clone();
+        changed.permission_envelope.repos[0].claim_type = "unknown".to_string();
+        assert!(!changed.permissions_are_subset_of(&baseline));
+    }
+
+    #[test]
+    fn identical_payload_in_new_invocation_has_distinct_authorization_identity() {
+        let first = request();
+        let mut second = first.clone();
+        second.invocation_id = Uuid::new_v4();
+        second.behavior.execution_context["state_invocation"]["id"] =
+            serde_json::Value::String(second.invocation_id.to_string());
+        assert_ne!(
+            first.request_digest().unwrap(),
+            second.request_digest().unwrap()
+        );
+        assert!(!second.behavior_matches(&first));
+    }
+
+    #[test]
+    fn floating_transport_integer_preserves_authorization_digest() {
+        let request = request();
+        let mut transported = serde_json::to_value(&request).unwrap();
+        transported["resource_constraints"]["max_retries"] = serde_json::json!(3.0);
+        let transported: ResolvedAuthorizationRequest =
+            serde_json::from_value(transported).unwrap();
+        assert_eq!(transported.resource_constraints.max_retries, 3);
+        assert_eq!(
+            request.request_digest().unwrap(),
+            transported.request_digest().unwrap()
+        );
+    }
+}
+use sha2::{Digest, Sha256};
 use strum::{Display, EnumString};
 use uuid::Uuid;
 
@@ -1423,6 +1614,59 @@ pub fn validate_reactive_workflows(
             }
         }
     }
+    let child_graph = defs
+        .iter()
+        .map(|def| {
+            let children = def
+                .states
+                .iter()
+                .filter_map(|state| match &state.config {
+                    ReactiveStateConfig::Auto(config) => config.child_workflow.clone(),
+                    _ => None,
+                })
+                .filter(|child| defs.iter().any(|candidate| candidate.id == *child))
+                .collect::<Vec<_>>();
+            (def.id.clone(), children)
+        })
+        .collect::<HashMap<_, _>>();
+    fn visit_child_graph(
+        node: &str,
+        graph: &HashMap<String, Vec<String>>,
+        visiting: &mut Vec<String>,
+        visited: &mut HashSet<String>,
+        errors: &mut Vec<WorkflowValidationError>,
+    ) {
+        if let Some(index) = visiting.iter().position(|candidate| candidate == node) {
+            let mut cycle = visiting[index..].to_vec();
+            cycle.push(node.to_string());
+            errors.push(WorkflowValidationError {
+                workflow_id: node.to_string(),
+                message: format!(
+                    "reactive child-workflow cycle detected: {}",
+                    cycle.join(" -> ")
+                ),
+            });
+            return;
+        }
+        if !visited.insert(node.to_string()) {
+            return;
+        }
+        visiting.push(node.to_string());
+        for child in graph.get(node).into_iter().flatten() {
+            visit_child_graph(child, graph, visiting, visited, errors);
+        }
+        visiting.pop();
+    }
+    let mut visited = HashSet::new();
+    for workflow_id in child_graph.keys() {
+        visit_child_graph(
+            workflow_id,
+            &child_graph,
+            &mut Vec::new(),
+            &mut visited,
+            &mut errors,
+        );
+    }
     WorkflowValidationReport { errors }
 }
 
@@ -2126,6 +2370,428 @@ fn default_runtime_version() -> String {
 }
 
 pub const CONTEXT_RUNTIME_SPEC_KEY: &str = "canonical_runtime_spec";
+pub const CONTEXT_AUTHORIZATION_REQUEST_KEY: &str = "resolved_authorization_request";
+pub const CONTEXT_AUTHORIZATION_ID_KEY: &str = "authorization_id";
+pub const CONTEXT_REQUEST_DIGEST_KEY: &str = "request_digest";
+pub const AUTHORIZATION_REQUEST_VERSION: &str = "resolved_authorization_request_v1";
+
+pub fn authorized_default_branch(work_item_id: Uuid, invocation_id: Uuid) -> String {
+    format!(
+        "agent-hub/{}--i{}",
+        work_item_id.simple(),
+        invocation_id.simple()
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ResolvedAuthorizationRequest {
+    pub version: String,
+    pub invocation_id: Uuid,
+    pub work_unit_id: Uuid,
+    pub root_work_item_id: Uuid,
+    pub workflow_id: String,
+    pub workflow_snapshot: serde_json::Value,
+    pub state_id: String,
+    pub state_kind: ReactiveStateKind,
+    pub behavior: ResolvedAuthorizationBehavior,
+    pub permission_envelope: CanonicalRuntimeSpec,
+    pub resolved_environment: serde_json::Value,
+    pub provider: ResolvedAuthorizationProvider,
+    pub resource_constraints: ResolvedAuthorizationResources,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ResolvedAuthorizationBehavior {
+    pub execution_kind: String,
+    pub runner_profile: serde_json::Value,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub prompt: Option<PromptRef>,
+    pub primary_repo: Option<RepoSource>,
+    pub primary_repo_branch: Option<String>,
+    pub execution_context: serde_json::Value,
+    pub triage: bool,
+    pub allow_remote_credentials: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ResolvedAuthorizationProvider {
+    pub provider: Option<String>,
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ResolvedAuthorizationResources {
+    #[serde(default, deserialize_with = "deserialize_optional_u64_lenient")]
+    pub timeout_secs: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u32_lenient")]
+    pub max_retries: u32,
+}
+
+impl ResolvedAuthorizationRequest {
+    pub fn normalize(mut self) -> Self {
+        normalize_runtime_for_authorization(&mut self.permission_envelope);
+        self.workflow_snapshot = canonical_json(self.workflow_snapshot);
+        self.behavior.runner_profile = canonical_json(self.behavior.runner_profile);
+        self.behavior.execution_context = canonical_json(self.behavior.execution_context);
+        self.resolved_environment = canonical_json(self.resolved_environment);
+        self
+    }
+
+    pub fn request_digest(&self) -> Result<String, serde_json::Error> {
+        let canonical = self.clone().normalize();
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?)))
+    }
+
+    pub fn behavior_matches(&self, baseline: &Self) -> bool {
+        self.version == baseline.version
+            && self.invocation_id == baseline.invocation_id
+            && self.work_unit_id == baseline.work_unit_id
+            && self.root_work_item_id == baseline.root_work_item_id
+            && self.workflow_id == baseline.workflow_id
+            && canonical_json(self.workflow_snapshot.clone())
+                == canonical_json(baseline.workflow_snapshot.clone())
+            && self.state_id == baseline.state_id
+            && self.state_kind == baseline.state_kind
+            && self.behavior == baseline.behavior
+            && canonical_json(self.resolved_environment.clone())
+                == canonical_json(baseline.resolved_environment.clone())
+            && self.provider == baseline.provider
+            && self.resource_constraints.max_retries == baseline.resource_constraints.max_retries
+    }
+
+    pub fn permissions_are_subset_of(&self, baseline: &Self) -> bool {
+        runtime_is_subset(
+            &self.clone().normalize().permission_envelope,
+            &baseline.clone().normalize().permission_envelope,
+        ) && optional_limit_is_subset(
+            self.resource_constraints.timeout_secs,
+            baseline.resource_constraints.timeout_secs,
+        )
+    }
+
+    pub fn matches_job_execution(&self, job: &Job) -> bool {
+        self.work_unit_id == job.work_item_id
+            && self.state_id == job.step_id
+            && self.behavior.command == job.command
+            && self.behavior.args == job.args
+            && self.behavior.env == job.env.clone().into_iter().collect()
+            && self.behavior.prompt == job.prompt
+            && self.behavior.primary_repo == job.repo
+            && self.permission_envelope.environment.execution_mode == job.execution_mode
+            && self.permission_envelope.environment.container_image == job.container_image
+            && self.resource_constraints.timeout_secs == job.timeout_secs
+            && self.resource_constraints.max_retries == job.max_retries
+            && self.behavior.execution_context == authorization_execution_context(&job.context)
+            && self
+                .behavior
+                .execution_context
+                .get("state_invocation")
+                .and_then(|value| value.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                == Some(self.invocation_id)
+    }
+}
+
+pub fn project_authorization_request_into_job_context(
+    context: &mut serde_json::Value,
+    authorization_id: &str,
+    request: &ResolvedAuthorizationRequest,
+) -> Result<String, serde_json::Error> {
+    let request = request.clone().normalize();
+    let digest = request.request_digest()?;
+    if !context.is_object() {
+        *context = serde_json::json!({});
+    }
+    let object = context
+        .as_object_mut()
+        .expect("context normalized as object");
+    object.insert(
+        CONTEXT_AUTHORIZATION_ID_KEY.to_string(),
+        serde_json::Value::String(authorization_id.to_string()),
+    );
+    object.insert(
+        CONTEXT_REQUEST_DIGEST_KEY.to_string(),
+        serde_json::Value::String(digest.clone()),
+    );
+    object.insert(
+        CONTEXT_AUTHORIZATION_REQUEST_KEY.to_string(),
+        serde_json::to_value(request)?,
+    );
+    Ok(digest)
+}
+
+pub fn authorization_request_from_job_context(
+    context: &serde_json::Value,
+) -> Option<ResolvedAuthorizationRequest> {
+    context
+        .get(CONTEXT_AUTHORIZATION_REQUEST_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+pub fn authorization_execution_context(context: &serde_json::Value) -> serde_json::Value {
+    let mut context = context.clone();
+    if let Some(object) = context.as_object_mut() {
+        object.remove(CONTEXT_AUTHORIZATION_ID_KEY);
+        object.remove(CONTEXT_REQUEST_DIGEST_KEY);
+        object.remove(CONTEXT_AUTHORIZATION_REQUEST_KEY);
+        object.remove("proposed_authorization_epoch");
+        object.remove("authorization_pending");
+        object.remove("authorization_recovery_required");
+        for key in [
+            "task_adapter",
+            "human_gate",
+            "human_gate_state",
+            "state_entered_at",
+            "state_entered_for",
+            "last_failure_reason",
+            "required_action_description",
+            "provider_ownership",
+            "authorization_epoch_id",
+            "used_state_invocations",
+        ] {
+            object.remove(key);
+        }
+    }
+    canonical_json(context)
+}
+
+fn normalize_runtime_for_authorization(runtime: &mut CanonicalRuntimeSpec) {
+    runtime.environment.file_mounts.sort_by(|left, right| {
+        (&left.host_path, &left.container_path, left.read_only).cmp(&(
+            &right.host_path,
+            &right.container_path,
+            right.read_only,
+        ))
+    });
+    runtime.environment.file_mounts.dedup();
+    normalize_string_set(&mut runtime.environment.toolchains);
+    normalize_string_set(&mut runtime.permissions.auto_approve_tools);
+    normalize_string_set(&mut runtime.permissions.escalate_tools);
+    if let Some(NetworkResourceRequest::Resources(resources)) =
+        runtime.environment.network_resources.as_mut()
+    {
+        resources.sort_by_key(ToString::to_string);
+        resources.dedup();
+    }
+    if runtime.environment.network_resources.is_some() {
+        runtime.environment.network =
+            legacy_network_label_for_request(runtime.environment.network_resources.as_ref());
+    }
+    if let Some(rules) = runtime.approval_rules.as_mut() {
+        normalize_string_set(&mut rules.auto_approve);
+        normalize_string_set(&mut rules.escalate);
+        normalize_string_set(&mut rules.deny);
+    }
+    runtime.repos.sort_by(|left, right| {
+        (
+            &left.repo_url,
+            &left.base_ref,
+            left.read_only,
+            &left.target_branch,
+            &left.branch_name,
+        )
+            .cmp(&(
+                &right.repo_url,
+                &right.base_ref,
+                right.read_only,
+                &right.target_branch,
+                &right.branch_name,
+            ))
+    });
+    runtime.repos.dedup();
+}
+
+fn normalize_string_set(values: &mut Vec<String>) {
+    values.sort();
+    values.dedup();
+}
+
+fn runtime_is_subset(request: &CanonicalRuntimeSpec, baseline: &CanonicalRuntimeSpec) -> bool {
+    request.runtime_version == baseline.runtime_version
+        && request.environment.execution_mode == baseline.environment.execution_mode
+        && request.environment.tier == baseline.environment.tier
+        && request.permissions.tier == baseline.permissions.tier
+        && request.environment.container_image == baseline.environment.container_image
+        && request.environment.memory_limit == baseline.environment.memory_limit
+        && request.environment.cpu_limit == baseline.environment.cpu_limit
+        && request.environment.filesystem == baseline.environment.filesystem
+        && optional_limit_is_subset(
+            request.environment.timeout_secs,
+            baseline.environment.timeout_secs,
+        )
+        && request.environment.file_mounts == baseline.environment.file_mounts
+        && string_set_is_subset(
+            &request.environment.toolchains,
+            &baseline.environment.toolchains,
+        )
+        && network_is_subset(
+            request.environment.network_resources.as_ref(),
+            baseline.environment.network_resources.as_ref(),
+        )
+        && network_label_is_subset(
+            request.environment.network.as_deref(),
+            baseline.environment.network.as_deref(),
+        )
+        && (!request.permissions.can_read_workspace || baseline.permissions.can_read_workspace)
+        && (!request.permissions.can_write_workspace || baseline.permissions.can_write_workspace)
+        && (!request.permissions.can_run_shell || baseline.permissions.can_run_shell)
+        && (!request.permissions.can_access_network || baseline.permissions.can_access_network)
+        && string_set_is_subset(
+            &request.permissions.auto_approve_tools,
+            &baseline.permissions.auto_approve_tools,
+        )
+        && string_set_is_subset(
+            &request.permissions.escalate_tools,
+            &baseline.permissions.escalate_tools,
+        )
+        && access_is_subset(
+            request.permissions.kubernetes_access.as_deref(),
+            baseline.permissions.kubernetes_access.as_deref(),
+        )
+        && access_is_subset(
+            request.permissions.aws_access.as_deref(),
+            baseline.permissions.aws_access.as_deref(),
+        )
+        && approval_is_subset(
+            request.approval_rules.as_ref(),
+            baseline.approval_rules.as_ref(),
+        )
+        && repos_are_subset(&request.repos, &baseline.repos)
+}
+
+fn optional_limit_is_subset(request: Option<u64>, baseline: Option<u64>) -> bool {
+    match (request, baseline) {
+        (Some(request), Some(baseline)) => request <= baseline,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
+}
+
+fn string_set_is_subset(request: &[String], baseline: &[String]) -> bool {
+    let baseline = baseline.iter().collect::<BTreeSet<_>>();
+    request.iter().all(|value| baseline.contains(value))
+}
+
+fn network_is_subset(
+    request: Option<&NetworkResourceRequest>,
+    baseline: Option<&NetworkResourceRequest>,
+) -> bool {
+    match (request, baseline) {
+        (None | Some(NetworkResourceRequest::None), _) => true,
+        (Some(NetworkResourceRequest::Full), Some(NetworkResourceRequest::Full)) => true,
+        (Some(NetworkResourceRequest::Resources(_)), Some(NetworkResourceRequest::Full)) => true,
+        (
+            Some(NetworkResourceRequest::Resources(request)),
+            Some(NetworkResourceRequest::Resources(baseline)),
+        ) => request.iter().all(|resource| baseline.contains(resource)),
+        _ => false,
+    }
+}
+
+fn network_label_is_subset(request: Option<&str>, baseline: Option<&str>) -> bool {
+    let rank = |value: Option<&str>| match value.unwrap_or("none") {
+        "none" => Some(0_u8),
+        "restricted" => Some(1),
+        "full" => Some(2),
+        _ => None,
+    };
+    matches!((rank(request), rank(baseline)), (Some(request), Some(baseline)) if request <= baseline)
+}
+
+fn access_is_subset(request: Option<&str>, baseline: Option<&str>) -> bool {
+    let rank = |value: Option<&str>| match value.unwrap_or("none") {
+        "none" => Some(0_u8),
+        "read_only" => Some(1),
+        "read_write" => Some(2),
+        _ => None,
+    };
+    matches!((rank(request), rank(baseline)), (Some(request), Some(baseline)) if request <= baseline)
+}
+
+fn approval_is_subset(
+    request: Option<&ApprovalRuleSet>,
+    baseline: Option<&ApprovalRuleSet>,
+) -> bool {
+    let tools = request
+        .into_iter()
+        .flat_map(|rules| {
+            rules
+                .auto_approve
+                .iter()
+                .chain(&rules.escalate)
+                .chain(&rules.deny)
+        })
+        .chain(baseline.into_iter().flat_map(|rules| {
+            rules
+                .auto_approve
+                .iter()
+                .chain(&rules.escalate)
+                .chain(&rules.deny)
+        }))
+        .collect::<BTreeSet<_>>();
+    tools.into_iter().all(|tool| {
+        let preserves_explicit_deny = !baseline
+            .is_some_and(|rules| rules.deny.iter().any(|candidate| candidate == tool))
+            || request.is_some_and(|rules| rules.deny.iter().any(|candidate| candidate == tool));
+        preserves_explicit_deny && approval_rank(request, tool) <= approval_rank(baseline, tool)
+    })
+}
+
+fn approval_rank(rules: Option<&ApprovalRuleSet>, tool: &str) -> u8 {
+    let Some(rules) = rules else { return 0 };
+    if rules.auto_approve.iter().any(|candidate| candidate == tool) {
+        2
+    } else if rules.escalate.iter().any(|candidate| candidate == tool) {
+        1
+    } else {
+        0
+    }
+}
+
+fn repos_are_subset(request: &[PlannedRepoClaim], baseline: &[PlannedRepoClaim]) -> bool {
+    request.iter().all(|requested| {
+        baseline.iter().any(|approved| {
+            requested.repo_url == approved.repo_url
+                && requested.base_ref == approved.base_ref
+                && (requested.read_only || !approved.read_only)
+                && claim_type_is_subset(&requested.claim_type, &approved.claim_type)
+                && (requested.read_only
+                    || (requested.target_branch == approved.target_branch
+                        && requested.branch_name == approved.branch_name))
+        })
+    })
+}
+
+fn claim_type_is_subset(request: &str, baseline: &str) -> bool {
+    let rank = |value: &str| match value {
+        "read_only" => Some(0_u8),
+        "workspace" | "existing_branch" => Some(1),
+        _ => None,
+    };
+    matches!((rank(request), rank(baseline)), (Some(request), Some(baseline)) if request <= baseline)
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        other => other,
+    }
+}
 pub const AGENT_CONTEXT_SCHEMA_NAME: &str = "agent_context_v1";
 pub const AGENT_CONTEXT_SCHEMA_VERSION: &str = "agent_context_v2";
 pub const AGENT_OUTPUT_SCHEMA_NAME: &str = "agent_output_v1";
@@ -2175,8 +2841,6 @@ pub struct AgentContextJob {
     pub id: Uuid,
     pub work_item_id: Option<Uuid>,
     pub step_id: String,
-    pub attempt: u32,
-    pub max_retries: u32,
     pub execution_mode: String,
     pub timeout_secs: Option<u64>,
     pub container_image: Option<String>,
@@ -3703,6 +4367,52 @@ kind = "terminal"
         assert!(report.errors.iter().any(|e| {
             e.message
                 .contains("references unknown child workflow 'missing_child'")
+        }));
+    }
+
+    #[test]
+    fn reactive_validation_rejects_indirect_child_workflow_cycle() {
+        fn workflow(id: &str, child: &str) -> ReactiveWorkflowDefinition {
+            ReactiveWorkflowDefinition {
+                id: id.to_string(),
+                schema: "reactive_v2".to_string(),
+                initial_state: "spawn".to_string(),
+                states: vec![
+                    ReactiveWorkflowState {
+                        id: "spawn".to_string(),
+                        auto_merge: false,
+                        config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig {
+                            action: None,
+                            child_workflow: Some(child.to_string()),
+                        }),
+                        on: vec![ReactiveWorkflowTransition {
+                            event: ReactiveEventKind::AllChildrenCompleted.into(),
+                            target: "done".to_string(),
+                        }],
+                    },
+                    ReactiveWorkflowState {
+                        id: "done".to_string(),
+                        auto_merge: false,
+                        config: ReactiveStateConfig::Terminal(ReactiveTerminalStateConfig {
+                            terminal_outcome: Some(ReactiveTerminalOutcome::Succeeded),
+                        }),
+                        on: Vec::new(),
+                    },
+                ],
+            }
+        }
+        let report = validate_reactive_workflows(&[workflow("a", "b"), workflow("b", "a")], &[]);
+        assert!(report.errors.iter().any(|error| {
+            error
+                .message
+                .contains("reactive child-workflow cycle detected")
+        }));
+        let direct = validate_reactive_workflows(&[workflow("self", "self")], &[]);
+        assert!(direct.errors.iter().any(|error| {
+            error.message.contains("must not reference itself")
+                || error
+                    .message
+                    .contains("reactive child-workflow cycle detected")
         }));
     }
 

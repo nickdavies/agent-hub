@@ -13,8 +13,8 @@ pub mod presence;
 pub mod pushover;
 pub mod questions;
 pub mod repo_discovery;
-pub mod session_views;
 pub mod scm;
+pub mod session_views;
 pub mod sessions;
 pub mod storage;
 pub mod task_adapter;
@@ -641,6 +641,44 @@ impl<N: Notifier> AppState<N> {
             .collect();
         let overlays = loaded.overlays.clone();
         let triage_prompt = loaded.triage_prompt.clone();
+        let runner_profiles = loaded.runner_profiles.clone();
+        let environment_snapshots = loaded
+            .environments
+            .iter()
+            .map(|environment| {
+                let mut policies = Vec::new();
+                let mut policy_name = Some(environment.toml.network_policy.as_str());
+                let mut visited = std::collections::HashSet::new();
+                while let Some(name) = policy_name {
+                    if !visited.insert(name.to_string()) {
+                        panic!("network policy inheritance cycle at '{name}'");
+                    }
+                    let policy = loaded
+                        .network_policies
+                        .iter()
+                        .find(|policy| policy.name == name)
+                        .unwrap_or_else(|| panic!("environment references missing policy '{name}'"));
+                    policies.push(policy.clone());
+                    policy_name = policy.extends.as_deref();
+                }
+                (
+                    environment.toml.name.clone(),
+                    serde_json::json!({
+                        "environment": environment.toml,
+                        "network_policies": &policies,
+                        "bundle_digests": environment.content_digests().unwrap_or_else(|error| {
+                            panic!("failed to digest environment '{}': {error:#}", environment.toml.name)
+                        }),
+                        "network_policy_bundle_digests": policies.iter().map(|policy| {
+                            let directory = loaded.root.join("network_policies").join(&policy.name);
+                            let digests = agent_hub_config::directory_content_digests(&directory)
+                                .unwrap_or_else(|error| panic!("failed to digest network policy '{}': {error}", policy.name));
+                            (policy.name.clone(), digests)
+                        }).collect::<std::collections::BTreeMap<_, _>>(),
+                    }),
+                )
+            })
+            .collect();
         let discovered_repos =
             discover_repositories_from_config(loaded.system.repo_discovery.as_ref())
                 .unwrap_or_else(|error| {
@@ -659,6 +697,8 @@ impl<N: Notifier> AppState<N> {
             .with_overlays(overlays)
             .with_discovered_repos(discovered_repos)
             .with_operator_login(system_operator_login.clone())
+            .with_runner_profiles(runner_profiles)
+            .with_environment_snapshots(environment_snapshots)
             .with_triage_prompt(triage_prompt)
             .with_server_approval_mode(server_config.approval_mode),
         );
@@ -729,10 +769,8 @@ mod integration_tests {
     /// triage prompt loading, so we just need a `system.toml` that satisfies the
     /// `installed = []` invariants `load_config_tree` enforces.
     fn make_hermetic_config_root() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "ah-test-config-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("ah-test-config-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).expect("create hermetic config root");
         let body = r#"[system]
 
@@ -746,6 +784,8 @@ installed = []
 installed = []
 "#;
         std::fs::write(root.join("system.toml"), body).expect("write hermetic system.toml");
+        std::fs::write(root.join("local-agent.json"), "{}")
+            .expect("write hermetic local-agent config");
         root
     }
 

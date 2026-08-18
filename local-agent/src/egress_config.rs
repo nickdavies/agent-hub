@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub(crate) use agent_hub_config::{
+    CursorRunnerConfig, ManagedRunnerFileMount, ManagedRunnerKind, ManagedRunnerSpec,
+    OpencodeRunnerConfig,
+};
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::credential_provider::CredentialProvider;
 use crate::mcp_bridge::McpBridgeConfig;
@@ -160,6 +164,10 @@ pub struct ConfiguredEnvironment {
     /// "opencode-default"), or the special string "auto" / `None` to defer to
     /// the local-agent's effective default.
     pub runtime: Option<String>,
+    pub network_policy: String,
+    pub bundle_digests: std::collections::BTreeMap<String, String>,
+    pub network_policy_bundle_digests:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -170,81 +178,7 @@ pub struct ConfiguredNetworkPolicy {
     pub docker_network: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct ManagedRunnerSpec {
-    #[serde(default)]
-    pub kind: ManagedRunnerKind,
-    #[serde(default)]
-    pub opencode: OpencodeRunnerConfig,
-    #[serde(default)]
-    pub cursor: CursorRunnerConfig,
-    #[serde(default)]
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub container_image: Option<String>,
-    #[serde(default)]
-    pub file_mounts: Vec<ManagedRunnerFileMount>,
-    /// Names of credential providers (from `credential_providers`) that must be
-    /// resolved and injected before this runner can launch. Useful for
-    /// frontend-specific API keys (e.g. `CURSOR_API_KEY`).
-    #[serde(default)]
-    pub requires_credentials: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ManagedRunnerKind {
-    #[default]
-    Generic,
-    Opencode,
-    Cursor,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct OpencodeRunnerConfig {
-    #[serde(default = "default_opencode_validation_attempts")]
-    pub max_validation_attempts: u32,
-}
-
-impl Default for OpencodeRunnerConfig {
-    fn default() -> Self {
-        Self {
-            max_validation_attempts: default_opencode_validation_attempts(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CursorRunnerConfig {
-    #[serde(default = "default_cursor_validation_attempts")]
-    pub max_validation_attempts: u32,
-    /// Default cursor model id (e.g. `auto`, `sonnet-4.5-thinking`). When unset,
-    /// the runner does not pass `--model` and cursor picks based on its own
-    /// defaults.
-    #[serde(default)]
-    pub default_model: Option<String>,
-}
-
-impl Default for CursorRunnerConfig {
-    fn default() -> Self {
-        Self {
-            max_validation_attempts: default_cursor_validation_attempts(),
-            default_model: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct ManagedRunnerFileMount {
-    pub host_path: String,
-    pub container_path: String,
-    #[serde(default)]
-    pub read_only: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EgressConfig {
     #[serde(default)]
     pub llm: LlmHostConfig,
@@ -256,7 +190,7 @@ pub struct EgressConfig {
     pub preflight_image: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LlmHostConfig {
     #[serde(default)]
     pub default_provider: Option<String>,
@@ -290,7 +224,7 @@ impl LlmHostConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildHostConfig {
     #[serde(default = "default_github_hosts")]
     pub github_hosts: Vec<String>,
@@ -310,7 +244,7 @@ impl Default for BuildHostConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     #[serde(default = "default_proxy_image")]
     pub image: String,
@@ -328,21 +262,17 @@ impl Default for ProxyConfig {
 }
 
 pub fn load_local_agent_config(path_override: Option<&Path>) -> anyhow::Result<LocalAgentConfig> {
-    let path = match path_override {
-        Some(path) => path.to_path_buf(),
-        None => default_local_agent_config_path()?,
-    };
-
     let config_root = config_root_from_env()?;
-
-    if !path.exists() {
-        let mut config = LocalAgentConfig::default();
-        config.config_tree = Some(
-            load_config_tree_snapshot(&config_root)
-                .with_context(|| format!("load config tree from {}", config_root.display()))?,
-        );
-        return Ok(config);
-    }
+    let authoritative_path = config_root.join("local-agent.json");
+    let path = match path_override {
+        Some(path) if path == authoritative_path => path.to_path_buf(),
+        Some(path) => anyhow::bail!(
+            "local-agent config override '{}' is not the authoritative CONFIG_ROOT path '{}'",
+            path.display(),
+            authoritative_path.display()
+        ),
+        None => authoritative_path,
+    };
 
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     let mut parsed: LocalAgentConfig =
@@ -404,6 +334,7 @@ struct EnvironmentFile {
 #[derive(Debug, Deserialize)]
 struct EnvironmentToml {
     name: String,
+    network_policy: String,
     #[serde(default)]
     allowed_overlays: Vec<String>,
     #[serde(default)]
@@ -447,14 +378,22 @@ fn load_config_tree_snapshot(root: &Path) -> anyhow::Result<ConfigTreeSnapshot> 
             .join("environment.toml");
         let environment_file: EnvironmentFile =
             read_toml_file(&environment_path, "environment manifest")?;
+        let environment = environment_file.environment;
         environments.push(ConfiguredEnvironment {
-            name: environment_file.environment.name,
-            allowed_overlays: environment_file.environment.allowed_overlays,
-            runtime: environment_file
-                .environment
+            name: environment.name,
+            allowed_overlays: environment.allowed_overlays,
+            runtime: environment
                 .runtime
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            network_policy: environment.network_policy,
+            bundle_digests: agent_hub_config::directory_content_digests(
+                environment_path
+                    .parent()
+                    .expect("environment manifest has parent"),
+            )
+            .map_err(anyhow::Error::msg)?,
+            network_policy_bundle_digests: std::collections::BTreeMap::new(),
         });
     }
 
@@ -475,6 +414,26 @@ fn load_config_tree_snapshot(root: &Path) -> anyhow::Result<ConfigTreeSnapshot> 
         let policy_file: NetworkPolicyFile =
             read_toml_file(&policy_path, "network policy manifest")?;
         policies_by_name.insert(policy_file.policy.name.clone(), policy_file.policy);
+    }
+
+    for environment in &mut environments {
+        let mut policy_name = Some(environment.network_policy.clone());
+        let mut visited = HashSet::new();
+        while let Some(name) = policy_name {
+            if !visited.insert(name.clone()) {
+                anyhow::bail!("network policy inheritance cycle detected at '{name}'");
+            }
+            environment.network_policy_bundle_digests.insert(
+                name.clone(),
+                agent_hub_config::directory_content_digests(
+                    &root.join("network_policies").join(&name),
+                )
+                .map_err(anyhow::Error::msg)?,
+            );
+            policy_name = policies_by_name
+                .get(&name)
+                .and_then(|policy| policy.extends.clone());
+        }
     }
 
     let mut network_policies = HashMap::new();
@@ -662,14 +621,6 @@ pub fn normalize_hosts(hosts: &[String]) -> Vec<String> {
     }
 
     out
-}
-
-fn default_local_agent_config_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set; pass --local-agent-config")?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("agent-hub")
-        .join("local-agent.json"))
 }
 
 fn default_proxy_image() -> String {

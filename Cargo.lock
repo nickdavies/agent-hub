@@ -58,6 +58,7 @@ dependencies = [
  "chrono",
  "clap",
  "comrak",
+ "config",
  "hex",
  "hmac",
  "html-escape",
@@ -615,10 +616,12 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "hex",
  "protocol",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "strum 0.26.3",
  "toml",
 ]
@@ -1774,6 +1777,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "config",
  "prost",
  "prost-types",
  "protocol",
@@ -2292,9 +2296,11 @@ name = "protocol"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2",
  "strum 0.27.2",
  "toml",
  "uuid",

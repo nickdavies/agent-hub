@@ -151,19 +151,15 @@ impl CredentialProvider {
 pub async fn resolve_all(providers: &[CredentialProvider]) -> anyhow::Result<ResolvedCredentials> {
     let mut merged = ResolvedCredentials::default();
     for provider in providers {
-        match provider.resolve().await {
-            Ok(creds) => {
-                merged.env_vars.extend(creds.env_vars);
-                merged.file_mounts.extend(creds.file_mounts);
-                merged.temp_files.extend(creds.temp_files);
-            }
-            Err(error) => {
-                eprintln!(
-                    "warning: credential provider '{}' failed: {error:#}",
-                    provider.name()
-                );
-            }
-        }
+        let creds = provider.resolve().await.map_err(|error| {
+            anyhow::anyhow!(
+                "credential provider '{}' failed: {error:#}",
+                provider.name()
+            )
+        })?;
+        merged.env_vars.extend(creds.env_vars);
+        merged.file_mounts.extend(creds.file_mounts);
+        merged.temp_files.extend(creds.temp_files);
     }
     Ok(merged)
 }

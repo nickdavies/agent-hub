@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use protocol::{CanonicalRuntimeSpec, Job, WorkItem};
+use protocol::{
+    CONTEXT_AUTHORIZATION_ID_KEY, CONTEXT_REQUEST_DIGEST_KEY, CanonicalRuntimeSpec, Job,
+    ResolvedAuthorizationRequest, WorkItem, authorization_request_from_job_context,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
@@ -14,6 +17,7 @@ pub(super) enum DbTable {
     OwnershipReturnOutbox,
     CheckpointOutbox,
     ProviderActionInbox,
+    AuthorizationRecords,
 }
 
 impl DbTable {
@@ -24,6 +28,7 @@ impl DbTable {
             Self::OwnershipReturnOutbox => "ownership_return_outbox",
             Self::CheckpointOutbox => "checkpoint_outbox",
             Self::ProviderActionInbox => "provider_action_inbox",
+            Self::AuthorizationRecords => "authorization_records",
         }
     }
 }
@@ -51,6 +56,36 @@ pub(super) struct ProviderActionJobInsert {
 }
 
 #[derive(Clone)]
+pub(super) struct ProviderActionBaselineInsert {
+    pub checkpoint_owner_id: Uuid,
+    pub work_item_id: Uuid,
+    pub state_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub approved_human_json: String,
+    pub approved_revision: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct ProviderActionObligationApproval {
+    pub checkpoint_owner_id: Uuid,
+    pub work_item_id: Uuid,
+    pub request_digest: String,
+    pub authorization_id: String,
+    pub approved_human_json: String,
+    pub approved_revision: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct AuthorizationObligationInsert {
+    pub checkpoint_owner_id: Uuid,
+    pub work_item_id: Uuid,
+    pub request_digest: String,
+    pub request_json: String,
+    pub job_json: String,
+}
+
+#[derive(Clone)]
 pub(super) struct ProviderActionCommit {
     pub task_id: String,
     pub identity: ProviderActionIdentity,
@@ -61,6 +96,9 @@ pub(super) struct ProviderActionCommit {
     pub work_item_updates: Vec<WorkItem>,
     pub work_item_inserts: Vec<WorkItem>,
     pub job_inserts: Vec<ProviderActionJobInsert>,
+    pub baseline_inserts: Vec<ProviderActionBaselineInsert>,
+    pub obligation_approvals: Vec<ProviderActionObligationApproval>,
+    pub obligation_inserts: Vec<AuthorizationObligationInsert>,
     pub cancel_active_work_item_ids: Vec<Uuid>,
     pub cancel_unreleased_checkpoint_owner_ids: Vec<Uuid>,
     pub revision_update: Option<ProviderActionRevisionUpdate>,
@@ -137,6 +175,59 @@ pub(super) fn commit_provider_action(
     for item in &commit.work_item_updates {
         update_work_item_in_transaction(&tx, item)?;
     }
+    for obligation in &commit.obligation_inserts {
+        insert_authorization_obligation(&tx, obligation)?;
+    }
+    for baseline in &commit.baseline_inserts {
+        if let Some(existing_request) = tx
+            .query_row(
+                "SELECT request_json FROM authorization_baselines WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND state_id = ?3 AND request_digest = ?4",
+                params![
+                    baseline.checkpoint_owner_id.to_string(),
+                    baseline.work_item_id.to_string(),
+                    baseline.state_id,
+                    baseline.request_digest,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            if existing_request != baseline.request_json {
+                anyhow::bail!("authorization baseline digest collision");
+            }
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO authorization_baselines (checkpoint_owner_id, work_item_id, state_id, request_digest, request_json, approved_human_json, approved_revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                baseline.checkpoint_owner_id.to_string(),
+                baseline.work_item_id.to_string(),
+                baseline.state_id,
+                baseline.request_digest,
+                baseline.request_json,
+                baseline.approved_human_json,
+                baseline.approved_revision.to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+    }
+    for approval in &commit.obligation_approvals {
+        let updated = tx.execute(
+            "UPDATE authorization_obligations SET state = 'approved', authorization_id = ?4, approved_human_json = ?5, approved_revision = ?6, updated_at = ?7 WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3 AND state = 'pending'",
+            params![
+                approval.checkpoint_owner_id.to_string(),
+                approval.work_item_id.to_string(),
+                approval.request_digest,
+                approval.authorization_id,
+                approval.approved_human_json,
+                approval.approved_revision.to_string(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("authorization obligation was not pending at approval");
+        }
+    }
     for job in &commit.job_inserts {
         insert_job_in_transaction(&tx, job)?;
     }
@@ -190,6 +281,74 @@ pub(super) fn commit_provider_action(
     }
     tx.commit()?;
     Ok(ProviderActionCommitOutcome::Committed)
+}
+
+pub(super) fn stage_authorization_obligation(
+    conn: &mut Connection,
+    root: &WorkItem,
+    logical_item: Option<&WorkItem>,
+    obligation: &AuthorizationObligationInsert,
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    insert_authorization_obligation(&tx, obligation)?;
+    update_work_item_in_transaction(&tx, root)?;
+    if let Some(logical_item) = logical_item
+        && logical_item.id != root.id
+    {
+        update_work_item_in_transaction(&tx, logical_item)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub(super) fn commit_ordinary_authorized_job(
+    conn: &mut Connection,
+    work_items: &[WorkItem],
+    insert: &ProviderActionJobInsert,
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    for item in work_items {
+        update_work_item_in_transaction(&tx, item)?;
+    }
+    insert_job_in_transaction(&tx, insert)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn insert_authorization_obligation(
+    tx: &Transaction<'_>,
+    obligation: &AuthorizationObligationInsert,
+) -> anyhow::Result<()> {
+    if let Some(stored_request) = tx
+        .query_row(
+            "SELECT request_json FROM authorization_obligations WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3",
+            params![
+                obligation.checkpoint_owner_id.to_string(),
+                obligation.work_item_id.to_string(),
+                obligation.request_digest,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if stored_request != obligation.request_json {
+            anyhow::bail!("authorization obligation digest collision");
+        }
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO authorization_obligations (checkpoint_owner_id, work_item_id, request_digest, request_json, job_json, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
+        params![
+            obligation.checkpoint_owner_id.to_string(),
+            obligation.work_item_id.to_string(),
+            obligation.request_digest,
+            obligation.request_json,
+            obligation.job_json,
+            now,
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_work_item_in_transaction(tx: &Transaction<'_>, item: &WorkItem) -> anyhow::Result<()> {
@@ -328,8 +487,10 @@ fn insert_job_in_transaction(
     insert: &ProviderActionJobInsert,
 ) -> anyhow::Result<()> {
     let job = &insert.job;
+    let (authorization_id, request_digest) =
+        insert_authorization_record(tx, job, insert.checkpoint_owner_id)?;
     tx.execute(
-        "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0)",
+        "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, authorization_id, request_digest, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 0)",
         params![
             job.id.to_string(), job.work_item_id.to_string(), job.step_id, job.state.to_string(),
             job.assigned_worker_id, job.execution_mode.to_string(), job.container_image, job.command,
@@ -341,8 +502,172 @@ fn insert_job_in_transaction(
             job.lease_expires_at.map(|at| at.to_rfc3339()), job.created_at.to_rfc3339(),
             job.updated_at.to_rfc3339(), serde_json::to_string(&insert.runtime)?,
             insert.checkpoint_owner_id.to_string(),
+            authorization_id,
+            request_digest,
         ],
     )?;
+    Ok(())
+}
+
+pub(super) fn insert_authorization_record(
+    tx: &Transaction<'_>,
+    job: &Job,
+    checkpoint_owner_id: Uuid,
+) -> anyhow::Result<(String, String)> {
+    let authorization_id = job
+        .context
+        .get(CONTEXT_AUTHORIZATION_ID_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("job {} has no authorization identity", job.id))?;
+    let request_digest = job
+        .context
+        .get(CONTEXT_REQUEST_DIGEST_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("job {} has no request digest", job.id))?;
+    let request = authorization_request_from_job_context(&job.context)
+        .ok_or_else(|| anyhow::anyhow!("job {} has no resolved authorization request", job.id))?;
+    verify_request_for_job(job, checkpoint_owner_id, request_digest, &request)?;
+    let request_json = serde_json::to_string(&request.clone().normalize())?;
+    if let Some((stored_digest, stored_json)) = tx
+        .query_row(
+            "SELECT request_digest, request_json FROM authorization_records WHERE authorization_id = ?1",
+            [authorization_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        if stored_digest != request_digest || stored_json != request_json {
+            anyhow::bail!("authorization identity collision for {authorization_id}");
+        }
+        return Ok((authorization_id.to_string(), request_digest.to_string()));
+    }
+    if request.workflow_id != "__triage__" {
+        let within_baseline = {
+            let mut stmt = tx.prepare(
+                "SELECT request_json FROM authorization_baselines WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND state_id = ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    checkpoint_owner_id.to_string(),
+                    job.work_item_id.to_string(),
+                    job.step_id,
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            let mut matched = false;
+            for row in rows {
+                let baseline: ResolvedAuthorizationRequest = serde_json::from_str(&row?)?;
+                if request.behavior_matches(&baseline)
+                    && request.permissions_are_subset_of(&baseline)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            matched
+        };
+        if !within_baseline {
+            let approved_obligation = tx
+                .query_row(
+                    "SELECT 1 FROM authorization_obligations WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3 AND authorization_id = ?4 AND state = 'approved'",
+                    params![
+                        checkpoint_owner_id.to_string(),
+                        job.work_item_id.to_string(),
+                        request_digest,
+                        authorization_id,
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !approved_obligation {
+                anyhow::bail!(
+                    "job {} has no applicable baseline or one-job approval",
+                    job.id
+                );
+            }
+        }
+    }
+    tx.execute(
+        "INSERT INTO authorization_records (authorization_id, work_item_id, checkpoint_owner_id, request_digest, invocation_id, request_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            authorization_id,
+            job.work_item_id.to_string(),
+            checkpoint_owner_id.to_string(),
+            request_digest,
+            request.invocation_id.to_string(),
+            request_json,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok((authorization_id.to_string(), request_digest.to_string()))
+}
+
+pub(super) fn verify_job_authorization(conn: &Connection, job: &Job) -> anyhow::Result<()> {
+    let (authorization_id, request_digest) = conn.query_row(
+        "SELECT authorization_id, request_digest FROM jobs WHERE id = ?1",
+        [job.id.to_string()],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    let (Some(authorization_id), Some(request_digest)) = (authorization_id, request_digest) else {
+        anyhow::bail!("job {} has no immutable authorization", job.id);
+    };
+    if job
+        .context
+        .get(CONTEXT_AUTHORIZATION_ID_KEY)
+        .and_then(serde_json::Value::as_str)
+        != Some(authorization_id.as_str())
+        || job
+            .context
+            .get(CONTEXT_REQUEST_DIGEST_KEY)
+            .and_then(serde_json::Value::as_str)
+            != Some(request_digest.as_str())
+    {
+        anyhow::bail!("job {} authorization evidence mismatch", job.id);
+    }
+    let request = authorization_request_from_job_context(&job.context)
+        .ok_or_else(|| anyhow::anyhow!("job {} authorization payload is missing", job.id))?;
+    verify_request_for_job(job, request.root_work_item_id, &request_digest, &request)?;
+    let stored_json = conn
+        .query_row(
+            "SELECT request_json FROM authorization_records WHERE authorization_id = ?1 AND request_digest = ?2 AND invocation_id = ?3",
+            params![authorization_id, request_digest, request.invocation_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("job {} authorization record is missing", job.id))?;
+    if stored_json != serde_json::to_string(&request.normalize())? {
+        anyhow::bail!("job {} authorization record payload mismatch", job.id);
+    }
+    Ok(())
+}
+
+fn verify_request_for_job(
+    job: &Job,
+    checkpoint_owner_id: Uuid,
+    request_digest: &str,
+    request: &ResolvedAuthorizationRequest,
+) -> anyhow::Result<()> {
+    if request.work_unit_id != job.work_item_id
+        || request.root_work_item_id != checkpoint_owner_id
+        || request.state_id != job.step_id
+    {
+        anyhow::bail!("job {} authorization binding mismatch", job.id);
+    }
+    if !request.matches_job_execution(job) {
+        anyhow::bail!(
+            "job {} execution payload differs from authorization",
+            job.id
+        );
+    }
+    if request.request_digest()? != request_digest {
+        anyhow::bail!("job {} request digest mismatch", job.id);
+    }
     Ok(())
 }
 

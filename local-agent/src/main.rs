@@ -28,6 +28,7 @@ mod mcp_bridge;
 mod pb_conv;
 mod workspace;
 
+use agent_hub_config::RunnerProfilesConfig;
 use artifacts::{
     AdditionalRepoMountView, AgentContextWriteParams, GITHUB_DEFAULT_HOST,
     collect_structured_transcript_artifacts, display_paths_for_runtime, file_len_u64,
@@ -82,7 +83,7 @@ struct Cli {
     #[arg(long, env = "ARTIFACT_STORE_ROOT")]
     artifact_store_root: Option<PathBuf>,
 
-    /// Optional local-agent JSON config override (default: ~/.config/agent-hub/local-agent.json)
+    /// Optional local-agent JSON config override (default: $CONFIG_ROOT/local-agent.json)
     #[arg(long)]
     local_agent_config: Option<PathBuf>,
 
@@ -618,6 +619,220 @@ mod tests {
         assert_eq!(decoded.id, job.id);
         assert_eq!(decoded.execution_mode, job.execution_mode);
         assert_eq!(decoded.max_retries, 2);
+    }
+
+    #[test]
+    fn worker_rejects_mutated_authorization_before_execution() {
+        let now = Utc::now();
+        let work_item_id = uuid::Uuid::new_v4();
+        let mut job = Job {
+            id: uuid::Uuid::new_v4(),
+            work_item_id,
+            step_id: "build".to_string(),
+            state: JobState::Assigned,
+            assigned_worker_id: Some("worker".to_string()),
+            execution_mode: ExecutionMode::Docker,
+            container_image: Some("image@sha256:abc".to_string()),
+            command: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            env: HashMap::from([("MODE".to_string(), "test".to_string())]),
+            prompt: Some(protocol::PromptRef {
+                system: Some("system".to_string()),
+                user: "user".to_string(),
+            }),
+            context: serde_json::json!({
+                "workflow": {"inputs":{"scope":"signed"}, "valid_next_events":["job_succeeded"]},
+                "work_item": {"workflow_id":"workflow"},
+                "state_invocation": {"state_id":"build", "id":work_item_id}
+            }),
+            repo: Some(protocol::RepoSource {
+                repo_url: "https://github.com/example/repo.git".to_string(),
+                base_ref: "origin/main".to_string(),
+                branch_name: None,
+            }),
+            timeout_secs: Some(60),
+            max_retries: 3,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let environment = protocol::canonical_environment_for_execution(
+            ExecutionMode::Docker,
+            job.container_image.clone(),
+            job.timeout_secs,
+        );
+        let request = protocol::ResolvedAuthorizationRequest {
+            version: protocol::AUTHORIZATION_REQUEST_VERSION.to_string(),
+            invocation_id: work_item_id,
+            work_unit_id: work_item_id,
+            root_work_item_id: work_item_id,
+            workflow_id: "workflow".to_string(),
+            workflow_snapshot: serde_json::json!({"schema":"reactive_v2"}),
+            state_id: job.step_id.clone(),
+            state_kind: protocol::ReactiveStateKind::Command,
+            behavior: protocol::ResolvedAuthorizationBehavior {
+                execution_kind: "command".to_string(),
+                runner_profile: serde_json::json!({
+                    "profile_name":"command",
+                    "config_digest":"command_v1"
+                }),
+                command: job.command.clone(),
+                args: job.args.clone(),
+                env: job.env.clone().into_iter().collect(),
+                prompt: job.prompt.clone(),
+                primary_repo: job.repo.clone(),
+                primary_repo_branch: Some(protocol::authorized_default_branch(
+                    work_item_id,
+                    work_item_id,
+                )),
+                execution_context: protocol::authorization_execution_context(&job.context),
+                triage: false,
+                allow_remote_credentials: true,
+            },
+            permission_envelope: protocol::CanonicalRuntimeSpec {
+                runtime_version: "v2".to_string(),
+                permissions: protocol::canonical_permissions_for_environment(&environment),
+                environment,
+                approval_rules: None,
+                repos: Vec::new(),
+            },
+            resolved_environment: serde_json::json!({}),
+            provider: protocol::ResolvedAuthorizationProvider {
+                provider: Some("test".to_string()),
+                task_id: Some("task".to_string()),
+            },
+            resource_constraints: protocol::ResolvedAuthorizationResources {
+                timeout_secs: Some(60),
+                max_retries: 3,
+            },
+        };
+        protocol::project_authorization_request_into_job_context(
+            &mut job.context,
+            "authorization",
+            &request,
+        )
+        .expect("authorization evidence");
+        assert!(verify_authorized_job(&job, &LocalAgentConfig::default()).is_ok());
+        let http_roundtrip: Job =
+            serde_json::from_value(serde_json::to_value(&job).expect("HTTP job JSON"))
+                .expect("HTTP authorization evidence");
+        let http_verified = verify_authorized_job(&http_roundtrip, &LocalAgentConfig::default())
+            .expect("HTTP verify");
+        let transported = job_from_pb(job_to_pb(job.clone())).expect("gRPC authorization evidence");
+        let grpc_verified =
+            verify_authorized_job(&transported, &LocalAgentConfig::default()).expect("gRPC verify");
+        let expected_branch = protocol::authorized_default_branch(work_item_id, work_item_id);
+        for verified in [&http_verified, &grpc_verified] {
+            assert_eq!(
+                resolve_target_branch_for_repo_job(
+                    &verified.job,
+                    verified.job.repo.as_ref().expect("authorized repo"),
+                ),
+                expected_branch
+            );
+            let transported_request =
+                protocol::authorization_request_from_job_context(&verified.job.context)
+                    .expect("transported request");
+            assert_eq!(
+                transported_request
+                    .request_digest()
+                    .expect("transported digest"),
+                request.request_digest().expect("source digest")
+            );
+            assert_eq!(transported_request.resource_constraints.max_retries, 3);
+        }
+
+        let mut http_attempt_mutation = job.clone();
+        http_attempt_mutation.attempt = 99;
+        let http_attempt_mutation: Job = serde_json::from_value(
+            serde_json::to_value(http_attempt_mutation).expect("HTTP attempt mutation"),
+        )
+        .expect("HTTP mutated job");
+        let http_attempt_verified =
+            verify_authorized_job(&http_attempt_mutation, &LocalAgentConfig::default())
+                .expect("HTTP attempt is host-only");
+        assert_eq!(
+            resolve_target_branch_for_repo_job(
+                &http_attempt_verified.job,
+                http_attempt_verified.job.repo.as_ref().expect("HTTP repo"),
+            ),
+            expected_branch
+        );
+
+        let mut grpc_attempt_mutation = job.clone();
+        grpc_attempt_mutation.attempt = 77;
+        let grpc_attempt_mutation =
+            job_from_pb(job_to_pb(grpc_attempt_mutation)).expect("gRPC attempt mutation");
+        let grpc_attempt_verified =
+            verify_authorized_job(&grpc_attempt_mutation, &LocalAgentConfig::default())
+                .expect("gRPC attempt is host-only");
+        assert_eq!(
+            resolve_target_branch_for_repo_job(
+                &grpc_attempt_verified.job,
+                grpc_attempt_verified.job.repo.as_ref().expect("gRPC repo"),
+            ),
+            expected_branch
+        );
+
+        for mutated in [
+            {
+                let mut mutated = job.clone();
+                mutated
+                    .env
+                    .insert("MODE".to_string(), "mutated".to_string());
+                mutated
+            },
+            {
+                let mut mutated = job.clone();
+                mutated.prompt.as_mut().unwrap().user = "mutated".to_string();
+                mutated
+            },
+            {
+                let mut mutated = job.clone();
+                mutated.repo.as_mut().unwrap().base_ref = "origin/other".to_string();
+                mutated
+            },
+            {
+                let mut mutated = job.clone();
+                mutated.context["workflow"]["inputs"]["scope"] =
+                    serde_json::Value::String("mutated".to_string());
+                mutated
+            },
+        ] {
+            assert!(verify_authorized_job(&mutated, &LocalAgentConfig::default()).is_err());
+        }
+
+        let mut profile_mismatch = job.clone();
+        let mut mismatched_request = request.clone();
+        mismatched_request.behavior.runner_profile["config_digest"] =
+            serde_json::Value::String("other".to_string());
+        protocol::project_authorization_request_into_job_context(
+            &mut profile_mismatch.context,
+            "authorization",
+            &mismatched_request,
+        )
+        .expect("profile mismatch evidence");
+        assert!(verify_authorized_job(&profile_mismatch, &LocalAgentConfig::default()).is_err());
+
+        let mut environment_mismatch = job.clone();
+        let mut mismatched_request = request.clone();
+        mismatched_request.resolved_environment = serde_json::json!({"base":"missing"});
+        protocol::project_authorization_request_into_job_context(
+            &mut environment_mismatch.context,
+            "authorization",
+            &mismatched_request,
+        )
+        .expect("environment mismatch evidence");
+        assert!(
+            verify_authorized_job(&environment_mismatch, &LocalAgentConfig::default()).is_err()
+        );
+
+        job.context[protocol::CONTEXT_REQUEST_DIGEST_KEY] =
+            serde_json::Value::String("mutated".to_string());
+        assert!(verify_authorized_job(&job, &LocalAgentConfig::default()).is_err());
     }
 
     #[test]
@@ -2415,7 +2630,7 @@ mod tests {
             AgentContextWriteParams {
                 transcript_dir: transcript_dir.to_string_lossy().to_string(),
                 workspace_dir: workspace_dir.clone(),
-                runtime_spec: runtime,
+                runtime_spec: runtime.clone(),
                 additional_repo_mounts: vec![],
             },
         )
@@ -2428,6 +2643,28 @@ mod tests {
             .get("paths")
             .and_then(serde_json::Value::as_object)
             .expect("paths object");
+        assert!(parsed["job"].get("attempt").is_none());
+        assert!(parsed["job"].get("max_retries").is_none());
+        let mut changed_attempt = job.clone();
+        changed_attempt.attempt = 99;
+        changed_attempt.max_retries = 99;
+        let changed_context_path = transcript_dir.join(".agent-context-changed.json");
+        write_agent_context_file(
+            &changed_context_path,
+            &changed_attempt,
+            AgentContextWriteParams {
+                transcript_dir: transcript_dir.to_string_lossy().to_string(),
+                workspace_dir: workspace_dir.clone(),
+                runtime_spec: runtime,
+                additional_repo_mounts: vec![],
+            },
+        )
+        .expect("write changed-attempt context");
+        let changed: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&changed_context_path).expect("read changed context"),
+        )
+        .expect("parse changed context");
+        assert_eq!(parsed["job"], changed["job"]);
 
         assert_eq!(
             paths
@@ -3227,13 +3464,21 @@ async fn run_job(
     worker_id: &str,
     transcript_dir: &str,
     transcript_rel_dir: &str,
-    data_dir: &Path,
+    _data_dir: &Path,
     repos_root: &Path,
     worktrees_root: &Path,
     egress_manager: &EgressManager,
     event_publisher: Option<&JobEventPublisher>,
     cancel_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<JobResult> {
+    let local_agent_config = egress_manager.config();
+    let verified = verify_authorized_job(job, local_agent_config)?;
+    let job = &verified.job;
+    let runtime_spec = verified.runtime_spec;
+    let resolved_runner = verified.runner;
+    let work_item_context = verified.work_item_context;
+    let triage_job = verified.triage;
+
     let transcript_dir = resolve_to_absolute(Path::new(transcript_dir))
         .with_context(|| format!("resolve transcript dir {}", transcript_dir))?
         .to_string_lossy()
@@ -3242,70 +3487,30 @@ async fn run_job(
 
     std::fs::create_dir_all(transcript_dir)?;
 
-    let local_agent_config = egress_manager.config();
     let environment_table =
         EnvironmentValidationTable::from_local_agent_config(local_agent_config)?;
-    let execution_kind = job_execution_kind_from_context(&job.context);
-    let managed_operation = managed_operation_from_job_context(&job.context);
-    let environment_runtime = environment_runtime_from_job_context(&job.context);
-    let resolved_runner = resolve_runner_spec_for_job(
-        job,
-        execution_kind,
-        managed_operation.as_deref(),
-        environment_runtime.as_deref(),
+    validate_triage_mount_and_credential_requests(
+        triage_job,
+        &resolved_runner,
+        &runtime_spec,
         local_agent_config,
     )?;
-    let work_item_context = work_item_contract_from_job_context(&job.context);
-    let triage_job = is_triage_job(&work_item_context);
-
-    let (runtime_spec, runtime_spec_source) = resolve_runtime_spec_and_source(job);
-    let mut runtime_spec = runtime_spec;
-    validate_triage_mount_and_credential_requests(triage_job, &resolved_runner, &runtime_spec)?;
-    if runtime_spec.environment.container_image.is_none() {
-        runtime_spec.environment.container_image = resolved_runner.container_image.clone();
-    }
-    if !triage_job {
-        runtime_spec
-            .environment
-            .file_mounts
-            .extend(resolved_runner.file_mounts.clone());
-    }
-    if triage_job {
-        runtime_spec
-            .environment
-            .file_mounts
-            .extend(configured_repo_discovery_mounts(
-                local_agent_config,
-                &data_dir.join("repo-cache"),
-            )?);
-    }
     let local_egress_plan = resolve_local_agent_egress_plan(&runtime_spec, local_agent_config)?;
-    let runtime_source_label = runtime_spec_source.label();
-    match runtime_spec_source {
-        RuntimeSpecSource::CanonicalContext => {
-            eprintln!(
-                "info: job {} using {} (version={}, mode={}, timeout_secs={:?}, network={:?}, mounts={}, toolchains={})",
-                job.id,
-                runtime_source_label,
-                runtime_spec.runtime_version,
-                runtime_spec.environment.execution_mode,
-                runtime_spec.environment.timeout_secs,
-                runtime_spec.environment.network,
-                runtime_spec.environment.file_mounts.len(),
-                runtime_spec.environment.toolchains.len()
-            );
-        }
-        RuntimeSpecSource::LegacyJobFields => {
-            eprintln!(
-                "WARNING: job {} falling back to {} (mode={}, timeout_secs={:?}, execution_kind={})",
-                job.id,
-                runtime_source_label,
-                runtime_spec.environment.execution_mode,
-                runtime_spec.environment.timeout_secs,
-                execution_kind.as_str()
-            );
-        }
-    }
+    let runtime_source_label = "immutable_authorization";
+    eprintln!(
+        "info: job {} using immutable authorization {} (version={}, mode={}, timeout_secs={:?}, network={:?}, mounts={}, toolchains={})",
+        job.id,
+        job.context
+            .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing"),
+        runtime_spec.runtime_version,
+        runtime_spec.environment.execution_mode,
+        runtime_spec.environment.timeout_secs,
+        runtime_spec.environment.network,
+        runtime_spec.environment.file_mounts.len(),
+        runtime_spec.environment.toolchains.len()
+    );
 
     let job_events_path = PathBuf::from(transcript_dir).join("job-events.jsonl");
     let job_event_sink = JobEventSink {
@@ -3366,8 +3571,6 @@ async fn run_job(
     let stdout_path = PathBuf::from(transcript_dir).join("stdout.log");
     let stderr_path = PathBuf::from(transcript_dir).join("stderr.log");
     let run_json_path = PathBuf::from(transcript_dir).join("run.json");
-    let work_item_context = work_item_contract_from_job_context(&job.context);
-
     env.insert(
         "AGENT_WORKSPACE_DIR".to_string(),
         workspace_dir.to_string_lossy().to_string(),
@@ -3856,6 +4059,233 @@ async fn run_job(
     }
 
     execution_result
+}
+
+struct VerifiedAuthorizedJob {
+    job: Job,
+    runtime_spec: protocol::CanonicalRuntimeSpec,
+    runner: ResolvedRunnerSpec,
+    work_item_context: serde_json::Value,
+    triage: bool,
+}
+
+fn verify_authorized_job(
+    job: &Job,
+    config: &LocalAgentConfig,
+) -> anyhow::Result<VerifiedAuthorizedJob> {
+    let authorization_id = job
+        .context
+        .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+        .and_then(serde_json::Value::as_str)
+        .context("job has no immutable authorization identity")?;
+    if authorization_id.trim().is_empty() {
+        anyhow::bail!("job authorization identity must not be empty");
+    }
+    let request_digest = job
+        .context
+        .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
+        .and_then(serde_json::Value::as_str)
+        .context("job has no immutable request digest")?;
+    let request = protocol::authorization_request_from_job_context(&job.context)
+        .context("job has no resolved authorization request")?;
+    if request.work_unit_id != job.work_item_id || request.state_id != job.step_id {
+        anyhow::bail!("job authorization work-unit binding mismatch");
+    }
+    if request.request_digest()? != request_digest {
+        anyhow::bail!("job authorization request digest mismatch");
+    }
+    if request.permission_envelope.environment.execution_mode != ExecutionMode::Docker {
+        anyhow::bail!("only authorized Docker jobs are supported");
+    }
+    if !request.matches_job_execution(job) {
+        anyhow::bail!("job execution fields do not match immutable authorization");
+    }
+    if request.behavior.triage != (request.workflow_id == "__triage__")
+        || request.behavior.allow_remote_credentials == request.behavior.triage
+    {
+        anyhow::bail!("job triage or credential classification is invalid");
+    }
+    let signed_work_item_context =
+        work_item_contract_from_job_context(&request.behavior.execution_context);
+    if is_triage_job(&signed_work_item_context) != request.behavior.triage
+        || job_allows_remote_credentials(&signed_work_item_context)
+            != request.behavior.allow_remote_credentials
+    {
+        anyhow::bail!("signed work-item classification does not match authorization");
+    }
+    let mut authorized_primary_repo = request.behavior.primary_repo.clone();
+    match (
+        authorized_primary_repo.as_mut(),
+        request.behavior.primary_repo_branch.as_deref(),
+    ) {
+        (Some(repo), Some(branch)) if !branch.trim().is_empty() => {
+            repo.branch_name = Some(branch.to_string());
+        }
+        (None, None) => {}
+        _ => anyhow::bail!("authorized primary repository branch binding is invalid"),
+    }
+    if let Some(environment_name) = request
+        .resolved_environment
+        .get("base")
+        .and_then(serde_json::Value::as_str)
+    {
+        let local_environment = config
+            .config_tree()
+            .and_then(|tree| {
+                tree.environments
+                    .iter()
+                    .find(|environment| environment.name == environment_name)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("authorized environment '{environment_name}' is not loaded")
+            })?;
+        let definition = request
+            .resolved_environment
+            .get("definition")
+            .and_then(serde_json::Value::as_object)
+            .context("authorized environment has no resolved definition")?;
+        let authorized_bundle = definition
+            .get("bundle_digests")
+            .cloned()
+            .context("authorized environment has no bundle digest")?;
+        let authorized_policies = definition
+            .get("network_policy_bundle_digests")
+            .cloned()
+            .context("authorized environment has no network-policy digest")?;
+        if authorized_bundle != serde_json::to_value(&local_environment.bundle_digests)?
+            || authorized_policies
+                != serde_json::to_value(&local_environment.network_policy_bundle_digests)?
+        {
+            anyhow::bail!("local environment bundle does not match authorization snapshot");
+        }
+    }
+    if request.behavior.execution_kind == "command" {
+        if request.behavior.runner_profile
+            != serde_json::json!({"profile_name":"command", "config_digest":"command_v1"})
+        {
+            anyhow::bail!("authorized command runner profile is invalid");
+        }
+        let mut authorized_job = job.clone();
+        authorized_job.command = request.behavior.command;
+        authorized_job.args = request.behavior.args;
+        authorized_job.env = request.behavior.env.into_iter().collect();
+        authorized_job.prompt = request.behavior.prompt;
+        authorized_job.repo = authorized_primary_repo;
+        authorized_job.context =
+            authorized_execution_context(job, request.behavior.execution_context);
+        return Ok(VerifiedAuthorizedJob {
+            runtime_spec: request.permission_envelope,
+            runner: ResolvedRunnerSpec {
+                kind: ResolvedRunnerKind::Generic,
+                command: authorized_job.command.clone(),
+                args: authorized_job.args.clone(),
+                container_image: None,
+                file_mounts: Vec::new(),
+                requires_credentials: Vec::new(),
+            },
+            work_item_context: work_item_contract_from_job_context(&authorized_job.context),
+            triage: request.behavior.triage,
+            job: authorized_job,
+        });
+    }
+    let profile: agent_hub_config::ResolvedRunnerProfile =
+        serde_json::from_value(request.behavior.runner_profile.clone())
+            .context("authorization has invalid runner profile")?;
+    if agent_hub_config::digest_profile(&profile).map_err(anyhow::Error::msg)?
+        != profile.config_digest
+    {
+        anyhow::bail!("authorized runner profile digest mismatch");
+    }
+    let configured_profiles = RunnerProfilesConfig {
+        default_agent: config.default_agent.clone(),
+        default_agent_id: config.default_agent_id.clone(),
+        managed_runners: config.managed_runners.clone(),
+        credential_providers: config
+            .credential_providers
+            .iter()
+            .map(|(name, provider)| Ok((name.clone(), serde_json::to_value(provider)?)))
+            .collect::<Result<HashMap<_, _>, serde_json::Error>>()?,
+        mcp_bridges: config
+            .mcp_bridges
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?,
+        egress: serde_json::to_value(&config.egress)?,
+        github_hosts: config.github_hosts.clone(),
+    };
+    let configured = if request.behavior.execution_kind == "managed" {
+        configured_profiles
+            .resolve_managed_profile(&profile.profile_name)
+            .map_err(anyhow::Error::msg)?
+    } else {
+        configured_profiles
+            .resolve_agent_profile(if profile.profile_name == "default_agent" {
+                None
+            } else {
+                Some(profile.profile_name.as_str())
+            })
+            .map_err(anyhow::Error::msg)?
+    };
+    if configured != profile {
+        anyhow::bail!("local runner profile does not match authorized config digest");
+    }
+    let runner = ResolvedRunnerSpec {
+        kind: match profile.kind {
+            ManagedRunnerKind::Opencode => ResolvedRunnerKind::Opencode(OpencodeManagedSpec {
+                max_validation_attempts: profile.opencode.max_validation_attempts,
+            }),
+            ManagedRunnerKind::Cursor => ResolvedRunnerKind::Cursor(CursorManagedSpec {
+                max_validation_attempts: profile.cursor.max_validation_attempts,
+                default_model: profile.cursor.default_model.clone(),
+            }),
+            ManagedRunnerKind::Generic => ResolvedRunnerKind::Generic,
+        },
+        command: profile.command,
+        args: profile.args,
+        container_image: profile.container_image,
+        file_mounts: Vec::new(),
+        requires_credentials: profile
+            .credential_providers
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect(),
+    };
+    let mut authorized_job = job.clone();
+    authorized_job.command = request.behavior.command;
+    authorized_job.args = request.behavior.args;
+    authorized_job.env = request.behavior.env.into_iter().collect();
+    authorized_job.prompt = request.behavior.prompt;
+    authorized_job.repo = authorized_primary_repo;
+    authorized_job.context = authorized_execution_context(job, request.behavior.execution_context);
+    Ok(VerifiedAuthorizedJob {
+        runtime_spec: request.permission_envelope,
+        runner,
+        work_item_context: work_item_contract_from_job_context(&authorized_job.context),
+        triage: request.behavior.triage,
+        job: authorized_job,
+    })
+}
+
+fn authorized_execution_context(
+    job: &Job,
+    mut execution_context: serde_json::Value,
+) -> serde_json::Value {
+    if !execution_context.is_object() {
+        execution_context = serde_json::json!({});
+    }
+    let object = execution_context
+        .as_object_mut()
+        .expect("execution context normalized as object");
+    for key in [
+        protocol::CONTEXT_AUTHORIZATION_ID_KEY,
+        protocol::CONTEXT_REQUEST_DIGEST_KEY,
+        protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY,
+    ] {
+        if let Some(value) = job.context.get(key) {
+            object.insert(key.to_string(), value.clone());
+        }
+    }
+    execution_context
 }
 
 fn artifact_store_relative_path(transcript_rel_dir: &str, filename: &str) -> String {
@@ -5131,8 +5561,12 @@ async fn run_docker(
             job_gh_host.as_deref(),
         );
     }
+    let required_credential_providers = authorized_credential_provider_names(job)?;
+    if !allow_remote_credentials && !required_credential_providers.is_empty() {
+        anyhow::bail!("job requires credential providers outside its remote-access envelope");
+    }
     let resolved_credentials = if allow_remote_credentials {
-        resolve_configured_credentials(local_agent_config).await?
+        resolve_configured_credentials(local_agent_config, &required_credential_providers).await?
     } else {
         ResolvedCredentials::default()
     };
@@ -5659,6 +6093,7 @@ fn validate_triage_mount_and_credential_requests(
     triage_job: bool,
     runner: &ResolvedRunnerSpec,
     runtime: &protocol::CanonicalRuntimeSpec,
+    config: &LocalAgentConfig,
 ) -> anyhow::Result<()> {
     if !triage_job {
         return Ok(());
@@ -5668,8 +6103,25 @@ fn validate_triage_mount_and_credential_requests(
             "triage runner must not declare arbitrary file mounts or credential providers"
         );
     }
-    if !runtime.environment.file_mounts.is_empty() {
-        anyhow::bail!("triage runtime must not request arbitrary file mounts");
+    let approved_roots = canonical_approved_repository_roots(config)?;
+    for mount in &runtime.environment.file_mounts {
+        if !mount.read_only || !mount.container_path.starts_with("/repos/") {
+            anyhow::bail!("triage repository mounts must be read-only under /repos");
+        }
+        let source = std::fs::canonicalize(&mount.host_path)
+            .with_context(|| format!("canonicalize triage repository mount {}", mount.host_path))?;
+        if !approved_roots.iter().any(|root| source.starts_with(root)) {
+            anyhow::bail!(
+                "triage repository mount '{}' is outside approved repository roots",
+                source.display()
+            );
+        }
+        if !source.join(".git").exists() || path_contains_credential_directory(&source) {
+            anyhow::bail!(
+                "triage mount '{}' is not an approved repository",
+                source.display()
+            );
+        }
     }
     if !runtime.repos.is_empty() {
         anyhow::bail!("triage runtime must not request arbitrary repository mounts");
@@ -6407,7 +6859,11 @@ async fn build_docker_runtime_invocation(
         );
     }
     let resolved_credentials = if allow_remote_credentials {
-        resolve_configured_credentials(local_agent_config).await?
+        resolve_configured_credentials(
+            local_agent_config,
+            &authorized_credential_provider_names(job)?,
+        )
+        .await?
     } else {
         ResolvedCredentials::default()
     };
@@ -6510,23 +6966,40 @@ async fn configure_mcp_bridges_for_docker(
 
 async fn resolve_configured_credentials(
     local_agent_config: &LocalAgentConfig,
+    required_provider_names: &[String],
 ) -> anyhow::Result<ResolvedCredentials> {
-    if local_agent_config.credential_providers.is_empty() {
+    if required_provider_names.is_empty() {
         return Ok(ResolvedCredentials::default());
     }
-
-    let mut provider_names = local_agent_config
-        .credential_providers
-        .keys()
-        .collect::<Vec<_>>();
-    provider_names.sort_unstable();
-
-    let providers = provider_names
-        .into_iter()
-        .filter_map(|name| local_agent_config.credential_providers.get(name))
-        .cloned()
-        .collect::<Vec<_>>();
+    let providers = required_provider_names
+        .iter()
+        .map(|name| {
+            local_agent_config
+                .credential_providers
+                .get(name)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("required credential provider '{name}' is unavailable")
+                })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     resolve_all(&providers).await
+}
+
+fn authorized_credential_provider_names(job: &Job) -> anyhow::Result<Vec<String>> {
+    let request = protocol::authorization_request_from_job_context(&job.context)
+        .context("job has no resolved authorization request")?;
+    if request.behavior.execution_kind == "command" {
+        return Ok(Vec::new());
+    }
+    let profile: agent_hub_config::ResolvedRunnerProfile =
+        serde_json::from_value(request.behavior.runner_profile)
+            .context("authorization has invalid runner profile")?;
+    Ok(profile
+        .credential_providers
+        .into_iter()
+        .map(|provider| provider.name)
+        .collect())
 }
 
 fn append_resolved_credentials_to_docker_invocation(
@@ -7440,11 +7913,27 @@ mod triage_validation_tests {
             }],
             requires_credentials: Vec::new(),
         };
-        assert!(validate_triage_mount_and_credential_requests(true, &runner, &runtime).is_err());
+        assert!(
+            validate_triage_mount_and_credential_requests(
+                true,
+                &runner,
+                &runtime,
+                &LocalAgentConfig::default(),
+            )
+            .is_err()
+        );
 
         runner.file_mounts.clear();
         runner.requires_credentials.push("github".to_string());
-        assert!(validate_triage_mount_and_credential_requests(true, &runner, &runtime).is_err());
+        assert!(
+            validate_triage_mount_and_credential_requests(
+                true,
+                &runner,
+                &runtime,
+                &LocalAgentConfig::default(),
+            )
+            .is_err()
+        );
 
         runner.requires_credentials.clear();
         runtime
@@ -7455,7 +7944,15 @@ mod triage_validation_tests {
                 container_path: "/var/run/docker.sock".to_string(),
                 read_only: false,
             });
-        assert!(validate_triage_mount_and_credential_requests(true, &runner, &runtime).is_err());
+        assert!(
+            validate_triage_mount_and_credential_requests(
+                true,
+                &runner,
+                &runtime,
+                &LocalAgentConfig::default(),
+            )
+            .is_err()
+        );
 
         runtime.environment.file_mounts.clear();
         runtime.repos.push(protocol::PlannedRepoClaim {
@@ -7466,7 +7963,15 @@ mod triage_validation_tests {
             claim_type: "read_only".to_string(),
             branch_name: None,
         });
-        assert!(validate_triage_mount_and_credential_requests(true, &runner, &runtime).is_err());
+        assert!(
+            validate_triage_mount_and_credential_requests(
+                true,
+                &runner,
+                &runtime,
+                &LocalAgentConfig::default(),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

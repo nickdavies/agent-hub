@@ -107,8 +107,6 @@ pub(crate) fn write_agent_context_file(
             id: job.id,
             work_item_id: Some(job.work_item_id),
             step_id: job.step_id.clone(),
-            attempt: job.attempt,
-            max_retries: job.max_retries,
             execution_mode,
             timeout_secs: params.runtime_spec.environment.timeout_secs,
             container_image: params.runtime_spec.environment.container_image.clone(),

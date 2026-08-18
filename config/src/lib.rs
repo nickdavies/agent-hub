@@ -2,6 +2,7 @@ pub mod environment;
 pub mod image;
 pub mod network_policy;
 mod rules;
+pub mod runner;
 pub mod system;
 mod tools;
 pub mod triage;
@@ -13,8 +14,13 @@ pub use rules::{
     ConfigAction, ConfigDecision, DefaultAction, RuleAction, RuleSummary, ToolConfig,
     default_to_resolved, load_tool_config, resolve_action, validate_tool_config,
 };
-pub use tools::{is_in_workspace, normalize_path, resolve_path};
+pub use runner::{
+    CredentialProviderDescriptor, CursorRunnerConfig, ManagedRunnerFileMount, ManagedRunnerKind,
+    ManagedRunnerSpec, McpBridgeDescriptor, OpencodeRunnerConfig, ResolvedRunnerProfile,
+    RunnerProfilesConfig, digest_profile, directory_content_digests,
+};
 pub use system::SystemConfig;
+pub use tools::{is_in_workspace, normalize_path, resolve_path};
 pub use triage::TriagePromptDefinition;
 
 /// Expand a leading `~/` to the user's home directory.

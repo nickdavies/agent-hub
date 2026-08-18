@@ -451,6 +451,13 @@ pub(crate) fn preferred_checkout_ref_from_job_results(
 }
 
 pub(crate) fn branch_for_job_attempt(job: &Job, configured_branch: Option<String>) -> String {
+    if let Some(request) = protocol::authorization_request_from_job_context(&job.context) {
+        return request
+            .behavior
+            .primary_repo_branch
+            .filter(|branch| !branch.trim().is_empty())
+            .expect("authorized repository execution requires a signed branch choice");
+    }
     configured_branch
         .filter(|branch| !branch.trim().is_empty())
         .unwrap_or_else(|| {

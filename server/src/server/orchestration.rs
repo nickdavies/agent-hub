@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -7,16 +7,19 @@ use std::time::{Duration, Instant};
 use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use protocol::{
-    AgentOutput, BlockReason, CanonicalRuntimeSpec, CreateWorkItemRequest, EnvironmentDefinition,
-    EnvironmentOverlay, EnvironmentSelection, EventSource, FireEventRequest, HeartbeatRequest, Job,
-    JobState, JobUpdateRequest, NetworkResourceRequest, PlannedEnvironmentTier, PollJobRequest,
-    PollJobResponse, ProviderIdentity, ProviderOwnership, ReactiveTerminalOutcome,
-    RegisterWorkerRequest, RepoSource, WorkItem, WorkItemState, WorkerInfo, WorkerState,
-    WorkflowDefinition, WorkflowDocument, WorkflowEvent, WorkflowEventKind, WorkflowEventPayload,
-    WorkflowStepKind, canonical_environment_for_execution, canonical_permissions_for_environment,
-    canonical_runtime_spec_for_job, canonical_runtime_spec_for_job_effective,
-    default_approval_rules_for_tier, legacy_network_label_for_request,
-    network_request_from_legacy_label, project_runtime_spec_into_job_context,
+    AUTHORIZATION_REQUEST_VERSION, AgentOutput, BlockReason, CanonicalRuntimeSpec,
+    CreateWorkItemRequest, EnvironmentDefinition, EnvironmentOverlay, EnvironmentSelection,
+    EventSource, FireEventRequest, HeartbeatRequest, Job, JobState, JobUpdateRequest,
+    NetworkResourceRequest, PlannedEnvironmentTier, PollJobRequest, PollJobResponse,
+    ProviderIdentity, ProviderOwnership, ReactiveTerminalOutcome, RegisterWorkerRequest,
+    RepoSource, ResolvedAuthorizationBehavior, ResolvedAuthorizationProvider,
+    ResolvedAuthorizationRequest, ResolvedAuthorizationResources, WorkItem, WorkItemState,
+    WorkerInfo, WorkerState, WorkflowDefinition, WorkflowDocument, WorkflowEvent,
+    WorkflowEventKind, WorkflowEventPayload, WorkflowStepKind, canonical_environment_for_execution,
+    canonical_permissions_for_environment, canonical_runtime_spec_for_job,
+    canonical_runtime_spec_for_job_effective, default_approval_rules_for_tier,
+    legacy_network_label_for_request, network_request_from_legacy_label,
+    project_authorization_request_into_job_context, project_runtime_spec_into_job_context,
     validate_agent_output_next_event, workflow_event_is_externally_fireable,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -37,11 +40,11 @@ use super::repo_discovery::DiscoveredRepo;
 #[cfg(test)]
 use super::task_adapter::task_from_work_item;
 use super::task_adapter::{
-    AdapterIntent, HumanActionKind, ProviderActionIdentity, ProviderActionNamespace,
-    ProviderActionRejectionDelivery, ProviderActionRejectionSource, TaskAdapter, TaskAdapterError,
-    TaskCheckpoint, TaskHumanAction, TaskHumanGateState, TaskLabels, TaskProjection,
-    TaskSyncRecord, TaskToolRecord, TaskTriageStatus, TriageResult, action_to_fire_event,
-    choose_workflow_id, infer_intents, legacy_human_gate_valid_next_events,
+    AdapterIntent, CheckpointAuthorizationPending, HumanActionKind, ProviderActionIdentity,
+    ProviderActionNamespace, ProviderActionRejectionDelivery, ProviderActionRejectionSource,
+    TaskAdapter, TaskAdapterError, TaskCheckpoint, TaskHumanAction, TaskHumanGateState, TaskLabels,
+    TaskProjection, TaskSyncRecord, TaskToolRecord, TaskTriageStatus, TriageResult,
+    action_to_fire_event, choose_workflow_id, infer_intents, legacy_human_gate_valid_next_events,
     task_from_work_item_with_valid_next_events, work_item_from_create,
 };
 #[cfg(test)]
@@ -62,10 +65,12 @@ use github::{
     parse_pr_url_components, update_github_pr_state_in_context,
 };
 use storage::{
-    DbTable, ProviderActionCommit, ProviderActionCommitOutcome, ProviderActionJobInsert,
+    AuthorizationObligationInsert, DbTable, ProviderActionBaselineInsert, ProviderActionCommit,
+    ProviderActionCommitOutcome, ProviderActionJobInsert, ProviderActionObligationApproval,
     ProviderActionRevisionUpdate, ProviderActionTerminalState, column_exists,
-    commit_provider_action, invalid_enum, invalid_json, migrate_provider_action_inbox_schema,
-    parse_datetime, row_to_job, row_to_work_item,
+    commit_ordinary_authorized_job, commit_provider_action, insert_authorization_record,
+    invalid_enum, invalid_json, migrate_provider_action_inbox_schema, parse_datetime, row_to_job,
+    row_to_work_item, stage_authorization_obligation, verify_job_authorization,
 };
 
 const LEASE_TTL_SECS: i64 = 120;
@@ -96,6 +101,10 @@ struct ProviderActionPlan {
     work_item_updates: Vec<WorkItem>,
     work_item_inserts: Vec<WorkItem>,
     job_inserts: Vec<ProviderActionJobInsert>,
+    baseline_inserts: Vec<ProviderActionBaselineInsert>,
+    obligation_approvals: Vec<ProviderActionObligationApproval>,
+    obligation_inserts: Vec<AuthorizationObligationInsert>,
+    authorization_pending: Option<CheckpointAuthorizationPending>,
     cancel_active_work_item_ids: Vec<Uuid>,
 }
 
@@ -270,6 +279,8 @@ pub struct OrchestrationService {
     overlays: Arc<Vec<EnvironmentOverlay>>,
     discovered_repos: Arc<Vec<DiscoveredRepo>>,
     operator_login: Option<String>,
+    runner_profiles: Arc<agent_hub_config::RunnerProfilesConfig>,
+    environment_snapshots: Arc<HashMap<String, serde_json::Value>>,
     /// Prompt used by the `__triage__` pseudo-workflow. Loaded from the
     /// triage prompt manifest referenced by `system.toml` so triage is
     /// decoupled from any specific selectable workflow.
@@ -325,6 +336,19 @@ impl OrchestrationService {
             overlays: Arc::new(Vec::new()),
             discovered_repos: Arc::new(Vec::new()),
             operator_login: None,
+            runner_profiles: Arc::new({
+                #[cfg(not(test))]
+                let profiles = agent_hub_config::RunnerProfilesConfig::default();
+                #[cfg(test)]
+                let mut profiles = agent_hub_config::RunnerProfilesConfig::default();
+                #[cfg(test)]
+                {
+                    profiles.default_agent.container_image =
+                        Some("local/agent-hub-test:latest".to_string());
+                }
+                profiles
+            }),
+            environment_snapshots: Arc::new(HashMap::new()),
             triage_prompt: Arc::new({
                 #[cfg(test)]
                 {
@@ -373,6 +397,22 @@ impl OrchestrationService {
         self.operator_login = operator_login
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        self
+    }
+
+    pub fn with_runner_profiles(
+        mut self,
+        runner_profiles: agent_hub_config::RunnerProfilesConfig,
+    ) -> Self {
+        self.runner_profiles = Arc::new(runner_profiles);
+        self
+    }
+
+    pub fn with_environment_snapshots(
+        mut self,
+        environment_snapshots: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        self.environment_snapshots = Arc::new(environment_snapshots);
         self
     }
 
@@ -695,11 +735,47 @@ impl OrchestrationService {
                         lease_expires_at TEXT,
                         runtime_spec_json TEXT,
                         checkpoint_owner_id TEXT NOT NULL,
+                        authorization_id TEXT,
+                        request_digest TEXT,
                         dispatch_released INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+                    CREATE TABLE IF NOT EXISTS authorization_records (
+                        authorization_id TEXT PRIMARY KEY,
+                        work_item_id TEXT NOT NULL,
+                        checkpoint_owner_id TEXT NOT NULL,
+                        request_digest TEXT NOT NULL,
+                        invocation_id TEXT NOT NULL,
+                        request_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS authorization_baselines (
+                        checkpoint_owner_id TEXT NOT NULL,
+                        work_item_id TEXT NOT NULL,
+                        state_id TEXT NOT NULL,
+                        request_digest TEXT NOT NULL,
+                        request_json TEXT NOT NULL,
+                        approved_human_json TEXT NOT NULL,
+                        approved_revision TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY(checkpoint_owner_id, work_item_id, state_id, request_digest)
+                    );
+                    CREATE TABLE IF NOT EXISTS authorization_obligations (
+                        checkpoint_owner_id TEXT NOT NULL,
+                        work_item_id TEXT NOT NULL,
+                        request_digest TEXT NOT NULL,
+                        request_json TEXT NOT NULL,
+                        job_json TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        authorization_id TEXT,
+                        approved_human_json TEXT,
+                        approved_revision TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(checkpoint_owner_id, work_item_id, request_digest)
+                    );
                     CREATE TABLE IF NOT EXISTS checkpoint_outbox (
                         root_work_item_id TEXT PRIMARY KEY,
                         generation INTEGER NOT NULL,
@@ -844,6 +920,26 @@ impl OrchestrationService {
                     }
                     if !column_exists(&conn, DbTable::Jobs, "runtime_spec_json")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN runtime_spec_json TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "authorization_id")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN authorization_id TEXT", [])?;
+                    }
+                    if !column_exists(&conn, DbTable::Jobs, "request_digest")? {
+                        conn.execute("ALTER TABLE jobs ADD COLUMN request_digest TEXT", [])?;
+                    }
+                    if !column_exists(
+                        &conn,
+                        DbTable::AuthorizationRecords,
+                        "invocation_id",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE authorization_records ADD COLUMN invocation_id TEXT",
+                            [],
+                        )?;
+                        conn.execute(
+                            "UPDATE authorization_records SET invocation_id = json_extract(request_json, '$.invocation_id')",
+                            [],
+                        )?;
                     }
                     if !column_exists(&conn, DbTable::Jobs, "checkpoint_owner_id")? {
                         conn.execute(
@@ -1136,6 +1232,101 @@ impl OrchestrationService {
                             [Utc::now().to_rfc3339()],
                         )?;
                     }
+                    let migrate_authorization: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM schema_migrations WHERE name = 'immutable_authorization_v1'",
+                            [],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_none();
+                    if migrate_authorization {
+                        let active_jobs = {
+                            let mut stmt = conn.prepare(
+                                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE state IN (?1, ?2, ?3)",
+                            )?;
+                            let rows = stmt.query_map(
+                                params![
+                                    JobState::Pending.to_string(),
+                                    JobState::Assigned.to_string(),
+                                    JobState::Running.to_string(),
+                                ],
+                                row_to_job,
+                            )?;
+                            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                        };
+                        let mut affected_roots = BTreeSet::new();
+                        for job in active_jobs {
+                            if verify_job_authorization(conn, &job).is_ok() {
+                                continue;
+                            }
+                            let root_id: String = conn.query_row(
+                                "SELECT checkpoint_owner_id FROM jobs WHERE id = ?1",
+                                [job.id.to_string()],
+                                |row| row.get(0),
+                            )?;
+                            affected_roots.insert(root_id);
+                            conn.execute(
+                                "UPDATE jobs SET state = ?2, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?3 WHERE id = ?1",
+                                params![
+                                    job.id.to_string(),
+                                    JobState::Cancelled.to_string(),
+                                    Utc::now().to_rfc3339(),
+                                ],
+                            )?;
+                        }
+                        for root_id in affected_roots {
+                            conn.execute(
+                                "UPDATE jobs SET state = ?2, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?3 WHERE checkpoint_owner_id = ?1 AND state IN (?4, ?5, ?6)",
+                                params![
+                                    root_id,
+                                    JobState::Cancelled.to_string(),
+                                    Utc::now().to_rfc3339(),
+                                    JobState::Pending.to_string(),
+                                    JobState::Assigned.to_string(),
+                                    JobState::Running.to_string(),
+                                ],
+                            )?;
+                            conn.execute(
+                                "WITH RECURSIVE checkpoint_tree(id) AS (SELECT ?1 UNION ALL SELECT work_items.id FROM work_items JOIN checkpoint_tree ON work_items.parent_work_item_id = checkpoint_tree.id) UPDATE work_items SET state = ?2, human_gate = 1, human_gate_state = 'authorization_pending', projected_state = 'authorization_pending', last_failure_reason = ?3, required_action_description = ?4, context_json = json_set(context_json, '$.authorization_recovery_required', json('true')), updated_at = ?5 WHERE id IN (SELECT id FROM checkpoint_tree)",
+                                params![
+                                    root_id,
+                                    WorkItemState::Failed.to_string(),
+                                    "Nonterminal work was quarantined because immutable authorization was missing or invalid",
+                                    "Review recovery state and explicitly reassign this task before creating replacement work.",
+                                    Utc::now().to_rfc3339(),
+                                ],
+                            )?;
+                            if let Some((task_id, owners_json)) = conn
+                                .query_row(
+                                    "SELECT external_task_id, remembered_human_owners_json FROM work_items WHERE id = ?1 AND external_task_id IS NOT NULL",
+                                    [&root_id],
+                                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                                )
+                                .optional()?
+                            {
+                                let owners: Vec<ProviderIdentity> =
+                                    serde_json::from_str(&owners_json)?;
+                                let first = owners.first();
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO ownership_return_outbox (root_work_item_id, task_id, human_owner, human_owner_provider_id, human_owners_json, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    params![
+                                        root_id,
+                                        task_id,
+                                        first.and_then(|owner| owner.display_name.as_deref()),
+                                        first.and_then(|owner| owner.provider_id.as_deref()),
+                                        owners_json,
+                                        "immutable authorization migration requires human recovery",
+                                        Utc::now().to_rfc3339(),
+                                    ],
+                                )?;
+                            }
+                        }
+                        conn.execute(
+                            "INSERT INTO schema_migrations (name, applied_at) VALUES ('immutable_authorization_v1', ?1)",
+                            [Utc::now().to_rfc3339()],
+                        )?;
+                    }
                     transaction.commit()?;
                     Ok(())
                 })
@@ -1327,6 +1518,17 @@ impl OrchestrationService {
             .await
             .map_err(map_db)?
             .ok_or_else(|| AppError::JobNotFound(job_id.to_string()))?;
+        let path = Arc::clone(&self.db_path);
+        let authorization_job = job.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            verify_job_authorization(&conn, &authorization_job)
+        })
+        .await
+        .map_err(|error| {
+            AppError::Config(format!("authorization verification join error: {error}"))
+        })?
+        .map_err(map_db)?;
 
         if job.assigned_worker_id.as_deref() != Some(req.worker_id.as_str()) {
             if job.state == JobState::Cancelled {
@@ -1930,7 +2132,20 @@ impl OrchestrationService {
             )));
         }
 
-        self.retry_job(&previous_failed).await.map_err(map_db)?;
+        if !self
+            .retry_job(&previous_failed, item)
+            .await
+            .map_err(map_db)?
+        {
+            item.updated_at = Utc::now();
+            item.blocked_on = block_reason_for_state_name(&item.current_step);
+            item.projected_state = Some(project_workflow_state(item));
+            self.update_work_item(item).await.map_err(map_db)?;
+            self.persist_task_projection(item, None)
+                .await
+                .map_err(map_config)?;
+            return Ok(true);
+        }
         item.current_step = previous_failed.step_id.clone();
         item.state = WorkItemState::Running;
         item.human_gate = false;
@@ -2026,7 +2241,7 @@ impl OrchestrationService {
                 ))
             })?;
 
-        item.current_step = transition.target.clone();
+        enter_workflow_state(item, &transition.target);
         item.human_gate_state = Some(task_human_gate_state_name(&TaskHumanGateState::Unblocked));
         item.context = mark_human_gate_state(item.context.clone(), TaskHumanGateState::Unblocked);
         if !item.context.is_object() {
@@ -2412,6 +2627,187 @@ impl OrchestrationService {
             .await
     }
 
+    async fn propose_initial_authorization_epoch(
+        &self,
+        triage_item: &mut WorkItem,
+        workflow_id: &str,
+    ) -> Result<Vec<ResolvedAuthorizationRequest>, AppError> {
+        let initial_state = self
+            .workflows
+            .get_reactive(workflow_id)
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(
+                    "legacy workflows cannot receive durable authorization".to_string(),
+                )
+            })?
+            .initial_state
+            .clone();
+        start_authorization_epoch(triage_item);
+        enter_workflow_state(triage_item, &initial_state);
+        let mut item = triage_item.clone();
+        if !self
+            .apply_triage_workflow_selection(&mut item, workflow_id)
+            .await?
+        {
+            return Err(AppError::WorkflowInvalid(
+                "triage selection did not resolve an executable workflow".to_string(),
+            ));
+        }
+        let workflow = self
+            .workflows
+            .get_reactive(workflow_id)
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(
+                    "legacy workflows cannot receive durable authorization".to_string(),
+                )
+            })?
+            .clone();
+        let requests = self.propose_authorization_epoch_from_states(
+            &item,
+            &workflow,
+            [workflow.initial_state.clone()],
+            triage_item.id,
+        )?;
+        if requests.is_empty() {
+            return Err(AppError::WorkflowInvalid(
+                "authorization epoch contains no executable states".to_string(),
+            ));
+        }
+        Ok(requests)
+    }
+
+    fn propose_authorization_epoch_from_states(
+        &self,
+        item: &WorkItem,
+        workflow: &protocol::ReactiveWorkflowDefinition,
+        initial_states: impl IntoIterator<Item = String>,
+        checkpoint_owner_id: Uuid,
+    ) -> Result<Vec<ResolvedAuthorizationRequest>, AppError> {
+        self.propose_authorization_epoch_from_states_guarded(
+            item,
+            workflow,
+            initial_states,
+            checkpoint_owner_id,
+            &mut Vec::new(),
+            0,
+        )
+    }
+
+    fn propose_authorization_epoch_from_states_guarded(
+        &self,
+        item: &WorkItem,
+        workflow: &protocol::ReactiveWorkflowDefinition,
+        initial_states: impl IntoIterator<Item = String>,
+        checkpoint_owner_id: Uuid,
+        workflow_stack: &mut Vec<String>,
+        depth: usize,
+    ) -> Result<Vec<ResolvedAuthorizationRequest>, AppError> {
+        if depth >= 32 {
+            return Err(AppError::WorkflowInvalid(
+                "authorization child-workflow depth exceeds 32".to_string(),
+            ));
+        }
+        if let Some(index) = workflow_stack
+            .iter()
+            .position(|workflow_id| workflow_id == &workflow.id)
+        {
+            let mut cycle = workflow_stack[index..].to_vec();
+            cycle.push(workflow.id.clone());
+            return Err(AppError::WorkflowInvalid(format!(
+                "authorization child-workflow cycle detected: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        workflow_stack.push(workflow.id.clone());
+        let mut item = item.clone();
+        let mut queue = initial_states.into_iter().collect::<VecDeque<_>>();
+        let mut visited = HashSet::new();
+        let mut requests = Vec::new();
+        while let Some(state_id) = queue.pop_front() {
+            if !visited.insert(state_id.clone()) {
+                continue;
+            }
+            let state = workflow
+                .states
+                .iter()
+                .find(|state| state.id == state_id)
+                .ok_or_else(|| {
+                    AppError::WorkflowInvalid(format!(
+                        "authorization epoch references missing state '{state_id}'"
+                    ))
+                })?;
+            item.current_step = state.id.clone();
+            set_proposed_state_invocation(&mut item, &state.id);
+            let mut enqueue_transitions = true;
+            match state.kind() {
+                protocol::ReactiveStateKind::Human | protocol::ReactiveStateKind::Terminal => {
+                    continue;
+                }
+                protocol::ReactiveStateKind::Auto => {
+                    if state.config.execution().is_some() {
+                        return Err(AppError::WorkflowInvalid(format!(
+                            "auto state '{}' unexpectedly has execution config",
+                            state.id
+                        )));
+                    }
+                    if let protocol::ReactiveStateConfig::Auto(config) = &state.config
+                        && let Some(child_workflow_id) = config.child_workflow.as_deref()
+                    {
+                        let child_workflow = self
+                            .workflows
+                            .get_reactive(child_workflow_id)
+                            .ok_or_else(|| {
+                                AppError::WorkflowInvalid(format!(
+                                    "child workflow '{child_workflow_id}' is not reactive"
+                                ))
+                            })?;
+                        let child = child_work_item_for_provider_action(
+                            &item,
+                            child_workflow.id.clone(),
+                            child_workflow.initial_state.clone(),
+                            state.id.clone(),
+                            DateTime::<Utc>::UNIX_EPOCH,
+                        );
+                        requests.extend(self.propose_authorization_epoch_from_states_guarded(
+                            &child,
+                            child_workflow,
+                            [child_workflow.initial_state.clone()],
+                            checkpoint_owner_id,
+                            workflow_stack,
+                            depth + 1,
+                        )?);
+                        enqueue_transitions = false;
+                    }
+                }
+                protocol::ReactiveStateKind::Agent
+                | protocol::ReactiveStateKind::Command
+                | protocol::ReactiveStateKind::Managed => {
+                    let job = self.build_reactive_job_for_provider_action(
+                        &item,
+                        state,
+                        checkpoint_owner_id,
+                    )?;
+                    let request = protocol::authorization_request_from_job_context(&job.context)
+                        .ok_or_else(|| {
+                            AppError::WorkflowInvalid(format!(
+                                "state '{}' did not produce an authorization request",
+                                state.id
+                            ))
+                        })?;
+                    requests.push(request);
+                }
+            }
+            if enqueue_transitions {
+                for transition in &state.on {
+                    queue.push_back(transition.target.clone());
+                }
+            }
+        }
+        workflow_stack.pop();
+        requests.sort_by(|left, right| left.state_id.cmp(&right.state_id));
+        Ok(requests)
+    }
+
     async fn ensure_ready(&self) -> Result<(), AppError> {
         self.init().await.map_err(map_db)
     }
@@ -2781,6 +3177,7 @@ impl OrchestrationService {
                         self.release_provider_authorized_jobs(
                             item.id,
                             &checkpoint.as_ref().expect("checked above").dispatch_job_ids,
+                            &checkpoint.as_ref().expect("checked above").dispatch_authorizations,
                             CheckpointReconciliationMode::SqliteLoss,
                         )
                         .await
@@ -3231,6 +3628,9 @@ impl OrchestrationService {
                         work_item_updates: Vec::new(),
                         work_item_inserts: Vec::new(),
                         job_inserts: Vec::new(),
+                        baseline_inserts: Vec::new(),
+                        obligation_approvals: Vec::new(),
+                        obligation_inserts: Vec::new(),
                         cancel_active_work_item_ids: Vec::new(),
                         cancel_unreleased_checkpoint_owner_ids: Vec::new(),
                         revision_update: None,
@@ -3311,6 +3711,25 @@ impl OrchestrationService {
             item.context["pinned_workflow_id"] = serde_json::Value::String(workflow_id);
         } else {
             let action = self.adapt_approve_to_unblock_if_needed(&item, action);
+            let authorization_pending = item
+                .context
+                .get("authorization_pending")
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<CheckpointAuthorizationPending>(value).ok()
+                });
+            let proposed_baseline = if matches!(
+                action.kind,
+                HumanActionKind::Approve | HumanActionKind::Unblock
+            ) {
+                item.context.get("proposed_authorization_epoch").cloned()
+            } else {
+                None
+            };
+            if let Some(proposed) = proposed_baseline.as_ref() {
+                self.verify_provider_proposed_authorizations(&item, proposed)
+                    .await?;
+            }
             if matches!(
                 action.kind,
                 HumanActionKind::Approve
@@ -3329,8 +3748,59 @@ impl OrchestrationService {
                 item.human_gate_state = Some(task_human_gate_state_name(&state));
                 item.context = mark_human_gate_state(item.context, state);
             }
-            self.plan_provider_action_event(&mut item, &action, root_id, &mut plan)
+            if let Some(pending) = authorization_pending {
+                if !matches!(
+                    action.kind,
+                    HumanActionKind::Approve | HumanActionKind::Unblock
+                ) {
+                    return Err(AppError::WorkflowInvalid(
+                        "authorization_pending accepts only approval or cancellation".to_string(),
+                    ));
+                }
+                self.plan_authorization_obligation_approval(
+                    &mut item,
+                    pending,
+                    root_id,
+                    action_revision,
+                    &mut plan,
+                )
                 .await?;
+            } else {
+                self.plan_provider_action_event(&mut item, &action, root_id, &mut plan)
+                    .await?;
+            }
+            if let Some(pending) = plan.authorization_pending.clone() {
+                mark_authorization_pending(&mut item, pending).map_err(map_db)?;
+            }
+            if let Some(proposed_baseline) = proposed_baseline {
+                let requests =
+                    serde_json::from_value::<Vec<ResolvedAuthorizationRequest>>(proposed_baseline)
+                        .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+                if requests.is_empty() {
+                    return Err(AppError::WorkflowInvalid(
+                        "triage approval has no proposed authorization epoch".to_string(),
+                    ));
+                }
+                let approved_human_json = serde_json::to_string(&item.remembered_human_owners)
+                    .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+                for request in requests {
+                    plan.baseline_inserts.push(ProviderActionBaselineInsert {
+                        checkpoint_owner_id: root_id,
+                        work_item_id: request.work_unit_id,
+                        state_id: request.state_id.clone(),
+                        request_digest: request
+                            .request_digest()
+                            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?,
+                        request_json: serde_json::to_string(&request.normalize())
+                            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?,
+                        approved_human_json: approved_human_json.clone(),
+                        approved_revision: action_revision,
+                    });
+                }
+                if let Some(context) = item.context.as_object_mut() {
+                    context.remove("proposed_authorization_epoch");
+                }
+            }
         }
         item.context =
             merge_provider_action_revision(item.context, revision_context, action_revision);
@@ -3352,6 +3822,9 @@ impl OrchestrationService {
             work_item_updates: plan.work_item_updates,
             work_item_inserts: plan.work_item_inserts.clone(),
             job_inserts: plan.job_inserts,
+            baseline_inserts: plan.baseline_inserts,
+            obligation_approvals: plan.obligation_approvals,
+            obligation_inserts: plan.obligation_inserts,
             cancel_active_work_item_ids: plan.cancel_active_work_item_ids,
             cancel_unreleased_checkpoint_owner_ids: Vec::new(),
             revision_update: None,
@@ -3408,6 +3881,44 @@ impl OrchestrationService {
                 retry.attempt = previous.attempt.saturating_add(1);
                 retry.created_at = Utc::now();
                 retry.updated_at = retry.created_at;
+                let workflow = self
+                    .workflows
+                    .get_reactive(&item.workflow_id)
+                    .ok_or_else(|| {
+                        AppError::WorkflowInvalid(
+                            "legacy workflow retries are not authorized".to_string(),
+                        )
+                    })?;
+                let state = workflow
+                    .states
+                    .iter()
+                    .find(|state| state.id == previous.step_id)
+                    .ok_or_else(|| {
+                        AppError::WorkflowInvalid(format!(
+                            "retry state '{}' is missing",
+                            previous.step_id
+                        ))
+                    })?;
+                let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+                project_workflow_inputs_into_job_context(
+                    &mut retry.context,
+                    &valid_next_events,
+                    item,
+                    &item.context,
+                );
+                self.project_resolved_authorization(
+                    &mut retry,
+                    item,
+                    state.kind(),
+                    checkpoint_owner_id,
+                )?;
+                if !self
+                    .plan_authorized_job(item, &retry, checkpoint_owner_id, plan)
+                    .await?
+                {
+                    item.state = WorkItemState::Running;
+                    return Ok(());
+                }
                 let runtime = canonical_runtime_spec_for_job_effective(&retry);
                 plan.job_inserts.push(ProviderActionJobInsert {
                     job: retry,
@@ -3451,7 +3962,7 @@ impl OrchestrationService {
                         state.id
                     ))
                 })?;
-            item.current_step = transition.target.clone();
+            enter_workflow_state(item, &transition.target);
             return self
                 .plan_reactive_current_state(item, checkpoint_owner_id, plan)
                 .await;
@@ -3548,12 +4059,201 @@ impl OrchestrationService {
             .await
     }
 
+    async fn plan_authorization_obligation_approval(
+        &self,
+        item: &mut WorkItem,
+        pending: CheckpointAuthorizationPending,
+        checkpoint_owner_id: Uuid,
+        action_revision: u64,
+        plan: &mut ProviderActionPlan,
+    ) -> Result<(), AppError> {
+        self.verify_provider_pending_authorization(item, &pending)
+            .await?;
+        let path = Arc::clone(&self.db_path);
+        let digest = pending.request_digest.clone();
+        let item_id = pending.work_item_id;
+        let (job_json, request_json) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let conn = Connection::open(path.as_path())?;
+            conn.query_row(
+                "SELECT job_json, request_json FROM authorization_obligations WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3 AND state = 'pending'",
+                params![
+                    checkpoint_owner_id.to_string(),
+                    item_id.to_string(),
+                    digest,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(map_db)?;
+        let request: ResolvedAuthorizationRequest = serde_json::from_str(&request_json)
+            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+        if request
+            .request_digest()
+            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?
+            != pending.request_digest
+            || serde_json::to_value(request.clone().normalize())
+                .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?
+                != pending.request
+        {
+            return Err(AppError::WorkflowInvalid(
+                "authorization obligation does not match checkpoint evidence".to_string(),
+            ));
+        }
+        let job: Job = serde_json::from_str(&job_json)
+            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+        if self
+            .has_pending_job_for_step(pending.work_item_id, &job.step_id)
+            .await
+            .map_err(map_db)?
+        {
+            return Err(AppError::WorkflowInvalid(
+                "authorization obligation already has an active job".to_string(),
+            ));
+        }
+        let authorization_id = job
+            .context
+            .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid("obligation job has no authorization id".to_string())
+            })?
+            .to_string();
+        plan.obligation_approvals
+            .push(ProviderActionObligationApproval {
+                checkpoint_owner_id,
+                work_item_id: pending.work_item_id,
+                request_digest: pending.request_digest,
+                authorization_id,
+                approved_human_json: serde_json::to_string(&item.remembered_human_owners)
+                    .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?,
+                approved_revision: action_revision,
+            });
+        plan.job_inserts.push(ProviderActionJobInsert {
+            runtime: canonical_runtime_spec_for_job_effective(&job),
+            job,
+            checkpoint_owner_id,
+        });
+        item.context.as_object_mut().map(|context| {
+            context.remove("authorization_pending");
+        });
+        item.human_gate = false;
+        item.human_gate_state = None;
+        item.required_action_description = None;
+        item.state = WorkItemState::Running;
+        if pending.work_item_id != item.id {
+            let mut logical_item = self
+                .get_work_item(pending.work_item_id)
+                .await
+                .map_err(map_db)?
+                .ok_or_else(|| {
+                    AppError::WorkflowInvalid(format!(
+                        "authorization obligation work item {} is missing",
+                        pending.work_item_id
+                    ))
+                })?;
+            if let Some(context) = logical_item.context.as_object_mut() {
+                context.remove("authorization_pending");
+            }
+            logical_item.human_gate = false;
+            logical_item.human_gate_state = None;
+            logical_item.required_action_description = None;
+            logical_item.state = WorkItemState::Running;
+            logical_item.projected_state = Some(project_workflow_state(&logical_item));
+            logical_item.updated_at = Utc::now();
+            plan.work_item_updates.push(logical_item);
+        }
+        Ok(())
+    }
+
+    async fn verify_provider_proposed_authorizations(
+        &self,
+        item: &WorkItem,
+        proposed: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        let task_id = item.external_task_id.as_deref().ok_or_else(|| {
+            AppError::WorkflowInvalid(
+                "authorization baseline has no provider task binding".to_string(),
+            )
+        })?;
+        let checkpoint = self
+            .read_provider_checkpoint(task_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(
+                    "provider checkpoint has no proposed authorization evidence".to_string(),
+                )
+            })?;
+        if checkpoint.generation > 0
+            && checkpoint.checkpoint_hash != checkpoint_hash(&checkpoint).map_err(map_db)?
+        {
+            return Err(AppError::WorkflowInvalid(
+                "provider checkpoint authorization hash mismatch".to_string(),
+            ));
+        }
+        let proposed = proposed.as_array().ok_or_else(|| {
+            AppError::WorkflowInvalid("proposed authorization epoch is not an array".to_string())
+        })?;
+        if checkpoint.proposed_authorizations != *proposed {
+            return Err(AppError::WorkflowInvalid(
+                "provider checkpoint proposed authorization evidence mismatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn verify_provider_pending_authorization(
+        &self,
+        item: &WorkItem,
+        pending: &CheckpointAuthorizationPending,
+    ) -> Result<(), AppError> {
+        let task_id = item.external_task_id.as_deref().ok_or_else(|| {
+            AppError::WorkflowInvalid(
+                "authorization obligation has no provider task binding".to_string(),
+            )
+        })?;
+        let checkpoint = self
+            .read_provider_checkpoint(task_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(
+                    "provider checkpoint has no pending authorization evidence".to_string(),
+                )
+            })?;
+        if checkpoint.generation > 0
+            && checkpoint.checkpoint_hash != checkpoint_hash(&checkpoint).map_err(map_db)?
+        {
+            return Err(AppError::WorkflowInvalid(
+                "provider checkpoint authorization hash mismatch".to_string(),
+            ));
+        }
+        let provider_pending = checkpoint.authorization_pending.ok_or_else(|| {
+            AppError::WorkflowInvalid(
+                "provider checkpoint has no pending authorization request".to_string(),
+            )
+        })?;
+        if provider_pending.work_item_id != pending.work_item_id
+            || provider_pending.request_digest != pending.request_digest
+            || provider_pending.request != pending.request
+        {
+            return Err(AppError::WorkflowInvalid(
+                "provider checkpoint pending authorization evidence mismatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn plan_pending_for_provider_action(
         &self,
         item: &mut WorkItem,
         checkpoint_owner_id: Uuid,
         plan: &mut ProviderActionPlan,
     ) -> Result<(), AppError> {
+        ensure_state_invocation(item);
         if let Some(workflow) = self.workflows.get(&item.workflow_id).cloned() {
             return self
                 .plan_legacy_step(item, &workflow, checkpoint_owner_id, plan)
@@ -3596,6 +4296,8 @@ impl OrchestrationService {
             ]));
             runtime.permissions.can_access_network = true;
             runtime.permissions.can_write_workspace = false;
+            add_triage_repository_mounts(&mut runtime, self.discovered_repos.as_slice())
+                .map_err(AppError::WorkflowInvalid)?;
             let valid_next_events = self.projected_valid_next_events_for_job_context(item);
             project_workflow_inputs_into_job_context(
                 &mut job.context,
@@ -3614,6 +4316,12 @@ impl OrchestrationService {
                 &item.context,
                 self.force_gateway_approval_mode,
             );
+            self.project_resolved_authorization(
+                &mut job,
+                item,
+                protocol::ReactiveStateKind::Agent,
+                checkpoint_owner_id,
+            )?;
             plan.job_inserts.push(ProviderActionJobInsert {
                 job,
                 runtime,
@@ -3802,7 +4510,7 @@ impl OrchestrationService {
         if matches!(event, WorkflowEventKind::HumanApproved) {
             clear_success_projection_fields(item);
         }
-        item.current_step = transition.target.clone();
+        enter_workflow_state(item, &transition.target);
         self.plan_reactive_current_state(item, checkpoint_owner_id, plan)
             .await
     }
@@ -3842,6 +4550,27 @@ impl OrchestrationService {
                     item.human_gate = true;
                     if item.human_gate_state.is_none() {
                         item.human_gate_state = Some("awaiting_human_action".to_string());
+                    }
+                    if item.context.get("proposed_authorization_epoch").is_none() {
+                        start_authorization_epoch(item);
+                    }
+                    let requests = self.propose_authorization_epoch_from_states(
+                        item,
+                        &reactive,
+                        state.on.iter().map(|transition| transition.target.clone()),
+                        checkpoint_owner_id,
+                    )?;
+                    if let Some(context) = item.context.as_object_mut() {
+                        if requests.is_empty() {
+                            context.remove("proposed_authorization_epoch");
+                        } else {
+                            context.insert(
+                                "proposed_authorization_epoch".to_string(),
+                                serde_json::to_value(requests).map_err(|error| {
+                                    AppError::WorkflowInvalid(error.to_string())
+                                })?,
+                            );
+                        }
                     }
                     return Ok(());
                 }
@@ -3900,7 +4629,7 @@ impl OrchestrationService {
                                 state.id
                             ))
                         })?;
-                    item.current_step = transition.target.clone();
+                    enter_workflow_state(item, &transition.target);
                 }
                 protocol::ReactiveStateKind::Agent
                 | protocol::ReactiveStateKind::Command
@@ -3914,7 +4643,18 @@ impl OrchestrationService {
                         item.state = WorkItemState::Running;
                         return Ok(());
                     }
-                    let job = self.build_reactive_job_for_provider_action(item, state)?;
+                    let job = self.build_reactive_job_for_provider_action(
+                        item,
+                        state,
+                        checkpoint_owner_id,
+                    )?;
+                    if !self
+                        .plan_authorized_job(item, &job, checkpoint_owner_id, plan)
+                        .await?
+                    {
+                        item.state = WorkItemState::Running;
+                        return Ok(());
+                    }
                     let runtime = canonical_runtime_spec_for_job_effective(&job);
                     plan.job_inserts.push(ProviderActionJobInsert {
                         job,
@@ -3932,6 +4672,7 @@ impl OrchestrationService {
         &self,
         item: &WorkItem,
         state: &protocol::ReactiveWorkflowState,
+        checkpoint_owner_id: Uuid,
     ) -> Result<Job, AppError> {
         let prompt_context = interpolation_context_for_work_item(item, &state.id);
         let prompt = state
@@ -4057,7 +4798,236 @@ impl OrchestrationService {
             &item.context,
             self.force_gateway_approval_mode,
         );
+        self.project_resolved_authorization(&mut job, item, state.kind(), checkpoint_owner_id)?;
         Ok(job)
+    }
+
+    async fn plan_authorized_job(
+        &self,
+        item: &mut WorkItem,
+        job: &Job,
+        checkpoint_owner_id: Uuid,
+        plan: &mut ProviderActionPlan,
+    ) -> Result<bool, AppError> {
+        let request =
+            protocol::authorization_request_from_job_context(&job.context).ok_or_else(|| {
+                AppError::WorkflowInvalid(format!("job {} has no authorization request", job.id))
+            })?;
+        let matches_proposed_epoch = item
+            .context
+            .get("proposed_authorization_epoch")
+            .cloned()
+            .map(serde_json::from_value::<Vec<ResolvedAuthorizationRequest>>)
+            .transpose()
+            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?
+            .unwrap_or_default()
+            .into_iter()
+            .any(|baseline| {
+                request.behavior_matches(&baseline) && request.permissions_are_subset_of(&baseline)
+            });
+        if matches_proposed_epoch {
+            return Ok(true);
+        }
+        if self
+            .authorization_request_is_authorized(job, &request, checkpoint_owner_id)
+            .await
+            .map_err(map_db)?
+        {
+            return Ok(true);
+        }
+        let root = if item.id == checkpoint_owner_id {
+            item.clone()
+        } else {
+            self.checkpoint_owner_for_work_item(item.id)
+                .await
+                .map_err(map_db)?
+        };
+        let (obligation, pending) =
+            build_authorization_obligation(&root, item, job, &request).map_err(map_db)?;
+        plan.obligation_inserts.push(obligation);
+        plan.authorization_pending = Some(pending.clone());
+        if item.id != root.id {
+            if !item.context.is_object() {
+                item.context = serde_json::json!({});
+            }
+            item.context["authorization_pending"] = serde_json::to_value(&pending)
+                .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+            item.human_gate = true;
+            item.human_gate_state = Some("authorization_pending".to_string());
+            item.projected_state = Some("authorization_pending".to_string());
+        }
+        Ok(false)
+    }
+
+    fn project_resolved_authorization(
+        &self,
+        job: &mut Job,
+        item: &WorkItem,
+        state_kind: protocol::ReactiveStateKind,
+        checkpoint_owner_id: Uuid,
+    ) -> Result<(), AppError> {
+        if job.execution_mode != protocol::ExecutionMode::Docker {
+            return Err(AppError::WorkflowInvalid(
+                "raw and legacy execution has no durable authorization support".to_string(),
+            ));
+        }
+        let execution_kind = job
+            .context
+            .get(CONTEXT_WORKFLOW_KEY)
+            .and_then(|workflow| workflow.get(CONTEXT_JOB_EXECUTION_KIND_KEY))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("command")
+            .to_string();
+        let runner_profile = match execution_kind.as_str() {
+            "agent" => self
+                .runner_profiles
+                .resolve_agent_profile(
+                    job.context
+                        .get("environment_runtime")
+                        .and_then(serde_json::Value::as_str),
+                )
+                .map_err(AppError::WorkflowInvalid)
+                .and_then(|profile| {
+                    serde_json::to_value(profile)
+                        .map_err(|error| AppError::WorkflowInvalid(error.to_string()))
+                })?,
+            "managed" => self
+                .runner_profiles
+                .resolve_managed_profile(
+                    job.context
+                        .get(CONTEXT_WORKFLOW_KEY)
+                        .and_then(|workflow| workflow.get(CONTEXT_MANAGED_OPERATION_KEY))
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            AppError::WorkflowInvalid(
+                                "managed job has no operation binding".to_string(),
+                            )
+                        })?,
+                )
+                .map_err(AppError::WorkflowInvalid)
+                .and_then(|profile| {
+                    serde_json::to_value(profile)
+                        .map_err(|error| AppError::WorkflowInvalid(error.to_string()))
+                })?,
+            "command" => {
+                serde_json::json!({"profile_name":"command", "config_digest":"command_v1"})
+            }
+            other => {
+                return Err(AppError::WorkflowInvalid(format!(
+                    "unsupported job execution kind '{other}'"
+                )));
+            }
+        };
+        let mut runtime = canonical_runtime_spec_for_job_effective(job);
+        if let Ok(profile) = serde_json::from_value::<agent_hub_config::ResolvedRunnerProfile>(
+            runner_profile.clone(),
+        ) {
+            if runtime.environment.container_image.is_none() {
+                runtime.environment.container_image = profile.container_image.clone();
+            }
+            runtime
+                .environment
+                .file_mounts
+                .extend(profile.file_mounts.into_iter().map(|mount| {
+                    protocol::orchestration::PlannedFileMount {
+                        host_path: mount.host_path,
+                        container_path: mount.container_path,
+                        read_only: mount.read_only,
+                    }
+                }));
+        }
+        if runtime.environment.container_image.is_none() {
+            return Err(AppError::WorkflowInvalid(format!(
+                "authorized Docker job '{}' has no resolved container image",
+                job.step_id
+            )));
+        }
+        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+        job.container_image = runtime.environment.container_image.clone();
+        let workflow_snapshot = if item.workflow_id == TRIAGE_WORKFLOW_ID {
+            serde_json::json!({"schema":"special_triage_v1", "state":"triage"})
+        } else {
+            serde_json::to_value(self.workflows.get_reactive(&item.workflow_id).ok_or_else(
+                || {
+                    AppError::WorkflowInvalid(format!(
+                        "workflow '{}' is not reactive",
+                        item.workflow_id
+                    ))
+                },
+            )?)
+            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?
+        };
+        let invocation_id = current_state_invocation_id(item).ok_or_else(|| {
+            AppError::WorkflowInvalid(format!(
+                "state '{}' has no logical invocation identity",
+                item.current_step
+            ))
+        })?;
+        let primary_repo_branch = job.repo.as_ref().map(|repo| {
+            repo.branch_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|branch| !branch.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| protocol::authorized_default_branch(item.id, invocation_id))
+        });
+        let request = ResolvedAuthorizationRequest {
+            version: AUTHORIZATION_REQUEST_VERSION.to_string(),
+            invocation_id,
+            work_unit_id: item.id,
+            root_work_item_id: checkpoint_owner_id,
+            workflow_id: item.workflow_id.clone(),
+            workflow_snapshot,
+            state_id: job.step_id.clone(),
+            state_kind,
+            behavior: ResolvedAuthorizationBehavior {
+                execution_kind,
+                runner_profile,
+                command: job.command.clone(),
+                args: job.args.clone(),
+                env: job.env.clone().into_iter().collect(),
+                prompt: job.prompt.clone(),
+                primary_repo: job.repo.clone(),
+                primary_repo_branch,
+                execution_context: protocol::authorization_execution_context(&job.context),
+                triage: item.workflow_id == TRIAGE_WORKFLOW_ID,
+                allow_remote_credentials: item.workflow_id != TRIAGE_WORKFLOW_ID,
+            },
+            permission_envelope: runtime,
+            resolved_environment: serde_json::json!({
+                "base": job.context.get("environment_base"),
+                "definition": job
+                    .context
+                    .get("environment_base")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|name| self.environment_snapshots.get(name)),
+                "selection": job.context.get("environment"),
+                "overlays": job.context.get("overlays"),
+                "approval_mode": job.context.get("approval_mode"),
+            }),
+            provider: ResolvedAuthorizationProvider {
+                provider: item.external_task_source.clone(),
+                task_id: item.external_task_id.clone(),
+            },
+            resource_constraints: ResolvedAuthorizationResources {
+                timeout_secs: job.timeout_secs,
+                max_retries: job.max_retries,
+            },
+        };
+        let digest = request
+            .request_digest()
+            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+        let authorization_id = format!(
+            "{}:{}:{}:{}:{}",
+            checkpoint_owner_id, item.id, job.step_id, request.invocation_id, digest
+        );
+        project_authorization_request_into_job_context(
+            &mut job.context,
+            &authorization_id,
+            &request,
+        )
+        .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+        Ok(())
     }
 
     async fn plan_provider_cancel_descendants(
@@ -4183,6 +5153,9 @@ impl OrchestrationService {
                     work_item_updates,
                     work_item_inserts: Vec::new(),
                     job_inserts: Vec::new(),
+                    baseline_inserts: Vec::new(),
+                    obligation_approvals: Vec::new(),
+                    obligation_inserts: Vec::new(),
                     cancel_active_work_item_ids: Vec::new(),
                     cancel_unreleased_checkpoint_owner_ids: if cancel_unreleased {
                         vec![root_id]
@@ -4540,6 +5513,18 @@ impl OrchestrationService {
             human_owner_provider_id: remembered_human_owner_provider_id(item),
             human_owners: item.remembered_human_owners.clone(),
             dispatch_job_ids: Vec::new(),
+            dispatch_authorizations: BTreeMap::new(),
+            authorization_pending: item
+                .context
+                .get("authorization_pending")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
+            proposed_authorizations: item
+                .context
+                .get("proposed_authorization_epoch")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
             generation: 0,
             checkpoint_hash: String::new(),
             semantic_hash: String::new(),
@@ -4640,6 +5625,7 @@ impl OrchestrationService {
         let provider_checkpoint = self.read_provider_checkpoint(&task_id).await?;
         let staged_job_ids = self.staged_job_ids(owner.id).await?;
         let has_staged_jobs = !staged_job_ids.is_empty();
+        let staged_authorizations = self.authorization_digests_for_jobs(&staged_job_ids).await?;
         let mut authorized_job_ids = provider_checkpoint
             .as_ref()
             .map(|checkpoint| checkpoint.dispatch_job_ids.clone())
@@ -4658,6 +5644,13 @@ impl OrchestrationService {
         let committed_outbox = self.get_checkpoint_outbox(owner.id).await?;
         let mut checkpoint = self.checkpoint_from_work_item(owner);
         checkpoint.dispatch_job_ids = authorized_job_ids;
+        checkpoint.dispatch_authorizations = provider_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.dispatch_authorizations.clone())
+            .unwrap_or_default();
+        checkpoint
+            .dispatch_authorizations
+            .extend(staged_authorizations);
         checkpoint.semantic_hash = checkpoint_semantic_hash(&checkpoint)?;
         if !has_staged_jobs
             && provider_checkpoint.as_ref().is_some_and(|provider| {
@@ -4772,6 +5765,30 @@ impl OrchestrationService {
                 Uuid::parse_str(&row?).map_err(|error| anyhow::anyhow!(error.to_string()))
             })
             .collect()
+        })
+        .await?
+    }
+
+    async fn authorization_digests_for_jobs(
+        &self,
+        job_ids: &[Uuid],
+    ) -> anyhow::Result<BTreeMap<Uuid, String>> {
+        let path = Arc::clone(&self.db_path);
+        let job_ids = job_ids.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<BTreeMap<Uuid, String>> {
+            let conn = Connection::open(path.as_path())?;
+            let mut result = BTreeMap::new();
+            for job_id in job_ids {
+                let digest = conn
+                    .query_row(
+                        "SELECT request_digest FROM jobs WHERE id = ?1",
+                        [job_id.to_string()],
+                        |row| row.get::<_, Option<String>>(0),
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("job {job_id} has no request digest"))?;
+                result.insert(job_id, digest);
+            }
+            Ok(result)
         })
         .await?
     }
@@ -4976,6 +5993,7 @@ impl OrchestrationService {
         self.release_provider_authorized_jobs(
             owner.id,
             &provider.dispatch_job_ids,
+            &provider.dispatch_authorizations,
             CheckpointReconciliationMode::Ordinary,
         )
         .await?;
@@ -4992,7 +6010,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut conn = Connection::open(path.as_path())?;
             let tx = conn.transaction()?;
-            release_jobs_in_transaction(&tx, root_id, &checkpoint.dispatch_job_ids, true)?;
+            release_jobs_in_transaction(&tx, root_id, &checkpoint.dispatch_job_ids, &checkpoint.dispatch_authorizations, true)?;
             tx.execute(
                 "INSERT INTO checkpoint_outbox (root_work_item_id, generation, checkpoint_hash, checkpoint_json, state, last_error, ownership_return_pending, human_owner, projection_pending, updated_at) VALUES (?1, ?2, ?3, ?4, 'committed', NULL, 0, ?5, 1, ?6)
                  ON CONFLICT(root_work_item_id) DO UPDATE SET generation = excluded.generation, checkpoint_hash = excluded.checkpoint_hash, checkpoint_json = excluded.checkpoint_json, state = 'committed', last_error = NULL, ownership_return_pending = 0, human_owner = excluded.human_owner, projection_pending = 1, updated_at = excluded.updated_at",
@@ -5021,7 +6039,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut conn = Connection::open(path.as_path())?;
             let tx = conn.transaction()?;
-            release_jobs_in_transaction(&tx, root_id, &checkpoint.dispatch_job_ids, true)?;
+            release_jobs_in_transaction(&tx, root_id, &checkpoint.dispatch_job_ids, &checkpoint.dispatch_authorizations, true)?;
             let updated = tx.execute(
                 "UPDATE checkpoint_outbox SET state = 'committed', last_error = NULL, ownership_return_pending = 0, projection_pending = 1, updated_at = ?4 WHERE root_work_item_id = ?1 AND generation = ?2 AND checkpoint_hash = ?3",
                 params![
@@ -5054,10 +6072,17 @@ impl OrchestrationService {
         }
         let path = Arc::clone(&self.db_path);
         let job_ids = job_ids.to_vec();
+        let authorization_digests = self.authorization_digests_for_jobs(&job_ids).await?;
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut conn = Connection::open(path.as_path())?;
             let tx = conn.transaction()?;
-            release_jobs_in_transaction(&tx, checkpoint_owner_id, &job_ids, true)?;
+            release_jobs_in_transaction(
+                &tx,
+                checkpoint_owner_id,
+                &job_ids,
+                &authorization_digests,
+                true,
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -5068,6 +6093,7 @@ impl OrchestrationService {
         &self,
         checkpoint_owner_id: Uuid,
         job_ids: &[Uuid],
+        authorization_digests: &BTreeMap<Uuid, String>,
         mode: CheckpointReconciliationMode,
     ) -> anyhow::Result<()> {
         if job_ids.is_empty() {
@@ -5075,6 +6101,7 @@ impl OrchestrationService {
         }
         let path = Arc::clone(&self.db_path);
         let job_ids = job_ids.to_vec();
+        let authorization_digests = authorization_digests.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut conn = Connection::open(path.as_path())?;
             let tx = conn.transaction()?;
@@ -5082,6 +6109,7 @@ impl OrchestrationService {
                 &tx,
                 checkpoint_owner_id,
                 &job_ids,
+                &authorization_digests,
                 mode == CheckpointReconciliationMode::Ordinary,
             )?;
             tx.commit()?;
@@ -5865,6 +6893,10 @@ impl OrchestrationService {
         // Failed is intentionally not treated as terminal here: trusted/internal callers may still
         // drive retry-oriented progression semantics from that state.
 
+        if item.context.get("authorization_pending").is_some() {
+            return vec![WorkflowEventKind::HumanApproved, WorkflowEventKind::Cancel];
+        }
+
         if item.workflow_id == "__triage__" {
             return triage_valid_next_events(item);
         }
@@ -5961,7 +6993,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = Connection::open(path.as_path())?;
             let count = conn.execute(
-                "UPDATE jobs SET state = ?1, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE assigned_worker_id = ?3 AND state IN (?4, ?5)",
+                "UPDATE jobs SET state = ?1, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE assigned_worker_id = ?3 AND state IN (?4, ?5) AND EXISTS (SELECT 1 FROM authorization_records ar WHERE ar.authorization_id = jobs.authorization_id AND ar.request_digest = jobs.request_digest AND ar.work_item_id = jobs.work_item_id AND ar.checkpoint_owner_id = jobs.checkpoint_owner_id AND ar.invocation_id = json_extract(jobs.context_json, '$.resolved_authorization_request.invocation_id'))",
                 params![
                     JobState::Pending.to_string(),
                     Utc::now().to_rfc3339(),
@@ -5981,7 +7013,7 @@ impl OrchestrationService {
             let conn = Connection::open(path.as_path())?;
             let now = Utc::now().to_rfc3339();
             let count = conn.execute(
-                "UPDATE jobs SET state = ?1, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE state IN (?3, ?4) AND lease_expires_at IS NOT NULL AND lease_expires_at < ?5",
+                "UPDATE jobs SET state = ?1, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE state IN (?3, ?4) AND lease_expires_at IS NOT NULL AND lease_expires_at < ?5 AND EXISTS (SELECT 1 FROM authorization_records ar WHERE ar.authorization_id = jobs.authorization_id AND ar.request_digest = jobs.request_digest AND ar.work_item_id = jobs.work_item_id AND ar.checkpoint_owner_id = jobs.checkpoint_owner_id AND ar.invocation_id = json_extract(jobs.context_json, '$.resolved_authorization_request.invocation_id'))",
                 params![
                     JobState::Pending.to_string(),
                     now,
@@ -6038,14 +7070,35 @@ impl OrchestrationService {
                         if let Some(obj) = item.context.as_object_mut() {
                             obj.insert(
                                 "workflow_id".to_string(),
-                                serde_json::Value::String(workflow_id),
+                                serde_json::Value::String(workflow_id.clone()),
                             );
                         }
-                        item.current_step = "await_triage_approval".to_string();
-                        item.human_gate = true;
-                        item.human_gate_state = Some("triage_completed".to_string());
-                        item.state = WorkItemState::Running;
-                        item.triage_status = Some("pending_approval".to_string());
+                        match self
+                            .propose_initial_authorization_epoch(&mut item, &workflow_id)
+                            .await
+                        {
+                            Ok(requests) => {
+                                if let Some(context) = item.context.as_object_mut() {
+                                    context.insert(
+                                        "proposed_authorization_epoch".to_string(),
+                                        serde_json::to_value(requests).map_err(|error| {
+                                            AppError::WorkflowInvalid(error.to_string())
+                                        })?,
+                                    );
+                                }
+                                item.current_step = "await_triage_approval".to_string();
+                                item.human_gate = true;
+                                item.human_gate_state = Some("triage_completed".to_string());
+                                item.state = WorkItemState::Running;
+                                item.triage_status = Some("pending_approval".to_string());
+                            }
+                            Err(error) => {
+                                self.reject_triage_result_with_reason(
+                                    &mut item,
+                                    format!("triage authorization proposal failed: {error}"),
+                                );
+                            }
+                        }
                     } else {
                         self.reject_triage_result_with_reason(
                             &mut item,
@@ -6106,7 +7159,16 @@ impl OrchestrationService {
                     // Cancelled jobs currently collapse onto the reactive failure lane; reactive
                     // transition tables only distinguish job success vs non-success in this MVP.
                     if job.state == JobState::Failed && job.attempt < job.max_retries {
-                        self.retry_job(job).await.map_err(map_db)?;
+                        if !self.retry_job(job, &mut item).await.map_err(map_db)? {
+                            item.updated_at = Utc::now();
+                            item.blocked_on = block_reason_for_state_name(&item.current_step);
+                            item.projected_state = Some(project_workflow_state(&item));
+                            self.update_work_item(&item).await.map_err(map_db)?;
+                            self.persist_task_projection(&item, None)
+                                .await
+                                .map_err(map_config)?;
+                            return Ok(());
+                        }
                         item.state = WorkItemState::Running;
                         item.updated_at = Utc::now();
                         item.blocked_on = block_reason_for_state_name(&item.current_step);
@@ -6176,7 +7238,16 @@ impl OrchestrationService {
             }
             JobState::Failed | JobState::Cancelled => {
                 if job.state == JobState::Failed && job.attempt < job.max_retries {
-                    self.retry_job(job).await.map_err(map_db)?;
+                    if !self.retry_job(job, &mut item).await.map_err(map_db)? {
+                        item.updated_at = Utc::now();
+                        item.blocked_on = block_reason_for_state_name(&item.current_step);
+                        item.projected_state = Some(project_workflow_state(&item));
+                        self.update_work_item(&item).await.map_err(map_db)?;
+                        self.persist_task_projection(&item, None)
+                            .await
+                            .map_err(map_config)?;
+                        return Ok(());
+                    }
                     item.state = WorkItemState::Running;
                     item.updated_at = Utc::now();
                     item.blocked_on = block_reason_for_state_name(&item.current_step);
@@ -6211,6 +7282,7 @@ impl OrchestrationService {
     }
 
     async fn ensure_pending_for_current_state(&self, item: &mut WorkItem) -> anyhow::Result<bool> {
+        ensure_state_invocation(item);
         if let Some(workflow) = self.workflows.get(&item.workflow_id) {
             self.ensure_pending_job_for_step(item, workflow).await?;
             return Ok(true);
@@ -6254,6 +7326,29 @@ impl OrchestrationService {
                     if item.human_gate_state.is_none() {
                         item.human_gate_state = Some("awaiting_human_action".to_string());
                     }
+                    if item.context.get("proposed_authorization_epoch").is_none() {
+                        start_authorization_epoch(item);
+                    }
+                    let checkpoint_owner_id =
+                        self.checkpoint_owner_for_work_item(item.id).await?.id;
+                    let requests = self
+                        .propose_authorization_epoch_from_states(
+                            item,
+                            reactive,
+                            state.on.iter().map(|transition| transition.target.clone()),
+                            checkpoint_owner_id,
+                        )
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    if let Some(context) = item.context.as_object_mut() {
+                        if requests.is_empty() {
+                            context.remove("proposed_authorization_epoch");
+                        } else {
+                            context.insert(
+                                "proposed_authorization_epoch".to_string(),
+                                serde_json::to_value(requests)?,
+                            );
+                        }
+                    }
                     break;
                 }
                 protocol::ReactiveStateKind::Auto => {
@@ -6270,11 +7365,22 @@ impl OrchestrationService {
                     };
                     if let Some(child_workflow_id) = child_workflow_id {
                         if item.child_work_item_id.is_none() {
+                            let parent_invocation_id = current_state_invocation_id(item)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("child state has no invocation identity")
+                                })?;
                             if let Some(existing_child) = self
                                 .select_children_for_parent_step(item.id, &state.id)
                                 .await?
                                 .into_iter()
-                                .next()
+                                .find(|child| {
+                                    child
+                                        .context
+                                        .get("parent_invocation_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .and_then(|value| Uuid::parse_str(value).ok())
+                                        == Some(parent_invocation_id)
+                                })
                             {
                                 item.child_work_item_id = Some(existing_child.id);
                                 item.state = WorkItemState::Running;
@@ -6299,7 +7405,10 @@ impl OrchestrationService {
                                     ));
                                 };
                             let now = Utc::now();
-                            let child_id = Uuid::new_v4();
+                            let child_id = deterministic_child_work_item_id(
+                                parent_invocation_id,
+                                &child_workflow_id,
+                            );
                             let mut child = WorkItem {
                                 id: child_id,
                                 workflow_id: child_workflow_id,
@@ -6335,6 +7444,8 @@ impl OrchestrationService {
                                 checkpoint_comment_id: None,
                                 job_result_comment_ids: HashMap::new(),
                             };
+                            child.context["parent_invocation_id"] =
+                                serde_json::Value::String(parent_invocation_id.to_string());
                             self.insert_work_item(&child).await?;
                             item.child_work_item_id = Some(child_id);
                             item.state = WorkItemState::Running;
@@ -6342,6 +7453,16 @@ impl OrchestrationService {
                             self.update_work_item(item).await?;
                             self.persist_task_projection(&child, None).await?;
                             Box::pin(self.ensure_pending_for_current_state(&mut child)).await?;
+                            if let Some(stored_root) = self.get_work_item(item.id).await?
+                                && let Some(pending) =
+                                    stored_root.context.get("authorization_pending").cloned()
+                            {
+                                item.context["authorization_pending"] = pending;
+                                item.human_gate = true;
+                                item.human_gate_state = Some("authorization_pending".to_string());
+                                item.required_action_description =
+                                    stored_root.required_action_description;
+                            }
                         }
                         item.state = WorkItemState::Running;
                         break;
@@ -6505,7 +7626,31 @@ impl OrchestrationService {
                             &item.context,
                             self.force_gateway_approval_mode,
                         );
-                        self.insert_job(&job).await?;
+                        let checkpoint_owner_id =
+                            self.checkpoint_owner_for_work_item(item.id).await?.id;
+                        self.project_resolved_authorization(
+                            &mut job,
+                            item,
+                            state.kind(),
+                            checkpoint_owner_id,
+                        )
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                        if !self
+                            .authorize_or_stage_job(item, &job, checkpoint_owner_id)
+                            .await?
+                        {
+                            created_job = false;
+                            break;
+                        }
+                        item.state = WorkItemState::Running;
+                        item.updated_at = Utc::now();
+                        item.projected_state = Some(project_workflow_state(item));
+                        self.commit_ordinary_job_boundary(
+                            std::slice::from_ref(item),
+                            &job,
+                            checkpoint_owner_id,
+                        )
+                        .await?;
                         created_job = true;
                     }
                     item.state = WorkItemState::Running;
@@ -6522,6 +7667,7 @@ impl OrchestrationService {
     }
 
     async fn ensure_pending_triage_job(&self, item: &mut WorkItem) -> anyhow::Result<bool> {
+        ensure_state_invocation(item);
         if item.state != WorkItemState::Pending {
             return Ok(false);
         }
@@ -6563,6 +7709,8 @@ impl OrchestrationService {
             ]));
         runtime.permissions.can_access_network = true;
         runtime.permissions.can_write_workspace = false;
+        add_triage_repository_mounts(&mut runtime, self.discovered_repos.as_slice())
+            .map_err(anyhow::Error::msg)?;
         let valid_next_events = self.projected_valid_next_events_for_job_context(item);
         project_workflow_inputs_into_job_context(
             &mut job.context,
@@ -6581,10 +7729,19 @@ impl OrchestrationService {
             &item.context,
             self.force_gateway_approval_mode,
         );
-        self.insert_job(&job).await?;
+        let checkpoint_owner_id = self.checkpoint_owner_for_work_item(item.id).await?.id;
+        self.project_resolved_authorization(
+            &mut job,
+            item,
+            protocol::ReactiveStateKind::Agent,
+            checkpoint_owner_id,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         item.triage_status = Some("in_progress".to_string());
         item.updated_at = Utc::now();
-        self.update_work_item(item).await?;
+        item.projected_state = Some(project_workflow_state(item));
+        self.commit_ordinary_job_boundary(std::slice::from_ref(item), &job, checkpoint_owner_id)
+            .await?;
         Ok(true)
     }
 
@@ -6707,7 +7864,7 @@ impl OrchestrationService {
         ) {
             clear_success_projection_fields(item);
         }
-        item.current_step = transition.target.clone();
+        enter_workflow_state(item, &transition.target);
         self.ensure_pending_for_current_state(item)
             .await
             .map_err(map_db)?;
@@ -6770,6 +7927,17 @@ impl OrchestrationService {
                 WorkflowEventKind::AllChildrenCompleted
             };
             Box::pin(self.fire_reactive_event(&mut parent, event)).await?;
+            if let Some(stored_root) = self.get_work_item(parent.id).await.map_err(map_db)?
+                && let Some(pending) = stored_root.context.get("authorization_pending").cloned()
+            {
+                if !parent.context.is_object() {
+                    parent.context = serde_json::json!({});
+                }
+                parent.context["authorization_pending"] = pending;
+                parent.human_gate = true;
+                parent.human_gate_state = Some("authorization_pending".to_string());
+                parent.required_action_description = stored_root.required_action_description;
+            }
             parent.updated_at = Utc::now();
             parent.blocked_on = block_reason_for_state_name(&parent.current_step);
             parent.projected_state = Some(project_workflow_state(&parent));
@@ -6845,7 +8013,16 @@ impl OrchestrationService {
         Ok(())
     }
 
-    async fn retry_job(&self, previous: &Job) -> anyhow::Result<()> {
+    async fn retry_job(&self, previous: &Job, item: &mut WorkItem) -> anyhow::Result<bool> {
+        let workflow = self
+            .workflows
+            .get_reactive(&item.workflow_id)
+            .ok_or_else(|| anyhow::anyhow!("legacy workflow retries are not authorized"))?;
+        let state = workflow
+            .states
+            .iter()
+            .find(|state| state.id == previous.step_id)
+            .ok_or_else(|| anyhow::anyhow!("retry state '{}' is missing", previous.step_id))?;
         let mut next = previous.clone();
         next.id = Uuid::new_v4();
         next.state = JobState::Pending;
@@ -6856,16 +8033,141 @@ impl OrchestrationService {
         next.attempt = previous.attempt.saturating_add(1);
         next.created_at = Utc::now();
         next.updated_at = next.created_at;
-        if let Some(item) = self.get_work_item(previous.work_item_id).await? {
-            let valid_next_events = self.projected_valid_next_events_for_job_context(&item);
-            project_workflow_inputs_into_job_context(
-                &mut next.context,
-                &valid_next_events,
-                &item,
-                &item.context,
-            );
+        let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+        project_workflow_inputs_into_job_context(
+            &mut next.context,
+            &valid_next_events,
+            item,
+            &item.context,
+        );
+        let checkpoint_owner_id = self.checkpoint_owner_for_work_item(item.id).await?.id;
+        self.project_resolved_authorization(&mut next, item, state.kind(), checkpoint_owner_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !self
+            .authorize_or_stage_job(item, &next, checkpoint_owner_id)
+            .await?
+        {
+            return Ok(false);
         }
-        self.insert_job(&next).await
+        item.state = WorkItemState::Running;
+        item.updated_at = Utc::now();
+        item.projected_state = Some(project_workflow_state(item));
+        self.commit_ordinary_job_boundary(std::slice::from_ref(item), &next, checkpoint_owner_id)
+            .await?;
+        Ok(true)
+    }
+
+    async fn authorize_or_stage_job(
+        &self,
+        item: &mut WorkItem,
+        job: &Job,
+        checkpoint_owner_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let request = protocol::authorization_request_from_job_context(&job.context)
+            .ok_or_else(|| anyhow::anyhow!("job {} has no authorization request", job.id))?;
+        if self
+            .authorization_request_is_authorized(job, &request, checkpoint_owner_id)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        let mut root = if item.id == checkpoint_owner_id {
+            item.clone()
+        } else {
+            self.checkpoint_owner_for_work_item(item.id).await?
+        };
+        let (obligation, pending) = build_authorization_obligation(&root, item, job, &request)?;
+        mark_authorization_pending(&mut root, pending.clone())?;
+        let mut logical_item = item.clone();
+        if logical_item.id != root.id {
+            logical_item.context["authorization_pending"] = serde_json::to_value(&pending)?;
+            logical_item.human_gate = true;
+            logical_item.human_gate_state = Some("authorization_pending".to_string());
+            logical_item.projected_state = Some("authorization_pending".to_string());
+        }
+        let path = Arc::clone(&self.db_path);
+        let root_for_store = root.clone();
+        let logical_for_store = (logical_item.id != root.id).then_some(logical_item.clone());
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            stage_authorization_obligation(
+                &mut conn,
+                &root_for_store,
+                logical_for_store.as_ref(),
+                &obligation,
+            )
+        })
+        .await??;
+        *item = if item.id == root.id {
+            root
+        } else {
+            logical_item
+        };
+        Ok(false)
+    }
+
+    async fn authorization_request_is_authorized(
+        &self,
+        job: &Job,
+        request: &ResolvedAuthorizationRequest,
+        checkpoint_owner_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let path = Arc::clone(&self.db_path);
+        let state_id = request.state_id.clone();
+        let work_item_id = request.work_unit_id;
+        let request_for_check = request.clone();
+        let authorization_id = job
+            .context
+            .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let request_digest = request.request_digest()?;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = Connection::open(path.as_path())?;
+            if let Some(authorization_id) = authorization_id {
+                let request_json = serde_json::to_string(&request_for_check.clone().normalize())?;
+                let exact_record = conn
+                    .query_row(
+                        "SELECT 1 FROM authorization_records WHERE authorization_id = ?1 AND request_digest = ?2 AND request_json = ?3 AND work_item_id = ?4 AND checkpoint_owner_id = ?5 AND invocation_id = ?6",
+                        params![
+                            authorization_id,
+                            request_digest,
+                            request_json,
+                            work_item_id.to_string(),
+                            checkpoint_owner_id.to_string(),
+                            request_for_check.invocation_id.to_string(),
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if exact_record {
+                    return Ok(true);
+                }
+            }
+            let mut stmt = conn.prepare(
+                "SELECT request_json FROM authorization_baselines WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND state_id = ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    checkpoint_owner_id.to_string(),
+                    work_item_id.to_string(),
+                    state_id,
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            for row in rows {
+                let baseline: ResolvedAuthorizationRequest = serde_json::from_str(&row?)?;
+                if request_for_check.behavior_matches(&baseline)
+                    && request_for_check.permissions_are_subset_of(&baseline)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await?
     }
 
     fn merge_job_output_into_context(&self, item: &mut WorkItem, job: &Job) -> Result<(), String> {
@@ -7585,9 +8887,12 @@ impl OrchestrationService {
         let runtime = canonical_runtime_spec_for_job_effective(&job);
         project_runtime_spec_into_job_context(&mut job.context, &runtime);
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = Connection::open(path.as_path())?;
-            conn.execute(
-                "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0)",
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction()?;
+            let (authorization_id, request_digest) =
+                insert_authorization_record(&tx, &job, checkpoint_owner_id)?;
+            tx.execute(
+                "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, authorization_id, request_digest, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 0)",
                 params![
                     job.id.to_string(),
                     job.work_item_id.to_string(),
@@ -7612,9 +8917,41 @@ impl OrchestrationService {
                     job.updated_at.to_rfc3339(),
                     serde_json::to_string(&runtime)?,
                     checkpoint_owner_id.to_string(),
+                    authorization_id,
+                    request_digest,
                 ],
             )?;
+            tx.commit()?;
             Ok(())
+        })
+        .await?
+    }
+
+    async fn commit_ordinary_job_boundary(
+        &self,
+        work_items: &[WorkItem],
+        job: &Job,
+        checkpoint_owner_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let mut job = job.clone();
+        let runtime = canonical_runtime_spec_for_job_effective(&job);
+        job.execution_mode = runtime.environment.execution_mode.clone();
+        job.container_image = runtime.environment.container_image.clone();
+        job.timeout_secs = runtime.environment.timeout_secs;
+        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+        let work_items = work_items.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            commit_ordinary_authorized_job(
+                &mut conn,
+                &work_items,
+                &ProviderActionJobInsert {
+                    job,
+                    runtime,
+                    checkpoint_owner_id,
+                },
+            )
         })
         .await?
     }
@@ -7742,6 +9079,7 @@ impl OrchestrationService {
             let rows = stmt.query_map([JobState::Pending.to_string()], row_to_job)?;
             for row in rows {
                 let mut job = row?;
+                verify_job_authorization(&conn, &job)?;
                 let runtime_environment = canonical_runtime_spec_for_job_effective(&job).environment;
                 if !supported_modes.contains(&runtime_environment.execution_mode) {
                     continue;
@@ -7960,6 +9298,96 @@ fn discovered_repo_catalog_entries(repos: &[DiscoveredRepo]) -> Vec<serde_json::
             })
         })
         .collect()
+}
+
+fn add_triage_repository_mounts(
+    runtime: &mut CanonicalRuntimeSpec,
+    repos: &[DiscoveredRepo],
+) -> Result<(), String> {
+    if let Some(repo) = repos.iter().find(|repo| {
+        repo.name.is_empty()
+            || repo.name == "."
+            || repo.name == ".."
+            || !repo.name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+    }) {
+        return Err(format!(
+            "repository '{}' has an unsafe triage mount name",
+            repo.name
+        ));
+    }
+    runtime
+        .environment
+        .file_mounts
+        .extend(
+            repos
+                .iter()
+                .map(|repo| protocol::orchestration::PlannedFileMount {
+                    host_path: repo.local_path.clone(),
+                    container_path: format!("/repos/{}", repo.name),
+                    read_only: true,
+                }),
+        );
+    Ok(())
+}
+
+fn build_authorization_obligation(
+    root: &WorkItem,
+    logical_item: &WorkItem,
+    job: &Job,
+    request: &ResolvedAuthorizationRequest,
+) -> anyhow::Result<(
+    AuthorizationObligationInsert,
+    CheckpointAuthorizationPending,
+)> {
+    if request.root_work_item_id != root.id || request.work_unit_id != logical_item.id {
+        anyhow::bail!("authorization obligation work-unit binding mismatch");
+    }
+    let digest = request.request_digest()?;
+    let request = request.clone().normalize();
+    let request_json = serde_json::to_string(&request)?;
+    let mut authoritative_job = job.clone();
+    authoritative_job.id = Uuid::new_v5(
+        &root.id,
+        format!("authorization-job:{}:{digest}", logical_item.id).as_bytes(),
+    );
+    authoritative_job.created_at = DateTime::<Utc>::UNIX_EPOCH;
+    authoritative_job.updated_at = DateTime::<Utc>::UNIX_EPOCH;
+    let pending = CheckpointAuthorizationPending {
+        work_item_id: logical_item.id,
+        request_digest: digest.clone(),
+        request: serde_json::to_value(request)?,
+    };
+    Ok((
+        AuthorizationObligationInsert {
+            checkpoint_owner_id: root.id,
+            work_item_id: logical_item.id,
+            request_digest: digest,
+            request_json,
+            job_json: serde_json::to_string(&authoritative_job)?,
+        },
+        pending,
+    ))
+}
+
+fn mark_authorization_pending(
+    root: &mut WorkItem,
+    pending: CheckpointAuthorizationPending,
+) -> anyhow::Result<()> {
+    if !root.context.is_object() {
+        root.context = serde_json::json!({});
+    }
+    root.context["authorization_pending"] = serde_json::to_value(pending)?;
+    root.human_gate = true;
+    root.human_gate_state = Some("authorization_pending".to_string());
+    root.required_action_description = Some(
+        "Review the immutable authorization request and reassign this task to Agent Hub to authorize this job."
+            .to_string(),
+    );
+    root.projected_state = Some("authorization_pending".to_string());
+    root.updated_at = Utc::now();
+    Ok(())
 }
 
 fn discovered_repo_catalog_hint(repos: &[DiscoveredRepo]) -> String {
@@ -8229,8 +9657,11 @@ fn child_work_item_for_provider_action(
     parent_step_id: String,
     now: DateTime<Utc>,
 ) -> WorkItem {
-    WorkItem {
-        id: Uuid::new_v4(),
+    let parent_invocation_id =
+        current_state_invocation_id(parent).expect("parent child state must have invocation id");
+    let id = deterministic_child_work_item_id(parent_invocation_id, &workflow_id);
+    let mut child = WorkItem {
+        id,
         workflow_id,
         external_task_id: None,
         external_task_source: None,
@@ -8263,7 +9694,17 @@ fn child_work_item_for_provider_action(
         status_comment_id: None,
         checkpoint_comment_id: None,
         job_result_comment_ids: HashMap::new(),
-    }
+    };
+    child.context["parent_invocation_id"] =
+        serde_json::Value::String(parent_invocation_id.to_string());
+    child
+}
+
+fn deterministic_child_work_item_id(parent_invocation_id: Uuid, workflow_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &parent_invocation_id,
+        format!("reactive-child:{workflow_id}").as_bytes(),
+    )
 }
 
 fn checkpoint_matches_known_workflow(
@@ -8317,6 +9758,11 @@ fn checkpoint_matches_known_workflow(
             .iter()
             .find(|state| state.id == checkpoint.current_step)
             .is_some_and(|state| {
+                if checkpoint.authorization_pending.is_some() {
+                    return checkpoint.human_gate
+                        && checkpoint.human_gate_state.as_deref() == Some("authorization_pending")
+                        && !matches!(state.kind(), protocol::ReactiveStateKind::Terminal);
+                }
                 let checkpoint_terminal =
                     matches!(checkpoint.phase.as_str(), "done" | "failed" | "cancelled");
                 let state_terminal = matches!(state.kind(), protocol::ReactiveStateKind::Terminal);
@@ -8809,6 +10255,99 @@ fn stamp_state_entered_if_changed(item: &mut WorkItem) {
         "state_entered_at".to_string(),
         serde_json::Value::String(Utc::now().to_rfc3339()),
     );
+}
+
+fn start_authorization_epoch(item: &mut WorkItem) {
+    if !item.context.is_object() {
+        item.context = serde_json::json!({});
+    }
+    item.context["authorization_epoch_id"] = serde_json::Value::String(Uuid::new_v4().to_string());
+    item.context["used_state_invocations"] = serde_json::Value::Array(Vec::new());
+}
+
+fn authorization_epoch_id(item: &mut WorkItem) -> Uuid {
+    if let Some(id) = item
+        .context
+        .get("authorization_epoch_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    {
+        return id;
+    }
+    start_authorization_epoch(item);
+    item.context["authorization_epoch_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .expect("authorization epoch id was inserted")
+}
+
+fn set_state_invocation(item: &mut WorkItem, state_id: &str, invocation_id: Uuid) {
+    if !item.context.is_object() {
+        item.context = serde_json::json!({});
+    }
+    item.context["state_invocation"] = serde_json::json!({
+        "state_id": state_id,
+        "id": invocation_id,
+    });
+}
+
+fn proposed_state_invocation_id(item: &mut WorkItem, state_id: &str) -> Uuid {
+    let epoch_id = authorization_epoch_id(item);
+    Uuid::new_v5(
+        &epoch_id,
+        format!("state:{}:{state_id}", item.id).as_bytes(),
+    )
+}
+
+fn set_proposed_state_invocation(item: &mut WorkItem, state_id: &str) -> Uuid {
+    let invocation_id = proposed_state_invocation_id(item, state_id);
+    set_state_invocation(item, state_id, invocation_id);
+    invocation_id
+}
+
+fn current_state_invocation_id(item: &WorkItem) -> Option<Uuid> {
+    let invocation = item.context.get("state_invocation")?;
+    if invocation
+        .get("state_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(item.current_step.as_str())
+    {
+        return None;
+    }
+    invocation
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn ensure_state_invocation(item: &mut WorkItem) -> Uuid {
+    if let Some(invocation_id) = current_state_invocation_id(item) {
+        return invocation_id;
+    }
+    let state_id = item.current_step.clone();
+    enter_workflow_state(item, &state_id)
+}
+
+fn enter_workflow_state(item: &mut WorkItem, state_id: &str) -> Uuid {
+    let proposed = proposed_state_invocation_id(item, state_id);
+    let proposed_string = proposed.to_string();
+    let used = item
+        .context
+        .get("used_state_invocations")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(proposed_string.as_str()))
+        });
+    let invocation_id = if used { Uuid::new_v4() } else { proposed };
+    item.current_step = state_id.to_string();
+    set_state_invocation(item, state_id, invocation_id);
+    let used_values = item.context["used_state_invocations"]
+        .as_array_mut()
+        .expect("used state invocations initialized by epoch resolution");
+    used_values.push(serde_json::Value::String(invocation_id.to_string()));
+    invocation_id
 }
 
 /// Read `context.state_entered_at` if present.
@@ -9553,6 +11092,9 @@ fn derive_phase(item: &WorkItem) -> String {
 }
 
 fn project_workflow_state(item: &WorkItem) -> String {
+    if item.context.get("authorization_pending").is_some() {
+        return "authorization_pending".to_string();
+    }
     if item.workflow_id == "__triage__" {
         return "triage".to_string();
     }
@@ -9884,24 +11426,38 @@ fn release_jobs_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     checkpoint_owner_id: Uuid,
     job_ids: &[Uuid],
+    authorization_digests: &BTreeMap<Uuid, String>,
     require_present: bool,
 ) -> anyhow::Result<()> {
     let mut expected_releases = 0usize;
     for job_id in job_ids {
         let row = tx
             .query_row(
-                "SELECT checkpoint_owner_id, state, dispatch_released FROM jobs WHERE id = ?1",
+                "SELECT jobs.checkpoint_owner_id, jobs.state, jobs.dispatch_released, jobs.request_digest, jobs.authorization_id, jobs.context_json, authorization_records.request_json FROM jobs LEFT JOIN authorization_records ON authorization_records.authorization_id = jobs.authorization_id AND authorization_records.request_digest = jobs.request_digest AND authorization_records.work_item_id = jobs.work_item_id AND authorization_records.checkpoint_owner_id = jobs.checkpoint_owner_id AND authorization_records.invocation_id = json_extract(jobs.context_json, '$.resolved_authorization_request.invocation_id') WHERE jobs.id = ?1",
                 [job_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((owner_id, state, released)) = row else {
+        let Some((
+            owner_id,
+            state,
+            released,
+            request_digest,
+            authorization_id,
+            context_json,
+            record_json,
+        )) = row
+        else {
             if require_present {
                 anyhow::bail!("authorized checkpoint job {job_id} is missing locally");
             }
@@ -9911,6 +11467,40 @@ fn release_jobs_in_transaction(
             anyhow::bail!(
                 "authorized checkpoint job {job_id} belongs to {owner_id}, not root {checkpoint_owner_id}"
             );
+        }
+        if released == 0 {
+            let verification_job = tx.query_row(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE id = ?1",
+                [job_id.to_string()],
+                row_to_job,
+            )?;
+            verify_job_authorization(tx, &verification_job)?;
+            let expected = authorization_digests.get(job_id).ok_or_else(|| {
+                anyhow::anyhow!("checkpoint job {job_id} has no authorization binding")
+            })?;
+            if request_digest.as_deref() != Some(expected.as_str()) {
+                anyhow::bail!("checkpoint job {job_id} authorization digest mismatch");
+            }
+            let authorization_id = authorization_id.ok_or_else(|| {
+                anyhow::anyhow!("checkpoint job {job_id} has no authorization identity")
+            })?;
+            let context: serde_json::Value = serde_json::from_str(&context_json)?;
+            let request = protocol::authorization_request_from_job_context(&context)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint job {job_id} has no request payload"))?;
+            let normalized_request_json = serde_json::to_string(&request.clone().normalize())?;
+            if context
+                .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+                .and_then(serde_json::Value::as_str)
+                != Some(authorization_id.as_str())
+                || context
+                    .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected.as_str())
+                || request.request_digest()? != *expected
+                || record_json.as_deref() != Some(normalized_request_json.as_str())
+            {
+                anyhow::bail!("checkpoint job {job_id} immutable authorization is invalid");
+            }
         }
         if released == 0 && state == JobState::Pending.to_string() {
             expected_releases = expected_releases.saturating_add(1);
@@ -10363,6 +11953,9 @@ mod tests {
             human_owner_provider_id: Some("42".to_string()),
             human_owners: vec![],
             dispatch_job_ids: vec![second, first, second],
+            dispatch_authorizations: BTreeMap::new(),
+            authorization_pending: None,
+            proposed_authorizations: Vec::new(),
             generation: 7,
             checkpoint_hash: String::new(),
             semantic_hash: String::new(),
@@ -10612,35 +12205,22 @@ mod tests {
             .await
             .expect("update actionable item");
 
-        let dispatch = {
-            let svc = svc.clone();
-            let item = item.clone();
-            let workflow = svc.workflows.get("wf").expect("workflow").clone();
-            tokio::spawn(async move {
-                svc.ensure_pending_job_for_step(&item, &workflow).await?;
-                svc.persist_task_projection(&item, None).await?;
-                Ok::<usize, anyhow::Error>(1)
-            })
-        };
-        let waiter = {
-            let adapter = Arc::clone(&adapter);
-            tokio::task::spawn_blocking(move || adapter.wait_for_checkpoint())
-        };
-        waiter.await.expect("waiter");
+        let workflow = svc.workflows.get("wf").expect("workflow").clone();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            svc.ensure_pending_job_for_step(&item, &workflow),
+        )
+        .await
+        .expect("legacy reconstruction must not hang")
+        .expect_err("legacy reconstruction must fail closed");
+        assert!(error.to_string().contains("authorization"));
         assert!(
             svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
                 .await
-                .expect("poll while maintenance checkpoint blocked")
+                .expect("poll after rejected maintenance reconstruction")
                 .is_none()
         );
-        adapter.unblock();
-        assert_eq!(dispatch.await.expect("dispatch task").expect("dispatch"), 1);
-        assert!(
-            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
-                .await
-                .expect("poll after maintenance checkpoint")
-                .is_some()
-        );
+        assert_eq!(adapter.checkpoint_calls.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_file(db);
     }
 
@@ -11749,6 +13329,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorization_migration_quarantines_released_running_jobs() {
+        let db = std::env::temp_dir().join(format!("orch-auth-legacy-{}.sqlite3", Uuid::new_v4()));
+        let root_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let grandchild_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        let owners = vec![ProviderIdentity {
+            provider_id: Some("42".to_string()),
+            display_name: Some("alice".to_string()),
+        }];
+        let conn = Connection::open(db.as_path()).expect("legacy db");
+        conn.execute_batch(
+            "CREATE TABLE work_items (
+                id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, external_task_id TEXT,
+                session_id TEXT, current_step TEXT NOT NULL, blocked_on TEXT,
+                state TEXT NOT NULL, context_json TEXT NOT NULL, repo_json TEXT,
+                parent_work_item_id TEXT, parent_step_id TEXT, child_work_item_id TEXT,
+                remembered_human_owners_json TEXT NOT NULL, provider_ownership_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL, step_id TEXT NOT NULL,
+                state TEXT NOT NULL, assigned_worker_id TEXT, execution_mode TEXT NOT NULL,
+                command TEXT NOT NULL, args_json TEXT NOT NULL, env_json TEXT NOT NULL,
+                prompt_json TEXT, context_json TEXT NOT NULL, transcript_dir TEXT,
+                lease_expires_at TEXT, checkpoint_owner_id TEXT, dispatch_released INTEGER NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO schema_migrations (name, applied_at) VALUES ('dispatch_checkpoint_gate_v1', 'legacy');",
+        )
+        .expect("legacy schema");
+        conn.execute(
+            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, remembered_human_owners_json, provider_ownership_json, created_at, updated_at) VALUES (?1, 'wf', ?1, 'build', ?2, '{}', ?3, ?4, ?5, ?5)",
+            params![
+                root_id.to_string(),
+                WorkItemState::Running.to_string(),
+                serde_json::to_string(&owners).expect("owners"),
+                serde_json::to_string(&ProviderOwnership::Bot).expect("ownership"),
+                now,
+            ],
+        )
+        .expect("legacy root");
+        for (item_id, parent_id) in [(child_id, root_id), (grandchild_id, child_id)] {
+            conn.execute(
+                "INSERT INTO work_items (id, workflow_id, current_step, state, context_json, parent_work_item_id, remembered_human_owners_json, provider_ownership_json, created_at, updated_at) VALUES (?1, 'wf', 'build', ?2, '{}', ?3, '[]', '{\"kind\":\"unassigned\"}', ?4, ?4)",
+                params![
+                    item_id.to_string(),
+                    WorkItemState::Running.to_string(),
+                    parent_id.to_string(),
+                    now,
+                ],
+            )
+            .expect("legacy descendant");
+        }
+        conn.execute(
+            "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, command, args_json, env_json, context_json, lease_expires_at, checkpoint_owner_id, dispatch_released, created_at, updated_at) VALUES (?1, ?2, 'build', ?3, 'worker', 'docker', 'true', '[]', '{}', '{}', ?4, ?2, 1, ?4, ?4)",
+            params![
+                job_id.to_string(),
+                grandchild_id.to_string(),
+                JobState::Running.to_string(),
+                now,
+            ],
+        )
+        .expect("released running job");
+        conn.execute(
+            "UPDATE jobs SET checkpoint_owner_id = ?2 WHERE id = ?1",
+            params![job_id.to_string(), root_id.to_string()],
+        )
+        .expect("stacked dispatch owner");
+        drop(conn);
+
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let mut task = recovery_test_task(true);
+        task.id = root_id;
+        task.ownership = ProviderOwnership::Bot;
+        adapter.tasks.lock().expect("tasks").push(task);
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("authorization migration");
+        let job = svc.get_job(job_id).await.expect("job").expect("job row");
+        assert_eq!(job.state, JobState::Cancelled);
+        assert!(job.assigned_worker_id.is_none());
+        assert!(job.lease_expires_at.is_none());
+        for item_id in [root_id, child_id, grandchild_id] {
+            let item = svc
+                .get_work_item(item_id)
+                .await
+                .expect("tree item")
+                .expect("tree item row");
+            assert_eq!(item.state, WorkItemState::Failed);
+            assert_eq!(
+                item.human_gate_state.as_deref(),
+                Some("authorization_pending")
+            );
+        }
+        assert!(matches!(
+            adapter.assignees.lock().expect("assignees").last(),
+            Some(ProviderOwnership::Human { owners: restored }) if restored == &owners
+        ));
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn authorization_migration_cancels_valid_siblings_of_invalid_job() {
+        let db = std::env::temp_dir().join(format!("orch-auth-mixed-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-auth-mixed-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: TRIAGE_WORKFLOW_ID.to_string(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("authorized item");
+        let valid_job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("valid jobs")
+            .into_iter()
+            .next()
+            .expect("valid active job");
+        let invalid_job_id = Uuid::new_v4();
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        conn.execute(
+            "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, authorization_id, request_digest, dispatch_released) SELECT ?1, work_item_id, step_id, 'running', 'worker', execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, NULL, NULL, 1 FROM jobs WHERE id = ?2",
+            params![invalid_job_id.to_string(), valid_job.id.to_string()],
+        )
+        .expect("invalid sibling");
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE name = 'immutable_authorization_v1'",
+            [],
+        )
+        .expect("rerun authorization migration");
+        drop(conn);
+        drop(svc);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted
+            .init()
+            .await
+            .expect("mixed authorization migration");
+        for job_id in [valid_job.id, invalid_job_id] {
+            let job = restarted
+                .get_job(job_id)
+                .await
+                .expect("job")
+                .expect("job row");
+            assert_eq!(job.state, JobState::Cancelled);
+        }
+        let root = restarted
+            .get_work_item(item.id)
+            .await
+            .expect("root")
+            .expect("root row");
+        assert_eq!(root.state, WorkItemState::Failed);
+        assert_eq!(
+            root.human_gate_state.as_deref(),
+            Some("authorization_pending")
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
     async fn migration_resolves_nested_child_job_to_provider_root_and_fails_tree_closed() {
         let db = std::env::temp_dir().join(format!("orch-legacy-{}.sqlite3", Uuid::new_v4()));
         let root_id = Uuid::new_v4();
@@ -12709,6 +14472,9 @@ mod tests {
             human_owner_provider_id: None,
             human_owners: vec![],
             dispatch_job_ids: Vec::new(),
+            dispatch_authorizations: BTreeMap::new(),
+            authorization_pending: None,
+            proposed_authorizations: Vec::new(),
             generation: 0,
             checkpoint_hash: String::new(),
             semantic_hash: String::new(),
@@ -12758,6 +14524,9 @@ mod tests {
             human_owner_provider_id: None,
             human_owners: Vec::new(),
             dispatch_job_ids: Vec::new(),
+            dispatch_authorizations: BTreeMap::new(),
+            authorization_pending: None,
+            proposed_authorizations: Vec::new(),
             generation: 0,
             checkpoint_hash: String::new(),
             semantic_hash: String::new(),
@@ -12839,6 +14608,9 @@ mod tests {
             human_owner_provider_id: None,
             human_owners: Vec::new(),
             dispatch_job_ids: Vec::new(),
+            dispatch_authorizations: BTreeMap::new(),
+            authorization_pending: None,
+            proposed_authorizations: Vec::new(),
             generation: 0,
             checkpoint_hash: String::new(),
             semantic_hash: String::new(),
@@ -12910,6 +14682,9 @@ mod tests {
             human_owner_provider_id: None,
             human_owners: owners.clone(),
             dispatch_job_ids: vec![],
+            dispatch_authorizations: BTreeMap::new(),
+            authorization_pending: None,
+            proposed_authorizations: Vec::new(),
             generation: 0,
             checkpoint_hash: String::new(),
             semantic_hash: String::new(),
@@ -12964,6 +14739,9 @@ mod tests {
             human_owner_provider_id: None,
             human_owners: vec![],
             dispatch_job_ids: vec![lost_job_id],
+            dispatch_authorizations: BTreeMap::new(),
+            authorization_pending: None,
+            proposed_authorizations: Vec::new(),
             generation: 1,
             checkpoint_hash: String::new(),
             semantic_hash: String::new(),
@@ -13030,6 +14808,9 @@ mod tests {
                 human_owner_provider_id: None,
                 human_owners: vec![],
                 dispatch_job_ids: Vec::new(),
+                dispatch_authorizations: BTreeMap::new(),
+                authorization_pending: None,
+                proposed_authorizations: Vec::new(),
                 generation: 0,
                 checkpoint_hash: String::new(),
                 semantic_hash: String::new(),
@@ -13447,8 +15228,21 @@ initial_state = "implement"
 [[workflow.states]]
 id = "implement"
 kind = "agent"
-executor = "raw"
+executor = "docker"
+container_image = "local/agent-hub-test:latest"
 prompt = { user = "implement" }
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "test"
+
+[[workflow.states]]
+id = "test"
+kind = "command"
+executor = "docker"
+container_image = "local/agent-hub-test:latest"
+command = "true"
+max_retries = 1
 
 [[workflow.states.on]]
 event = "job_succeeded"
@@ -13756,6 +15550,70 @@ args = ["child"]
 "#;
         write_workflow(&tmp, "reactive_parent", parent);
         write_workflow(&tmp, "child_legacy", child);
+        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+    }
+
+    fn reactive_authorized_child_catalog() -> Arc<WorkflowCatalog> {
+        let tmp =
+            std::env::temp_dir().join(format!("wf-catalog-authorized-child-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let parent = r#"
+[workflow]
+id = "authorized_parent"
+schema = "reactive_v2"
+initial_state = "spawn"
+
+[[workflow.states]]
+id = "spawn"
+kind = "auto"
+child_workflow = "authorized_child"
+
+[[workflow.states.on]]
+event = "all_children_completed"
+target = "spawn"
+
+[[workflow.states.on]]
+event = "child_failed"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        let child = r#"
+[workflow]
+id = "authorized_child"
+schema = "reactive_v2"
+initial_state = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "agent"
+executor = "docker"
+container_image = "local/agent-hub-test:latest"
+prompt = { user = "run child" }
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "finish"
+
+[[workflow.states]]
+id = "finish"
+kind = "command"
+executor = "docker"
+container_image = "local/agent-hub-test:latest"
+command = "true"
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        write_workflow(&tmp, "authorized_parent", parent);
+        write_workflow(&tmp, "authorized_child", child);
         Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
     }
 
@@ -17575,6 +19433,9 @@ args = ["child"]
                 job,
                 checkpoint_owner_id: id,
             }],
+            baseline_inserts: Vec::new(),
+            obligation_approvals: Vec::new(),
+            obligation_inserts: Vec::new(),
             cancel_active_work_item_ids: Vec::new(),
             cancel_unreleased_checkpoint_owner_ids: Vec::new(),
             revision_update: None,
@@ -17679,6 +19540,9 @@ args = ["child"]
                 work_item_updates: Vec::new(),
                 work_item_inserts: Vec::new(),
                 job_inserts: Vec::new(),
+                baseline_inserts: Vec::new(),
+                obligation_approvals: Vec::new(),
+                obligation_inserts: Vec::new(),
                 cancel_active_work_item_ids: Vec::new(),
                 cancel_unreleased_checkpoint_owner_ids: Vec::new(),
                 revision_update: None,
@@ -18255,6 +20119,9 @@ args = ["child"]
                 job,
                 checkpoint_owner_id: id,
             }],
+            baseline_inserts: Vec::new(),
+            obligation_approvals: Vec::new(),
+            obligation_inserts: Vec::new(),
             cancel_active_work_item_ids: Vec::new(),
             cancel_unreleased_checkpoint_owner_ids: Vec::new(),
             revision_update: None,
@@ -19181,6 +21048,234 @@ args = ["child"]
     }
 
     #[tokio::test]
+    async fn authorization_mismatch_blocks_release_poll_update_and_identity_collision() {
+        let db = std::env::temp_dir().join(format!("orch-auth-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-auth-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: TRIAGE_WORKFLOW_ID.to_string(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("triage item");
+        let job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .next()
+            .expect("triage job");
+
+        let mut collision = job.clone();
+        collision.id = Uuid::new_v4();
+        let authorization_id = collision.context[protocol::CONTEXT_AUTHORIZATION_ID_KEY]
+            .as_str()
+            .expect("authorization id")
+            .to_string();
+        let mut request =
+            protocol::authorization_request_from_job_context(&collision.context).expect("request");
+        request
+            .behavior
+            .prompt
+            .as_mut()
+            .expect("prompt")
+            .user
+            .push_str(" changed");
+        collision.prompt = request.behavior.prompt.clone();
+        protocol::project_authorization_request_into_job_context(
+            &mut collision.context,
+            &authorization_id,
+            &request,
+        )
+        .expect("changed request");
+        let collision_error = svc
+            .insert_job(&collision)
+            .await
+            .expect_err("same authorization identity with changed payload must fail");
+        assert!(collision_error.to_string().contains("identity collision"));
+
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        conn.execute(
+            "UPDATE jobs SET dispatch_released = 0, request_digest = 'bad' WHERE id = ?1",
+            [job.id.to_string()],
+        )
+        .expect("tamper staged job");
+        drop(conn);
+        assert!(
+            svc.release_staged_jobs_exact(item.id, &[job.id])
+                .await
+                .is_err()
+        );
+
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        conn.execute(
+            "UPDATE jobs SET dispatch_released = 1 WHERE id = ?1",
+            [job.id.to_string()],
+        )
+        .expect("force released");
+        drop(conn);
+        svc.register_worker(RegisterWorkerRequest {
+            id: "worker".to_string(),
+            hostname: "host".to_string(),
+            supported_modes: vec![protocol::ExecutionMode::Docker],
+        })
+        .await
+        .expect("worker");
+        assert!(
+            svc.poll_job(PollJobRequest {
+                worker_id: "worker".to_string(),
+            })
+            .await
+            .is_err()
+        );
+
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let digest: String = conn
+            .query_row(
+                "SELECT request_digest FROM authorization_records WHERE authorization_id = ?1",
+                [authorization_id],
+                |row| row.get(0),
+            )
+            .expect("stored digest");
+        conn.execute(
+            "UPDATE jobs SET request_digest = ?2, state = 'assigned', assigned_worker_id = 'worker' WHERE id = ?1",
+            params![job.id.to_string(), digest],
+        )
+        .expect("restore assignment");
+        conn.execute(
+            "UPDATE authorization_records SET request_json = '{}' WHERE authorization_id = (SELECT authorization_id FROM jobs WHERE id = ?1)",
+            [job.id.to_string()],
+        )
+        .expect("tamper record");
+        drop(conn);
+        assert!(
+            svc.update_job(
+                job.id,
+                JobUpdateRequest {
+                    worker_id: "worker".to_string(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn ordinary_job_boundary_survives_crash_and_concurrent_reconciliation() {
+        let db = std::env::temp_dir().join(format!("orch-ordinary-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-ordinary-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let request = CreateWorkItemRequest {
+            workflow_id: TRIAGE_WORKFLOW_ID.to_string(),
+            session_id: None,
+            context: serde_json::json!({}),
+            repo: None,
+        };
+        let mut item = work_item_from_create(
+            &request,
+            Uuid::new_v4(),
+            TRIAGE_WORKFLOW_ID.to_string(),
+            "triage".to_string(),
+            svc.task_adapter.adapter_name(),
+        );
+        svc.ensure_repo_catalog_hint_context(&mut item);
+        svc.insert_work_item(&item).await.expect("insert item");
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("initial provider projection");
+        assert!(
+            svc.ensure_pending_triage_job(&mut item)
+                .await
+                .expect("atomic triage boundary")
+        );
+        let job = svc
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("staged job")
+            .into_iter()
+            .next()
+            .expect("staged job exists");
+        let request = protocol::authorization_request_from_job_context(&job.context)
+            .expect("authorization request");
+        let durable_item = svc
+            .get_work_item(item.id)
+            .await
+            .expect("durable item")
+            .expect("durable item exists");
+        assert_eq!(
+            current_state_invocation_id(&durable_item),
+            Some(request.invocation_id)
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let released: i64 = conn
+            .query_row(
+                "SELECT dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("dispatch state");
+        assert_eq!(released, 0);
+        drop(conn);
+        drop(svc);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted.init().await.expect("restart reconciliation");
+        let (left, right) = tokio::join!(
+            restarted.persist_task_projection(&durable_item, None),
+            restarted.persist_task_projection(&durable_item, None),
+        );
+        left.expect("left reconciliation");
+        right.expect("right reconciliation");
+        let jobs = restarted
+            .list_jobs_for_work_item(item.id)
+            .await
+            .expect("jobs after restart");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            protocol::authorization_request_from_job_context(&jobs[0].context)
+                .expect("recovered authorization")
+                .invocation_id,
+            request.invocation_id
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite after restart");
+        let released: i64 = conn
+            .query_row(
+                "SELECT dispatch_released FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("released after restart");
+        assert_eq!(released, 1);
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
     async fn triage_failed_job_update_is_accepted_and_marks_work_item_failed() {
         let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
         let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
@@ -19460,6 +21555,575 @@ args = ["child"]
             .expect("exists");
         assert_eq!(updated.workflow_id, "triage-approved-reactive");
         assert_eq!(updated.current_step, "implement");
+        let jobs = svc
+            .list_jobs_for_work_item(updated.id)
+            .await
+            .expect("authorized jobs");
+        let implementation = jobs
+            .iter()
+            .find(|job| job.step_id == "implement")
+            .expect("implementation job");
+        let request = protocol::authorization_request_from_job_context(&implementation.context)
+            .expect("resolved authorization request");
+        let request_digest = request.request_digest().expect("request digest");
+        assert_eq!(
+            implementation
+                .context
+                .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some(request_digest.as_str())
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let baseline_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM authorization_baselines WHERE work_item_id = ?1 AND state_id = 'implement'",
+                [updated.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("baseline count");
+        assert_eq!(baseline_count, 1);
+        drop(conn);
+
+        let mut implementation = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".to_string(),
+            })
+            .await
+            .expect("poll implementation")
+            .job
+            .expect("implementation released");
+        let lease_authorization = implementation
+            .context
+            .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+            .cloned();
+        implementation.lease_expires_at = Some(Utc::now() - chrono::TimeDelta::seconds(1));
+        svc.update_job_row(&implementation)
+            .await
+            .expect("expire implementation lease");
+        assert_eq!(
+            svc.requeue_expired_leases().await.expect("requeue lease"),
+            1
+        );
+        implementation = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".to_string(),
+            })
+            .await
+            .expect("poll exact lease retry")
+            .job
+            .expect("lease retry job");
+        assert_eq!(
+            implementation
+                .context
+                .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+                .cloned(),
+            lease_authorization
+        );
+        svc.update_job(
+            implementation.id,
+            JobUpdateRequest {
+                worker_id: "w1".to_string(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start implementation");
+        let mut implementation_result = successful_job_result();
+        implementation_result.output_json = Some(serde_json::json!({
+            "next_event": "job_succeeded"
+        }));
+        svc.update_job(
+            implementation.id,
+            JobUpdateRequest {
+                worker_id: "w1".to_string(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/implementation".to_string()),
+                result: Some(implementation_result),
+            },
+        )
+        .await
+        .expect("complete implementation");
+        let pending = svc
+            .get_work_item(updated.id)
+            .await
+            .expect("pending item")
+            .expect("pending item exists");
+        assert_eq!(
+            pending.human_gate_state.as_deref(),
+            Some("authorization_pending")
+        );
+        assert!(pending.context.get("authorization_pending").is_some());
+        assert_eq!(
+            svc.list_jobs_for_work_item(updated.id)
+                .await
+                .expect("jobs before escalation approval")
+                .iter()
+                .filter(|job| job.step_id == "test")
+                .count(),
+            0
+        );
+
+        drop(svc);
+        let svc = OrchestrationService::new(
+            triage_approved_reactive_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init()
+            .await
+            .expect("restart with pending authorization obligation");
+        let recovered = svc
+            .get_work_item(updated.id)
+            .await
+            .expect("recovered item")
+            .expect("recovered pending item");
+        assert_eq!(
+            recovered.human_gate_state.as_deref(),
+            Some("authorization_pending")
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite after restart");
+        let pending_obligations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM authorization_obligations WHERE checkpoint_owner_id = ?1 AND state = 'pending'",
+                [updated.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("pending obligation count");
+        assert_eq!(pending_obligations, 1);
+        drop(conn);
+
+        adapter
+            .set_ownership(&updated.id.to_string(), &ProviderOwnership::Bot)
+            .expect("approve one-job escalation");
+        svc.sync_tasks_from_adapter()
+            .await
+            .expect("apply one-job authorization");
+        let escalated_jobs = svc
+            .list_jobs_for_work_item(updated.id)
+            .await
+            .expect("jobs after escalation approval");
+        assert_eq!(
+            escalated_jobs
+                .iter()
+                .filter(|job| job.step_id == "test")
+                .count(),
+            1
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite after escalation");
+        let baseline_count_after_escalation: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM authorization_baselines WHERE work_item_id = ?1 AND state_id = 'test'",
+                [updated.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("test baseline count");
+        assert_eq!(baseline_count_after_escalation, 1);
+        drop(conn);
+
+        let escalated = svc
+            .poll_job(PollJobRequest {
+                worker_id: "w1".to_string(),
+            })
+            .await
+            .expect("poll escalated job")
+            .job
+            .expect("escalated job released");
+        svc.update_job(
+            escalated.id,
+            JobUpdateRequest {
+                worker_id: "w1".to_string(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start escalated job");
+        svc.update_job(
+            escalated.id,
+            JobUpdateRequest {
+                worker_id: "w1".to_string(),
+                state: JobState::Failed,
+                transcript_dir: Some("/tmp/escalated".to_string()),
+                result: Some(failed_job_result()),
+            },
+        )
+        .await
+        .expect("changed retry stages authorization escalation");
+        let pending_retry = svc
+            .get_work_item(updated.id)
+            .await
+            .expect("retry root")
+            .expect("retry root exists");
+        assert_eq!(
+            pending_retry.human_gate_state.as_deref(),
+            Some("authorization_pending")
+        );
+        let before_retry_approval = svc
+            .list_jobs_for_work_item(updated.id)
+            .await
+            .expect("jobs before retry approval")
+            .into_iter()
+            .filter(|job| job.step_id == "test")
+            .collect::<Vec<_>>();
+        assert_eq!(before_retry_approval.len(), 1);
+        adapter
+            .set_ownership(&updated.id.to_string(), &ProviderOwnership::Bot)
+            .expect("approve changed retry");
+        svc.sync_tasks_from_adapter()
+            .await
+            .expect("stage changed retry once");
+        let retry_root = svc
+            .get_work_item(updated.id)
+            .await
+            .expect("retry root")
+            .expect("retry root exists");
+        assert!(
+            retry_root.context.get("authorization_pending").is_none(),
+            "retry approval did not clear pending state: {retry_root:?}"
+        );
+        let test_jobs = svc
+            .list_jobs_for_work_item(updated.id)
+            .await
+            .expect("retried jobs")
+            .into_iter()
+            .filter(|job| job.step_id == "test")
+            .collect::<Vec<_>>();
+        assert_eq!(test_jobs.len(), 2);
+        assert_ne!(
+            test_jobs[0]
+                .context
+                .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY),
+            test_jobs[1]
+                .context
+                .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+        );
+        assert_eq!(
+            before_retry_approval[0]
+                .context
+                .get(protocol::CONTEXT_REQUEST_DIGEST_KEY),
+            test_jobs[0]
+                .context
+                .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
+        );
+        assert_ne!(
+            test_jobs[0]
+                .context
+                .get(protocol::CONTEXT_REQUEST_DIGEST_KEY),
+            test_jobs[1]
+                .context
+                .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
+        );
+
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn child_baseline_and_escalation_are_root_owned_and_deterministic() {
+        let db = std::env::temp_dir().join(format!("orch-child-auth-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-child-auth-{}", Uuid::new_v4()));
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone()));
+        let svc = OrchestrationService::new(
+            reactive_authorized_child_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let root = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: TRIAGE_WORKFLOW_ID.to_string(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("triage item");
+        let guarded_workflow = svc
+            .workflows
+            .get_reactive("authorized_parent")
+            .expect("guarded workflow");
+        let cycle_error = svc
+            .propose_authorization_epoch_from_states_guarded(
+                &root,
+                guarded_workflow,
+                [guarded_workflow.initial_state.clone()],
+                root.id,
+                &mut vec![guarded_workflow.id.clone()],
+                1,
+            )
+            .expect_err("runtime cycle guard");
+        assert!(cycle_error.to_string().contains("cycle detected"));
+        let depth_error = svc
+            .propose_authorization_epoch_from_states_guarded(
+                &root,
+                guarded_workflow,
+                [guarded_workflow.initial_state.clone()],
+                root.id,
+                &mut Vec::new(),
+                32,
+            )
+            .expect_err("runtime depth guard");
+        assert!(depth_error.to_string().contains("depth exceeds"));
+        svc.register_worker(RegisterWorkerRequest {
+            id: "worker".to_string(),
+            hostname: "host".to_string(),
+            supported_modes: vec![protocol::ExecutionMode::Docker],
+        })
+        .await
+        .expect("worker");
+        let triage = svc
+            .poll_job(PollJobRequest {
+                worker_id: "worker".to_string(),
+            })
+            .await
+            .expect("poll triage")
+            .job
+            .expect("triage job");
+        svc.update_job(
+            triage.id,
+            JobUpdateRequest {
+                worker_id: "worker".to_string(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start triage");
+        let mut triage_result = successful_job_result();
+        triage_result.output_json = Some(serde_json::json!({
+            "next_event":"job_succeeded",
+            "workflow_id":"authorized_parent"
+        }));
+        svc.update_job(
+            triage.id,
+            JobUpdateRequest {
+                worker_id: "worker".to_string(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/child-triage".to_string()),
+                result: Some(triage_result),
+            },
+        )
+        .await
+        .expect("complete triage");
+        adapter
+            .set_ownership(&root.id.to_string(), &ProviderOwnership::Bot)
+            .expect("approve child epoch");
+        svc.sync_tasks_from_adapter().await.expect("approve epoch");
+
+        let parent = svc
+            .get_work_item(root.id)
+            .await
+            .expect("parent")
+            .expect("parent exists");
+        let child_id = parent.child_work_item_id.expect("deterministic child");
+        let first_parent_invocation =
+            current_state_invocation_id(&parent).expect("first parent invocation");
+        let first_child = svc
+            .get_work_item(child_id)
+            .await
+            .expect("first child")
+            .expect("first child exists");
+        let first_child_parent_invocation = first_child
+            .context
+            .get("parent_invocation_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("first child parent invocation");
+        assert_eq!(
+            child_id,
+            deterministic_child_work_item_id(
+                current_state_invocation_id(&parent).expect("parent invocation"),
+                "authorized_child"
+            )
+        );
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let child_baselines: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM authorization_baselines WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2",
+                params![root.id.to_string(), child_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("child baselines");
+        assert_eq!(child_baselines, 2);
+        drop(conn);
+
+        let child_job = svc
+            .poll_job(PollJobRequest {
+                worker_id: "worker".to_string(),
+            })
+            .await
+            .expect("poll child")
+            .job
+            .expect("child job");
+        assert_eq!(child_job.work_item_id, child_id);
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "worker".to_string(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start child");
+        let mut child_result = successful_job_result();
+        child_result.output_json = Some(serde_json::json!({
+            "next_event":"job_succeeded"
+        }));
+        svc.update_job(
+            child_job.id,
+            JobUpdateRequest {
+                worker_id: "worker".to_string(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/child-run".to_string()),
+                result: Some(child_result),
+            },
+        )
+        .await
+        .expect("complete child run");
+        let pending_root = svc
+            .get_work_item(root.id)
+            .await
+            .expect("pending root")
+            .expect("pending root exists");
+        let pending = pending_root
+            .context
+            .get("authorization_pending")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<CheckpointAuthorizationPending>(value).ok())
+            .expect("root-owned child obligation");
+        assert_eq!(pending.work_item_id, child_id);
+        assert_eq!(
+            svc.list_jobs_for_work_item(child_id)
+                .await
+                .expect("child jobs")
+                .iter()
+                .filter(|job| job.step_id == "finish")
+                .count(),
+            0
+        );
+        adapter
+            .set_ownership(&root.id.to_string(), &ProviderOwnership::Bot)
+            .expect("approve child escalation");
+        svc.sync_tasks_from_adapter()
+            .await
+            .expect("apply child escalation");
+        assert_eq!(
+            svc.list_jobs_for_work_item(child_id)
+                .await
+                .expect("approved child jobs")
+                .iter()
+                .filter(|job| job.step_id == "finish")
+                .count(),
+            1
+        );
+        let finish = svc
+            .poll_job(PollJobRequest {
+                worker_id: "worker".to_string(),
+            })
+            .await
+            .expect("poll child finish")
+            .job
+            .expect("child finish job");
+        svc.update_job(
+            finish.id,
+            JobUpdateRequest {
+                worker_id: "worker".to_string(),
+                state: JobState::Running,
+                transcript_dir: None,
+                result: None,
+            },
+        )
+        .await
+        .expect("start child finish");
+        svc.update_job(
+            finish.id,
+            JobUpdateRequest {
+                worker_id: "worker".to_string(),
+                state: JobState::Succeeded,
+                transcript_dir: Some("/tmp/child-finish".to_string()),
+                result: Some(successful_job_result()),
+            },
+        )
+        .await
+        .expect("complete child finish and re-enter spawn");
+        let repeated_parent = svc
+            .get_work_item(root.id)
+            .await
+            .expect("repeated parent")
+            .expect("repeated parent exists");
+        let repeated_child_id = repeated_parent.child_work_item_id.expect("repeated child");
+        let repeated_child = svc
+            .get_work_item(repeated_child_id)
+            .await
+            .expect("repeated child")
+            .expect("repeated child exists");
+        let repeated_child_parent_invocation = repeated_child
+            .context
+            .get("parent_invocation_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .expect("repeated child parent invocation");
+        let repeated_parent_invocation =
+            current_state_invocation_id(&repeated_parent).expect("repeated parent invocation");
+        assert_ne!(
+            repeated_parent_invocation, first_parent_invocation,
+            "parent state invocation must rotate on self-loop: {repeated_parent:?}"
+        );
+        assert_eq!(
+            repeated_child_id,
+            deterministic_child_work_item_id(repeated_child_parent_invocation, "authorized_child"),
+            "repeated child must derive from repeated parent invocation"
+        );
+        assert_ne!(
+            repeated_child_parent_invocation,
+            first_child_parent_invocation
+        );
+        assert_ne!(repeated_child_id, child_id);
+        let repeated_pending = repeated_parent
+            .context
+            .get("authorization_pending")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<CheckpointAuthorizationPending>(value).ok())
+            .expect("repeated child authorization pending");
+        assert_eq!(repeated_pending.work_item_id, repeated_child_id);
+        adapter
+            .set_ownership(
+                &root.id.to_string(),
+                &ProviderOwnership::Human {
+                    owners: vec![ProviderIdentity {
+                        provider_id: Some("42".to_string()),
+                        display_name: Some("reviewer".to_string()),
+                    }],
+                },
+            )
+            .expect("project repeated child human owner");
+        svc.sync_tasks_from_adapter()
+            .await
+            .expect("observe repeated child human ownership");
+        adapter
+            .set_ownership(&root.id.to_string(), &ProviderOwnership::Bot)
+            .expect("approve repeated child invocation");
+        svc.sync_tasks_from_adapter()
+            .await
+            .expect("stage repeated child invocation");
+        svc.sync_tasks_from_adapter()
+            .await
+            .expect("provider replay remains idempotent");
+        assert_eq!(
+            svc.list_jobs_for_work_item(repeated_child_id)
+                .await
+                .expect("repeated child jobs")
+                .iter()
+                .filter(|job| job.step_id == "run")
+                .count(),
+            1
+        );
 
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(tasks);

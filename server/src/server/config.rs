@@ -368,7 +368,7 @@ struct EnvironmentFile {
     environment: EnvironmentToml,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct EnvironmentToml {
     pub name: String,
     pub description: Option<String>,
@@ -396,7 +396,7 @@ struct NetworkPolicyFile {
     policy: NetworkPolicyToml,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct NetworkPolicyToml {
     pub name: String,
     pub description: Option<String>,
@@ -410,7 +410,7 @@ pub struct NetworkPolicyToml {
     pub hosts_from: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PolicyAllowEntry {
     pub description: Option<String>,
     #[serde(default)]
@@ -431,12 +431,14 @@ pub struct ImageToml {
 }
 
 pub struct LoadedConfigTree {
+    pub root: PathBuf,
     pub system: SystemManifest,
     pub environments: Vec<LoadedEnvironment>,
     pub network_policies: Vec<NetworkPolicyToml>,
     pub images: Vec<ImageToml>,
     pub overlays: Vec<EnvironmentOverlay>,
     pub triage_prompt: Option<LoadedTriagePrompt>,
+    pub runner_profiles: agent_hub_config::RunnerProfilesConfig,
 }
 
 pub struct LoadedEnvironment {
@@ -463,6 +465,10 @@ impl LoadedEnvironment {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
         }
+    }
+
+    pub fn content_digests(&self) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        agent_hub_config::directory_content_digests(&self.dir).map_err(anyhow::Error::msg)
     }
 }
 
@@ -493,6 +499,12 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
     let system_path = root.join("system.toml");
     let system_file: SystemManifestFile = read_toml_file(&system_path, "system manifest")?;
     let system = system_file.system;
+    let runner_profiles_path = root.join("local-agent.json");
+    let runner_profiles = serde_json::from_slice::<agent_hub_config::RunnerProfilesConfig>(
+        &std::fs::read(&runner_profiles_path)
+            .with_context(|| format!("read {}", runner_profiles_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", runner_profiles_path.display()))?;
 
     let mut environments = Vec::new();
     for environment_name in &system.environments.installed {
@@ -562,7 +574,8 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
         && let Some(config_path) = triage.config.as_deref()
     {
         let absolute_path = root.join(config_path);
-        let manifest: TriageManifestFile = read_toml_file(&absolute_path, "triage prompt manifest")?;
+        let manifest: TriageManifestFile =
+            read_toml_file(&absolute_path, "triage prompt manifest")?;
         Some(LoadedTriagePrompt {
             system: manifest.prompt.system,
             user: manifest.prompt.user,
@@ -572,12 +585,14 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
     };
 
     Ok(LoadedConfigTree {
+        root: root.to_path_buf(),
         system,
         environments,
         network_policies,
         images,
         overlays,
         triage_prompt,
+        runner_profiles,
     })
 }
 

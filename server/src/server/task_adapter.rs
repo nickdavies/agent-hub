@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use protocol::{
@@ -249,6 +249,12 @@ pub struct TaskCheckpoint {
     /// concurrently after the checkpoint snapshot remains gated.
     #[serde(default)]
     pub dispatch_job_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub dispatch_authorizations: BTreeMap<Uuid, String>,
+    #[serde(default)]
+    pub authorization_pending: Option<CheckpointAuthorizationPending>,
+    #[serde(default)]
+    pub proposed_authorizations: Vec<serde_json::Value>,
     /// Monotonic per-root generation used by the durable checkpoint outbox.
     #[serde(default)]
     pub generation: u64,
@@ -260,6 +266,13 @@ pub struct TaskCheckpoint {
     /// the exact-payload hash. Used to make reconciliation idempotent.
     #[serde(default)]
     pub semantic_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointAuthorizationPending {
+    pub work_item_id: Uuid,
+    pub request_digest: String,
+    pub request: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
