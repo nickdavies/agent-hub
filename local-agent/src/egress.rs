@@ -7,7 +7,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::LocalAgentEgressTier;
-use crate::egress_config::{LocalAgentConfig, normalize_hosts};
+use crate::egress_config::{LocalAgentConfig, canonical_hosts};
 
 const EGRESS_WORKER_LABEL: &str = "agent-hub.local-agent.worker_id";
 const EGRESS_MANAGED_LABEL: &str = "agent-hub.local-agent.egress.managed";
@@ -236,6 +236,12 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
         tier: LocalAgentEgressTier,
         llm_provider: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
+        let llm_hosts = match tier {
+            LocalAgentEgressTier::Llm | LocalAgentEgressTier::Build => {
+                self.resolve_llm_provider_hosts(llm_provider)?
+            }
+            LocalAgentEgressTier::Github | LocalAgentEgressTier::Full => Vec::new(),
+        };
         let network_policy_name = match tier {
             LocalAgentEgressTier::Llm => Some("llm-only"),
             LocalAgentEgressTier::Github => Some("github-only"),
@@ -246,7 +252,11 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
         if let Some(policy_name) = network_policy_name
             && let Some(policy) = self.config.network_policy(policy_name)
         {
-            let hosts = normalize_hosts(&policy.hosts);
+            let mut hosts = policy.hosts.clone();
+            if policy.uses_llm_provider_hosts {
+                hosts.extend(llm_hosts.iter().cloned());
+            }
+            let hosts = canonical_hosts(&hosts);
             if hosts.is_empty() {
                 anyhow::bail!(
                     "restricted {} tier requested but '{}' policy has no hosts",
@@ -259,43 +269,27 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
                     "restricted '{policy_name}' policy must not be unrestricted or select an external Docker network"
                 );
             }
-            if tier == LocalAgentEgressTier::Llm {
-                let expected =
-                    normalize_hosts(&self.config.egress.llm.hosts_for_provider(llm_provider));
-                validate_literal_model_hosts(&expected)?;
+            if matches!(
+                tier,
+                LocalAgentEgressTier::Llm | LocalAgentEgressTier::Build
+            ) {
+                let expected = match tier {
+                    LocalAgentEgressTier::Llm => llm_hosts.clone(),
+                    LocalAgentEgressTier::Build => self.build_hosts(&llm_hosts),
+                    _ => unreachable!(),
+                };
                 if hosts != expected {
                     anyhow::bail!(
-                        "llm-only hosts must exactly match normalized configured model hosts: policy={hosts:?} configured={expected:?}"
+                        "restricted {policy_name} hosts must exactly match configured hosts: policy={hosts:?} configured={expected:?}"
                     );
                 }
             }
             return Ok(hosts);
         }
 
-        let llm_hosts = self.config.egress.llm.hosts_for_provider(llm_provider);
         match tier {
-            LocalAgentEgressTier::Llm => {
-                if llm_hosts.is_empty() {
-                    anyhow::bail!(
-                        "restricted llm tier requested but no LLM hosts are configured; configure egress.llm.providers in local-agent config"
-                    );
-                }
-                validate_literal_model_hosts(&llm_hosts)?;
-                Ok(llm_hosts)
-            }
-            LocalAgentEgressTier::Build => {
-                if llm_hosts.is_empty() {
-                    anyhow::bail!(
-                        "restricted build tier requested but LLM hosts are missing; configure egress.llm.providers in local-agent config"
-                    );
-                }
-                let mut hosts = Vec::new();
-                hosts.extend(llm_hosts);
-                hosts.extend(self.config.egress.build.github_hosts.clone());
-                hosts.extend(self.config.egress.build.go_registry_hosts.clone());
-                hosts.extend(self.config.egress.build.crates_registry_hosts.clone());
-                Ok(normalize_hosts(&hosts))
-            }
+            LocalAgentEgressTier::Llm => Ok(llm_hosts),
+            LocalAgentEgressTier::Build => Ok(self.build_hosts(&llm_hosts)),
             LocalAgentEgressTier::Github => {
                 anyhow::bail!("github-only policy must be loaded from CONFIG_ROOT")
             }
@@ -303,6 +297,32 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
                 anyhow::bail!("full tier does not use restricted egress proxy")
             }
         }
+    }
+
+    fn resolve_llm_provider_hosts(&self, provider: Option<&str>) -> anyhow::Result<Vec<String>> {
+        let (provider, local_hosts) = self.config.egress.llm.resolve_provider_hosts(provider)?;
+        validate_literal_model_hosts(&local_hosts)?;
+        let Some(config_tree) = self.config.config_tree() else {
+            return Ok(local_hosts);
+        };
+        let system_hosts = config_tree
+            .llm_provider_hosts
+            .get(&provider)
+            .ok_or_else(|| anyhow::anyhow!("unknown system LLM provider '{provider}'"))?;
+        if system_hosts != &local_hosts {
+            anyhow::bail!(
+                "LLM provider '{provider}' hosts differ between system and local-agent config: system={system_hosts:?} local={local_hosts:?}"
+            );
+        }
+        Ok(system_hosts.clone())
+    }
+
+    fn build_hosts(&self, llm_hosts: &[String]) -> Vec<String> {
+        let mut hosts = llm_hosts.to_vec();
+        hosts.extend(self.config.egress.build.github_hosts.clone());
+        hosts.extend(self.config.egress.build.go_registry_hosts.clone());
+        hosts.extend(self.config.egress.build.crates_registry_hosts.clone());
+        canonical_hosts(&hosts)
     }
 
     fn render_squid_config(&self, allowed_hosts: &[String]) -> String {
@@ -859,9 +879,11 @@ pub fn llm_provider_from_env(env: &HashMap<String, String>) -> Option<String> {
 mod tests {
     use super::{
         EGRESS_KIND_LABEL, EGRESS_MANAGED_LABEL, EGRESS_WORKER_LABEL, EgressManager,
-        RestrictedEgressRuntime, squid_acl_host_groups, validate_literal_model_hosts,
+        LocalAgentEgressTier, RestrictedEgressRuntime, squid_acl_host_groups,
+        validate_literal_model_hosts,
     };
-    use crate::egress_config::LocalAgentConfig;
+    use crate::egress_config::{ConfigTreeSnapshot, ConfiguredNetworkPolicy, LocalAgentConfig};
+    use std::collections::HashMap;
 
     #[test]
     fn squid_acl_host_groups_include_apex_and_prune_redundant_subdomains() {
@@ -888,6 +910,102 @@ mod tests {
     fn llm_only_rejects_wildcard_model_hosts() {
         assert!(validate_literal_model_hosts(&["*.openai.com".to_string()]).is_err());
         assert!(validate_literal_model_hosts(&["api.openai.com".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn provider_specific_policies_cover_default_explicit_unknown_and_build_tiers() {
+        let mut config = LocalAgentConfig::default();
+        config.egress.llm.default_provider = Some("first".to_string());
+        config.egress.llm.providers = HashMap::from([
+            (
+                "first".to_string(),
+                vec!["z.example.com".to_string(), "a.example.com".to_string()],
+            ),
+            ("second".to_string(), vec!["second.example.com".to_string()]),
+        ]);
+        config.egress.build.github_hosts = vec!["build.example.com".to_string()];
+        config.egress.build.go_registry_hosts.clear();
+        config.egress.build.crates_registry_hosts.clear();
+        config.set_config_tree_for_tests(ConfigTreeSnapshot {
+            network_policies: HashMap::from([
+                (
+                    "llm-only".to_string(),
+                    ConfiguredNetworkPolicy {
+                        uses_llm_provider_hosts: true,
+                        ..ConfiguredNetworkPolicy::default()
+                    },
+                ),
+                (
+                    "build".to_string(),
+                    ConfiguredNetworkPolicy {
+                        hosts: vec!["build.example.com".to_string()],
+                        uses_llm_provider_hosts: true,
+                        ..ConfiguredNetworkPolicy::default()
+                    },
+                ),
+            ]),
+            llm_provider_hosts: HashMap::from([
+                (
+                    "first".to_string(),
+                    vec!["a.example.com".to_string(), "z.example.com".to_string()],
+                ),
+                ("second".to_string(), vec!["second.example.com".to_string()]),
+            ]),
+            ..ConfigTreeSnapshot::default()
+        });
+        let manager = EgressManager::new("worker-1", std::path::Path::new("/tmp"), config)
+            .expect("manager should build");
+
+        assert_eq!(
+            manager
+                .resolve_tier_hosts(LocalAgentEgressTier::Llm, None)
+                .unwrap(),
+            vec!["a.example.com", "z.example.com"]
+        );
+        assert_eq!(
+            manager
+                .resolve_tier_hosts(LocalAgentEgressTier::Llm, Some("second"))
+                .unwrap(),
+            vec!["second.example.com"]
+        );
+        assert!(
+            manager
+                .resolve_tier_hosts(LocalAgentEgressTier::Llm, Some("missing"))
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .resolve_tier_hosts(LocalAgentEgressTier::Build, Some("second"))
+                .unwrap(),
+            vec!["build.example.com", "second.example.com"]
+        );
+
+        let mut mismatched = manager.config().clone();
+        mismatched.set_config_tree_for_tests(ConfigTreeSnapshot {
+            network_policies: HashMap::from([(
+                "llm-only".to_string(),
+                ConfiguredNetworkPolicy {
+                    hosts: vec!["extra.example.com".to_string()],
+                    uses_llm_provider_hosts: true,
+                    ..ConfiguredNetworkPolicy::default()
+                },
+            )]),
+            llm_provider_hosts: HashMap::from([
+                (
+                    "first".to_string(),
+                    vec!["a.example.com".to_string(), "z.example.com".to_string()],
+                ),
+                ("second".to_string(), vec!["second.example.com".to_string()]),
+            ]),
+            ..ConfigTreeSnapshot::default()
+        });
+        let mismatched = EgressManager::new("worker-1", std::path::Path::new("/tmp"), mismatched)
+            .expect("manager should build");
+        assert!(
+            mismatched
+                .resolve_tier_hosts(LocalAgentEgressTier::Llm, None)
+                .is_err()
+        );
     }
 
     #[test]

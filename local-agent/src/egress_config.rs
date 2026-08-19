@@ -149,6 +149,7 @@ impl LocalAgentConfig {
 pub struct ConfigTreeSnapshot {
     pub environments: Vec<ConfiguredEnvironment>,
     pub network_policies: HashMap<String, ConfiguredNetworkPolicy>,
+    pub llm_provider_hosts: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -164,6 +165,7 @@ pub struct ConfiguredEnvironment {
 #[derive(Debug, Clone, Default)]
 pub struct ConfiguredNetworkPolicy {
     pub hosts: Vec<String>,
+    pub uses_llm_provider_hosts: bool,
     pub env: HashMap<String, String>,
     pub unrestricted: bool,
     pub docker_network: Option<String>,
@@ -190,7 +192,10 @@ pub struct LlmHostConfig {
 }
 
 impl LlmHostConfig {
-    pub fn hosts_for_provider(&self, provider: Option<&str>) -> Vec<String> {
+    pub fn resolve_provider_hosts(
+        &self,
+        provider: Option<&str>,
+    ) -> anyhow::Result<(String, Vec<String>)> {
         let provider_key = provider
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -203,15 +208,16 @@ impl LlmHostConfig {
                     .map(|s| s.to_ascii_lowercase())
             });
 
-        let mut out = Vec::new();
-        let Some(provider_key) = provider_key else {
-            return out;
-        };
-
-        if let Some(hosts) = self.providers.get(&provider_key) {
-            out.extend(normalize_hosts(hosts));
+        let provider_key = provider_key.context("egress.llm.default_provider is required")?;
+        let hosts = self
+            .providers
+            .get(&provider_key)
+            .ok_or_else(|| anyhow::anyhow!("unknown LLM provider '{provider_key}'"))?;
+        let hosts = canonical_hosts(hosts);
+        if hosts.is_empty() {
+            anyhow::bail!("LLM provider '{provider_key}' must configure at least one host");
         }
-        out
+        Ok((provider_key, hosts))
     }
 }
 
@@ -270,7 +276,7 @@ pub fn load_local_agent_config(path_override: Option<&Path>) -> anyhow::Result<L
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
     normalize_config(&mut parsed)?;
     parsed.config_tree = Some(
-        load_config_tree_snapshot(&config_root)
+        load_config_tree_snapshot(&config_root, &parsed.egress.llm)
             .with_context(|| format!("load config tree from {}", config_root.display()))?,
     );
     Ok(parsed)
@@ -301,6 +307,7 @@ struct SystemManifestToml {
 
 #[derive(Debug, Deserialize)]
 struct LlmProviderToml {
+    name: String,
     #[serde(default)]
     hosts: Vec<String>,
 }
@@ -354,7 +361,10 @@ struct PolicyAllowEntryToml {
     hosts_from: Option<String>,
 }
 
-fn load_config_tree_snapshot(root: &Path) -> anyhow::Result<ConfigTreeSnapshot> {
+fn load_config_tree_snapshot(
+    root: &Path,
+    local_llm: &LlmHostConfig,
+) -> anyhow::Result<ConfigTreeSnapshot> {
     let system_path = root.join("system.toml");
     let system_file: SystemManifestFile = read_toml_file(&system_path, "system manifest")?;
     let system = system_file.system;
@@ -382,13 +392,7 @@ fn load_config_tree_snapshot(root: &Path) -> anyhow::Result<ConfigTreeSnapshot> 
         });
     }
 
-    let llm_hosts = normalize_hosts(
-        &system
-            .llm_providers
-            .into_iter()
-            .flat_map(|provider| provider.hosts)
-            .collect::<Vec<_>>(),
-    );
+    let llm_provider_hosts = validate_llm_provider_host_maps(&system.llm_providers, local_llm)?;
 
     let mut policies_by_name = HashMap::new();
     for policy_name in &system.network_policies.installed {
@@ -427,7 +431,6 @@ fn load_config_tree_snapshot(root: &Path) -> anyhow::Result<ConfigTreeSnapshot> 
         let policy = resolve_network_policy(
             policy_name,
             &policies_by_name,
-            &llm_hosts,
             &mut resolution_cache,
             &mut HashSet::new(),
         )?;
@@ -437,13 +440,51 @@ fn load_config_tree_snapshot(root: &Path) -> anyhow::Result<ConfigTreeSnapshot> 
     Ok(ConfigTreeSnapshot {
         environments,
         network_policies,
+        llm_provider_hosts,
     })
+}
+
+fn system_llm_provider_hosts(
+    providers: &[LlmProviderToml],
+) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let mut hosts_by_provider = HashMap::new();
+    for provider in providers {
+        let name = provider.name.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            anyhow::bail!("system.llm_providers name must not be empty");
+        }
+        let hosts = canonical_hosts(&provider.hosts);
+        if hosts.is_empty() {
+            anyhow::bail!("system LLM provider '{name}' must configure at least one host");
+        }
+        if hosts_by_provider.insert(name.clone(), hosts).is_some() {
+            anyhow::bail!("system.llm_providers contains duplicate provider '{name}'");
+        }
+    }
+    Ok(hosts_by_provider)
+}
+
+fn validate_llm_provider_host_maps(
+    system_providers: &[LlmProviderToml],
+    local: &LlmHostConfig,
+) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let system = system_llm_provider_hosts(system_providers)?;
+    let local_hosts = local
+        .providers
+        .iter()
+        .map(|(provider, hosts)| (provider.trim().to_ascii_lowercase(), canonical_hosts(hosts)))
+        .collect::<HashMap<_, _>>();
+    if system != local_hosts {
+        anyhow::bail!(
+            "system and local-agent LLM provider host maps must exactly match: system={system:?} local={local_hosts:?}"
+        );
+    }
+    Ok(system)
 }
 
 fn resolve_network_policy(
     policy_name: &str,
     policies_by_name: &HashMap<String, NetworkPolicyToml>,
-    llm_hosts: &[String],
     cache: &mut HashMap<String, ConfiguredNetworkPolicy>,
     resolving: &mut HashSet<String>,
 ) -> anyhow::Result<ConfiguredNetworkPolicy> {
@@ -460,7 +501,7 @@ fn resolve_network_policy(
         .ok_or_else(|| anyhow::anyhow!("network policy '{policy_name}' is not loaded"))?;
 
     let mut resolved = if let Some(parent_name) = policy.extends.as_deref() {
-        resolve_network_policy(parent_name, policies_by_name, llm_hosts, cache, resolving)?
+        resolve_network_policy(parent_name, policies_by_name, cache, resolving)?
     } else {
         ConfiguredNetworkPolicy::default()
     };
@@ -468,6 +509,7 @@ fn resolve_network_policy(
     if policy.unrestricted.unwrap_or(false) {
         resolved.unrestricted = true;
         resolved.hosts.clear();
+        resolved.uses_llm_provider_hosts = false;
     }
     if let Some(docker_network) = &policy.docker_network {
         resolved.docker_network = Some(docker_network.clone());
@@ -475,11 +517,13 @@ fn resolve_network_policy(
 
     for allow in &policy.allow {
         resolved.hosts.extend(allow.hosts.clone());
-        if allow.hosts_from.as_deref() == Some("system.llm_providers") {
-            resolved.hosts.extend(llm_hosts.iter().cloned());
+        match allow.hosts_from.as_deref() {
+            Some("system.llm_providers") => resolved.uses_llm_provider_hosts = true,
+            Some(reference) => anyhow::bail!("unsupported hosts_from reference '{reference}'"),
+            None => {}
         }
     }
-    resolved.hosts = normalize_hosts(&resolved.hosts);
+    resolved.hosts = canonical_hosts(&resolved.hosts);
 
     for (key, value) in &policy.env {
         resolved.env.insert(key.clone(), value.clone());
@@ -497,6 +541,16 @@ fn read_toml_file<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> a
 }
 
 fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
+    config.egress.preflight_image = Some(
+        config
+            .egress
+            .preflight_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|image| !image.is_empty())
+            .context("egress.preflight_image is required")?
+            .to_string(),
+    );
     config.github_hosts = config
         .github_hosts
         .iter()
@@ -516,13 +570,28 @@ fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
             Ok((host, api_base_url))
         })
         .collect::<anyhow::Result<HashMap<_, _>>>()?;
-    config.egress.llm.providers = config
+    config.egress.llm.default_provider = config
         .egress
         .llm
-        .providers
-        .iter()
-        .map(|(provider, hosts)| (provider.to_ascii_lowercase(), normalize_hosts(hosts)))
-        .collect();
+        .default_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(str::to_ascii_lowercase);
+    let mut providers = HashMap::new();
+    for (provider, hosts) in &config.egress.llm.providers {
+        let provider = provider.trim().to_ascii_lowercase();
+        if provider.is_empty() {
+            anyhow::bail!("egress.llm.providers name must not be empty");
+        }
+        if providers
+            .insert(provider.clone(), canonical_hosts(hosts))
+            .is_some()
+        {
+            anyhow::bail!("egress.llm.providers contains duplicate provider '{provider}'");
+        }
+    }
+    config.egress.llm.providers = providers;
     config.egress.build.github_hosts = normalize_hosts(&config.egress.build.github_hosts);
     config.egress.build.go_registry_hosts = normalize_hosts(&config.egress.build.go_registry_hosts);
     config.egress.build.crates_registry_hosts =
@@ -625,6 +694,13 @@ pub fn normalize_hosts(hosts: &[String]) -> Vec<String> {
     out
 }
 
+pub fn canonical_hosts(hosts: &[String]) -> Vec<String> {
+    let mut hosts = normalize_hosts(hosts);
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 fn default_proxy_image() -> String {
     // Use pinned stable image digest to avoid beta/default-latest drift.
     "ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029"
@@ -715,10 +791,117 @@ mod tests {
         };
 
         assert_eq!(
-            cfg.hosts_for_provider(Some("anthropic")),
+            cfg.resolve_provider_hosts(Some("anthropic")).unwrap().1,
             vec!["api.anthropic.com"]
         );
-        assert_eq!(cfg.hosts_for_provider(None), vec!["api.openai.com"]);
+        assert_eq!(
+            cfg.resolve_provider_hosts(None).unwrap().1,
+            vec!["api.openai.com"]
+        );
+        assert!(cfg.resolve_provider_hosts(Some("missing")).is_err());
+    }
+
+    #[test]
+    fn provider_host_maps_preserve_providers_and_compare_as_sets() {
+        let providers = vec![
+            LlmProviderToml {
+                name: "first".to_string(),
+                hosts: vec![
+                    "login.example.com".to_string(),
+                    "chat.example.com".to_string(),
+                ],
+            },
+            LlmProviderToml {
+                name: "second".to_string(),
+                hosts: vec!["other.example.com".to_string()],
+            },
+        ];
+        let mut local = LlmHostConfig {
+            default_provider: Some("first".to_string()),
+            providers: HashMap::from([
+                (
+                    "first".to_string(),
+                    vec![
+                        "chat.example.com".to_string(),
+                        "login.example.com".to_string(),
+                    ],
+                ),
+                ("second".to_string(), vec!["other.example.com".to_string()]),
+            ]),
+        };
+        assert_eq!(
+            validate_llm_provider_host_maps(&providers, &local).unwrap(),
+            HashMap::from([
+                (
+                    "first".to_string(),
+                    vec![
+                        "chat.example.com".to_string(),
+                        "login.example.com".to_string(),
+                    ],
+                ),
+                ("second".to_string(), vec!["other.example.com".to_string()],),
+            ])
+        );
+
+        local
+            .providers
+            .get_mut("first")
+            .unwrap()
+            .push("other.example.com".to_string());
+        assert!(validate_llm_provider_host_maps(&providers, &local).is_err());
+    }
+
+    #[test]
+    fn policy_inheritance_preserves_dynamic_provider_hosts() {
+        let policies = HashMap::from([
+            (
+                "llm-only".to_string(),
+                NetworkPolicyToml {
+                    name: "llm-only".to_string(),
+                    extends: None,
+                    docker_network: None,
+                    unrestricted: None,
+                    allow: vec![PolicyAllowEntryToml {
+                        hosts: Vec::new(),
+                        hosts_from: Some("system.llm_providers".to_string()),
+                    }],
+                    env: HashMap::new(),
+                },
+            ),
+            (
+                "build".to_string(),
+                NetworkPolicyToml {
+                    name: "build".to_string(),
+                    extends: Some("llm-only".to_string()),
+                    docker_network: None,
+                    unrestricted: None,
+                    allow: vec![PolicyAllowEntryToml {
+                        hosts: vec!["z.example.com".to_string(), "a.example.com".to_string()],
+                        hosts_from: None,
+                    }],
+                    env: HashMap::new(),
+                },
+            ),
+        ]);
+
+        let policy =
+            resolve_network_policy("build", &policies, &mut HashMap::new(), &mut HashSet::new())
+                .unwrap();
+        assert!(policy.uses_llm_provider_hosts);
+        assert_eq!(policy.hosts, vec!["a.example.com", "z.example.com"]);
+    }
+
+    #[test]
+    fn local_agent_config_requires_a_preflight_image() {
+        let mut config = LocalAgentConfig::default();
+        assert!(normalize_config(&mut config).is_err());
+
+        config.egress.preflight_image = Some(" job-code:locked ".to_string());
+        normalize_config(&mut config).unwrap();
+        assert_eq!(
+            config.egress.preflight_image.as_deref(),
+            Some("job-code:locked")
+        );
     }
 
     #[test]
@@ -745,7 +928,10 @@ mod tests {
     #[test]
     fn normalize_runner_spec_strips_blank_fields() {
         let mut config = LocalAgentConfig {
-            egress: EgressConfig::default(),
+            egress: EgressConfig {
+                preflight_image: Some("job-code:locked".to_string()),
+                ..EgressConfig::default()
+            },
             credential_providers: HashMap::new(),
             default_agent: ManagedRunnerSpec {
                 kind: ManagedRunnerKind::Generic,
