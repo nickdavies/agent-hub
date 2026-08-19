@@ -5,8 +5,8 @@ use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use protocol::{
     CreateWorkItemRequest, FireEventRequest, HeartbeatRequest, Job, JobState, JobUpdateRequest,
-    PollJobRequest, PollJobResponse, RegisterWorkerRequest, WorkItem, WorkerInfo,
-    WorkflowDefinition, WorkflowDocument,
+    PollJobRequest, PollJobResponse, ReactiveWorkflowDefinition, RegisterWorkerRequest, WorkItem,
+    WorkerInfo,
 };
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -140,14 +140,8 @@ pub struct DispatchResponse {
 
 pub async fn list_workflows<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
-) -> Json<Vec<WorkflowDefinition>> {
+) -> Json<Vec<ReactiveWorkflowDefinition>> {
     Json(state.orchestration.list_workflows())
-}
-
-pub async fn list_workflow_documents<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
-) -> Json<Vec<WorkflowDocument>> {
-    Json(state.orchestration.list_workflow_documents())
 }
 
 pub async fn validate_workflows<N: super::super::notifier::Notifier>(

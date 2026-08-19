@@ -107,6 +107,7 @@ mod immutable_authorization_tests {
                     claim_type: "workspace".to_string(),
                     branch_name: Some("task/change".to_string()),
                 }],
+                github_capabilities: Vec::new(),
             },
             resolved_environment: serde_json::json!({"network":"none"}),
             provider: ResolvedAuthorizationProvider {
@@ -161,10 +162,6 @@ mod immutable_authorization_tests {
         let baseline = request();
 
         let mut changed = baseline.clone();
-        changed.permission_envelope.permissions.tier = PlannedPermissionTier::RawCompatible;
-        assert!(!changed.permissions_are_subset_of(&baseline));
-
-        let mut changed = baseline.clone();
         changed
             .permission_envelope
             .permissions
@@ -190,6 +187,31 @@ mod immutable_authorization_tests {
 
         let mut changed = baseline.clone();
         changed.permission_envelope.repos[0].claim_type = "unknown".to_string();
+        assert!(!changed.permissions_are_subset_of(&baseline));
+    }
+
+    #[test]
+    fn github_api_base_is_digest_bound_and_requires_exact_subset_identity() {
+        let mut baseline = request();
+        baseline.permission_envelope.github_capabilities = vec![GithubCapability {
+            host: "github.com".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            repository: "reddit/agent-hub".to_string(),
+            operations: vec![GithubOperation::PushBranch],
+            branch: Some("agent-hub/task".to_string()),
+            head_branch: Some("agent-hub/task".to_string()),
+            base_branch: Some("main".to_string()),
+            pull_request: None,
+            expected_head_sha: None,
+            credential_provider: "github:github.com:read_write".to_string(),
+        }];
+        let mut changed = baseline.clone();
+        changed.permission_envelope.github_capabilities[0].api_base_url =
+            "https://github.com/api/v3".to_string();
+        assert_ne!(
+            baseline.request_digest().unwrap(),
+            changed.request_digest().unwrap()
+        );
         assert!(!changed.permissions_are_subset_of(&baseline));
     }
 
@@ -228,12 +250,22 @@ use uuid::Uuid;
 use crate::sessions::SessionId;
 
 #[derive(
-    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, Display, EnumString,
+    Debug,
+    Clone,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    Hash,
+    Display,
+    EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ExecutionMode {
-    Raw,
+    #[default]
     Docker,
 }
 
@@ -251,6 +283,7 @@ pub enum WorkItemState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderIdentity {
     #[serde(default)]
     pub provider_id: Option<String>,
@@ -385,6 +418,7 @@ pub enum WorkflowEventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EventSource {
     Webhook,
+    ScmPoller,
     Agent,
     System,
     Manual,
@@ -418,7 +452,6 @@ pub fn workflow_event_is_externally_fireable(event: &WorkflowEventKind) -> bool 
             | WorkflowEventKind::OwnerChangesRequested
             | WorkflowEventKind::CoworkerPrApproved
             | WorkflowEventKind::CoworkerChangesRequested
-            | WorkflowEventKind::PrMerged
             | WorkflowEventKind::ChecksPassed
             | WorkflowEventKind::ChecksFailed
             | WorkflowEventKind::Cancel
@@ -474,18 +507,6 @@ pub fn reactive_event_kind_from_str(event: &str) -> Option<ReactiveEventKind> {
 
 pub fn reactive_event_kind_for_workflow_event(event: WorkflowEventKind) -> ReactiveEventKind {
     event
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum WorkflowStepKind {
-    Agent,
-    ChildWorkflow,
-}
-
-fn default_workflow_step_kind() -> WorkflowStepKind {
-    WorkflowStepKind::Agent
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -575,12 +596,14 @@ pub struct GithubPullRequestMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PromptRef {
     pub system: Option<String>,
     pub user: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RepoSource {
     pub repo_url: String,
     /// Git ref to check out in worktree (e.g. origin/main).
@@ -588,6 +611,252 @@ pub struct RepoSource {
     /// Desired branch name for job/work item lifecycle.
     #[serde(default)]
     pub branch_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoAccessMode {
+    ReadOnly,
+    #[default]
+    ReadWrite,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Display,
+    EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GithubOperation {
+    ReadRepository,
+    PushBranch,
+    ReadPullRequest,
+    CreatePullRequest,
+    MarkPullRequestReady,
+    RequestReview,
+    MergePullRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GithubAction {
+    PushHead,
+    ReadOrCreatePullRequest,
+    MarkPullRequestReady,
+    RequestReview,
+    MergePullRequest,
+}
+
+impl GithubAction {
+    pub fn required_operations(&self) -> &'static [GithubOperation] {
+        match self {
+            Self::PushHead => &[GithubOperation::PushBranch],
+            Self::ReadOrCreatePullRequest => &[
+                GithubOperation::ReadPullRequest,
+                GithubOperation::CreatePullRequest,
+            ],
+            Self::MarkPullRequestReady => &[
+                GithubOperation::ReadPullRequest,
+                GithubOperation::MarkPullRequestReady,
+            ],
+            Self::RequestReview => &[
+                GithubOperation::ReadPullRequest,
+                GithubOperation::RequestReview,
+            ],
+            Self::MergePullRequest => &[
+                GithubOperation::ReadPullRequest,
+                GithubOperation::MergePullRequest,
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GithubCapabilityRequest {
+    pub operations: Vec<GithubOperation>,
+    pub access: GithubAccessClass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubAccessClass {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GithubCapability {
+    pub host: String,
+    pub api_base_url: String,
+    pub repository: String,
+    pub operations: Vec<GithubOperation>,
+    pub branch: Option<String>,
+    pub head_branch: Option<String>,
+    pub base_branch: Option<String>,
+    pub pull_request: Option<u64>,
+    pub expected_head_sha: Option<String>,
+    pub credential_provider: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubRepositoryIdentity {
+    pub host: String,
+    pub owner: String,
+    pub repository: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubPullRequestIdentity {
+    pub repository: GithubRepositoryIdentity,
+    pub number: u64,
+}
+
+pub fn parse_github_repository_url(value: &str) -> Option<GithubRepositoryIdentity> {
+    let url = parse_strict_https_url(value)?;
+    let segments = strict_path_segments(&url)?;
+    if segments.len() != 2 {
+        return None;
+    }
+    let owner = validated_github_path_segment(segments[0])?;
+    let repository =
+        validated_github_path_segment(segments[1].strip_suffix(".git").unwrap_or(segments[1]))?;
+    Some(GithubRepositoryIdentity {
+        host: url.host_str()?.to_string(),
+        owner: owner.to_string(),
+        repository: repository.to_string(),
+    })
+}
+
+pub fn canonical_github_host(value: &str) -> Option<String> {
+    if value.is_empty() || value != value.trim() || value.contains(['/', '@', ':', '?', '#']) {
+        return None;
+    }
+    let url = url::Url::parse(&format!("https://{value}/")).ok()?;
+    if url.port().is_some() {
+        return None;
+    }
+    Some(url.host_str()?.to_ascii_lowercase())
+}
+
+pub fn canonical_github_api_base_url(value: &str) -> Option<String> {
+    if value.is_empty() || value != value.trim() || value.contains('%') {
+        return None;
+    }
+    let authority = value.strip_prefix("https://")?.split('/').next()?;
+    if authority.contains(':') {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port().is_some()
+        || url.host_str().is_none()
+    {
+        return None;
+    }
+    let path = url.path().trim_end_matches('/');
+    if path.split('/').any(|segment| matches!(segment, "." | "..")) {
+        return None;
+    }
+    let mut canonical = format!("https://{}", url.host_str()?);
+    canonical.push_str(path);
+    Some(canonical)
+}
+
+pub fn canonical_github_api_base_for_host(host: &str, value: &str) -> Option<String> {
+    let host = canonical_github_host(host)?;
+    let api_base = canonical_github_api_base_url(value)?;
+    let api_url = url::Url::parse(&api_base).ok()?;
+    let api_host = api_url.host_str()?;
+    if host == "github.com" {
+        if api_host != "api.github.com" || api_url.path() != "/" {
+            return None;
+        }
+    } else if api_host != host {
+        return None;
+    }
+    Some(api_base)
+}
+
+pub fn parse_github_pull_request_url(value: &str) -> Option<GithubPullRequestIdentity> {
+    let url = parse_strict_https_url(value)?;
+    let segments = strict_path_segments(&url)?;
+    if segments.len() != 4 || segments[2] != "pull" {
+        return None;
+    }
+    let owner = validated_github_path_segment(segments[0])?;
+    let repository =
+        validated_github_path_segment(segments[1].strip_suffix(".git").unwrap_or(segments[1]))?;
+    let number = segments[3].parse::<u64>().ok()?;
+    if number == 0 {
+        return None;
+    }
+    Some(GithubPullRequestIdentity {
+        repository: GithubRepositoryIdentity {
+            host: url.host_str()?.to_string(),
+            owner: owner.to_string(),
+            repository: repository.to_string(),
+        },
+        number,
+    })
+}
+
+fn parse_strict_https_url(value: &str) -> Option<url::Url> {
+    if value.is_empty() || value != value.trim() || value.contains('%') {
+        return None;
+    }
+    let authority = value.strip_prefix("https://")?.split('/').next()?;
+    if authority.contains(':') {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port().is_some()
+    {
+        return None;
+    }
+    url.host_str()?;
+    Some(url)
+}
+
+fn strict_path_segments(url: &url::Url) -> Option<Vec<&str>> {
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    Some(segments)
+}
+
+fn validated_github_path_segment(value: &str) -> Option<&str> {
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,7 +868,7 @@ pub struct EnvironmentDefinition {
     pub allowed_overlays: Vec<String>,
     pub description: Option<String>,
     /// Optional runtime preference for this environment. Names a managed-runner
-    /// id known to the local-agent (e.g. `cursor-default`, `opencode-default`),
+    /// id known to the local-agent (e.g. `opencode-default`),
     /// or `auto`/`None` to defer to the local-agent's configured default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
@@ -618,38 +887,6 @@ pub struct EnvironmentSelection {
     pub overlays: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct WorkflowStep {
-    pub id: String,
-    #[serde(default = "default_workflow_step_kind")]
-    pub kind: WorkflowStepKind,
-    pub executor: ExecutionMode,
-    #[serde(default)]
-    pub container_image: Option<String>,
-    #[serde(default)]
-    pub child_workflow_id: Option<String>,
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    pub prompt: Option<PromptRef>,
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub max_retries: u32,
-    pub on_success: Option<String>,
-    pub on_failure: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct WorkflowDefinition {
-    pub id: String,
-    pub entry_step: String,
-    #[serde(default)]
-    pub steps: Vec<WorkflowStep>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -665,10 +902,7 @@ pub enum ReactiveStateKind {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ReactiveExecutionConfig {
-    #[serde(default)]
-    pub executor: Option<ExecutionMode>,
-    #[serde(default)]
-    pub environment_tier: Option<PlannedEnvironmentTier>,
+    pub executor: ExecutionMode,
     #[serde(default)]
     pub container_image: Option<String>,
     #[serde(default)]
@@ -676,19 +910,18 @@ pub struct ReactiveExecutionConfig {
     #[serde(default)]
     pub overlays: Vec<String>,
     #[serde(default)]
-    pub network: Option<String>,
-    #[serde(default)]
     pub network_resources: Option<NetworkResourceRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_rules: Option<ApprovalRuleSet>,
-    #[serde(default)]
-    pub timeout: Option<u64>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub toolchains: Option<Vec<String>>,
     #[serde(default)]
     pub candidate_repos: Vec<RepoSource>,
+    pub repo_access: RepoAccessMode,
+    #[serde(default)]
+    pub github_capability: Option<GithubCapabilityRequest>,
     #[serde(default)]
     pub max_retries: u32,
 }
@@ -709,10 +942,7 @@ impl<'de> Deserialize<'de> for ReactiveAgentStateConfig {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct RawReactiveAgentStateConfig {
-            #[serde(default)]
-            executor: Option<ExecutionMode>,
-            #[serde(default)]
-            environment_tier: Option<PlannedEnvironmentTier>,
+            executor: ExecutionMode,
             #[serde(default)]
             container_image: Option<String>,
             #[serde(default)]
@@ -720,19 +950,18 @@ impl<'de> Deserialize<'de> for ReactiveAgentStateConfig {
             #[serde(default)]
             overlays: Vec<String>,
             #[serde(default)]
-            network: Option<String>,
-            #[serde(default)]
             network_resources: Option<NetworkResourceRequest>,
             #[serde(default)]
             approval_rules: Option<ApprovalRuleSet>,
-            #[serde(default)]
-            timeout: Option<u64>,
             #[serde(default)]
             timeout_secs: Option<u64>,
             #[serde(default)]
             toolchains: Option<Vec<String>>,
             #[serde(default)]
             candidate_repos: Vec<RepoSource>,
+            repo_access: RepoAccessMode,
+            #[serde(default)]
+            github_capability: Option<GithubCapabilityRequest>,
             #[serde(default)]
             max_retries: u32,
             #[serde(default)]
@@ -743,17 +972,16 @@ impl<'de> Deserialize<'de> for ReactiveAgentStateConfig {
         Ok(Self {
             execution: ReactiveExecutionConfig {
                 executor: raw.executor,
-                environment_tier: raw.environment_tier,
                 container_image: raw.container_image,
                 environment: raw.environment,
                 overlays: raw.overlays,
-                network: raw.network,
                 network_resources: raw.network_resources,
                 approval_rules: raw.approval_rules,
-                timeout: raw.timeout,
                 timeout_secs: raw.timeout_secs,
                 toolchains: raw.toolchains,
                 candidate_repos: raw.candidate_repos,
+                repo_access: raw.repo_access,
+                github_capability: raw.github_capability,
                 max_retries: raw.max_retries,
             },
             prompt: raw.prompt,
@@ -782,10 +1010,7 @@ impl<'de> Deserialize<'de> for ReactiveCommandStateConfig {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct RawReactiveCommandStateConfig {
-            #[serde(default)]
-            executor: Option<ExecutionMode>,
-            #[serde(default)]
-            environment_tier: Option<PlannedEnvironmentTier>,
+            executor: ExecutionMode,
             #[serde(default)]
             container_image: Option<String>,
             #[serde(default)]
@@ -793,19 +1018,18 @@ impl<'de> Deserialize<'de> for ReactiveCommandStateConfig {
             #[serde(default)]
             overlays: Vec<String>,
             #[serde(default)]
-            network: Option<String>,
-            #[serde(default)]
             network_resources: Option<NetworkResourceRequest>,
             #[serde(default)]
             approval_rules: Option<ApprovalRuleSet>,
-            #[serde(default)]
-            timeout: Option<u64>,
             #[serde(default)]
             timeout_secs: Option<u64>,
             #[serde(default)]
             toolchains: Option<Vec<String>>,
             #[serde(default)]
             candidate_repos: Vec<RepoSource>,
+            repo_access: RepoAccessMode,
+            #[serde(default)]
+            github_capability: Option<GithubCapabilityRequest>,
             #[serde(default)]
             max_retries: u32,
             command: String,
@@ -821,17 +1045,16 @@ impl<'de> Deserialize<'de> for ReactiveCommandStateConfig {
         Ok(Self {
             execution: ReactiveExecutionConfig {
                 executor: raw.executor,
-                environment_tier: raw.environment_tier,
                 container_image: raw.container_image,
                 environment: raw.environment,
                 overlays: raw.overlays,
-                network: raw.network,
                 network_resources: raw.network_resources,
                 approval_rules: raw.approval_rules,
-                timeout: raw.timeout,
                 timeout_secs: raw.timeout_secs,
                 toolchains: raw.toolchains,
                 candidate_repos: raw.candidate_repos,
+                repo_access: raw.repo_access,
+                github_capability: raw.github_capability,
                 max_retries: raw.max_retries,
             },
             command: raw.command,
@@ -846,7 +1069,7 @@ impl<'de> Deserialize<'de> for ReactiveCommandStateConfig {
 pub struct ReactiveManagedStateConfig {
     #[serde(flatten)]
     pub execution: ReactiveExecutionConfig,
-    pub operation: String,
+    pub operation: GithubAction,
     #[serde(default)]
     pub prompt: Option<PromptRef>,
 }
@@ -859,10 +1082,7 @@ impl<'de> Deserialize<'de> for ReactiveManagedStateConfig {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct RawReactiveManagedStateConfig {
-            #[serde(default)]
-            executor: Option<ExecutionMode>,
-            #[serde(default)]
-            environment_tier: Option<PlannedEnvironmentTier>,
+            executor: ExecutionMode,
             #[serde(default)]
             container_image: Option<String>,
             #[serde(default)]
@@ -870,22 +1090,21 @@ impl<'de> Deserialize<'de> for ReactiveManagedStateConfig {
             #[serde(default)]
             overlays: Vec<String>,
             #[serde(default)]
-            network: Option<String>,
-            #[serde(default)]
             network_resources: Option<NetworkResourceRequest>,
             #[serde(default)]
             approval_rules: Option<ApprovalRuleSet>,
-            #[serde(default)]
-            timeout: Option<u64>,
             #[serde(default)]
             timeout_secs: Option<u64>,
             #[serde(default)]
             toolchains: Option<Vec<String>>,
             #[serde(default)]
             candidate_repos: Vec<RepoSource>,
+            repo_access: RepoAccessMode,
+            #[serde(default)]
+            github_capability: Option<GithubCapabilityRequest>,
             #[serde(default)]
             max_retries: u32,
-            operation: String,
+            operation: GithubAction,
             #[serde(default)]
             prompt: Option<PromptRef>,
         }
@@ -894,17 +1113,16 @@ impl<'de> Deserialize<'de> for ReactiveManagedStateConfig {
         Ok(Self {
             execution: ReactiveExecutionConfig {
                 executor: raw.executor,
-                environment_tier: raw.environment_tier,
                 container_image: raw.container_image,
                 environment: raw.environment,
                 overlays: raw.overlays,
-                network: raw.network,
                 network_resources: raw.network_resources,
                 approval_rules: raw.approval_rules,
-                timeout: raw.timeout,
                 timeout_secs: raw.timeout_secs,
                 toolchains: raw.toolchains,
                 candidate_repos: raw.candidate_repos,
+                repo_access: raw.repo_access,
+                github_capability: raw.github_capability,
                 max_retries: raw.max_retries,
             },
             operation: raw.operation,
@@ -996,6 +1214,7 @@ pub enum ReactiveTerminalOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReactiveWorkflowTransition {
     pub event: ReactiveTransitionEvent,
     pub target: String,
@@ -1004,8 +1223,6 @@ pub struct ReactiveWorkflowTransition {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ReactiveWorkflowState {
     pub id: String,
-    #[serde(default)]
-    pub auto_merge: bool,
     #[serde(flatten)]
     pub config: ReactiveStateConfig,
     #[serde(default)]
@@ -1019,6 +1236,7 @@ impl ReactiveWorkflowState {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalRuleSet {
     /// Tools that are auto-approved for this job
     #[serde(default)]
@@ -1032,6 +1250,7 @@ pub struct ApprovalRuleSet {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MergePolicy {
     /// Required status check names that must pass
     #[serde(default)]
@@ -1048,28 +1267,13 @@ pub struct MergePolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReactiveWorkflowDefinition {
     pub id: String,
-    #[serde(default = "default_reactive_schema")]
     pub schema: String,
     pub initial_state: String,
     #[serde(default)]
     pub states: Vec<ReactiveWorkflowState>,
-}
-
-fn default_reactive_schema() -> String {
-    "reactive_v2".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "schema_variant", rename_all = "snake_case")]
-pub enum WorkflowDocument {
-    LegacyV1 {
-        workflow: WorkflowDefinition,
-    },
-    ReactiveV2 {
-        workflow: ReactiveWorkflowDefinition,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1091,38 +1295,27 @@ impl WorkflowValidationReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkflowTomlFile {
-    pub workflow: WorkflowDefinition,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReactiveWorkflowTomlFile {
     pub workflow: ReactiveWorkflowDefinition,
 }
 
-pub fn parse_workflow_toml(input: &str) -> Result<WorkflowDefinition, toml::de::Error> {
-    let wrapped: WorkflowTomlFile = toml::from_str(input)?;
-    Ok(wrapped.workflow)
-}
-
-pub fn parse_workflow_toml_document(input: &str) -> Result<WorkflowDocument, toml::de::Error> {
+pub fn parse_workflow_toml(input: &str) -> Result<ReactiveWorkflowDefinition, toml::de::Error> {
     let value: toml::Value = toml::from_str(input)?;
     let schema = value
         .get("workflow")
         .and_then(|w| w.get("schema"))
         .and_then(toml::Value::as_str)
-        .unwrap_or("legacy_v1");
-    if schema == "reactive_v2" {
-        let wrapped: ReactiveWorkflowTomlFile = value.try_into()?;
-        Ok(WorkflowDocument::ReactiveV2 {
-            workflow: wrapped.workflow,
-        })
-    } else {
-        let wrapped: WorkflowTomlFile = value.try_into()?;
-        Ok(WorkflowDocument::LegacyV1 {
-            workflow: wrapped.workflow,
-        })
+        .ok_or_else(|| {
+            serde::de::Error::custom("workflow.schema is required and must be 'reactive_v2'")
+        })?;
+    if schema != "reactive_v2" {
+        return Err(serde::de::Error::custom(format!(
+            "workflow schema '{schema}' is not supported (expected reactive_v2)"
+        )));
     }
+    let wrapped: ReactiveWorkflowTomlFile = value.try_into()?;
+    Ok(wrapped.workflow)
 }
 
 pub fn validate_reactive_workflow(def: &ReactiveWorkflowDefinition) -> WorkflowValidationReport {
@@ -1146,50 +1339,7 @@ pub fn validate_reactive_workflow(def: &ReactiveWorkflowDefinition) -> WorkflowV
     let mut ids = HashSet::new();
     for state in &def.states {
         let execution = state.config.execution();
-        if let Some(network) = execution.and_then(|cfg| cfg.network.as_deref())
-            && !matches!(network, "none" | "restricted" | "full")
-        {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!(
-                    "state '{}' has unknown network '{}' (expected one of: none, restricted, full)",
-                    state.id, network
-                ),
-            });
-        }
-
-        if execution.and_then(|cfg| cfg.network.as_deref()).is_some()
-            && execution
-                .and_then(|cfg| cfg.network_resources.as_ref())
-                .is_some()
-        {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!(
-                    "state '{}' must not set both network and network_resources",
-                    state.id
-                ),
-            });
-        }
-
-        if matches!(
-            execution.and_then(|cfg| cfg.environment_tier.clone()),
-            Some(PlannedEnvironmentTier::Kubernetes)
-        ) {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!(
-                    "state '{}' has unknown environment_tier 'kubernetes' (expected one of: kube, docker, raw)",
-                    state.id
-                ),
-            });
-        }
-
-        let effective_network_request = execution
-            .and_then(|cfg| cfg.network_resources.clone())
-            .or_else(|| {
-                network_request_from_legacy_label(execution.and_then(|cfg| cfg.network.as_deref()))
-            });
+        let effective_network_request = execution.and_then(|cfg| cfg.network_resources.clone());
         if matches!(
             effective_network_request,
             Some(NetworkResourceRequest::None)
@@ -1236,13 +1386,78 @@ pub fn validate_reactive_workflow(def: &ReactiveWorkflowDefinition) -> WorkflowV
                 ),
             });
         }
-        if matches!(state.kind(), ReactiveStateKind::Agent) {
-            if execution.and_then(|cfg| cfg.executor.as_ref()).is_none() {
+        if execution.is_some_and(|config| config.executor != ExecutionMode::Docker) {
+            errors.push(WorkflowValidationError {
+                workflow_id: def.id.clone(),
+                message: format!("executable state '{}' must use Docker", state.id),
+            });
+        }
+        if let Some(capability) = execution.and_then(|config| config.github_capability.as_ref()) {
+            if capability.operations.is_empty() {
                 errors.push(WorkflowValidationError {
                     workflow_id: def.id.clone(),
-                    message: format!("agent state '{}' must declare executor", state.id),
+                    message: format!(
+                        "state '{}' GitHub capability must declare operations",
+                        state.id
+                    ),
                 });
             }
+            if !matches!(state.config, ReactiveStateConfig::Managed(_)) {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' may declare github_capability only for a managed GitHub action",
+                        state.id
+                    ),
+                });
+            }
+            if !matches!(execution.and_then(|config| config.network_resources.as_ref()), Some(NetworkResourceRequest::Resources(resources)) if resources == &[NetworkResourceKind::Github])
+            {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "state '{}' GitHub capability requires the GitHub-only network policy",
+                        state.id
+                    ),
+                });
+            }
+        }
+        if let ReactiveStateConfig::Managed(config) = &state.config {
+            if execution
+                .and_then(|config| config.timeout_secs)
+                .is_none_or(|value| value == 0)
+            {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "managed GitHub state '{}' requires positive timeout_secs",
+                        state.id
+                    ),
+                });
+            }
+            let valid_capability = execution
+                .and_then(|execution| execution.github_capability.as_ref())
+                .is_some_and(|capability| {
+                    let mut actual = capability.operations.clone();
+                    actual.sort();
+                    actual.dedup();
+                    let mut required = config.operation.required_operations().to_vec();
+                    required.sort();
+                    capability.access == GithubAccessClass::ReadWrite
+                        && actual == required
+                        && capability.operations.len() == required.len()
+                });
+            if !valid_capability {
+                errors.push(WorkflowValidationError {
+                    workflow_id: def.id.clone(),
+                    message: format!(
+                        "managed GitHub state '{}' requires the exact read_write operation set for '{}'",
+                        state.id, config.operation
+                    ),
+                });
+            }
+        }
+        if matches!(state.kind(), ReactiveStateKind::Agent) {
             if let ReactiveStateConfig::Agent(_) = &state.config {
             } else {
                 errors.push(WorkflowValidationError {
@@ -1269,14 +1484,6 @@ pub fn validate_reactive_workflow(def: &ReactiveWorkflowDefinition) -> WorkflowV
             errors.push(WorkflowValidationError {
                 workflow_id: def.id.clone(),
                 message: format!("command state '{}' must declare command", state.id),
-            });
-        }
-        if let ReactiveStateConfig::Managed(config) = &state.config
-            && config.operation.trim().is_empty()
-        {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("managed state '{}' must declare operation", state.id),
             });
         }
         if let Some(timeout_secs) = execution.and_then(|cfg| cfg.timeout_secs)
@@ -1566,17 +1773,10 @@ pub fn validate_reactive_workflow(def: &ReactiveWorkflowDefinition) -> WorkflowV
 
 pub fn validate_reactive_workflows(
     defs: &[ReactiveWorkflowDefinition],
-    legacy_defs: &[WorkflowDefinition],
 ) -> WorkflowValidationReport {
     let mut errors = Vec::new();
     let mut ids = HashSet::new();
-    let mut all_catalog_ids = legacy_defs
-        .iter()
-        .map(|d| d.id.as_str())
-        .collect::<HashSet<_>>();
-    for def in defs {
-        all_catalog_ids.insert(def.id.as_str());
-    }
+    let all_catalog_ids = defs.iter().map(|d| d.id.as_str()).collect::<HashSet<_>>();
     for def in defs {
         if !ids.insert(def.id.clone()) {
             errors.push(WorkflowValidationError {
@@ -1668,275 +1868,6 @@ pub fn validate_reactive_workflows(
         );
     }
     WorkflowValidationReport { errors }
-}
-
-pub fn validate_workflow_document(doc: &WorkflowDocument) -> WorkflowValidationReport {
-    match doc {
-        WorkflowDocument::LegacyV1 { workflow } => validate_workflow(workflow),
-        WorkflowDocument::ReactiveV2 { workflow } => validate_reactive_workflow(workflow),
-    }
-}
-
-pub fn validate_workflow(def: &WorkflowDefinition) -> WorkflowValidationReport {
-    let mut errors = Vec::new();
-    let mut ids = HashSet::new();
-    for step in &def.steps {
-        if step.id.trim().is_empty() {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: "step id must not be empty".to_string(),
-            });
-            continue;
-        }
-        if !ids.insert(step.id.clone()) {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("duplicate step id '{}'", step.id),
-            });
-        }
-        if step.id.contains('.') {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!(
-                    "step '{}' must not contain '.' (reserved by dot-path interpolation aliases)",
-                    step.id
-                ),
-            });
-        }
-        if let Some(prompt) = &step.prompt
-            && prompt.user.trim().is_empty()
-        {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("step '{}' has empty user prompt reference", step.id),
-            });
-        }
-        if step.kind == WorkflowStepKind::Agent && step.command.trim().is_empty() {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("step '{}' command must not be empty", step.id),
-            });
-        }
-        if step.kind == WorkflowStepKind::ChildWorkflow {
-            let child = step
-                .child_workflow_id
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default();
-            if child.is_empty() {
-                errors.push(WorkflowValidationError {
-                    workflow_id: def.id.clone(),
-                    message: format!(
-                        "step '{}' child_workflow_id must be set for child_workflow kind",
-                        step.id
-                    ),
-                });
-            }
-        }
-        if let Some(image) = &step.container_image
-            && image.trim().is_empty()
-        {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("step '{}' has empty container_image", step.id),
-            });
-        }
-        if let Some(timeout_secs) = step.timeout_secs
-            && timeout_secs == 0
-        {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("step '{}' timeout_secs must be > 0", step.id),
-            });
-        }
-    }
-
-    if !ids.contains(&def.entry_step) {
-        errors.push(WorkflowValidationError {
-            workflow_id: def.id.clone(),
-            message: format!("entry_step '{}' does not exist", def.entry_step),
-        });
-    }
-
-    for step in &def.steps {
-        if let Some(next) = &step.on_success
-            && !ids.contains(next)
-        {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("step '{}' on_success '{}' does not exist", step.id, next),
-            });
-        }
-        if let Some(next) = &step.on_failure
-            && !ids.contains(next)
-        {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("step '{}' on_failure '{}' does not exist", step.id, next),
-            });
-        }
-    }
-
-    let step_map = def
-        .steps
-        .iter()
-        .map(|step| (step.id.as_str(), step))
-        .collect::<HashMap<_, _>>();
-    let mut visiting = HashSet::new();
-    let mut visited = HashSet::new();
-    for step in &def.steps {
-        if has_cycle(step.id.as_str(), &step_map, &mut visiting, &mut visited) {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!(
-                    "workflow contains a cycle reachable from step '{}'",
-                    step.id
-                ),
-            });
-            break;
-        }
-    }
-
-    WorkflowValidationReport { errors }
-}
-
-fn has_cycle<'a>(
-    step_id: &'a str,
-    step_map: &HashMap<&'a str, &'a WorkflowStep>,
-    visiting: &mut HashSet<&'a str>,
-    visited: &mut HashSet<&'a str>,
-) -> bool {
-    if visited.contains(step_id) {
-        return false;
-    }
-    if !visiting.insert(step_id) {
-        return true;
-    }
-
-    let has_cycle = step_map
-        .get(step_id)
-        .into_iter()
-        .flat_map(|step| [step.on_success.as_deref(), step.on_failure.as_deref()])
-        .flatten()
-        .any(|next| has_cycle(next, step_map, visiting, visited));
-
-    visiting.remove(step_id);
-    visited.insert(step_id);
-    has_cycle
-}
-
-pub fn validate_workflows(defs: &[WorkflowDefinition]) -> WorkflowValidationReport {
-    let mut errors = Vec::new();
-    let mut workflow_ids = HashSet::new();
-    for def in defs {
-        if def.id.trim().is_empty() {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: "workflow id must not be empty".to_string(),
-            });
-            continue;
-        }
-        if !workflow_ids.insert(def.id.clone()) {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!("duplicate workflow id '{}'", def.id),
-            });
-        }
-        errors.extend(validate_workflow(def).errors);
-    }
-    let ids = defs.iter().map(|d| d.id.as_str()).collect::<HashSet<_>>();
-    let mut child_edges = HashMap::<&str, Vec<&str>>::new();
-    for def in defs {
-        for step in &def.steps {
-            if step.kind != WorkflowStepKind::ChildWorkflow {
-                continue;
-            }
-            if let Some(child_id) = step.child_workflow_id.as_deref() {
-                if !ids.contains(child_id) {
-                    errors.push(WorkflowValidationError {
-                        workflow_id: def.id.clone(),
-                        message: format!(
-                            "step '{}' references unknown child workflow '{}'",
-                            step.id, child_id
-                        ),
-                    });
-                }
-                if child_id == def.id {
-                    errors.push(WorkflowValidationError {
-                        workflow_id: def.id.clone(),
-                        message: format!(
-                            "step '{}' child workflow must not reference itself",
-                            step.id
-                        ),
-                    });
-                }
-                child_edges
-                    .entry(def.id.as_str())
-                    .or_default()
-                    .push(child_id);
-            }
-        }
-    }
-
-    // Reject nested child workflows: a workflow referenced as child may not itself contain child steps.
-    for (parent_id, children) in &child_edges {
-        for child_id in children {
-            if let Some(child_def) = defs.iter().find(|d| d.id == *child_id)
-                && child_def
-                    .steps
-                    .iter()
-                    .any(|s| s.kind == WorkflowStepKind::ChildWorkflow)
-            {
-                errors.push(WorkflowValidationError {
-                    workflow_id: (*parent_id).to_string(),
-                    message: format!(
-                        "workflow '{}' references child workflow '{}' which itself contains child_workflow steps (nested child workflows not supported)",
-                        parent_id, child_id
-                    ),
-                });
-            }
-        }
-    }
-
-    // Cross-workflow cycle detection for child-workflow references (A -> B -> ... -> A).
-    let mut visiting = HashSet::<&str>::new();
-    let mut visited = HashSet::<&str>::new();
-    for def in defs {
-        if has_child_cycle(def.id.as_str(), &child_edges, &mut visiting, &mut visited) {
-            errors.push(WorkflowValidationError {
-                workflow_id: def.id.clone(),
-                message: format!(
-                    "child workflow reference cycle detected starting at '{}'",
-                    def.id
-                ),
-            });
-        }
-    }
-    WorkflowValidationReport { errors }
-}
-
-fn has_child_cycle<'a>(
-    id: &'a str,
-    edges: &HashMap<&'a str, Vec<&'a str>>,
-    visiting: &mut HashSet<&'a str>,
-    visited: &mut HashSet<&'a str>,
-) -> bool {
-    if visited.contains(id) {
-        return false;
-    }
-    if !visiting.insert(id) {
-        return true;
-    }
-
-    let has_cycle = edges
-        .get(id)
-        .into_iter()
-        .flatten()
-        .any(|next| has_child_cycle(next, edges, visiting, visited));
-
-    visiting.remove(id);
-    visited.insert(id);
-    has_cycle
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2203,8 +2134,6 @@ pub struct PlannedPermissionSet {
 #[serde(rename_all = "snake_case")]
 pub enum PlannedPermissionTier {
     DockerDefault,
-    RawCompatible,
-    KubernetesStub,
 }
 
 #[derive(
@@ -2241,31 +2170,6 @@ impl NetworkResourceRequest {
     }
 }
 
-pub fn network_request_from_legacy_label(label: Option<&str>) -> Option<NetworkResourceRequest> {
-    match label {
-        Some("none") => Some(NetworkResourceRequest::None),
-        Some("full") => Some(NetworkResourceRequest::Full),
-        Some("restricted") => Some(NetworkResourceRequest::Resources(vec![
-            NetworkResourceKind::Llm,
-            NetworkResourceKind::Github,
-            NetworkResourceKind::GoRegistry,
-            NetworkResourceKind::CratesRegistry,
-        ])),
-        _ => None,
-    }
-}
-
-pub fn legacy_network_label_for_request(
-    request: Option<&NetworkResourceRequest>,
-) -> Option<String> {
-    match request {
-        Some(NetworkResourceRequest::None) => Some("none".to_string()),
-        Some(NetworkResourceRequest::Full) => Some("full".to_string()),
-        Some(NetworkResourceRequest::Resources(_)) => Some("restricted".to_string()),
-        None => None,
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PlannedEnvironmentSpec {
     pub tier: PlannedEnvironmentTier,
@@ -2278,8 +2182,6 @@ pub struct PlannedEnvironmentSpec {
     pub memory_limit: Option<String>,
     #[serde(default)]
     pub cpu_limit: Option<String>,
-    #[serde(default)]
-    pub network: Option<String>,
     #[serde(default)]
     pub network_resources: Option<NetworkResourceRequest>,
     #[serde(default)]
@@ -2301,8 +2203,6 @@ pub struct PlannedFileMount {
 #[serde(rename_all = "snake_case")]
 pub enum PlannedEnvironmentTier {
     Docker,
-    Raw,
-    Kubernetes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -2363,6 +2263,8 @@ pub struct CanonicalRuntimeSpec {
     pub approval_rules: Option<ApprovalRuleSet>,
     #[serde(default)]
     pub repos: Vec<PlannedRepoClaim>,
+    #[serde(default)]
+    pub github_capabilities: Vec<GithubCapability>,
 }
 
 fn default_runtime_version() -> String {
@@ -2550,6 +2452,7 @@ pub fn authorization_execution_context(context: &serde_json::Value) -> serde_jso
             "last_failure_reason",
             "required_action_description",
             "provider_ownership",
+            "task_human_gate_state",
             "authorization_epoch_id",
             "used_state_invocations",
         ] {
@@ -2577,10 +2480,6 @@ fn normalize_runtime_for_authorization(runtime: &mut CanonicalRuntimeSpec) {
         resources.sort_by_key(ToString::to_string);
         resources.dedup();
     }
-    if runtime.environment.network_resources.is_some() {
-        runtime.environment.network =
-            legacy_network_label_for_request(runtime.environment.network_resources.as_ref());
-    }
     if let Some(rules) = runtime.approval_rules.as_mut() {
         normalize_string_set(&mut rules.auto_approve);
         normalize_string_set(&mut rules.escalate);
@@ -2603,6 +2502,35 @@ fn normalize_runtime_for_authorization(runtime: &mut CanonicalRuntimeSpec) {
             ))
     });
     runtime.repos.dedup();
+    for capability in &mut runtime.github_capabilities {
+        capability.operations.sort();
+        capability.operations.dedup();
+    }
+    runtime.github_capabilities.sort_by(|left, right| {
+        (
+            &left.host,
+            &left.api_base_url,
+            &left.repository,
+            &left.branch,
+            &left.head_branch,
+            &left.base_branch,
+            left.pull_request,
+            &left.expected_head_sha,
+            &left.credential_provider,
+        )
+            .cmp(&(
+                &right.host,
+                &right.api_base_url,
+                &right.repository,
+                &right.branch,
+                &right.head_branch,
+                &right.base_branch,
+                right.pull_request,
+                &right.expected_head_sha,
+                &right.credential_provider,
+            ))
+    });
+    runtime.github_capabilities.dedup();
 }
 
 fn normalize_string_set(values: &mut Vec<String>) {
@@ -2632,10 +2560,6 @@ fn runtime_is_subset(request: &CanonicalRuntimeSpec, baseline: &CanonicalRuntime
             request.environment.network_resources.as_ref(),
             baseline.environment.network_resources.as_ref(),
         )
-        && network_label_is_subset(
-            request.environment.network.as_deref(),
-            baseline.environment.network.as_deref(),
-        )
         && (!request.permissions.can_read_workspace || baseline.permissions.can_read_workspace)
         && (!request.permissions.can_write_workspace || baseline.permissions.can_write_workspace)
         && (!request.permissions.can_run_shell || baseline.permissions.can_run_shell)
@@ -2661,6 +2585,33 @@ fn runtime_is_subset(request: &CanonicalRuntimeSpec, baseline: &CanonicalRuntime
             baseline.approval_rules.as_ref(),
         )
         && repos_are_subset(&request.repos, &baseline.repos)
+        && github_capabilities_are_subset(
+            &request.github_capabilities,
+            &baseline.github_capabilities,
+        )
+}
+
+fn github_capabilities_are_subset(
+    request: &[GithubCapability],
+    baseline: &[GithubCapability],
+) -> bool {
+    request.iter().all(|requested| {
+        baseline.iter().any(|approved| {
+            requested.host == approved.host
+                && requested.api_base_url == approved.api_base_url
+                && requested.repository == approved.repository
+                && requested.branch == approved.branch
+                && requested.head_branch == approved.head_branch
+                && requested.base_branch == approved.base_branch
+                && requested.pull_request == approved.pull_request
+                && requested.expected_head_sha == approved.expected_head_sha
+                && requested.credential_provider == approved.credential_provider
+                && requested
+                    .operations
+                    .iter()
+                    .all(|operation| approved.operations.contains(operation))
+        })
+    })
 }
 
 fn optional_limit_is_subset(request: Option<u64>, baseline: Option<u64>) -> bool {
@@ -2691,16 +2642,6 @@ fn network_is_subset(
         ) => request.iter().all(|resource| baseline.contains(resource)),
         _ => false,
     }
-}
-
-fn network_label_is_subset(request: Option<&str>, baseline: Option<&str>) -> bool {
-    let rank = |value: Option<&str>| match value.unwrap_or("none") {
-        "none" => Some(0_u8),
-        "restricted" => Some(1),
-        "full" => Some(2),
-        _ => None,
-    };
-    matches!((rank(request), rank(baseline)), (Some(request), Some(baseline)) if request <= baseline)
 }
 
 fn access_is_subset(request: Option<&str>, baseline: Option<&str>) -> bool {
@@ -2886,18 +2827,13 @@ pub fn canonical_environment_for_execution(
     container_image: Option<String>,
     timeout_secs: Option<u64>,
 ) -> PlannedEnvironmentSpec {
-    let tier = match execution_mode {
-        ExecutionMode::Docker => PlannedEnvironmentTier::Docker,
-        ExecutionMode::Raw => PlannedEnvironmentTier::Raw,
-    };
     PlannedEnvironmentSpec {
-        tier,
+        tier: PlannedEnvironmentTier::Docker,
         execution_mode,
         container_image,
         timeout_secs,
         memory_limit: None,
         cpu_limit: None,
-        network: None,
         network_resources: None,
         filesystem: None,
         file_mounts: Vec::new(),
@@ -2906,70 +2842,28 @@ pub fn canonical_environment_for_execution(
 }
 
 pub fn canonical_permissions_for_environment(
-    environment: &PlannedEnvironmentSpec,
+    _environment: &PlannedEnvironmentSpec,
 ) -> PlannedPermissionSet {
-    match environment.tier {
-        PlannedEnvironmentTier::Docker => PlannedPermissionSet {
-            tier: PlannedPermissionTier::DockerDefault,
-            can_read_workspace: true,
-            can_write_workspace: true,
-            can_run_shell: true,
-            can_access_network: false,
-            auto_approve_tools: Vec::new(),
-            escalate_tools: Vec::new(),
-            kubernetes_access: Some("none".to_string()),
-            aws_access: Some("none".to_string()),
-        },
-        PlannedEnvironmentTier::Raw => PlannedPermissionSet {
-            tier: PlannedPermissionTier::RawCompatible,
-            can_read_workspace: true,
-            can_write_workspace: true,
-            can_run_shell: true,
-            can_access_network: true,
-            auto_approve_tools: Vec::new(),
-            escalate_tools: Vec::new(),
-            kubernetes_access: Some("none".to_string()),
-            aws_access: Some("none".to_string()),
-        },
-        PlannedEnvironmentTier::Kubernetes => PlannedPermissionSet {
-            tier: PlannedPermissionTier::KubernetesStub,
-            can_read_workspace: true,
-            can_write_workspace: false,
-            can_run_shell: false,
-            can_access_network: false,
-            auto_approve_tools: Vec::new(),
-            escalate_tools: Vec::new(),
-            kubernetes_access: Some("read_only".to_string()),
-            aws_access: Some("none".to_string()),
-        },
+    PlannedPermissionSet {
+        tier: PlannedPermissionTier::DockerDefault,
+        can_read_workspace: true,
+        can_write_workspace: true,
+        can_run_shell: true,
+        can_access_network: false,
+        auto_approve_tools: Vec::new(),
+        escalate_tools: Vec::new(),
+        kubernetes_access: Some("none".to_string()),
+        aws_access: Some("none".to_string()),
     }
 }
 
 pub fn default_approval_rules_for_tier(
     tier: &PlannedEnvironmentTier,
-    network: Option<&str>,
+    network: Option<&NetworkResourceRequest>,
 ) -> ApprovalRuleSet {
-    let all_tools = vec![
-        "file_read".to_string(),
-        "file_write".to_string(),
-        "shell_safe".to_string(),
-        "shell_unknown".to_string(),
-        "git".to_string(),
-        "network".to_string(),
-        "k8s_read".to_string(),
-        "k8s_write".to_string(),
-        "aws_read".to_string(),
-        "aws_write".to_string(),
-    ];
-
     match tier {
-        PlannedEnvironmentTier::Kubernetes => ApprovalRuleSet {
-            auto_approve: all_tools,
-            escalate: Vec::new(),
-            deny: Vec::new(),
-        },
         PlannedEnvironmentTier::Docker => {
-            let has_network = !matches!(network, None | Some("none"));
+            let has_network = !matches!(network, None | Some(NetworkResourceRequest::None));
             if has_network {
                 ApprovalRuleSet {
                     auto_approve: vec![
@@ -2995,25 +2889,11 @@ pub fn default_approval_rules_for_tier(
                 }
             }
         }
-        PlannedEnvironmentTier::Raw => ApprovalRuleSet {
-            auto_approve: vec!["file_read".to_string(), "file_write".to_string()],
-            escalate: vec![
-                "shell_safe".to_string(),
-                "shell_unknown".to_string(),
-                "git".to_string(),
-                "network".to_string(),
-                "k8s_read".to_string(),
-                "k8s_write".to_string(),
-                "aws_read".to_string(),
-                "aws_write".to_string(),
-            ],
-            deny: Vec::new(),
-        },
     }
 }
 
 pub fn canonical_runtime_spec_for_job(job: &Job) -> CanonicalRuntimeSpec {
-    let mut runtime = canonical_runtime_spec_from_legacy_job_fields(
+    let mut runtime = canonical_runtime_spec_for_execution(
         job.execution_mode.clone(),
         job.container_image.clone(),
         job.timeout_secs,
@@ -3024,7 +2904,7 @@ pub fn canonical_runtime_spec_for_job(job: &Job) -> CanonicalRuntimeSpec {
     runtime
 }
 
-pub fn canonical_runtime_spec_from_legacy_job_fields(
+pub fn canonical_runtime_spec_for_execution(
     execution_mode: ExecutionMode,
     container_image: Option<String>,
     timeout_secs: Option<u64>,
@@ -3032,19 +2912,16 @@ pub fn canonical_runtime_spec_from_legacy_job_fields(
     let environment =
         canonical_environment_for_execution(execution_mode, container_image, timeout_secs);
     let permissions = canonical_permissions_for_environment(&environment);
-    let network_label = environment
-        .network_resources
-        .as_ref()
-        .and_then(|request| legacy_network_label_for_request(Some(request)));
     CanonicalRuntimeSpec {
         runtime_version: default_runtime_version(),
         approval_rules: Some(default_approval_rules_for_tier(
             &environment.tier,
-            network_label.as_deref(),
+            environment.network_resources.as_ref(),
         )),
         environment,
         permissions,
         repos: Vec::new(),
+        github_capabilities: Vec::new(),
     }
 }
 
@@ -3130,297 +3007,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_good_workflow() {
-        let def = WorkflowDefinition {
-            id: "basic".into(),
-            entry_step: "s1".into(),
-            steps: vec![WorkflowStep {
-                id: "s1".into(),
-                kind: WorkflowStepKind::Agent,
-                executor: ExecutionMode::Raw,
-                container_image: None,
-                child_workflow_id: None,
-                command: "echo".into(),
-                args: vec!["ok".into()],
-                env: HashMap::new(),
-                prompt: Some(PromptRef {
-                    system: None,
-                    user: "u.md".into(),
-                }),
-                timeout_secs: None,
-                max_retries: 0,
-                on_success: None,
-                on_failure: None,
-            }],
-        };
-
-        assert!(validate_workflow(&def).is_valid());
-    }
-
-    #[test]
-    fn parses_workflow_toml() {
-        let input = r#"
-[workflow]
-id = "wf1"
-entry_step = "s1"
-
-[[workflow.steps]]
-id = "s1"
-executor = "raw"
-command = "echo"
-args = ["hello"]
-"#;
-        let def = parse_workflow_toml(input).expect("valid toml");
-        assert_eq!(def.id, "wf1");
-        assert_eq!(def.steps.len(), 1);
-    }
-
-    #[test]
-    fn rejects_cycles() {
-        let def = WorkflowDefinition {
-            id: "cycle".into(),
-            entry_step: "a".into(),
-            steps: vec![
-                WorkflowStep {
-                    id: "a".into(),
-                    kind: WorkflowStepKind::Agent,
-                    executor: ExecutionMode::Raw,
-                    container_image: None,
-                    child_workflow_id: None,
-                    command: "echo".into(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: Some("b".into()),
-                    on_failure: None,
-                },
-                WorkflowStep {
-                    id: "b".into(),
-                    kind: WorkflowStepKind::Agent,
-                    executor: ExecutionMode::Docker,
-                    container_image: Some("alpine:3.20".into()),
-                    child_workflow_id: None,
-                    command: "echo".into(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: Some("a".into()),
-                    on_failure: None,
-                },
-            ],
-        };
-
-        assert!(!validate_workflow(&def).is_valid());
-    }
-
-    #[test]
-    fn rejects_zero_timeout() {
-        let def = WorkflowDefinition {
-            id: "bad_timeout".into(),
-            entry_step: "s1".into(),
-            steps: vec![WorkflowStep {
-                id: "s1".into(),
-                kind: WorkflowStepKind::Agent,
-                executor: ExecutionMode::Raw,
-                container_image: None,
-                child_workflow_id: None,
-                command: "echo".into(),
-                args: vec![],
-                env: HashMap::new(),
-                prompt: None,
-                timeout_secs: Some(0),
-                max_retries: 0,
-                on_success: None,
-                on_failure: None,
-            }],
-        };
-        assert!(!validate_workflow(&def).is_valid());
-    }
-
-    #[test]
-    fn rejects_step_ids_with_dots() {
-        let def = WorkflowDefinition {
-            id: "bad_step_id".into(),
-            entry_step: "build.v1".into(),
-            steps: vec![WorkflowStep {
-                id: "build.v1".into(),
-                kind: WorkflowStepKind::Agent,
-                executor: ExecutionMode::Raw,
-                container_image: None,
-                child_workflow_id: None,
-                command: "echo".into(),
-                args: vec![],
-                env: HashMap::new(),
-                prompt: None,
-                timeout_secs: None,
-                max_retries: 0,
-                on_success: None,
-                on_failure: None,
-            }],
-        };
-
-        assert!(!validate_workflow(&def).is_valid());
-    }
-
-    #[test]
-    fn validates_child_workflow_reference() {
-        let defs = vec![
-            WorkflowDefinition {
-                id: "parent".into(),
-                entry_step: "invoke_child".into(),
-                steps: vec![WorkflowStep {
-                    id: "invoke_child".into(),
-                    kind: WorkflowStepKind::ChildWorkflow,
-                    executor: ExecutionMode::Raw,
-                    container_image: None,
-                    child_workflow_id: Some("child".into()),
-                    command: String::new(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: None,
-                    on_failure: None,
-                }],
-            },
-            WorkflowDefinition {
-                id: "child".into(),
-                entry_step: "run".into(),
-                steps: vec![WorkflowStep {
-                    id: "run".into(),
-                    kind: WorkflowStepKind::Agent,
-                    executor: ExecutionMode::Raw,
-                    container_image: None,
-                    child_workflow_id: None,
-                    command: "echo".into(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: None,
-                    on_failure: None,
-                }],
-            },
-        ];
-        assert!(validate_workflows(&defs).is_valid());
-    }
-
-    #[test]
-    fn rejects_cross_workflow_child_cycle() {
-        let defs = vec![
-            WorkflowDefinition {
-                id: "a".into(),
-                entry_step: "s".into(),
-                steps: vec![WorkflowStep {
-                    id: "s".into(),
-                    kind: WorkflowStepKind::ChildWorkflow,
-                    executor: ExecutionMode::Raw,
-                    container_image: None,
-                    child_workflow_id: Some("b".into()),
-                    command: String::new(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: None,
-                    on_failure: None,
-                }],
-            },
-            WorkflowDefinition {
-                id: "b".into(),
-                entry_step: "s".into(),
-                steps: vec![WorkflowStep {
-                    id: "s".into(),
-                    kind: WorkflowStepKind::ChildWorkflow,
-                    executor: ExecutionMode::Raw,
-                    container_image: None,
-                    child_workflow_id: Some("a".into()),
-                    command: String::new(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: None,
-                    on_failure: None,
-                }],
-            },
-        ];
-        assert!(!validate_workflows(&defs).is_valid());
-    }
-
-    #[test]
-    fn rejects_nested_child_workflow() {
-        let defs = vec![
-            WorkflowDefinition {
-                id: "parent".into(),
-                entry_step: "child".into(),
-                steps: vec![WorkflowStep {
-                    id: "child".into(),
-                    kind: WorkflowStepKind::ChildWorkflow,
-                    executor: ExecutionMode::Raw,
-                    container_image: None,
-                    child_workflow_id: Some("mid".into()),
-                    command: String::new(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: None,
-                    on_failure: None,
-                }],
-            },
-            WorkflowDefinition {
-                id: "mid".into(),
-                entry_step: "nested".into(),
-                steps: vec![WorkflowStep {
-                    id: "nested".into(),
-                    kind: WorkflowStepKind::ChildWorkflow,
-                    executor: ExecutionMode::Raw,
-                    container_image: None,
-                    child_workflow_id: Some("leaf".into()),
-                    command: String::new(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: None,
-                    on_failure: None,
-                }],
-            },
-            WorkflowDefinition {
-                id: "leaf".into(),
-                entry_step: "run".into(),
-                steps: vec![WorkflowStep {
-                    id: "run".into(),
-                    kind: WorkflowStepKind::Agent,
-                    executor: ExecutionMode::Raw,
-                    container_image: None,
-                    child_workflow_id: None,
-                    command: "echo".into(),
-                    args: vec![],
-                    env: HashMap::new(),
-                    prompt: None,
-                    timeout_secs: None,
-                    max_retries: 0,
-                    on_success: None,
-                    on_failure: None,
-                }],
-            },
-        ];
-        assert!(!validate_workflows(&defs).is_valid());
-    }
-
-    #[test]
     fn parses_reactive_workflow_document() {
         let input = r#"
 [workflow]
@@ -3449,14 +3035,9 @@ id = "done"
 kind = "terminal"
 "#;
 
-        let doc = parse_workflow_toml_document(input).expect("parse");
-        match doc {
-            WorkflowDocument::ReactiveV2 { workflow } => {
-                assert_eq!(workflow.id, "reactive_demo");
-                assert!(validate_reactive_workflow(&workflow).is_valid());
-            }
-            _ => panic!("expected reactive workflow"),
-        }
+        let workflow = parse_workflow_toml(input).expect("parse");
+        assert_eq!(workflow.id, "reactive_demo");
+        assert!(validate_reactive_workflow(&workflow).is_valid());
     }
 
     #[test]
@@ -3556,7 +3137,7 @@ kind = "terminal"
         assert!(workflow_event_is_externally_fireable(
             &WorkflowEventKind::CoworkerChangesRequested
         ));
-        assert!(workflow_event_is_externally_fireable(
+        assert!(workflow_event_is_internal_system_only(
             &WorkflowEventKind::PrMerged
         ));
         assert!(workflow_event_is_externally_fireable(
@@ -3594,7 +3175,6 @@ kind = "terminal"
                 timeout_secs: Some(45),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -3612,6 +3192,7 @@ kind = "terminal"
                 aws_access: None,
             },
             approval_rules: None,
+            github_capabilities: vec![],
             repos: vec![],
         };
 
@@ -3658,11 +3239,7 @@ id = "done"
 kind = "terminal"
 "#;
 
-        let doc = parse_workflow_toml_document(input).expect("parse role-aware workflow");
-        let workflow = match doc {
-            WorkflowDocument::ReactiveV2 { workflow } => workflow,
-            WorkflowDocument::LegacyV1 { .. } => panic!("expected reactive workflow"),
-        };
+        let workflow = parse_workflow_toml(input).expect("parse role-aware workflow");
         assert!(
             validate_reactive_workflow(&workflow).is_valid(),
             "role-aware review events should be valid for human states"
@@ -3678,7 +3255,7 @@ kind = "terminal"
             step_id: "s1".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -3705,7 +3282,6 @@ kind = "terminal"
                 timeout_secs: Some(42),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -3723,6 +3299,7 @@ kind = "terminal"
                 aws_access: None,
             },
             approval_rules: None,
+            github_capabilities: vec![],
             repos: vec![],
         };
         project_runtime_spec_into_job_context(&mut job.context, &from_context);
@@ -3732,7 +3309,7 @@ kind = "terminal"
 
     fn exec_with_mode(mode: ExecutionMode) -> ReactiveExecutionConfig {
         ReactiveExecutionConfig {
-            executor: Some(mode),
+            executor: mode,
             ..Default::default()
         }
     }
@@ -3740,7 +3317,6 @@ kind = "terminal"
     fn auto_state(id: &str, target: &str) -> ReactiveWorkflowState {
         ReactiveWorkflowState {
             id: id.to_string(),
-            auto_merge: false,
             config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig::default()),
             on: vec![ReactiveWorkflowTransition {
                 event: ReactiveEventKind::Start.into(),
@@ -3752,9 +3328,8 @@ kind = "terminal"
     fn agent_state(id: &str, next: &str) -> ReactiveWorkflowState {
         ReactiveWorkflowState {
             id: id.to_string(),
-            auto_merge: false,
             config: ReactiveStateConfig::Agent(ReactiveAgentStateConfig {
-                execution: exec_with_mode(ExecutionMode::Raw),
+                execution: exec_with_mode(ExecutionMode::Docker),
                 prompt: None,
             }),
             on: vec![ReactiveWorkflowTransition {
@@ -3767,7 +3342,6 @@ kind = "terminal"
     fn terminal_state(id: &str) -> ReactiveWorkflowState {
         ReactiveWorkflowState {
             id: id.to_string(),
-            auto_merge: false,
             config: ReactiveStateConfig::Terminal(ReactiveTerminalStateConfig::default()),
             on: vec![],
         }
@@ -3783,7 +3357,6 @@ kind = "terminal"
                 auto_state("auto", "agent"),
                 ReactiveWorkflowState {
                     id: "agent".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Agent(ReactiveAgentStateConfig {
                         execution: exec_with_mode(ExecutionMode::Docker),
                         prompt: Some(PromptRef {
@@ -3798,9 +3371,8 @@ kind = "terminal"
                 },
                 ReactiveWorkflowState {
                     id: "command".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Command(ReactiveCommandStateConfig {
-                        execution: exec_with_mode(ExecutionMode::Raw),
+                        execution: exec_with_mode(ExecutionMode::Docker),
                         command: "echo".into(),
                         args: vec!["ok".into()],
                         env: HashMap::new(),
@@ -3813,10 +3385,20 @@ kind = "terminal"
                 },
                 ReactiveWorkflowState {
                     id: "managed".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Managed(ReactiveManagedStateConfig {
-                        execution: exec_with_mode(ExecutionMode::Docker),
-                        operation: "default-agent".into(),
+                        execution: ReactiveExecutionConfig {
+                            network_resources: Some(NetworkResourceRequest::Resources(vec![
+                                NetworkResourceKind::Github,
+                            ])),
+                            repo_access: RepoAccessMode::ReadWrite,
+                            github_capability: Some(GithubCapabilityRequest {
+                                operations: vec![GithubOperation::PushBranch],
+                                access: GithubAccessClass::ReadWrite,
+                            }),
+                            timeout_secs: Some(120),
+                            ..exec_with_mode(ExecutionMode::Docker)
+                        },
+                        operation: GithubAction::PushHead,
                         prompt: None,
                     }),
                     on: vec![ReactiveWorkflowTransition {
@@ -3827,7 +3409,8 @@ kind = "terminal"
                 terminal_state("done"),
             ],
         };
-        assert!(validate_reactive_workflow(&def).is_valid());
+        let report = validate_reactive_workflow(&def);
+        assert!(report.is_valid(), "{:?}", report.errors);
     }
 
     #[test]
@@ -3839,9 +3422,8 @@ kind = "terminal"
             states: vec![
                 ReactiveWorkflowState {
                     id: "run".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Command(ReactiveCommandStateConfig {
-                        execution: exec_with_mode(ExecutionMode::Raw),
+                        execution: exec_with_mode(ExecutionMode::Docker),
                         command: " ".into(),
                         args: vec![],
                         env: HashMap::new(),
@@ -3861,34 +3443,6 @@ kind = "terminal"
                 .iter()
                 .any(|e| e.message.contains("must declare command"))
         );
-
-        let managed_bad = ReactiveWorkflowDefinition {
-            id: "managed_bad".into(),
-            schema: "reactive_v2".into(),
-            initial_state: "run".into(),
-            states: vec![
-                ReactiveWorkflowState {
-                    id: "run".into(),
-                    auto_merge: false,
-                    config: ReactiveStateConfig::Managed(ReactiveManagedStateConfig {
-                        execution: exec_with_mode(ExecutionMode::Docker),
-                        operation: " ".into(),
-                        prompt: None,
-                    }),
-                    on: vec![ReactiveWorkflowTransition {
-                        event: ReactiveEventKind::JobSucceeded.into(),
-                        target: "done".into(),
-                    }],
-                },
-                terminal_state("done"),
-            ],
-        };
-        assert!(
-            validate_reactive_workflow(&managed_bad)
-                .errors
-                .iter()
-                .any(|e| e.message.contains("must declare operation"))
-        );
     }
 
     #[test]
@@ -3899,7 +3453,6 @@ kind = "terminal"
             initial_state: "auto1".into(),
             states: vec![ReactiveWorkflowState {
                 id: "auto1".into(),
-                auto_merge: false,
                 config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig::default()),
                 on: vec![ReactiveWorkflowTransition {
                     event: ReactiveEventKind::WorkflowChosen.into(),
@@ -3919,9 +3472,8 @@ kind = "terminal"
             states: vec![
                 ReactiveWorkflowState {
                     id: "cmd".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Command(ReactiveCommandStateConfig {
-                        execution: exec_with_mode(ExecutionMode::Raw),
+                        execution: exec_with_mode(ExecutionMode::Docker),
                         command: "echo".into(),
                         args: vec![],
                         env: HashMap::new(),
@@ -3934,10 +3486,9 @@ kind = "terminal"
                 },
                 ReactiveWorkflowState {
                     id: "managed".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Managed(ReactiveManagedStateConfig {
                         execution: exec_with_mode(ExecutionMode::Docker),
-                        operation: "foo".into(),
+                        operation: GithubAction::PushHead,
                         prompt: None,
                     }),
                     on: vec![ReactiveWorkflowTransition {
@@ -3994,7 +3545,7 @@ id = "done"
 kind = "terminal"
 "#;
 
-        let err = parse_workflow_toml_document(input).expect_err("unknown event should fail parse");
+        let err = parse_workflow_toml(input).expect_err("unknown event should fail parse");
         assert!(
             err.to_string()
                 .contains("unknown reactive transition event 'go_now'")
@@ -4009,7 +3560,6 @@ kind = "terminal"
             initial_state: "done".into(),
             states: vec![ReactiveWorkflowState {
                 id: "done".into(),
-                auto_merge: false,
                 config: ReactiveStateConfig::Terminal(ReactiveTerminalStateConfig::default()),
                 on: vec![ReactiveWorkflowTransition {
                     event: ReactiveEventKind::Cancel.into(),
@@ -4030,7 +3580,6 @@ kind = "terminal"
             states: vec![
                 ReactiveWorkflowState {
                     id: "review".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Human(ReactiveHumanStateConfig::default()),
                     on: vec![
                         ReactiveWorkflowTransition {
@@ -4060,9 +3609,8 @@ kind = "terminal"
             states: vec![
                 ReactiveWorkflowState {
                     id: "run".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Agent(ReactiveAgentStateConfig {
-                        execution: exec_with_mode(ExecutionMode::Raw),
+                        execution: exec_with_mode(ExecutionMode::Docker),
                         prompt: None,
                     }),
                     on: vec![ReactiveWorkflowTransition {
@@ -4086,7 +3634,6 @@ kind = "terminal"
             states: vec![
                 ReactiveWorkflowState {
                     id: "review".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Human(ReactiveHumanStateConfig::default()),
                     on: vec![ReactiveWorkflowTransition {
                         event: ReactiveEventKind::JobSucceeded.into(),
@@ -4109,7 +3656,6 @@ kind = "terminal"
             states: vec![
                 ReactiveWorkflowState {
                     id: "review".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Human(ReactiveHumanStateConfig::default()),
                     on: vec![ReactiveWorkflowTransition {
                         event: ReactiveEventKind::Cancel.into(),
@@ -4131,7 +3677,6 @@ kind = "terminal"
             initial_state: "done".into(),
             states: vec![ReactiveWorkflowState {
                 id: "done".into(),
-                auto_merge: false,
                 config: ReactiveStateConfig::Terminal(ReactiveTerminalStateConfig {
                     terminal_outcome: Some(ReactiveTerminalOutcome::Failed),
                 }),
@@ -4164,8 +3709,8 @@ id = "done"
 kind = "terminal"
 "#;
 
-        let err = parse_workflow_toml_document(input)
-            .expect_err("human state should reject terminal_outcome");
+        let err =
+            parse_workflow_toml(input).expect_err("human state should reject terminal_outcome");
         assert!(err.to_string().contains("unknown field `terminal_outcome`"));
     }
 
@@ -4190,8 +3735,7 @@ target = "done"
 id = "done"
 kind = "terminal"
 "#;
-        let err = parse_workflow_toml_document(input)
-            .expect_err("human state should reject child_workflow");
+        let err = parse_workflow_toml(input).expect_err("human state should reject child_workflow");
         assert!(err.to_string().contains("unknown field `child_workflow`"));
     }
 
@@ -4207,7 +3751,8 @@ initial_state = "run"
 id = "run"
 kind = "command"
 command = "echo"
-executor = "raw"
+executor = "docker"
+repo_access = "read_only"
 timeout_secs = 30
 
 [[workflow.states.on]]
@@ -4219,24 +3764,19 @@ id = "done"
 kind = "terminal"
 "#;
 
-        let doc = parse_workflow_toml_document(input).expect("parse command state");
-        match doc {
-            WorkflowDocument::ReactiveV2 { workflow } => {
-                let run = workflow
-                    .states
-                    .iter()
-                    .find(|state| state.id == "run")
-                    .expect("run state");
-                match &run.config {
-                    ReactiveStateConfig::Command(config) => {
-                        assert_eq!(config.command, "echo");
-                        assert_eq!(config.execution.executor, Some(ExecutionMode::Raw));
-                        assert_eq!(config.execution.timeout_secs, Some(30));
-                    }
-                    _ => panic!("expected command state"),
-                }
+        let workflow = parse_workflow_toml(input).expect("parse command state");
+        let run = workflow
+            .states
+            .iter()
+            .find(|state| state.id == "run")
+            .expect("run state");
+        match &run.config {
+            ReactiveStateConfig::Command(config) => {
+                assert_eq!(config.command, "echo");
+                assert_eq!(config.execution.executor, ExecutionMode::Docker);
+                assert_eq!(config.execution.timeout_secs, Some(30));
             }
-            _ => panic!("expected reactive workflow"),
+            _ => panic!("expected command state"),
         }
     }
 
@@ -4261,8 +3801,8 @@ target = "done"
 id = "done"
 kind = "terminal"
 "#;
-        let err = parse_workflow_toml_document(agent_input)
-            .expect_err("agent state should reject unknown field");
+        let err =
+            parse_workflow_toml(agent_input).expect_err("agent state should reject unknown field");
         assert!(err.to_string().contains("unknown field `prompt_typo`"));
 
         let command_input = r#"
@@ -4285,7 +3825,7 @@ target = "done"
 id = "done"
 kind = "terminal"
 "#;
-        let err = parse_workflow_toml_document(command_input)
+        let err = parse_workflow_toml(command_input)
             .expect_err("command state should reject unknown field");
         assert!(err.to_string().contains("unknown field `argz`"));
 
@@ -4298,7 +3838,11 @@ initial_state = "run"
 [[workflow.states]]
 id = "run"
 kind = "managed"
-operation = "default-agent"
+executor = "docker"
+repo_access = "read_write"
+network_resources = { resources = ["github"] }
+operation = "push_head"
+github_capability = { operations = ["push_branch"], access = "read_write" }
 operation_typo = "oops"
 
 [[workflow.states.on]]
@@ -4309,9 +3853,176 @@ target = "done"
 id = "done"
 kind = "terminal"
 "#;
-        let err = parse_workflow_toml_document(managed_input)
+        let err = parse_workflow_toml(managed_input)
             .expect_err("managed state should reject unknown field");
         assert!(err.to_string().contains("unknown field `operation_typo`"));
+    }
+
+    #[test]
+    fn reactive_schema_rejects_timeout_alias_and_unknown_nested_fields() {
+        let base = r#"[workflow]
+id = "strict"
+schema = "reactive_v2"
+initial_state = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "command"
+executor = "docker"
+repo_access = "read_only"
+command = "true"
+timeout_secs = 30
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        assert!(parse_workflow_toml(base).is_ok());
+        for invalid in [
+            base.replace("timeout_secs = 30", "timeout = 30"),
+            base.replace("timeout_secs = 30", "timeout_sec = 30"),
+            base.replace("target = \"done\"", "target = \"done\"\ntypo = true"),
+            base.replace(
+                "schema = \"reactive_v2\"",
+                "schema = \"reactive_v2\"\nunknown = true",
+            ),
+            base.replace(
+                "command = \"true\"",
+                "command = \"true\"\napproval_rules = { auto_approve = [], typo = [] }",
+            ),
+            base.replace(
+                "command = \"true\"",
+                "command = \"true\"\nprompt = { user = \"run\", typo = true }",
+            ),
+            base.replace("repo_access = \"read_only\"\n", ""),
+        ] {
+            assert!(
+                parse_workflow_toml(&invalid).is_err(),
+                "accepted:\n{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_github_capability_matrix_is_validated_at_catalog_boundary() {
+        let cases = [
+            ("push_head", "[\"push_branch\"]"),
+            (
+                "read_or_create_pull_request",
+                "[\"read_pull_request\", \"create_pull_request\"]",
+            ),
+            (
+                "mark_pull_request_ready",
+                "[\"read_pull_request\", \"mark_pull_request_ready\"]",
+            ),
+            (
+                "request_review",
+                "[\"read_pull_request\", \"request_review\"]",
+            ),
+            (
+                "merge_pull_request",
+                "[\"read_pull_request\", \"merge_pull_request\"]",
+            ),
+        ];
+        for (action, operations) in cases {
+            let source = format!(
+                "[workflow]\nid = \"managed\"\nschema = \"reactive_v2\"\ninitial_state = \"run\"\n[[workflow.states]]\nid = \"run\"\nkind = \"managed\"\nexecutor = \"docker\"\ntimeout_secs = 120\nrepo_access = \"read_only\"\nnetwork_resources = {{ resources = [\"github\"] }}\noperation = \"{action}\"\ngithub_capability = {{ operations = {operations}, access = \"read_write\" }}\n[[workflow.states.on]]\nevent = \"job_succeeded\"\ntarget = \"done\"\n[[workflow.states]]\nid = \"done\"\nkind = \"terminal\"\n"
+            );
+            let definition = parse_workflow_toml(&source).unwrap();
+            assert!(
+                validate_reactive_workflow(&definition).is_valid(),
+                "{action}"
+            );
+            for invalid in [
+                source.replace("timeout_secs = 120\n", ""),
+                source.replace("access = \"read_write\"", "access = \"read_only\""),
+                source.replace(
+                    "network_resources = { resources = [\"github\"] }",
+                    "network_resources = { resources = [\"github\", \"llm\"] }",
+                ),
+                source.replace(
+                    &format!("github_capability = {{ operations = {operations}, access = \"read_write\" }}"),
+                    "github_capability = { operations = [\"push_branch\", \"read_pull_request\"], access = \"read_write\" }",
+                ),
+            ] {
+                let definition = parse_workflow_toml(&invalid).unwrap();
+                assert!(!validate_reactive_workflow(&definition).is_valid());
+            }
+        }
+
+        let command_with_capability = r#"[workflow]
+id = "invalid"
+schema = "reactive_v2"
+initial_state = "run"
+[[workflow.states]]
+id = "run"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+network_resources = { resources = ["github"] }
+github_capability = { operations = ["push_branch"], access = "read_write" }
+command = "true"
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#;
+        assert!(
+            !validate_reactive_workflow(&parse_workflow_toml(command_with_capability).unwrap())
+                .is_valid()
+        );
+    }
+
+    #[test]
+    fn github_api_base_must_match_repository_host_identity() {
+        assert_eq!(
+            canonical_github_api_base_for_host("github.com", "https://api.github.com"),
+            Some("https://api.github.com".to_string())
+        );
+        assert!(
+            canonical_github_api_base_for_host("github.com", "https://github.com/api/v3").is_none()
+        );
+        assert_eq!(
+            canonical_github_api_base_for_host(
+                "ghe.example.com",
+                "https://ghe.example.com/custom/api/v3"
+            ),
+            Some("https://ghe.example.com/custom/api/v3".to_string())
+        );
+        assert!(
+            canonical_github_api_base_for_host(
+                "ghe.example.com",
+                "https://api.other.example/custom/api/v3"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn repository_and_provider_identity_records_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<RepoSource>(serde_json::json!({
+                "repo_url":"https://github.com/reddit/agent-hub",
+                "base_ref":"origin/main",
+                "branch_name":null,
+                "unknown":true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProviderIdentity>(serde_json::json!({
+                "provider_id":"42",
+                "display_name":"alice",
+                "unknown":true
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -4323,7 +4034,6 @@ kind = "terminal"
             states: vec![
                 ReactiveWorkflowState {
                     id: "spawn".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig {
                         child_workflow: Some("child".into()),
                         action: Some("spawn_children".into()),
@@ -4348,7 +4058,6 @@ kind = "terminal"
             states: vec![
                 ReactiveWorkflowState {
                     id: "spawn".into(),
-                    auto_merge: false,
                     config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig {
                         child_workflow: Some("missing_child".into()),
                         action: Some("spawn_children".into()),
@@ -4362,7 +4071,7 @@ kind = "terminal"
             ],
         };
 
-        let report = validate_reactive_workflows(&[reactive], &[]);
+        let report = validate_reactive_workflows(&[reactive]);
         assert!(!report.is_valid());
         assert!(report.errors.iter().any(|e| {
             e.message
@@ -4380,7 +4089,6 @@ kind = "terminal"
                 states: vec![
                     ReactiveWorkflowState {
                         id: "spawn".to_string(),
-                        auto_merge: false,
                         config: ReactiveStateConfig::Auto(ReactiveAutoStateConfig {
                             action: None,
                             child_workflow: Some(child.to_string()),
@@ -4392,7 +4100,6 @@ kind = "terminal"
                     },
                     ReactiveWorkflowState {
                         id: "done".to_string(),
-                        auto_merge: false,
                         config: ReactiveStateConfig::Terminal(ReactiveTerminalStateConfig {
                             terminal_outcome: Some(ReactiveTerminalOutcome::Succeeded),
                         }),
@@ -4401,13 +4108,13 @@ kind = "terminal"
                 ],
             }
         }
-        let report = validate_reactive_workflows(&[workflow("a", "b"), workflow("b", "a")], &[]);
+        let report = validate_reactive_workflows(&[workflow("a", "b"), workflow("b", "a")]);
         assert!(report.errors.iter().any(|error| {
             error
                 .message
                 .contains("reactive child-workflow cycle detected")
         }));
-        let direct = validate_reactive_workflows(&[workflow("self", "self")], &[]);
+        let direct = validate_reactive_workflows(&[workflow("self", "self")]);
         assert!(direct.errors.iter().any(|error| {
             error.message.contains("must not reference itself")
                 || error
@@ -4468,8 +4175,8 @@ kind = "terminal"
             step_id: "build".into(),
             state: JobState::Running,
             assigned_worker_id: Some("w1".into()),
-            execution_mode: ExecutionMode::Raw,
-            container_image: None,
+            execution_mode: ExecutionMode::Docker,
+            container_image: Some("alpine:3.20".into()),
             command: "echo".into(),
             args: vec![],
             env: HashMap::new(),
@@ -4501,14 +4208,5 @@ kind = "terminal"
         assert_eq!(env.tier, PlannedEnvironmentTier::Docker);
         assert_eq!(permissions.tier, PlannedPermissionTier::DockerDefault);
         assert!(!permissions.can_access_network);
-    }
-
-    #[test]
-    fn raw_runtime_uses_compatible_permission_tier() {
-        let env = canonical_environment_for_execution(ExecutionMode::Raw, None, None);
-        let permissions = canonical_permissions_for_environment(&env);
-        assert_eq!(env.tier, PlannedEnvironmentTier::Raw);
-        assert_eq!(permissions.tier, PlannedPermissionTier::RawCompatible);
-        assert!(permissions.can_access_network);
     }
 }

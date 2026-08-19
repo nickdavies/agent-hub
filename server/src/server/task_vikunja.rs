@@ -101,8 +101,6 @@ struct VikunjaLabel {
 struct VikunjaUser {
     id: i64,
     username: String,
-    #[serde(default)]
-    email: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2229,23 +2227,26 @@ impl TaskAdapter for VikunjaAdapter {
 
     fn write_job_result_comment(
         &self,
-        task_id: &str,
-        step_id: &str,
-        work_item_id: &str,
-        job_succeeded: bool,
-        output: &serde_json::Value,
-        context: &serde_json::Value,
-        stored_comment_id: Option<i64>,
+        result: super::task_adapter::JobResultComment<'_>,
     ) -> anyhow::Result<Option<i64>> {
-        let vikunja_task_id = self.resolve_task_numeric_id(task_id)?;
-        let job_state = if job_succeeded { "succeeded" } else { "failed" };
-        let comment = self.format_job_result_comment(step_id, job_state, output, context);
+        let vikunja_task_id = self.resolve_task_numeric_id(result.task_id)?;
+        let job_state = if result.succeeded {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        let comment = self.format_job_result_comment(
+            result.step_id,
+            job_state,
+            result.output,
+            result.context,
+        );
         let comment_id = self.write_comment(
             vikunja_task_id,
-            Some(CommentKind::JobResult(step_id.to_string())),
-            Some(work_item_id),
+            Some(CommentKind::JobResult(result.step_id.to_string())),
+            Some(result.work_item_id),
             &comment,
-            stored_comment_id,
+            result.stored_comment_id,
         )?;
         Ok(Some(comment_id))
     }
@@ -2592,7 +2593,6 @@ mod tests {
             author: VikunjaUser {
                 id: 1,
                 username: "operator".to_string(),
-                email: None,
             },
             created: timestamp.to_string(),
             updated: timestamp.to_string(),
@@ -2745,7 +2745,6 @@ mod tests {
             author: VikunjaUser {
                 id: 42,
                 username: "nick".to_string(),
-                email: None,
             },
             created: "2026-01-01T00:00:00Z".to_string(),
             updated: "2026-01-01T00:00:00Z".to_string(),
@@ -2766,7 +2765,6 @@ mod tests {
             author: VikunjaUser {
                 id: 99,
                 username: "bot".to_string(),
-                email: None,
             },
             created: "2026-01-01T00:01:00Z".to_string(),
             updated: "2026-01-01T00:01:00Z".to_string(),
@@ -2788,7 +2786,6 @@ mod tests {
             author: VikunjaUser {
                 id: 99,
                 username: "bot".to_string(),
-                email: None,
             },
             created: "2026-01-01T00:02:00Z".to_string(),
             updated: "2026-01-01T00:02:00Z".to_string(),
@@ -2820,7 +2817,6 @@ mod tests {
             author: VikunjaUser {
                 id: 99,
                 username: "bot".to_string(),
-                email: None,
             },
             created: "2026-01-01T00:00:00Z".to_string(),
             updated: "2026-01-01T00:00:00Z".to_string(),
@@ -2858,7 +2854,6 @@ mod tests {
                 author: VikunjaUser {
                     id: 10,
                     username: "alice".to_string(),
-                    email: None,
                 },
                 created: "2026-01-01T00:00:00Z".to_string(),
                 updated: "2026-01-01T00:00:00Z".to_string(),
@@ -2869,7 +2864,6 @@ mod tests {
                 author: VikunjaUser {
                     id: 11,
                     username: "bob".to_string(),
-                    email: None,
                 },
                 created: "2026-01-01T00:01:00Z".to_string(),
                 updated: "2026-01-01T00:01:00Z".to_string(),
@@ -2890,7 +2884,6 @@ mod tests {
             author: VikunjaUser {
                 id: 10,
                 username: "alice".to_string(),
-                email: None,
             },
             created: "2026-01-01T00:00:00Z".to_string(),
             updated: "2026-01-01T00:00:00Z".to_string(),
@@ -2913,7 +2906,6 @@ mod tests {
                 author: VikunjaUser {
                     id: 10,
                     username: "alice".to_string(),
-                    email: None,
                 },
                 created: "2026-01-01T00:02:00Z".to_string(),
                 updated: "2026-01-01T00:02:00Z".to_string(),
@@ -2988,7 +2980,6 @@ mod tests {
             author: VikunjaUser {
                 id: 42,
                 username: "nick".to_string(),
-                email: None,
             },
             created: "2026-01-01T00:00:00Z".to_string(),
             updated: "2026-01-01T00:00:00Z".to_string(),

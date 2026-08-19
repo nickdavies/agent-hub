@@ -2,8 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub(crate) use agent_hub_config::{
-    CursorRunnerConfig, ManagedRunnerFileMount, ManagedRunnerKind, ManagedRunnerSpec,
-    OpencodeRunnerConfig,
+    ManagedRunnerFileMount, ManagedRunnerKind, ManagedRunnerSpec, OpencodeRunnerConfig,
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,7 @@ use crate::credential_provider::CredentialProvider;
 use crate::mcp_bridge::McpBridgeConfig;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalAgentConfig {
     #[serde(default)]
     pub egress: EgressConfig,
@@ -33,11 +33,13 @@ pub struct LocalAgentConfig {
     #[serde(default)]
     pub approved_repository_roots: Vec<PathBuf>,
     /// Hosts the local-agent treats as "GitHub-shaped" when parsing repo URLs
-    /// for `AGENT_REPO_SLUG`, `GH_HOST`, and `gh auth token` resolution.
+    /// for repository identity and managed GitHub actions.
     /// Empty (or missing) means just `github.com`. Add GitHub Enterprise
     /// hosts (e.g. `github.snooguts.net`) here to opt in.
     #[serde(default)]
     pub github_hosts: Vec<String>,
+    #[serde(default)]
+    pub github_api_base_urls: HashMap<String, String>,
     #[serde(skip)]
     config_tree: Option<ConfigTreeSnapshot>,
 }
@@ -54,31 +56,24 @@ impl Default for LocalAgentConfig {
             triage_repos: Vec::new(),
             approved_repository_roots: Vec::new(),
             github_hosts: Vec::new(),
+            github_api_base_urls: HashMap::new(),
             config_tree: None,
         }
     }
 }
 
 impl LocalAgentConfig {
-    pub fn managed_runner_for_operation(&self, operation: &str) -> Option<&ManagedRunnerSpec> {
-        let key = operation.trim();
-        if key.is_empty() {
-            return None;
-        }
-        self.managed_runners.get(key)
-    }
-
     /// Resolve the effective default-agent spec, honoring (in order):
     /// 1. an explicit `override_id` (e.g. from a CLI flag or env var)
     /// 2. `self.default_agent_id` from this config file
-    /// 3. the inline `self.default_agent` struct (legacy fallback)
+    /// 3. the inline `self.default_agent` struct
     ///
     /// Returns the resolved spec and a label describing where it came from
     /// (useful for startup logging).
     pub fn resolve_default_agent<'a>(
         &'a self,
         override_id: Option<&str>,
-    ) -> (&'a ManagedRunnerSpec, String) {
+    ) -> anyhow::Result<(&'a ManagedRunnerSpec, String)> {
         let candidates = [
             (
                 override_id.map(str::trim).filter(|s| !s.is_empty()),
@@ -94,17 +89,18 @@ impl LocalAgentConfig {
         ];
 
         for (candidate, source) in candidates {
-            if let Some(name) = candidate
-                && let Some(spec) = self.managed_runners.get(name)
-            {
-                return (spec, format!("{source}={name}"));
+            if let Some(name) = candidate {
+                let spec = self.managed_runners.get(name).ok_or_else(|| {
+                    anyhow::anyhow!("{source} names unavailable managed runner '{name}'")
+                })?;
+                return Ok((spec, format!("{source}={name}")));
             }
         }
 
-        (
+        Ok((
             &self.default_agent,
             "config:default_agent (inline)".to_string(),
-        )
+        ))
     }
 
     pub fn config_tree(&self) -> Option<&ConfigTreeSnapshot> {
@@ -159,11 +155,6 @@ pub struct ConfigTreeSnapshot {
 pub struct ConfiguredEnvironment {
     pub name: String,
     pub allowed_overlays: Vec<String>,
-    /// Runtime preference for this environment. Values are operator-defined
-    /// names that map to `managed_runners` keys (e.g. "cursor-default" or
-    /// "opencode-default"), or the special string "auto" / `None` to defer to
-    /// the local-agent's effective default.
-    pub runtime: Option<String>,
     pub network_policy: String,
     pub bundle_digests: std::collections::BTreeMap<String, String>,
     pub network_policy_bundle_digests:
@@ -277,7 +268,7 @@ pub fn load_local_agent_config(path_override: Option<&Path>) -> anyhow::Result<L
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     let mut parsed: LocalAgentConfig =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    normalize_config(&mut parsed);
+    normalize_config(&mut parsed)?;
     parsed.config_tree = Some(
         load_config_tree_snapshot(&config_root)
             .with_context(|| format!("load config tree from {}", config_root.display()))?,
@@ -337,8 +328,6 @@ struct EnvironmentToml {
     network_policy: String,
     #[serde(default)]
     allowed_overlays: Vec<String>,
-    #[serde(default)]
-    runtime: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,10 +371,6 @@ fn load_config_tree_snapshot(root: &Path) -> anyhow::Result<ConfigTreeSnapshot> 
         environments.push(ConfiguredEnvironment {
             name: environment.name,
             allowed_overlays: environment.allowed_overlays,
-            runtime: environment
-                .runtime
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
             network_policy: environment.network_policy,
             bundle_digests: agent_hub_config::directory_content_digests(
                 environment_path
@@ -511,7 +496,26 @@ fn read_toml_file<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> a
     toml::from_str(&raw).with_context(|| format!("failed to parse {label} at {}", path.display()))
 }
 
-fn normalize_config(config: &mut LocalAgentConfig) {
+fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
+    config.github_hosts = config
+        .github_hosts
+        .iter()
+        .map(|host| {
+            protocol::canonical_github_host(host)
+                .ok_or_else(|| anyhow::anyhow!("invalid configured GitHub host '{host}'"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    config.github_api_base_urls = config
+        .github_api_base_urls
+        .iter()
+        .map(|(host, api_base_url)| {
+            let host = protocol::canonical_github_host(host)
+                .ok_or_else(|| anyhow::anyhow!("invalid GitHub API host mapping '{host}'"))?;
+            let api_base_url = protocol::canonical_github_api_base_for_host(&host, api_base_url)
+                .ok_or_else(|| anyhow::anyhow!("invalid GitHub API base URL for '{host}'"))?;
+            Ok((host, api_base_url))
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()?;
     config.egress.llm.providers = config
         .egress
         .llm
@@ -546,6 +550,7 @@ fn normalize_config(config: &mut LocalAgentConfig) {
         .filter(|root| !root.as_os_str().is_empty())
         .cloned()
         .collect();
+    Ok(())
 }
 
 fn normalize_runner_spec(spec: &mut ManagedRunnerSpec) {
@@ -581,9 +586,6 @@ fn normalize_runner_spec(spec: &mut ManagedRunnerSpec) {
         .collect();
     if spec.opencode.max_validation_attempts == 0 {
         spec.opencode.max_validation_attempts = default_opencode_validation_attempts();
-    }
-    if spec.cursor.max_validation_attempts == 0 {
-        spec.cursor.max_validation_attempts = default_cursor_validation_attempts();
     }
     spec.requires_credentials = spec
         .requires_credentials
@@ -633,7 +635,6 @@ fn default_managed_agent_runner() -> ManagedRunnerSpec {
     ManagedRunnerSpec {
         kind: ManagedRunnerKind::Opencode,
         opencode: OpencodeRunnerConfig::default(),
-        cursor: CursorRunnerConfig::default(),
         command: "sh".to_string(),
         args: vec![
             "-lc".to_string(),
@@ -675,9 +676,27 @@ fn default_crates_registry_hosts() -> Vec<String> {
     ]
 }
 
+const fn default_opencode_validation_attempts() -> u32 {
+    3
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_default_runner_ids_fail_when_unavailable() {
+        let mut config = LocalAgentConfig::default();
+        assert!(config.resolve_default_agent(None).is_ok());
+        config.default_agent_id = Some("missing-default".to_string());
+        assert!(config.resolve_default_agent(None).is_err());
+        config.default_agent_id = None;
+        assert!(
+            config
+                .resolve_default_agent(Some("missing-override"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn llm_hosts_resolve_from_provider_or_default() {
@@ -731,7 +750,6 @@ mod tests {
             default_agent: ManagedRunnerSpec {
                 kind: ManagedRunnerKind::Generic,
                 opencode: OpencodeRunnerConfig::default(),
-                cursor: CursorRunnerConfig::default(),
                 command: " sh ".to_string(),
                 args: vec![" -lc ".to_string(), " ".to_string()],
                 container_image: Some(" ".to_string()),
@@ -748,7 +766,6 @@ mod tests {
                 ManagedRunnerSpec {
                     kind: ManagedRunnerKind::Generic,
                     opencode: OpencodeRunnerConfig::default(),
-                    cursor: CursorRunnerConfig::default(),
                     command: " runner ".to_string(),
                     args: vec!["--go".to_string()],
                     container_image: None,
@@ -767,10 +784,11 @@ mod tests {
             ],
             approved_repository_roots: Vec::new(),
             github_hosts: Vec::new(),
+            github_api_base_urls: HashMap::new(),
             config_tree: None,
         };
 
-        normalize_config(&mut config);
+        normalize_config(&mut config).expect("normalize config");
         assert_eq!(config.default_agent.command, "sh");
         assert_eq!(config.default_agent.args, vec!["-lc"]);
         assert!(config.default_agent.container_image.is_none());
@@ -804,12 +822,4 @@ mod tests {
         assert!(runner.args[1].contains("$AGENT_PROMPT_USER_PATH"));
         assert!(runner.container_image.is_none());
     }
-}
-
-const fn default_opencode_validation_attempts() -> u32 {
-    3
-}
-
-const fn default_cursor_validation_attempts() -> u32 {
-    3
 }

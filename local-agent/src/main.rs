@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -7,11 +9,13 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
+#[cfg(test)]
+use protocol::canonical_runtime_spec_for_job;
 use protocol::{
     AgentOutput, ArtifactSummary, ExecutionMode, ExecutionOutcome, ExecutionTiming,
     JOB_RUN_SCHEMA_NAME, Job, JobEvent, JobEventKind, JobResult, JobState, NetworkResourceKind,
     NetworkResourceRequest, RegisterWorkerRequest, Secret, TerminationReason, WorkerState,
-    canonical_runtime_spec_for_job, validate_agent_output_next_event,
+    validate_agent_output_next_event,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
@@ -30,11 +34,10 @@ mod workspace;
 
 use agent_hub_config::RunnerProfilesConfig;
 use artifacts::{
-    AdditionalRepoMountView, AgentContextWriteParams, GITHUB_DEFAULT_HOST,
-    collect_structured_transcript_artifacts, display_paths_for_runtime, file_len_u64,
-    normalize_github_repo_slug_with_allowlist, parse_github_pr_from_output, parse_github_repo_url,
-    work_item_contract_from_job_context, workflow_valid_next_events_from_job_context,
-    write_agent_context_file,
+    AdditionalRepoMountView, AgentContextWriteParams, collect_structured_transcript_artifacts,
+    display_paths_for_runtime, file_len_u64, normalize_github_repo_slug_with_allowlist,
+    parse_github_pr_from_output, parse_github_repo_url, work_item_contract_from_job_context,
+    workflow_valid_next_events_from_job_context, write_agent_context_file,
 };
 use client::{
     Client, GrpcClient, HttpClient, JobUpdateOutcome, is_worker_not_found_error,
@@ -42,9 +45,7 @@ use client::{
 };
 use credential_provider::{ResolvedCredentials, resolve_all};
 use egress::{EgressManager, llm_provider_from_env};
-use egress_config::{
-    LocalAgentConfig, ManagedRunnerKind, ManagedRunnerSpec, load_local_agent_config,
-};
+use egress_config::{LocalAgentConfig, ManagedRunnerKind, load_local_agent_config};
 use mcp_bridge::{McpBridgeInstance, container_socket_path, mcp_socket_env_var};
 use pb_conv::ts_to_pb;
 #[cfg(test)]
@@ -73,9 +74,6 @@ struct Cli {
 
     #[arg(long, default_value = "localhost")]
     hostname: String,
-
-    #[arg(long, value_enum, default_values_t = vec![ModeArg::Raw, ModeArg::Docker])]
-    mode: Vec<ModeArg>,
 
     #[arg(long, default_value = "./local-agent-data")]
     data_dir: PathBuf,
@@ -106,24 +104,9 @@ struct Cli {
 }
 
 #[derive(Clone, ValueEnum)]
-enum ModeArg {
-    Raw,
-    Docker,
-}
-
-#[derive(Clone, ValueEnum)]
 enum TransportKind {
     Http,
     Grpc,
-}
-
-impl From<ModeArg> for ExecutionMode {
-    fn from(value: ModeArg) -> Self {
-        match value {
-            ModeArg::Raw => ExecutionMode::Raw,
-            ModeArg::Docker => ExecutionMode::Docker,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -466,6 +449,7 @@ fn validate_triage_repos_and_prime_cache(
     Ok(remote_repos)
 }
 
+#[cfg(test)]
 fn configured_repo_discovery_mounts(
     local_agent_config: &LocalAgentConfig,
     repo_cache_dir: &Path,
@@ -698,6 +682,7 @@ mod tests {
                 environment,
                 approval_rules: None,
                 repos: Vec::new(),
+                github_capabilities: Vec::new(),
             },
             resolved_environment: serde_json::json!({}),
             provider: protocol::ResolvedAuthorizationProvider {
@@ -848,14 +833,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_github_ssh_repo_slug() {
+    fn parse_github_ssh_repo_slug_is_rejected() {
         let allowlist = LocalAgentConfig::default().github_host_allowlist();
         assert_eq!(
             normalize_github_repo_slug_with_allowlist(
                 "git@github.com:reddit/agent-hub.git",
                 &allowlist,
             ),
-            Some("reddit/agent-hub".to_string())
+            None
         );
     }
 
@@ -868,11 +853,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_github_repo_url_extracts_host_and_slug_for_ssh() {
-        let parsed = parse_github_repo_url("git@github.snooguts.net:reddit/agent-hub.git")
-            .expect("parse ssh GHE URL");
-        assert_eq!(parsed.host, "github.snooguts.net");
-        assert_eq!(parsed.slug, "reddit/agent-hub");
+    fn parse_github_repo_url_rejects_ssh_and_adversarial_urls() {
+        for value in [
+            "git@github.snooguts.net:reddit/agent-hub.git",
+            "http://github.com/reddit/agent-hub",
+            "https://user@github.com/reddit/agent-hub",
+            "https://github.com:443/reddit/agent-hub",
+            "https://github.com/reddit/agent-hub/extra",
+            "https://github.com/reddit/%2e%2e",
+            "https://github.com/reddit/agent-hub?x=1",
+            "https://github.com/reddit/agent-hub#fragment",
+            "https://github.com/reddit/bad repo",
+        ] {
+            assert!(parse_github_repo_url(value).is_none(), "accepted {value}");
+        }
     }
 
     #[test]
@@ -1043,55 +1037,6 @@ mod tests {
         assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
 
         let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn append_gh_config_mount_sets_gh_host_for_ghe_job_override() {
-        let mut args = Vec::new();
-        let mut env = HashMap::new();
-        append_gh_config_mount_for_toolchains(
-            &mut args,
-            &mut env,
-            &["gh".to_string()],
-            Some("github.snooguts.net"),
-        );
-        assert_eq!(
-            env.get("GH_HOST").map(String::as_str),
-            Some("github.snooguts.net"),
-            "GH_HOST should be set in docker_env when the job repo is on GHE",
-        );
-    }
-
-    #[test]
-    fn append_gh_config_mount_skips_gh_host_for_default_host_override() {
-        let mut args = Vec::new();
-        let mut env = HashMap::new();
-        append_gh_config_mount_for_toolchains(
-            &mut args,
-            &mut env,
-            &["gh".to_string()],
-            Some("github.com"),
-        );
-        assert!(
-            !env.contains_key("GH_HOST"),
-            "GH_HOST should not be forced when the job repo is on github.com",
-        );
-    }
-
-    #[test]
-    fn append_gh_config_mount_skips_gh_host_when_no_gh_toolchain() {
-        let mut args = Vec::new();
-        let mut env = HashMap::new();
-        append_gh_config_mount_for_toolchains(
-            &mut args,
-            &mut env,
-            &["git".to_string()],
-            Some("github.snooguts.net"),
-        );
-        assert!(
-            !env.contains_key("GH_HOST"),
-            "GH_HOST should only be set when the gh toolchain is requested",
-        );
     }
 
     #[test]
@@ -1449,11 +1394,12 @@ mod tests {
     }
 
     #[test]
-    fn run_raw_wait_strategy_does_not_depend_on_second_command_spawn() {
+    fn supervise_process_wait_strategy_does_not_depend_on_second_command_spawn() {
         // Regression guard for no-timeout branch: command must execute once.
         let rt = tokio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let root = std::env::temp_dir().join(format!("run-raw-once-{}", uuid::Uuid::new_v4()));
+            let root =
+                std::env::temp_dir().join(format!("run-process-once-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).expect("mkdir root");
             let workspace = root.join("workspace");
             std::fs::create_dir_all(&workspace).expect("mkdir workspace");
@@ -1475,7 +1421,7 @@ mod tests {
                 step_id: "s".into(),
                 state: JobState::Assigned,
                 assigned_worker_id: Some("w1".into()),
-                execution_mode: ExecutionMode::Raw,
+                execution_mode: ExecutionMode::Docker,
                 container_image: None,
                 command: "sh".into(),
                 args: vec!["-lc".into(), script],
@@ -1493,7 +1439,7 @@ mod tests {
                 updated_at: now,
             };
 
-            let status = run_raw(
+            let status = supervise_process(
                 &job,
                 &workspace,
                 &transcript.join("transcript.jsonl"),
@@ -1505,7 +1451,7 @@ mod tests {
                 None,
             )
             .await
-            .expect("run_raw");
+            .expect("supervise_process");
 
             assert!(matches!(status, ExecutionStatus::Exited(0)));
             let n = std::fs::read_to_string(&counter).expect("counter exists");
@@ -1516,11 +1462,11 @@ mod tests {
     }
 
     #[test]
-    fn run_raw_output_validation_early_exit_stops_lingering_process_after_valid_output() {
+    fn supervise_process_output_validation_stops_lingering_process() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
             let root = std::env::temp_dir().join(format!(
-                "run-raw-validate-early-exit-{}",
+                "run-process-validate-early-exit-{}",
                 uuid::Uuid::new_v4()
             ));
             std::fs::create_dir_all(&root).expect("mkdir root");
@@ -1542,7 +1488,7 @@ mod tests {
                 step_id: "s".into(),
                 state: JobState::Assigned,
                 assigned_worker_id: Some("w1".into()),
-                execution_mode: ExecutionMode::Raw,
+                execution_mode: ExecutionMode::Docker,
                 container_image: None,
                 command: "sh".into(),
                 args: vec!["-lc".into(), script],
@@ -1561,7 +1507,7 @@ mod tests {
             };
 
             let started = Instant::now();
-            let status = run_raw_with_output_validation_early_exit(
+            let status = supervise_process_with_output_validation(
                 &job,
                 &workspace,
                 &transcript.join("transcript.jsonl"),
@@ -1578,7 +1524,7 @@ mod tests {
                 false,
             )
             .await
-            .expect("run_raw_with_output_validation_early_exit");
+            .expect("supervise_process_with_output_validation");
 
             assert!(matches!(status, ExecutionStatus::Exited(0)));
             assert!(
@@ -1591,11 +1537,11 @@ mod tests {
     }
 
     #[test]
-    fn run_raw_output_validation_early_exit_does_not_accept_invalid_output() {
+    fn supervise_process_output_validation_rejects_invalid_output() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
             let root = std::env::temp_dir().join(format!(
-                "run-raw-validate-invalid-output-{}",
+                "run-process-validate-invalid-output-{}",
                 uuid::Uuid::new_v4()
             ));
             std::fs::create_dir_all(&root).expect("mkdir root");
@@ -1617,7 +1563,7 @@ mod tests {
                 step_id: "s".into(),
                 state: JobState::Assigned,
                 assigned_worker_id: Some("w1".into()),
-                execution_mode: ExecutionMode::Raw,
+                execution_mode: ExecutionMode::Docker,
                 container_image: None,
                 command: "sh".into(),
                 args: vec!["-lc".into(), script],
@@ -1635,7 +1581,7 @@ mod tests {
                 updated_at: now,
             };
 
-            let status = run_raw_with_output_validation_early_exit(
+            let status = supervise_process_with_output_validation(
                 &job,
                 &workspace,
                 &transcript.join("transcript.jsonl"),
@@ -1652,7 +1598,7 @@ mod tests {
                 false,
             )
             .await
-            .expect("run_raw_with_output_validation_early_exit");
+            .expect("supervise_process_with_output_validation");
 
             assert!(matches!(status, ExecutionStatus::TimedOut));
 
@@ -1661,11 +1607,11 @@ mod tests {
     }
 
     #[test]
-    fn run_raw_cancel_signal_kills_process_and_returns_cancelled() {
+    fn supervise_process_cancel_signal_kills_process() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
             let root =
-                std::env::temp_dir().join(format!("run-raw-cancel-{}", uuid::Uuid::new_v4()));
+                std::env::temp_dir().join(format!("run-process-cancel-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).expect("mkdir root");
             let workspace = root.join("workspace");
             std::fs::create_dir_all(&workspace).expect("mkdir workspace");
@@ -1679,7 +1625,7 @@ mod tests {
                 step_id: "s".into(),
                 state: JobState::Assigned,
                 assigned_worker_id: Some("w1".into()),
-                execution_mode: ExecutionMode::Raw,
+                execution_mode: ExecutionMode::Docker,
                 container_image: None,
                 command: "sh".into(),
                 args: vec!["-lc".into(), "sleep 30".into()],
@@ -1703,7 +1649,7 @@ mod tests {
             let stderr_path = transcript.join("stderr.log");
             let env = std::collections::HashMap::new();
 
-            let run = run_raw(
+            let run = supervise_process(
                 &job,
                 &workspace,
                 &transcript_jsonl_path,
@@ -1718,7 +1664,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             cancel_tx.send(true).expect("send cancel");
 
-            let status = run.await.expect("run_raw");
+            let status = run.await.expect("supervise_process");
             assert!(matches!(status, ExecutionStatus::Cancelled));
 
             let _ = std::fs::remove_dir_all(root);
@@ -1734,7 +1680,7 @@ mod tests {
             step_id: "step".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -1765,7 +1711,7 @@ mod tests {
             step_id: "step".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -1913,7 +1859,7 @@ mod tests {
             step_id: "step".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -1949,7 +1895,7 @@ mod tests {
             step_id: "push_to_remote".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -2022,7 +1968,7 @@ mod tests {
             step_id: "open_draft_pr".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -2068,7 +2014,7 @@ mod tests {
             step_id: "open_draft_pr".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -2116,7 +2062,6 @@ mod tests {
                 timeout_secs: None,
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: Some(NetworkResourceRequest::Resources(vec![
                     NetworkResourceKind::Llm,
                 ])),
@@ -2137,6 +2082,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
 
         let mut config = LocalAgentConfig::default();
@@ -2166,7 +2112,6 @@ mod tests {
                 timeout_secs: None,
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: Some(NetworkResourceRequest::Resources(vec![
                     NetworkResourceKind::Github,
                     NetworkResourceKind::CratesRegistry,
@@ -2188,6 +2133,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
 
         let mut config = LocalAgentConfig::default();
@@ -2217,7 +2163,6 @@ mod tests {
                 timeout_secs: None,
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: Some(NetworkResourceRequest::Resources(vec![
                     NetworkResourceKind::Llm,
                     NetworkResourceKind::Github,
@@ -2241,6 +2186,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
 
         let mut config = LocalAgentConfig::default();
@@ -2267,7 +2213,6 @@ mod tests {
                 timeout_secs: None,
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: Some(NetworkResourceRequest::Full),
                 filesystem: None,
                 file_mounts: vec![],
@@ -2286,6 +2231,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
 
         let mut full_config = LocalAgentConfig::default();
@@ -2313,7 +2259,6 @@ mod tests {
                 timeout_secs: None,
                 memory_limit: None,
                 cpu_limit: None,
-                network: Some("internet".to_string()),
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -2332,6 +2277,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
         assert!(resolve_local_agent_egress_plan(&invalid_runtime, &full_config).is_err());
     }
@@ -2429,7 +2375,7 @@ mod tests {
                 step_id: "s".into(),
                 state: JobState::Assigned,
                 assigned_worker_id: Some("w1".into()),
-                execution_mode: ExecutionMode::Raw,
+                execution_mode: ExecutionMode::Docker,
                 container_image: None,
                 command: "echo".into(),
                 args: vec!["ok".into()],
@@ -2506,7 +2452,6 @@ mod tests {
                 timeout_secs: Some(77),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -2525,6 +2470,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
         let mut ctx = serde_json::json!({});
         protocol::project_runtime_spec_into_job_context(&mut ctx, &runtime);
@@ -2535,7 +2481,7 @@ mod tests {
             step_id: "s".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -2554,7 +2500,7 @@ mod tests {
         });
         assert_eq!(parsed.environment.execution_mode, ExecutionMode::Docker);
         assert_eq!(parsed.environment.timeout_secs, Some(77));
-        assert_eq!(parsed.permissions.can_access_network, false);
+        assert!(!parsed.permissions.can_access_network);
     }
 
     #[test]
@@ -2575,7 +2521,7 @@ mod tests {
             step_id: "step".into(),
             state: JobState::Assigned,
             assigned_worker_id: Some("w1".into()),
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec!["ok".into()],
@@ -2596,20 +2542,19 @@ mod tests {
         let runtime = protocol::CanonicalRuntimeSpec {
             runtime_version: "v2".to_string(),
             environment: protocol::PlannedEnvironmentSpec {
-                tier: protocol::PlannedEnvironmentTier::Raw,
-                execution_mode: ExecutionMode::Raw,
+                tier: protocol::PlannedEnvironmentTier::Docker,
+                execution_mode: ExecutionMode::Docker,
                 container_image: None,
                 timeout_secs: Some(30),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
                 toolchains: vec![],
             },
             permissions: protocol::PlannedPermissionSet {
-                tier: protocol::PlannedPermissionTier::RawCompatible,
+                tier: protocol::PlannedPermissionTier::DockerDefault,
                 can_read_workspace: true,
                 can_write_workspace: true,
                 can_run_shell: true,
@@ -2621,6 +2566,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
 
         let agent_context_path = transcript_dir.join(".agent-context.json");
@@ -2670,24 +2616,19 @@ mod tests {
             paths
                 .get("job_events_jsonl")
                 .and_then(serde_json::Value::as_str),
-            Some(
-                transcript_dir
-                    .join("job-events.jsonl")
-                    .to_string_lossy()
-                    .as_ref()
-            )
+            Some("/transcript/job-events.jsonl")
         );
         assert_eq!(
             paths.get("stdout_log").and_then(serde_json::Value::as_str),
-            Some(transcript_dir.join("stdout.log").to_string_lossy().as_ref())
+            Some("/transcript/stdout.log")
         );
         assert_eq!(
             paths.get("stderr_log").and_then(serde_json::Value::as_str),
-            Some(transcript_dir.join("stderr.log").to_string_lossy().as_ref())
+            Some("/transcript/stderr.log")
         );
         assert_eq!(
             paths.get("run_json").and_then(serde_json::Value::as_str),
-            Some(transcript_dir.join("run.json").to_string_lossy().as_ref())
+            Some("/transcript/run.json")
         );
 
         let _ = std::fs::remove_dir_all(root);
@@ -2740,7 +2681,6 @@ mod tests {
                 timeout_secs: Some(30),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -2759,6 +2699,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
 
         let agent_context_path = transcript_dir.join(".agent-context.json");
@@ -2861,7 +2802,7 @@ mod tests {
             step_id: "step".into(),
             state: JobState::Assigned,
             assigned_worker_id: Some("w1".into()),
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec!["ok".into()],
@@ -2915,20 +2856,19 @@ mod tests {
         let runtime = protocol::CanonicalRuntimeSpec {
             runtime_version: "v2".to_string(),
             environment: protocol::PlannedEnvironmentSpec {
-                tier: protocol::PlannedEnvironmentTier::Raw,
-                execution_mode: ExecutionMode::Raw,
+                tier: protocol::PlannedEnvironmentTier::Docker,
+                execution_mode: ExecutionMode::Docker,
                 container_image: None,
                 timeout_secs: Some(30),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
                 toolchains: vec![],
             },
             permissions: protocol::PlannedPermissionSet {
-                tier: protocol::PlannedPermissionTier::RawCompatible,
+                tier: protocol::PlannedPermissionTier::DockerDefault,
                 can_read_workspace: true,
                 can_write_workspace: true,
                 can_run_shell: true,
@@ -2940,6 +2880,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
 
         let agent_context_path = transcript_dir.join(".agent-context.json");
@@ -3008,8 +2949,8 @@ mod tests {
             step_id: "step".into(),
             state: JobState::Assigned,
             assigned_worker_id: Some("w1".into()),
-            execution_mode: ExecutionMode::Raw,
-            container_image: Some("legacy:image".into()),
+            execution_mode: ExecutionMode::Docker,
+            container_image: Some("authorized:image".into()),
             command: "echo".into(),
             args: vec!["ok".into()],
             env: std::collections::HashMap::new(),
@@ -3035,7 +2976,6 @@ mod tests {
                 timeout_secs: Some(77),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -3054,6 +2994,7 @@ mod tests {
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
 
         let payload = build_run_json_payload(
@@ -3102,11 +3043,7 @@ mod tests {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let modes = cli
-        .mode
-        .into_iter()
-        .map(ExecutionMode::from)
-        .collect::<Vec<_>>();
+    let modes = vec![ExecutionMode::Docker];
 
     let client = match cli.transport {
         TransportKind::Http => Client::Http(HttpClient::new(
@@ -3144,7 +3081,7 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let (resolved_spec, resolved_label) =
-            local_agent_config.resolve_default_agent(cli.default_agent.as_deref());
+            local_agent_config.resolve_default_agent(cli.default_agent.as_deref())?;
         let resolved_clone = resolved_spec.clone();
         eprintln!(
             "info: effective default agent: {} (kind={:?}, command={:?})",
@@ -3478,6 +3415,7 @@ async fn run_job(
     let resolved_runner = verified.runner;
     let work_item_context = verified.work_item_context;
     let triage_job = verified.triage;
+    let github_action = verified.github_action;
 
     let transcript_dir = resolve_to_absolute(Path::new(transcript_dir))
         .with_context(|| format!("resolve transcript dir {}", transcript_dir))?
@@ -3507,7 +3445,7 @@ async fn run_job(
         runtime_spec.runtime_version,
         runtime_spec.environment.execution_mode,
         runtime_spec.environment.timeout_secs,
-        runtime_spec.environment.network,
+        runtime_spec.environment.network_resources,
         runtime_spec.environment.file_mounts.len(),
         runtime_spec.environment.toolchains.len()
     );
@@ -3571,6 +3509,88 @@ async fn run_job(
     let stdout_path = PathBuf::from(transcript_dir).join("stdout.log");
     let stderr_path = PathBuf::from(transcript_dir).join("stderr.log");
     let run_json_path = PathBuf::from(transcript_dir).join("run.json");
+    if let Some(action) = github_action.as_ref() {
+        let started_at = Utc::now();
+        let operation = async {
+            let output_json = execute_github_action(
+                action,
+                &runtime_spec,
+                &workspace_dir,
+                local_agent_config,
+                &work_item_context,
+            )
+            .await?;
+            std::fs::write(&output_path, serde_json::to_vec_pretty(&output_json)?)?;
+            std::fs::write(&stdout_path, b"")?;
+            std::fs::write(&stderr_path, b"")?;
+            std::fs::write(&transcript_jsonl_path, b"")?;
+            let finished_at = Utc::now();
+            let timing = ExecutionTiming {
+                started_at,
+                finished_at,
+                duration_ms: (finished_at - started_at)
+                    .to_std()
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0),
+            };
+            let target_branch = job
+                .repo
+                .as_ref()
+                .map(|repo| resolve_target_branch_for_repo_job(job, repo));
+            let repo =
+                capture_repo_metadata(&workspace_dir, job.repo.as_ref(), target_branch).await;
+            std::fs::write(
+                &run_json_path,
+                serde_json::to_vec_pretty(&build_run_json_payload(
+                    job,
+                    &runtime_spec,
+                    &ExecutionOutcome::Succeeded,
+                    &TerminationReason::ExitCode,
+                    Some(0),
+                    &workspace_dir.to_string_lossy(),
+                    transcript_dir,
+                ))?,
+            )?;
+            Ok::<JobResult, anyhow::Error>(JobResult {
+                outcome: ExecutionOutcome::Succeeded,
+                termination_reason: TerminationReason::ExitCode,
+                exit_code: Some(0),
+                timing,
+                artifacts: ArtifactSummary {
+                    stdout_path: stdout_path.to_string_lossy().to_string(),
+                    stderr_path: stderr_path.to_string_lossy().to_string(),
+                    output_path: Some(output_path.to_string_lossy().to_string()),
+                    transcript_dir: Some(transcript_dir.to_string()),
+                    stdout_bytes: Some(0),
+                    stderr_bytes: Some(0),
+                    output_bytes: file_len_u64(&output_path),
+                    structured_transcript_artifacts: collect_structured_transcript_artifacts(
+                        &agent_context_path,
+                        &run_json_path,
+                        &transcript_jsonl_path,
+                        &job_events_path,
+                    ),
+                },
+                github_pr: output_json
+                    .as_object()
+                    .and_then(|_| parse_github_pr_from_output(&output_json)),
+                output_json: Some(output_json),
+                repo,
+                error_message: None,
+            })
+        };
+        let operation = run_authorized_github_operation(
+            operation,
+            runtime_spec.environment.timeout_secs,
+            cancel_rx.clone(),
+        )
+        .await;
+        return finalize_required_cleanup(
+            operation,
+            cleanup_workspace(job, &prepared_workspace, Some(&job_event_sink)),
+        )
+        .await;
+    }
     env.insert(
         "AGENT_WORKSPACE_DIR".to_string(),
         workspace_dir.to_string_lossy().to_string(),
@@ -3772,127 +3792,59 @@ async fn run_job(
                     runtime_source_label,
                     runtime_spec.environment.execution_mode,
                     runtime_spec.environment.timeout_secs,
-                    runtime_spec.environment.network
+                    runtime_spec.environment.network_resources
                 ),
             )
             .await;
-        let execution_status = match runtime_spec.environment.execution_mode {
-            ExecutionMode::Raw => {
-                if matches!(local_egress_plan.tier, Some(LocalAgentEgressTier::Llm | LocalAgentEgressTier::Build))
-                {
-                    anyhow::bail!(
-                        "restricted egress tiers are only supported for Docker execution mode; raw mode cannot enforce restricted egress"
-                    );
-                }
-                if !runtime_spec.permissions.can_access_network {
-                    let warning = "WARNING: network restriction is not enforced in raw mode";
-                    eprintln!("{warning}");
-                    job_event_sink
-                        .emit(job.id, pb::JobEventKind::JobEventSystem, warning.to_string())
-                        .await;
-                }
-                if !runtime_spec.permissions.can_write_workspace {
-                    let warning =
-                        "WARNING: workspace write restriction is not enforced in raw mode";
-                    eprintln!("{warning}");
-                    job_event_sink
-                        .emit(job.id, pb::JobEventKind::JobEventSystem, warning.to_string())
-                        .await;
-                }
-                run_raw(
+        let execution_status = match &resolved_runner.kind {
+            ResolvedRunnerKind::Opencode(opencode) => {
+                run_docker_opencode_with_validation_retries(
                     &resolved_job,
+                    local_agent_config,
+                    opencode,
                     &workspace_dir,
+                    transcript_dir,
                     &transcript_jsonl_path,
                     &stdout_path,
                     &stderr_path,
+                    &output_path,
                     &env,
                     runtime_spec.environment.timeout_secs,
+                    runtime_spec.environment.container_image.clone(),
+                    &runtime_spec,
+                    &local_egress_plan,
+                    egress_manager,
+                    prepared_workspace.mirror_dir.as_deref(),
+                    &prepared_workspace.additional_repo_mounts,
+                    workflow_valid_next_events_from_job_context(&job.context).unwrap_or_default(),
+                    work_item_context.clone(),
+                    &environment_table,
                     Some(&job_event_sink),
                     Some(cancel_rx.clone()),
                 )
                 .await?
             }
-            ExecutionMode::Docker => {
-                match &resolved_runner.kind {
-                    ResolvedRunnerKind::Opencode(opencode) => {
-                        run_docker_opencode_with_validation_retries(
-                            &resolved_job,
-                            local_agent_config,
-                            opencode,
-                            &workspace_dir,
-                            transcript_dir,
-                            &transcript_jsonl_path,
-                            &stdout_path,
-                            &stderr_path,
-                            &output_path,
-                            &env,
-                            runtime_spec.environment.timeout_secs,
-                            runtime_spec.environment.container_image.clone(),
-                            &runtime_spec,
-                            &local_egress_plan,
-                            egress_manager,
-                            prepared_workspace.mirror_dir.as_deref(),
-                            &prepared_workspace.additional_repo_mounts,
-                            workflow_valid_next_events_from_job_context(&job.context)
-                                .unwrap_or_default(),
-                            work_item_context.clone(),
-                            &environment_table,
-                            Some(&job_event_sink),
-                            Some(cancel_rx.clone()),
-                        )
-                        .await?
-                    }
-                    ResolvedRunnerKind::Cursor(cursor) => {
-                        run_docker_cursor_with_validation_retries(
-                            &resolved_job,
-                            local_agent_config,
-                            cursor,
-                            &workspace_dir,
-                            transcript_dir,
-                            &transcript_jsonl_path,
-                            &stdout_path,
-                            &stderr_path,
-                            &output_path,
-                            &env,
-                            runtime_spec.environment.timeout_secs,
-                            runtime_spec.environment.container_image.clone(),
-                            &runtime_spec,
-                            &local_egress_plan,
-                            egress_manager,
-                            prepared_workspace.mirror_dir.as_deref(),
-                            &prepared_workspace.additional_repo_mounts,
-                            workflow_valid_next_events_from_job_context(&job.context)
-                                .unwrap_or_default(),
-                            work_item_context.clone(),
-                            &environment_table,
-                            Some(&job_event_sink),
-                            Some(cancel_rx.clone()),
-                        )
-                        .await?
-                    }
-                    ResolvedRunnerKind::Generic => {
-                        run_docker(
-                            &resolved_job,
-                            local_agent_config,
-                            &workspace_dir,
-                            transcript_dir,
-                            &transcript_jsonl_path,
-                            &stdout_path,
-                            &stderr_path,
-                            &env,
-                            runtime_spec.environment.timeout_secs,
-                            runtime_spec.environment.container_image.clone(),
-                            &runtime_spec,
-                            &local_egress_plan,
-                            egress_manager,
-                            prepared_workspace.mirror_dir.as_deref(),
-                            &prepared_workspace.additional_repo_mounts,
-                            Some(&job_event_sink),
-                            Some(cancel_rx.clone()),
-                        )
-                        .await?
-                    }
-                }
+            ResolvedRunnerKind::Generic => {
+                run_docker(
+                    &resolved_job,
+                    local_agent_config,
+                    &workspace_dir,
+                    transcript_dir,
+                    &transcript_jsonl_path,
+                    &stdout_path,
+                    &stderr_path,
+                    &env,
+                    runtime_spec.environment.timeout_secs,
+                    runtime_spec.environment.container_image.clone(),
+                    &runtime_spec,
+                    &local_egress_plan,
+                    egress_manager,
+                    prepared_workspace.mirror_dir.as_deref(),
+                    &prepared_workspace.additional_repo_mounts,
+                    Some(&job_event_sink),
+                    Some(cancel_rx.clone()),
+                )
+                .await?
             }
         };
         let finished_at = Utc::now();
@@ -3935,7 +3887,11 @@ async fn run_job(
                         "execution cancelled by server".to_string(),
                     )
                     .await;
-                (ExecutionOutcome::Cancelled, TerminationReason::Cancelled, None)
+                (
+                    ExecutionOutcome::Cancelled,
+                    TerminationReason::Cancelled,
+                    None,
+                )
             }
         };
 
@@ -4009,7 +3965,10 @@ async fn run_job(
                 stdout_path: artifact_store_relative_path(transcript_rel_dir, "stdout.log"),
                 stderr_path: artifact_store_relative_path(transcript_rel_dir, "stderr.log"),
                 output_path: if output_path.exists() {
-                    Some(artifact_store_relative_path(transcript_rel_dir, "output.json"))
+                    Some(artifact_store_relative_path(
+                        transcript_rel_dir,
+                        "output.json",
+                    ))
                 } else {
                     None
                 },
@@ -4067,6 +4026,7 @@ struct VerifiedAuthorizedJob {
     runner: ResolvedRunnerSpec,
     work_item_context: serde_json::Value,
     triage: bool,
+    github_action: Option<protocol::GithubAction>,
 }
 
 fn verify_authorized_job(
@@ -4179,12 +4139,55 @@ fn verify_authorized_job(
                 kind: ResolvedRunnerKind::Generic,
                 command: authorized_job.command.clone(),
                 args: authorized_job.args.clone(),
-                container_image: None,
                 file_mounts: Vec::new(),
                 requires_credentials: Vec::new(),
             },
             work_item_context: work_item_contract_from_job_context(&authorized_job.context),
             triage: request.behavior.triage,
+            github_action: None,
+            job: authorized_job,
+        });
+    }
+    if request.behavior.execution_kind == "managed" {
+        if request.behavior.runner_profile
+            != serde_json::json!({"profile_name":"github_action", "config_digest":"github_action_v1"})
+        {
+            anyhow::bail!("authorized GitHub action profile is invalid");
+        }
+        let operation = request
+            .behavior
+            .execution_context
+            .get("workflow")
+            .and_then(|workflow| workflow.get("managed_operation"))
+            .and_then(serde_json::Value::as_str)
+            .context("managed GitHub action has no operation")?
+            .parse::<protocol::GithubAction>()
+            .context("managed GitHub action is unknown")?;
+        validate_github_action_capability(
+            &operation,
+            &request.permission_envelope,
+            authorized_primary_repo.as_ref(),
+        )?;
+        let mut authorized_job = job.clone();
+        authorized_job.command.clear();
+        authorized_job.args.clear();
+        authorized_job.env.clear();
+        authorized_job.prompt = None;
+        authorized_job.repo = authorized_primary_repo;
+        authorized_job.context =
+            authorized_execution_context(job, request.behavior.execution_context);
+        return Ok(VerifiedAuthorizedJob {
+            runtime_spec: request.permission_envelope,
+            runner: ResolvedRunnerSpec {
+                kind: ResolvedRunnerKind::Generic,
+                command: String::new(),
+                args: Vec::new(),
+                file_mounts: Vec::new(),
+                requires_credentials: Vec::new(),
+            },
+            work_item_context: work_item_contract_from_job_context(&authorized_job.context),
+            triage: false,
+            github_action: Some(operation),
             job: authorized_job,
         });
     }
@@ -4234,15 +4237,10 @@ fn verify_authorized_job(
             ManagedRunnerKind::Opencode => ResolvedRunnerKind::Opencode(OpencodeManagedSpec {
                 max_validation_attempts: profile.opencode.max_validation_attempts,
             }),
-            ManagedRunnerKind::Cursor => ResolvedRunnerKind::Cursor(CursorManagedSpec {
-                max_validation_attempts: profile.cursor.max_validation_attempts,
-                default_model: profile.cursor.default_model.clone(),
-            }),
             ManagedRunnerKind::Generic => ResolvedRunnerKind::Generic,
         },
         command: profile.command,
         args: profile.args,
-        container_image: profile.container_image,
         file_mounts: Vec::new(),
         requires_credentials: profile
             .credential_providers
@@ -4262,8 +4260,1782 @@ fn verify_authorized_job(
         runner,
         work_item_context: work_item_contract_from_job_context(&authorized_job.context),
         triage: request.behavior.triage,
+        github_action: None,
         job: authorized_job,
     })
+}
+
+fn validate_github_action_capability(
+    action: &protocol::GithubAction,
+    runtime: &protocol::CanonicalRuntimeSpec,
+    repo: Option<&protocol::RepoSource>,
+) -> anyhow::Result<()> {
+    let capability = runtime
+        .github_capabilities
+        .as_slice()
+        .first()
+        .filter(|_| runtime.github_capabilities.len() == 1)
+        .context("managed GitHub action requires exactly one capability")?;
+    let repo = repo.context("managed GitHub action requires a repository")?;
+    let parsed = parse_github_repo_url(&repo.repo_url)
+        .context("managed GitHub action repository is not GitHub-shaped")?;
+    if capability.host != parsed.host || capability.repository != parsed.slug {
+        anyhow::bail!("managed GitHub action repository does not match authorization");
+    }
+    if protocol::canonical_github_api_base_for_host(&capability.host, &capability.api_base_url)
+        .is_none()
+    {
+        anyhow::bail!("managed GitHub action API base URL is invalid");
+    }
+    let branch = repo
+        .branch_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .context("managed GitHub action requires an exact branch")?;
+    if capability.branch.as_deref() != Some(branch)
+        || capability.head_branch.as_deref() != Some(branch)
+        || capability.base_branch.as_deref() != Some(repo.base_ref.trim_start_matches("origin/"))
+    {
+        anyhow::bail!("managed GitHub action branch constraints do not match authorization");
+    }
+    let required_operations = action.required_operations();
+    let mut actual_operations = capability.operations.clone();
+    actual_operations.sort();
+    let mut required_operations = required_operations.to_vec();
+    required_operations.sort();
+    if actual_operations != required_operations
+        || capability.credential_provider != format!("github:{}:read_write", capability.host)
+    {
+        anyhow::bail!("managed GitHub action exceeds its signed capability");
+    }
+    match action {
+        protocol::GithubAction::PushHead | protocol::GithubAction::ReadOrCreatePullRequest => {}
+        _ if capability.pull_request.is_none() => {
+            anyhow::bail!("managed GitHub action requires an exact pull request")
+        }
+        _ => {}
+    }
+    if matches!(action, protocol::GithubAction::MergePullRequest)
+        && capability.expected_head_sha.is_none()
+    {
+        anyhow::bail!("merge capability requires an exact expected head SHA");
+    }
+    Ok(())
+}
+
+async fn run_authorized_github_operation<F, T>(
+    operation: F,
+    timeout_secs: Option<u64>,
+    cancel_rx: watch::Receiver<bool>,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let cancellation = wait_for_cancellation(cancel_rx);
+    tokio::pin!(operation);
+    tokio::pin!(cancellation);
+    if let Some(timeout_secs) = timeout_secs {
+        tokio::select! {
+            result = &mut operation => result,
+            () = &mut cancellation => anyhow::bail!("managed GitHub action cancelled"),
+            () = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                anyhow::bail!("managed GitHub action exceeded authorized timeout")
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut operation => result,
+            () = &mut cancellation => anyhow::bail!("managed GitHub action cancelled"),
+        }
+    }
+}
+
+async fn wait_for_cancellation(mut cancel_rx: watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+async fn finalize_required_cleanup<T, F>(
+    operation: anyhow::Result<T>,
+    cleanup: F,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let cleanup = cleanup.await;
+    match (operation, cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(error.context(format!("workspace cleanup failed: {cleanup_error:#}")))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GithubHttpRequest {
+    method: reqwest::Method,
+    url: String,
+    query: Vec<(String, String)>,
+    body: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct GithubHttpResponse {
+    status: reqwest::StatusCode,
+    body: serde_json::Value,
+}
+
+trait GithubHttpTransport {
+    async fn send(
+        &self,
+        request: GithubHttpRequest,
+        token: &str,
+    ) -> anyhow::Result<GithubHttpResponse>;
+}
+
+struct ReqwestGithubHttpTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestGithubHttpTransport {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .user_agent("agent-hub-github-action/1")
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()?,
+        })
+    }
+}
+
+impl GithubHttpTransport for ReqwestGithubHttpTransport {
+    async fn send(
+        &self,
+        request: GithubHttpRequest,
+        token: &str,
+    ) -> anyhow::Result<GithubHttpResponse> {
+        let mut builder = self
+            .client
+            .request(request.method, &request.url)
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if !request.query.is_empty() {
+            builder = builder.query(&request.query);
+        }
+        if let Some(body) = request.body {
+            builder = builder.json(&body);
+        }
+        let response = builder.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("GitHub request failed with HTTP {status}");
+        }
+        let bytes = response.bytes().await?;
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).context("GitHub returned invalid JSON")?
+        };
+        Ok(GithubHttpResponse { status, body })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitCommandRequest {
+    workspace: PathBuf,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
+
+#[derive(Debug)]
+struct GitCommandOutput {
+    success: bool,
+    stdout: Vec<u8>,
+}
+
+trait GitCommandRunner {
+    async fn run(&self, request: GitCommandRequest) -> anyhow::Result<GitCommandOutput>;
+}
+
+struct TokioGitCommandRunner;
+
+impl GitCommandRunner for TokioGitCommandRunner {
+    async fn run(&self, request: GitCommandRequest) -> anyhow::Result<GitCommandOutput> {
+        let output = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(request.workspace)
+            .args(request.args)
+            .envs(request.env)
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        Ok(GitCommandOutput {
+            success: output.status.success(),
+            stdout: output.stdout,
+        })
+    }
+}
+
+struct TemporaryCredentialFile {
+    path: Option<PathBuf>,
+}
+
+impl TemporaryCredentialFile {
+    fn create(contents: &[u8]) -> anyhow::Result<Self> {
+        let path =
+            std::env::temp_dir().join(format!("agent-hub-github-askpass-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents)?;
+        Ok(Self { path: Some(path) })
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("temporary credential path")
+    }
+
+    fn cleanup(mut self) -> anyhow::Result<()> {
+        let path = self.path.take().expect("temporary credential path");
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove GitHub credential helper {}", path.display()))
+    }
+}
+
+impl Drop for TemporaryCredentialFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+async fn execute_github_action(
+    action: &protocol::GithubAction,
+    runtime: &protocol::CanonicalRuntimeSpec,
+    workspace: &Path,
+    config: &LocalAgentConfig,
+    work_item_context: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let capability = runtime
+        .github_capabilities
+        .as_slice()
+        .first()
+        .filter(|_| runtime.github_capabilities.len() == 1)
+        .context("managed GitHub action requires exactly one capability")?;
+    let token = resolve_github_action_token(config, capability).await?;
+    let transport = ReqwestGithubHttpTransport::new()?;
+    execute_github_action_with(
+        action,
+        runtime,
+        workspace,
+        work_item_context,
+        &token,
+        &transport,
+        &TokioGitCommandRunner,
+    )
+    .await
+}
+
+fn github_read_write_provider(host: &str) -> String {
+    format!("github:{host}:read_write")
+}
+
+async fn resolve_github_action_token(
+    config: &LocalAgentConfig,
+    capability: &protocol::GithubCapability,
+) -> anyhow::Result<String> {
+    if !config
+        .github_host_allowlist()
+        .iter()
+        .any(|host| host.eq_ignore_ascii_case(&capability.host))
+    {
+        anyhow::bail!("authorized GitHub host is not configured on this worker");
+    }
+    let expected_provider = github_read_write_provider(&capability.host);
+    if capability.credential_provider != expected_provider {
+        anyhow::bail!("GitHub credential provider does not match host and access class");
+    }
+    let configured_api_base = config
+        .github_api_base_urls
+        .get(&capability.host)
+        .context("authorized GitHub host has no configured API base URL")?;
+    let authorized_api_base =
+        protocol::canonical_github_api_base_for_host(&capability.host, &capability.api_base_url)
+            .context("authorized GitHub API base URL is invalid")?;
+    if configured_api_base != &authorized_api_base {
+        anyhow::bail!("GitHub API base URL does not match authorized host configuration");
+    }
+    let credentials = resolve_configured_credentials(config, &[expected_provider])
+        .await
+        .map_err(|_| anyhow::anyhow!("GitHub credential provider resolution failed"))?;
+    github_token_from_credentials(credentials)
+}
+
+fn github_token_from_credentials(credentials: ResolvedCredentials) -> anyhow::Result<String> {
+    let token = credentials
+        .env_vars
+        .get("GITHUB_TOKEN")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    cleanup_credential_temp_files(&credentials.temp_files)?;
+    if !credentials.file_mounts.is_empty()
+        || !credentials.temp_files.is_empty()
+        || credentials.env_vars.len() != 1
+    {
+        anyhow::bail!(
+            "GitHub action credential provider must only return one token environment variable"
+        );
+    }
+    token.context("GitHub action credential provider returned no GITHUB_TOKEN")
+}
+
+fn cleanup_credential_temp_files(temp_files: &[PathBuf]) -> anyhow::Result<()> {
+    for path in temp_files {
+        std::fs::remove_file(path)
+            .with_context(|| format!("remove temporary credential file {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_github_action_with<H: GithubHttpTransport, G: GitCommandRunner>(
+    action: &protocol::GithubAction,
+    runtime: &protocol::CanonicalRuntimeSpec,
+    workspace: &Path,
+    work_item_context: &serde_json::Value,
+    token: &str,
+    transport: &H,
+    git: &G,
+) -> anyhow::Result<serde_json::Value> {
+    let capability = runtime
+        .github_capabilities
+        .as_slice()
+        .first()
+        .filter(|_| runtime.github_capabilities.len() == 1)
+        .context("managed GitHub action requires exactly one capability")?;
+    let branch = capability
+        .branch
+        .as_deref()
+        .context("GitHub action has no branch constraint")?;
+    validate_git_ref(branch)?;
+    let base_branch = capability
+        .base_branch
+        .as_deref()
+        .context("GitHub action has no base branch constraint")?;
+    validate_git_ref(base_branch)?;
+    let api_base =
+        protocol::canonical_github_api_base_for_host(&capability.host, &capability.api_base_url)
+            .context("GitHub action API base URL is invalid")?;
+    let repository_url = format!("{api_base}/repos/{}", capability.repository);
+
+    match action {
+        protocol::GithubAction::PushHead => {
+            let output = git
+                .run(GitCommandRequest {
+                    workspace: workspace.to_path_buf(),
+                    args: vec!["rev-parse".to_string(), "HEAD".to_string()],
+                    env: HashMap::new(),
+                })
+                .await?;
+            if !output.success {
+                anyhow::bail!("failed to resolve exact repository HEAD");
+            }
+            let head_sha = String::from_utf8(output.stdout)?.trim().to_string();
+            validate_git_sha(&head_sha)?;
+            let askpass = TemporaryCredentialFile::create(
+                b"#!/bin/sh\ncase \"$1\" in *Username*) printf x-access-token;; *Password*) printf %s \"$AGENT_HUB_GITHUB_TOKEN\";; *) exit 1;; esac\n",
+            )?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(askpass.path(), std::fs::Permissions::from_mode(0o700))?;
+            }
+            let remote = format!("https://{}/{}.git", capability.host, capability.repository);
+            let refspec = format!("HEAD:refs/heads/{branch}");
+            let push = git
+                .run(GitCommandRequest {
+                    workspace: workspace.to_path_buf(),
+                    args: vec![
+                        "-c".to_string(),
+                        "core.hooksPath=/dev/null".to_string(),
+                        "-c".to_string(),
+                        "credential.helper=".to_string(),
+                        "-c".to_string(),
+                        format!("url.{remote}.insteadOf={remote}"),
+                        "push".to_string(),
+                        "--".to_string(),
+                        remote,
+                        refspec,
+                    ],
+                    env: HashMap::from([
+                        (
+                            "GIT_ASKPASS".to_string(),
+                            askpass.path().to_string_lossy().into_owned(),
+                        ),
+                        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+                        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+                        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+                        ("AGENT_HUB_GITHUB_TOKEN".to_string(), token.to_string()),
+                    ]),
+                })
+                .await;
+            askpass.cleanup()?;
+            let push = push?;
+            if !push.success {
+                anyhow::bail!("exact GitHub branch push failed");
+            }
+            Ok(serde_json::json!({
+                "status": "completed",
+                "next_event": "job_succeeded",
+                "summary": format!("Pushed exact HEAD to {branch}"),
+                "head_sha": head_sha,
+                "branch": branch,
+            }))
+        }
+        protocol::GithubAction::ReadOrCreatePullRequest => {
+            let owner = capability
+                .repository
+                .split_once('/')
+                .map(|(owner, _)| owner)
+                .context("invalid GitHub repository identity")?;
+            let list = send_github_json(
+                transport,
+                token,
+                GithubHttpRequest {
+                    method: reqwest::Method::GET,
+                    url: format!("{repository_url}/pulls"),
+                    query: vec![
+                        ("state".to_string(), "open".to_string()),
+                        ("head".to_string(), format!("{owner}:{branch}")),
+                    ],
+                    body: None,
+                },
+            )
+            .await?;
+            let list = list
+                .as_array()
+                .context("GitHub pull request list was not an array")?;
+            let matches = list
+                .iter()
+                .filter(|pull| validate_pull_identity(pull, capability, None).is_ok())
+                .collect::<Vec<_>>();
+            if matches.len() > 1 {
+                anyhow::bail!("GitHub returned ambiguous exact pull request matches");
+            }
+            let pull = if let Some(pull) = matches.first() {
+                (*pull).clone()
+            } else {
+                let title = work_item_context
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .context("work item title is required to create a pull request")?;
+                send_github_json(
+                    transport,
+                    token,
+                    GithubHttpRequest {
+                        method: reqwest::Method::POST,
+                        url: format!("{repository_url}/pulls"),
+                        query: Vec::new(),
+                        body: Some(serde_json::json!({
+                        "title": title,
+                        "body": work_item_context.get("description").and_then(serde_json::Value::as_str).unwrap_or(""),
+                        "head": branch,
+                        "base": base_branch,
+                        "draft": true,
+                        })),
+                    },
+                )
+                .await?
+            };
+            validate_pull_identity(&pull, capability, None)?;
+            github_pull_output(&pull, branch, base_branch)
+        }
+        protocol::GithubAction::MarkPullRequestReady => {
+            let pull = fetch_exact_pull(transport, token, capability, &repository_url).await?;
+            if pull.get("draft").and_then(serde_json::Value::as_bool) == Some(false) {
+                return Ok(github_action_success("Pull request is already ready"));
+            }
+            let node_id = pull
+                .get("node_id")
+                .and_then(serde_json::Value::as_str)
+                .context("GitHub pull request has no node id")?;
+            let graphql_url = github_graphql_url(&api_base)?;
+            let response = send_github_json(
+                transport,
+                token,
+                GithubHttpRequest {
+                    method: reqwest::Method::POST,
+                    url: graphql_url,
+                    query: Vec::new(),
+                    body: Some(serde_json::json!({
+                        "query": "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}",
+                        "variables": {"id": node_id},
+                    })),
+                },
+            )
+            .await?;
+            if response.get("errors").is_some() {
+                anyhow::bail!("GitHub rejected mark-ready action");
+            }
+            Ok(github_action_success("Pull request marked ready"))
+        }
+        protocol::GithubAction::RequestReview => {
+            let pull = fetch_exact_pull(transport, token, capability, &repository_url).await?;
+            let reviewer = work_item_context
+                .get("owner_github_login")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("exact reviewer login is required")?;
+            validate_github_login(reviewer)?;
+            if pull
+                .get("requested_reviewers")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|reviewers| {
+                    reviewers.iter().any(|requested| {
+                        requested.get("login").and_then(serde_json::Value::as_str) == Some(reviewer)
+                    })
+                })
+            {
+                return Ok(github_action_success(
+                    "Exact pull request reviewer is already requested",
+                ));
+            }
+            let number = pull
+                .get("number")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap();
+            send_github_json(
+                transport,
+                token,
+                GithubHttpRequest {
+                    method: reqwest::Method::POST,
+                    url: format!("{repository_url}/pulls/{number}/requested_reviewers"),
+                    query: Vec::new(),
+                    body: Some(serde_json::json!({"reviewers": [reviewer]})),
+                },
+            )
+            .await?;
+            Ok(github_action_success(
+                "Requested exact pull request reviewer",
+            ))
+        }
+        protocol::GithubAction::MergePullRequest => {
+            let pull = fetch_exact_pull(transport, token, capability, &repository_url).await?;
+            let number = pull
+                .get("number")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap();
+            let expected_sha = capability
+                .expected_head_sha
+                .as_deref()
+                .context("merge capability has no expected head SHA")?;
+            validate_git_sha(expected_sha)?;
+            if pull
+                .pointer("/head/sha")
+                .and_then(serde_json::Value::as_str)
+                != Some(expected_sha)
+            {
+                anyhow::bail!("pull request head SHA no longer matches authorization");
+            }
+            if pull.get("merged").and_then(serde_json::Value::as_bool) == Some(true) {
+                return Ok(github_action_success(
+                    "Merge already observed by GitHub; awaiting authoritative workflow observation",
+                ));
+            }
+            let response = send_github_json(
+                transport,
+                token,
+                GithubHttpRequest {
+                    method: reqwest::Method::PUT,
+                    url: format!("{repository_url}/pulls/{number}/merge"),
+                    query: Vec::new(),
+                    body: Some(serde_json::json!({
+                        "sha": expected_sha,
+                        "merge_method": "merge"
+                    })),
+                },
+            )
+            .await?;
+            if response.get("merged").and_then(serde_json::Value::as_bool) != Some(true) {
+                anyhow::bail!("GitHub did not accept the exact merge action");
+            }
+            Ok(github_action_success(
+                "Merge command accepted; awaiting authoritative GitHub observation",
+            ))
+        }
+    }
+}
+
+async fn send_github_json<H: GithubHttpTransport>(
+    transport: &H,
+    token: &str,
+    request: GithubHttpRequest,
+) -> anyhow::Result<serde_json::Value> {
+    let response = transport.send(request, token).await?;
+    if !response.status.is_success() {
+        anyhow::bail!("GitHub request failed with HTTP {}", response.status);
+    }
+    Ok(response.body)
+}
+
+async fn fetch_exact_pull<H: GithubHttpTransport>(
+    transport: &H,
+    token: &str,
+    capability: &protocol::GithubCapability,
+    repository_url: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let number = capability
+        .pull_request
+        .context("GitHub action requires an exact pull request number")?;
+    let pull = send_github_json(
+        transport,
+        token,
+        GithubHttpRequest {
+            method: reqwest::Method::GET,
+            url: format!("{repository_url}/pulls/{number}"),
+            query: Vec::new(),
+            body: None,
+        },
+    )
+    .await?;
+    validate_pull_identity(&pull, capability, Some(number))?;
+    Ok(pull)
+}
+
+fn validate_pull_identity(
+    pull: &serde_json::Value,
+    capability: &protocol::GithubCapability,
+    exact_number: Option<u64>,
+) -> anyhow::Result<()> {
+    let number = pull
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .context("GitHub pull request has no number")?;
+    let parsed_url = pull
+        .get("html_url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(protocol::parse_github_pull_request_url)
+        .context("GitHub pull request URL is invalid")?;
+    let response_repository = format!(
+        "{}/{}",
+        parsed_url.repository.owner, parsed_url.repository.repository
+    );
+    if exact_number.is_some_and(|expected| expected != number)
+        || parsed_url.number != number
+        || parsed_url.repository.host != capability.host
+        || response_repository != capability.repository
+        || pull
+            .pointer("/head/ref")
+            .and_then(serde_json::Value::as_str)
+            != capability.head_branch.as_deref()
+        || pull
+            .pointer("/base/ref")
+            .and_then(serde_json::Value::as_str)
+            != capability.base_branch.as_deref()
+        || pull
+            .pointer("/head/repo/full_name")
+            .and_then(serde_json::Value::as_str)
+            != Some(capability.repository.as_str())
+        || pull
+            .pointer("/base/repo/full_name")
+            .and_then(serde_json::Value::as_str)
+            != Some(capability.repository.as_str())
+    {
+        anyhow::bail!("pull request identity or branch constraints no longer match authorization");
+    }
+    Ok(())
+}
+
+fn github_graphql_url(api_base_url: &str) -> anyhow::Result<String> {
+    let mut url = url::Url::parse(api_base_url)?;
+    let path = url.path().trim_end_matches('/');
+    let graphql_path = if let Some(prefix) = path.strip_suffix("/v3") {
+        format!("{prefix}/graphql")
+    } else {
+        format!("{path}/graphql")
+    };
+    url.set_path(&graphql_path);
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn github_pull_output(
+    pull: &serde_json::Value,
+    branch: &str,
+    base_branch: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let number = pull
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .context("pull request has no number")?;
+    let url = pull
+        .get("html_url")
+        .and_then(serde_json::Value::as_str)
+        .context("pull request has no URL")?;
+    Ok(serde_json::json!({
+        "status": "completed",
+        "next_event": "job_succeeded",
+        "summary": format!("Draft pull request #{number} is available"),
+        "github_pr": {
+            "number": number,
+            "url": url,
+            "state": "open",
+            "is_draft": pull.get("draft").and_then(serde_json::Value::as_bool).unwrap_or(true),
+            "head_ref_name": branch,
+            "base_ref_name": base_branch,
+        }
+    }))
+}
+
+fn github_action_success(summary: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "completed",
+        "next_event": "job_succeeded",
+        "summary": summary,
+    })
+}
+
+fn validate_git_ref(value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+    {
+        anyhow::bail!("invalid exact Git ref constraint");
+    }
+    Ok(())
+}
+
+fn validate_git_sha(value: &str) -> anyhow::Result<()> {
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid exact Git commit SHA");
+    }
+    Ok(())
+}
+
+fn validate_github_login(value: &str) -> anyhow::Result<()> {
+    if value.len() > 39
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        anyhow::bail!("invalid exact GitHub reviewer login");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod github_action_tests {
+    use super::*;
+    use crate::credential_provider::CredentialProvider;
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TOKEN: &str = "test-token-that-must-not-leak";
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    struct FakeHttp {
+        expected_token: String,
+        requests: StdMutex<Vec<GithubHttpRequest>>,
+        responses: StdMutex<VecDeque<GithubHttpResponse>>,
+    }
+
+    impl FakeHttp {
+        fn new(responses: impl IntoIterator<Item = serde_json::Value>) -> Self {
+            Self {
+                expected_token: TOKEN.to_string(),
+                requests: StdMutex::new(Vec::new()),
+                responses: StdMutex::new(
+                    responses
+                        .into_iter()
+                        .map(|body| GithubHttpResponse {
+                            status: reqwest::StatusCode::OK,
+                            body,
+                        })
+                        .collect(),
+                ),
+            }
+        }
+
+        fn with_status(status: reqwest::StatusCode) -> Self {
+            Self {
+                expected_token: TOKEN.to_string(),
+                requests: StdMutex::new(Vec::new()),
+                responses: StdMutex::new(VecDeque::from([GithubHttpResponse {
+                    status,
+                    body: serde_json::json!({"message": TOKEN}),
+                }])),
+            }
+        }
+
+        fn requests(&self) -> Vec<GithubHttpRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl GithubHttpTransport for FakeHttp {
+        async fn send(
+            &self,
+            request: GithubHttpRequest,
+            token: &str,
+        ) -> anyhow::Result<GithubHttpResponse> {
+            assert_eq!(token, self.expected_token);
+            self.requests.lock().unwrap().push(request);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .context("unexpected GitHub HTTP request")
+        }
+    }
+
+    struct FakeGit {
+        requests: StdMutex<Vec<GitCommandRequest>>,
+        askpass_existed: StdMutex<Vec<bool>>,
+        outputs: StdMutex<VecDeque<Result<GitCommandOutput, &'static str>>>,
+    }
+
+    impl FakeGit {
+        fn new(outputs: impl IntoIterator<Item = Result<GitCommandOutput, &'static str>>) -> Self {
+            Self {
+                requests: StdMutex::new(Vec::new()),
+                askpass_existed: StdMutex::new(Vec::new()),
+                outputs: StdMutex::new(outputs.into_iter().collect()),
+            }
+        }
+
+        fn requests(&self) -> Vec<GitCommandRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl GitCommandRunner for FakeGit {
+        async fn run(&self, request: GitCommandRequest) -> anyhow::Result<GitCommandOutput> {
+            if let Some(path) = request.env.get("GIT_ASKPASS") {
+                self.askpass_existed
+                    .lock()
+                    .unwrap()
+                    .push(Path::new(path).is_file());
+            }
+            self.requests.lock().unwrap().push(request);
+            self.outputs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .context("unexpected git command")?
+                .map_err(anyhow::Error::msg)
+        }
+    }
+
+    fn capability(
+        host: &str,
+        operations: Vec<protocol::GithubOperation>,
+    ) -> protocol::GithubCapability {
+        protocol::GithubCapability {
+            host: host.to_string(),
+            api_base_url: if host == "github.com" {
+                "https://api.github.com".to_string()
+            } else {
+                format!("https://{host}/api/v3")
+            },
+            repository: "reddit/agent-hub".to_string(),
+            operations,
+            branch: Some("agent-hub/task".to_string()),
+            head_branch: Some("agent-hub/task".to_string()),
+            base_branch: Some("main".to_string()),
+            pull_request: Some(42),
+            expected_head_sha: Some(SHA.to_string()),
+            credential_provider: github_read_write_provider(host),
+        }
+    }
+
+    fn runtime(capability: protocol::GithubCapability) -> protocol::CanonicalRuntimeSpec {
+        let environment = protocol::canonical_environment_for_execution(
+            ExecutionMode::Docker,
+            Some("image".to_string()),
+            None,
+        );
+        protocol::CanonicalRuntimeSpec {
+            runtime_version: "v2".to_string(),
+            permissions: protocol::canonical_permissions_for_environment(&environment),
+            environment,
+            approval_rules: None,
+            repos: Vec::new(),
+            github_capabilities: vec![capability],
+        }
+    }
+
+    fn repo(host: &str) -> protocol::RepoSource {
+        protocol::RepoSource {
+            repo_url: format!("https://{host}/reddit/agent-hub.git"),
+            base_ref: "origin/main".to_string(),
+            branch_name: Some("agent-hub/task".to_string()),
+        }
+    }
+
+    fn pull(host: &str) -> serde_json::Value {
+        serde_json::json!({
+            "number": 42,
+            "html_url": format!("https://{host}/reddit/agent-hub/pull/42"),
+            "node_id": "PR_node_42",
+            "draft": true,
+            "head": {
+                "ref": "agent-hub/task",
+                "sha": SHA,
+                "repo": {"full_name": "reddit/agent-hub"}
+            },
+            "base": {
+                "ref": "main",
+                "repo": {"full_name": "reddit/agent-hub"}
+            },
+            "requested_reviewers": []
+        })
+    }
+
+    fn no_git() -> FakeGit {
+        FakeGit::new([])
+    }
+
+    #[test]
+    fn managed_github_capability_requires_exact_signed_constraints() {
+        let operations = vec![
+            protocol::GithubOperation::ReadPullRequest,
+            protocol::GithubOperation::MergePullRequest,
+        ];
+        let base = capability("github.com", operations);
+        let base_runtime = runtime(base.clone());
+        assert!(
+            validate_github_action_capability(
+                &protocol::GithubAction::MergePullRequest,
+                &base_runtime,
+                Some(&repo("github.com")),
+            )
+            .is_ok()
+        );
+
+        let mut invalid_runtimes = vec![protocol::CanonicalRuntimeSpec {
+            github_capabilities: Vec::new(),
+            ..base_runtime.clone()
+        }];
+        let mut two = base_runtime.clone();
+        two.github_capabilities.push(base.clone());
+        invalid_runtimes.push(two);
+        for mutate in [
+            |value: &mut protocol::GithubCapability| value.host = "other.example".to_string(),
+            |value: &mut protocol::GithubCapability| {
+                value.api_base_url = "http://api.github.com".to_string()
+            },
+            |value: &mut protocol::GithubCapability| value.repository = "reddit/other".to_string(),
+            |value: &mut protocol::GithubCapability| value.branch = Some("other".to_string()),
+            |value: &mut protocol::GithubCapability| value.head_branch = Some("other".to_string()),
+            |value: &mut protocol::GithubCapability| value.base_branch = Some("other".to_string()),
+            |value: &mut protocol::GithubCapability| value.pull_request = None,
+            |value: &mut protocol::GithubCapability| value.expected_head_sha = None,
+            |value: &mut protocol::GithubCapability| {
+                value.credential_provider = "github:github.com:read_only".to_string()
+            },
+            |value: &mut protocol::GithubCapability| {
+                value.operations.push(protocol::GithubOperation::PushBranch)
+            },
+        ] {
+            let mut invalid = base.clone();
+            mutate(&mut invalid);
+            invalid_runtimes.push(runtime(invalid));
+        }
+        for invalid in invalid_runtimes {
+            assert!(
+                validate_github_action_capability(
+                    &protocol::GithubAction::MergePullRequest,
+                    &invalid,
+                    Some(&repo("github.com")),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_github_action_capability(
+                &protocol::GithubAction::RequestReview,
+                &base_runtime,
+                Some(&repo("github.com")),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn github_tokens_are_host_specific_and_fail_closed() {
+        let mut config = LocalAgentConfig::default();
+        config.github_hosts = vec!["github.com".to_string(), "github.snooguts.net".to_string()];
+        config.github_api_base_urls = HashMap::from([
+            (
+                "github.com".to_string(),
+                "https://api.github.com".to_string(),
+            ),
+            (
+                "github.snooguts.net".to_string(),
+                "https://github.snooguts.net/api/v3".to_string(),
+            ),
+        ]);
+        for (host, token) in [
+            ("github.com", "dotcom-token"),
+            ("github.snooguts.net", "ghe-token"),
+        ] {
+            config.credential_providers.insert(
+                github_read_write_provider(host),
+                CredentialProvider::Env {
+                    name: github_read_write_provider(host),
+                    vars: HashMap::from([("GITHUB_TOKEN".to_string(), token.to_string())]),
+                },
+            );
+            let capability = capability(host, vec![protocol::GithubOperation::PushBranch]);
+            assert_eq!(
+                resolve_github_action_token(&config, &capability)
+                    .await
+                    .expect("host token"),
+                token
+            );
+        }
+
+        let missing = capability(
+            "missing.example",
+            vec![protocol::GithubOperation::PushBranch],
+        );
+        assert!(
+            resolve_github_action_token(&config, &missing)
+                .await
+                .is_err()
+        );
+        let mut mismatch = capability("github.com", vec![protocol::GithubOperation::PushBranch]);
+        mismatch.credential_provider = github_read_write_provider("github.snooguts.net");
+        assert!(
+            resolve_github_action_token(&config, &mismatch)
+                .await
+                .is_err()
+        );
+        let mut mismatched_api =
+            capability("github.com", vec![protocol::GithubOperation::PushBranch]);
+        mismatched_api.api_base_url = "https://ghe-api.example.com/custom".to_string();
+        assert!(
+            resolve_github_action_token(&config, &mismatched_api)
+                .await
+                .is_err()
+        );
+        config.credential_providers.insert(
+            github_read_write_provider("github.com"),
+            CredentialProvider::Env {
+                name: github_read_write_provider("github.com"),
+                vars: HashMap::from([("GITHUB_TOKEN".to_string(), "  ".to_string())]),
+            },
+        );
+        assert!(
+            resolve_github_action_token(
+                &config,
+                &capability("github.com", vec![protocol::GithubOperation::PushBranch]),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn github_tokens_and_host_config_are_rejected_for_general_jobs() {
+        for name in [
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GH_HOST",
+            "GH_CONFIG_DIR",
+            "AGENT_HUB_GITHUB_TOKEN",
+        ] {
+            let credentials = ResolvedCredentials {
+                env_vars: HashMap::from([(name.to_string(), TOKEN.to_string())]),
+                ..Default::default()
+            };
+            let error = validate_general_job_credentials(&credentials).unwrap_err();
+            assert!(!format!("{error:#}").contains(TOKEN));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_or_create_pull_request_is_idempotent_and_creates_exact_draft() {
+        let mut capability = capability(
+            "github.com",
+            vec![
+                protocol::GithubOperation::ReadPullRequest,
+                protocol::GithubOperation::CreatePullRequest,
+            ],
+        );
+        capability.pull_request = None;
+        let runtime = runtime(capability);
+        let context = serde_json::json!({"title":"Task title", "description":"Task body"});
+
+        let existing = FakeHttp::new([serde_json::json!([pull("github.com")])]);
+        let output = execute_github_action_with(
+            &protocol::GithubAction::ReadOrCreatePullRequest,
+            &runtime,
+            Path::new("/workspace"),
+            &context,
+            TOKEN,
+            &existing,
+            &no_git(),
+        )
+        .await
+        .expect("existing pull request");
+        assert_eq!(output["github_pr"]["number"], 42);
+        assert_eq!(existing.requests().len(), 1);
+
+        let mut wrong_base = pull("github.com");
+        wrong_base["base"]["ref"] = serde_json::json!("other");
+        let filtered = FakeHttp::new([serde_json::json!([wrong_base, pull("github.com")])]);
+        execute_github_action_with(
+            &protocol::GithubAction::ReadOrCreatePullRequest,
+            &runtime,
+            Path::new("/workspace"),
+            &context,
+            TOKEN,
+            &filtered,
+            &no_git(),
+        )
+        .await
+        .expect("one exact pull request after filtering");
+        assert_eq!(filtered.requests().len(), 1);
+
+        let ambiguous =
+            FakeHttp::new([serde_json::json!([pull("github.com"), pull("github.com")])]);
+        assert!(
+            execute_github_action_with(
+                &protocol::GithubAction::ReadOrCreatePullRequest,
+                &runtime,
+                Path::new("/workspace"),
+                &context,
+                TOKEN,
+                &ambiguous,
+                &no_git(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(ambiguous.requests().len(), 1);
+
+        let absent = FakeHttp::new([serde_json::json!([]), pull("github.com")]);
+        execute_github_action_with(
+            &protocol::GithubAction::ReadOrCreatePullRequest,
+            &runtime,
+            Path::new("/workspace"),
+            &context,
+            TOKEN,
+            &absent,
+            &no_git(),
+        )
+        .await
+        .expect("created pull request");
+        let requests = absent.requests();
+        assert_eq!(requests[0].method, reqwest::Method::GET);
+        assert_eq!(
+            requests[0].query,
+            vec![
+                ("state".to_string(), "open".to_string()),
+                ("head".to_string(), "reddit:agent-hub/task".to_string()),
+            ]
+        );
+        assert_eq!(requests[1].method, reqwest::Method::POST);
+        assert_eq!(
+            requests[1].body,
+            Some(serde_json::json!({
+                "title":"Task title",
+                "body":"Task body",
+                "head":"agent-hub/task",
+                "base":"main",
+                "draft":true
+            }))
+        );
+
+        let no_title = FakeHttp::new([serde_json::json!([])]);
+        assert!(
+            execute_github_action_with(
+                &protocol::GithubAction::ReadOrCreatePullRequest,
+                &runtime,
+                Path::new("/workspace"),
+                &serde_json::json!({}),
+                TOKEN,
+                &no_title,
+                &no_git(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(no_title.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_request_identity_mismatches_fail_before_mutation() {
+        let runtime = runtime(capability(
+            "github.com",
+            vec![
+                protocol::GithubOperation::ReadPullRequest,
+                protocol::GithubOperation::RequestReview,
+            ],
+        ));
+        for pointer in [
+            "/number",
+            "/html_url",
+            "/head/ref",
+            "/base/ref",
+            "/head/repo/full_name",
+            "/base/repo/full_name",
+        ] {
+            let mut mismatched = pull("github.com");
+            *mismatched.pointer_mut(pointer).unwrap() = match pointer {
+                "/number" => serde_json::json!(43),
+                _ => serde_json::json!("mismatch"),
+            };
+            let http = FakeHttp::new([mismatched]);
+            assert!(
+                execute_github_action_with(
+                    &protocol::GithubAction::RequestReview,
+                    &runtime,
+                    Path::new("/workspace"),
+                    &serde_json::json!({"owner_github_login":"octocat"}),
+                    TOKEN,
+                    &http,
+                    &no_git(),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(http.requests().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_ready_uses_exact_node_and_routes_graphql_by_host() {
+        for (host, api_base, graphql_url) in [
+            (
+                "github.com",
+                "https://api.github.com",
+                "https://api.github.com/graphql",
+            ),
+            (
+                "github.snooguts.net",
+                "https://github.snooguts.net/api/v3",
+                "https://github.snooguts.net/api/graphql",
+            ),
+            (
+                "ghe.example.com",
+                "https://ghe.example.com/custom/api/v3",
+                "https://ghe.example.com/custom/api/graphql",
+            ),
+        ] {
+            let http = FakeHttp::new([pull(host), serde_json::json!({"data":{}})]);
+            let mut capability = capability(
+                host,
+                vec![
+                    protocol::GithubOperation::ReadPullRequest,
+                    protocol::GithubOperation::MarkPullRequestReady,
+                ],
+            );
+            capability.api_base_url = api_base.to_string();
+            execute_github_action_with(
+                &protocol::GithubAction::MarkPullRequestReady,
+                &runtime(capability),
+                Path::new("/workspace"),
+                &serde_json::json!({}),
+                TOKEN,
+                &http,
+                &no_git(),
+            )
+            .await
+            .expect("mark ready");
+            let requests = http.requests();
+            assert_eq!(
+                requests[0].url,
+                format!("{api_base}/repos/reddit/agent-hub/pulls/42")
+            );
+            assert_eq!(requests[1].url, graphql_url);
+            assert_eq!(
+                requests[1].body.as_ref().unwrap()["variables"]["id"],
+                "PR_node_42"
+            );
+        }
+
+        let rejected = FakeHttp::new([
+            pull("github.com"),
+            serde_json::json!({"errors":[{"message":TOKEN}]}),
+        ]);
+        let error = execute_github_action_with(
+            &protocol::GithubAction::MarkPullRequestReady,
+            &runtime(capability(
+                "github.com",
+                vec![
+                    protocol::GithubOperation::ReadPullRequest,
+                    protocol::GithubOperation::MarkPullRequestReady,
+                ],
+            )),
+            Path::new("/workspace"),
+            &serde_json::json!({}),
+            TOKEN,
+            &rejected,
+            &no_git(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains(TOKEN));
+    }
+
+    #[tokio::test]
+    async fn reviewer_request_is_exact_and_invalid_login_never_mutates() {
+        let runtime = runtime(capability(
+            "github.com",
+            vec![
+                protocol::GithubOperation::ReadPullRequest,
+                protocol::GithubOperation::RequestReview,
+            ],
+        ));
+        let http = FakeHttp::new([pull("github.com"), serde_json::Value::Null]);
+        execute_github_action_with(
+            &protocol::GithubAction::RequestReview,
+            &runtime,
+            Path::new("/workspace"),
+            &serde_json::json!({"owner_github_login":"octocat"}),
+            TOKEN,
+            &http,
+            &no_git(),
+        )
+        .await
+        .expect("request review");
+        let requests = http.requests();
+        assert_eq!(
+            requests[1].url,
+            "https://api.github.com/repos/reddit/agent-hub/pulls/42/requested_reviewers"
+        );
+        assert_eq!(
+            requests[1].body,
+            Some(serde_json::json!({"reviewers":["octocat"]}))
+        );
+
+        let invalid = FakeHttp::new([pull("github.com")]);
+        assert!(
+            execute_github_action_with(
+                &protocol::GithubAction::RequestReview,
+                &runtime,
+                Path::new("/workspace"),
+                &serde_json::json!({"owner_github_login":"invalid login"}),
+                TOKEN,
+                &invalid,
+                &no_git(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(invalid.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn merge_checks_exact_identity_and_sha_before_mutation() {
+        let runtime = runtime(capability(
+            "github.com",
+            vec![
+                protocol::GithubOperation::ReadPullRequest,
+                protocol::GithubOperation::MergePullRequest,
+            ],
+        ));
+        let http = FakeHttp::new([pull("github.com"), serde_json::json!({"merged":true})]);
+        let output = execute_github_action_with(
+            &protocol::GithubAction::MergePullRequest,
+            &runtime,
+            Path::new("/workspace"),
+            &serde_json::json!({}),
+            TOKEN,
+            &http,
+            &no_git(),
+        )
+        .await
+        .expect("merge accepted");
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["next_event"], "job_succeeded");
+        assert!(output["summary"].as_str().unwrap().contains("awaiting"));
+        let requests = http.requests();
+        assert_eq!(requests[1].method, reqwest::Method::PUT);
+        assert_eq!(
+            requests[1].body,
+            Some(serde_json::json!({"sha":SHA,"merge_method":"merge"}))
+        );
+
+        let mut changed = pull("github.com");
+        changed["head"]["sha"] =
+            serde_json::Value::String("abcdef0123456789abcdef0123456789abcdef01".to_string());
+        let mismatch = FakeHttp::new([changed]);
+        assert!(
+            execute_github_action_with(
+                &protocol::GithubAction::MergePullRequest,
+                &runtime,
+                Path::new("/workspace"),
+                &serde_json::json!({}),
+                TOKEN,
+                &mismatch,
+                &no_git(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(mismatch.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_github_retries_are_idempotent_at_exact_observed_state() {
+        let mut ready = pull("github.com");
+        ready["draft"] = serde_json::Value::Bool(false);
+        let ready_http = FakeHttp::new([ready]);
+        execute_github_action_with(
+            &protocol::GithubAction::MarkPullRequestReady,
+            &runtime(capability(
+                "github.com",
+                vec![
+                    protocol::GithubOperation::ReadPullRequest,
+                    protocol::GithubOperation::MarkPullRequestReady,
+                ],
+            )),
+            Path::new("/workspace"),
+            &serde_json::json!({}),
+            TOKEN,
+            &ready_http,
+            &no_git(),
+        )
+        .await
+        .expect("already ready");
+        assert_eq!(ready_http.requests().len(), 1);
+
+        let mut reviewed = pull("github.com");
+        reviewed["requested_reviewers"] = serde_json::json!([{"login":"octocat"}]);
+        let review_http = FakeHttp::new([reviewed]);
+        execute_github_action_with(
+            &protocol::GithubAction::RequestReview,
+            &runtime(capability(
+                "github.com",
+                vec![
+                    protocol::GithubOperation::ReadPullRequest,
+                    protocol::GithubOperation::RequestReview,
+                ],
+            )),
+            Path::new("/workspace"),
+            &serde_json::json!({"owner_github_login":"octocat"}),
+            TOKEN,
+            &review_http,
+            &no_git(),
+        )
+        .await
+        .expect("reviewer already requested");
+        assert_eq!(review_http.requests().len(), 1);
+
+        let mut merged = pull("github.com");
+        merged["merged"] = serde_json::Value::Bool(true);
+        let merge_http = FakeHttp::new([merged]);
+        let output = execute_github_action_with(
+            &protocol::GithubAction::MergePullRequest,
+            &runtime(capability(
+                "github.com",
+                vec![
+                    protocol::GithubOperation::ReadPullRequest,
+                    protocol::GithubOperation::MergePullRequest,
+                ],
+            )),
+            Path::new("/workspace"),
+            &serde_json::json!({}),
+            TOKEN,
+            &merge_http,
+            &no_git(),
+        )
+        .await
+        .expect("already merged");
+        assert!(output["summary"].as_str().unwrap().contains("awaiting"));
+        assert_eq!(merge_http.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn push_uses_exact_remote_ref_and_cleans_askpass_on_success_and_failure() {
+        for push_output in [
+            Ok(GitCommandOutput {
+                success: true,
+                stdout: Vec::new(),
+            }),
+            Ok(GitCommandOutput {
+                success: false,
+                stdout: TOKEN.as_bytes().to_vec(),
+            }),
+            Err("git runner failed"),
+        ] {
+            let git = FakeGit::new([
+                Ok(GitCommandOutput {
+                    success: true,
+                    stdout: format!("{SHA}\n").into_bytes(),
+                }),
+                push_output,
+            ]);
+            let result = execute_github_action_with(
+                &protocol::GithubAction::PushHead,
+                &runtime(capability(
+                    "github.snooguts.net",
+                    vec![protocol::GithubOperation::PushBranch],
+                )),
+                Path::new("/workspace"),
+                &serde_json::json!({}),
+                TOKEN,
+                &FakeHttp::new([]),
+                &git,
+            )
+            .await;
+            let requests = git.requests();
+            assert_eq!(requests[0].args, ["rev-parse", "HEAD"]);
+            assert_eq!(
+                &requests[1].args[requests[1].args.len() - 2..],
+                [
+                    "https://github.snooguts.net/reddit/agent-hub.git",
+                    "HEAD:refs/heads/agent-hub/task"
+                ]
+            );
+            assert!(
+                requests[1]
+                    .args
+                    .contains(&"core.hooksPath=/dev/null".to_string())
+            );
+            assert!(requests[1].args.contains(&"credential.helper=".to_string()));
+            assert_eq!(
+                requests[1].env.get("GIT_CONFIG_GLOBAL").unwrap(),
+                "/dev/null"
+            );
+            let askpass = requests[1].env.get("GIT_ASKPASS").unwrap();
+            assert!(!Path::new(askpass).exists());
+            assert_eq!(*git.askpass_existed.lock().unwrap(), vec![true]);
+            if let Err(error) = result {
+                assert!(!format!("{error:#}").contains(TOKEN));
+            }
+        }
+
+        let invalid_sha = FakeGit::new([Ok(GitCommandOutput {
+            success: true,
+            stdout: b"not-a-sha".to_vec(),
+        })]);
+        assert!(
+            execute_github_action_with(
+                &protocol::GithubAction::PushHead,
+                &runtime(capability(
+                    "github.com",
+                    vec![protocol::GithubOperation::PushBranch],
+                )),
+                Path::new("/workspace"),
+                &serde_json::json!({}),
+                TOKEN,
+                &FakeHttp::new([]),
+                &invalid_sha,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(invalid_sha.requests().len(), 1);
+
+        let mut invalid_ref = capability("github.com", vec![protocol::GithubOperation::PushBranch]);
+        invalid_ref.branch = Some("../redirect".to_string());
+        let no_commands = no_git();
+        assert!(
+            execute_github_action_with(
+                &protocol::GithubAction::PushHead,
+                &runtime(invalid_ref),
+                Path::new("/workspace"),
+                &serde_json::json!({}),
+                TOKEN,
+                &FakeHttp::new([]),
+                &no_commands,
+            )
+            .await
+            .is_err()
+        );
+        assert!(no_commands.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_http_errors_and_outputs_never_contain_token() {
+        let http = FakeHttp::with_status(reqwest::StatusCode::UNAUTHORIZED);
+        let error = execute_github_action_with(
+            &protocol::GithubAction::RequestReview,
+            &runtime(capability(
+                "github.com",
+                vec![
+                    protocol::GithubOperation::ReadPullRequest,
+                    protocol::GithubOperation::RequestReview,
+                ],
+            )),
+            Path::new("/workspace"),
+            &serde_json::json!({"owner_github_login":"octocat"}),
+            TOKEN,
+            &http,
+            &no_git(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains(TOKEN));
+
+        let temp = std::env::temp_dir().join(format!("github-cred-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temp, TOKEN).unwrap();
+        let credentials = ResolvedCredentials {
+            env_vars: HashMap::from([("GITHUB_TOKEN".to_string(), TOKEN.to_string())]),
+            file_mounts: vec![(
+                temp.to_string_lossy().into_owned(),
+                "/credential".to_string(),
+                true,
+            )],
+            temp_files: vec![temp.clone()],
+        };
+        let error = github_token_from_credentials(credentials).unwrap_err();
+        assert!(!format!("{error:#}").contains(TOKEN));
+        assert!(!temp.exists());
+    }
+
+    #[tokio::test]
+    async fn authorized_lifecycle_cleans_up_on_success_errors_timeout_and_cancellation() {
+        async fn finalized<T>(
+            result: anyhow::Result<T>,
+            cleanup_count: Arc<AtomicUsize>,
+        ) -> anyhow::Result<T> {
+            finalize_required_cleanup(result, async move {
+                cleanup_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        }
+
+        for result in [
+            Ok("success"),
+            Err(anyhow::anyhow!("HTTP error")),
+            Err(anyhow::anyhow!("git error")),
+        ] {
+            let cleanup_count = Arc::new(AtomicUsize::new(0));
+            let _ = finalized(result, Arc::clone(&cleanup_count)).await;
+            assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+        }
+
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let timed_out = run_authorized_github_operation(
+            std::future::pending::<anyhow::Result<()>>(),
+            Some(0),
+            cancel_rx,
+        )
+        .await;
+        let timeout_cleanup = Arc::new(AtomicUsize::new(0));
+        assert!(
+            finalized(timed_out, Arc::clone(&timeout_cleanup))
+                .await
+                .is_err()
+        );
+        assert_eq!(timeout_cleanup.load(Ordering::SeqCst), 1);
+
+        struct DropSignal(Arc<AtomicUsize>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let operation = {
+            let guard = DropSignal(Arc::clone(&dropped));
+            async move {
+                let _guard = guard;
+                std::future::pending::<anyhow::Result<()>>().await
+            }
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        let cancelled = run_authorized_github_operation(operation, Some(60), cancel_rx).await;
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let cancel_cleanup = Arc::new(AtomicUsize::new(0));
+        assert!(
+            finalized(cancelled, Arc::clone(&cancel_cleanup))
+                .await
+                .is_err()
+        );
+        assert_eq!(cancel_cleanup.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hanging_github_credential_command_is_timed_out_and_terminated() {
+        let pid_path =
+            std::env::temp_dir().join(format!("credential-pid-{}", uuid::Uuid::new_v4()));
+        let mut config = LocalAgentConfig::default();
+        config.github_hosts = vec!["github.com".to_string()];
+        config.github_api_base_urls = HashMap::from([(
+            "github.com".to_string(),
+            "https://api.github.com".to_string(),
+        )]);
+        config.credential_providers.insert(
+            github_read_write_provider("github.com"),
+            CredentialProvider::Command {
+                name: github_read_write_provider("github.com"),
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!("echo $$ > '{}'; exec sleep 30", pid_path.display()),
+                ],
+                capture_env: Some("GITHUB_TOKEN".to_string()),
+                capture_file: None,
+            },
+        );
+        let capability = capability("github.com", vec![protocol::GithubOperation::PushBranch]);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let started = Instant::now();
+        let result = run_authorized_github_operation(
+            resolve_github_action_token(&config, &capability),
+            Some(1),
+            cancel_rx,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid = std::fs::read_to_string(&pid_path).expect("credential command started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[test]
+    fn github_credential_shape_fails_closed() {
+        for credentials in [
+            ResolvedCredentials::default(),
+            ResolvedCredentials {
+                env_vars: HashMap::from([
+                    ("GITHUB_TOKEN".to_string(), TOKEN.to_string()),
+                    ("OTHER".to_string(), "value".to_string()),
+                ]),
+                ..Default::default()
+            },
+            ResolvedCredentials {
+                env_vars: HashMap::from([("OTHER".to_string(), TOKEN.to_string())]),
+                ..Default::default()
+            },
+        ] {
+            let error = github_token_from_credentials(credentials).unwrap_err();
+            assert!(!format!("{error:#}").contains(TOKEN));
+        }
+    }
 }
 
 fn authorized_execution_context(
@@ -4310,44 +6082,11 @@ enum ExecutionStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RuntimeSpecSource {
-    CanonicalContext,
-    LegacyJobFields,
-}
-
-impl RuntimeSpecSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::CanonicalContext => "canonical-runtime-spec",
-            Self::LegacyJobFields => "legacy-job-fields-fallback",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobExecutionKind {
-    Agent,
-    Command,
-    Managed,
-}
-
-impl JobExecutionKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Agent => "agent",
-            Self::Command => "command",
-            Self::Managed => "managed",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ResolvedRunnerSpec {
     kind: ResolvedRunnerKind,
     command: String,
     args: Vec<String>,
-    container_image: Option<String>,
     file_mounts: Vec<protocol::orchestration::PlannedFileMount>,
     requires_credentials: Vec<String>,
 }
@@ -4356,7 +6095,6 @@ struct ResolvedRunnerSpec {
 enum ResolvedRunnerKind {
     Generic,
     Opencode(OpencodeManagedSpec),
-    Cursor(CursorManagedSpec),
 }
 
 #[derive(Debug, Clone)]
@@ -4364,15 +6102,10 @@ struct OpencodeManagedSpec {
     max_validation_attempts: u32,
 }
 
-#[derive(Debug, Clone)]
-struct CursorManagedSpec {
-    max_validation_attempts: u32,
-    default_model: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalAgentEgressTier {
     Llm,
+    Github,
     Build,
     Full,
 }
@@ -4381,6 +6114,7 @@ impl LocalAgentEgressTier {
     fn as_str(self) -> &'static str {
         match self {
             Self::Llm => "llm",
+            Self::Github => "github-only",
             Self::Build => "build",
             Self::Full => "full",
         }
@@ -4479,27 +6213,14 @@ fn resolve_local_agent_egress_plan(
     runtime_spec: &protocol::CanonicalRuntimeSpec,
     local_agent_config: &LocalAgentConfig,
 ) -> anyhow::Result<LocalAgentEgressPlan> {
-    if runtime_spec.environment.network_resources.is_none()
-        && let Some(raw_network) = runtime_spec.environment.network.as_deref()
-        && !matches!(raw_network, "none" | "restricted" | "full")
-    {
-        anyhow::bail!(
-            "legacy network label '{}' is unsupported; expected one of: none, restricted, full",
-            raw_network
-        );
-    }
-
-    let request = runtime_spec
-        .environment
-        .network_resources
-        .clone()
-        .or_else(|| {
-            protocol::network_request_from_legacy_label(runtime_spec.environment.network.as_deref())
-        });
+    let request = runtime_spec.environment.network_resources.clone();
 
     let Some(request) = request else {
+        if runtime_spec.permissions.can_access_network {
+            anyhow::bail!("network access requires an explicit typed network_resources request");
+        }
         return Ok(LocalAgentEgressPlan {
-            network_none: !runtime_spec.permissions.can_access_network,
+            network_none: true,
             tier: None,
         });
     };
@@ -4533,6 +6254,7 @@ fn resolve_local_agent_egress_plan(
     } else {
         match policy_name {
             "llm-only" => Some(LocalAgentEgressTier::Llm),
+            "github-only" => Some(LocalAgentEgressTier::Github),
             "build" => Some(LocalAgentEgressTier::Build),
             "none" => None,
             "full" => Some(LocalAgentEgressTier::Full),
@@ -4568,6 +6290,9 @@ fn policy_name_for_network_request(
             {
                 return Ok(Some("llm-only"));
             }
+            if deduped == [NetworkResourceKind::Github] {
+                return Ok(Some("github-only"));
+            }
             if deduped.iter().all(|resource| {
                 matches!(
                     resource,
@@ -4587,288 +6312,8 @@ fn policy_name_for_network_request(
     }
 }
 
-fn resolve_runtime_spec_and_source(
-    job: &Job,
-) -> (protocol::CanonicalRuntimeSpec, RuntimeSpecSource) {
-    if let Some(runtime_spec) = protocol::runtime_spec_from_job_context(&job.context) {
-        if runtime_spec.runtime_version == "v2" {
-            return (runtime_spec, RuntimeSpecSource::CanonicalContext);
-        }
-        let mut fallback = canonical_runtime_spec_for_job(job);
-        fallback.runtime_version = runtime_spec.runtime_version;
-        merge_missing_repo_claims(&mut fallback.repos, runtime_spec.repos);
-        (fallback, RuntimeSpecSource::LegacyJobFields)
-    } else {
-        let mut fallback = canonical_runtime_spec_for_job(job);
-        merge_missing_repo_claims(
-            &mut fallback.repos,
-            repo_claims_from_runtime_spec_context_value(&job.context),
-        );
-        (fallback, RuntimeSpecSource::LegacyJobFields)
-    }
-}
-
-fn merge_missing_repo_claims(
-    destination: &mut Vec<protocol::PlannedRepoClaim>,
-    candidates: Vec<protocol::PlannedRepoClaim>,
-) {
-    if candidates.is_empty() {
-        return;
-    }
-
-    let mut seen = destination
-        .iter()
-        .map(|claim| claim.repo_url.trim().to_string())
-        .filter(|repo_url| !repo_url.is_empty())
-        .collect::<HashSet<_>>();
-
-    for claim in candidates {
-        let repo_url = claim.repo_url.trim().to_string();
-        if repo_url.is_empty() || !seen.insert(repo_url) {
-            continue;
-        }
-        destination.push(claim);
-    }
-}
-
-fn repo_claims_from_runtime_spec_context_value(
-    context: &serde_json::Value,
-) -> Vec<protocol::PlannedRepoClaim> {
-    context
-        .as_object()
-        .and_then(|obj| obj.get("canonical_runtime_spec"))
-        .and_then(serde_json::Value::as_object)
-        .and_then(|runtime| runtime.get("repos"))
-        .and_then(serde_json::Value::as_array)
-        .map(|repos| {
-            repos
-                .iter()
-                .filter_map(repo_claim_from_runtime_context_entry)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn repo_claim_from_runtime_context_entry(
-    entry: &serde_json::Value,
-) -> Option<protocol::PlannedRepoClaim> {
-    let obj = entry.as_object()?;
-    let repo_url = obj
-        .get("repo_url")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    let base_ref = obj
-        .get("base_ref")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("origin/main")
-        .to_string();
-    let read_only = obj
-        .get("read_only")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let target_branch = obj
-        .get("target_branch")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let claim_type = obj
-        .get("claim_type")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            if read_only {
-                "read_only".to_string()
-            } else {
-                "workspace".to_string()
-            }
-        });
-    let branch_name = obj
-        .get("branch_name")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-
-    Some(protocol::PlannedRepoClaim {
-        repo_url,
-        base_ref,
-        read_only,
-        target_branch,
-        claim_type,
-        branch_name,
-    })
-}
-
-fn job_execution_kind_from_context(context: &serde_json::Value) -> JobExecutionKind {
-    let raw = context
-        .get("workflow")
-        .and_then(|workflow| workflow.get("job_execution_kind"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("command");
-    match raw {
-        "agent" => JobExecutionKind::Agent,
-        "managed" => JobExecutionKind::Managed,
-        _ => JobExecutionKind::Command,
-    }
-}
-
-fn managed_operation_from_job_context(context: &serde_json::Value) -> Option<String> {
-    context
-        .get("workflow")
-        .and_then(|workflow| workflow.get("managed_operation"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn environment_runtime_from_job_context(context: &serde_json::Value) -> Option<String> {
-    let from_env_obj = context
-        .get("environment")
-        .and_then(|env| env.get("runtime"))
-        .and_then(serde_json::Value::as_str);
-    let from_top_level = context
-        .get("environment_runtime")
-        .and_then(serde_json::Value::as_str);
-    from_env_obj
-        .or(from_top_level)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn resolve_runner_spec_for_job(
-    job: &Job,
-    execution_kind: JobExecutionKind,
-    managed_operation: Option<&str>,
-    environment_runtime: Option<&str>,
-    config: &LocalAgentConfig,
-) -> anyhow::Result<ResolvedRunnerSpec> {
-    match execution_kind {
-        JobExecutionKind::Command => Ok(ResolvedRunnerSpec {
-            kind: ResolvedRunnerKind::Generic,
-            command: job.command.clone(),
-            args: job.args.clone(),
-            container_image: None,
-            file_mounts: Vec::new(),
-            requires_credentials: Vec::new(),
-        }),
-        JobExecutionKind::Agent => {
-            if let Some(runtime) = environment_runtime
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && *value != "auto")
-            {
-                if let Some(spec) = config.managed_runners.get(runtime) {
-                    return resolved_runner_spec_from_config(spec, Some(runtime));
-                }
-                eprintln!(
-                    "warning: environment.runtime={runtime} but no matching managed_runners entry; falling back to default_agent"
-                );
-            }
-            resolved_runner_spec_from_config(&config.default_agent, Some("default_agent"))
-        }
-        JobExecutionKind::Managed => {
-            let operation = managed_operation.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "managed job {} missing workflow.managed_operation context",
-                    job.id
-                )
-            })?;
-            let spec = config
-                .managed_runner_for_operation(operation)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "managed job {} references unknown managed operation '{}'",
-                        job.id,
-                        operation
-                    )
-                })?;
-            resolved_runner_spec_from_config(spec, Some(operation))
-        }
-    }
-}
-
-fn resolved_runner_spec_from_config(
-    spec: &ManagedRunnerSpec,
-    label: Option<&str>,
-) -> anyhow::Result<ResolvedRunnerSpec> {
-    if spec.command.trim().is_empty() {
-        let target = label.unwrap_or("managed runner");
-        anyhow::bail!("{target} command must not be empty");
-    }
-
-    Ok(ResolvedRunnerSpec {
-        kind: resolved_runner_kind_from_spec(spec),
-        command: spec.command.clone(),
-        args: spec.args.clone(),
-        container_image: spec.container_image.clone(),
-        file_mounts: spec
-            .file_mounts
-            .iter()
-            .map(|mount| protocol::orchestration::PlannedFileMount {
-                host_path: mount.host_path.clone(),
-                container_path: mount.container_path.clone(),
-                read_only: mount.read_only,
-            })
-            .collect(),
-        requires_credentials: spec.requires_credentials.clone(),
-    })
-}
-
-fn resolved_runner_kind_from_spec(spec: &ManagedRunnerSpec) -> ResolvedRunnerKind {
-    match spec.kind {
-        ManagedRunnerKind::Opencode => ResolvedRunnerKind::Opencode(OpencodeManagedSpec {
-            max_validation_attempts: spec.opencode.max_validation_attempts,
-        }),
-        ManagedRunnerKind::Cursor => ResolvedRunnerKind::Cursor(CursorManagedSpec {
-            max_validation_attempts: spec.cursor.max_validation_attempts,
-            default_model: spec.cursor.default_model.clone(),
-        }),
-        ManagedRunnerKind::Generic => {
-            if runner_spec_looks_like_cursor(spec) {
-                ResolvedRunnerKind::Cursor(CursorManagedSpec {
-                    max_validation_attempts: spec.cursor.max_validation_attempts,
-                    default_model: spec.cursor.default_model.clone(),
-                })
-            } else if runner_spec_looks_like_opencode(spec) {
-                ResolvedRunnerKind::Opencode(OpencodeManagedSpec {
-                    max_validation_attempts: spec.opencode.max_validation_attempts,
-                })
-            } else {
-                ResolvedRunnerKind::Generic
-            }
-        }
-    }
-}
-
-fn runner_spec_looks_like_opencode(spec: &ManagedRunnerSpec) -> bool {
-    if spec.command.trim() == "opencode" {
-        return true;
-    }
-    spec.args
-        .iter()
-        .any(|arg| arg.contains("opencode run") || arg.contains("opencode\trun"))
-}
-
-fn runner_spec_looks_like_cursor(spec: &ManagedRunnerSpec) -> bool {
-    let cmd = spec.command.trim();
-    if cmd == "cursor-agent" || cmd == "agent" {
-        return true;
-    }
-    spec.args.iter().any(|arg| {
-        arg.contains("cursor-agent ") || arg.contains("agent -p") || arg.contains("agent --print")
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn run_raw(
+async fn supervise_process(
     job: &Job,
     workspace_dir: &Path,
     transcript_jsonl_path: &Path,
@@ -4879,7 +6324,7 @@ async fn run_raw(
     events: Option<&JobEventSink>,
     cancel_rx: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ExecutionStatus> {
-    run_raw_with_mode(
+    supervise_process_with_mode(
         job,
         workspace_dir,
         transcript_jsonl_path,
@@ -4895,7 +6340,7 @@ async fn run_raw(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_raw_with_output_validation_early_exit(
+async fn supervise_process_with_output_validation(
     job: &Job,
     workspace_dir: &Path,
     transcript_jsonl_path: &Path,
@@ -4963,10 +6408,10 @@ async fn run_raw_with_output_validation_early_exit(
         cmd.env(k, v);
     }
 
-    eprintln!("info: spawning command: {} {:?}", &job.command, &job.args);
+    eprintln!("info: spawning command: {} {:?}", job.command, job.args);
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("failed to spawn command: {} {:?}", &job.command, &job.args))?;
+        .with_context(|| format!("failed to spawn command: {} {:?}", job.command, job.args))?;
 
     let stdout = child
         .stdout
@@ -5095,7 +6540,7 @@ async fn run_raw_with_output_validation_early_exit(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_raw_with_mode(
+async fn supervise_process_with_mode(
     job: &Job,
     workspace_dir: &Path,
     transcript_jsonl_path: &Path,
@@ -5160,8 +6605,8 @@ async fn run_raw_with_mode(
     }
 
     eprintln!(
-        "info: run_raw_with_mode spawning: cmd={} args_count={} cwd={} cwd_exists={}",
-        &job.command,
+        "info: supervising process: cmd={} args_count={} cwd={} cwd_exists={}",
+        job.command,
         job.args.len(),
         workspace_dir.display(),
         workspace_dir.exists()
@@ -5169,7 +6614,7 @@ async fn run_raw_with_mode(
     let mut child = cmd.spawn().with_context(|| {
         format!(
             "failed to spawn '{}' (args={}) in cwd={}",
-            &job.command,
+            job.command,
             job.args.len(),
             workspace_dir.display()
         )
@@ -5434,9 +6879,9 @@ async fn run_docker(
 
     let mut docker_network_none = local_egress_plan.network_none;
     let restricted_tier = match local_egress_plan.tier {
-        Some(LocalAgentEgressTier::Llm) | Some(LocalAgentEgressTier::Build) => {
-            local_egress_plan.tier
-        }
+        Some(LocalAgentEgressTier::Llm)
+        | Some(LocalAgentEgressTier::Github)
+        | Some(LocalAgentEgressTier::Build) => local_egress_plan.tier,
         _ => None,
     };
     if !runtime_spec.permissions.can_access_network && !docker_network_none {
@@ -5550,18 +6995,15 @@ async fn run_docker(
         ));
     }
 
-    let job_gh_host = job_gh_host_override(job, local_agent_config);
     let work_item_context = work_item_contract_from_job_context(&job.context);
     let allow_remote_credentials = job_allows_remote_credentials(&work_item_context);
-    if allow_remote_credentials {
-        append_gh_config_mount_for_toolchains(
-            &mut args,
-            &mut docker_env,
-            &runtime_spec.environment.toolchains,
-            job_gh_host.as_deref(),
-        );
-    }
     let required_credential_providers = authorized_credential_provider_names(job)?;
+    if required_credential_providers
+        .iter()
+        .any(|provider| provider.starts_with("github:"))
+    {
+        anyhow::bail!("GitHub credentials are restricted to managed GitHub actions");
+    }
     if !allow_remote_credentials && !required_credential_providers.is_empty() {
         anyhow::bail!("job requires credential providers outside its remote-access envelope");
     }
@@ -5570,6 +7012,7 @@ async fn run_docker(
     } else {
         ResolvedCredentials::default()
     };
+    validate_general_job_credentials(&resolved_credentials)?;
     append_resolved_credentials_to_docker_invocation(
         &resolved_credentials,
         &mut args,
@@ -5611,10 +7054,10 @@ async fn run_docker(
     };
     eprintln!(
         "info: docker invocation: {} {}",
-        &docker_job.command,
+        docker_job.command,
         docker_job.args.join(" ")
     );
-    let run_result = run_raw(
+    let run_result = supervise_process(
         &docker_job,
         &workspace_dir,
         transcript_jsonl_path,
@@ -5904,7 +7347,7 @@ async fn run_docker_opencode_attempt(
     };
 
     if append_logs {
-        run_raw_with_output_validation_early_exit(
+        supervise_process_with_output_validation(
             &docker_job,
             &invocation.workspace_dir,
             &invocation.transcript_jsonl_path,
@@ -5922,7 +7365,7 @@ async fn run_docker_opencode_attempt(
         )
         .await
     } else {
-        run_raw_with_output_validation_early_exit(
+        supervise_process_with_output_validation(
             &docker_job,
             &invocation.workspace_dir,
             &invocation.transcript_jsonl_path,
@@ -6265,358 +7708,6 @@ async fn cleanup_opencode_container(container_name: &str) -> anyhow::Result<()> 
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_docker_cursor_with_validation_retries(
-    job: &Job,
-    local_agent_config: &LocalAgentConfig,
-    cursor: &CursorManagedSpec,
-    workspace_dir: &Path,
-    transcript_dir: &str,
-    transcript_jsonl_path: &Path,
-    stdout_path: &Path,
-    stderr_path: &Path,
-    output_path: &Path,
-    env: &HashMap<String, String>,
-    timeout_secs: Option<u64>,
-    runtime_container_image: Option<String>,
-    runtime_spec: &protocol::CanonicalRuntimeSpec,
-    local_egress_plan: &LocalAgentEgressPlan,
-    egress_manager: &EgressManager,
-    primary_repo_mirror_dir: Option<&Path>,
-    additional_repo_mounts: &[AdditionalRepoMount],
-    valid_next_events: Vec<String>,
-    work_item_context: serde_json::Value,
-    environment_table: &EnvironmentValidationTable,
-    events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
-) -> anyhow::Result<ExecutionStatus> {
-    let invocation = build_docker_runtime_invocation(
-        job,
-        local_agent_config,
-        workspace_dir,
-        transcript_dir,
-        transcript_jsonl_path,
-        stdout_path,
-        stderr_path,
-        env,
-        timeout_secs,
-        runtime_container_image,
-        runtime_spec,
-        local_egress_plan,
-        egress_manager,
-        primary_repo_mirror_dir,
-        additional_repo_mounts,
-        events,
-    )
-    .await?;
-
-    run_cursor_validation_loop(
-        job,
-        cursor,
-        &invocation,
-        output_path,
-        &valid_next_events,
-        &work_item_context,
-        environment_table,
-        events,
-        cancel_rx,
-    )
-    .await
-    .inspect(|_| {
-        for bridge in &invocation.mcp_bridges {
-            bridge.stop();
-        }
-        cleanup_credential_temp_files_best_effort(&invocation.credential_temp_files);
-    })
-    .inspect_err(|_| {
-        for bridge in &invocation.mcp_bridges {
-            bridge.stop();
-        }
-        cleanup_credential_temp_files_best_effort(&invocation.credential_temp_files);
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_cursor_validation_loop(
-    job: &Job,
-    cursor: &CursorManagedSpec,
-    invocation: &DockerRuntimeInvocation,
-    output_path: &Path,
-    valid_next_events: &[String],
-    work_item_context: &serde_json::Value,
-    environment_table: &EnvironmentValidationTable,
-    events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
-) -> anyhow::Result<ExecutionStatus> {
-    let _ = cursor.default_model.as_ref();
-    let max_attempts = cursor.max_validation_attempts.max(1);
-    let _ = std::fs::remove_file(output_path);
-
-    let container_name = format!("agent-hub-cursor-{}", job.id.simple());
-    let mut attempt: u32 = 1;
-    let mut continuation_prompt: Option<String> = None;
-    let shell_prelude = cursor_shell_prelude(job);
-
-    spawn_cursor_runtime_container(invocation, &container_name).await?;
-
-    loop {
-        if let Some(events) = events {
-            events
-                .emit(
-                    job.id,
-                    pb::JobEventKind::JobEventSystem,
-                    format!(
-                        "cursor validation attempt {attempt}/{max_attempts} ({})",
-                        if continuation_prompt.is_none() {
-                            "run"
-                        } else {
-                            "agent --continue"
-                        }
-                    ),
-                )
-                .await;
-        }
-
-        let status = run_docker_cursor_attempt(
-            job,
-            invocation,
-            &container_name,
-            continuation_prompt.as_deref(),
-            &shell_prelude,
-            attempt > 1,
-            output_path,
-            valid_next_events,
-            work_item_context,
-            environment_table,
-            events,
-            cancel_rx.clone(),
-        )
-        .await?;
-
-        if matches!(status, ExecutionStatus::Cancelled) {
-            if let Err(error) = cleanup_cursor_container(&container_name).await {
-                eprintln!(
-                    "warning: failed to cleanup cursor container {}: {error:#}",
-                    container_name
-                );
-            }
-            return Ok(status);
-        }
-
-        if !matches!(status, ExecutionStatus::Exited(0)) {
-            if let Err(error) = cleanup_cursor_container(&container_name).await {
-                eprintln!(
-                    "warning: failed to cleanup cursor container {}: {error:#}",
-                    container_name
-                );
-            }
-            return Ok(status);
-        }
-
-        match validate_opencode_output(
-            output_path,
-            valid_next_events,
-            work_item_context,
-            environment_table,
-        ) {
-            Ok(()) => {
-                if let Some(events) = events {
-                    events
-                        .emit(
-                            job.id,
-                            pb::JobEventKind::JobEventSystem,
-                            format!("cursor output validation passed on attempt {attempt}"),
-                        )
-                        .await;
-                }
-                if let Err(error) = cleanup_cursor_container(&container_name).await {
-                    eprintln!(
-                        "warning: failed to cleanup cursor container {}: {error:#}",
-                        container_name
-                    );
-                }
-                return Ok(status);
-            }
-            Err(validation_error) => {
-                if attempt >= max_attempts {
-                    if let Some(events) = events {
-                        events
-                            .emit(
-                                job.id,
-                                pb::JobEventKind::JobEventSystem,
-                                format!(
-                                    "cursor output validation failed after {attempt} attempts: {validation_error}"
-                                ),
-                            )
-                            .await;
-                    }
-                    if let Err(error) = cleanup_cursor_container(&container_name).await {
-                        eprintln!(
-                            "warning: failed to cleanup cursor container {}: {error:#}",
-                            container_name
-                        );
-                    }
-                    anyhow::bail!(
-                        "cursor validation failed after {attempt} attempts: {validation_error}"
-                    );
-                }
-
-                if let Some(events) = events {
-                    events
-                        .emit(
-                            job.id,
-                            pb::JobEventKind::JobEventSystem,
-                            format!(
-                                "cursor output validation failed (attempt {attempt}/{max_attempts}): {validation_error}; retrying with agent --continue"
-                            ),
-                        )
-                        .await;
-                }
-                continuation_prompt = Some(build_opencode_correction_prompt(
-                    valid_next_events,
-                    &validation_error.to_string(),
-                    environment_table,
-                ));
-                attempt = attempt.saturating_add(1);
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_docker_cursor_attempt(
-    job: &Job,
-    invocation: &DockerRuntimeInvocation,
-    container_name: &str,
-    continuation_prompt: Option<&str>,
-    shell_prelude: &str,
-    append_logs: bool,
-    output_path: &Path,
-    valid_next_events: &[String],
-    work_item_context: &serde_json::Value,
-    environment_table: &EnvironmentValidationTable,
-    events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
-) -> anyhow::Result<ExecutionStatus> {
-    let cursor_cmd = if let Some(prompt) = continuation_prompt {
-        build_cursor_continue_script(shell_prelude, prompt)
-    } else {
-        String::new()
-    };
-
-    let docker_job = Job {
-        command: invocation.command.clone(),
-        args: if continuation_prompt.is_some() {
-            vec![
-                "exec".to_string(),
-                container_name.to_string(),
-                "sh".to_string(),
-                "-lc".to_string(),
-                cursor_cmd,
-            ]
-        } else {
-            let mut exec_args = vec!["exec".to_string(), container_name.to_string()];
-            exec_args.push(job.command.clone());
-            exec_args.extend(job.args.clone());
-            exec_args
-        },
-        ..job.clone()
-    };
-
-    run_raw_with_output_validation_early_exit(
-        &docker_job,
-        &invocation.workspace_dir,
-        &invocation.transcript_jsonl_path,
-        &invocation.stdout_path,
-        &invocation.stderr_path,
-        &invocation.env,
-        invocation.timeout_secs,
-        output_path,
-        valid_next_events,
-        work_item_context,
-        environment_table,
-        events,
-        cancel_rx,
-        append_logs,
-    )
-    .await
-}
-
-async fn spawn_cursor_runtime_container(
-    invocation: &DockerRuntimeInvocation,
-    container_name: &str,
-) -> anyhow::Result<()> {
-    let _ = tokio::process::Command::new("docker")
-        .arg("rm")
-        .arg("-f")
-        .arg(container_name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
-    let run_args = build_opencode_spawn_run_args(&invocation.args, container_name)?;
-
-    let mut cmd = tokio::process::Command::new(&invocation.command);
-    cmd.args(&run_args).current_dir(&invocation.workspace_dir);
-    for (k, v) in &invocation.env {
-        cmd.env(k, v);
-    }
-
-    let status = cmd.status().await?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "failed to start cursor runtime container {}: {}",
-            container_name,
-            status
-        )
-    }
-}
-
-fn cursor_shell_prelude(job: &Job) -> String {
-    if job.command != "sh" {
-        return String::new();
-    }
-    if job.args.first().map(String::as_str) != Some("-lc") {
-        return String::new();
-    }
-    let Some(script) = job.args.get(1) else {
-        return String::new();
-    };
-    let marker = "if [ -f \"$AGENT_PROMPT_USER_PATH\" ]";
-    let Some((prefix, _)) = script.split_once(marker) else {
-        return String::new();
-    };
-    prefix.trim().trim_end_matches(';').trim().to_string()
-}
-
-fn build_cursor_continue_script(shell_prelude: &str, prompt: &str) -> String {
-    let mut script = String::new();
-    if !shell_prelude.is_empty() {
-        script.push_str(shell_prelude);
-        script.push_str("; ");
-    }
-    script.push_str("cat <<'AGENT_HUB_RETRY_PROMPT' >/tmp/agent-hub-retry-prompt.txt\n");
-    script.push_str(prompt);
-    script.push_str(
-        "\nAGENT_HUB_RETRY_PROMPT\nagent --continue -p --force --trust < /tmp/agent-hub-retry-prompt.txt",
-    );
-    script
-}
-
-async fn cleanup_cursor_container(container_name: &str) -> anyhow::Result<()> {
-    let mut cmd = tokio::process::Command::new("docker");
-    cmd.arg("rm").arg("-f").arg(container_name);
-    let status = cmd.status().await?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("docker rm -f {} failed with {}", container_name, status)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn build_docker_runtime_invocation(
     job: &Job,
     local_agent_config: &LocalAgentConfig,
@@ -6731,9 +7822,9 @@ async fn build_docker_runtime_invocation(
 
     let mut docker_network_none = local_egress_plan.network_none;
     let restricted_tier = match local_egress_plan.tier {
-        Some(LocalAgentEgressTier::Llm) | Some(LocalAgentEgressTier::Build) => {
-            local_egress_plan.tier
-        }
+        Some(LocalAgentEgressTier::Llm)
+        | Some(LocalAgentEgressTier::Github)
+        | Some(LocalAgentEgressTier::Build) => local_egress_plan.tier,
         _ => None,
     };
     if !runtime_spec.permissions.can_access_network && !docker_network_none {
@@ -6847,26 +7938,21 @@ async fn build_docker_runtime_invocation(
         ));
     }
 
-    let job_gh_host = job_gh_host_override(job, local_agent_config);
     let work_item_context = work_item_contract_from_job_context(&job.context);
     let allow_remote_credentials = job_allows_remote_credentials(&work_item_context);
-    if allow_remote_credentials {
-        append_gh_config_mount_for_toolchains(
-            &mut args,
-            &mut docker_env,
-            &runtime_spec.environment.toolchains,
-            job_gh_host.as_deref(),
-        );
+    let required_credential_providers = authorized_credential_provider_names(job)?;
+    if required_credential_providers
+        .iter()
+        .any(|provider| provider.starts_with("github:"))
+    {
+        anyhow::bail!("GitHub credentials are restricted to managed GitHub actions");
     }
     let resolved_credentials = if allow_remote_credentials {
-        resolve_configured_credentials(
-            local_agent_config,
-            &authorized_credential_provider_names(job)?,
-        )
-        .await?
+        resolve_configured_credentials(local_agent_config, &required_credential_providers).await?
     } else {
         ResolvedCredentials::default()
     };
+    validate_general_job_credentials(&resolved_credentials)?;
     append_resolved_credentials_to_docker_invocation(
         &resolved_credentials,
         &mut args,
@@ -6989,17 +8075,26 @@ async fn resolve_configured_credentials(
 fn authorized_credential_provider_names(job: &Job) -> anyhow::Result<Vec<String>> {
     let request = protocol::authorization_request_from_job_context(&job.context)
         .context("job has no resolved authorization request")?;
-    if request.behavior.execution_kind == "command" {
-        return Ok(Vec::new());
-    }
-    let profile: agent_hub_config::ResolvedRunnerProfile =
-        serde_json::from_value(request.behavior.runner_profile)
-            .context("authorization has invalid runner profile")?;
-    Ok(profile
-        .credential_providers
+    let mut providers = request
+        .permission_envelope
+        .github_capabilities
         .into_iter()
-        .map(|provider| provider.name)
-        .collect())
+        .map(|capability| capability.credential_provider)
+        .collect::<Vec<_>>();
+    if request.behavior.execution_kind != "command" {
+        let profile: agent_hub_config::ResolvedRunnerProfile =
+            serde_json::from_value(request.behavior.runner_profile)
+                .context("authorization has invalid runner profile")?;
+        providers.extend(
+            profile
+                .credential_providers
+                .into_iter()
+                .map(|provider| provider.name),
+        );
+    }
+    providers.sort();
+    providers.dedup();
+    Ok(providers)
 }
 
 fn append_resolved_credentials_to_docker_invocation(
@@ -7021,6 +8116,25 @@ fn append_resolved_credentials_to_docker_invocation(
             .entry(key.clone())
             .or_insert_with(|| value.clone());
     }
+}
+
+fn validate_general_job_credentials(resolved: &ResolvedCredentials) -> anyhow::Result<()> {
+    const MANAGED_GITHUB_ENV: [&str; 6] = [
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GH_HOST",
+        "GH_CONFIG_DIR",
+        "AGENT_HUB_GITHUB_TOKEN",
+    ];
+    if MANAGED_GITHUB_ENV
+        .iter()
+        .any(|name| resolved.env_vars.contains_key(*name))
+    {
+        cleanup_credential_temp_files(&resolved.temp_files)?;
+        anyhow::bail!("GitHub credentials are restricted to managed GitHub actions");
+    }
+    Ok(())
 }
 
 fn cleanup_credential_temp_files_best_effort(temp_files: &[PathBuf]) {
@@ -7056,159 +8170,6 @@ fn docker_run_user_arg(workspace_dir: &Path) -> Option<String> {
     #[cfg(not(unix))]
     {
         let _ = workspace_dir;
-        None
-    }
-}
-
-const GH_CONFIG_CONTAINER_DIR: &str = "/gh-config";
-const GH_DEFAULT_HOST: &str = GITHUB_DEFAULT_HOST;
-
-/// Resolve the GitHub host for `job` from its repo URL, but only when that
-/// host appears in the configured `github_hosts` allowlist (see
-/// [`LocalAgentConfig::github_host_allowlist`]). Returns `None` when the job
-/// has no repo, the URL doesn't look like a GitHub host, or the host isn't
-/// allowlisted — in those cases callers should fall back to the local-agent's
-/// host-level `GH_HOST` (or the gh default).
-fn job_gh_host_override(job: &Job, local_agent_config: &LocalAgentConfig) -> Option<String> {
-    let repo = job.repo.as_ref()?;
-    let parsed = parse_github_repo_url(&repo.repo_url)?;
-    let allowlist = local_agent_config.github_host_allowlist();
-    if allowlist
-        .iter()
-        .any(|h| h.eq_ignore_ascii_case(&parsed.host))
-    {
-        Some(parsed.host)
-    } else {
-        None
-    }
-}
-
-fn append_gh_config_mount_for_toolchains(
-    args: &mut Vec<String>,
-    docker_env: &mut HashMap<String, String>,
-    toolchains: &[String],
-    job_gh_host: Option<&str>,
-) {
-    if let Some(host_gh_config_dir) = resolve_gh_config_mount_source(
-        toolchains,
-        std::env::var_os("GH_CONFIG_DIR").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    ) {
-        args.push("-v".to_string());
-        args.push(format!(
-            "{}:{GH_CONFIG_CONTAINER_DIR}:ro",
-            host_gh_config_dir.to_string_lossy()
-        ));
-        docker_env.insert(
-            "GH_CONFIG_DIR".to_string(),
-            GH_CONFIG_CONTAINER_DIR.to_string(),
-        );
-    }
-
-    // Per-job repo host (when present and non-default) takes precedence over
-    // the local-agent's process-wide GH_HOST. Without this, jobs whose repo
-    // lives on a GHE host can't authenticate `gh` even when the host machine
-    // has both auths configured.
-    let host_gh_host = std::env::var_os("GH_HOST");
-    let host_gh_host_str = host_gh_host
-        .as_deref()
-        .and_then(std::ffi::OsStr::to_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let effective_host = job_gh_host
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .or(host_gh_host_str);
-
-    if toolchains.iter().any(|t| t == "gh")
-        && let Some(host) = effective_host
-        && !host.eq_ignore_ascii_case(GH_DEFAULT_HOST)
-        && !docker_env.contains_key("GH_HOST")
-    {
-        // Surface the host inside the container so `gh` commands target the
-        // right forge by default. Skipped for github.com because gh's default
-        // already matches and we want to avoid masking an unset env.
-        docker_env.insert("GH_HOST".to_string(), host.to_string());
-    }
-
-    let effective_host_owned = effective_host.map(str::to_string);
-    append_gh_auth_token_env_for_toolchains(
-        docker_env,
-        toolchains,
-        effective_host_owned.as_deref().map(std::ffi::OsStr::new),
-        resolve_gh_auth_token_from_host,
-    );
-}
-
-fn append_gh_auth_token_env_for_toolchains<F>(
-    docker_env: &mut HashMap<String, String>,
-    toolchains: &[String],
-    gh_host: Option<&std::ffi::OsStr>,
-    resolve_token: F,
-) where
-    F: FnOnce(&str) -> Option<String>,
-{
-    if !toolchains.iter().any(|toolchain| toolchain == "gh") {
-        return;
-    }
-
-    let host = gh_host
-        .and_then(std::ffi::OsStr::to_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(GH_DEFAULT_HOST);
-
-    let token_env_var = if host.eq_ignore_ascii_case(GH_DEFAULT_HOST) {
-        "GH_TOKEN"
-    } else {
-        "GH_ENTERPRISE_TOKEN"
-    };
-
-    if docker_env.contains_key(token_env_var) {
-        return;
-    }
-
-    if let Some(token) = resolve_token(host)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        docker_env.insert(token_env_var.to_string(), token);
-    }
-}
-
-fn resolve_gh_auth_token_from_host(hostname: &str) -> Option<String> {
-    let output = std::process::Command::new("gh")
-        .args(["auth", "token", "--hostname", hostname])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn resolve_gh_config_mount_source(
-    toolchains: &[String],
-    gh_config_dir: Option<&std::ffi::OsStr>,
-    home_dir: Option<&std::ffi::OsStr>,
-) -> Option<PathBuf> {
-    if !toolchains.iter().any(|toolchain| toolchain == "gh") {
-        return None;
-    }
-
-    let candidate = if let Some(explicit) = gh_config_dir {
-        PathBuf::from(explicit)
-    } else {
-        PathBuf::from(home_dir?).join(".config/gh")
-    };
-
-    if candidate.is_dir() {
-        Some(candidate)
-    } else {
         None
     }
 }
@@ -7278,9 +8239,8 @@ fn normalize_mount_path_for_policy(path: &str) -> String {
 #[cfg(test)]
 mod restricted_mount_tests {
     use super::{
-        append_gh_auth_token_env_for_toolchains, append_gh_config_mount_for_toolchains,
         append_git_config_env, append_git_identity_env_defaults, docker_run_user_arg,
-        is_restricted_breakout_mount, resolve_gh_config_mount_source,
+        is_restricted_breakout_mount,
     };
     use std::collections::HashMap;
 
@@ -7414,123 +8374,6 @@ mod restricted_mount_tests {
         );
     }
 
-    #[test]
-    fn resolve_gh_config_mount_source_prefers_explicit_dir() {
-        let temp_root =
-            std::env::temp_dir().join(format!("local-agent-gh-test-{}", uuid::Uuid::new_v4()));
-        let explicit = temp_root.join("explicit-gh");
-        let home_dir = temp_root.join("home");
-        let fallback = home_dir.join(".config/gh");
-        std::fs::create_dir_all(&explicit).expect("create explicit dir");
-        std::fs::create_dir_all(&fallback).expect("create fallback dir");
-
-        let resolved = resolve_gh_config_mount_source(
-            &["gh".to_string()],
-            Some(explicit.as_os_str()),
-            Some(home_dir.as_os_str()),
-        );
-
-        assert_eq!(resolved, Some(explicit.clone()));
-        let _ = std::fs::remove_dir_all(temp_root);
-    }
-
-    #[test]
-    fn resolve_gh_config_mount_source_falls_back_to_home_config() {
-        let temp_root =
-            std::env::temp_dir().join(format!("local-agent-gh-test-{}", uuid::Uuid::new_v4()));
-        let home_dir = temp_root.join("home");
-        let gh_dir = home_dir.join(".config/gh");
-        std::fs::create_dir_all(&gh_dir).expect("create gh dir");
-
-        let resolved =
-            resolve_gh_config_mount_source(&["gh".to_string()], None, Some(home_dir.as_os_str()));
-
-        assert_eq!(resolved, Some(gh_dir));
-        let _ = std::fs::remove_dir_all(temp_root);
-    }
-
-    #[test]
-    fn resolve_gh_config_mount_source_requires_gh_toolchain() {
-        let temp_root =
-            std::env::temp_dir().join(format!("local-agent-gh-test-{}", uuid::Uuid::new_v4()));
-        let explicit = temp_root.join("explicit-gh");
-        std::fs::create_dir_all(&explicit).expect("create explicit dir");
-
-        let resolved = resolve_gh_config_mount_source(
-            &["git".to_string()],
-            Some(explicit.as_os_str()),
-            Some(temp_root.as_os_str()),
-        );
-
-        assert!(resolved.is_none());
-        let _ = std::fs::remove_dir_all(temp_root);
-    }
-
-    #[test]
-    fn append_gh_config_mount_for_toolchains_noops_without_gh_toolchain() {
-        let mut args = Vec::new();
-        let mut env = HashMap::new();
-        append_gh_config_mount_for_toolchains(&mut args, &mut env, &["git".to_string()], None);
-
-        assert!(args.is_empty());
-        assert!(!env.contains_key("GH_CONFIG_DIR"));
-    }
-
-    #[test]
-    fn append_gh_auth_token_env_uses_default_host_token() {
-        let mut env = HashMap::new();
-        append_gh_auth_token_env_for_toolchains(&mut env, &["gh".to_string()], None, |host| {
-            assert_eq!(host, "github.com");
-            Some("secret-token".to_string())
-        });
-
-        assert_eq!(
-            env.get("GH_TOKEN").map(String::as_str),
-            Some("secret-token")
-        );
-        assert!(!env.contains_key("GH_ENTERPRISE_TOKEN"));
-    }
-
-    #[test]
-    fn append_gh_auth_token_env_uses_enterprise_token_for_non_default_host() {
-        let mut env = HashMap::new();
-        append_gh_auth_token_env_for_toolchains(
-            &mut env,
-            &["gh".to_string()],
-            Some(std::ffi::OsStr::new("ghe.example.com")),
-            |host| {
-                assert_eq!(host, "ghe.example.com");
-                Some("enterprise-token".to_string())
-            },
-        );
-
-        assert_eq!(
-            env.get("GH_ENTERPRISE_TOKEN").map(String::as_str),
-            Some("enterprise-token")
-        );
-        assert!(!env.contains_key("GH_TOKEN"));
-    }
-
-    #[test]
-    fn append_gh_auth_token_env_preserves_existing_token() {
-        let mut env = HashMap::from([("GH_TOKEN".to_string(), "already-set".to_string())]);
-        append_gh_auth_token_env_for_toolchains(&mut env, &["gh".to_string()], None, |_| {
-            panic!("token resolver should not run when GH_TOKEN already exists")
-        });
-
-        assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some("already-set"));
-    }
-
-    #[test]
-    fn append_gh_auth_token_env_noops_without_gh_toolchain() {
-        let mut env = HashMap::new();
-        append_gh_auth_token_env_for_toolchains(&mut env, &["git".to_string()], None, |_| {
-            panic!("token resolver should not run without gh toolchain")
-        });
-
-        assert!(env.is_empty());
-    }
-
     #[cfg(unix)]
     #[test]
     fn docker_run_user_arg_uses_workspace_owner_uid_gid() {
@@ -7577,8 +8420,6 @@ fn build_run_json_payload(
 fn planned_permission_tier_name(tier: &protocol::PlannedPermissionTier) -> &'static str {
     match tier {
         protocol::PlannedPermissionTier::DockerDefault => "docker_default",
-        protocol::PlannedPermissionTier::RawCompatible => "raw_compatible",
-        protocol::PlannedPermissionTier::KubernetesStub => "kubernetes_stub",
     }
 }
 
@@ -7632,7 +8473,6 @@ mod multi_repo_tests {
                 timeout_secs: None,
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -7650,6 +8490,7 @@ mod multi_repo_tests {
                 aws_access: None,
             },
             approval_rules: None,
+            github_capabilities: Vec::new(),
             repos: vec![protocol::PlannedRepoClaim {
                 repo_url: "https://github.com/reddit/opencode.git".to_string(),
                 base_ref: "origin/main".to_string(),
@@ -7705,7 +8546,6 @@ mod multi_repo_tests {
                 timeout_secs: None,
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -7723,6 +8563,7 @@ mod multi_repo_tests {
                 aws_access: None,
             },
             approval_rules: None,
+            github_capabilities: Vec::new(),
             repos: vec![
                 protocol::PlannedRepoClaim {
                     repo_url: candidate_url.to_string(),
@@ -7749,80 +8590,6 @@ mod multi_repo_tests {
     }
 
     #[test]
-    fn resolve_runtime_spec_falls_back_and_keeps_repo_claims_from_context() {
-        let runtime = protocol::CanonicalRuntimeSpec {
-            runtime_version: "v1".to_string(),
-            environment: protocol::PlannedEnvironmentSpec {
-                tier: protocol::PlannedEnvironmentTier::Docker,
-                execution_mode: ExecutionMode::Docker,
-                container_image: None,
-                timeout_secs: None,
-                memory_limit: None,
-                cpu_limit: None,
-                network: None,
-                network_resources: None,
-                filesystem: None,
-                file_mounts: vec![],
-                toolchains: vec![],
-            },
-            permissions: protocol::PlannedPermissionSet {
-                tier: protocol::PlannedPermissionTier::DockerDefault,
-                can_read_workspace: true,
-                can_write_workspace: true,
-                can_run_shell: true,
-                can_access_network: true,
-                auto_approve_tools: vec![],
-                escalate_tools: vec![],
-                kubernetes_access: None,
-                aws_access: None,
-            },
-            approval_rules: None,
-            repos: vec![protocol::PlannedRepoClaim {
-                repo_url: "https://github.com/nickdavies/agent-hub-poc-test.git".to_string(),
-                base_ref: "origin/main".to_string(),
-                read_only: true,
-                target_branch: None,
-                claim_type: "read_only".to_string(),
-                branch_name: None,
-            }],
-        };
-        let mut context = serde_json::json!({});
-        protocol::project_runtime_spec_into_job_context(&mut context, &runtime);
-
-        let job = Job {
-            id: uuid::Uuid::new_v4(),
-            work_item_id: uuid::Uuid::new_v4(),
-            step_id: "step".to_string(),
-            state: JobState::Assigned,
-            assigned_worker_id: None,
-            execution_mode: ExecutionMode::Raw,
-            container_image: None,
-            command: "echo".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            prompt: None,
-            context,
-            repo: None,
-            timeout_secs: None,
-            max_retries: 0,
-            attempt: 0,
-            transcript_dir: None,
-            result: None,
-            lease_expires_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-
-        let (resolved, source) = resolve_runtime_spec_and_source(&job);
-        assert!(matches!(source, RuntimeSpecSource::LegacyJobFields));
-        assert_eq!(resolved.repos.len(), 1);
-        assert_eq!(
-            resolved.repos[0].repo_url,
-            "https://github.com/nickdavies/agent-hub-poc-test.git"
-        );
-    }
-
-    #[test]
     fn build_opencode_spawn_run_args_preserves_repo_mounts() {
         let invocation_args = vec![
             "run".to_string(),
@@ -7835,7 +8602,7 @@ mod multi_repo_tests {
             "/host/repo:/repos/agent-hub-poc-test:ro".to_string(),
             "--entrypoint".to_string(),
             "sh".to_string(),
-            "local/opencode:managed".to_string(),
+            "agent-hub/job-code:2026-08-18".to_string(),
             "-lc".to_string(),
             "opencode run".to_string(),
         ];
@@ -7905,7 +8672,6 @@ mod triage_validation_tests {
             kind: ResolvedRunnerKind::Generic,
             command: "agent".to_string(),
             args: Vec::new(),
-            container_image: Some("agent-image".to_string()),
             file_mounts: vec![protocol::orchestration::PlannedFileMount {
                 host_path: "/home/user/.ssh".to_string(),
                 container_path: "/credentials".to_string(),
@@ -7994,27 +8760,6 @@ mod triage_validation_tests {
         assert!(args.is_empty());
         assert!(env.is_empty());
 
-        if job_allows_remote_credentials(&work_item_contract_from_job_context(&job.context)) {
-            append_gh_config_mount_for_toolchains(
-                &mut args,
-                &mut env,
-                &["gh".to_string()],
-                Some("github.com"),
-            );
-            append_resolved_credentials_to_docker_invocation(
-                &ResolvedCredentials {
-                    env_vars: HashMap::from([("GH_TOKEN".to_string(), "secret".to_string())]),
-                    file_mounts: vec![(
-                        "/credentials/provider".to_string(),
-                        "/credentials/provider".to_string(),
-                        true,
-                    )],
-                    temp_files: Vec::new(),
-                },
-                &mut args,
-                &mut env,
-            );
-        }
         assert!(args.is_empty());
         assert!(env.is_empty());
     }

@@ -412,13 +412,7 @@ pub trait TaskAdapter: Send + Sync {
     /// Write/update a structured job result comment on the task
     fn write_job_result_comment(
         &self,
-        _task_id: &str,
-        _step_id: &str,
-        _work_item_id: &str,
-        _job_succeeded: bool,
-        _output: &serde_json::Value,
-        _context: &serde_json::Value,
-        _stored_comment_id: Option<i64>,
+        _result: JobResultComment<'_>,
     ) -> anyhow::Result<Option<i64>> {
         Ok(None)
     }
@@ -471,6 +465,16 @@ pub trait TaskAdapter: Send + Sync {
             self.adapter_name()
         ))
     }
+}
+
+pub struct JobResultComment<'a> {
+    pub task_id: &'a str,
+    pub step_id: &'a str,
+    pub work_item_id: &'a str,
+    pub succeeded: bool,
+    pub output: &'a serde_json::Value,
+    pub context: &'a serde_json::Value,
+    pub stored_comment_id: Option<i64>,
 }
 
 pub fn work_item_from_create(
@@ -841,7 +845,7 @@ fn infer_valid_next_events_for_projection(item: &WorkItem) -> Vec<WorkflowEventK
     }
 
     if item.human_gate {
-        return legacy_human_gate_valid_next_events(item);
+        return inferred_human_gate_valid_next_events(item);
     }
 
     let mut events = Vec::new();
@@ -852,7 +856,7 @@ fn infer_valid_next_events_for_projection(item: &WorkItem) -> Vec<WorkflowEventK
     events
 }
 
-pub(crate) fn legacy_human_gate_valid_next_events(item: &WorkItem) -> Vec<WorkflowEventKind> {
+fn inferred_human_gate_valid_next_events(item: &WorkItem) -> Vec<WorkflowEventKind> {
     let mut events = Vec::new();
     match current_human_gate_state(item) {
         Some(TaskHumanGateState::Approved) => {}

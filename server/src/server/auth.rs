@@ -54,6 +54,14 @@ pub async fn require_auth<N: Notifier>(
     Err(StatusCode::UNAUTHORIZED)
 }
 
+/// Web auth middleware: session cookie only, redirects to login on failure.
+pub async fn require_web_auth(session: Session, request: Request, next: Next) -> Response {
+    if oauth::get_session_email(&session).await.is_some() {
+        return next.run(request).await;
+    }
+    Redirect::temporary("/auth/login").into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,12 +86,4 @@ mod tests {
         assert!(match_bearer_token("Bearer wrong", &tokens).is_none());
         assert!(match_bearer_token("abc123", &tokens).is_none());
     }
-}
-
-/// Web auth middleware: session cookie only, redirects to login on failure.
-pub async fn require_web_auth(session: Session, request: Request, next: Next) -> Response {
-    if oauth::get_session_email(&session).await.is_some() {
-        return next.run(request).await;
-    }
-    Redirect::temporary("/auth/login").into_response()
 }

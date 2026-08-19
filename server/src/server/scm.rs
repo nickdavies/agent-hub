@@ -2,7 +2,7 @@
 //!
 //! At startup the server takes the `[[system.scm_hosts]]` rows from
 //! `system.toml` (deserialised as `ScmHostConfig`) and resolves each row's
-//! `token_env` pointer against the process environment. The result is a
+//! `read_token_env` pointer against the process environment. The result is a
 //! `ScmHostRegistry` of `ResolvedScmHost` values that the poller and the
 //! `github_pr` URL parser consult at runtime.
 //!
@@ -45,7 +45,7 @@ impl std::fmt::Display for ScmHostKind {
     }
 }
 
-/// A host config row with `token_env` already resolved against the
+/// A host config row with `read_token_env` already resolved against the
 /// process environment.
 ///
 /// `token` is mandatory because every supported `kind` needs auth to be
@@ -56,7 +56,7 @@ pub struct ResolvedScmHost {
     pub kind: ScmHostKind,
     pub host: String,
     pub api_base_url: String,
-    pub token: String,
+    pub read_token: String,
 }
 
 /// Lookup table for resolved hosts. Constructed once at startup; cheap to
@@ -67,12 +67,21 @@ pub struct ScmHostRegistry {
 }
 
 impl ScmHostRegistry {
-    /// Build a registry from declared hosts. If the list is empty the
-    /// caller is expected to inject a fallback (see `with_legacy_github_fallback`).
-    ///
+    #[cfg(test)]
+    pub fn github_com_for_tests() -> Self {
+        Self {
+            hosts: vec![ResolvedScmHost {
+                kind: ScmHostKind::Github,
+                host: "github.com".to_string(),
+                api_base_url: "https://api.github.com".to_string(),
+                read_token: "test-token".to_string(),
+            }],
+        }
+    }
+
     /// Hard-fails (returns `AppError::Config`) if any declared row has
-    /// a missing or empty `host` / `api_base_url` / `token_env`, or if
-    /// `token_env` points at an env var that is unset or empty. Silent
+    /// a missing or empty `host` / `api_base_url` / `read_token_env`, or if
+    /// `read_token_env` points at an env var that is unset or empty. Silent
     /// skipping makes "polling stopped working" debugging miserable;
     /// if you don't want a host registered, delete its
     /// `[[system.scm_hosts]]` row.
@@ -80,32 +89,37 @@ impl ScmHostRegistry {
         let mut hosts = Vec::with_capacity(configs.len());
         for cfg in configs {
             let kind = ScmHostKind::parse(&cfg.kind)?;
-            let host = cfg.host.trim().to_ascii_lowercase();
+            if cfg.host.trim().is_empty() {
+                return Err(AppError::Config(
+                    "scm_host entry has empty `host`".to_string(),
+                ));
+            }
+            let host = protocol::canonical_github_host(&cfg.host).ok_or_else(|| {
+                AppError::Config(format!("scm_host entry has invalid `host` '{}'", cfg.host))
+            })?;
             if host.is_empty() {
                 return Err(AppError::Config(
                     "scm_host entry has empty `host`".to_string(),
                 ));
             }
-            let api_base_url = cfg.api_base_url.trim().trim_end_matches('/').to_string();
-            if api_base_url.is_empty() {
-                return Err(AppError::Config(format!(
-                    "scm_host '{host}' has empty `api_base_url`"
-                )));
-            }
+            let api_base_url =
+                protocol::canonical_github_api_base_for_host(&host, &cfg.api_base_url).ok_or_else(
+                    || AppError::Config(format!("scm_host '{host}' has invalid `api_base_url`")),
+                )?;
             let token_env_name = cfg
-                .token_env
+                .read_token_env
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
                     AppError::Config(format!(
-                        "scm_host '{host}' (kind '{kind}') is missing `token_env`; \
+                        "scm_host '{host}' (kind '{kind}') is missing `read_token_env`; \
                          declare which env var holds the auth token, or remove the row"
                     ))
                 })?;
-            let token = read_secret_env(token_env_name).ok_or_else(|| {
+            let read_token = read_secret_env(token_env_name).ok_or_else(|| {
                 AppError::Config(format!(
-                    "scm_host '{host}': env var '{token_env_name}' (referenced by `token_env`) \
+                    "scm_host '{host}': env var '{token_env_name}' (referenced by `read_token_env`) \
                      is empty or unset; populate it (e.g. in agent-hub/.env) or remove the row"
                 ))
             })?;
@@ -113,42 +127,15 @@ impl ScmHostRegistry {
                 kind,
                 host,
                 api_base_url,
-                token,
+                read_token,
             });
+        }
+        if hosts.is_empty() {
+            return Err(AppError::Config(
+                "at least one system.scm_hosts entry is required".to_string(),
+            ));
         }
         Ok(Self { hosts })
-    }
-
-    /// If no hosts are declared, fold legacy single-host env vars
-    /// (`GITHUB_TOKEN` + `GITHUB_API_BASE_URL`) into a synthetic
-    /// `github.com` row. This is purely backwards-compat — once
-    /// `[[system.scm_hosts]]` is populated, the legacy env vars are
-    /// ignored.
-    ///
-    /// An empty `legacy_token` produces no row. That isn't a soft
-    /// failure: callers who want polling configure `[[system.scm_hosts]]`
-    /// (which is hard-validated). The legacy fallback is only there so
-    /// pre-registry deployments keep working until they migrate.
-    pub fn with_legacy_github_fallback(
-        mut self,
-        legacy_token: Option<&str>,
-        legacy_api_base_url: &str,
-    ) -> Self {
-        if self.hosts.is_empty()
-            && let Some(token) = legacy_token
-            && !token.is_empty()
-        {
-            self.hosts.push(ResolvedScmHost {
-                kind: ScmHostKind::Github,
-                host: "github.com".to_string(),
-                api_base_url: legacy_api_base_url
-                    .trim()
-                    .trim_end_matches('/')
-                    .to_string(),
-                token: token.to_string(),
-            });
-        }
-        self
     }
 
     /// Find a configured host by its name (case-insensitive).
@@ -159,19 +146,6 @@ impl ScmHostRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.hosts.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &ResolvedScmHost> {
-        self.hosts.iter()
-    }
-
-    /// Convenience for callers that don't care about the host (e.g.
-    /// legacy single-host code paths). Returns the first registered host
-    /// if any.
-    pub fn default_github_host(&self) -> Option<&ResolvedScmHost> {
-        self.hosts
-            .iter()
-            .find(|h| matches!(h.kind, ScmHostKind::Github))
     }
 }
 
@@ -190,12 +164,12 @@ fn read_secret_env(name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn cfg(kind: &str, host: &str, base: &str, token_env: Option<&str>) -> ScmHostConfig {
+    fn cfg(kind: &str, host: &str, base: &str, read_token_env: Option<&str>) -> ScmHostConfig {
         ScmHostConfig {
             kind: kind.into(),
             host: host.into(),
             api_base_url: base.into(),
-            token_env: token_env.map(Into::into),
+            read_token_env: read_token_env.map(Into::into),
         }
     }
 
@@ -216,29 +190,33 @@ mod tests {
             .expect("host resolves case-insensitively");
         assert_eq!(h.kind, ScmHostKind::Github);
         assert_eq!(h.api_base_url, "https://github.snooguts.net/api/v3");
-        assert_eq!(h.token, "tok");
+        assert_eq!(h.read_token, "tok");
         unsafe { env::remove_var("SCM_TEST_TOKEN_INSENS") };
     }
 
     #[test]
-    fn legacy_fallback_only_kicks_in_when_registry_empty() {
-        unsafe { env::set_var("SCM_TEST_TOKEN_LEGACY_OVERRIDE", "real") };
-        let registry = ScmHostRegistry::default()
-            .with_legacy_github_fallback(Some("legacy"), "https://api.github.com");
-        let h = registry.find("github.com").expect("legacy fallback");
-        assert_eq!(h.token, "legacy");
+    fn api_base_cannot_cross_scm_host_identity() {
+        unsafe { env::set_var("SCM_TEST_TOKEN_CROSS_HOST", "tok") };
+        for (host, api_base) in [
+            ("github.com", "https://github.com/api/v3"),
+            ("ghe.example.com", "https://api.other.example/api/v3"),
+        ] {
+            assert!(
+                ScmHostRegistry::from_configs(&[cfg(
+                    "github",
+                    host,
+                    api_base,
+                    Some("SCM_TEST_TOKEN_CROSS_HOST")
+                )])
+                .is_err()
+            );
+        }
+        unsafe { env::remove_var("SCM_TEST_TOKEN_CROSS_HOST") };
+    }
 
-        let populated = ScmHostRegistry::from_configs(&[cfg(
-            "github",
-            "github.com",
-            "https://api.github.com",
-            Some("SCM_TEST_TOKEN_LEGACY_OVERRIDE"),
-        )])
-        .expect("parse")
-        .with_legacy_github_fallback(Some("ignored"), "https://api.github.com");
-        // populated registry wins; legacy token is NOT applied
-        assert_eq!(populated.find("github.com").unwrap().token, "real");
-        unsafe { env::remove_var("SCM_TEST_TOKEN_LEGACY_OVERRIDE") };
+    #[test]
+    fn empty_registry_is_rejected() {
+        assert!(ScmHostRegistry::from_configs(&[]).is_err());
     }
 
     #[test]
@@ -265,7 +243,7 @@ mod tests {
         assert!(format!("{err}").contains("unknown scm_host kind"));
     }
 
-    /// Hard-fail #1: row declares `token_env = "..."` but the env var is
+    /// Hard-fail #1: row declares `read_token_env = "..."` but the env var is
     /// empty/unset. This is the case Nick hit with `GITHUB_ENTERPRISE_TOKEN`
     /// and the failure mode we explicitly do not want to be silent.
     #[test]
@@ -287,22 +265,22 @@ mod tests {
         assert!(msg.contains("empty or unset"), "error is explicit: {msg}");
     }
 
-    /// Hard-fail #2: row omits `token_env` altogether. We don't have a
+    /// Hard-fail #2: row omits `read_token_env` altogether. We don't have a
     /// "polling-disabled host" mode; an unauthed `kind = "github"` row
     /// is functionally useless.
     #[test]
-    fn omitted_token_env_field_is_a_hard_config_error() {
+    fn omitted_read_token_env_field_is_a_hard_config_error() {
         let err = ScmHostRegistry::from_configs(&[cfg(
             "github",
             "ghe.example.com",
             "https://ghe.example.com/api/v3",
             None,
         )])
-        .expect_err("missing token_env should reject");
+        .expect_err("missing read_token_env should reject");
         let msg = format!("{err}");
         assert!(
-            msg.contains("missing `token_env`"),
-            "error mentions missing token_env: {msg}"
+            msg.contains("missing `read_token_env`"),
+            "error mentions missing read_token_env: {msg}"
         );
     }
 
@@ -321,5 +299,4 @@ mod tests {
         unsafe { env::remove_var("SCM_TEST_TOKEN_BLANK") };
         assert!(format!("{err}").contains("empty or unset"));
     }
-
 }

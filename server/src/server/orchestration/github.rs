@@ -47,11 +47,7 @@ pub(crate) struct MergeReadiness {
 }
 
 pub(super) fn parse_pr_number_from_url(url: &str) -> Option<u64> {
-    url.rsplit('/').next()?.parse::<u64>().ok()
-}
-
-pub(super) fn parse_pr_owner_repo_from_url(url: &str) -> Option<(String, String)> {
-    parse_pr_url_components(url).map(|parts| (parts.owner, parts.repo))
+    Some(protocol::parse_github_pull_request_url(url)?.number)
 }
 
 /// Components extracted from a GitHub-style PR URL, including the host.
@@ -67,8 +63,8 @@ pub(super) struct PrUrlParts {
     pub number: Option<u64>,
 }
 
-/// Parse `https://<host>/<owner>/<repo>/pull/<n>` (with or without a
-/// trailing slash, with or without `.git` on the repo segment) into its
+/// Parse `https://<host>/<owner>/<repo>/pull/<n>` (with or without `.git`
+/// on the repo segment) into its
 /// components. Accepts arbitrary hosts so it works for both `github.com`
 /// and GitHub Enterprise instances such as `github.snooguts.net`.
 ///
@@ -76,44 +72,12 @@ pub(super) struct PrUrlParts {
 /// not what humans paste into a task description and `gh pr create` does
 /// not produce them. Rejects anything that isn't `.../pull/<id>`.
 pub(super) fn parse_pr_url_components(url: &str) -> Option<PrUrlParts> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let rest = trimmed
-        .split_once("://")
-        .map(|(_, after)| after)
-        .unwrap_or(trimmed);
-    let mut segments = rest.split('/');
-    let host = segments
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_ascii_lowercase();
-    // Skip API-style URLs: api.github.com/repos/owner/repo/pulls/N. Those
-    // are accessed via the registry, not parsed back into PrUrlParts.
-    if host.starts_with("api.") || rest.contains("/repos/") {
-        return None;
-    }
-    let owner = segments
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
-    let repo_raw = segments
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let repo = repo_raw.trim_end_matches(".git").to_string();
-    let marker = segments.next()?;
-    if marker != "pull" && marker != "pulls" {
-        return None;
-    }
-    let number = segments
-        .next()
-        .and_then(|value| value.trim().parse::<u64>().ok());
+    let parsed = protocol::parse_github_pull_request_url(url)?;
     Some(PrUrlParts {
-        host,
-        owner,
-        repo,
-        number,
+        host: parsed.repository.host,
+        owner: parsed.repository.owner,
+        repo: parsed.repository.repository,
+        number: Some(parsed.number),
     })
 }
 

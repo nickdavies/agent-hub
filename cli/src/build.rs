@@ -87,6 +87,19 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
         .map(|cfg| (cfg.name.clone(), cfg))
         .collect();
 
+    for cfg in &image_configs {
+        let dockerfile = config_root
+            .join("images")
+            .join(&cfg.name)
+            .join("Dockerfile");
+        if cfg.name == "job-code"
+            && let Err(error) = validate_reproducible_job_code_context(&dockerfile)
+        {
+            eprintln!("[FAIL] {error}");
+            return (false, Vec::new());
+        }
+    }
+
     if build_order.is_empty() {
         println!("[SKIP] no installed images to build");
         return (true, Vec::new());
@@ -103,14 +116,14 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
         let tag = &cfg.tag;
         println!("[{}/{}] Building image {}...", index + 1, total, tag);
 
-        let status = Command::new("docker")
+        let mut command = Command::new("docker");
+        command
             .arg("build")
             .arg("-f")
             .arg(&dockerfile)
             .arg("-t")
-            .arg(&tag)
-            .arg(&image_dir)
-            .status();
+            .arg(tag);
+        let status = command.arg(&image_dir).status();
 
         match status {
             Ok(status) if status.success() => {
@@ -129,6 +142,26 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
     }
 
     (ok, built)
+}
+
+fn validate_reproducible_job_code_context(dockerfile: &Path) -> Result<(), String> {
+    let source = std::fs::read_to_string(dockerfile)
+        .map_err(|error| format!("failed to read {}: {error}", dockerfile.display()))?;
+    let from = source
+        .lines()
+        .find(|line| line.trim_start().starts_with("FROM "))
+        .ok_or_else(|| "job-code Dockerfile has no base image".to_string())?;
+    if !from.contains("@sha256:") {
+        return Err("job-code base image must be pinned by digest".to_string());
+    }
+    for forbidden in ["COPY bin/", "curl |", "curl|", ":latest", "ARG "] {
+        if source.contains(forbidden) {
+            return Err(format!(
+                "job-code Dockerfile contains non-reproducible input '{forbidden}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn build_environments(
@@ -242,7 +275,8 @@ fn materialize_environment(
     copy_required_file(source_env_dir, output_env_dir, "dippy.conf")?;
     copy_required_file(source_env_dir, output_env_dir, "opencode.json")?;
 
-    for dir_name in ["prompts"] {
+    {
+        let dir_name = "prompts";
         let source = source_env_dir.join(dir_name);
         let destination = output_env_dir.join(dir_name);
         if source.exists() {
@@ -325,8 +359,6 @@ fn materialize_environment(
         copy_dir_recursive(&local_agents, &output_agents_dir)?;
     }
 
-    emit_cursor_frontend(config_root, source_env_dir, output_env_dir, environment)?;
-
     let flattened = config::flatten_policy(&environment.network_policy, policies, system)?;
     let network_policy_path = output_env_dir.join("network_policy.json");
     let network_policy_json = json!({
@@ -345,111 +377,6 @@ fn materialize_environment(
             network_policy_path.display()
         )
     })?;
-
-    Ok(())
-}
-
-fn emit_cursor_frontend(
-    config_root: &Path,
-    source_env_dir: &Path,
-    output_env_dir: &Path,
-    environment: &config::EnvironmentConfig,
-) -> Result<(), String> {
-    let cursor_dir = output_env_dir.join("cursor");
-    std::fs::create_dir_all(&cursor_dir)
-        .map_err(|e| format!("failed to create {}: {e}", cursor_dir.display()))?;
-    let rules_dir = cursor_dir.join("rules");
-    std::fs::create_dir_all(&rules_dir)
-        .map_err(|e| format!("failed to create {}: {e}", rules_dir.display()))?;
-
-    let mut agents_md = String::new();
-    agents_md.push_str(&format!(
-        "# {} agent\n\n_Materialized from agent-hub-configs for the `{}` environment._\n\n",
-        environment.name, environment.name
-    ));
-
-    for agent_name in &environment.include_agents {
-        let local = source_env_dir.join("agents").join(format!("{agent_name}.md"));
-        let shared = config_root
-            .join("shared")
-            .join("agents")
-            .join(format!("{agent_name}.md"));
-        let path = if local.exists() { local } else { shared };
-        if !path.exists() {
-            return Err(format!(
-                "shared agent '{}' not found at {} for environment '{}'",
-                agent_name,
-                path.display(),
-                environment.name
-            ));
-        }
-        let body = std::fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        agents_md.push_str(&format!("## Persona: {agent_name}\n\n"));
-        agents_md.push_str(body.trim_end());
-        agents_md.push_str("\n\n");
-    }
-
-    if !environment.include_skills.is_empty() {
-        agents_md.push_str("## Active skills\n\n");
-        for skill_name in &environment.include_skills {
-            let local = source_env_dir
-                .join("skills")
-                .join(skill_name)
-                .join("SKILL.md");
-            let shared = config_root
-                .join("shared")
-                .join("skills")
-                .join(skill_name)
-                .join("SKILL.md");
-            let path = if local.exists() { local } else { shared };
-            if !path.exists() {
-                return Err(format!(
-                    "shared skill '{}' not found at {} for environment '{}'",
-                    skill_name,
-                    path.display(),
-                    environment.name
-                ));
-            }
-            let body = std::fs::read_to_string(&path)
-                .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-            agents_md.push_str(&format!("### Skill: {skill_name}\n\n"));
-            agents_md.push_str(body.trim_end());
-            agents_md.push_str("\n\n");
-
-            let rule_path = rules_dir.join(format!("{skill_name}.md"));
-            let rule_body = format!(
-                "---\ndescription: {skill_name}\nalwaysApply: true\n---\n\n{}\n",
-                body.trim_end()
-            );
-            std::fs::write(&rule_path, rule_body)
-                .map_err(|e| format!("failed to write {}: {e}", rule_path.display()))?;
-        }
-    }
-
-    let agents_path = cursor_dir.join("AGENTS.md");
-    std::fs::write(&agents_path, agents_md)
-        .map_err(|e| format!("failed to write {}: {e}", agents_path.display()))?;
-
-    let cli_config_path = cursor_dir.join("cli-config.json");
-    let approval_mode = environment.approval_mode.as_str();
-    let cli_config = if approval_mode == "auto" {
-        serde_json::json!({
-            "permissions": {
-                "allow": ["Shell(*)", "Read(**)", "Write(**)", "WebFetch(*)"],
-                "deny": []
-            }
-        })
-    } else {
-        serde_json::json!({
-            "permissions": { "allow": [], "deny": [] }
-        })
-    };
-    std::fs::write(
-        &cli_config_path,
-        serde_json::to_string_pretty(&cli_config).unwrap_or_default(),
-    )
-    .map_err(|e| format!("failed to write {}: {e}", cli_config_path.display()))?;
 
     Ok(())
 }
@@ -543,5 +470,40 @@ fn write_manifest(
             eprintln!("[FAIL] failed to serialize manifest: {}", err);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_code_context_requires_fully_locked_inputs() {
+        let root = std::env::temp_dir().join(format!("job-code-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let dockerfile = root.join("Dockerfile");
+        std::fs::write(
+            &dockerfile,
+            "FROM debian@sha256:abc\nENV TOOL_VERSION=1.0\nRUN true\n",
+        )
+        .unwrap();
+        validate_reproducible_job_code_context(&dockerfile).unwrap();
+
+        for invalid in [
+            "FROM debian:latest\n",
+            "FROM debian@sha256:abc\nCOPY bin/opencode /usr/bin/opencode\n",
+            "FROM debian@sha256:abc\nRUN curl|bash\n",
+            "FROM debian@sha256:abc\nARG TOOL_URL\n",
+            "FROM debian@sha256:abc\n",
+        ] {
+            std::fs::write(&dockerfile, invalid).unwrap();
+            let result = validate_reproducible_job_code_context(&dockerfile);
+            if invalid == "FROM debian@sha256:abc\n" {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

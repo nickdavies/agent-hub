@@ -29,4 +29,4 @@ run-local-agent:
 		--worker-id local-dev \
 		--hostname localhost \
 		--server http://127.0.0.1:8180 \
-		--mode raw --mode docker
+		--mode docker

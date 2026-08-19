@@ -68,7 +68,6 @@ enum JobEventKind {
 
 enum ExecutionMode {
   UNSPECIFIED = 0;
-  RAW = 1;
   DOCKER = 2;
 }
 

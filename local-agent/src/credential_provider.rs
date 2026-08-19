@@ -96,6 +96,7 @@ impl CredentialProvider {
             } => {
                 let output = tokio::process::Command::new(command)
                     .args(args)
+                    .kill_on_drop(true)
                     .output()
                     .await?;
                 if !output.status.success() {

@@ -238,6 +238,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
     ) -> anyhow::Result<Vec<String>> {
         let network_policy_name = match tier {
             LocalAgentEgressTier::Llm => Some("llm-only"),
+            LocalAgentEgressTier::Github => Some("github-only"),
             LocalAgentEgressTier::Build => Some("build"),
             LocalAgentEgressTier::Full => None,
         };
@@ -294,6 +295,9 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
                 hosts.extend(self.config.egress.build.go_registry_hosts.clone());
                 hosts.extend(self.config.egress.build.crates_registry_hosts.clone());
                 Ok(normalize_hosts(&hosts))
+            }
+            LocalAgentEgressTier::Github => {
+                anyhow::bail!("github-only policy must be loaded from CONFIG_ROOT")
             }
             LocalAgentEgressTier::Full => {
                 anyhow::bail!("full tier does not use restricted egress proxy")

@@ -20,7 +20,6 @@ pub(crate) fn protocol_job_event_kind(kind: pb::JobEventKind) -> protocol::JobEv
 
 pub(crate) fn execution_mode_to_pb(v: ExecutionMode) -> i32 {
     match v {
-        ExecutionMode::Raw => pb::ExecutionMode::Raw as i32,
         ExecutionMode::Docker => pb::ExecutionMode::Docker as i32,
     }
 }
@@ -47,7 +46,6 @@ pub(crate) fn job_state_to_pb(v: JobState) -> i32 {
 pub(crate) fn execution_mode_from_pb(v: i32) -> anyhow::Result<ExecutionMode> {
     Ok(
         match pb::ExecutionMode::try_from(v).unwrap_or(pb::ExecutionMode::Unspecified) {
-            pb::ExecutionMode::Raw => ExecutionMode::Raw,
             pb::ExecutionMode::Docker => ExecutionMode::Docker,
             pb::ExecutionMode::Unspecified => anyhow::bail!("execution mode unspecified"),
         },

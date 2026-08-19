@@ -27,10 +27,18 @@ pub struct TriagePromptDefinition {
 
 impl TriagePromptDefinition {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read triage prompt config {}: {e}", path.display()))?;
-        let wrapped: TriageManifest = toml::from_str(&raw)
-            .map_err(|e| format!("failed to parse triage prompt config {}: {e}", path.display()))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "failed to read triage prompt config {}: {e}",
+                path.display()
+            )
+        })?;
+        let wrapped: TriageManifest = toml::from_str(&raw).map_err(|e| {
+            format!(
+                "failed to parse triage prompt config {}: {e}",
+                path.display()
+            )
+        })?;
         Ok(wrapped.prompt)
     }
 }

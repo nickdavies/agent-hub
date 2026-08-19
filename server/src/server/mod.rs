@@ -15,6 +15,7 @@ pub mod questions;
 pub mod repo_discovery;
 pub mod scm;
 pub mod session_views;
+pub(crate) use session_views::resolve_effective_status;
 pub mod sessions;
 pub mod storage;
 pub mod task_adapter;
@@ -124,10 +125,6 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
         .route(
             "/orchestration/workflows",
             get(orchestration::handlers::list_workflows::<N>),
-        )
-        .route(
-            "/orchestration/workflows/all",
-            get(orchestration::handlers::list_workflow_documents::<N>),
         )
         .route(
             "/orchestration/workflows/validate",
@@ -557,7 +554,7 @@ impl<N: Notifier> AppState<N> {
                 &server_config.workflows_dir,
                 installed_workflows,
             )
-            .unwrap_or_else(|_| WorkflowCatalog::empty()),
+            .unwrap_or_else(|error| panic!("failed to load installed workflows: {error:#}")),
         );
         let task_adapter: Arc<dyn TaskAdapter> = match server_config.task_adapter.as_str() {
             "vikunja" => {
@@ -618,17 +615,9 @@ impl<N: Notifier> AppState<N> {
         } else {
             server_config.orchestration_db_path.clone()
         };
-        // Build the SCM host registry. `[[system.scm_hosts]]` rows win;
-        // legacy `GITHUB_TOKEN`/`GITHUB_API_BASE_URL` env vars synthesize an
-        // implicit `github.com` row only if the registry is otherwise empty.
-        // Hard-fails (panics) on any malformed row or missing token env
-        // — silent skipping makes "polling stopped working" undebuggable.
+        // Build the required host-specific read-only observation registry.
         let scm_registry = scm::ScmHostRegistry::from_configs(&loaded.system.scm_hosts)
-            .unwrap_or_else(|error| panic!("invalid [[system.scm_hosts]] config: {error}"))
-            .with_legacy_github_fallback(
-                server_config.github_token.as_deref(),
-                &server_config.github_api_base_url,
-            );
+            .unwrap_or_else(|error| panic!("invalid [[system.scm_hosts]] config: {error}"));
         let github_poller = if server_config.github_polling_enabled && !scm_registry.is_empty() {
             Some(Arc::new(GitHubPoller::new(scm_registry.clone())))
         } else {
@@ -698,6 +687,7 @@ impl<N: Notifier> AppState<N> {
             .with_discovered_repos(discovered_repos)
             .with_operator_login(system_operator_login.clone())
             .with_runner_profiles(runner_profiles)
+            .with_scm_hosts(scm_registry)
             .with_environment_snapshots(environment_snapshots)
             .with_triage_prompt(triage_prompt)
             .with_server_approval_mode(server_config.approval_mode),
@@ -769,6 +759,7 @@ mod integration_tests {
     /// triage prompt loading, so we just need a `system.toml` that satisfies the
     /// `installed = []` invariants `load_config_tree` enforces.
     fn make_hermetic_config_root() -> std::path::PathBuf {
+        unsafe { std::env::set_var("SCM_TEST_INTEGRATION_READ_TOKEN", "read-token") };
         let root =
             std::env::temp_dir().join(format!("ah-test-config-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).expect("create hermetic config root");
@@ -782,10 +773,26 @@ installed = []
 
 [system.environments]
 installed = []
+
+[[system.scm_hosts]]
+kind = "github"
+host = "github.com"
+api_base_url = "https://api.github.com"
+read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
 "#;
         std::fs::write(root.join("system.toml"), body).expect("write hermetic system.toml");
-        std::fs::write(root.join("local-agent.json"), "{}")
-            .expect("write hermetic local-agent config");
+        std::fs::write(
+            root.join("local-agent.json"),
+            r#"{
+                "default_agent": {
+                    "kind": "generic",
+                    "command": "true",
+                    "args": [],
+                    "container_image": "local/agent-hub-test:latest"
+                }
+            }"#,
+        )
+        .expect("write hermetic local-agent config");
         root
     }
 
@@ -836,8 +843,6 @@ installed = []
             github_webhook_secret: None,
             github_polling_enabled: false,
             github_poll_interval_secs: 30,
-            github_token: None,
-            github_api_base_url: "https://api.github.com".into(),
         };
         let state = AppState::new(config, NullNotifier, None);
         router(state)
@@ -1033,7 +1038,7 @@ installed = []
 
         let req = Request::builder()
             .method("GET")
-            .uri(&format!(
+            .uri(format!(
                 "/orchestration/jobs/{}/artifacts/stdout_log",
                 uuid::Uuid::new_v4()
             ))
@@ -1116,14 +1121,25 @@ installed = []
             r#"
 [workflow]
 id = "sample_local_exec"
-entry_step = "run"
+schema = "reactive_v2"
+initial_state = "run"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "run"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["hello"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
 "#,
         )
         .expect("write sample_local_exec workflow");
@@ -1132,7 +1148,7 @@ args = ["hello"]
         let create_resp = post_json_response(
             &app,
             "/api/v1/orchestration/work-items",
-            r#"{"workflow_id":"sample_local_exec","context":{"task":"artifact-test"}}"#,
+            r#"{"workflow_id":"__triage__","context":{"task":"artifact-test"}}"#,
         )
         .await;
         assert_eq!(create_resp.status(), AxumStatus::OK);
@@ -1140,7 +1156,7 @@ args = ["hello"]
         let _ = post_json_response(
             &app,
             "/api/v1/orchestration/workers",
-            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["raw"]}"#,
+            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"]}"#,
         )
         .await;
 
@@ -1600,4 +1616,3 @@ args = ["hello"]
         );
     }
 }
-pub(crate) use session_views::resolve_effective_status;

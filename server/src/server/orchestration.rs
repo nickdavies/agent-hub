@@ -10,21 +10,18 @@ use protocol::{
     AUTHORIZATION_REQUEST_VERSION, AgentOutput, BlockReason, CanonicalRuntimeSpec,
     CreateWorkItemRequest, EnvironmentDefinition, EnvironmentOverlay, EnvironmentSelection,
     EventSource, FireEventRequest, HeartbeatRequest, Job, JobState, JobUpdateRequest,
-    NetworkResourceRequest, PlannedEnvironmentTier, PollJobRequest, PollJobResponse,
-    ProviderIdentity, ProviderOwnership, ReactiveTerminalOutcome, RegisterWorkerRequest,
-    RepoSource, ResolvedAuthorizationBehavior, ResolvedAuthorizationProvider,
-    ResolvedAuthorizationRequest, ResolvedAuthorizationResources, WorkItem, WorkItemState,
-    WorkerInfo, WorkerState, WorkflowDefinition, WorkflowDocument, WorkflowEvent,
-    WorkflowEventKind, WorkflowEventPayload, WorkflowStepKind, canonical_environment_for_execution,
+    NetworkResourceRequest, PollJobRequest, PollJobResponse, ProviderIdentity, ProviderOwnership,
+    ReactiveTerminalOutcome, RegisterWorkerRequest, RepoSource, ResolvedAuthorizationBehavior,
+    ResolvedAuthorizationProvider, ResolvedAuthorizationRequest, ResolvedAuthorizationResources,
+    WorkItem, WorkItemState, WorkerInfo, WorkerState, WorkflowEvent, WorkflowEventKind,
+    WorkflowEventPayload, canonical_environment_for_execution,
     canonical_permissions_for_environment, canonical_runtime_spec_for_job,
     canonical_runtime_spec_for_job_effective, default_approval_rules_for_tier,
-    legacy_network_label_for_request, network_request_from_legacy_label,
     project_authorization_request_into_job_context, project_runtime_spec_into_job_context,
     validate_agent_output_next_event, workflow_event_is_externally_fireable,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
@@ -40,11 +37,11 @@ use super::repo_discovery::DiscoveredRepo;
 #[cfg(test)]
 use super::task_adapter::task_from_work_item;
 use super::task_adapter::{
-    AdapterIntent, CheckpointAuthorizationPending, HumanActionKind, ProviderActionIdentity,
-    ProviderActionNamespace, ProviderActionRejectionDelivery, ProviderActionRejectionSource,
-    TaskAdapter, TaskAdapterError, TaskCheckpoint, TaskHumanAction, TaskHumanGateState, TaskLabels,
-    TaskProjection, TaskSyncRecord, TaskToolRecord, TaskTriageStatus, TriageResult,
-    action_to_fire_event, choose_workflow_id, infer_intents, legacy_human_gate_valid_next_events,
+    AdapterIntent, CheckpointAuthorizationPending, HumanActionKind, JobResultComment,
+    ProviderActionIdentity, ProviderActionNamespace, ProviderActionRejectionDelivery,
+    ProviderActionRejectionSource, TaskAdapter, TaskAdapterError, TaskCheckpoint, TaskHumanAction,
+    TaskHumanGateState, TaskLabels, TaskProjection, TaskSyncRecord, TaskToolRecord,
+    TaskTriageStatus, TriageResult, action_to_fire_event, choose_workflow_id, infer_intents,
     task_from_work_item_with_valid_next_events, work_item_from_create,
 };
 #[cfg(test)]
@@ -64,13 +61,15 @@ use github::{
     github_pr_state_from_context, merge_readiness_from_pr_state, parse_pr_number_from_url,
     parse_pr_url_components, update_github_pr_state_in_context,
 };
+#[cfg(test)]
+use storage::insert_authorization_record;
 use storage::{
     AuthorizationObligationInsert, DbTable, ProviderActionBaselineInsert, ProviderActionCommit,
     ProviderActionCommitOutcome, ProviderActionJobInsert, ProviderActionObligationApproval,
     ProviderActionRevisionUpdate, ProviderActionTerminalState, column_exists,
-    commit_ordinary_authorized_job, commit_provider_action, insert_authorization_record,
-    invalid_enum, invalid_json, migrate_provider_action_inbox_schema, parse_datetime, row_to_job,
-    row_to_work_item, stage_authorization_obligation, verify_job_authorization,
+    commit_ordinary_authorized_job, commit_provider_action, invalid_enum, invalid_json,
+    migrate_provider_action_inbox_schema, parse_datetime, row_to_job, row_to_work_item,
+    stage_authorization_obligation, verify_job_authorization,
 };
 
 const LEASE_TTL_SECS: i64 = 120;
@@ -221,6 +220,196 @@ struct CheckpointCommit {
     projection_pending: bool,
 }
 
+type OwnershipReturn = (
+    Uuid,
+    String,
+    Option<String>,
+    Option<String>,
+    Vec<ProviderIdentity>,
+);
+
+#[derive(Debug)]
+struct TypedResetWorkItem {
+    parent_id: Option<String>,
+    external_task_id: Option<String>,
+    ownership: ProviderOwnership,
+    remembered_human_owners: Vec<ProviderIdentity>,
+}
+
+fn enqueue_typed_runtime_reset_ownership_returns(conn: &Connection) -> anyhow::Result<()> {
+    let items = {
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_work_item_id, external_task_id, provider_ownership_json, remembered_human_owners_json FROM work_items",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let ownership_json: String = row.get(3)?;
+            let owners_json: String = row.get(4)?;
+            let ownership = serde_json::from_str(&ownership_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let remembered_human_owners = serde_json::from_str(&owners_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok((
+                id,
+                TypedResetWorkItem {
+                    parent_id: row.get(1)?,
+                    external_task_id: row.get(2)?,
+                    ownership,
+                    remembered_human_owners,
+                },
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
+    };
+
+    let root_for = |item_id: &str| -> anyhow::Result<String> {
+        if !items.contains_key(item_id) {
+            anyhow::bail!("typed-runtime reset references missing work item {item_id}");
+        }
+        let mut current = item_id.to_string();
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = items.get(&current).and_then(|item| item.parent_id.as_ref()) {
+            if !visited.insert(current.clone()) {
+                anyhow::bail!("work-item parent cycle at {current} during typed-runtime reset");
+            }
+            if !items.contains_key(parent_id) {
+                anyhow::bail!(
+                    "work item {current} references missing parent {parent_id} during typed-runtime reset"
+                );
+            }
+            current = parent_id.clone();
+        }
+        Ok(current)
+    };
+
+    for item_id in items.keys() {
+        root_for(item_id)?;
+    }
+
+    let active_roots = {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT work_item_id FROM jobs WHERE state IN (?1, ?2, ?3)")?;
+        let rows = stmt.query_map(
+            params![
+                JobState::Pending.to_string(),
+                JobState::Assigned.to_string(),
+                JobState::Running.to_string(),
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.map(|row| root_for(&row?))
+            .collect::<anyhow::Result<BTreeSet<_>>>()?
+    };
+
+    let mut roots_to_return = BTreeSet::new();
+    for (item_id, item) in &items {
+        if item.parent_id.is_none() && matches!(item.ownership, ProviderOwnership::Bot) {
+            roots_to_return.insert(item_id.clone());
+        }
+    }
+    for root_id in &active_roots {
+        let root = &items[root_id];
+        if !matches!(root.ownership, ProviderOwnership::Bot) {
+            anyhow::bail!(
+                "active root {root_id} is not exactly bot-owned during typed-runtime reset"
+            );
+        }
+        roots_to_return.insert(root_id.clone());
+    }
+
+    for root_id in roots_to_return {
+        let root = &items[&root_id];
+        let task_id = root.external_task_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("bot-owned root {root_id} has no provider task for ownership recovery")
+        })?;
+        if task_id.trim().is_empty() || task_id != task_id.trim() {
+            anyhow::bail!(
+                "bot-owned root {root_id} has invalid provider task identity for ownership recovery"
+            );
+        }
+        validate_exact_remembered_human_owners(&root_id, &root.remembered_human_owners)?;
+        for (item_id, item) in &items {
+            if item_id == &root_id || root_for(item_id)? != root_id {
+                continue;
+            }
+            if item.external_task_id.is_some()
+                || !matches!(item.ownership, ProviderOwnership::Unassigned)
+            {
+                anyhow::bail!(
+                    "root {root_id} has inconsistent descendant ownership at {item_id} during typed-runtime reset"
+                );
+            }
+            if !item.remembered_human_owners.is_empty()
+                && item.remembered_human_owners != root.remembered_human_owners
+            {
+                anyhow::bail!(
+                    "root {root_id} has inconsistent remembered-human ownership at descendant {item_id}"
+                );
+            }
+        }
+        let owners_json = serde_json::to_string(&root.remembered_human_owners)?;
+        let first = root
+            .remembered_human_owners
+            .first()
+            .expect("remembered owners validated as nonempty");
+        conn.execute(
+            "INSERT OR REPLACE INTO ownership_return_outbox (root_work_item_id, task_id, human_owner, human_owner_provider_id, human_owners_json, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                root_id,
+                task_id,
+                first.display_name.as_deref(),
+                first.provider_id.as_deref(),
+                owners_json,
+                "typed reactive Docker reset requires exact human ownership recovery",
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_exact_remembered_human_owners(
+    root_id: &str,
+    owners: &[ProviderIdentity],
+) -> anyhow::Result<()> {
+    if owners.is_empty() {
+        anyhow::bail!(
+            "bot-owned root {root_id} has no remembered human owners for ownership recovery"
+        );
+    }
+    let mut identities = HashSet::new();
+    for owner in owners {
+        let provider_id = owner.provider_id.as_deref().map(str::trim);
+        let display_name = owner.display_name.as_deref().map(str::trim);
+        if provider_id.is_some_and(str::is_empty)
+            || display_name.is_some_and(str::is_empty)
+            || owner.provider_id.as_deref() != provider_id
+            || owner.display_name.as_deref() != display_name
+            || (provider_id.is_none() && display_name.is_none())
+        {
+            anyhow::bail!(
+                "bot-owned root {root_id} has invalid remembered human identity for ownership recovery"
+            );
+        }
+        if !identities.insert((provider_id, display_name)) {
+            anyhow::bail!(
+                "bot-owned root {root_id} has duplicate remembered human identity for ownership recovery"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointIntent {
     Transition,
@@ -280,6 +469,7 @@ pub struct OrchestrationService {
     discovered_repos: Arc<Vec<DiscoveredRepo>>,
     operator_login: Option<String>,
     runner_profiles: Arc<agent_hub_config::RunnerProfilesConfig>,
+    scm_hosts: Arc<super::scm::ScmHostRegistry>,
     environment_snapshots: Arc<HashMap<String, serde_json::Value>>,
     /// Prompt used by the `__triage__` pseudo-workflow. Loaded from the
     /// triage prompt manifest referenced by `system.toml` so triage is
@@ -349,6 +539,16 @@ impl OrchestrationService {
                 profiles
             }),
             environment_snapshots: Arc::new(HashMap::new()),
+            scm_hosts: Arc::new({
+                #[cfg(test)]
+                {
+                    super::scm::ScmHostRegistry::github_com_for_tests()
+                }
+                #[cfg(not(test))]
+                {
+                    super::scm::ScmHostRegistry::default()
+                }
+            }),
             triage_prompt: Arc::new({
                 #[cfg(test)]
                 {
@@ -416,6 +616,11 @@ impl OrchestrationService {
         self
     }
 
+    pub fn with_scm_hosts(mut self, scm_hosts: super::scm::ScmHostRegistry) -> Self {
+        self.scm_hosts = Arc::new(scm_hosts);
+        self
+    }
+
     pub fn with_triage_prompt(
         mut self,
         triage_prompt: Option<super::config::LoadedTriagePrompt>,
@@ -459,44 +664,6 @@ impl OrchestrationService {
                     self.discovered_repos.as_slice(),
                 ))
             });
-    }
-
-    #[allow(dead_code)]
-    fn maybe_apply_environment_selection_for_work_item_context(
-        &self,
-        context: &mut serde_json::Value,
-    ) {
-        let Some(selection) = extract_environment_selection_from_context(context) else {
-            return;
-        };
-
-        match validate_environment_selection(
-            &selection,
-            self.environments.as_slice(),
-            self.overlays.as_slice(),
-        ) {
-            Ok(environment) => {
-                project_environment_selection_into_context(context, &selection, environment);
-            }
-            Err(error) => {
-                if let Some((default_selection, default_environment)) =
-                    self.default_environment_selection()
-                {
-                    tracing::warn!(
-                        environment_base = %selection.base,
-                        overlays = ?selection.overlays,
-                        error = %error,
-                        fallback_environment = %default_environment.name,
-                        "invalid environment selection; falling back to workflow default"
-                    );
-                    project_environment_selection_into_context(
-                        context,
-                        &default_selection,
-                        &default_environment,
-                    );
-                }
-            }
-        }
     }
 
     fn validate_triage_environment_selection_for_work_item_context(
@@ -549,52 +716,6 @@ impl OrchestrationService {
         item.blocked_on = block_reason_for_state_name(&item.current_step);
     }
 
-    fn default_environment_selection(
-        &self,
-    ) -> Option<(EnvironmentSelection, EnvironmentDefinition)> {
-        let environment = self.environments.first()?.clone();
-        Some((
-            EnvironmentSelection {
-                base: environment.name.clone(),
-                overlays: Vec::new(),
-            },
-            environment,
-        ))
-    }
-
-    fn selected_environment_for_context(
-        &self,
-        context: &serde_json::Value,
-    ) -> Option<(EnvironmentSelection, EnvironmentDefinition)> {
-        let selection = extract_environment_selection_from_context(context)?;
-        match validate_environment_selection(
-            &selection,
-            self.environments.as_slice(),
-            self.overlays.as_slice(),
-        ) {
-            Ok(environment) => Some((selection, environment.clone())),
-            Err(error) => {
-                if let Some((default_selection, default_environment)) =
-                    self.default_environment_selection()
-                {
-                    tracing::warn!(
-                        environment_base = %selection.base,
-                        overlays = ?selection.overlays,
-                        error = %error,
-                        fallback_environment = %default_environment.name,
-                        "invalid environment selection during job creation; falling back"
-                    );
-                    eprintln!(
-                        "warning: invalid environment selection fell back during job creation; triage validation should reject invalid triage selections before this point"
-                    );
-                    Some((default_selection, default_environment))
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
     fn selected_environment_for_reactive_execution(
         &self,
         execution: Option<&protocol::ReactiveExecutionConfig>,
@@ -636,7 +757,23 @@ impl OrchestrationService {
             return Ok(Some((selection, environment)));
         }
 
-        Ok(self.selected_environment_for_context(context))
+        let Some(selection) = extract_environment_selection_from_context(context) else {
+            return Ok(None);
+        };
+        let environment = validate_environment_selection(
+            &selection,
+            self.environments.as_slice(),
+            self.overlays.as_slice(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "work-item environment '{}' is invalid: {}",
+                selection.base,
+                error
+            )
+        })?
+        .clone();
+        Ok(Some((selection, environment)))
     }
 
     pub async fn init(&self) -> anyhow::Result<()> {
@@ -667,6 +804,7 @@ impl OrchestrationService {
                 lock_path.push(".writer.lock");
                 let file = std::fs::OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .read(true)
                     .write(true)
                     .open(PathBuf::from(lock_path))?;
@@ -834,7 +972,7 @@ impl OrchestrationService {
                     );
                     "#,
                     )?;
-                    if !column_exists(&conn, DbTable::Jobs, "container_image")? {
+                    if !column_exists(conn, DbTable::Jobs, "container_image")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN container_image TEXT", [])?;
                     }
                     if !column_exists(
@@ -882,53 +1020,53 @@ impl OrchestrationService {
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "result_json")? {
+                    if !column_exists(conn, DbTable::Jobs, "result_json")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN result_json TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "repo_json")? {
+                    if !column_exists(conn, DbTable::WorkItems, "repo_json")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN repo_json TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "parent_work_item_id")? {
+                    if !column_exists(conn, DbTable::WorkItems, "parent_work_item_id")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN parent_work_item_id TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "parent_step_id")? {
+                    if !column_exists(conn, DbTable::WorkItems, "parent_step_id")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN parent_step_id TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "child_work_item_id")? {
+                    if !column_exists(conn, DbTable::WorkItems, "child_work_item_id")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN child_work_item_id TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "repo_json")? {
+                    if !column_exists(conn, DbTable::Jobs, "repo_json")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN repo_json TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "lease_expires_at")? {
+                    if !column_exists(conn, DbTable::Jobs, "lease_expires_at")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "timeout_secs")? {
+                    if !column_exists(conn, DbTable::Jobs, "timeout_secs")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN timeout_secs INTEGER", [])?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "max_retries")? {
+                    if !column_exists(conn, DbTable::Jobs, "max_retries")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN max_retries INTEGER", [])?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "attempt")? {
+                    if !column_exists(conn, DbTable::Jobs, "attempt")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN attempt INTEGER", [])?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "runtime_spec_json")? {
+                    if !column_exists(conn, DbTable::Jobs, "runtime_spec_json")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN runtime_spec_json TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "authorization_id")? {
+                    if !column_exists(conn, DbTable::Jobs, "authorization_id")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN authorization_id TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "request_digest")? {
+                    if !column_exists(conn, DbTable::Jobs, "request_digest")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN request_digest TEXT", [])?;
                     }
                     if !column_exists(
-                        &conn,
+                        conn,
                         DbTable::AuthorizationRecords,
                         "invocation_id",
                     )? {
@@ -941,7 +1079,7 @@ impl OrchestrationService {
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::Jobs, "checkpoint_owner_id")? {
+                    if !column_exists(conn, DbTable::Jobs, "checkpoint_owner_id")? {
                         conn.execute(
                             "ALTER TABLE jobs ADD COLUMN checkpoint_owner_id TEXT",
                             [],
@@ -951,6 +1089,64 @@ impl OrchestrationService {
                             [],
                         )?;
                     }
+                    if !column_exists(conn, DbTable::WorkItems, "external_task_id")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN external_task_id TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(conn, DbTable::WorkItems, "provider_ownership_json")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN provider_ownership_json TEXT NOT NULL DEFAULT '{\"kind\":\"unassigned\"}'",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(conn, DbTable::WorkItems, "remembered_human_owners_json")? {
+                        conn.execute(
+                            "ALTER TABLE work_items ADD COLUMN remembered_human_owners_json TEXT NOT NULL DEFAULT '[]'",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(
+                        conn,
+                        DbTable::OwnershipReturnOutbox,
+                        "human_owners_json",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE ownership_return_outbox ADD COLUMN human_owners_json TEXT NOT NULL DEFAULT '[]'",
+                            [],
+                        )?;
+                    }
+                    let typed_docker_migrated: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name = 'typed_reactive_docker_only_v1')",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if !typed_docker_migrated {
+                        enqueue_typed_runtime_reset_ownership_returns(conn)?;
+                        conn.execute_batch(
+                            "DELETE FROM jobs;
+                             DELETE FROM work_items;
+                             DELETE FROM authorization_records;
+                             DELETE FROM authorization_baselines;
+                             DELETE FROM authorization_obligations;
+                             DELETE FROM checkpoint_outbox;
+                             DELETE FROM checkpoint_verification;
+                             DELETE FROM provider_action_inbox;
+                             DELETE FROM provider_task_observations;",
+                        )?;
+                        let applied_at = Utc::now().to_rfc3339();
+                        for migration in [
+                            "dispatch_checkpoint_gate_v1",
+                            "immutable_authorization_v1",
+                            "typed_reactive_docker_only_v1",
+                        ] {
+                            conn.execute(
+                                "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
+                                params![migration, applied_at],
+                            )?;
+                        }
+                    }
                     let migrate_dispatch_gate: bool = conn
                         .query_row(
                             "SELECT 1 FROM schema_migrations WHERE name = 'dispatch_checkpoint_gate_v1'",
@@ -959,103 +1155,103 @@ impl OrchestrationService {
                         )
                         .optional()?
                         .is_none();
-                    if !column_exists(&conn, DbTable::Jobs, "dispatch_released")? {
+                    if !column_exists(conn, DbTable::Jobs, "dispatch_released")? {
                         conn.execute(
                             "ALTER TABLE jobs ADD COLUMN dispatch_released INTEGER NOT NULL DEFAULT 0",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "external_task_id")? {
+                    if !column_exists(conn, DbTable::WorkItems, "external_task_id")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN external_task_id TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "external_task_source")? {
+                    if !column_exists(conn, DbTable::WorkItems, "external_task_source")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN external_task_source TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "title")? {
+                    if !column_exists(conn, DbTable::WorkItems, "title")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN title TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "description")? {
+                    if !column_exists(conn, DbTable::WorkItems, "description")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN description TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "labels_json")? {
+                    if !column_exists(conn, DbTable::WorkItems, "labels_json")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN labels_json TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "priority")? {
+                    if !column_exists(conn, DbTable::WorkItems, "priority")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN priority TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "projected_state")? {
+                    if !column_exists(conn, DbTable::WorkItems, "projected_state")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN projected_state TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "last_failure_reason")? {
+                    if !column_exists(conn, DbTable::WorkItems, "last_failure_reason")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN last_failure_reason TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "required_action_description")? {
+                    if !column_exists(conn, DbTable::WorkItems, "required_action_description")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN required_action_description TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "triage_status")? {
+                    if !column_exists(conn, DbTable::WorkItems, "triage_status")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN triage_status TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "human_gate")? {
+                    if !column_exists(conn, DbTable::WorkItems, "human_gate")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN human_gate INTEGER", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "human_gate_state")? {
+                    if !column_exists(conn, DbTable::WorkItems, "human_gate_state")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN human_gate_state TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "blocked_on")? {
+                    if !column_exists(conn, DbTable::WorkItems, "blocked_on")? {
                         conn.execute("ALTER TABLE work_items ADD COLUMN blocked_on TEXT", [])?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "last_written_at")? {
+                    if !column_exists(conn, DbTable::WorkItems, "last_written_at")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN last_written_at TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "write_back_failures")? {
+                    if !column_exists(conn, DbTable::WorkItems, "write_back_failures")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN write_back_failures INTEGER NOT NULL DEFAULT 0",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "write_back_retry_after")? {
+                    if !column_exists(conn, DbTable::WorkItems, "write_back_retry_after")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN write_back_retry_after TEXT",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "status_comment_id")? {
+                    if !column_exists(conn, DbTable::WorkItems, "status_comment_id")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN status_comment_id INTEGER",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "checkpoint_comment_id")? {
+                    if !column_exists(conn, DbTable::WorkItems, "checkpoint_comment_id")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN checkpoint_comment_id INTEGER",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "triage_comment_id")? {
+                    if !column_exists(conn, DbTable::WorkItems, "triage_comment_id")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN triage_comment_id INTEGER",
                             [],
                         )?;
                     }
-                    if !column_exists(&conn, DbTable::WorkItems, "job_result_comment_ids_json")? {
+                    if !column_exists(conn, DbTable::WorkItems, "job_result_comment_ids_json")? {
                         conn.execute(
                             "ALTER TABLE work_items ADD COLUMN job_result_comment_ids_json TEXT",
                             [],
@@ -1074,7 +1270,7 @@ impl OrchestrationService {
                         )?;
                     }
                     if !column_exists(
-                        &conn,
+                        conn,
                         DbTable::OwnershipReturnOutbox,
                         "human_owner_provider_id",
                     )? {
@@ -1094,7 +1290,7 @@ impl OrchestrationService {
                         )?;
                     }
                     if !column_exists(
-                        &conn,
+                        conn,
                         DbTable::CheckpointOutbox,
                         "projection_pending",
                     )? {
@@ -1348,9 +1544,7 @@ impl OrchestrationService {
     pub async fn create_work_item(&self, req: CreateWorkItemRequest) -> Result<WorkItem, AppError> {
         self.ensure_ready().await?;
         let initial_state = if let Some(workflow) = self.workflows.get(&req.workflow_id) {
-            workflow.entry_step.clone()
-        } else if let Some(reactive) = self.workflows.get_reactive(&req.workflow_id) {
-            reactive.initial_state.clone()
+            workflow.initial_state.clone()
         } else if req.workflow_id == "__triage__" {
             "triage".to_string()
         } else {
@@ -1594,6 +1788,13 @@ impl OrchestrationService {
         source: EventSource,
         provider_action_revision: Option<u64>,
     ) -> Result<WorkItem, AppError> {
+        if req.event == WorkflowEventKind::PrMerged
+            && !matches!(source, EventSource::Webhook | EventSource::ScmPoller)
+        {
+            return Err(AppError::WorkflowInvalid(
+                "pr_merged requires authoritative SCM observation".to_string(),
+            ));
+        }
         let workflow_event = WorkflowEvent {
             work_item_id: work_item_id.to_string(),
             event_type: req.event.clone(),
@@ -1673,139 +1874,7 @@ impl OrchestrationService {
                     )));
                 }
             }
-        } else if let Some(workflow) = self.workflows.get(&item.workflow_id).cloned() {
-            let step = workflow
-                .steps
-                .iter()
-                .find(|s| s.id == item.current_step)
-                .ok_or_else(|| {
-                    AppError::WorkflowInvalid(format!("missing step '{}'", item.current_step))
-                })?;
-
-            match req.event {
-                WorkflowEventKind::Start | WorkflowEventKind::Submit => {
-                    if item.state == WorkItemState::Pending {
-                        item.state = WorkItemState::Running;
-                    }
-                    self.ensure_pending_job_for_step(&item, &workflow)
-                        .await
-                        .map_err(map_db)?;
-                }
-                WorkflowEventKind::JobSucceeded => {
-                    clear_success_projection_fields(&mut item);
-                    if let Some(next) = &step.on_success {
-                        item.current_step = next.clone();
-                        item.state = WorkItemState::Running;
-                        self.ensure_pending_job_for_step(&item, &workflow)
-                            .await
-                            .map_err(map_db)?;
-                    } else {
-                        item.state = WorkItemState::Succeeded;
-                    }
-                }
-                WorkflowEventKind::JobFailed => {
-                    if let Some(next) = &step.on_failure {
-                        item.current_step = next.clone();
-                        item.state = WorkItemState::Running;
-                        self.ensure_pending_job_for_step(&item, &workflow)
-                            .await
-                            .map_err(map_db)?;
-                    } else {
-                        item.state = WorkItemState::Failed;
-                    }
-                }
-                WorkflowEventKind::HumanApproved => {
-                    clear_success_projection_fields(&mut item);
-                    if let Some(next) = &step.on_success {
-                        item.current_step = next.clone();
-                        item.state = WorkItemState::Running;
-                        self.ensure_pending_job_for_step(&item, &workflow)
-                            .await
-                            .map_err(map_db)?;
-                    } else {
-                        item.state = WorkItemState::Succeeded;
-                    }
-                }
-                WorkflowEventKind::HumanChangesRequested
-                | WorkflowEventKind::HumanUnblocked
-                | WorkflowEventKind::RetryRequested => {
-                    if let Some(next) = &step.on_failure {
-                        item.current_step = next.clone();
-                        item.state = WorkItemState::Running;
-                        self.ensure_pending_job_for_step(&item, &workflow)
-                            .await
-                            .map_err(map_db)?;
-                    } else {
-                        item.state = WorkItemState::Failed;
-                    }
-                }
-                WorkflowEventKind::AllChildrenCompleted => {
-                    clear_success_projection_fields(&mut item);
-                    item.child_work_item_id = None;
-                    if let Some(next) = &step.on_success {
-                        item.current_step = next.clone();
-                        item.state = WorkItemState::Running;
-                        self.ensure_pending_job_for_step(&item, &workflow)
-                            .await
-                            .map_err(map_db)?;
-                    } else {
-                        item.state = WorkItemState::Succeeded;
-                    }
-                }
-                WorkflowEventKind::ChildFailed => {
-                    item.child_work_item_id = None;
-                    if let Some(next) = &step.on_failure {
-                        item.current_step = next.clone();
-                        item.state = WorkItemState::Running;
-                        self.ensure_pending_job_for_step(&item, &workflow)
-                            .await
-                            .map_err(map_db)?;
-                    } else {
-                        item.state = WorkItemState::Failed;
-                    }
-                }
-                WorkflowEventKind::NeedsTriage => {
-                    item.state = WorkItemState::Pending;
-                }
-                WorkflowEventKind::WorkflowChosen => {
-                    if item.state == WorkItemState::Pending {
-                        item.state = WorkItemState::Running;
-                    }
-                }
-                event @ (WorkflowEventKind::TaskCreated
-                | WorkflowEventKind::TaskUpdated
-                | WorkflowEventKind::CommentAdded
-                | WorkflowEventKind::LabelChanged
-                | WorkflowEventKind::PrCreated
-                | WorkflowEventKind::PrApproved
-                | WorkflowEventKind::PrChangesRequested
-                | WorkflowEventKind::OwnerPrApproved
-                | WorkflowEventKind::OwnerChangesRequested
-                | WorkflowEventKind::CoworkerPrApproved
-                | WorkflowEventKind::CoworkerChangesRequested
-                | WorkflowEventKind::PrMerged
-                | WorkflowEventKind::ChecksPassed
-                | WorkflowEventKind::ChecksFailed
-                | WorkflowEventKind::CiFailureTrivial
-                | WorkflowEventKind::CiFailureEscalate
-                | WorkflowEventKind::Timeout) => {
-                    return Err(AppError::WorkflowInvalid(format!(
-                        "event '{}' is not supported for legacy workflow '{}'",
-                        workflow_event_kind_name(&event),
-                        item.workflow_id
-                    )));
-                }
-                WorkflowEventKind::Cancel => {
-                    item.state = WorkItemState::Cancelled;
-                    self.cancel_active_jobs_for_work_item(item.id)
-                        .await
-                        .map_err(map_db)?;
-                    if let Some(child_id) = item.child_work_item_id {
-                        self.cancel_work_item(child_id).await.map_err(map_db)?;
-                    }
-                }
-            }
-        } else if self.workflows.get_reactive(&item.workflow_id).is_some() {
+        } else if self.workflows.get(&item.workflow_id).is_some() {
             self.fire_reactive_event(&mut item, req.event).await?;
         } else {
             return Err(AppError::WorkflowNotFound(item.workflow_id.clone()));
@@ -1818,9 +1887,6 @@ impl OrchestrationService {
         self.persist_task_projection(&item, None)
             .await
             .map_err(map_config)?;
-        // Commit the provider checkpoint authorizing this state before any
-        // deterministic side effect that bypasses worker dispatch.
-        Box::pin(self.try_auto_merge_for_current_state(&mut item)).await;
         Ok(item)
     }
 
@@ -2033,30 +2099,18 @@ impl OrchestrationService {
                 if !matches!(item.state, WorkItemState::Pending | WorkItemState::Running) {
                     return Ok(0);
                 }
-                let workflow = match self.workflows.get(&item.workflow_id) {
-                    Some(w) => w.clone(),
-                    None => {
-                        let mut item = item;
-                        let created_for_item = self
-                            .ensure_pending_for_current_state(&mut item)
-                            .await
-                            .map_err(map_db)?;
-                        self.persist_task_projection(&item, None)
-                            .await
-                            .map_err(map_config)?;
-                        return Ok(if created_for_item { 1 } else { 0 });
-                    }
-                };
                 if self.has_active_job(item.id).await.map_err(map_db)? {
                     return Ok(0);
                 }
-                self.ensure_pending_job_for_step(&item, &workflow)
+                let mut item = item;
+                let created_for_item = self
+                    .ensure_pending_for_current_state(&mut item)
                     .await
                     .map_err(map_db)?;
                 self.persist_task_projection(&item, None)
                     .await
                     .map_err(map_config)?;
-                Ok(1)
+                Ok(usize::from(created_for_item))
             }
             .await;
 
@@ -2077,16 +2131,13 @@ impl OrchestrationService {
         item: &mut WorkItem,
         reason: Option<&str>,
     ) -> Result<bool, AppError> {
-        let reactive_state_kind =
-            self.workflows
-                .get_reactive(&item.workflow_id)
-                .and_then(|workflow| {
-                    workflow
-                        .states
-                        .iter()
-                        .find(|state| state.id == item.current_step)
-                        .map(protocol::ReactiveWorkflowState::kind)
-                });
+        let reactive_state_kind = self.workflows.get(&item.workflow_id).and_then(|workflow| {
+            workflow
+                .states
+                .iter()
+                .find(|state| state.id == item.current_step)
+                .map(protocol::ReactiveWorkflowState::kind)
+        });
 
         let current_is_executable = matches!(
             reactive_state_kind,
@@ -2137,6 +2188,14 @@ impl OrchestrationService {
             .await
             .map_err(map_db)?
         {
+            if !item.context.is_object() {
+                item.context = serde_json::json!({});
+            }
+            item.context["operator_override"] = serde_json::json!({
+                "action": "retry",
+                "reason": reason,
+                "step_id": previous_failed.step_id,
+            });
             item.updated_at = Utc::now();
             item.blocked_on = block_reason_for_state_name(&item.current_step);
             item.projected_state = Some(project_workflow_state(item));
@@ -2204,7 +2263,7 @@ impl OrchestrationService {
         item: &mut WorkItem,
         reason: Option<&str>,
     ) -> Result<bool, AppError> {
-        let Some(reactive) = self.workflows.get_reactive(&item.workflow_id) else {
+        let Some(reactive) = self.workflows.get(&item.workflow_id) else {
             return Ok(false);
         };
         let Some(state) = reactive
@@ -2354,7 +2413,14 @@ impl OrchestrationService {
                         job_id: None,
                         reason: Some("GitHub polling".to_string()),
                     };
-                    match self.fire_event_trusted_internal(work_item_id, req).await {
+                    match self
+                        .fire_event_trusted_internal_with_source(
+                            work_item_id,
+                            req,
+                            EventSource::ScmPoller,
+                        )
+                        .await
+                    {
                         Ok(_) => {
                             github_fired_events = github_fired_events.saturating_add(1);
                         }
@@ -2405,7 +2471,7 @@ impl OrchestrationService {
             if !matches!(item.state, WorkItemState::Pending | WorkItemState::Running) {
                 continue;
             }
-            let Some(reactive) = self.workflows.get_reactive(&item.workflow_id) else {
+            let Some(reactive) = self.workflows.get(&item.workflow_id) else {
                 continue;
             };
             let Some(state) = reactive.states.iter().find(|s| s.id == item.current_step) else {
@@ -2485,25 +2551,8 @@ impl OrchestrationService {
         Ok(fired)
     }
 
-    pub fn list_workflows(&self) -> Vec<WorkflowDefinition> {
+    pub fn list_workflows(&self) -> Vec<protocol::ReactiveWorkflowDefinition> {
         self.workflows.list()
-    }
-
-    pub fn list_workflow_documents(&self) -> Vec<WorkflowDocument> {
-        let mut docs = self
-            .workflows
-            .list()
-            .into_iter()
-            .map(|workflow| WorkflowDocument::LegacyV1 { workflow })
-            .collect::<Vec<_>>();
-        docs.extend(
-            self.workflows
-                .list_reactive()
-                .into_iter()
-                .map(|workflow| WorkflowDocument::ReactiveV2 { workflow }),
-        );
-        docs.sort_by(|a, b| workflow_document_id(a).cmp(workflow_document_id(b)));
-        docs
     }
 
     pub fn workflow_validation_report(&self) -> protocol::WorkflowValidationReport {
@@ -2534,9 +2583,7 @@ impl OrchestrationService {
                     .to_string(),
             ));
         }
-        if self.workflows.get(&workflow_id).is_none()
-            && self.workflows.get_reactive(&workflow_id).is_none()
-        {
+        if self.workflows.get(&workflow_id).is_none() {
             return Err(AppError::WorkflowNotFound(workflow_id));
         }
         let original = item.clone();
@@ -2568,8 +2615,6 @@ impl OrchestrationService {
         workflow_id: &str,
     ) -> Result<bool, AppError> {
         let initial_state = if let Some(workflow) = self.workflows.get(workflow_id) {
-            workflow.entry_step.clone()
-        } else if let Some(workflow) = self.workflows.get_reactive(workflow_id) {
             workflow.initial_state.clone()
         } else {
             return Err(AppError::WorkflowNotFound(workflow_id.to_string()));
@@ -2634,10 +2679,10 @@ impl OrchestrationService {
     ) -> Result<Vec<ResolvedAuthorizationRequest>, AppError> {
         let initial_state = self
             .workflows
-            .get_reactive(workflow_id)
+            .get(workflow_id)
             .ok_or_else(|| {
                 AppError::WorkflowInvalid(
-                    "legacy workflows cannot receive durable authorization".to_string(),
+                    "workflow cannot receive durable authorization".to_string(),
                 )
             })?
             .initial_state
@@ -2655,10 +2700,10 @@ impl OrchestrationService {
         }
         let workflow = self
             .workflows
-            .get_reactive(workflow_id)
+            .get(workflow_id)
             .ok_or_else(|| {
                 AppError::WorkflowInvalid(
-                    "legacy workflows cannot receive durable authorization".to_string(),
+                    "workflow cannot receive durable authorization".to_string(),
                 )
             })?
             .clone();
@@ -2753,10 +2798,8 @@ impl OrchestrationService {
                     if let protocol::ReactiveStateConfig::Auto(config) = &state.config
                         && let Some(child_workflow_id) = config.child_workflow.as_deref()
                     {
-                        let child_workflow = self
-                            .workflows
-                            .get_reactive(child_workflow_id)
-                            .ok_or_else(|| {
+                        let child_workflow =
+                            self.workflows.get(child_workflow_id).ok_or_else(|| {
                                 AppError::WorkflowInvalid(format!(
                                     "child workflow '{child_workflow_id}' is not reactive"
                                 ))
@@ -2844,13 +2887,12 @@ impl OrchestrationService {
             .into_iter()
             .map(|i| (i.id, i))
             .collect::<HashMap<_, _>>();
-        let mut workflow_ids = self
+        let workflow_ids = self
             .workflows
             .list()
             .into_iter()
             .map(|w| w.id)
             .collect::<Vec<_>>();
-        workflow_ids.extend(self.workflows.list_reactive().into_iter().map(|w| w.id));
 
         let intents = infer_intents(
             tasks,
@@ -2909,7 +2951,7 @@ impl OrchestrationService {
                         && self.workflows.get(&checkpoint.workflow_id).is_none()
                         && self
                             .workflows
-                            .get_reactive(&checkpoint.workflow_id)
+                            .get(&checkpoint.workflow_id)
                             .is_none()
                     {
                         self.insert_recovery_failure(
@@ -2991,8 +3033,8 @@ impl OrchestrationService {
                             .map(|checkpoint| checkpoint.current_step.clone())
                             .unwrap_or_else(|| "triage".to_string())
                     } else if let Some(workflow) = self.workflows.get(&workflow_id) {
-                        workflow.entry_step.clone()
-                    } else if let Some(reactive) = self.workflows.get_reactive(&workflow_id) {
+                        workflow.initial_state.clone()
+                    } else if let Some(reactive) = self.workflows.get(&workflow_id) {
                         reactive.initial_state.clone()
                     } else {
                         return Ok(());
@@ -3682,7 +3724,7 @@ impl OrchestrationService {
             } else if !self.triage_pin_can_change(&item).await.map_err(map_db)? {
                 Some("workflow pin cannot change after triage has started".to_string())
             } else if self.workflows.get(&workflow_id).is_none()
-                && self.workflows.get_reactive(&workflow_id).is_none()
+                && self.workflows.get(&workflow_id).is_none()
             {
                 Some(format!("unknown workflow '{workflow_id}'"))
             } else {
@@ -3881,14 +3923,9 @@ impl OrchestrationService {
                 retry.attempt = previous.attempt.saturating_add(1);
                 retry.created_at = Utc::now();
                 retry.updated_at = retry.created_at;
-                let workflow = self
-                    .workflows
-                    .get_reactive(&item.workflow_id)
-                    .ok_or_else(|| {
-                        AppError::WorkflowInvalid(
-                            "legacy workflow retries are not authorized".to_string(),
-                        )
-                    })?;
+                let workflow = self.workflows.get(&item.workflow_id).ok_or_else(|| {
+                    AppError::WorkflowInvalid("workflow retries are not authorized".to_string())
+                })?;
                 let state = workflow
                     .states
                     .iter()
@@ -3933,7 +3970,7 @@ impl OrchestrationService {
             }
         }
         if matches!(action.kind, HumanActionKind::Unblock)
-            && let Some(reactive) = self.workflows.get_reactive(&item.workflow_id)
+            && let Some(reactive) = self.workflows.get(&item.workflow_id)
             && let Some(state) = reactive
                 .states
                 .iter()
@@ -3998,56 +4035,6 @@ impl OrchestrationService {
                 _ => {
                     return Err(AppError::WorkflowInvalid(format!(
                         "event '{}' is not supported for triage workflow",
-                        workflow_event_kind_name(&event)
-                    )));
-                }
-            }
-            return Ok(());
-        }
-
-        if let Some(workflow) = self.workflows.get(&item.workflow_id).cloned() {
-            let step = workflow
-                .steps
-                .iter()
-                .find(|step| step.id == item.current_step)
-                .ok_or_else(|| AppError::WorkflowInvalid("legacy workflow step missing".into()))?;
-            match event {
-                WorkflowEventKind::Start | WorkflowEventKind::Submit => {
-                    item.state = WorkItemState::Running;
-                    self.plan_legacy_step(item, &workflow, checkpoint_owner_id, plan)
-                        .await?;
-                }
-                WorkflowEventKind::HumanApproved => {
-                    clear_success_projection_fields(item);
-                    if let Some(next) = &step.on_success {
-                        item.current_step = next.clone();
-                        item.state = WorkItemState::Running;
-                        self.plan_legacy_step(item, &workflow, checkpoint_owner_id, plan)
-                            .await?;
-                    } else {
-                        item.state = WorkItemState::Succeeded;
-                    }
-                }
-                WorkflowEventKind::HumanChangesRequested
-                | WorkflowEventKind::HumanUnblocked
-                | WorkflowEventKind::RetryRequested => {
-                    if let Some(next) = &step.on_failure {
-                        item.current_step = next.clone();
-                        item.state = WorkItemState::Running;
-                        self.plan_legacy_step(item, &workflow, checkpoint_owner_id, plan)
-                            .await?;
-                    } else {
-                        item.state = WorkItemState::Failed;
-                    }
-                }
-                WorkflowEventKind::Cancel => {
-                    item.state = WorkItemState::Cancelled;
-                    plan.cancel_active_work_item_ids.push(item.id);
-                    self.plan_provider_cancel_descendants(item, plan).await?;
-                }
-                _ => {
-                    return Err(AppError::WorkflowInvalid(format!(
-                        "provider event '{}' is not supported for legacy workflow",
                         workflow_event_kind_name(&event)
                     )));
                 }
@@ -4136,9 +4123,9 @@ impl OrchestrationService {
             job,
             checkpoint_owner_id,
         });
-        item.context.as_object_mut().map(|context| {
+        if let Some(context) = item.context.as_object_mut() {
             context.remove("authorization_pending");
-        });
+        }
         item.human_gate = false;
         item.human_gate_state = None;
         item.required_action_description = None;
@@ -4254,11 +4241,6 @@ impl OrchestrationService {
         plan: &mut ProviderActionPlan,
     ) -> Result<(), AppError> {
         ensure_state_invocation(item);
-        if let Some(workflow) = self.workflows.get(&item.workflow_id).cloned() {
-            return self
-                .plan_legacy_step(item, &workflow, checkpoint_owner_id, plan)
-                .await;
-        }
         if item.workflow_id == TRIAGE_WORKFLOW_ID {
             if item.state != WorkItemState::Pending {
                 return Ok(());
@@ -4334,146 +4316,6 @@ impl OrchestrationService {
             .await
     }
 
-    async fn plan_legacy_step(
-        &self,
-        item: &mut WorkItem,
-        workflow: &WorkflowDefinition,
-        checkpoint_owner_id: Uuid,
-        plan: &mut ProviderActionPlan,
-    ) -> Result<(), AppError> {
-        let step = workflow
-            .steps
-            .iter()
-            .find(|step| step.id == item.current_step)
-            .ok_or_else(|| {
-                AppError::WorkflowInvalid(format!("missing step {}", item.current_step))
-            })?;
-        if self
-            .has_pending_job_for_step(item.id, &step.id)
-            .await
-            .map_err(map_db)?
-        {
-            return Ok(());
-        }
-        if step.kind == WorkflowStepKind::ChildWorkflow {
-            if item.child_work_item_id.is_some() {
-                return Ok(());
-            }
-            let child_workflow_id = step.child_workflow_id.as_deref().ok_or_else(|| {
-                AppError::WorkflowInvalid(format!("missing child_workflow_id for step {}", step.id))
-            })?;
-            let (child_workflow_id, child_initial_step) = if let Some(child_workflow) =
-                self.workflows.get(child_workflow_id)
-            {
-                (child_workflow.id.clone(), child_workflow.entry_step.clone())
-            } else if let Some(child_workflow) = self.workflows.get_reactive(child_workflow_id) {
-                (
-                    child_workflow.id.clone(),
-                    child_workflow.initial_state.clone(),
-                )
-            } else {
-                return Err(AppError::WorkflowNotFound(child_workflow_id.to_string()));
-            };
-            let now = Utc::now();
-            let mut child = child_work_item_for_provider_action(
-                item,
-                child_workflow_id,
-                child_initial_step,
-                step.id.clone(),
-                now,
-            );
-            item.child_work_item_id = Some(child.id);
-            item.state = WorkItemState::Running;
-            Box::pin(self.plan_pending_for_provider_action(&mut child, checkpoint_owner_id, plan))
-                .await?;
-            plan.work_item_inserts.push(child);
-            return Ok(());
-        }
-
-        let interpolation_context = interpolation_context_for_work_item(item, &step.id);
-        let command = interpolate_template(&step.command, &interpolation_context)
-            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
-        let args = step
-            .args
-            .iter()
-            .map(|arg| interpolate_template(arg, &interpolation_context))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
-        let env = step
-            .env
-            .iter()
-            .map(|(key, value)| {
-                Ok((
-                    key.clone(),
-                    interpolate_template(value, &interpolation_context)?,
-                ))
-            })
-            .collect::<Result<HashMap<_, _>, InterpolationError>>()
-            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
-        let now = Utc::now();
-        let selected_environment = self.selected_environment_for_context(&item.context);
-        let mut job = Job {
-            id: Uuid::new_v4(),
-            work_item_id: item.id,
-            step_id: step.id.clone(),
-            state: JobState::Pending,
-            assigned_worker_id: None,
-            execution_mode: step.executor.clone(),
-            container_image: step.container_image.clone().or_else(|| {
-                selected_environment
-                    .as_ref()
-                    .map(|(_, environment)| environment.image.clone())
-            }),
-            command,
-            args,
-            env,
-            prompt: step.prompt.clone(),
-            context: item.context.clone(),
-            repo: item.repo.clone(),
-            timeout_secs: step.timeout_secs,
-            max_retries: step.max_retries,
-            attempt: 0,
-            transcript_dir: None,
-            result: None,
-            lease_expires_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-        let mut runtime = canonical_runtime_spec_for_job(&job);
-        if let Some((selection, environment)) = selected_environment.as_ref() {
-            apply_environment_definition_to_runtime(
-                &mut runtime,
-                environment,
-                step.container_image.is_some(),
-            );
-            project_environment_selection_into_job_context(
-                &mut job.context,
-                selection,
-                self.overlays.as_slice(),
-            );
-            project_environment_runtime_into_job_context(&mut job.context, environment);
-        }
-        let valid_next_events = self.projected_valid_next_events_for_job_context(item);
-        project_workflow_inputs_into_job_context(
-            &mut job.context,
-            &valid_next_events,
-            item,
-            &item.context,
-        );
-        project_runtime_spec_into_job_context(&mut job.context, &runtime);
-        project_approval_mode_into_job_context(
-            &mut job.context,
-            &item.context,
-            self.force_gateway_approval_mode,
-        );
-        plan.job_inserts.push(ProviderActionJobInsert {
-            job,
-            runtime,
-            checkpoint_owner_id,
-        });
-        Ok(())
-    }
-
     async fn plan_reactive_event(
         &self,
         item: &mut WorkItem,
@@ -4483,7 +4325,7 @@ impl OrchestrationService {
     ) -> Result<(), AppError> {
         let reactive = self
             .workflows
-            .get_reactive(&item.workflow_id)
+            .get(&item.workflow_id)
             .ok_or_else(|| AppError::WorkflowNotFound(item.workflow_id.clone()))?;
         let state = reactive
             .states
@@ -4523,7 +4365,7 @@ impl OrchestrationService {
     ) -> Result<(), AppError> {
         let reactive = self
             .workflows
-            .get_reactive(&item.workflow_id)
+            .get(&item.workflow_id)
             .ok_or_else(|| AppError::WorkflowNotFound(item.workflow_id.clone()))?
             .clone();
         let mut auto_hops = 0usize;
@@ -4587,10 +4429,8 @@ impl OrchestrationService {
                         let (workflow_id, initial_step) = if let Some(workflow) =
                             self.workflows.get(child_workflow_id)
                         {
-                            (workflow.id.clone(), workflow.entry_step.clone())
-                        } else if let Some(workflow) =
-                            self.workflows.get_reactive(child_workflow_id)
-                        {
+                            (workflow.id.clone(), workflow.initial_state.clone())
+                        } else if let Some(workflow) = self.workflows.get(child_workflow_id) {
                             (workflow.id.clone(), workflow.initial_state.clone())
                         } else {
                             return Err(AppError::WorkflowNotFound(child_workflow_id.to_string()));
@@ -4740,9 +4580,7 @@ impl OrchestrationService {
             step_id: state.id.clone(),
             state: JobState::Pending,
             assigned_worker_id: None,
-            execution_mode: execution
-                .and_then(|config| config.executor.clone())
-                .unwrap_or(protocol::ExecutionMode::Raw),
+            execution_mode: protocol::ExecutionMode::Docker,
             container_image: execution.and_then(|config| config.container_image.clone()),
             command,
             args,
@@ -4750,9 +4588,7 @@ impl OrchestrationService {
             prompt,
             context: item.context.clone(),
             repo: item.repo.clone(),
-            timeout_secs: execution
-                .and_then(|config| config.timeout)
-                .or(execution.and_then(|config| config.timeout_secs)),
+            timeout_secs: execution.and_then(|config| config.timeout_secs),
             max_retries: execution.map(|config| config.max_retries).unwrap_or(0),
             attempt: 0,
             transcript_dir: None,
@@ -4761,7 +4597,9 @@ impl OrchestrationService {
             created_at: now,
             updated_at: now,
         };
-        let mut runtime = runtime_spec_for_reactive_agent_state(state, item, &job);
+        let mut runtime =
+            runtime_spec_for_reactive_agent_state(state, item, &job, self.scm_hosts.as_ref())
+                .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
         if let Some((selection, environment)) = selected_environment.as_ref() {
             apply_environment_definition_to_runtime(
                 &mut runtime,
@@ -4783,7 +4621,7 @@ impl OrchestrationService {
         project_reactive_execution_markers_into_job_context(
             &mut job.context,
             state.kind(),
-            managed_operation.as_deref(),
+            managed_operation.as_ref(),
         );
         let valid_next_events = self.projected_valid_next_events_for_job_context(item);
         project_workflow_inputs_into_job_context(
@@ -4866,11 +4704,6 @@ impl OrchestrationService {
         state_kind: protocol::ReactiveStateKind,
         checkpoint_owner_id: Uuid,
     ) -> Result<(), AppError> {
-        if job.execution_mode != protocol::ExecutionMode::Docker {
-            return Err(AppError::WorkflowInvalid(
-                "raw and legacy execution has no durable authorization support".to_string(),
-            ));
-        }
         let execution_kind = job
             .context
             .get(CONTEXT_WORKFLOW_KEY)
@@ -4891,24 +4724,10 @@ impl OrchestrationService {
                     serde_json::to_value(profile)
                         .map_err(|error| AppError::WorkflowInvalid(error.to_string()))
                 })?,
-            "managed" => self
-                .runner_profiles
-                .resolve_managed_profile(
-                    job.context
-                        .get(CONTEXT_WORKFLOW_KEY)
-                        .and_then(|workflow| workflow.get(CONTEXT_MANAGED_OPERATION_KEY))
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            AppError::WorkflowInvalid(
-                                "managed job has no operation binding".to_string(),
-                            )
-                        })?,
-                )
-                .map_err(AppError::WorkflowInvalid)
-                .and_then(|profile| {
-                    serde_json::to_value(profile)
-                        .map_err(|error| AppError::WorkflowInvalid(error.to_string()))
-                })?,
+            "managed" => serde_json::json!({
+                "profile_name": "github_action",
+                "config_digest": "github_action_v1"
+            }),
             "command" => {
                 serde_json::json!({"profile_name":"command", "config_digest":"command_v1"})
             }
@@ -4919,6 +4738,16 @@ impl OrchestrationService {
             }
         };
         let mut runtime = canonical_runtime_spec_for_job_effective(job);
+        if !runtime.github_capabilities.is_empty() && execution_kind != "managed" {
+            return Err(AppError::WorkflowInvalid(
+                "GitHub mutation capability is restricted to managed GitHub actions".to_string(),
+            ));
+        }
+        if execution_kind == "managed" && runtime.github_capabilities.len() != 1 {
+            return Err(AppError::WorkflowInvalid(
+                "managed GitHub action requires exactly one GitHub capability".to_string(),
+            ));
+        }
         if let Ok(profile) = serde_json::from_value::<agent_hub_config::ResolvedRunnerProfile>(
             runner_profile.clone(),
         ) {
@@ -4947,14 +4776,12 @@ impl OrchestrationService {
         let workflow_snapshot = if item.workflow_id == TRIAGE_WORKFLOW_ID {
             serde_json::json!({"schema":"special_triage_v1", "state":"triage"})
         } else {
-            serde_json::to_value(self.workflows.get_reactive(&item.workflow_id).ok_or_else(
-                || {
-                    AppError::WorkflowInvalid(format!(
-                        "workflow '{}' is not reactive",
-                        item.workflow_id
-                    ))
-                },
-            )?)
+            serde_json::to_value(self.workflows.get(&item.workflow_id).ok_or_else(|| {
+                AppError::WorkflowInvalid(format!(
+                    "workflow '{}' is not reactive",
+                    item.workflow_id
+                ))
+            })?)
             .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?
         };
         let invocation_id = current_state_invocation_id(item).ok_or_else(|| {
@@ -6235,7 +6062,7 @@ impl OrchestrationService {
     async fn retry_ownership_returns(&self) -> anyhow::Result<()> {
         let path = Arc::clone(&self.db_path);
         let obligations = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Vec<(Uuid, String, Option<String>, Option<String>, Vec<ProviderIdentity>)>> {
+            move || -> anyhow::Result<Vec<OwnershipReturn>> {
                 let conn = Connection::open(path.as_path())?;
                 let mut stmt = conn.prepare(
                     "SELECT root_work_item_id, task_id, human_owner, human_owner_provider_id, human_owners_json FROM ownership_return_outbox ORDER BY updated_at ASC",
@@ -6259,21 +6086,20 @@ impl OrchestrationService {
             },
         )
         .await??;
-        for (root_id, task_id, human_owner, human_owner_provider_id, human_owners) in obligations {
-            let ownership = if !human_owners.is_empty() {
-                ProviderOwnership::Human {
-                    owners: human_owners.clone(),
-                }
-            } else {
-                match (human_owner_provider_id.clone(), human_owner.clone()) {
-                    (None, None) => ProviderOwnership::Unassigned,
-                    (provider_id, display_name) => ProviderOwnership::Human {
-                        owners: vec![ProviderIdentity {
-                            provider_id,
-                            display_name,
-                        }],
-                    },
-                }
+        for (root_id, task_id, human_owner, human_owner_provider_id, mut human_owners) in
+            obligations
+        {
+            if human_owners.is_empty()
+                && (human_owner_provider_id.is_some() || human_owner.is_some())
+            {
+                human_owners.push(ProviderIdentity {
+                    provider_id: human_owner_provider_id.clone(),
+                    display_name: human_owner.clone(),
+                });
+            }
+            validate_exact_remembered_human_owners(&root_id.to_string(), &human_owners)?;
+            let ownership = ProviderOwnership::Human {
+                owners: human_owners.clone(),
             };
             let adapter = Arc::clone(&self.task_adapter);
             let task_id_for_call = task_id.clone();
@@ -6631,15 +6457,18 @@ impl OrchestrationService {
             .unwrap_or(serde_json::Value::Null);
         let stored_comment_id = item.job_result_comment_ids.get(&step_id).copied();
 
-        match self.task_adapter.write_job_result_comment(
-            task_id,
-            &step_id,
-            &item.id.to_string(),
-            job.state == JobState::Succeeded,
-            &output,
-            &context,
-            stored_comment_id,
-        ) {
+        let work_item_id = item.id.to_string();
+        match self
+            .task_adapter
+            .write_job_result_comment(JobResultComment {
+                task_id,
+                step_id: &step_id,
+                work_item_id: &work_item_id,
+                succeeded: job.state == JobState::Succeeded,
+                output: &output,
+                context: &context,
+                stored_comment_id,
+            }) {
             Ok(Some(comment_id)) => {
                 item.job_result_comment_ids.insert(step_id, comment_id);
             }
@@ -6715,7 +6544,7 @@ impl OrchestrationService {
             ];
         }
 
-        if let Some(reactive) = self.workflows.get_reactive(&item.workflow_id)
+        if let Some(reactive) = self.workflows.get(&item.workflow_id)
             && let Some(state) = reactive
                 .states
                 .iter()
@@ -6743,146 +6572,6 @@ impl OrchestrationService {
             .map(merge_readiness_from_pr_state)
     }
 
-    fn reactive_state_auto_merge_enabled(&self, item: &WorkItem) -> bool {
-        self.workflows
-            .get_reactive(&item.workflow_id)
-            .and_then(|workflow| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.id == item.current_step)
-            })
-            .map(|state| state.auto_merge)
-            .unwrap_or(false)
-    }
-
-    fn should_attempt_auto_merge_for_current_state(&self, item: &WorkItem) -> bool {
-        if !self.reactive_state_auto_merge_enabled(item) {
-            return false;
-        }
-
-        let Some(readiness) = self.check_merge_readiness(item) else {
-            return false;
-        };
-        if !readiness.ready {
-            return false;
-        }
-
-        let Some(pr_state) = self.github_pr_state_for_work_item(item) else {
-            return false;
-        };
-
-        !matches!(pr_state.state, GithubPrLifecycleState::Merged) && !pr_state.merge_attempted
-    }
-
-    async fn try_auto_merge_for_current_state(&self, item: &mut WorkItem) {
-        if !self.should_attempt_auto_merge_for_current_state(item) {
-            return;
-        }
-
-        if let Err(error) = self.try_auto_merge(item).await {
-            eprintln!(
-                "[info] deterministic auto-merge attempt errored: work_item={} error={error:#}",
-                item.id
-            );
-        }
-    }
-
-    /// Attempt to merge a PR when readiness conditions are met.
-    /// This is deterministic — no agent involvement.
-    /// Returns Ok(true) if merge was triggered, Ok(false) if not ready or already merged.
-    pub(crate) async fn try_auto_merge(&self, item: &mut WorkItem) -> anyhow::Result<bool> {
-        let Some(readiness) = self.check_merge_readiness(item) else {
-            return Ok(false);
-        };
-        if !readiness.ready {
-            return Ok(false);
-        }
-
-        let Some(mut pr_state) = self.github_pr_state_for_work_item(item) else {
-            return Ok(false);
-        };
-        if matches!(pr_state.state, GithubPrLifecycleState::Merged) || pr_state.merge_attempted {
-            return Ok(false);
-        }
-
-        eprintln!(
-            "[info] deterministic auto-merge attempt: work_item={} pr_url={}",
-            item.id, pr_state.url
-        );
-        let output = match Command::new("gh")
-            .arg("pr")
-            .arg("merge")
-            .arg(&pr_state.url)
-            .arg("--merge")
-            .arg("--auto")
-            .output()
-            .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                eprintln!(
-                    "[info] deterministic auto-merge failed to execute gh: work_item={} pr_url={} error={error}",
-                    item.id, pr_state.url
-                );
-                return Ok(false);
-            }
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if !output.status.success() {
-            eprintln!(
-                "[info] deterministic auto-merge command failed: work_item={} pr_url={} status={} stdout='{}' stderr='{}'",
-                item.id, pr_state.url, output.status, stdout, stderr
-            );
-            return Ok(false);
-        }
-
-        eprintln!(
-            "[info] deterministic auto-merge command succeeded: work_item={} pr_url={} stdout='{}' stderr='{}'",
-            item.id, pr_state.url, stdout, stderr
-        );
-
-        pr_state.merge_attempted = true;
-        pr_state.state = GithubPrLifecycleState::Merged;
-        pr_state.mergeable = false;
-        pr_state.last_updated = Utc::now();
-        if !item.context.is_object() {
-            item.context = serde_json::Value::Object(serde_json::Map::new());
-        }
-        if let Some(obj) = item.context.as_object_mut()
-            && let Ok(value) = serde_json::to_value(pr_state)
-        {
-            obj.insert(CONTEXT_GITHUB_PR_STATE_KEY.to_string(), value);
-        }
-        item.updated_at = Utc::now();
-        self.update_work_item(item).await?;
-        self.persist_task_projection(item, None).await?;
-
-        if let Err(error) = self
-            .fire_event_trusted_internal(
-                item.id,
-                FireEventRequest {
-                    event: WorkflowEventKind::PrMerged,
-                    job_id: None,
-                    reason: Some("deterministic auto-merge completed".to_string()),
-                },
-            )
-            .await
-            .map(|updated| {
-                *item = updated;
-            })
-        {
-            eprintln!(
-                "[info] deterministic auto-merge fired merge command but could not fire PrMerged: work_item={} error={error}",
-                item.id
-            );
-        }
-
-        Ok(true)
-    }
-
     fn valid_next_events_for_work_item_internal(&self, item: &WorkItem) -> Vec<WorkflowEventKind> {
         if matches!(
             item.state,
@@ -6901,7 +6590,7 @@ impl OrchestrationService {
             return triage_valid_next_events(item);
         }
 
-        if let Some(reactive) = self.workflows.get_reactive(&item.workflow_id)
+        if let Some(reactive) = self.workflows.get(&item.workflow_id)
             && let Some(state) = reactive.states.iter().find(|s| s.id == item.current_step)
         {
             let mut out = state
@@ -6928,36 +6617,7 @@ impl OrchestrationService {
             return out;
         }
 
-        let Some(workflow) = self.workflows.get(&item.workflow_id) else {
-            return Vec::new();
-        };
-        let Some(step) = workflow.steps.iter().find(|s| s.id == item.current_step) else {
-            return Vec::new();
-        };
-
-        let mut out = Vec::new();
-        if item.state == WorkItemState::Pending {
-            push_unique_event(&mut out, WorkflowEventKind::Start);
-            push_unique_event(&mut out, WorkflowEventKind::Submit);
-        }
-        if item.state == WorkItemState::Failed {
-            push_unique_event(&mut out, WorkflowEventKind::RetryRequested);
-        }
-        if item.human_gate {
-            // Human-gate semantics fully determine the externally valid event set for this legacy
-            // item, so return the narrowed gate-state-aware contract directly.
-            out = legacy_human_gate_valid_next_events(item);
-            return out;
-        }
-        if step.kind == WorkflowStepKind::ChildWorkflow {
-            push_unique_event(&mut out, WorkflowEventKind::AllChildrenCompleted);
-            push_unique_event(&mut out, WorkflowEventKind::ChildFailed);
-        } else {
-            push_unique_event(&mut out, WorkflowEventKind::JobSucceeded);
-            push_unique_event(&mut out, WorkflowEventKind::JobFailed);
-        }
-        push_unique_event(&mut out, WorkflowEventKind::Cancel);
-        out
+        Vec::new()
     }
 
     async fn reconcile_stale_workers(&self, stale_after: Duration) -> Result<usize, AppError> {
@@ -7129,7 +6789,7 @@ impl OrchestrationService {
             self.try_progress_parent(item.id).await?;
             return Ok(());
         }
-        if self.workflows.get_reactive(&item.workflow_id).is_some() {
+        if self.workflows.get(&item.workflow_id).is_some() {
             self.merge_job_output_into_context(&mut item, job)
                 .map_err(AppError::WorkflowInvalid)?;
             update_last_failure_reason_fields(&mut item, Some(job));
@@ -7195,104 +6855,16 @@ impl OrchestrationService {
             return Ok(());
         }
 
-        let workflow = self
-            .workflows
-            .get(&item.workflow_id)
-            .ok_or_else(|| AppError::WorkflowNotFound(item.workflow_id.clone()))?
-            .clone();
-        let step = workflow
-            .steps
-            .iter()
-            .find(|s| s.id == item.current_step)
-            .ok_or_else(|| {
-                AppError::WorkflowInvalid(format!("missing step '{}'", item.current_step))
-            })?;
-
-        if step.id != job.step_id {
-            return Err(AppError::WorkflowInvalid(format!(
-                "job step '{}' does not match work item step '{}'",
-                job.step_id, item.current_step
-            )));
-        }
-
-        self.merge_job_output_into_context(&mut item, job)
-            .map_err(AppError::WorkflowInvalid)?;
-        update_last_failure_reason_fields(&mut item, Some(job));
-        if job.state == JobState::Failed {
-            self.append_failure_log(&item).await.map_err(map_config)?;
-        }
-        self.write_job_result_comment_best_effort(&mut item, job)
-            .await;
-
-        match job.state {
-            JobState::Succeeded => {
-                if let Some(next) = &step.on_success {
-                    item.current_step = next.clone();
-                    item.state = WorkItemState::Running;
-                    self.ensure_pending_job_for_step(&item, &workflow)
-                        .await
-                        .map_err(map_db)?;
-                } else {
-                    item.state = WorkItemState::Succeeded;
-                }
-            }
-            JobState::Failed | JobState::Cancelled => {
-                if job.state == JobState::Failed && job.attempt < job.max_retries {
-                    if !self.retry_job(job, &mut item).await.map_err(map_db)? {
-                        item.updated_at = Utc::now();
-                        item.blocked_on = block_reason_for_state_name(&item.current_step);
-                        item.projected_state = Some(project_workflow_state(&item));
-                        self.update_work_item(&item).await.map_err(map_db)?;
-                        self.persist_task_projection(&item, None)
-                            .await
-                            .map_err(map_config)?;
-                        return Ok(());
-                    }
-                    item.state = WorkItemState::Running;
-                    item.updated_at = Utc::now();
-                    item.blocked_on = block_reason_for_state_name(&item.current_step);
-                    self.update_work_item(&item).await.map_err(map_db)?;
-                    self.persist_task_projection(&item, None)
-                        .await
-                        .map_err(map_config)?;
-                    return Ok(());
-                }
-                if let Some(next) = &step.on_failure {
-                    item.current_step = next.clone();
-                    item.state = WorkItemState::Running;
-                    self.ensure_pending_job_for_step(&item, &workflow)
-                        .await
-                        .map_err(map_db)?;
-                } else {
-                    item.state = WorkItemState::Failed;
-                }
-            }
-            JobState::Pending | JobState::Assigned | JobState::Running => return Ok(()),
-        }
-
-        item.updated_at = Utc::now();
-        item.blocked_on = block_reason_for_state_name(&item.current_step);
-        item.projected_state = Some(project_workflow_state(&item));
-        self.update_work_item(&item).await.map_err(map_db)?;
-        self.persist_task_projection(&item, None)
-            .await
-            .map_err(map_config)?;
-        self.try_progress_parent(item.id).await?;
-        Ok(())
+        Err(AppError::WorkflowNotFound(item.workflow_id))
     }
 
     async fn ensure_pending_for_current_state(&self, item: &mut WorkItem) -> anyhow::Result<bool> {
         ensure_state_invocation(item);
-        if let Some(workflow) = self.workflows.get(&item.workflow_id) {
-            self.ensure_pending_job_for_step(item, workflow).await?;
-            return Ok(true);
-        }
-
         if item.workflow_id == "__triage__" {
             return self.ensure_pending_triage_job(item).await;
         }
 
-        let Some(reactive) = self.workflows.get_reactive(&item.workflow_id) else {
+        let Some(reactive) = self.workflows.get(&item.workflow_id) else {
             return Ok(false);
         };
 
@@ -7391,9 +6963,12 @@ impl OrchestrationService {
                             let (child_workflow_id, child_initial_step) =
                                 if let Some(child_workflow) = self.workflows.get(child_workflow_id)
                                 {
-                                    (child_workflow.id.clone(), child_workflow.entry_step.clone())
+                                    (
+                                        child_workflow.id.clone(),
+                                        child_workflow.initial_state.clone(),
+                                    )
                                 } else if let Some(child_workflow) =
-                                    self.workflows.get_reactive(child_workflow_id)
+                                    self.workflows.get(child_workflow_id)
                                 {
                                     (
                                         child_workflow.id.clone(),
@@ -7478,7 +7053,7 @@ impl OrchestrationService {
                         .iter()
                         .find(|t| t.event.kind() == protocol::ReactiveEventKind::Start)
                     {
-                        item.current_step = next.target.clone();
+                        enter_workflow_state(item, &next.target);
                         item.state = WorkItemState::Running;
                         continue;
                     }
@@ -7553,19 +7128,14 @@ impl OrchestrationService {
                                 execution,
                                 &item.context,
                             )?;
-                        let timeout_secs = execution
-                            .and_then(|config| config.timeout)
-                            .or(execution.and_then(|config| config.timeout_secs));
+                        let timeout_secs = execution.and_then(|config| config.timeout_secs);
                         let job = Job {
                             id: Uuid::new_v4(),
                             work_item_id: item.id,
                             step_id: state.id.clone(),
                             state: JobState::Pending,
                             assigned_worker_id: None,
-                            execution_mode: execution
-                                .and_then(|config| config.executor.clone())
-                                .clone()
-                                .unwrap_or(protocol::ExecutionMode::Raw),
+                            execution_mode: protocol::ExecutionMode::Docker,
                             container_image: execution
                                 .and_then(|config| config.container_image.clone()),
                             command,
@@ -7583,7 +7153,12 @@ impl OrchestrationService {
                             created_at: now,
                             updated_at: now,
                         };
-                        let runtime = runtime_spec_for_reactive_agent_state(state, item, &job);
+                        let runtime = runtime_spec_for_reactive_agent_state(
+                            state,
+                            item,
+                            &job,
+                            self.scm_hosts.as_ref(),
+                        )?;
                         let mut job = job;
                         let mut runtime = runtime;
                         if let Some((selection, environment)) = selected_environment.as_ref() {
@@ -7610,7 +7185,7 @@ impl OrchestrationService {
                         project_reactive_execution_markers_into_job_context(
                             &mut job.context,
                             state.kind(),
-                            managed_operation.as_deref(),
+                            managed_operation.as_ref(),
                         );
                         let valid_next_events =
                             self.projected_valid_next_events_for_job_context(item);
@@ -7785,7 +7360,7 @@ impl OrchestrationService {
                 .map(|workflow| workflow.id)
                 .chain(
                     self.workflows
-                        .list_reactive()
+                        .list()
                         .into_iter()
                         .map(|workflow| workflow.id),
                 )
@@ -7826,7 +7401,7 @@ impl OrchestrationService {
     ) -> Result<(), AppError> {
         let reactive = self
             .workflows
-            .get_reactive(&item.workflow_id)
+            .get(&item.workflow_id)
             .ok_or_else(|| AppError::WorkflowNotFound(item.workflow_id.clone()))?
             .clone();
         let state = reactive
@@ -7895,7 +7470,7 @@ impl OrchestrationService {
             .await
             .map_err(map_db)?
             .ok_or_else(|| AppError::WorkItemNotFound(parent_id.to_string()))?;
-        if self.workflows.get_reactive(&parent.workflow_id).is_some() {
+        if self.workflows.get(&parent.workflow_id).is_some() {
             let children = self
                 .select_children_for_parent_step(parent.id, &parent_step_id)
                 .await
@@ -7947,57 +7522,7 @@ impl OrchestrationService {
                 .map_err(map_config)?;
             return Ok(());
         }
-        let workflow = self
-            .workflows
-            .get(&parent.workflow_id)
-            .ok_or_else(|| AppError::WorkflowNotFound(parent.workflow_id.clone()))?
-            .clone();
-        let step = workflow
-            .steps
-            .iter()
-            .find(|s| s.id == parent_step_id)
-            .ok_or_else(|| AppError::WorkflowInvalid("parent step missing".into()))?;
-        merge_child_result_into_parent_context(&mut parent, &child)
-            .map_err(AppError::WorkflowInvalid)?;
-
-        match child.state {
-            WorkItemState::Succeeded => {
-                if let Some(next) = &step.on_success {
-                    parent.current_step = next.clone();
-                    parent.state = WorkItemState::Running;
-                    parent.child_work_item_id = None;
-                    self.ensure_pending_job_for_step(&parent, &workflow)
-                        .await
-                        .map_err(map_db)?;
-                } else {
-                    parent.state = WorkItemState::Succeeded;
-                    parent.child_work_item_id = None;
-                }
-            }
-            WorkItemState::Failed | WorkItemState::Cancelled => {
-                if let Some(next) = &step.on_failure {
-                    parent.current_step = next.clone();
-                    parent.state = WorkItemState::Running;
-                    parent.child_work_item_id = None;
-                    self.ensure_pending_job_for_step(&parent, &workflow)
-                        .await
-                        .map_err(map_db)?;
-                } else {
-                    parent.state = WorkItemState::Failed;
-                    parent.child_work_item_id = None;
-                }
-            }
-            _ => {}
-        }
-
-        parent.updated_at = Utc::now();
-        parent.blocked_on = block_reason_for_state_name(&parent.current_step);
-        parent.projected_state = Some(project_workflow_state(&parent));
-        self.update_work_item(&parent).await.map_err(map_db)?;
-        self.persist_task_projection(&parent, None)
-            .await
-            .map_err(map_config)?;
-        Ok(())
+        Err(AppError::WorkflowNotFound(parent.workflow_id))
     }
 
     async fn cancel_work_item(&self, id: Uuid) -> anyhow::Result<()> {
@@ -8016,8 +7541,8 @@ impl OrchestrationService {
     async fn retry_job(&self, previous: &Job, item: &mut WorkItem) -> anyhow::Result<bool> {
         let workflow = self
             .workflows
-            .get_reactive(&item.workflow_id)
-            .ok_or_else(|| anyhow::anyhow!("legacy workflow retries are not authorized"))?;
+            .get(&item.workflow_id)
+            .ok_or_else(|| anyhow::anyhow!("workflow is not installed"))?;
         let state = workflow
             .states
             .iter()
@@ -8033,6 +7558,8 @@ impl OrchestrationService {
         next.attempt = previous.attempt.saturating_add(1);
         next.created_at = Utc::now();
         next.updated_at = next.created_at;
+        enter_workflow_state(item, &previous.step_id);
+        next.context["state_invocation"] = item.context["state_invocation"].clone();
         let valid_next_events = self.projected_valid_next_events_for_job_context(item);
         project_workflow_inputs_into_job_context(
             &mut next.context,
@@ -8246,12 +7773,36 @@ impl OrchestrationService {
                 .result
                 .as_ref()
                 .and_then(|result| result.github_pr.as_ref())
-            && let Some(parts) = parse_pr_url_components(&github_pr.url)
         {
+            let parts = parse_pr_url_components(&github_pr.url)
+                .ok_or_else(|| "managed GitHub result has invalid pull request URL".to_string())?;
+            if parts.number != Some(github_pr.number) {
+                return Err(
+                    "managed GitHub result pull request number does not match URL".to_string(),
+                );
+            }
+            if self.scm_hosts.find(&parts.host).is_none() {
+                return Err(format!(
+                    "managed GitHub result host '{}' is not in the SCM registry",
+                    parts.host
+                ));
+            }
+            let repo_identity = job
+                .repo
+                .as_ref()
+                .and_then(|repo| protocol::parse_github_repository_url(&repo.repo_url))
+                .ok_or_else(|| "managed GitHub job has invalid repository URL".to_string())?;
+            if parts.host != repo_identity.host
+                || parts.owner != repo_identity.owner
+                || parts.repo != repo_identity.repository
+            {
+                return Err(
+                    "managed GitHub result repository does not match authorized job repository"
+                        .to_string(),
+                );
+            }
             // `host` is what lets the SCM registry pick the right
-            // api_base_url + token at poll time. Without it the poller
-            // falls back to github.com, which 404s for any PR on a
-            // GitHub Enterprise instance.
+            // api_base_url + token at poll time.
             let mut promoted = serde_json::Map::new();
             promoted.insert("host".to_string(), serde_json::Value::String(parts.host));
             promoted.insert("owner".to_string(), serde_json::Value::String(parts.owner));
@@ -8375,261 +7926,6 @@ impl OrchestrationService {
             Ok(count)
         })
         .await?
-    }
-
-    async fn ensure_pending_job_for_step(
-        &self,
-        item: &WorkItem,
-        workflow: &WorkflowDefinition,
-    ) -> anyhow::Result<()> {
-        let step = workflow
-            .steps
-            .iter()
-            .find(|s| s.id == item.current_step)
-            .ok_or_else(|| anyhow::anyhow!("missing step {}", item.current_step))?;
-
-        if self.has_pending_job_for_step(item.id, &step.id).await? {
-            return Ok(());
-        }
-
-        if step.kind == WorkflowStepKind::ChildWorkflow {
-            let child_workflow_id = step
-                .child_workflow_id
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing child_workflow_id for step {}", step.id))?;
-            if item.child_work_item_id.is_some() {
-                return Ok(());
-            }
-            let child_workflow = self
-                .workflows
-                .get(child_workflow_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown child workflow {child_workflow_id}"))?
-                .clone();
-            // Belt-and-suspenders guard: catalog validation should reject nested child workflows,
-            // but we keep this runtime check to avoid silently stalling if invalid data slips through.
-            if child_workflow
-                .steps
-                .iter()
-                .any(|s| s.kind == WorkflowStepKind::ChildWorkflow)
-            {
-                return Err(anyhow::anyhow!(
-                    "nested child workflows are not supported for child workflow '{}'",
-                    child_workflow_id
-                ));
-            }
-            let now = Utc::now();
-            let child_id = Uuid::new_v4();
-            let child = WorkItem {
-                id: child_id,
-                workflow_id: child_workflow.id.clone(),
-                external_task_id: None,
-                external_task_source: None,
-                provider_ownership: ProviderOwnership::Unassigned,
-                remembered_human_owners: item.remembered_human_owners.clone(),
-                title: item.title.clone(),
-                description: item.description.clone(),
-                labels: item.labels.clone(),
-                priority: item.priority.clone(),
-                session_id: item.session_id.clone(),
-                current_step: child_workflow.entry_step.clone(),
-                projected_state: Some("pending".to_string()),
-                last_failure_reason: item.last_failure_reason.clone(),
-                required_action_description: None,
-                triage_status: item.triage_status.clone(),
-                human_gate: item.human_gate,
-                human_gate_state: item.human_gate_state.clone(),
-                blocked_on: None,
-                state: WorkItemState::Pending,
-                context: item.context.clone(),
-                repo: item.repo.clone(),
-                parent_work_item_id: Some(item.id),
-                parent_step_id: Some(step.id.clone()),
-                child_work_item_id: None,
-                created_at: now,
-                updated_at: now,
-                last_written_at: None,
-                write_back_failures: 0,
-                write_back_retry_after: None,
-                status_comment_id: None,
-                checkpoint_comment_id: None,
-                job_result_comment_ids: HashMap::new(),
-            };
-            self.insert_work_item(&child).await?;
-            self.persist_task_projection(&child, None)
-                .await
-                .map_err(map_config)?;
-
-            let mut parent = item.clone();
-            parent.state = WorkItemState::Running;
-            parent.child_work_item_id = Some(child_id);
-            parent.updated_at = now;
-            parent.blocked_on = block_reason_for_state_name(&parent.current_step);
-            self.update_work_item(&parent).await?;
-            self.persist_task_projection(&parent, None)
-                .await
-                .map_err(map_config)?;
-
-            let child_step = child_workflow
-                .steps
-                .iter()
-                .find(|s| s.id == child.current_step)
-                .ok_or_else(|| anyhow::anyhow!("missing child entry step"))?;
-            if child_step.kind == WorkflowStepKind::Agent {
-                let selected_environment = self.selected_environment_for_context(&child.context);
-                let command = interpolate_template(&child_step.command, &child.context)?;
-                let args = child_step
-                    .args
-                    .iter()
-                    .map(|a| interpolate_template(a, &child.context))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let env = child_step
-                    .env
-                    .iter()
-                    .map(|(k, v)| Ok((k.clone(), interpolate_template(v, &child.context)?)))
-                    .collect::<Result<HashMap<_, _>, InterpolationError>>()?;
-                let job = Job {
-                    id: Uuid::new_v4(),
-                    work_item_id: child.id,
-                    step_id: child_step.id.clone(),
-                    state: JobState::Pending,
-                    assigned_worker_id: None,
-                    execution_mode: child_step.executor.clone(),
-                    container_image: child_step.container_image.clone().or_else(|| {
-                        selected_environment
-                            .as_ref()
-                            .map(|(_, environment)| environment.image.clone())
-                    }),
-                    command,
-                    args,
-                    env,
-                    prompt: child_step.prompt.clone(),
-                    context: child.context.clone(),
-                    repo: child.repo.clone(),
-                    timeout_secs: child_step.timeout_secs,
-                    max_retries: child_step.max_retries,
-                    attempt: 0,
-                    transcript_dir: None,
-                    result: None,
-                    lease_expires_at: None,
-                    created_at: now,
-                    updated_at: now,
-                };
-                let mut runtime = canonical_runtime_spec_for_job(&job);
-                // Triage jobs need LLM access for the AI agent to call the model.
-                runtime.environment.network_resources =
-                    Some(protocol::NetworkResourceRequest::Resources(vec![
-                        protocol::NetworkResourceKind::Llm,
-                    ]));
-                runtime.permissions.can_access_network = true;
-                let mut job = job;
-                let mut runtime = runtime;
-                if let Some((selection, environment)) = selected_environment.as_ref() {
-                    apply_environment_definition_to_runtime(
-                        &mut runtime,
-                        environment,
-                        child_step.container_image.is_some(),
-                    );
-                    project_environment_selection_into_job_context(
-                        &mut job.context,
-                        selection,
-                        self.overlays.as_slice(),
-                    );
-                    project_environment_runtime_into_job_context(&mut job.context, environment);
-                }
-                let valid_next_events = self.projected_valid_next_events_for_job_context(&child);
-                project_workflow_inputs_into_job_context(
-                    &mut job.context,
-                    &valid_next_events,
-                    &child,
-                    &child.context,
-                );
-                project_runtime_spec_into_job_context(&mut job.context, &runtime);
-                project_approval_mode_into_job_context(
-                    &mut job.context,
-                    &child.context,
-                    self.force_gateway_approval_mode,
-                );
-                self.insert_job(&job).await?;
-                // The parent was checkpointed before the child job existed;
-                // checkpoint its now-durable child boundary and release here.
-                self.persist_task_projection(&child, None).await?;
-            }
-
-            return Ok(());
-        }
-
-        let interpolation_context = interpolation_context_for_work_item(item, &step.id);
-        let command = interpolate_template(&step.command, &interpolation_context)?;
-        let args = step
-            .args
-            .iter()
-            .map(|a| interpolate_template(a, &interpolation_context))
-            .collect::<Result<Vec<_>, _>>()?;
-        let env = step
-            .env
-            .iter()
-            .map(|(k, v)| Ok((k.clone(), interpolate_template(v, &interpolation_context)?)))
-            .collect::<Result<HashMap<_, _>, InterpolationError>>()?;
-
-        let now = Utc::now();
-        let selected_environment = self.selected_environment_for_context(&item.context);
-        let job = Job {
-            id: Uuid::new_v4(),
-            work_item_id: item.id,
-            step_id: step.id.clone(),
-            state: JobState::Pending,
-            assigned_worker_id: None,
-            execution_mode: step.executor.clone(),
-            container_image: step.container_image.clone().or_else(|| {
-                selected_environment
-                    .as_ref()
-                    .map(|(_, environment)| environment.image.clone())
-            }),
-            command,
-            args,
-            env,
-            prompt: step.prompt.clone(),
-            context: item.context.clone(),
-            repo: item.repo.clone(),
-            timeout_secs: step.timeout_secs,
-            max_retries: step.max_retries,
-            attempt: 0,
-            transcript_dir: None,
-            result: None,
-            lease_expires_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-        let runtime = canonical_runtime_spec_for_job(&job);
-        let mut job = job;
-        let mut runtime = runtime;
-        if let Some((selection, environment)) = selected_environment.as_ref() {
-            apply_environment_definition_to_runtime(
-                &mut runtime,
-                environment,
-                step.container_image.is_some(),
-            );
-            project_environment_selection_into_job_context(
-                &mut job.context,
-                selection,
-                self.overlays.as_slice(),
-            );
-            project_environment_runtime_into_job_context(&mut job.context, environment);
-        }
-        let valid_next_events = self.projected_valid_next_events_for_job_context(item);
-        project_workflow_inputs_into_job_context(
-            &mut job.context,
-            &valid_next_events,
-            item,
-            &item.context,
-        );
-        project_runtime_spec_into_job_context(&mut job.context, &runtime);
-        project_approval_mode_into_job_context(
-            &mut job.context,
-            &item.context,
-            self.force_gateway_approval_mode,
-        );
-        self.insert_job(&job).await
     }
 
     async fn has_pending_job_for_step(
@@ -8877,6 +8173,7 @@ impl OrchestrationService {
         .await?
     }
 
+    #[cfg(test)]
     async fn insert_job(&self, job: &Job) -> anyhow::Result<()> {
         let path = Arc::clone(&self.db_path);
         let mut job = job.clone();
@@ -9748,12 +9045,6 @@ fn checkpoint_matches_known_workflow(
     }
     if let Some(workflow) = service.workflows.get(&checkpoint.workflow_id) {
         return workflow
-            .steps
-            .iter()
-            .any(|step| step.id == checkpoint.current_step);
-    }
-    if let Some(workflow) = service.workflows.get_reactive(&checkpoint.workflow_id) {
-        return workflow
             .states
             .iter()
             .find(|state| state.id == checkpoint.current_step)
@@ -9979,34 +9270,38 @@ fn apply_environment_definition_to_runtime(
     if !container_image_overridden {
         runtime.environment.container_image = Some(environment.image.clone());
     }
-    // For raw-mode steps, skip environment network overrides since the local-agent
-    // cannot enforce restricted egress outside Docker containers.
-    //
-    // For Docker-mode steps, the workflow author can express an explicit
+    // The workflow author can express an explicit
     // `network_resources` (parsed from workflow.toml into
     // `runtime.environment.network_resources` upstream). When they have, we
     // honour it — workflow definitions are reviewed code, so they have
     // authority over the environment's default `network_class`. The environment
     // policy only fills in for steps that didn't ask for anything.
-    if runtime.environment.execution_mode != protocol::ExecutionMode::Raw {
-        if runtime.environment.network_resources.is_none() {
-            runtime.environment.network = Some(environment.network_class.clone());
-            runtime.environment.network_resources =
-                network_request_from_legacy_label(Some(environment.network_class.as_str()));
-        } else {
-            runtime.environment.network =
-                legacy_network_label_for_request(runtime.environment.network_resources.as_ref());
-        }
-        runtime.permissions = canonical_permissions_for_environment(&runtime.environment);
-        if let Some(request) = &runtime.environment.network_resources {
-            runtime.permissions.can_access_network =
-                !matches!(request, NetworkResourceRequest::None);
-        }
+    if runtime.environment.network_resources.is_none() {
+        runtime.environment.network_resources =
+            network_request_for_environment_class(environment.network_class.as_str());
+    }
+    runtime.permissions = canonical_permissions_for_environment(&runtime.environment);
+    if let Some(request) = &runtime.environment.network_resources {
+        runtime.permissions.can_access_network = !matches!(request, NetworkResourceRequest::None);
     }
     runtime.approval_rules = Some(default_approval_rules_for_tier(
         &runtime.environment.tier,
-        runtime.environment.network.as_deref(),
+        runtime.environment.network_resources.as_ref(),
     ));
+}
+
+fn network_request_for_environment_class(class: &str) -> Option<NetworkResourceRequest> {
+    match class {
+        "none" => Some(NetworkResourceRequest::None),
+        "full" => Some(NetworkResourceRequest::Full),
+        "restricted" => Some(NetworkResourceRequest::Resources(vec![
+            protocol::NetworkResourceKind::Llm,
+            protocol::NetworkResourceKind::Github,
+            protocol::NetworkResourceKind::GoRegistry,
+            protocol::NetworkResourceKind::CratesRegistry,
+        ])),
+        _ => None,
+    }
 }
 
 #[allow(dead_code)]
@@ -10697,7 +9992,7 @@ fn merged_reactive_candidate_repos(
 fn project_reactive_execution_markers_into_job_context(
     context: &mut serde_json::Value,
     state_kind: protocol::ReactiveStateKind,
-    managed_operation: Option<&str>,
+    managed_operation: Option<&protocol::GithubAction>,
 ) {
     if !context.is_object() {
         *context = serde_json::json!({});
@@ -10721,7 +10016,7 @@ fn project_reactive_execution_markers_into_job_context(
         serde_json::Value::String(reactive_state_kind_name(state_kind)),
     );
     match managed_operation {
-        Some(operation) if !operation.trim().is_empty() => {
+        Some(operation) => {
             workflow_obj.insert(
                 CONTEXT_MANAGED_OPERATION_KEY.to_string(),
                 serde_json::Value::String(operation.to_string()),
@@ -10737,19 +10032,12 @@ fn runtime_spec_for_reactive_agent_state(
     state: &protocol::ReactiveWorkflowState,
     item: &WorkItem,
     job: &Job,
-) -> CanonicalRuntimeSpec {
+    scm_hosts: &super::scm::ScmHostRegistry,
+) -> anyhow::Result<CanonicalRuntimeSpec> {
     let execution = state.config.execution();
-    let execution_mode = match execution.and_then(|config| config.environment_tier.clone()) {
-        Some(PlannedEnvironmentTier::Docker) => protocol::ExecutionMode::Docker,
-        Some(PlannedEnvironmentTier::Raw) => protocol::ExecutionMode::Raw,
-        Some(PlannedEnvironmentTier::Kubernetes) => job.execution_mode.clone(),
-        None => execution
-            .and_then(|config| config.executor.clone())
-            .unwrap_or_else(|| job.execution_mode.clone()),
-    };
+    let execution_mode = protocol::ExecutionMode::Docker;
     let timeout_secs = execution
-        .and_then(|config| config.timeout)
-        .or(execution.and_then(|config| config.timeout_secs))
+        .and_then(|config| config.timeout_secs)
         .or(job.timeout_secs);
     let mut environment = canonical_environment_for_execution(
         execution_mode,
@@ -10758,17 +10046,7 @@ fn runtime_spec_for_reactive_agent_state(
             .or_else(|| job.container_image.clone()),
         timeout_secs,
     );
-    if let Some(environment_tier) = execution.and_then(|config| config.environment_tier.clone()) {
-        environment.tier = environment_tier.clone();
-    }
-    environment.network_resources = execution
-        .and_then(|config| config.network_resources.clone())
-        .or_else(|| {
-            network_request_from_legacy_label(
-                execution.and_then(|config| config.network.as_deref()),
-            )
-        });
-    environment.network = legacy_network_label_for_request(environment.network_resources.as_ref());
+    environment.network_resources = execution.and_then(|config| config.network_resources.clone());
     environment.toolchains = execution
         .and_then(|config| config.toolchains.clone())
         .unwrap_or_default();
@@ -10784,17 +10062,69 @@ fn runtime_spec_for_reactive_agent_state(
         permissions,
         approval_rules: None,
         repos: Vec::new(),
+        github_capabilities: Vec::new(),
     };
     runtime.approval_rules = execution
         .and_then(|config| config.approval_rules.clone())
         .or_else(|| {
             Some(default_approval_rules_for_tier(
                 &runtime.environment.tier,
-                runtime.environment.network.as_deref(),
+                runtime.environment.network_resources.as_ref(),
             ))
         });
     if let Some(repo) = &job.repo {
-        runtime.repos.push(repo.into());
+        let mut claim = protocol::PlannedRepoClaim::from(repo);
+        claim.read_only = matches!(
+            execution.map(|config| &config.repo_access),
+            Some(protocol::RepoAccessMode::ReadOnly)
+        );
+        claim.claim_type = if claim.read_only {
+            "read_only"
+        } else {
+            "workspace"
+        }
+        .to_string();
+        runtime.repos.push(claim);
+        if let Some(request) = execution.and_then(|config| config.github_capability.as_ref()) {
+            let identity = protocol::parse_github_repository_url(&repo.repo_url)
+                .ok_or_else(|| anyhow::anyhow!("managed GitHub repository URL is invalid"))?;
+            let host_config = scm_hosts.find(&identity.host).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "managed GitHub host '{}' is not in the SCM registry",
+                    identity.host
+                )
+            })?;
+            let host = identity.host;
+            let repository = format!("{}/{}", identity.owner, identity.repository);
+            let credential_provider = format!(
+                "github:{}:{}",
+                host,
+                match request.access {
+                    protocol::GithubAccessClass::ReadOnly => "read_only",
+                    protocol::GithubAccessClass::ReadWrite => "read_write",
+                }
+            );
+            let capability = protocol::GithubCapability {
+                host,
+                api_base_url: host_config.api_base_url.clone(),
+                repository,
+                operations: request.operations.clone(),
+                branch: repo.branch_name.clone(),
+                head_branch: repo.branch_name.clone(),
+                base_branch: Some(repo.base_ref.trim_start_matches("origin/").to_string()),
+                pull_request: item_github_pr_urls(item)
+                    .next()
+                    .and_then(parse_pr_number_from_url),
+                expected_head_sha: unique_head_sha_from_context(&item.context),
+                credential_provider,
+            };
+            let action = match &state.config {
+                protocol::ReactiveStateConfig::Managed(config) => &config.operation,
+                _ => anyhow::bail!("GitHub capability is only valid for managed states"),
+            };
+            validate_server_github_capability(action, &capability)?;
+            runtime.github_capabilities.push(capability);
+        }
     }
     let mut seen_repo_urls = runtime
         .repos
@@ -10816,7 +10146,72 @@ fn runtime_spec_for_reactive_agent_state(
             branch_name: candidate.branch_name,
         });
     }
-    runtime
+    Ok(runtime)
+}
+
+fn validate_server_github_capability(
+    action: &protocol::GithubAction,
+    capability: &protocol::GithubCapability,
+) -> anyhow::Result<()> {
+    for (name, value) in [
+        ("branch", capability.branch.as_deref()),
+        ("head branch", capability.head_branch.as_deref()),
+        ("base branch", capability.base_branch.as_deref()),
+    ] {
+        if value.is_none_or(|value| value.trim().is_empty()) {
+            anyhow::bail!("managed GitHub action requires an exact {name}");
+        }
+    }
+    if !matches!(
+        action,
+        protocol::GithubAction::PushHead | protocol::GithubAction::ReadOrCreatePullRequest
+    ) && capability.pull_request.is_none()
+    {
+        anyhow::bail!("managed GitHub action requires an exact pull request number");
+    }
+    if matches!(action, protocol::GithubAction::MergePullRequest)
+        && capability
+            .expected_head_sha
+            .as_deref()
+            .is_none_or(|sha| sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        anyhow::bail!("managed GitHub merge requires an exact expected head SHA");
+    }
+    if capability.credential_provider != format!("github:{}:read_write", capability.host) {
+        anyhow::bail!("managed GitHub credential provider name is invalid");
+    }
+    Ok(())
+}
+
+fn unique_head_sha_from_context(context: &serde_json::Value) -> Option<String> {
+    fn collect(value: &serde_json::Value, values: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(head_sha) = object
+                    .get("head_sha")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    values.insert(head_sha.to_string());
+                }
+                for value in object.values() {
+                    collect(value, values);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for value in array {
+                    collect(value, values);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut values = BTreeSet::new();
+    collect(context, &mut values);
+    (values.len() == 1)
+        .then(|| values.into_iter().next())
+        .flatten()
 }
 
 fn task_human_gate_state_name(state: &TaskHumanGateState) -> String {
@@ -11339,16 +10734,12 @@ fn item_github_pr_urls(item: &WorkItem) -> impl Iterator<Item = &str> {
 }
 
 #[cfg(test)]
-pub use handlers::{
-    DispatchResponse, create_work_item, dispatch, fire_work_item_event, heartbeat_worker,
-    job_events_sse, list_jobs, list_work_items, list_workers, list_workflow_documents,
-    list_workflows, poll_job, register_worker, terminal_job_event, update_job, validate_workflows,
-};
+pub use handlers::{job_events_sse, terminal_job_event, update_job};
 #[cfg(test)]
 pub use webhook::{
     GithubCheckRunWebhook, GithubCheckSuiteWebhook, GithubPullRequestRefWebhook,
-    GithubPullRequestWebhook, GithubReviewWebhook, GithubUserWebhook, GithubWebhookIngestResponse,
-    GithubWebhookPayload, github_webhook,
+    GithubPullRequestWebhook, GithubReviewWebhook, GithubUserWebhook, GithubWebhookPayload,
+    github_webhook,
 };
 
 #[cfg(test)]
@@ -11395,13 +10786,6 @@ fn item_matches_github_webhook(item: &WorkItem, webhook_pr: &GithubWebhookPrRefe
         webhook_pr.pr_number,
         webhook_pr.head_branch.clone(),
     )
-}
-
-fn workflow_document_id(doc: &WorkflowDocument) -> &str {
-    match doc {
-        WorkflowDocument::LegacyV1 { workflow } => workflow.id.as_str(),
-        WorkflowDocument::ReactiveV2 { workflow } => workflow.id.as_str(),
-    }
 }
 
 fn checkpoint_hash(checkpoint: &TaskCheckpoint) -> anyhow::Result<String> {
@@ -11539,11 +10923,22 @@ mod tests {
     use axum::http::HeaderValue;
     use axum::http::StatusCode;
     use axum::{Router, routing::get};
+    use hmac::Mac;
     use protocol::JobResult;
     use protocol::{EnvironmentDefinition, MergePolicy};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex as StdMutex};
     use tower::ServiceExt;
+
+    fn github_signature_header(secret: &str, body: &[u8]) -> HeaderValue {
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        HeaderValue::from_str(&format!(
+            "sha256={}",
+            hex::encode(mac.finalize().into_bytes())
+        ))
+        .unwrap()
+    }
 
     #[derive(Default)]
     struct ControlledCheckpointAdapter {
@@ -11804,7 +11199,7 @@ mod tests {
         parent_work_item_id: Option<Uuid>,
     ) -> WorkItem {
         let req = CreateWorkItemRequest {
-            workflow_id: "test".to_string(),
+            workflow_id: "wf".to_string(),
             session_id: None,
             context: serde_json::json!({"remembered_human_owner": "operator"}),
             repo: None,
@@ -11812,43 +11207,69 @@ mod tests {
         let mut item = work_item_from_create(
             &req,
             id,
-            "test".to_string(),
-            "execute".to_string(),
+            "wf".to_string(),
+            "build".to_string(),
             "controlled",
         );
         item.parent_work_item_id = parent_work_item_id;
         if parent_work_item_id.is_some() {
             item.external_task_id = None;
         }
+        ensure_state_invocation(&mut item);
         svc.insert_work_item(&item).await.expect("insert work item");
         item
     }
 
-    fn checkpoint_test_job(work_item_id: Uuid) -> Job {
-        let now = Utc::now();
-        Job {
-            id: Uuid::new_v4(),
-            work_item_id,
-            step_id: "execute".to_string(),
-            state: JobState::Pending,
-            assigned_worker_id: None,
-            execution_mode: protocol::ExecutionMode::Raw,
-            container_image: None,
-            command: "true".to_string(),
-            args: Vec::new(),
-            env: HashMap::new(),
-            prompt: None,
-            context: serde_json::json!({}),
-            repo: None,
-            timeout_secs: None,
-            max_retries: 1,
-            attempt: 0,
-            transcript_dir: None,
-            result: None,
-            lease_expires_at: None,
-            created_at: now,
-            updated_at: now,
-        }
+    async fn checkpoint_test_job(svc: &OrchestrationService, work_item_id: Uuid) -> Job {
+        let item = svc
+            .get_work_item(work_item_id)
+            .await
+            .expect("read checkpoint test item")
+            .expect("checkpoint test item");
+        let workflow = svc.workflows.get("wf").expect("test workflow");
+        let state = workflow
+            .states
+            .iter()
+            .find(|state| state.id == "build")
+            .expect("test workflow build state");
+        let checkpoint_owner_id = svc
+            .checkpoint_owner_for_work_item(work_item_id)
+            .await
+            .expect("checkpoint owner")
+            .id;
+        let job = svc
+            .build_reactive_job_for_provider_action(&item, state, checkpoint_owner_id)
+            .expect("production-built authorized checkpoint job");
+        freeze_checkpoint_test_baseline(svc, &item, &job, checkpoint_owner_id);
+        job
+    }
+
+    fn freeze_checkpoint_test_baseline(
+        svc: &OrchestrationService,
+        item: &WorkItem,
+        job: &Job,
+        checkpoint_owner_id: Uuid,
+    ) {
+        let request = protocol::authorization_request_from_job_context(&job.context)
+            .expect("production authorization request");
+        let request_digest = request.request_digest().expect("authorization digest");
+        let request_json =
+            serde_json::to_string(&request.clone().normalize()).expect("request json");
+        let conn = Connection::open(svc.db_path.as_path()).expect("open authorization database");
+        conn.execute(
+            "INSERT OR IGNORE INTO authorization_baselines (checkpoint_owner_id, work_item_id, state_id, request_digest, request_json, approved_human_json, approved_revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                checkpoint_owner_id.to_string(),
+                item.id.to_string(),
+                request.state_id,
+                request_digest,
+                request_json,
+                serde_json::to_string(&item.remembered_human_owners).expect("human owners"),
+                "1",
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("freeze checkpoint test baseline");
     }
 
     fn recovery_test_task(assigned_to_bot: bool) -> TaskToolRecord {
@@ -11917,6 +11338,251 @@ mod tests {
             .expect("authorize bot assignment");
     }
 
+    struct AuthorizedWorkflowHarness {
+        svc: OrchestrationService,
+        adapter: Arc<dyn TaskAdapter>,
+        work_item_id: Uuid,
+        worker_id: String,
+        db: PathBuf,
+        tasks: PathBuf,
+    }
+
+    fn test_scm_registry() -> super::super::scm::ScmHostRegistry {
+        unsafe { std::env::set_var("SCM_AUTHORIZED_HARNESS_TOKEN", "test-token") };
+        super::super::scm::ScmHostRegistry::from_configs(&[super::super::config::ScmHostConfig {
+            kind: "github".to_string(),
+            host: "github.com".to_string(),
+            api_base_url: "https://api.github.com".to_string(),
+            read_token_env: Some("SCM_AUTHORIZED_HARNESS_TOKEN".to_string()),
+        }])
+        .expect("test SCM registry")
+    }
+
+    impl AuthorizedWorkflowHarness {
+        async fn new(
+            catalog: Arc<WorkflowCatalog>,
+            workflow_id: &str,
+            register_worker: bool,
+        ) -> Self {
+            Self::new_with_task(
+                catalog,
+                workflow_id,
+                register_worker,
+                serde_json::json!({}),
+                None,
+            )
+            .await
+        }
+
+        async fn new_with_task(
+            catalog: Arc<WorkflowCatalog>,
+            workflow_id: &str,
+            register_worker: bool,
+            context: serde_json::Value,
+            repo: Option<RepoSource>,
+        ) -> Self {
+            Self::new_configured(
+                catalog,
+                workflow_id,
+                register_worker,
+                context,
+                repo,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+        }
+
+        async fn new_configured(
+            catalog: Arc<WorkflowCatalog>,
+            workflow_id: &str,
+            register_worker: bool,
+            context: serde_json::Value,
+            repo: Option<RepoSource>,
+            environments: Vec<EnvironmentDefinition>,
+            overlays: Vec<EnvironmentOverlay>,
+        ) -> Self {
+            let db = std::env::temp_dir().join(format!("authorized-{}.sqlite3", Uuid::new_v4()));
+            let tasks = std::env::temp_dir().join(format!("authorized-tasks-{}", Uuid::new_v4()));
+            let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+            let svc = OrchestrationService::new(
+                catalog,
+                Arc::clone(&adapter),
+                db.to_string_lossy().into_owned(),
+            )
+            .with_environments(environments)
+            .with_overlays(overlays)
+            .with_scm_hosts(test_scm_registry());
+            svc.init().await.expect("initialize authorized harness");
+
+            let mut task = recovery_test_task(false);
+            task.workflow_id = Some(workflow_id.to_string());
+            task.context = context;
+            task.repo = repo;
+            authorize_file_task(&svc, &adapter, &mut task).await;
+
+            let triage_job = svc
+                .assign_next_job(
+                    "authorization-harness".to_string(),
+                    vec![protocol::ExecutionMode::Docker],
+                )
+                .await
+                .expect("assign triage job")
+                .expect("released triage job");
+            svc.update_job(
+                triage_job.id,
+                JobUpdateRequest {
+                    worker_id: "authorization-harness".to_string(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .expect("start triage job");
+            let mut triage_result = successful_job_result();
+            triage_result.output_json = Some(serde_json::json!({
+                "next_event": "job_succeeded",
+                "workflow_id": workflow_id,
+            }));
+            svc.update_job(
+                triage_job.id,
+                JobUpdateRequest {
+                    worker_id: "authorization-harness".to_string(),
+                    state: JobState::Succeeded,
+                    transcript_dir: Some("/tmp/authorization-harness".to_string()),
+                    result: Some(triage_result),
+                },
+            )
+            .await
+            .expect("complete triage job");
+
+            adapter
+                .set_ownership(
+                    &task.id.to_string(),
+                    &ProviderOwnership::Human {
+                        owners: vec![ProviderIdentity {
+                            provider_id: Some("42".to_string()),
+                            display_name: Some("operator".to_string()),
+                        }],
+                    },
+                )
+                .expect("persist human authorization observation");
+            svc.sync_tasks_from_adapter()
+                .await
+                .expect("observe human authorization state");
+            adapter
+                .set_ownership(&task.id.to_string(), &ProviderOwnership::Bot)
+                .expect("persist bot authorization assignment");
+            svc.sync_tasks_from_adapter()
+                .await
+                .expect("freeze baseline and release authorized job");
+
+            let worker_id = "w1".to_string();
+            if register_worker {
+                svc.register_worker(RegisterWorkerRequest {
+                    id: worker_id.clone(),
+                    hostname: "authorized-host".to_string(),
+                    supported_modes: vec![protocol::ExecutionMode::Docker],
+                })
+                .await
+                .expect("register authorized worker");
+            }
+
+            Self {
+                svc,
+                adapter,
+                work_item_id: task.id,
+                worker_id,
+                db,
+                tasks,
+            }
+        }
+
+        async fn work_item(&self) -> WorkItem {
+            self.svc
+                .get_work_item(self.work_item_id)
+                .await
+                .expect("read authorized work item")
+                .expect("authorized work item")
+        }
+
+        async fn poll_job(&self) -> Job {
+            self.svc
+                .poll_job(PollJobRequest {
+                    worker_id: self.worker_id.clone(),
+                })
+                .await
+                .expect("poll authorized job")
+                .job
+                .expect("authorized job")
+        }
+
+        async fn authorize_pending(&self) {
+            self.observe_ownership(ProviderOwnership::Human {
+                owners: vec![ProviderIdentity {
+                    provider_id: Some("42".to_string()),
+                    display_name: Some("operator".to_string()),
+                }],
+            })
+            .await;
+            self.observe_ownership(ProviderOwnership::Bot).await;
+        }
+
+        async fn observe_ownership(&self, ownership: ProviderOwnership) {
+            let mut task = self
+                .adapter
+                .get_task(self.work_item_id)
+                .expect("read provider task")
+                .expect("provider task");
+            task.ownership = ownership;
+            task.updated_at += chrono::TimeDelta::milliseconds(1);
+            self.adapter
+                .persist_projection(&TaskProjection { task }, None)
+                .expect("persist provider ownership observation");
+            self.svc
+                .sync_tasks_from_adapter()
+                .await
+                .expect("apply provider ownership observation");
+        }
+
+        async fn complete_next_job(&self, state: JobState, result: JobResult) -> WorkItem {
+            let job = self.poll_job().await;
+            self.svc
+                .update_job(
+                    job.id,
+                    JobUpdateRequest {
+                        worker_id: self.worker_id.clone(),
+                        state: JobState::Running,
+                        transcript_dir: None,
+                        result: None,
+                    },
+                )
+                .await
+                .expect("start authorized job");
+            self.svc
+                .update_job(
+                    job.id,
+                    JobUpdateRequest {
+                        worker_id: self.worker_id.clone(),
+                        state,
+                        transcript_dir: Some("/tmp/authorization-harness-job".to_string()),
+                        result: Some(result),
+                    },
+                )
+                .await
+                .expect("complete authorized job");
+            self.work_item().await
+        }
+    }
+
+    impl Drop for AuthorizedWorkflowHarness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.db);
+            let _ = std::fs::remove_dir_all(&self.tasks);
+        }
+    }
+
     async fn detach_provider_task_for_workflow_test(
         svc: &OrchestrationService,
         work_item_id: Uuid,
@@ -11962,7 +11628,7 @@ mod tests {
         };
         let semantic_hash = checkpoint_semantic_hash(&checkpoint).expect("semantic hash");
         checkpoint.dispatch_job_ids = vec![first, second];
-        checkpoint.updated_at = checkpoint.updated_at + chrono::TimeDelta::seconds(30);
+        checkpoint.updated_at += chrono::TimeDelta::seconds(30);
         checkpoint.generation = 8;
         assert_eq!(
             checkpoint_semantic_hash(&checkpoint).expect("stable semantic hash"),
@@ -11995,7 +11661,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage job");
 
         let checkpoint = {
@@ -12010,7 +11676,7 @@ mod tests {
         waiter.await.expect("waiter");
 
         assert!(
-            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
+            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Docker],)
                 .await
                 .expect("poll while blocked")
                 .is_none()
@@ -12037,7 +11703,7 @@ mod tests {
         );
         drop(conn);
         assert_eq!(
-            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
+            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Docker],)
                 .await
                 .expect("poll after commit")
                 .map(|assigned| assigned.id),
@@ -12059,7 +11725,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage job");
 
         assert!(svc.persist_task_projection(&item, None).await.is_err());
@@ -12098,7 +11764,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         assert!(svc.persist_task_projection(&item, None).await.is_err());
         let stored = svc.get_job(job.id).await.expect("job").expect("job row");
@@ -12158,7 +11824,7 @@ mod tests {
         svc.init().await.expect("init");
         let root = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
         let child = insert_checkpoint_test_item(&svc, Uuid::new_v4(), Some(root.id)).await;
-        let job = checkpoint_test_job(child.id);
+        let job = checkpoint_test_job(&svc, child.id).await;
         svc.insert_job(&job).await.expect("stage child job");
 
         let conn = Connection::open(db.as_path()).expect("open sqlite");
@@ -12188,42 +11854,6 @@ mod tests {
         let _ = std::fs::remove_file(db);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn maintenance_reconstruction_cannot_bypass_checkpoint_gate() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let adapter = Arc::new(ControlledCheckpointAdapter::default());
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-        let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        item.workflow_id = "wf".to_string();
-        item.current_step = "build".to_string();
-        svc.update_work_item(&item)
-            .await
-            .expect("update actionable item");
-
-        let workflow = svc.workflows.get("wf").expect("workflow").clone();
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            svc.ensure_pending_job_for_step(&item, &workflow),
-        )
-        .await
-        .expect("legacy reconstruction must not hang")
-        .expect_err("legacy reconstruction must fail closed");
-        assert!(error.to_string().contains("authorization"));
-        assert!(
-            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw],)
-                .await
-                .expect("poll after rejected maintenance reconstruction")
-                .is_none()
-        );
-        assert_eq!(adapter.checkpoint_calls.load(Ordering::SeqCst), 0);
-        let _ = std::fs::remove_file(db);
-    }
-
     #[tokio::test]
     async fn public_maintenance_reconstruction_commits_checkpoint_before_dispatch() {
         let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
@@ -12245,21 +11875,17 @@ mod tests {
         adapter.tasks.lock().expect("tasks").push(task);
 
         let stats = svc.maintenance_tick().await.expect("maintenance");
-        assert_eq!(stats.created_jobs, 1);
+        assert_eq!(stats.created_jobs, 0);
         let jobs = svc.select_jobs_for_work_item(item.id).await.expect("jobs");
-        assert_eq!(jobs.len(), 1);
-        let checkpoint = adapter
-            .checkpoint_to_read
-            .lock()
-            .expect("checkpoint")
-            .clone()
-            .expect("checkpoint");
-        assert!(checkpoint.dispatch_job_ids.contains(&jobs[0].id));
-        assert!(
-            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Raw])
-                .await
-                .expect("poll")
-                .is_some()
+        assert!(jobs.is_empty());
+        let stored = svc
+            .get_work_item(item.id)
+            .await
+            .expect("work item")
+            .expect("work item row");
+        assert_eq!(
+            stored.human_gate_state.as_deref(),
+            Some("authorization_pending")
         );
         let _ = std::fs::remove_file(db);
     }
@@ -12276,7 +11902,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         svc.persist_task_projection(&item, None)
             .await
@@ -12300,6 +11926,7 @@ mod tests {
         let initial_assignees = adapter.assignees.lock().expect("assignees").len();
         let mut desired = svc.checkpoint_from_work_item(&initial_item);
         desired.dispatch_job_ids = initial_checkpoint.dispatch_job_ids.clone();
+        desired.dispatch_authorizations = initial_checkpoint.dispatch_authorizations.clone();
         desired.semantic_hash = checkpoint_semantic_hash(&desired).expect("desired semantic hash");
         assert_eq!(desired.semantic_hash, initial_checkpoint.semantic_hash);
         let initial_outbox = svc
@@ -12467,7 +12094,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let first_job = checkpoint_test_job(item.id);
+        let first_job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&first_job).await.expect("stage first");
 
         let first_commit = {
@@ -12487,7 +12114,10 @@ mod tests {
         svc.update_work_item(&newer_item)
             .await
             .expect("persist newer root state");
-        let second_job = checkpoint_test_job(item.id);
+        let mut second_job = first_job.clone();
+        second_job.id = Uuid::new_v4();
+        second_job.created_at = Utc::now();
+        second_job.updated_at = second_job.created_at;
         svc.insert_job(&second_job).await.expect("stage second");
         let second_commit = {
             let svc = svc.clone();
@@ -12737,10 +12367,10 @@ mod tests {
         root.current_step = "root-authoritative".to_string();
         svc.update_work_item(&root).await.expect("root state");
         let mut child = insert_checkpoint_test_item(&svc, Uuid::new_v4(), Some(root.id)).await;
+        let job = checkpoint_test_job(&svc, child.id).await;
         child.state = WorkItemState::Succeeded;
         child.current_step = "child-terminal".to_string();
         svc.update_work_item(&child).await.expect("child state");
-        let job = checkpoint_test_job(child.id);
         svc.insert_job(&job).await.expect("stage child job");
 
         svc.persist_task_projection(&child, None)
@@ -12772,7 +12402,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let mut item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         svc.persist_task_projection(&item, None)
             .await
@@ -12821,7 +12451,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage before crash");
         let mut task = recovery_test_task(false);
         task.id = item.id;
@@ -12866,11 +12496,18 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         let mut checkpoint = svc.checkpoint_from_work_item(&item);
         checkpoint.generation = 1;
         checkpoint.dispatch_job_ids = vec![job.id];
+        checkpoint.dispatch_authorizations.insert(
+            job.id,
+            job.context[protocol::CONTEXT_REQUEST_DIGEST_KEY]
+                .as_str()
+                .expect("request digest")
+                .to_string(),
+        );
         checkpoint.checkpoint_hash = checkpoint_hash(&checkpoint).expect("hash");
         svc.put_checkpoint_outbox(item.id, &checkpoint)
             .await
@@ -12917,7 +12554,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         assert!(svc.persist_task_projection(&item, None).await.is_err());
         assert_eq!(
@@ -12973,7 +12610,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         let mut checkpoint = svc.checkpoint_from_work_item(&item);
         checkpoint.generation = 1;
@@ -13129,7 +12766,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         adapter.fail_checkpoint_read.store(true, Ordering::SeqCst);
 
@@ -13225,7 +12862,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         let blocked_task_path = tasks_dir.join(format!("{}.json", item.id));
         std::fs::create_dir_all(&blocked_task_path).expect("block projection path");
@@ -13300,7 +12937,7 @@ mod tests {
             "INSERT INTO jobs (id, work_item_id, step_id, state, execution_mode, command, args_json, env_json, context_json, created_at, updated_at) VALUES (?1, ?2, 'build', ?3, 'raw', 'true', '[]', '{}', '{}', ?4, ?4)",
             params![job_id.to_string(), root_id.to_string(), JobState::Pending.to_string(), now],
         )
-        .expect("legacy job");
+        .expect("persisted job");
         drop(conn);
 
         let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
@@ -13309,23 +12946,201 @@ mod tests {
             Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
             db.to_string_lossy().into_owned(),
         );
-        svc.init().await.expect("migrate");
-        let job = svc.get_job(job_id).await.expect("job").expect("job row");
-        assert_eq!(job.state, JobState::Cancelled);
-        let item = svc
-            .get_work_item(root_id)
+        let error = svc
+            .init()
             .await
-            .expect("item")
-            .expect("item row");
-        assert_eq!(item.state, WorkItemState::Failed);
-        assert!(item.human_gate);
-        assert!(
-            item.last_failure_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("migration"))
-        );
+            .expect_err("active work without provider ownership must fail closed");
+        assert!(error.to_string().contains("not exactly bot-owned"));
         let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn typed_runtime_reset_returns_bot_owned_human_gate_without_active_job() {
+        let db = std::env::temp_dir().join(format!("orch-gate-reset-{}.sqlite3", Uuid::new_v4()));
+        let root_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        let owners = vec![ProviderIdentity {
+            provider_id: Some("42".to_string()),
+            display_name: Some("alice".to_string()),
+        }];
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_items (
+                id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, external_task_id TEXT,
+                session_id TEXT, current_step TEXT NOT NULL, blocked_on TEXT,
+                state TEXT NOT NULL, context_json TEXT NOT NULL, repo_json TEXT,
+                parent_work_item_id TEXT, parent_step_id TEXT, child_work_item_id TEXT,
+                remembered_human_owners_json TEXT NOT NULL, provider_ownership_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL, step_id TEXT NOT NULL,
+                state TEXT NOT NULL, assigned_worker_id TEXT, execution_mode TEXT NOT NULL,
+                command TEXT NOT NULL, args_json TEXT NOT NULL, env_json TEXT NOT NULL,
+                prompt_json TEXT, context_json TEXT NOT NULL, transcript_dir TEXT,
+                lease_expires_at TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, remembered_human_owners_json, provider_ownership_json, created_at, updated_at) VALUES (?1, 'wf', ?1, 'await_review', ?2, '{}', ?3, ?4, ?5, ?5)",
+            params![
+                root_id.to_string(),
+                WorkItemState::Running.to_string(),
+                serde_json::to_string(&owners).unwrap(),
+                serde_json::to_string(&ProviderOwnership::Bot).unwrap(),
+                now,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let mut task = recovery_test_task(true);
+        task.id = root_id;
+        task.ownership = ProviderOwnership::Bot;
+        adapter.tasks.lock().unwrap().push(task);
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("reset human gate");
+        assert!(adapter.assignees.lock().unwrap().iter().any(
+            |ownership| matches!(ownership, ProviderOwnership::Human { owners: restored } if restored == &owners)
+        ));
+        assert!(svc.get_work_item(root_id).await.unwrap().is_none());
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn typed_runtime_reset_returns_terminal_bot_owned_root() {
+        let db =
+            std::env::temp_dir().join(format!("orch-terminal-reset-{}.sqlite3", Uuid::new_v4()));
+        let adapter = Arc::new(ControlledCheckpointAdapter::default());
+        adapter.unblock();
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.unwrap();
+        let item = svc
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: TRIAGE_WORKFLOW_ID.to_string(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .unwrap();
+        let owners = vec![ProviderIdentity {
+            provider_id: Some("42".to_string()),
+            display_name: Some("alice".to_string()),
+        }];
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "DELETE FROM jobs WHERE work_item_id = ?1",
+            [item.id.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_items SET state = ?2, provider_ownership_json = ?3, remembered_human_owners_json = ?4 WHERE id = ?1",
+            params![
+                item.id.to_string(),
+                WorkItemState::Succeeded.to_string(),
+                serde_json::to_string(&ProviderOwnership::Bot).unwrap(),
+                serde_json::to_string(&owners).unwrap(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE name = 'typed_reactive_docker_only_v1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        drop(svc);
+
+        let mut task = recovery_test_task(true);
+        task.id = item.id;
+        task.ownership = ProviderOwnership::Bot;
+        adapter.tasks.lock().unwrap().push(task);
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        restarted.init().await.expect("reset terminal root");
+        assert!(adapter.assignees.lock().unwrap().iter().any(
+            |ownership| matches!(ownership, ProviderOwnership::Human { owners: restored } if restored == &owners)
+        ));
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[tokio::test]
+    async fn typed_runtime_reset_missing_remembered_owner_rolls_back() {
+        let db = std::env::temp_dir().join(format!("orch-owner-reset-{}.sqlite3", Uuid::new_v4()));
+        let root_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_items (
+                id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, external_task_id TEXT,
+                session_id TEXT, current_step TEXT NOT NULL, blocked_on TEXT,
+                state TEXT NOT NULL, context_json TEXT NOT NULL, repo_json TEXT,
+                parent_work_item_id TEXT, parent_step_id TEXT, child_work_item_id TEXT,
+                remembered_human_owners_json TEXT NOT NULL, provider_ownership_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY, work_item_id TEXT NOT NULL, step_id TEXT NOT NULL,
+                state TEXT NOT NULL, assigned_worker_id TEXT, execution_mode TEXT NOT NULL,
+                command TEXT NOT NULL, args_json TEXT NOT NULL, env_json TEXT NOT NULL,
+                prompt_json TEXT, context_json TEXT NOT NULL, transcript_dir TEXT,
+                lease_expires_at TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, remembered_human_owners_json, provider_ownership_json, created_at, updated_at) VALUES (?1, 'wf', ?1, 'authorization_pending', ?2, '{}', '[]', ?3, ?4, ?4)",
+            params![
+                root_id.to_string(),
+                WorkItemState::Failed.to_string(),
+                serde_json::to_string(&ProviderOwnership::Bot).unwrap(),
+                now,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(ControlledCheckpointAdapter::default()) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        let error = svc
+            .init()
+            .await
+            .expect_err("missing owner must fail startup");
+        assert!(error.to_string().contains("no remembered human owners"));
+        let conn = Connection::open(&db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM work_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let migrated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = 'typed_reactive_docker_only_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(migrated, 0);
+        let _ = std::fs::remove_file(db);
     }
 
     #[tokio::test]
@@ -13414,20 +13229,13 @@ mod tests {
             db.to_string_lossy().into_owned(),
         );
         svc.init().await.expect("authorization migration");
-        let job = svc.get_job(job_id).await.expect("job").expect("job row");
-        assert_eq!(job.state, JobState::Cancelled);
-        assert!(job.assigned_worker_id.is_none());
-        assert!(job.lease_expires_at.is_none());
+        assert!(svc.get_job(job_id).await.expect("job").is_none());
         for item_id in [root_id, child_id, grandchild_id] {
-            let item = svc
-                .get_work_item(item_id)
-                .await
-                .expect("tree item")
-                .expect("tree item row");
-            assert_eq!(item.state, WorkItemState::Failed);
-            assert_eq!(
-                item.human_gate_state.as_deref(),
-                Some("authorization_pending")
+            assert!(
+                svc.get_work_item(item_id)
+                    .await
+                    .expect("tree item")
+                    .is_none()
             );
         }
         assert!(matches!(
@@ -13466,6 +13274,19 @@ mod tests {
             .expect("valid active job");
         let invalid_job_id = Uuid::new_v4();
         let conn = Connection::open(db.as_path()).expect("sqlite");
+        let owners = vec![ProviderIdentity {
+            provider_id: Some("operator-1".to_string()),
+            display_name: Some("operator".to_string()),
+        }];
+        conn.execute(
+            "UPDATE work_items SET remembered_human_owners_json = ?2, provider_ownership_json = ?3 WHERE id = ?1",
+            params![
+                item.id.to_string(),
+                serde_json::to_string(&owners).unwrap(),
+                serde_json::to_string(&ProviderOwnership::Bot).unwrap(),
+            ],
+        )
+        .expect("set recovery identity");
         conn.execute(
             "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, authorization_id, request_digest, dispatch_released) SELECT ?1, work_item_id, step_id, 'running', 'worker', execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, NULL, NULL, 1 FROM jobs WHERE id = ?2",
             params![invalid_job_id.to_string(), valid_job.id.to_string()],
@@ -13508,7 +13329,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
@@ -13525,6 +13345,7 @@ mod tests {
                 session_id TEXT, current_step TEXT NOT NULL, blocked_on TEXT,
                 state TEXT NOT NULL, context_json TEXT NOT NULL, repo_json TEXT,
                 parent_work_item_id TEXT, parent_step_id TEXT, child_work_item_id TEXT,
+                remembered_human_owners_json TEXT NOT NULL, provider_ownership_json TEXT NOT NULL,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE TABLE jobs (
@@ -13537,18 +13358,22 @@ mod tests {
         )
         .expect("legacy schema");
         conn.execute(
-            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, child_work_item_id, created_at, updated_at) VALUES (?1, 'wf', ?1, 'build', ?2, ?3, ?4, ?5, ?5)",
+            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, child_work_item_id, remembered_human_owners_json, provider_ownership_json, created_at, updated_at) VALUES (?1, 'wf', ?1, 'build', ?2, '{}', ?3, ?4, ?5, ?6, ?6)",
             params![
                 root_id.to_string(),
                 WorkItemState::Running.to_string(),
-                serde_json::json!({"remembered_human_owner": "alice"}).to_string(),
                 child_id.to_string(),
+                serde_json::to_string(&vec![ProviderIdentity {
+                    provider_id: None,
+                    display_name: Some("alice".to_string()),
+                }]).expect("owners"),
+                serde_json::to_string(&ProviderOwnership::Bot).expect("ownership"),
                 now,
             ],
         )
         .expect("root");
         conn.execute(
-            "INSERT INTO work_items (id, workflow_id, current_step, state, context_json, parent_work_item_id, created_at, updated_at) VALUES (?1, 'wf', 'build', ?2, '{}', ?3, ?4, ?4)",
+            "INSERT INTO work_items (id, workflow_id, current_step, state, context_json, parent_work_item_id, remembered_human_owners_json, provider_ownership_json, created_at, updated_at) VALUES (?1, 'wf', 'build', ?2, '{}', ?3, '[]', '{\"kind\":\"unassigned\"}', ?4, ?4)",
             params![
                 child_id.to_string(),
                 WorkItemState::Running.to_string(),
@@ -13576,38 +13401,9 @@ mod tests {
             db.to_string_lossy().into_owned(),
         );
         svc.init().await.expect("migrate nested tree");
-        let conn = Connection::open(db.as_path()).expect("sqlite");
-        let owner: String = conn
-            .query_row(
-                "SELECT checkpoint_owner_id FROM jobs WHERE id = ?1",
-                [job_id.to_string()],
-                |row| row.get(0),
-            )
-            .expect("job owner");
-        assert_eq!(owner, root_id.to_string());
-        drop(conn);
-        assert_eq!(
-            svc.get_job(job_id)
-                .await
-                .expect("job")
-                .expect("job row")
-                .state,
-            JobState::Cancelled
-        );
+        assert!(svc.get_job(job_id).await.expect("job").is_none());
         for item_id in [root_id, child_id] {
-            let item = svc
-                .get_work_item(item_id)
-                .await
-                .expect("item")
-                .expect("item row");
-            assert_eq!(
-                item.state,
-                WorkItemState::Failed,
-                "{} item {item_id}; provider events: {:?}",
-                if item_id == root_id { "root" } else { "child" },
-                adapter.events.lock().expect("events")
-            );
-            assert!(item.human_gate);
+            assert!(svc.get_work_item(item_id).await.expect("item").is_none());
         }
         assert!(matches!(
             adapter.assignees.lock().expect("assignees").last(),
@@ -13668,13 +13464,7 @@ mod tests {
                 db.to_string_lossy().into_owned(),
             );
             svc.init().await.expect("migrate history");
-            let item = svc
-                .get_work_item(root_id)
-                .await
-                .expect("root")
-                .expect("root row");
-            assert_eq!(item.state, root_state);
-            assert!(!item.human_gate);
+            assert!(svc.get_work_item(root_id).await.expect("root").is_none());
             let conn = Connection::open(db.as_path()).expect("sqlite");
             let obligations: i64 = conn
                 .query_row("SELECT COUNT(*) FROM ownership_return_outbox", [], |row| {
@@ -13682,20 +13472,10 @@ mod tests {
                 })
                 .expect("obligations");
             assert_eq!(obligations, 0);
-            if job_state.is_some() {
-                let (stored_state, owner): (String, String) = conn
-                    .query_row(
-                        "SELECT state, checkpoint_owner_id FROM jobs WHERE id = ?1",
-                        [job_id.to_string()],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .expect("historical job");
-                assert_eq!(
-                    stored_state,
-                    job_state.as_ref().expect("job state").to_string()
-                );
-                assert_eq!(owner, root_id.to_string());
-            }
+            let stored_jobs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+                .expect("historical jobs reset");
+            assert_eq!(stored_jobs, 0);
             let _ = std::fs::remove_file(db);
             let _ = std::fs::remove_dir_all(tasks);
         }
@@ -13713,6 +13493,7 @@ mod tests {
                 id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, external_task_id TEXT,
                 session_id TEXT, current_step TEXT NOT NULL, state TEXT NOT NULL,
                 context_json TEXT NOT NULL, parent_work_item_id TEXT, created_at TEXT NOT NULL,
+                remembered_human_owners_json TEXT NOT NULL, provider_ownership_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE jobs (
@@ -13732,11 +13513,15 @@ mod tests {
         )
         .expect("legacy schema");
         conn.execute(
-            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, created_at, updated_at) VALUES (?1, 'wf', ?1, 'build', ?2, ?3, ?4, ?4)",
+            "INSERT INTO work_items (id, workflow_id, external_task_id, current_step, state, context_json, remembered_human_owners_json, provider_ownership_json, created_at, updated_at) VALUES (?1, 'wf', ?1, 'build', ?2, '{}', ?3, ?4, ?5, ?5)",
             params![
                 root_id.to_string(),
                 WorkItemState::Running.to_string(),
-                serde_json::json!({"remembered_human_owner": "alice"}).to_string(),
+                serde_json::to_string(&vec![ProviderIdentity {
+                    provider_id: None,
+                    display_name: Some("alice".to_string()),
+                }]).expect("owners"),
+                serde_json::to_string(&ProviderOwnership::Bot).expect("ownership"),
                 now,
             ],
         )
@@ -13788,15 +13573,7 @@ mod tests {
             db.to_string_lossy().into_owned(),
         );
         resumed.init().await.expect("migration resumes");
-        assert_eq!(
-            resumed
-                .get_job(job_id)
-                .await
-                .expect("job")
-                .expect("job row")
-                .state,
-            JobState::Cancelled
-        );
+        assert!(resumed.get_job(job_id).await.expect("job").is_none());
         let conn = Connection::open(db.as_path()).expect("sqlite");
         let marker: i64 = conn
             .query_row(
@@ -13835,7 +13612,7 @@ mod tests {
             },
         ];
         svc.update_work_item(&item).await.expect("remember owner");
-        let job = checkpoint_test_job(item.id);
+        let job = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&job).await.expect("stage");
         assert!(svc.persist_task_projection(&item, None).await.is_err());
 
@@ -13927,8 +13704,8 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let unreleased = checkpoint_test_job(item.id);
-        let released = checkpoint_test_job(item.id);
+        let unreleased = checkpoint_test_job(&svc, item.id).await;
+        let released = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&unreleased).await.expect("unreleased job");
         svc.insert_job(&released).await.expect("released job");
         let conn = Connection::open(db.as_path()).expect("sqlite");
@@ -14054,7 +13831,11 @@ mod tests {
             .await
             .expect("item")
             .expect("item row");
-        assert_eq!(stored.provider_ownership, ProviderOwnership::Bot);
+        assert_eq!(
+            stored.provider_ownership,
+            ProviderOwnership::Bot,
+            "{stored:?}"
+        );
         let child_id = stored.child_work_item_id.expect("linked child");
         let children = svc
             .select_children_for_parent_step(id, "spawn")
@@ -14150,7 +13931,11 @@ mod tests {
             .await
             .expect("item")
             .expect("item row");
-        assert_eq!(stored.provider_ownership, ProviderOwnership::Bot);
+        assert_eq!(
+            stored.provider_ownership,
+            ProviderOwnership::Bot,
+            "{stored:?}"
+        );
         assert_eq!(stored.current_step, "build");
         assert_eq!(
             svc.select_jobs_for_work_item(id).await.expect("jobs").len(),
@@ -14334,7 +14119,7 @@ mod tests {
         );
         svc.init().await.expect("init");
         let item = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
-        let unreleased = checkpoint_test_job(item.id);
+        let unreleased = checkpoint_test_job(&svc, item.id).await;
         svc.insert_job(&unreleased).await.expect("unreleased job");
         let mixed = ProviderOwnership::BotAndHuman {
             owners: vec![ProviderIdentity {
@@ -14457,7 +14242,7 @@ mod tests {
             .checkpoint_to_read
             .lock()
             .expect("checkpoint to read") = Some(TaskCheckpoint {
-            current_step: "test".to_string(),
+            current_step: "done".to_string(),
             phase: "done".to_string(),
             workflow_id: "wf".to_string(),
             repo: None,
@@ -14961,23 +14746,47 @@ mod tests {
         let wf = r#"
 [workflow]
 id = "wf"
-entry_step = "build"
+schema = "reactive_v2"
+initial_state = "build"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "build"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["hello"]
-on_success = "test"
 
-[[workflow.steps]]
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "test"
+
+[[workflow.states]]
 id = "test"
-kind = "agent"
+kind = "command"
 executor = "docker"
+repo_access = "read_write"
 container_image = "alpine:3.20"
 command = "echo"
 args = ["ok"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states.on]]
+event = "job_failed"
+target = "failed"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+
+[[workflow.states]]
+id = "failed"
+kind = "terminal"
+terminal_outcome = "failed"
 "#;
         write_workflow(&tmp, "wf", wf);
         Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
@@ -14986,39 +14795,72 @@ args = ["ok"]
     fn assignment_action_catalog(with_child: bool) -> (Arc<WorkflowCatalog>, PathBuf) {
         let tmp = std::env::temp_dir().join(format!("wf-assignment-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("mkdir");
-        let next = if with_child { "spawn" } else { "build" };
-        let parent = format!(
+        let parent = if with_child {
             r#"
 [workflow]
 id = "parent"
-entry_step = "review"
+schema = "reactive_v2"
+initial_state = "review"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "review"
-kind = "agent"
-executor = "raw"
-command = "true"
-on_success = "{next}"
+kind = "human"
 
-[[workflow.steps]]
-id = "{next}"
-kind = "{}"
-executor = "raw"
+[[workflow.states.on]]
+event = "human_approved"
+target = "spawn"
+
+[[workflow.states]]
+id = "spawn"
+kind = "auto"
+child_workflow = "child"
+
+[[workflow.states.on]]
+event = "all_children_completed"
+target = "done"
+
+[[workflow.states.on]]
+event = "child_failed"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#
+        } else {
+            r#"
+[workflow]
+id = "parent"
+schema = "reactive_v2"
+initial_state = "review"
+
+[[workflow.states]]
+id = "review"
+kind = "human"
+
+[[workflow.states.on]]
+event = "human_approved"
+target = "build"
+
+[[workflow.states]]
+id = "build"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
-{}
-"#,
-            if with_child {
-                "child_workflow"
-            } else {
-                "agent"
-            },
-            if with_child {
-                "child_workflow_id = \"child\""
-            } else {
-                "args = [\"build\"]"
-            }
-        );
-        write_workflow(&tmp, "parent", &parent);
+args = ["build"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#
+        };
+        write_workflow(&tmp, "parent", parent);
         if with_child {
             write_workflow(
                 &tmp,
@@ -15026,14 +14868,25 @@ command = "echo"
                 r#"
 [workflow]
 id = "child"
-entry_step = "run"
+schema = "reactive_v2"
+initial_state = "run"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "run"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["child"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
 "#,
             );
         }
@@ -15088,9 +14941,16 @@ args = ["child"]
         item.state = WorkItemState::Running;
         item.human_gate = true;
         item.human_gate_state = Some("awaiting_human_action".to_string());
+        let mut plan = ProviderActionPlan::default();
+        svc.plan_reactive_current_state(&mut item, id, &mut plan)
+            .await
+            .expect("prepare assignment authorization epoch");
         svc.insert_work_item(&item)
             .await
             .expect("assignment gate item");
+        svc.persist_task_projection(&item, None)
+            .await
+            .expect("commit assignment authorization checkpoint");
         item
     }
 
@@ -15134,7 +14994,8 @@ target = "run_agent"
 [[workflow.states]]
 id = "run_agent"
 kind = "agent"
-executor = "raw"
+executor = "docker"
+repo_access = "read_write"
 prompt = { user = "run agent" }
 
 [[workflow.states.on]]
@@ -15186,7 +15047,8 @@ target = "run_agent"
 [[workflow.states]]
 id = "run_agent"
 kind = "agent"
-executor = "raw"
+executor = "docker"
+repo_access = "read_write"
 prompt = { user = "triage" }
 candidate_repos = [
   { repo_url = "https://github.com/reddit/agent-hub", base_ref = "origin/main" },
@@ -15229,6 +15091,7 @@ initial_state = "implement"
 id = "implement"
 kind = "agent"
 executor = "docker"
+repo_access = "read_write"
 container_image = "local/agent-hub-test:latest"
 prompt = { user = "implement" }
 
@@ -15240,6 +15103,7 @@ target = "test"
 id = "test"
 kind = "command"
 executor = "docker"
+repo_access = "read_write"
 container_image = "local/agent-hub-test:latest"
 command = "true"
 max_retries = 1
@@ -15264,7 +15128,7 @@ kind = "terminal"
         Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
     }
 
-    fn reactive_no_start_catalog() -> Arc<WorkflowCatalog> {
+    fn reactive_no_start_catalog() -> anyhow::Result<WorkflowCatalog> {
         let tmp = std::env::temp_dir().join(format!("wf-catalog-reactive-ns-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("mkdir");
         let wf = r#"
@@ -15277,12 +15141,12 @@ initial_state = "bootstrap"
 id = "bootstrap"
 kind = "auto"
 
-[[workflow.states.on]]
-event = "noop"
-target = "bootstrap"
+[[workflow.states]]
+id = "done"
+kind = "terminal"
 "#;
         write_workflow(&tmp, "reactive_no_start", wf);
-        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
+        WorkflowCatalog::load_from_dir(tmp.to_str().unwrap())
     }
 
     fn reactive_submit_catalog() -> Arc<WorkflowCatalog> {
@@ -15333,7 +15197,8 @@ target = "run"
 [[workflow.states]]
 id = "run"
 kind = "agent"
-executor = "raw"
+executor = "docker"
+repo_access = "read_write"
 prompt = { user = "run" }
 
 [[workflow.states.on]]
@@ -15378,7 +15243,13 @@ target = "run_managed"
 [[workflow.states]]
 id = "run_managed"
 kind = "managed"
-operation = "open_pr"
+timeout_secs = 120
+executor = "docker"
+repo_access = "read_only"
+container_image = "local/agent-hub-test:latest"
+network_resources = { resources = ["github"] }
+operation = "read_or_create_pull_request"
+github_capability = { operations = ["read_pull_request", "create_pull_request"], access = "read_write" }
 
 [[workflow.states.on]]
 event = "job_succeeded"
@@ -15396,52 +15267,6 @@ kind = "terminal"
         Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
     }
 
-    fn reactive_auto_merge_transition_catalog() -> Arc<WorkflowCatalog> {
-        let tmp = std::env::temp_dir().join(format!(
-            "wf-catalog-reactive-auto-merge-transition-{}",
-            Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
-        let wf = r#"
-[workflow]
-id = "reactive_auto_merge_transition"
-schema = "reactive_v2"
-initial_state = "await_owner_review"
-
-[[workflow.states]]
-id = "await_owner_review"
-kind = "human"
-
-[[workflow.states.on]]
-event = "pr_approved"
-target = "merge"
-
-[[workflow.states]]
-id = "merge"
-kind = "auto"
-auto_merge = true
-
-[[workflow.states.on]]
-event = "start"
-target = "await_merge_completion"
-
-[[workflow.states]]
-id = "await_merge_completion"
-kind = "human"
-auto_merge = true
-
-[[workflow.states.on]]
-event = "pr_merged"
-target = "done"
-
-[[workflow.states]]
-id = "done"
-kind = "terminal"
-"#;
-        write_workflow(&tmp, "reactive_auto_merge_transition", wf);
-        Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
-    }
-
     fn reactive_child_only_catalog() -> Arc<WorkflowCatalog> {
         let tmp =
             std::env::temp_dir().join(format!("wf-catalog-child-reactive-{}", Uuid::new_v4()));
@@ -15449,22 +15274,38 @@ kind = "terminal"
         let parent = r#"
 [workflow]
 id = "wf"
-entry_step = "build"
+schema = "reactive_v2"
+initial_state = "spawn"
 
-[[workflow.steps]]
-id = "build"
-kind = "agent"
-executor = "raw"
-command = "echo"
-args = ["parent"]
-on_success = "after"
+[[workflow.states]]
+id = "spawn"
+kind = "auto"
+child_workflow = "child_reactive"
 
-[[workflow.steps]]
+[[workflow.states.on]]
+event = "all_children_completed"
+target = "after"
+
+[[workflow.states.on]]
+event = "child_failed"
+target = "done"
+
+[[workflow.states]]
 id = "after"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["after"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
 "#;
         let child = r#"
 [workflow]
@@ -15483,7 +15324,9 @@ target = "run"
 [[workflow.states]]
 id = "run"
 kind = "command"
-executor = "raw"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["child"]
 
@@ -15516,7 +15359,7 @@ initial_state = "spawn"
 id = "spawn"
 kind = "auto"
 action = "spawn_children"
-child_workflow = "child_legacy"
+child_workflow = "child_reactive"
 
 [[workflow.states.on]]
 event = "all_children_completed"
@@ -15538,18 +15381,38 @@ terminal_outcome = "failed"
 "#;
         let child = r#"
 [workflow]
-id = "child_legacy"
-entry_step = "run"
+id = "child_reactive"
+schema = "reactive_v2"
+initial_state = "run"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "run"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["child"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states.on]]
+event = "job_failed"
+target = "failed"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+
+[[workflow.states]]
+id = "failed"
+kind = "terminal"
+terminal_outcome = "failed"
 "#;
         write_workflow(&tmp, "reactive_parent", parent);
-        write_workflow(&tmp, "child_legacy", child);
+        write_workflow(&tmp, "child_reactive", child);
         Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("load"))
     }
 
@@ -15590,6 +15453,7 @@ initial_state = "run"
 id = "run"
 kind = "agent"
 executor = "docker"
+repo_access = "read_write"
 container_image = "local/agent-hub-test:latest"
 prompt = { user = "run child" }
 
@@ -15601,6 +15465,7 @@ target = "finish"
 id = "finish"
 kind = "command"
 executor = "docker"
+repo_access = "read_write"
 container_image = "local/agent-hub-test:latest"
 command = "true"
 
@@ -15623,26 +15488,48 @@ kind = "terminal"
         let wf_a = r#"
 [workflow]
 id = "wf_alpha"
-entry_step = "run"
+schema = "reactive_v2"
+initial_state = "run"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "run"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["alpha"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
 "#;
         let wf_b = r#"
 [workflow]
 id = "wf_beta"
-entry_step = "run"
+schema = "reactive_v2"
+initial_state = "run"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "run"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["beta"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
 "#;
         write_workflow(&tmp, "wf_alpha", wf_a);
         write_workflow(&tmp, "wf_beta", wf_b);
@@ -15661,7 +15548,6 @@ args = ["beta"]
                 timeout_secs: Some(900),
                 memory_limit: None,
                 cpu_limit: None,
-                network: legacy_network_label_for_request(request.as_ref()),
                 network_resources: request,
                 filesystem: None,
                 file_mounts: vec![],
@@ -15680,6 +15566,7 @@ args = ["beta"]
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         }
     }
 
@@ -15717,7 +15604,6 @@ args = ["beta"]
         // The legacy `network` string should reflect the workflow choice too,
         // since downstream consumers (squid policy selection, approval rules)
         // read it.
-        assert_eq!(runtime.environment.network.as_deref(), Some("full"));
         assert!(runtime.permissions.can_access_network);
     }
 
@@ -15737,7 +15623,34 @@ args = ["beta"]
             env_resources,
             NetworkResourceRequest::Resources(_)
         ));
-        assert_eq!(runtime.environment.network.as_deref(), Some("restricted"));
+    }
+
+    #[test]
+    fn invalid_work_item_environment_never_falls_back_to_first_environment() {
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(std::env::temp_dir())) as Arc<dyn TaskAdapter>,
+            std::env::temp_dir()
+                .join(format!("invalid-env-{}.sqlite3", Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .with_environments(vec![EnvironmentDefinition {
+            name: "first-environment".to_string(),
+            image: "image".to_string(),
+            network_class: "none".to_string(),
+            approval_mode: "auto".to_string(),
+            allowed_overlays: Vec::new(),
+            description: None,
+            runtime: None,
+        }]);
+        let context = serde_json::json!({
+            "environment": {"base": "misspelled-environment", "overlays": []}
+        });
+        assert!(
+            svc.selected_environment_for_reactive_execution(None, &context)
+                .is_err()
+        );
     }
 
     #[test]
@@ -15752,50 +15665,15 @@ args = ["beta"]
             runtime.environment.network_resources,
             Some(NetworkResourceRequest::None),
         );
-        assert_eq!(runtime.environment.network.as_deref(), Some("none"));
         assert!(!runtime.permissions.can_access_network);
     }
 
     #[tokio::test]
     async fn successful_job_advances_workflow() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![
-                protocol::ExecutionMode::Raw,
-                protocol::ExecutionMode::Docker,
-            ],
-        })
-        .await
-        .expect("reg worker");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job assigned");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        let job = harness.poll_job().await;
 
         svc.update_job(
             job.id,
@@ -15904,6 +15782,7 @@ args = ["beta"]
         )
         .await
         .expect("success");
+        harness.authorize_pending().await;
 
         let updated = svc
             .list_work_items()
@@ -16067,7 +15946,7 @@ args = ["beta"]
             .expect("next step job");
         assert_eq!(
             next_job.context["workflow"]["inputs"]["valid_next_events"],
-            serde_json::json!(["cancel"])
+            serde_json::json!(["job_succeeded", "job_failed", "cancel"])
         );
         assert_eq!(
             next_job.context["workflow"]["inputs"]["job_artifact_paths"]["build"]["agent_context"],
@@ -16095,48 +15974,25 @@ args = ["beta"]
                 .get("job_artifact_data")
                 .is_none()
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn successful_job_promotes_github_pr_into_top_level_context() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new_with_task(
             workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("reg worker");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job assigned");
+            "wf",
+            true,
+            serde_json::json!({}),
+            Some(RepoSource {
+                repo_url: "https://github.com/reddit/agent-hub.git".to_string(),
+                base_ref: "origin/main".to_string(),
+                branch_name: Some("feature/test".to_string()),
+            }),
+        )
+        .await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        let job = harness.poll_job().await;
 
         svc.update_job(
             job.id,
@@ -16197,31 +16053,13 @@ args = ["beta"]
             updated.context["github_pr"]["status"],
             serde_json::json!("open")
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn initial_job_context_includes_workflow_inputs_contract() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let initial_job = svc
             .list_jobs_for_work_item(item.id)
@@ -16233,15 +16071,27 @@ args = ["beta"]
 
         assert_eq!(
             initial_job.context["workflow"]["inputs"]["valid_next_events"],
-            serde_json::json!(["submit", "cancel"])
+            serde_json::json!(["job_succeeded", "cancel"])
         );
         assert_eq!(
             initial_job.context["workflow"]["inputs"]["job_artifact_paths"],
-            serde_json::json!({})
+            serde_json::json!({
+                "triage": {
+                    "stdout_log": "/tmp/success/stdout.log",
+                    "stderr_log": "/tmp/success/stderr.log",
+                    "transcript_dir": "/tmp/success"
+                }
+            })
         );
         assert_eq!(
             initial_job.context["workflow"]["inputs"]["job_artifact_metadata"],
-            serde_json::json!({})
+            serde_json::json!({
+                "triage": {
+                    "stdout_log": {"path": "/tmp/success/stdout.log"},
+                    "stderr_log": {"path": "/tmp/success/stderr.log"},
+                    "transcript_dir": {"path": "/tmp/success"}
+                }
+            })
         );
         assert_eq!(
             initial_job.context["work_item"]["id"],
@@ -16260,33 +16110,15 @@ args = ["beta"]
                 .get("job_artifact_data")
                 .is_none()
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn sse_events_endpoint_replays_buffered_events() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let svc = &harness.svc;
 
         let job_events = crate::server::job_events::JobEventHub::new();
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
+        let item = harness.work_item().await;
         let job = svc
             .list_jobs()
             .await
@@ -16330,11 +16162,9 @@ args = ["beta"]
                 orchestration_db_path: ":memory:".into(),
                 artifact_store_root: "local-agent-data".into(),
                 grpc_listen_addr: None,
-                github_webhook_secret: None,
+                github_webhook_secret: Some("webhook-secret".to_string()),
                 github_polling_enabled: false,
                 github_poll_interval_secs: 30,
-                github_token: None,
-                github_api_base_url: "https://api.github.com".into(),
             }),
             artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
                 std::path::PathBuf::from("local-agent-data"),
@@ -16348,7 +16178,7 @@ args = ["beta"]
             pending: Arc::new(super::super::hooks::PendingNotifications::new()),
             approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
             questions: Arc::new(super::super::questions::QuestionRegistry::new()),
-            orchestration: Arc::new(svc.clone()),
+            orchestration: Arc::new((*svc).clone()),
             job_events: Arc::new(job_events),
             oauth: Arc::new(None),
             loaded_config_tree: Arc::new(None),
@@ -16368,48 +16198,14 @@ args = ["beta"]
             .expect("request");
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn empty_structured_transcript_artifacts_still_project_legacy_artifact_summary_aliases() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("reg worker");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job assigned");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        let job = harness.poll_job().await;
 
         svc.update_job(
             job.id,
@@ -16514,50 +16310,16 @@ args = ["beta"]
                 .get("output_json")
                 .is_none()
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn update_job_terminal_marks_event_buffer_terminal() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let svc = &harness.svc;
 
         let job_events = crate::server::job_events::JobEventHub::new();
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("reg");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job");
+        let item = harness.work_item().await;
+        let job = harness.poll_job().await;
 
         let state = super::super::AppState {
             config: Arc::new(super::super::config::ServerConfig {
@@ -16583,11 +16345,9 @@ args = ["beta"]
                 orchestration_db_path: ":memory:".into(),
                 artifact_store_root: "local-agent-data".into(),
                 grpc_listen_addr: None,
-                github_webhook_secret: None,
+                github_webhook_secret: Some("webhook-secret".to_string()),
                 github_polling_enabled: false,
                 github_poll_interval_secs: 30,
-                github_token: None,
-                github_api_base_url: "https://api.github.com".into(),
             }),
             artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
                 std::path::PathBuf::from("local-agent-data"),
@@ -16601,7 +16361,7 @@ args = ["beta"]
             pending: Arc::new(super::super::hooks::PendingNotifications::new()),
             approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
             questions: Arc::new(super::super::questions::QuestionRegistry::new()),
-            orchestration: Arc::new(svc.clone()),
+            orchestration: Arc::new((*svc).clone()),
             job_events: Arc::new(job_events.clone()),
             oauth: Arc::new(None),
             loaded_config_tree: Arc::new(None),
@@ -16640,9 +16400,6 @@ args = ["beta"]
         // Marked terminal entries should eventually be cleanable.
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         let _ = job_events.cleanup_terminal_expired().await;
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
         let _ = item;
     }
 
@@ -16654,7 +16411,7 @@ args = ["beta"]
             step_id: "build".into(),
             state: JobState::Succeeded,
             assigned_worker_id: Some("w1".into()),
-            execution_mode: protocol::ExecutionMode::Raw,
+            execution_mode: protocol::ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec![],
@@ -17430,6 +17187,24 @@ args = ["beta"]
     }
 
     #[test]
+    fn parse_pr_url_components_rejects_adversarial_identity_shapes() {
+        for value in [
+            "http://github.com/reddit/agent-hub/pull/1",
+            "https://user@github.com/reddit/agent-hub/pull/1",
+            "https://github.com:443/reddit/agent-hub/pull/1",
+            "https://github.com/reddit/agent-hub/pull/1/extra",
+            "https://github.com/reddit/%2e%2e/pull/1",
+            "https://github.com/reddit/agent-hub/pull/1?x=1",
+            "https://github.com/reddit/agent-hub/pull/1#fragment",
+            "https://github.com/reddit/bad repo/pull/1",
+            "https://github.com/reddit/agent-hub/pulls/1",
+            "https://github.com/reddit/agent-hub/pull/0",
+        ] {
+            assert!(parse_pr_url_components(value).is_none(), "accepted {value}");
+        }
+    }
+
+    #[test]
     fn stamp_state_entered_records_timestamp_only_when_step_changes() {
         let mut item = WorkItem {
             id: Uuid::new_v4(),
@@ -17696,28 +17471,13 @@ args = ["beta"]
 
     #[tokio::test]
     async fn stale_worker_requeues_assigned_job() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        svc.create_work_item(CreateWorkItemRequest {
-            workflow_id: "wf".into(),
-            session_id: None,
-            context: serde_json::json!({}),
-            repo: None,
-        })
-        .await
-        .expect("create");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let svc = &harness.svc;
 
         svc.register_worker(RegisterWorkerRequest {
             id: "stale".into(),
             hostname: "host".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
+            supported_modes: vec![protocol::ExecutionMode::Docker],
         })
         .await
         .expect("reg");
@@ -17752,49 +17512,16 @@ args = ["beta"]
             .expect("job exists");
         assert_eq!(refreshed.state, JobState::Pending);
         assert!(refreshed.assigned_worker_id.is_none());
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn reactive_human_gate_requires_bot_assignment_before_progression() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::clone(&adapter),
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let first_job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", true).await;
+        let svc = &harness.svc;
+        let adapter = Arc::clone(&harness.adapter);
+        let item = harness.work_item().await;
+        let first_job = harness.poll_job().await;
         assert_eq!(first_job.step_id, "run_agent");
 
         svc.update_job(
@@ -17866,250 +17593,14 @@ args = ["beta"]
             .expect("exists");
         assert_eq!(done.current_step, "done");
         assert_eq!(done.state, WorkItemState::Succeeded);
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
-    }
-
-    #[tokio::test]
-    async fn manual_pr_approved_checks_auto_merge_on_resulting_state() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_auto_merge_transition_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let mut item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_auto_merge_transition".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        update_github_pr_state_in_context(
-            &mut item.context,
-            "https://github.com/reddit/agent-hub/pull/not-a-number",
-            None,
-            Some("feature/auto-merge"),
-            Some(&WorkflowEventKind::PrCreated),
-            None,
-            false,
-            Utc::now(),
-        );
-        update_github_pr_state_in_context(
-            &mut item.context,
-            "https://github.com/reddit/agent-hub/pull/not-a-number",
-            None,
-            Some("feature/auto-merge"),
-            Some(&WorkflowEventKind::PrApproved),
-            None,
-            false,
-            Utc::now(),
-        );
-        update_github_pr_state_in_context(
-            &mut item.context,
-            "https://github.com/reddit/agent-hub/pull/not-a-number",
-            None,
-            Some("feature/auto-merge"),
-            Some(&WorkflowEventKind::ChecksPassed),
-            Some("ci"),
-            false,
-            Utc::now(),
-        );
-        assert!(!svc.should_attempt_auto_merge_for_current_state(&item));
-        svc.update_work_item(&item)
-            .await
-            .expect("persist seeded context");
-
-        detach_provider_task_for_workflow_test(&svc, item.id).await;
-        let updated = svc
-            .fire_event(
-                item.id,
-                FireEventRequest {
-                    event: WorkflowEventKind::PrApproved,
-                    job_id: None,
-                    reason: Some("owner approved".into()),
-                },
-            )
-            .await
-            .expect("pr approved");
-
-        assert_eq!(updated.current_step, "await_merge_completion");
-        assert!(svc.reactive_state_auto_merge_enabled(&updated));
-        assert!(svc.should_attempt_auto_merge_for_current_state(&updated));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
-    }
-
-    #[tokio::test]
-    async fn webhook_source_pr_approved_checks_auto_merge_on_resulting_state() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_auto_merge_transition_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let mut item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_auto_merge_transition".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        update_github_pr_state_in_context(
-            &mut item.context,
-            "https://github.com/reddit/agent-hub/pull/not-a-number",
-            None,
-            Some("feature/auto-merge"),
-            Some(&WorkflowEventKind::PrCreated),
-            None,
-            false,
-            Utc::now(),
-        );
-        update_github_pr_state_in_context(
-            &mut item.context,
-            "https://github.com/reddit/agent-hub/pull/not-a-number",
-            None,
-            Some("feature/auto-merge"),
-            Some(&WorkflowEventKind::PrApproved),
-            None,
-            false,
-            Utc::now(),
-        );
-        update_github_pr_state_in_context(
-            &mut item.context,
-            "https://github.com/reddit/agent-hub/pull/not-a-number",
-            None,
-            Some("feature/auto-merge"),
-            Some(&WorkflowEventKind::ChecksPassed),
-            Some("ci"),
-            false,
-            Utc::now(),
-        );
-        assert!(!svc.should_attempt_auto_merge_for_current_state(&item));
-        svc.update_work_item(&item)
-            .await
-            .expect("persist seeded context");
-
-        let updated = svc
-            .fire_event_trusted_internal_with_source(
-                item.id,
-                FireEventRequest {
-                    event: WorkflowEventKind::PrApproved,
-                    job_id: None,
-                    reason: Some("webhook approved".into()),
-                },
-                EventSource::Webhook,
-            )
-            .await
-            .expect("webhook pr approved");
-
-        assert_eq!(updated.current_step, "await_merge_completion");
-        assert!(svc.reactive_state_auto_merge_enabled(&updated));
-        assert!(svc.should_attempt_auto_merge_for_current_state(&updated));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
-    }
-
-    #[tokio::test]
-    async fn manual_pr_approved_updates_pr_state_for_auto_merge_readiness() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_auto_merge_transition_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let mut item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_auto_merge_transition".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        update_github_pr_state_in_context(
-            &mut item.context,
-            "https://github.com/reddit/agent-hub/pull/not-a-number",
-            None,
-            Some("feature/auto-merge"),
-            Some(&WorkflowEventKind::PrCreated),
-            None,
-            false,
-            Utc::now(),
-        );
-        update_github_pr_state_in_context(
-            &mut item.context,
-            "https://github.com/reddit/agent-hub/pull/not-a-number",
-            None,
-            Some("feature/auto-merge"),
-            Some(&WorkflowEventKind::ChecksPassed),
-            Some("ci"),
-            false,
-            Utc::now(),
-        );
-        svc.update_work_item(&item)
-            .await
-            .expect("persist seeded context");
-
-        detach_provider_task_for_workflow_test(&svc, item.id).await;
-        let updated = svc
-            .fire_event(
-                item.id,
-                FireEventRequest {
-                    event: WorkflowEventKind::PrApproved,
-                    job_id: None,
-                    reason: Some("approved".into()),
-                },
-            )
-            .await
-            .expect("pr approved");
-
-        assert_eq!(updated.current_step, "await_merge_completion");
-        assert!(svc.should_attempt_auto_merge_for_current_state(&updated));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn reactive_terminal_defaults_to_succeeded_when_outcome_missing() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", false).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let after_create = svc
             .get_work_item(item.id)
@@ -18121,7 +17612,7 @@ args = ["beta"]
         svc.register_worker(RegisterWorkerRequest {
             id: "w-default-terminal".into(),
             hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
+            supported_modes: vec![protocol::ExecutionMode::Docker],
         })
         .await
         .expect("worker");
@@ -18159,7 +17650,7 @@ args = ["beta"]
         .await
         .expect("succeeded");
 
-        detach_provider_task_for_workflow_test(&svc, item.id).await;
+        detach_provider_task_for_workflow_test(svc, item.id).await;
         svc.fire_event(
             item.id,
             FireEventRequest {
@@ -18178,9 +17669,6 @@ args = ["beta"]
             .expect("exists");
         assert_eq!(done.current_step, "done");
         assert_eq!(done.state, WorkItemState::Succeeded);
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
@@ -18343,34 +17831,13 @@ args = ["beta"]
         let _ = std::fs::remove_dir_all(tasks);
     }
 
-    #[tokio::test]
-    async fn reactive_auto_without_start_rejected_by_catalog_validation() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_no_start_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let err = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_no_start".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect_err("should fail");
-        assert!(matches!(err, AppError::WorkflowNotFound(_)));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
+    #[test]
+    fn reactive_auto_without_start_rejected_by_catalog_validation() {
+        assert!(reactive_no_start_catalog().is_err());
     }
 
     #[tokio::test]
-    async fn reactive_child_completion_progresses_legacy_parent() {
+    async fn reactive_child_completion_progresses_reactive_parent() {
         let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
         let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
         let svc = OrchestrationService::new(
@@ -18396,7 +17863,7 @@ args = ["beta"]
             labels: vec![],
             priority: None,
             session_id: None,
-            current_step: "build".into(),
+            current_step: "spawn".into(),
             projected_state: Some("running".into()),
             last_failure_reason: None,
             required_action_description: None,
@@ -18445,7 +17912,7 @@ args = ["beta"]
             context: serde_json::json!({}),
             repo: None,
             parent_work_item_id: Some(parent_id),
-            parent_step_id: Some("build".into()),
+            parent_step_id: Some("spawn".into()),
             child_work_item_id: None,
             created_at: now,
             updated_at: now,
@@ -18456,16 +17923,30 @@ args = ["beta"]
             checkpoint_comment_id: None,
             job_result_comment_ids: HashMap::new(),
         };
+        ensure_state_invocation(&mut child);
         svc.insert_work_item(&child).await.expect("insert child");
-        let _ = svc
-            .ensure_pending_for_current_state(&mut child)
+        let child_workflow = svc.workflows.get("child_reactive").expect("child workflow");
+        let state = child_workflow
+            .states
+            .iter()
+            .find(|state| state.id == "run")
+            .expect("child run state");
+        child.current_step = "run".to_string();
+        enter_workflow_state(&mut child, "run");
+        svc.update_work_item(&child).await.expect("child run state");
+        let job = svc
+            .build_reactive_job_for_provider_action(&child, state, parent_id)
+            .expect("authorized child job");
+        freeze_checkpoint_test_baseline(&svc, &child, &job, parent_id);
+        svc.insert_job(&job).await.expect("insert child job");
+        svc.persist_task_projection(&child, None)
             .await
-            .expect("prepare child reactive state");
+            .expect("release child job");
 
         svc.register_worker(RegisterWorkerRequest {
             id: "w1".into(),
             hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
+            supported_modes: vec![protocol::ExecutionMode::Docker],
         })
         .await
         .expect("worker");
@@ -18517,24 +17998,14 @@ args = ["beta"]
 
     #[tokio::test]
     async fn reactive_parent_child_progresses_on_child_success() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new(
             reactive_parent_child_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let parent = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_parent".into(),
-                session_id: None,
-                context: serde_json::json!({"task": "x"}),
-                repo: None,
-            })
-            .await
-            .expect("create parent");
+            "reactive_parent",
+            true,
+        )
+        .await;
+        let svc = &harness.svc;
+        let parent = harness.work_item().await;
 
         let items = svc.list_work_items().await.expect("items");
         let parent_now = items
@@ -18550,24 +18021,8 @@ args = ["beta"]
             .expect("child exists")
             .clone();
         assert_eq!(parent_now.child_work_item_id, Some(child_item.id));
-        assert_eq!(child_item.workflow_id, "child_legacy");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let child_job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("child job");
+        assert_eq!(child_item.workflow_id, "child_reactive");
+        let child_job = harness.poll_job().await;
         assert_eq!(child_job.work_item_id, child_item.id);
 
         svc.update_job(
@@ -18606,24 +18061,14 @@ args = ["beta"]
 
     #[tokio::test]
     async fn reactive_parent_child_progresses_to_failure_on_child_failure() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new(
             reactive_parent_child_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let parent = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_parent".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create parent");
+            "reactive_parent",
+            true,
+        )
+        .await;
+        let svc = &harness.svc;
+        let parent = harness.work_item().await;
 
         let child_item = svc
             .list_work_items()
@@ -18636,22 +18081,7 @@ args = ["beta"]
             })
             .expect("child exists");
 
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let child_job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("child job");
+        let child_job = harness.poll_job().await;
         assert_eq!(child_job.work_item_id, child_item.id);
 
         svc.update_job(
@@ -18686,47 +18116,13 @@ args = ["beta"]
         assert_eq!(parent_after.state, WorkItemState::Failed);
         assert_eq!(parent_after.current_step, "blocked");
         assert!(parent_after.child_work_item_id.is_none());
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn lease_expiry_requeues_running_job() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        svc.create_work_item(CreateWorkItemRequest {
-            workflow_id: "wf".into(),
-            session_id: None,
-            context: serde_json::json!({}),
-            repo: None,
-        })
-        .await
-        .expect("create");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let mut job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let svc = &harness.svc;
+        let mut job = harness.poll_job().await;
         job.state = JobState::Running;
         job.lease_expires_at = Some(Utc::now() - chrono::TimeDelta::seconds(5));
         svc.update_job_row(&job).await.expect("set expired lease");
@@ -18738,37 +18134,22 @@ args = ["beta"]
         assert_eq!(refreshed.state, JobState::Pending);
         assert!(refreshed.assigned_worker_id.is_none());
         assert!(refreshed.lease_expires_at.is_none());
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn cancel_event_cancels_active_jobs() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        let mut jobs = svc.list_jobs().await.expect("jobs");
-        assert_eq!(jobs.len(), 1);
-        jobs[0].state = JobState::Running;
-        jobs[0].assigned_worker_id = Some("w1".into());
-        svc.update_job_row(&jobs[0]).await.expect("update running");
+        let mut jobs = svc.list_jobs_for_work_item(item.id).await.expect("jobs");
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.step_id == "build")
+            .expect("build job");
+        job.state = JobState::Running;
+        job.assigned_worker_id = Some("w1".into());
+        svc.update_job_row(job).await.expect("update running");
 
         let _ = svc
             .fire_event(
@@ -18782,37 +18163,20 @@ args = ["beta"]
             .await
             .expect("cancel");
 
-        let refreshed = svc
-            .get_job(jobs[0].id)
-            .await
-            .expect("get job")
-            .expect("exists");
+        let refreshed = svc.get_job(job.id).await.expect("get job").expect("exists");
         assert_eq!(refreshed.state, JobState::Cancelled);
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn reactive_cancel_event_cascades_to_active_child_work_items() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new(
             reactive_parent_child_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let parent = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_parent".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create parent");
+            "reactive_parent",
+            false,
+        )
+        .await;
+        let svc = &harness.svc;
+        let parent = harness.work_item().await;
 
         let child_item = svc
             .list_work_items()
@@ -18826,11 +18190,11 @@ args = ["beta"]
             .expect("child exists");
 
         let cancelled_parent = svc
-            .fire_event(
+            .apply_operator_action(
                 parent.id,
-                FireEventRequest {
-                    event: WorkflowEventKind::Cancel,
-                    job_id: None,
+                TaskHumanAction {
+                    kind: HumanActionKind::Cancel,
+                    workflow_id: None,
                     reason: None,
                 },
             )
@@ -18844,47 +18208,13 @@ args = ["beta"]
             .expect("get child")
             .expect("exists");
         assert_eq!(refreshed_child.state, WorkItemState::Cancelled);
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn update_job_returns_job_cancelled_when_server_cancelled_assigned_job() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        svc.create_work_item(CreateWorkItemRequest {
-            workflow_id: "wf".into(),
-            session_id: None,
-            context: serde_json::json!({}),
-            repo: None,
-        })
-        .await
-        .expect("create");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let assigned_job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let svc = &harness.svc;
+        let assigned_job = harness.poll_job().await;
 
         let work_item = svc
             .get_work_item(assigned_job.work_item_id)
@@ -18916,47 +18246,13 @@ args = ["beta"]
             .await
             .expect_err("running renewal should surface cancellation");
         assert!(matches!(err, AppError::JobCancelled(_)));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn running_to_running_renews_lease() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        svc.create_work_item(CreateWorkItemRequest {
-            workflow_id: "wf".into(),
-            session_id: None,
-            context: serde_json::json!({}),
-            repo: None,
-        })
-        .await
-        .expect("create");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let svc = &harness.svc;
+        let job = harness.poll_job().await;
 
         let running = svc
             .update_job(
@@ -18988,9 +18284,6 @@ args = ["beta"]
             .expect("renew");
         let second_lease = renewed.lease_expires_at.expect("lease set");
         assert!(second_lease > first_lease);
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
@@ -19000,60 +18293,50 @@ args = ["beta"]
         let wf = r#"
 [workflow]
 id = "wf_retry"
-entry_step = "build"
+schema = "reactive_v2"
+initial_state = "build"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "build"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["x"]
 max_retries = 1
-on_failure = "failstep"
 
-[[workflow.steps]]
+[[workflow.states.on]]
+event = "job_failed"
+target = "failstep"
+
+[[workflow.states]]
 id = "failstep"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["f"]
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
 "#;
         write_workflow(&tmp, "wf_retry", wf);
 
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new(
             Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        svc.create_work_item(CreateWorkItemRequest {
-            workflow_id: "wf_retry".into(),
-            session_id: None,
-            context: serde_json::json!({}),
-            repo: None,
-        })
-        .await
-        .expect("create");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let first = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("job");
+            "wf_retry",
+            true,
+        )
+        .await;
+        let svc = &harness.svc;
+        let first = harness.poll_job().await;
 
         svc.update_job(
             first.id,
@@ -19078,12 +18361,11 @@ args = ["f"]
         )
         .await
         .expect("failed");
+        harness.authorize_pending().await;
 
         let jobs = svc.list_jobs().await.expect("jobs");
         assert!(jobs.iter().any(|j| j.step_id == "build" && j.attempt == 1));
 
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -19094,105 +18376,59 @@ args = ["f"]
         let wf = r#"
 [workflow]
 id = "wf_interp"
-entry_step = "s1"
+schema = "reactive_v2"
+initial_state = "s1"
 
-[[workflow.steps]]
+[[workflow.states]]
 id = "s1"
-kind = "agent"
-executor = "raw"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
 command = "echo"
 args = ["{{task.name}}", "{{task.count}}"]
 
-[workflow.steps.env]
+[workflow.states.env]
 TASK_NAME = "{{task.name}}"
+
+[[workflow.states.on]]
+event = "job_succeeded"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
 "#;
         write_workflow(&tmp, "wf_interp", wf);
 
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new_with_task(
             Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        svc.create_work_item(CreateWorkItemRequest {
-            workflow_id: "wf_interp".into(),
-            session_id: None,
-            context: serde_json::json!({"task": {"name": "demo", "count": 2}}),
-            repo: None,
-        })
-        .await
-        .expect("create");
+            "wf_interp",
+            false,
+            serde_json::json!({"task": {"name": "demo", "count": 2}}),
+            None,
+        )
+        .await;
+        let svc = &harness.svc;
 
         let jobs = svc.list_jobs().await.expect("jobs");
         let job = jobs.iter().find(|j| j.step_id == "s1").expect("job");
         assert_eq!(job.args, vec!["demo".to_string(), "2".to_string()]);
         assert_eq!(job.env.get("TASK_NAME").cloned(), Some("demo".to_string()));
 
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
         let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]
     async fn parent_waits_for_single_child_and_advances_on_child_success() {
-        let tmp = std::env::temp_dir().join(format!("wf-child-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
-        let wf = r#"
-[workflow]
-id = "parent"
-entry_step = "spawn"
-
-[[workflow.steps]]
-id = "spawn"
-kind = "child_workflow"
-executor = "raw"
-child_workflow_id = "child"
-command = ""
-on_success = "after"
-
-[[workflow.steps]]
-id = "after"
-kind = "agent"
-executor = "raw"
-command = "echo"
-args = ["done"]
-"#;
-        let child = r#"
-[workflow]
-id = "child"
-entry_step = "run"
-
-[[workflow.steps]]
-id = "run"
-kind = "agent"
-executor = "raw"
-command = "echo"
-args = ["child"]
-"#;
-        write_workflow(&tmp, "parent", wf);
-        write_workflow(&tmp, "child", child);
-
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let parent = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "parent".into(),
-                session_id: None,
-                context: serde_json::json!({"task": "x"}),
-                repo: None,
-            })
-            .await
-            .expect("create parent");
+        let harness = AuthorizedWorkflowHarness::new(
+            reactive_parent_child_catalog(),
+            "reactive_parent",
+            true,
+        )
+        .await;
+        let svc = &harness.svc;
+        let parent = harness.work_item().await;
 
         let items = svc.list_work_items().await.expect("items");
         let parent_now = items
@@ -19206,22 +18442,7 @@ args = ["child"]
             .clone();
         assert_eq!(parent_now.child_work_item_id, Some(child_item.id));
 
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let child_job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("child job");
+        let child_job = harness.poll_job().await;
         assert_eq!(child_job.work_item_id, child_item.id);
 
         svc.update_job(
@@ -19301,7 +18522,7 @@ args = ["child"]
             .await
             .expect("get parent")
             .expect("exists");
-        assert_eq!(parent_after.current_step, "after");
+        assert_eq!(parent_after.current_step, "done");
         assert!(parent_after.context["child_results"]["spawn"].is_object());
         assert_eq!(
             parent_after.context["child_results"]["spawn"]["job_artifact_paths"]["run"]["agent_context"],
@@ -19327,53 +18548,15 @@ args = ["child"]
                 ["schema"],
             serde_json::json!(protocol::JOB_RUN_SCHEMA_NAME)
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
-        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]
     async fn provider_action_child_boundary_is_atomic_across_crash_and_replay() {
-        let tmp = std::env::temp_dir().join(format!("wf-action-child-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
-        write_workflow(
-            &tmp,
-            "parent",
-            r#"
-[workflow]
-id = "parent"
-entry_step = "spawn"
-
-[[workflow.steps]]
-id = "spawn"
-kind = "child_workflow"
-executor = "raw"
-child_workflow_id = "child"
-command = ""
-"#,
-        );
-        write_workflow(
-            &tmp,
-            "child",
-            r#"
-[workflow]
-id = "child"
-entry_step = "run"
-
-[[workflow.steps]]
-id = "run"
-kind = "agent"
-executor = "raw"
-command = "echo"
-args = ["child"]
-"#,
-        );
         let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
         let adapter = Arc::new(ControlledCheckpointAdapter::default());
         adapter.unblock();
         let svc = OrchestrationService::new(
-            Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
+            reactive_parent_child_catalog(),
             Arc::clone(&adapter) as Arc<dyn TaskAdapter>,
             db.to_string_lossy().into_owned(),
         );
@@ -19381,14 +18564,14 @@ args = ["child"]
         let id = Uuid::new_v4();
         let mut parent = work_item_from_create(
             &CreateWorkItemRequest {
-                workflow_id: "parent".to_string(),
+                workflow_id: "reactive_parent".to_string(),
                 session_id: None,
                 context: serde_json::json!({}),
                 repo: None,
             },
             id,
-            "parent".to_string(),
-            "review".to_string(),
+            "reactive_parent".to_string(),
+            "spawn".to_string(),
             "controlled",
         );
         parent.external_task_id = Some(id.to_string());
@@ -19396,26 +18579,37 @@ args = ["child"]
         parent.state = WorkItemState::Running;
         parent.human_gate = true;
         parent.human_gate_state = Some("awaiting_human_action".to_string());
+        ensure_state_invocation(&mut parent);
         svc.insert_work_item(&parent).await.expect("parent");
         let action = TaskHumanAction {
             kind: HumanActionKind::Approve,
             workflow_id: None,
             reason: Some("start".to_string()),
         };
-        let child = child_work_item_for_provider_action(
+        let mut child = child_work_item_for_provider_action(
             &parent,
-            "child".to_string(),
+            "child_reactive".to_string(),
             "run".to_string(),
             "spawn".to_string(),
             Utc::now(),
         );
+        ensure_state_invocation(&mut child);
         let mut linked_parent = parent.clone();
         linked_parent.current_step = "spawn".to_string();
         linked_parent.child_work_item_id = Some(child.id);
         linked_parent.state = WorkItemState::Running;
         linked_parent.human_gate = false;
         linked_parent.context = merge_task_action_revision(linked_parent.context, 1);
-        let job = checkpoint_test_job(child.id);
+        let child_workflow = svc.workflows.get("child_reactive").expect("child workflow");
+        let child_state = child_workflow
+            .states
+            .iter()
+            .find(|state| state.id == "run")
+            .expect("child run state");
+        let job = svc
+            .build_reactive_job_for_provider_action(&child, child_state, id)
+            .expect("production child job");
+        freeze_checkpoint_test_baseline(&svc, &child, &job, id);
         let commit = ProviderActionCommit {
             task_id: id.to_string(),
             identity: ProviderActionIdentity {
@@ -19570,7 +18764,6 @@ args = ["child"]
             1
         );
         let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]
@@ -19877,23 +19070,7 @@ args = ["child"]
                     .collect::<Result<Vec<_>, _>>()
             })
             .expect("migrated rows");
-        assert_eq!(
-            rows,
-            vec![
-                (
-                    "command".to_string(),
-                    "41".to_string(),
-                    "text".to_string(),
-                    "pending".to_string()
-                ),
-                (
-                    "ownership".to_string(),
-                    "7".to_string(),
-                    "text".to_string(),
-                    "pending".to_string()
-                ),
-            ]
-        );
+        assert!(rows.is_empty());
         let primary_key_columns = conn
             .prepare("PRAGMA table_info(provider_action_inbox)")
             .and_then(|mut statement| {
@@ -19933,7 +19110,7 @@ args = ["child"]
                 0
             ))
             .expect("migrated row count"),
-            2
+            0
         );
         let _ = std::fs::remove_file(db);
     }
@@ -20030,7 +19207,7 @@ args = ["child"]
                 |row| row.get::<_, i64>(0),
             )
             .expect("acknowledged aliases"),
-            2
+            0
         );
         drop(conn);
         for task_id in [applied_task_id, rejected_task_id] {
@@ -20092,11 +19269,12 @@ args = ["child"]
         );
         item.external_task_id = Some(id.to_string());
         item.provider_ownership = ProviderOwnership::Bot;
+        ensure_state_invocation(&mut item);
         svc.insert_work_item(&item).await.expect("item");
         let mut transitioned = item.clone();
         transitioned.state = WorkItemState::Running;
         transitioned.context = merge_task_action_revision(transitioned.context, 5);
-        let job = checkpoint_test_job(id);
+        let job = checkpoint_test_job(&svc, id).await;
         let commit = ProviderActionCommit {
             task_id: id.to_string(),
             identity: ProviderActionIdentity {
@@ -20192,70 +19370,15 @@ args = ["child"]
 
     #[tokio::test]
     async fn child_success_without_on_success_marks_parent_succeeded_via_system_event() {
-        let tmp = std::env::temp_dir().join(format!("wf-child-terminal-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
-        let parent = r#"
-[workflow]
-id = "parent_terminal"
-entry_step = "spawn"
-
-[[workflow.steps]]
-id = "spawn"
-kind = "child_workflow"
-executor = "raw"
-child_workflow_id = "child"
-command = ""
-"#;
-        let child = r#"
-[workflow]
-id = "child"
-entry_step = "run"
-
-[[workflow.steps]]
-id = "run"
-kind = "agent"
-executor = "raw"
-command = "echo"
-args = ["child"]
-"#;
-        write_workflow(&tmp, "parent_terminal", parent);
-        write_workflow(&tmp, "child", child);
-
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).expect("catalog")),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let parent = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "parent_terminal".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create parent");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "h".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("worker");
-
-        let child_job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("child job");
+        let harness = AuthorizedWorkflowHarness::new(
+            reactive_parent_child_catalog(),
+            "reactive_parent",
+            true,
+        )
+        .await;
+        let svc = &harness.svc;
+        let parent = harness.work_item().await;
+        let child_job = harness.poll_job().await;
 
         svc.update_job(
             child_job.id,
@@ -20288,10 +19411,6 @@ args = ["child"]
             .expect("exists");
         assert_eq!(parent_after.state, WorkItemState::Succeeded);
         assert!(parent_after.child_work_item_id.is_none());
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
-        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]
@@ -20300,25 +19419,10 @@ args = ["child"]
         // the metadata fields `merge_task_metadata`/`apply_task_fields` actually
         // propagate from the task projection back to the work item, so we use it
         // as a stable vehicle for the timestamp comparison this test cares about.
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::clone(&adapter),
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let svc = &harness.svc;
+        let adapter = Arc::clone(&harness.adapter);
+        let item = harness.work_item().await;
 
         let mut external = task_from_work_item(&item, None);
         external.title = "newer title".to_string();
@@ -20355,9 +19459,6 @@ args = ["child"]
             .expect("get")
             .expect("exists");
         assert_eq!(refreshed_again.title.as_deref(), Some("newer title"));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
@@ -20371,32 +19472,20 @@ args = ["child"]
         );
         svc.init().await.expect("init");
 
-        let now = Utc::now();
-        let job = Job {
-            id: Uuid::new_v4(),
-            work_item_id: Uuid::new_v4(),
-            step_id: "s1".into(),
-            state: JobState::Pending,
-            assigned_worker_id: None,
-            execution_mode: protocol::ExecutionMode::Docker,
-            container_image: Some("alpine:3.20".into()),
-            command: "echo".into(),
-            args: vec!["hi".into()],
-            env: HashMap::new(),
-            prompt: None,
-            context: serde_json::json!({"ownership": {"kind": "bot"}}),
-            repo: None,
-            timeout_secs: Some(60),
-            max_retries: 0,
-            attempt: 0,
-            transcript_dir: None,
-            result: None,
-            lease_expires_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-
-        let _owner = insert_checkpoint_test_item(&svc, job.work_item_id, None).await;
+        let owner = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let mut job = checkpoint_test_job(&svc, owner.id).await;
+        job.container_image = Some("alpine:3.20".into());
+        job.timeout_secs = Some(60);
+        let runtime = canonical_runtime_spec_for_job(&job);
+        project_runtime_spec_into_job_context(&mut job.context, &runtime);
+        svc.project_resolved_authorization(
+            &mut job,
+            &owner,
+            protocol::ReactiveStateKind::Command,
+            owner.id,
+        )
+        .expect("refresh authorization");
+        freeze_checkpoint_test_baseline(&svc, &owner, &job, owner.id);
         svc.insert_job(&job).await.expect("insert job");
         let loaded = svc.get_job(job.id).await.expect("get job").expect("exists");
         assert_eq!(loaded.execution_mode, protocol::ExecutionMode::Docker);
@@ -20438,30 +19527,8 @@ args = ["child"]
         );
         svc.init().await.expect("init");
 
-        let now = Utc::now();
-        let mut job = Job {
-            id: Uuid::new_v4(),
-            work_item_id: Uuid::new_v4(),
-            step_id: "s1".into(),
-            state: JobState::Pending,
-            assigned_worker_id: None,
-            execution_mode: protocol::ExecutionMode::Raw,
-            container_image: None,
-            command: "echo".into(),
-            args: vec!["hi".into()],
-            env: HashMap::new(),
-            prompt: None,
-            context: serde_json::json!({}),
-            repo: None,
-            timeout_secs: Some(10),
-            max_retries: 0,
-            attempt: 0,
-            transcript_dir: None,
-            result: None,
-            lease_expires_at: None,
-            created_at: now,
-            updated_at: now,
-        };
+        let owner = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let mut job = checkpoint_test_job(&svc, owner.id).await;
         let runtime = CanonicalRuntimeSpec {
             runtime_version: "v2".to_string(),
             environment: protocol::PlannedEnvironmentSpec {
@@ -20471,7 +19538,6 @@ args = ["child"]
                 timeout_secs: Some(99),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -20490,10 +19556,20 @@ args = ["child"]
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
         project_runtime_spec_into_job_context(&mut job.context, &runtime);
-
-        let _owner = insert_checkpoint_test_item(&svc, job.work_item_id, None).await;
+        job.execution_mode = runtime.environment.execution_mode.clone();
+        job.container_image = runtime.environment.container_image.clone();
+        job.timeout_secs = runtime.environment.timeout_secs;
+        svc.project_resolved_authorization(
+            &mut job,
+            &owner,
+            protocol::ReactiveStateKind::Command,
+            owner.id,
+        )
+        .expect("refresh authorization");
+        freeze_checkpoint_test_baseline(&svc, &owner, &job, owner.id);
         svc.insert_job(&job).await.expect("insert job");
 
         let conn = Connection::open(db.as_path()).expect("open sqlite");
@@ -20523,30 +19599,8 @@ args = ["child"]
         );
         svc.init().await.expect("init");
 
-        let now = Utc::now();
-        let mut job = Job {
-            id: Uuid::new_v4(),
-            work_item_id: Uuid::new_v4(),
-            step_id: "s1".into(),
-            state: JobState::Pending,
-            assigned_worker_id: None,
-            execution_mode: protocol::ExecutionMode::Raw,
-            container_image: None,
-            command: "echo".into(),
-            args: vec!["hi".into()],
-            env: HashMap::new(),
-            prompt: None,
-            context: serde_json::json!({}),
-            repo: None,
-            timeout_secs: Some(12),
-            max_retries: 0,
-            attempt: 0,
-            transcript_dir: None,
-            result: None,
-            lease_expires_at: None,
-            created_at: now,
-            updated_at: now,
-        };
+        let owner = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let mut job = checkpoint_test_job(&svc, owner.id).await;
         let runtime = CanonicalRuntimeSpec {
             runtime_version: "v2".to_string(),
             environment: protocol::PlannedEnvironmentSpec {
@@ -20556,7 +19610,6 @@ args = ["child"]
                 timeout_secs: Some(99),
                 memory_limit: None,
                 cpu_limit: None,
-                network: None,
                 network_resources: None,
                 filesystem: None,
                 file_mounts: vec![],
@@ -20575,10 +19628,20 @@ args = ["child"]
             },
             approval_rules: None,
             repos: vec![],
+            github_capabilities: Vec::new(),
         };
         project_runtime_spec_into_job_context(&mut job.context, &runtime);
-
-        let owner = insert_checkpoint_test_item(&svc, job.work_item_id, None).await;
+        job.execution_mode = runtime.environment.execution_mode.clone();
+        job.container_image = runtime.environment.container_image.clone();
+        job.timeout_secs = runtime.environment.timeout_secs;
+        svc.project_resolved_authorization(
+            &mut job,
+            &owner,
+            protocol::ReactiveStateKind::Command,
+            owner.id,
+        )
+        .expect("refresh authorization");
+        freeze_checkpoint_test_baseline(&svc, &owner, &job, owner.id);
         svc.insert_job(&job).await.expect("insert");
         svc.persist_task_projection(&owner, None)
             .await
@@ -20856,42 +19919,13 @@ args = ["child"]
 
     #[tokio::test]
     async fn adapter_sync_applies_approve_action_to_work_item() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::clone(&adapter),
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let mut item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({"human_gate": true, "ownership": {"kind": "bot"}}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        // Move to human gate state before applying human approve action.
-        svc.fire_event_trusted_internal(
-            item.id,
-            FireEventRequest {
-                event: WorkflowEventKind::JobSucceeded,
-                job_id: None,
-                reason: Some("agent done".into()),
-            },
-        )
-        .await
-        .expect("move to review");
-        item = svc
-            .get_work_item(item.id)
-            .await
-            .expect("get")
-            .expect("exists");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", true).await;
+        let svc = &harness.svc;
+        let adapter = Arc::clone(&harness.adapter);
+        let item = harness
+            .complete_next_job(JobState::Succeeded, successful_job_result())
+            .await;
 
         let mut task = task_from_work_item(&item, None);
         task.requested_action = Some(crate::server::task_adapter::TaskHumanAction {
@@ -20917,9 +19951,6 @@ args = ["child"]
             !updated.human_gate,
             "human_gate should be cleared on terminal state entry"
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
@@ -21299,7 +20330,7 @@ args = ["child"]
             id: "w1".into(),
             hostname: "host".into(),
             supported_modes: vec![
-                protocol::ExecutionMode::Raw,
+                protocol::ExecutionMode::Docker,
                 protocol::ExecutionMode::Docker,
             ],
         })
@@ -21376,7 +20407,7 @@ args = ["child"]
             id: "w1".into(),
             hostname: "host".into(),
             supported_modes: vec![
-                protocol::ExecutionMode::Raw,
+                protocol::ExecutionMode::Docker,
                 protocol::ExecutionMode::Docker,
             ],
         })
@@ -21477,7 +20508,7 @@ args = ["child"]
             id: "w1".into(),
             hostname: "host".into(),
             supported_modes: vec![
-                protocol::ExecutionMode::Raw,
+                protocol::ExecutionMode::Docker,
                 protocol::ExecutionMode::Docker,
             ],
         })
@@ -21843,7 +20874,7 @@ args = ["child"]
             .expect("triage item");
         let guarded_workflow = svc
             .workflows
-            .get_reactive("authorized_parent")
+            .get("authorized_parent")
             .expect("guarded workflow");
         let cycle_error = svc
             .propose_authorization_epoch_from_states_guarded(
@@ -22306,51 +21337,17 @@ args = ["child"]
 
     #[tokio::test]
     async fn reactive_human_state_sets_human_gate_flag() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::clone(&adapter),
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        svc.fire_event_trusted_internal(
-            item.id,
-            FireEventRequest {
-                event: WorkflowEventKind::JobSucceeded,
-                job_id: None,
-                reason: Some("agent done".into()),
-            },
-        )
-        .await
-        .expect("to human state");
-
-        let review = svc
-            .get_work_item(item.id)
-            .await
-            .expect("get")
-            .expect("exists");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", true).await;
+        let review = harness
+            .complete_next_job(JobState::Succeeded, successful_job_result())
+            .await;
         assert_eq!(review.current_step, "review");
         assert!(review.human_gate);
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
-    async fn github_webhook_matches_pr_from_terminal_originating_job_context() {
+    async fn github_webhook_matches_terminal_originating_job_context_without_undeclared_event() {
         let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
         let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
         let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
@@ -22408,11 +21405,9 @@ args = ["child"]
                 orchestration_db_path: ":memory:".into(),
                 artifact_store_root: "local-agent-data".into(),
                 grpc_listen_addr: None,
-                github_webhook_secret: None,
+                github_webhook_secret: Some("webhook-secret".to_string()),
                 github_polling_enabled: false,
                 github_poll_interval_secs: 30,
-                github_token: None,
-                github_api_base_url: "https://api.github.com".into(),
             }),
             artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
                 std::path::PathBuf::from("local-agent-data"),
@@ -22432,21 +21427,32 @@ args = ["child"]
             loaded_config_tree: Arc::new(None),
         };
 
-        let resp = github_webhook::<super::super::notifier::NullNotifier>(
-            State(state),
-            headers,
-            axum::body::Bytes::from(
-                r#"{"action":"closed","pull_request":{"html_url":"https://github.com/reddit/agent-hub/pull/42","merged":true}}"#,
-            ),
+        let body = axum::body::Bytes::from(
+            r#"{"action":"closed","pull_request":{"html_url":"https://github.com/reddit/agent-hub/pull/42","merged":true}}"#,
+        );
+        let unsigned = github_webhook::<super::super::notifier::NullNotifier>(
+            State(state.clone()),
+            headers.clone(),
+            body.clone(),
         )
         .await
-        .expect("webhook");
+        .expect("unsigned webhook");
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+        headers.insert(
+            "x-hub-signature-256",
+            github_signature_header("webhook-secret", &body),
+        );
+        let resp =
+            github_webhook::<super::super::notifier::NullNotifier>(State(state), headers, body)
+                .await
+                .expect("webhook");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("read body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(json.get("fired_events"), Some(&serde_json::json!(1)));
+        assert_eq!(json.get("matched_jobs"), Some(&serde_json::json!(1)));
+        assert_eq!(json.get("fired_events"), Some(&serde_json::json!(0)));
 
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(tasks);
@@ -22511,11 +21517,9 @@ args = ["child"]
                 orchestration_db_path: ":memory:".into(),
                 artifact_store_root: "local-agent-data".into(),
                 grpc_listen_addr: None,
-                github_webhook_secret: None,
+                github_webhook_secret: Some("webhook-secret".to_string()),
                 github_polling_enabled: false,
                 github_poll_interval_secs: 30,
-                github_token: None,
-                github_api_base_url: "https://api.github.com".into(),
             }),
             artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
                 std::path::PathBuf::from("local-agent-data"),
@@ -22535,15 +21539,17 @@ args = ["child"]
             loaded_config_tree: Arc::new(None),
         };
 
-        let resp = github_webhook::<super::super::notifier::NullNotifier>(
-            State(state),
-            headers,
-            axum::body::Bytes::from(
-                r#"{"action":"closed","pull_request":{"html_url":"https://github.com/reddit/agent-hub/pull/43","merged":true}}"#,
-            ),
-        )
-        .await
-        .expect("webhook");
+        let body = axum::body::Bytes::from(
+            r#"{"action":"closed","pull_request":{"html_url":"https://github.com/reddit/agent-hub/pull/43","merged":true}}"#,
+        );
+        headers.insert(
+            "x-hub-signature-256",
+            github_signature_header("webhook-secret", &body),
+        );
+        let resp =
+            github_webhook::<super::super::notifier::NullNotifier>(State(state), headers, body)
+                .await
+                .expect("webhook");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -22849,25 +21855,10 @@ args = ["child"]
 
     #[tokio::test]
     async fn valid_next_events_for_reactive_item_follow_state_transitions() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::clone(&adapter),
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let mut item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", true).await;
+        let svc = &harness.svc;
+        let mut item = harness.work_item().await;
 
         let initial_events = svc.valid_next_events_for_work_item(&item);
         assert!(initial_events.contains(&WorkflowEventKind::Cancel));
@@ -22880,21 +21871,9 @@ args = ["child"]
         assert!(initial_internal.contains(&WorkflowEventKind::JobFailed));
         assert!(initial_internal.contains(&WorkflowEventKind::Cancel));
 
-        svc.fire_event_trusted_internal(
-            item.id,
-            FireEventRequest {
-                event: WorkflowEventKind::JobSucceeded,
-                job_id: None,
-                reason: Some("advance to review".into()),
-            },
-        )
-        .await
-        .expect("fire");
-        item = svc
-            .get_work_item(item.id)
-            .await
-            .expect("get")
-            .expect("exists");
+        item = harness
+            .complete_next_job(JobState::Succeeded, successful_job_result())
+            .await;
         let review_events = svc.valid_next_events_for_work_item(&item);
         assert!(review_events.contains(&WorkflowEventKind::HumanApproved));
         assert!(review_events.contains(&WorkflowEventKind::HumanChangesRequested));
@@ -22905,9 +21884,6 @@ args = ["child"]
         assert!(review_internal.contains(&WorkflowEventKind::HumanApproved));
         assert!(review_internal.contains(&WorkflowEventKind::HumanChangesRequested));
         assert!(review_internal.contains(&WorkflowEventKind::Cancel));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
@@ -22947,77 +21923,21 @@ args = ["child"]
 
     #[tokio::test]
     async fn operator_retry_requeues_last_failed_reactive_step_without_retry_transition() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new(
             reactive_failed_terminal_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_failed_terminal".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("register");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("assigned job");
-
-        svc.update_job(
-            job.id,
-            JobUpdateRequest {
-                worker_id: "w1".into(),
-                state: JobState::Running,
-                transcript_dir: None,
-                result: None,
-            },
+            "reactive_failed_terminal",
+            true,
         )
-        .await
-        .expect("start job");
-
-        svc.update_job(
-            job.id,
-            JobUpdateRequest {
-                worker_id: "w1".into(),
-                state: JobState::Failed,
-                transcript_dir: Some("/tmp/fail".into()),
-                result: Some(JobResult {
-                    ..failed_job_result()
-                }),
-            },
-        )
-        .await
-        .expect("fail job");
-
-        let failed = svc
-            .get_work_item(item.id)
-            .await
-            .expect("get item")
-            .expect("exists");
+        .await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        let failed = harness
+            .complete_next_job(JobState::Failed, failed_job_result())
+            .await;
         assert_eq!(failed.state, WorkItemState::Failed);
         assert_eq!(failed.current_step, "failed");
 
-        let retried = svc
+        let pending_retry = svc
             .apply_operator_action(
                 item.id,
                 TaskHumanAction {
@@ -23028,8 +21948,28 @@ args = ["child"]
             )
             .await
             .expect("operator retry");
+        assert_eq!(
+            pending_retry.human_gate_state.as_deref(),
+            Some("authorization_pending")
+        );
+        let mut bot_owned = harness.work_item().await;
+        svc.persist_ownership_transition_locked(&mut bot_owned, &ProviderOwnership::Bot, false)
+            .await
+            .expect("persist bot ownership for operator approval");
+        svc.process_provider_action(
+            item.id,
+            TaskHumanAction {
+                kind: HumanActionKind::Approve,
+                workflow_id: None,
+                reason: Some("approve pending retry".to_string()),
+            },
+            u64::MAX - 1,
+        )
+        .await
+        .expect("approve pending retry");
+        let retried = harness.work_item().await;
 
-        assert_eq!(retried.state, WorkItemState::Running);
+        assert_eq!(retried.state, WorkItemState::Running, "{retried:?}");
         assert_eq!(retried.current_step, "run");
         assert_eq!(retried.context["operator_override"]["action"], "retry");
 
@@ -23038,49 +21978,23 @@ args = ["child"]
             jobs.iter()
                 .any(|j| j.step_id == "run" && j.state == JobState::Pending && j.attempt == 1)
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn operator_unblock_advances_reactive_human_state_without_explicit_unblock_transition() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        let review = svc
-            .fire_event_trusted_internal(
-                item.id,
-                FireEventRequest {
-                    event: WorkflowEventKind::JobSucceeded,
-                    job_id: None,
-                    reason: Some("advance to review".into()),
-                },
-            )
-            .await
-            .expect("move to review");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", true).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        let review = harness
+            .complete_next_job(JobState::Succeeded, successful_job_result())
+            .await;
         assert_eq!(review.current_step, "review");
 
         let events = svc.valid_next_events_for_work_item(&review);
         assert!(events.contains(&WorkflowEventKind::HumanUnblocked));
 
-        detach_provider_task_for_workflow_test(&svc, item.id).await;
+        detach_provider_task_for_workflow_test(svc, item.id).await;
         let updated = svc
             .apply_operator_action(
                 item.id,
@@ -23096,9 +22010,6 @@ args = ["child"]
         assert_eq!(updated.current_step, "done");
         assert_eq!(updated.state, WorkItemState::Succeeded);
         assert_eq!(updated.context["operator_override"]["action"], "unblock");
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     fn reactive_workflow_with_failed_human_state() -> Arc<WorkflowCatalog> {
@@ -23193,43 +22104,20 @@ kind = "terminal"
 
     #[tokio::test]
     async fn approve_at_review_state_keeps_approve_semantics() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create");
-
-        let review = svc
-            .fire_event_trusted_internal(
-                item.id,
-                FireEventRequest {
-                    event: WorkflowEventKind::JobSucceeded,
-                    job_id: None,
-                    reason: Some("advance to review".into()),
-                },
-            )
-            .await
-            .expect("advance to review");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", true).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        let review = harness
+            .complete_next_job(JobState::Succeeded, successful_job_result())
+            .await;
         assert_eq!(review.current_step, "review");
 
         // The review state accepts HumanApproved, so the polymorphism is a no-op.
         let valid = svc.valid_next_events_for_work_item(&review);
         assert!(valid.contains(&WorkflowEventKind::HumanApproved));
 
-        detach_provider_task_for_workflow_test(&svc, item.id).await;
+        detach_provider_task_for_workflow_test(svc, item.id).await;
         let advanced = svc
             .apply_operator_action(
                 item.id,
@@ -23245,31 +22133,14 @@ kind = "terminal"
         assert_eq!(advanced.current_step, "done");
         // No operator_override should have been recorded — this took the ordinary path.
         assert!(advanced.context.get("operator_override").is_none());
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn reactive_agent_job_context_projects_internal_transition_events() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", false).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let job = svc
             .list_jobs_for_work_item(item.id)
@@ -23283,40 +22154,29 @@ kind = "terminal"
             job.context["workflow"]["inputs"]["valid_next_events"],
             serde_json::json!(["job_succeeded", "job_failed", "cancel"])
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn reactive_runtime_spec_includes_workflow_and_context_candidate_repos() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new_with_task(
             reactive_candidate_repo_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_candidates".into(),
-                session_id: None,
-                context: serde_json::json!({
-                    "repo_catalog": [
-                        { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/main" },
-                        { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" }
-                    ]
-                }),
-                repo: Some(protocol::RepoSource {
-                    repo_url: "https://github.com/reddit/agent-hub".to_string(),
-                    base_ref: "origin/main".to_string(),
-                    branch_name: Some("agent-hub/test-branch".to_string()),
-                }),
-            })
-            .await
-            .expect("create item");
+            "reactive_candidates",
+            false,
+            serde_json::json!({
+                "repo_catalog": [
+                    { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/main" },
+                    { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" }
+                ]
+            }),
+            Some(protocol::RepoSource {
+                repo_url: "https://github.com/reddit/agent-hub".to_string(),
+                base_ref: "origin/main".to_string(),
+                branch_name: Some("agent-hub/test-branch".to_string()),
+            }),
+        )
+        .await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let job = svc
             .list_jobs_for_work_item(item.id)
@@ -23339,38 +22199,27 @@ kind = "terminal"
         assert!(!runtime.repos[0].read_only);
         assert!(runtime.repos[1].read_only);
         assert!(runtime.repos[2].read_only);
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn reactive_runtime_spec_candidate_repos_dedupes_by_repo_url() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new_with_task(
             reactive_candidate_repo_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_candidates".into(),
-                session_id: None,
-                context: serde_json::json!({
-                    "repo_catalog": [
-                        { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/main" },
-                        { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/release" },
-                        { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" },
-                        { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" }
-                    ]
-                }),
-                repo: None,
-            })
-            .await
-            .expect("create item");
+            "reactive_candidates",
+            false,
+            serde_json::json!({
+                "repo_catalog": [
+                    { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/main" },
+                    { "repo_url": "https://github.com/reddit/opencode", "base_ref": "origin/release" },
+                    { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" },
+                    { "repo_url": "https://github.com/reddit/Dippy", "base_ref": "origin/main" }
+                ]
+            }),
+            None,
+        )
+        .await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let job = svc
             .list_jobs_for_work_item(item.id)
@@ -23390,48 +22239,15 @@ kind = "terminal"
         assert_eq!(repo_urls[0], "https://github.com/reddit/agent-hub");
         assert_eq!(repo_urls[1], "https://github.com/reddit/opencode");
         assert_eq!(repo_urls[2], "https://github.com/reddit/Dippy");
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn reactive_agent_output_repo_is_promoted_to_work_item_repo() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("register");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("assigned job");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", true).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        let job = harness.poll_job().await;
 
         svc.update_job(
             job.id,
@@ -23496,48 +22312,15 @@ kind = "terminal"
         assert_eq!(repo.repo_url, "https://github.com/reddit/agent-hub");
         assert_eq!(repo.base_ref, "origin/main");
         assert_eq!(repo.branch_name.as_deref(), Some("feature/discovered"));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn reactive_agent_output_invalid_repo_is_not_promoted_to_work_item_repo() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("register");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("assigned job");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", true).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        let job = harness.poll_job().await;
 
         svc.update_job(
             job.id,
@@ -23599,9 +22382,6 @@ kind = "terminal"
             .expect("exists");
         assert!(updated.repo.is_none());
         assert_eq!(updated.current_step, "review");
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
@@ -23844,24 +22624,20 @@ kind = "terminal"
 
     #[tokio::test]
     async fn reactive_managed_job_context_projects_internal_transition_events() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new_with_task(
             reactive_managed_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "reactive_managed".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
+            "reactive_managed",
+            false,
+            serde_json::json!({}),
+            Some(RepoSource {
+                repo_url: "https://github.com/reddit/agent-hub.git".to_string(),
+                base_ref: "origin/main".to_string(),
+                branch_name: Some("agent-hub/task".to_string()),
+            }),
+        )
+        .await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let job = svc
             .list_jobs_for_work_item(item.id)
@@ -23875,31 +22651,20 @@ kind = "terminal"
             job.context["workflow"]["inputs"]["valid_next_events"],
             serde_json::json!(["job_succeeded", "job_failed", "cancel"])
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
+        let runtime = protocol::runtime_spec_from_job_context(&job.context).expect("runtime");
+        assert_eq!(
+            runtime.github_capabilities[0].api_base_url,
+            "https://api.github.com"
+        );
     }
 
     #[tokio::test]
     async fn reactive_command_job_context_projects_internal_transition_events() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            reactive_child_only_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "child_reactive".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
+        let harness =
+            AuthorizedWorkflowHarness::new(reactive_child_only_catalog(), "child_reactive", false)
+                .await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let job = svc
             .list_jobs_for_work_item(item.id)
@@ -23913,96 +22678,33 @@ kind = "terminal"
             job.context["workflow"]["inputs"]["valid_next_events"],
             serde_json::json!(["job_succeeded", "cancel"])
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
-    async fn valid_next_events_for_failed_legacy_item_include_retry_and_cancel() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![protocol::ExecutionMode::Raw],
-        })
-        .await
-        .expect("register");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("assigned job");
-
-        svc.update_job(
-            job.id,
-            JobUpdateRequest {
-                worker_id: "w1".into(),
-                state: JobState::Running,
-                transcript_dir: None,
-                result: None,
-            },
+    async fn valid_next_events_for_failed_reactive_terminal_include_retry_only() {
+        let harness = AuthorizedWorkflowHarness::new(
+            reactive_failed_terminal_catalog(),
+            "reactive_failed_terminal",
+            true,
         )
-        .await
-        .expect("start job");
-
-        svc.update_job(
-            job.id,
-            JobUpdateRequest {
-                worker_id: "w1".into(),
-                state: JobState::Failed,
-                transcript_dir: Some("/tmp/fail".into()),
-                result: Some(JobResult {
-                    ..failed_job_result()
-                }),
-            },
-        )
-        .await
-        .expect("fail job");
-
-        let failed_item = svc
-            .get_work_item(item.id)
-            .await
-            .expect("get item")
-            .expect("exists");
+        .await;
+        let svc = &harness.svc;
+        let failed_item = harness
+            .complete_next_job(JobState::Failed, failed_job_result())
+            .await;
         assert_eq!(failed_item.state, WorkItemState::Failed);
 
         let events = svc.valid_next_events_for_work_item(&failed_item);
         assert!(events.contains(&WorkflowEventKind::RetryRequested));
-        assert!(events.contains(&WorkflowEventKind::Cancel));
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
+        assert!(!events.contains(&WorkflowEventKind::Cancel));
     }
 
     #[tokio::test]
-    async fn valid_next_events_for_legacy_human_gate_are_state_aware() {
+    async fn valid_next_events_for_reactive_human_gate_are_state_aware() {
         let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
         let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
         let svc = OrchestrationService::new(
-            workflow_catalog(),
+            reactive_workflow_with_failed_human_state(),
             Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
             db.to_string_lossy().into_owned(),
         );
@@ -24010,7 +22712,7 @@ kind = "terminal"
 
         let mut item = svc
             .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
+                workflow_id: "reactive_failed_wf".into(),
                 session_id: None,
                 context: serde_json::json!({}),
                 repo: None,
@@ -24018,14 +22720,12 @@ kind = "terminal"
             .await
             .expect("create item");
         item.human_gate = true;
-        item.human_gate_state = Some("changes_requested".into());
 
         let events = svc.valid_next_events_for_work_item(&item);
         assert!(events.contains(&WorkflowEventKind::HumanUnblocked));
-        assert!(events.contains(&WorkflowEventKind::RetryRequested));
+        assert!(events.contains(&WorkflowEventKind::HumanChangesRequested));
         assert!(events.contains(&WorkflowEventKind::Cancel));
         assert!(!events.contains(&WorkflowEventKind::HumanApproved));
-        assert!(!events.contains(&WorkflowEventKind::HumanChangesRequested));
 
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(tasks);
@@ -24033,24 +22733,9 @@ kind = "terminal"
 
     #[tokio::test]
     async fn fire_event_rejects_external_events_not_in_valid_next_events() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
-            workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
-        );
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create item");
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let err = svc
             .fire_event(
@@ -24066,9 +22751,11 @@ kind = "terminal"
         assert!(matches!(err, AppError::WorkflowInvalid(_)));
         let msg = err.to_string();
         assert!(msg.contains("event 'human_approved' is not currently valid"));
-        assert!(msg.contains("submit"));
+        assert!(
+            msg.contains("event 'human_approved' is not currently valid"),
+            "{msg}"
+        );
         assert!(msg.contains("cancel"));
-        assert!(!msg.contains("job_succeeded"));
 
         let err = svc
             .fire_event(
@@ -24107,9 +22794,101 @@ kind = "terminal"
             .expect("create triage item");
         let triage_events = svc.valid_next_events_for_work_item(&triage);
         assert!(!triage_events.contains(&WorkflowEventKind::WorkflowChosen));
+    }
+
+    #[tokio::test]
+    async fn pr_merged_requires_webhook_or_scm_poller_observation() {
+        let root = std::env::temp_dir().join(format!("pr-merged-workflow-{}", Uuid::new_v4()));
+        let workflow_dir = root.join("merge-observation");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.toml"),
+            r#"[workflow]
+id = "merge-observation"
+schema = "reactive_v2"
+initial_state = "await_merge"
+
+[[workflow.states]]
+id = "await_merge"
+kind = "human"
+
+[[workflow.states.on]]
+event = "pr_merged"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+"#,
+        )
+        .unwrap();
+        let catalog = Arc::new(WorkflowCatalog::load_from_dir(root.to_str().unwrap()).unwrap());
+        let db = std::env::temp_dir().join(format!("pr-merged-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("pr-merged-tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            catalog,
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.unwrap();
+
+        for source in [EventSource::ScmPoller, EventSource::Webhook] {
+            let id = Uuid::new_v4();
+            let req = CreateWorkItemRequest {
+                workflow_id: "merge-observation".to_string(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            };
+            let mut item = work_item_from_create(
+                &req,
+                id,
+                "merge-observation".to_string(),
+                "await_merge".to_string(),
+                "file",
+            );
+            item.external_task_id = None;
+            item.external_task_source = None;
+            item.provider_ownership = ProviderOwnership::Unassigned;
+            item.state = WorkItemState::Running;
+            item.human_gate = true;
+            svc.insert_work_item(&item).await.unwrap();
+            assert!(
+                svc.valid_next_events_for_work_item_internal(&item)
+                    .contains(&WorkflowEventKind::PrMerged)
+            );
+            let stored = svc.get_work_item(id).await.unwrap().unwrap();
+            assert!(
+                svc.valid_next_events_for_work_item_internal(&stored)
+                    .contains(&WorkflowEventKind::PrMerged),
+                "stored item: {stored:?}"
+            );
+
+            let event = FireEventRequest {
+                event: WorkflowEventKind::PrMerged,
+                job_id: None,
+                reason: None,
+            };
+            assert!(svc.fire_event(id, event.clone()).await.is_err());
+            assert!(
+                svc.fire_event_trusted_internal(id, event.clone())
+                    .await
+                    .is_err()
+            );
+            let before_authoritative = svc.get_work_item(id).await.unwrap().unwrap();
+            assert_eq!(before_authoritative.current_step, "await_merge");
+            assert_eq!(before_authoritative.state, WorkItemState::Running);
+            let updated = svc
+                .fire_event_trusted_internal_with_source(id, event, source)
+                .await
+                .expect("authoritative SCM event");
+            assert_eq!(updated.current_step, "done");
+            assert_eq!(updated.state, WorkItemState::Succeeded);
+        }
 
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(tasks);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -24270,32 +23049,24 @@ kind = "terminal"
     }
 
     #[tokio::test]
-    async fn workflow_job_uses_selected_environment_when_no_step_override() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+    async fn workflow_job_keeps_initial_step_container_override_with_environment_selection() {
+        let harness = AuthorizedWorkflowHarness::new_configured(
             workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
+            "wf",
+            false,
+            serde_json::json!({
+                "environment": {
+                    "base": "code-auto",
+                    "overlays": ["github"]
+                }
+            }),
+            None,
+            environments_fixture(),
+            overlays_fixture(),
         )
-        .with_environments(environments_fixture())
-        .with_overlays(overlays_fixture());
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({
-                    "environment": {
-                        "base": "code-auto",
-                        "overlays": ["github"]
-                    }
-                }),
-                repo: None,
-            })
-            .await
-            .expect("create item");
+        .await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
 
         let build_job = svc
             .list_jobs_for_work_item(item.id)
@@ -24307,7 +23078,7 @@ kind = "terminal"
 
         assert_eq!(
             build_job.container_image.as_deref(),
-            Some("agent-hub/job-code:latest")
+            Some("local/agent-hub-test:latest")
         );
         assert_eq!(
             build_job.context["environment_base"],
@@ -24323,80 +23094,31 @@ kind = "terminal"
                 }
             ])
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
     async fn workflow_job_keeps_step_container_override_with_environment_selection() {
-        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
-        let svc = OrchestrationService::new(
+        let harness = AuthorizedWorkflowHarness::new_configured(
             workflow_catalog(),
-            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
-            db.to_string_lossy().into_owned(),
+            "wf",
+            true,
+            serde_json::json!({
+                "environment": {
+                    "base": "code-auto",
+                    "overlays": ["github"]
+                }
+            }),
+            None,
+            environments_fixture(),
+            overlays_fixture(),
         )
-        .with_environments(environments_fixture())
-        .with_overlays(overlays_fixture());
-        svc.init().await.expect("init");
-
-        let item = svc
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: "wf".into(),
-                session_id: None,
-                context: serde_json::json!({
-                    "environment": {
-                        "base": "code-auto",
-                        "overlays": ["github"]
-                    }
-                }),
-                repo: None,
-            })
-            .await
-            .expect("create item");
-
-        svc.register_worker(RegisterWorkerRequest {
-            id: "w1".into(),
-            hostname: "host".into(),
-            supported_modes: vec![
-                protocol::ExecutionMode::Raw,
-                protocol::ExecutionMode::Docker,
-            ],
-        })
-        .await
-        .expect("register");
-
-        let job = svc
-            .poll_job(PollJobRequest {
-                worker_id: "w1".into(),
-            })
-            .await
-            .expect("poll")
-            .job
-            .expect("assigned build job");
-        svc.update_job(
-            job.id,
-            JobUpdateRequest {
-                worker_id: "w1".into(),
-                state: JobState::Running,
-                transcript_dir: None,
-                result: None,
-            },
-        )
-        .await
-        .expect("start");
-        svc.update_job(
-            job.id,
-            JobUpdateRequest {
-                worker_id: "w1".into(),
-                state: JobState::Succeeded,
-                transcript_dir: Some("/tmp/x".into()),
-                result: Some(successful_job_result()),
-            },
-        )
-        .await
-        .expect("finish");
+        .await;
+        let svc = &harness.svc;
+        let item = harness.work_item().await;
+        harness
+            .complete_next_job(JobState::Succeeded, successful_job_result())
+            .await;
+        harness.authorize_pending().await;
 
         let test_job = svc
             .list_jobs_for_work_item(item.id)
@@ -24421,9 +23143,6 @@ kind = "terminal"
                 }
             ])
         );
-
-        let _ = std::fs::remove_file(db);
-        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[test]

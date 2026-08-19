@@ -200,7 +200,6 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
 
 fn execution_mode_to_pb(mode: ExecutionMode) -> i32 {
     match mode {
-        ExecutionMode::Raw => pb::ExecutionMode::Raw as i32,
         ExecutionMode::Docker => pb::ExecutionMode::Docker as i32,
     }
 }
@@ -227,7 +226,6 @@ fn job_event_kind_from_pb(v: i32) -> Result<JobEventKind, Status> {
 
 fn execution_mode_from_pb(value: i32) -> Result<ExecutionMode, Status> {
     match pb::ExecutionMode::try_from(value).unwrap_or(pb::ExecutionMode::Unspecified) {
-        pb::ExecutionMode::Raw => Ok(ExecutionMode::Raw),
         pb::ExecutionMode::Docker => Ok(ExecutionMode::Docker),
         pb::ExecutionMode::Unspecified => {
             Err(Status::invalid_argument("execution_mode unspecified"))
@@ -665,8 +663,6 @@ mod tests {
             github_webhook_secret: None,
             github_polling_enabled: false,
             github_poll_interval_secs: 30,
-            github_token: None,
-            github_api_base_url: "https://api.github.com".to_string(),
         })
     }
 
@@ -679,7 +675,7 @@ mod tests {
             step_id: "s1".into(),
             state: JobState::Running,
             assigned_worker_id: Some("w1".into()),
-            execution_mode: ExecutionMode::Raw,
+            execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
             args: vec!["hi".into()],

@@ -10,7 +10,7 @@ use std::path::Path as FsPath;
 use tower_sessions::Session;
 use uuid::Uuid;
 
-use protocol::{Approval, SessionView, WorkflowDocument, WorkflowEventKind};
+use protocol::{Approval, SessionView, WorkflowEventKind};
 
 use super::AppState;
 use super::DEFAULT_WEB_HOME;
@@ -321,17 +321,6 @@ struct JobStatsRow {
 #[cfg(test)]
 const STRUCTURED_IO_CONTEXT_NAMESPACES: [&str; 6] =
     web_structured::STRUCTURED_IO_CONTEXT_NAMESPACES;
-#[cfg(test)]
-const STRUCTURED_IO_ALIAS_ROW_LIMIT: usize = web_structured::STRUCTURED_IO_ALIAS_ROW_LIMIT;
-#[cfg(test)]
-const STRUCTURED_VALUE_PREVIEW_ROW_LIMIT: usize =
-    web_structured::STRUCTURED_VALUE_PREVIEW_ROW_LIMIT;
-#[cfg(test)]
-const STRUCTURED_ARTIFACT_PROJECTION_PREVIEW_ROW_LIMIT: usize =
-    web_structured::STRUCTURED_ARTIFACT_PROJECTION_PREVIEW_ROW_LIMIT;
-#[cfg(test)]
-const INLINE_STRUCTURED_PREVIEW_MAX_CHARS: usize =
-    web_structured::INLINE_STRUCTURED_PREVIEW_MAX_CHARS;
 #[cfg(test)]
 const STRUCTURED_VALUE_PREVIEW_MAX_JSON_BYTES: usize =
     web_structured::STRUCTURED_VALUE_PREVIEW_MAX_JSON_BYTES;
@@ -842,17 +831,11 @@ pub async fn orchestration_work_item_detail<N: Notifier>(
 
     let workflow_options = state
         .orchestration
-        .list_workflow_documents()
+        .list_workflows()
         .into_iter()
-        .map(|doc| match doc {
-            WorkflowDocument::LegacyV1 { workflow } => WorkflowOption {
-                id: workflow.id,
-                kind: "legacy_v1".to_string(),
-            },
-            WorkflowDocument::ReactiveV2 { workflow } => WorkflowOption {
-                id: workflow.id,
-                kind: "reactive_v2".to_string(),
-            },
+        .map(|workflow| WorkflowOption {
+            id: workflow.id,
+            kind: "reactive_v2".to_string(),
         })
         .collect::<Vec<_>>();
 

@@ -12,6 +12,8 @@ pub use protocol::{NotifyConfig, NotifyConfigUpdate, Secret};
 use super::sessions::SessionApprovalMode;
 use crate::error::AppError;
 
+pub const GITHUB_WEBHOOK_SECRET_ENV: &str = "AGENT_HUB_GITHUB_WEBHOOK_SECRET";
+
 /// Feature mode for the approval system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalFeatureMode {
@@ -56,8 +58,6 @@ pub struct ServerConfig {
     pub github_webhook_secret: Option<String>,
     pub github_polling_enabled: bool,
     pub github_poll_interval_secs: u64,
-    pub github_token: Option<String>,
-    pub github_api_base_url: String,
 }
 
 pub struct Token {
@@ -164,7 +164,7 @@ impl ServerConfig {
                     Some(trimmed)
                 }
             }),
-            github_webhook_secret: env::var("GITHUB_WEBHOOK_SECRET").ok().and_then(|v| {
+            github_webhook_secret: env::var(GITHUB_WEBHOOK_SECRET_ENV).ok().and_then(|v| {
                 let trimmed = v.trim().to_string();
                 if trimmed.is_empty() {
                     None
@@ -180,19 +180,6 @@ impl ServerConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
-            github_token: env::var("GITHUB_TOKEN").ok().and_then(|v| {
-                let trimmed = v.trim().to_string();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                }
-            }),
-            github_api_base_url: env::var("GITHUB_API_BASE_URL")
-                .ok()
-                .map(|u| u.trim_end_matches('/').to_string())
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| "https://api.github.com".to_string()),
         })
     }
 }
@@ -205,17 +192,10 @@ struct SystemManifestFile {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SystemManifest {
     pub operator: Option<String>,
-    pub bot_identity: Option<String>,
-    pub task_provider: Option<TaskProviderConfig>,
-    pub github: Option<GithubConfig>,
-    /// Optional SCM host registry. When empty, the legacy
-    /// `GITHUB_TOKEN`/`GITHUB_API_BASE_URL` env vars synthesize a single
-    /// implicit `kind = "github", host = "github.com"` row at startup so
-    /// existing deployments keep working.
+    pub github: Option<SystemGithubConfig>,
+    /// SCM hosts and their authoritative read-only observation credentials.
     #[serde(default)]
     pub scm_hosts: Vec<ScmHostConfig>,
-    #[serde(default)]
-    pub llm_providers: Vec<LlmProviderConfig>,
     pub images: ImagesConfig,
     pub network_policies: NetworkPoliciesConfig,
     pub environments: EnvironmentsConfig,
@@ -223,24 +203,16 @@ pub struct SystemManifest {
     pub overlays: Option<OverlaysConfig>,
     pub triage: Option<TriageConfig>,
     pub repo_discovery: Option<RepoDiscoveryConfig>,
-    #[serde(default)]
-    pub agents: Vec<AgentConfig>,
-    pub local_agent_defaults: Option<LocalAgentDefaultsConfig>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct TaskProviderConfig {
-    #[serde(rename = "type")]
-    pub provider_type: String,
-    #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, toml::Value>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct GithubConfig {
-    pub webhook_secret_env: Option<String>,
-    pub poll_interval_secs: Option<u64>,
-    pub owner_login: Option<String>,
+#[serde(deny_unknown_fields)]
+pub struct SystemGithubConfig {
+    pub webhook_secret_env: String,
+    #[serde(rename = "poll_interval_secs")]
+    pub _poll_interval_secs: u64,
+    #[serde(rename = "owner_login")]
+    pub _owner_login: String,
 }
 
 /// Source-control-management host registered with the orchestrator.
@@ -252,26 +224,17 @@ pub struct GithubConfig {
 /// `Poller` impl + a `kind` arm.
 ///
 /// Tokens are deliberately *not* embedded in the TOML. We point at an
-/// environment variable name (`token_env`) so secrets stay out of repo and
+/// environment variable name (`read_token_env`) so secrets stay out of repo and
 /// rotate independently of config.
 ///
-/// `webhook_secret_env` is intentionally absent today: the webhook handler
-/// (`orchestration/webhook.rs`) is still single-host and uses the legacy
-/// `GITHUB_WEBHOOK_SECRET` env var directly. When that handler grows
-/// multi-host routing, add `webhook_secret_env` back here so its
-/// presence/absence is validated at startup.
+/// Webhook authentication uses the canonical
+/// `AGENT_HUB_GITHUB_WEBHOOK_SECRET` process environment variable.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ScmHostConfig {
     pub kind: String,
     pub host: String,
     pub api_base_url: String,
-    pub token_env: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct LlmProviderConfig {
-    pub name: String,
-    pub hosts: Vec<String>,
+    pub read_token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -287,7 +250,6 @@ pub struct NetworkPoliciesConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct EnvironmentsConfig {
     pub installed: Vec<String>,
-    pub triage_environment: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -344,25 +306,6 @@ pub struct RepoDiscoveryStrategy {
     pub exclude: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct AgentConfig {
-    pub id: String,
-    pub hostname: String,
-    #[serde(default)]
-    pub supported_modes: Vec<String>,
-    #[serde(default)]
-    pub environments: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct LocalAgentDefaultsConfig {
-    pub mirror_dir: Option<String>,
-    pub worktree_dir: Option<String>,
-    pub transcript_dir: Option<String>,
-    pub transcript_retention_days: Option<u64>,
-    pub fetch_interval_secs: Option<u64>,
-}
-
 #[derive(serde::Deserialize)]
 struct EnvironmentFile {
     environment: EnvironmentToml,
@@ -384,7 +327,7 @@ pub struct EnvironmentToml {
     #[serde(default)]
     pub include_prompts: Vec<String>,
     pub max_timeout_secs: Option<u64>,
-    /// Optional runtime preference (e.g. `cursor-default`, `opencode-default`,
+    /// Optional runtime preference (e.g. `opencode-default`,
     /// or `auto`). The local-agent honors this when dispatching agent jobs;
     /// the server simply projects it into job context.
     #[serde(default)]
@@ -420,14 +363,7 @@ pub struct PolicyAllowEntry {
 
 #[derive(serde::Deserialize)]
 struct ImageFile {
-    image: ImageToml,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ImageToml {
-    pub name: String,
-    pub description: Option<String>,
-    pub extends: Option<String>,
+    image: toml::Value,
 }
 
 pub struct LoadedConfigTree {
@@ -435,7 +371,6 @@ pub struct LoadedConfigTree {
     pub system: SystemManifest,
     pub environments: Vec<LoadedEnvironment>,
     pub network_policies: Vec<NetworkPolicyToml>,
-    pub images: Vec<ImageToml>,
     pub overlays: Vec<EnvironmentOverlay>,
     pub triage_prompt: Option<LoadedTriagePrompt>,
     pub runner_profiles: agent_hub_config::RunnerProfilesConfig,
@@ -444,9 +379,6 @@ pub struct LoadedConfigTree {
 pub struct LoadedEnvironment {
     pub toml: EnvironmentToml,
     pub dir: PathBuf,
-    pub permissions_path: PathBuf,
-    pub dippy_path: PathBuf,
-    pub opencode_path: PathBuf,
 }
 
 impl LoadedEnvironment {
@@ -499,6 +431,11 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
     let system_path = root.join("system.toml");
     let system_file: SystemManifestFile = read_toml_file(&system_path, "system manifest")?;
     let system = system_file.system;
+    if let Some(github) = system.github.as_ref()
+        && github.webhook_secret_env != GITHUB_WEBHOOK_SECRET_ENV
+    {
+        anyhow::bail!("system.github.webhook_secret_env must be {GITHUB_WEBHOOK_SECRET_ENV}");
+    }
     let runner_profiles_path = root.join("local-agent.json");
     let runner_profiles = serde_json::from_slice::<agent_hub_config::RunnerProfilesConfig>(
         &std::fs::read(&runner_profiles_path)
@@ -525,9 +462,6 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
         environments.push(LoadedEnvironment {
             toml: environment_file.environment,
             dir,
-            permissions_path,
-            dippy_path,
-            opencode_path,
         });
     }
 
@@ -542,11 +476,15 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
         network_policies.push(policy_file.policy);
     }
 
-    let mut images = Vec::new();
     for image_name in &system.images.installed {
         let image_path = root.join("images").join(image_name).join("image.toml");
         let image_file: ImageFile = read_toml_file(&image_path, "image manifest")?;
-        images.push(image_file.image);
+        if !image_file.image.is_table() {
+            anyhow::bail!(
+                "image manifest '{}' must contain an image table",
+                image_path.display()
+            );
+        }
     }
 
     let overlays = if let Some(overlays) = &system.overlays {
@@ -589,7 +527,6 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
         system,
         environments,
         network_policies,
-        images,
         overlays,
         triage_prompt,
         runner_profiles,

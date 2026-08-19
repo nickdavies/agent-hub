@@ -93,17 +93,12 @@ pub async fn github_webhook<N: super::super::notifier::Notifier>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, AppError> {
-    if let Some(secret) = state.config.github_webhook_secret.as_deref() {
-        let Some(signature_header) = headers
-            .get("x-hub-signature-256")
-            .and_then(|value| value.to_str().ok())
-        else {
-            return Ok(StatusCode::UNAUTHORIZED.into_response());
-        };
-
-        if !verify_github_signature(secret, &body, signature_header) {
-            return Ok(StatusCode::UNAUTHORIZED.into_response());
-        }
+    if let Err(status) = authenticate_github_webhook(
+        state.config.github_webhook_secret.as_deref(),
+        &headers,
+        &body,
+    ) {
+        return Ok(status.into_response());
     }
 
     let payload: GithubWebhookPayload = match serde_json::from_slice(&body) {
@@ -121,6 +116,24 @@ pub async fn github_webhook<N: super::super::notifier::Notifier>(
     .await?;
 
     Ok(Json(result).into_response())
+}
+
+fn authenticate_github_webhook(
+    secret: Option<&str>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), StatusCode> {
+    let Some(secret) = secret.filter(|secret| !secret.trim().is_empty()) else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let signature_header = headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if !verify_github_signature(secret, body, signature_header) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
 }
 
 pub(crate) async fn ingest_github_event(
@@ -617,4 +630,26 @@ pub(super) fn verify_github_signature_for_tests(
     signature_header: &str,
 ) -> bool {
     verify_github_signature(secret, body, signature_header)
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn missing_blank_and_unsigned_webhooks_are_rejected() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            authenticate_github_webhook(None, &headers, b"{}"),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            authenticate_github_webhook(Some("  "), &headers, b"{}"),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            authenticate_github_webhook(Some("secret"), &headers, b"{}"),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
 }

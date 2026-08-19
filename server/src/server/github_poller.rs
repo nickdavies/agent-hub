@@ -340,10 +340,7 @@ impl GitHubPoller {
                         } else {
                             WorkflowEventKind::CoworkerPrApproved
                         };
-                        push_event_unique(
-                            &mut item_events,
-                            PollerEvent::bare(item.id, role_event),
-                        );
+                        push_event_unique(&mut item_events, PollerEvent::bare(item.id, role_event));
                         push_event_unique(
                             &mut item_events,
                             PollerEvent::bare(item.id, WorkflowEventKind::PrApproved),
@@ -355,10 +352,7 @@ impl GitHubPoller {
                         } else {
                             WorkflowEventKind::CoworkerChangesRequested
                         };
-                        push_event_unique(
-                            &mut item_events,
-                            PollerEvent::bare(item.id, role_event),
-                        );
+                        push_event_unique(&mut item_events, PollerEvent::bare(item.id, role_event));
                     }
                     ReviewState::Other => {}
                 }
@@ -414,7 +408,7 @@ impl GitHubPoller {
         let response = self
             .client
             .get(url)
-            .header("Authorization", format!("Bearer {}", host_cfg.token))
+            .header("Authorization", format!("Bearer {}", host_cfg.read_token))
             .header("User-Agent", "agent-hub")
             .header("Accept", "application/vnd.github+json")
             .send()
@@ -650,13 +644,13 @@ fn compute_check_status(
     // Only consider the combined status state if there are actual individual statuses.
     // GitHub returns "pending" as the combined state even when there are zero statuses,
     // which would incorrectly block repos with no CI configured.
-    if !status.statuses.is_empty() {
-        if let Some(state) = status.state.as_deref() {
-            if matches_ci(state, &["failure", "error"]) {
-                has_failure = true;
-            } else if matches_ci(state, &["pending"]) {
-                has_pending = true;
-            }
+    if !status.statuses.is_empty()
+        && let Some(state) = status.state.as_deref()
+    {
+        if matches_ci(state, &["failure", "error"]) {
+            has_failure = true;
+        } else if matches_ci(state, &["pending"]) {
+            has_pending = true;
         }
     }
 
@@ -1007,15 +1001,22 @@ mod tests {
             ],
         };
 
-        let patch = build_ci_failure_context_patch("github.example.test", "deadbeef", &runs, &status);
+        let patch =
+            build_ci_failure_context_patch("github.example.test", "deadbeef", &runs, &status);
         let last = patch
             .get("last_ci_failure")
             .expect("last_ci_failure key set")
             .as_object()
             .expect("object");
 
-        assert_eq!(last.get("host").and_then(|v| v.as_str()), Some("github.example.test"));
-        assert_eq!(last.get("head_sha").and_then(|v| v.as_str()), Some("deadbeef"));
+        assert_eq!(
+            last.get("host").and_then(|v| v.as_str()),
+            Some("github.example.test")
+        );
+        assert_eq!(
+            last.get("head_sha").and_then(|v| v.as_str()),
+            Some("deadbeef")
+        );
         assert!(last.contains_key("observed_at"));
 
         let runs_arr = last

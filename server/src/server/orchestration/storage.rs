@@ -661,8 +661,27 @@ fn verify_request_for_job(
     }
     if !request.matches_job_execution(job) {
         anyhow::bail!(
-            "job {} execution payload differs from authorization",
-            job.id
+            "job {} execution payload differs from authorization (command={}, args={}, env={}, prompt={}, repo={}, mode={}, image={}, timeout={}, retries={}, context={}, invocation={})",
+            job.id,
+            request.behavior.command == job.command,
+            request.behavior.args == job.args,
+            request.behavior.env == job.env.clone().into_iter().collect(),
+            request.behavior.prompt == job.prompt,
+            request.behavior.primary_repo == job.repo,
+            request.permission_envelope.environment.execution_mode == job.execution_mode,
+            request.permission_envelope.environment.container_image == job.container_image,
+            request.resource_constraints.timeout_secs == job.timeout_secs,
+            request.resource_constraints.max_retries == job.max_retries,
+            request.behavior.execution_context
+                == protocol::authorization_execution_context(&job.context),
+            request
+                .behavior
+                .execution_context
+                .get("state_invocation")
+                .and_then(|value| value.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                == Some(request.invocation_id),
         );
     }
     if request.request_digest()? != request_digest {
@@ -820,8 +839,8 @@ pub(super) fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     if let Some(spec_json) = runtime_spec_json {
         let runtime: CanonicalRuntimeSpec =
             serde_json::from_str(&spec_json).map_err(invalid_json)?;
-        // Compatibility boundary: Job still exposes legacy runtime fields only.
-        // We intentionally project canonical environment back into those fields,
+        // Job exposes flattened runtime fields in addition to the canonical runtime spec.
+        // Project canonical environment back into those fields,
         // while canonical permissions remain persisted in runtime_spec_json.
         job.execution_mode = runtime.environment.execution_mode;
         job.container_image = runtime.environment.container_image;
