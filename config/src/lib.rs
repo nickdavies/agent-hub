@@ -15,9 +15,9 @@ pub use rules::{
     default_to_resolved, load_tool_config, resolve_action, validate_tool_config,
 };
 pub use runner::{
-    CredentialProviderDescriptor, CursorRunnerConfig, ManagedRunnerFileMount, ManagedRunnerKind,
-    ManagedRunnerSpec, McpBridgeDescriptor, OpencodeRunnerConfig, ResolvedRunnerProfile,
-    RunnerProfilesConfig, digest_profile, directory_content_digests,
+    CredentialProviderDescriptor, ManagedRunnerFileMount, ManagedRunnerKind, ManagedRunnerSpec,
+    McpBridgeDescriptor, OpencodeRunnerConfig, ResolvedRunnerProfile, RunnerProfilesConfig,
+    digest_profile, directory_content_digests,
 };
 pub use system::SystemConfig;
 pub use tools::{is_in_workspace, normalize_path, resolve_path};

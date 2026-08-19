@@ -37,13 +37,12 @@ impl Default for RunnerProfilesConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedRunnerSpec {
     #[serde(default)]
     pub kind: ManagedRunnerKind,
     #[serde(default)]
     pub opencode: OpencodeRunnerConfig,
-    #[serde(default)]
-    pub cursor: CursorRunnerConfig,
     #[serde(default)]
     pub command: String,
     #[serde(default)]
@@ -62,10 +61,10 @@ pub enum ManagedRunnerKind {
     #[default]
     Generic,
     Opencode,
-    Cursor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OpencodeRunnerConfig {
     #[serde(
         default = "default_opencode_validation_attempts",
@@ -82,27 +81,8 @@ impl Default for OpencodeRunnerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CursorRunnerConfig {
-    #[serde(
-        default = "default_cursor_validation_attempts",
-        deserialize_with = "deserialize_u32_lenient"
-    )]
-    pub max_validation_attempts: u32,
-    #[serde(default)]
-    pub default_model: Option<String>,
-}
-
-impl Default for CursorRunnerConfig {
-    fn default() -> Self {
-        Self {
-            max_validation_attempts: default_cursor_validation_attempts(),
-            default_model: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedRunnerFileMount {
     pub host_path: String,
     pub container_path: String,
@@ -131,7 +111,6 @@ pub struct ResolvedRunnerProfile {
     pub egress: serde_json::Value,
     pub github_hosts: Vec<String>,
     pub opencode: OpencodeRunnerConfig,
-    pub cursor: CursorRunnerConfig,
     pub config_digest: String,
 }
 
@@ -243,7 +222,6 @@ impl RunnerProfilesConfig {
             )),
             github_hosts,
             opencode: spec.opencode,
-            cursor: spec.cursor,
             config_digest: String::new(),
         };
         profile.config_digest = digest_profile(&profile)?;
@@ -592,15 +570,10 @@ where
     }
 }
 
-fn default_cursor_validation_attempts() -> u32 {
-    3
-}
-
 fn default_managed_agent_runner() -> ManagedRunnerSpec {
     ManagedRunnerSpec {
         kind: ManagedRunnerKind::Opencode,
         opencode: OpencodeRunnerConfig::default(),
-        cursor: CursorRunnerConfig::default(),
         command: "sh".to_string(),
         args: vec![
             "-lc".to_string(),

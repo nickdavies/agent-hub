@@ -281,45 +281,11 @@ pub(crate) const GITHUB_DEFAULT_HOST: &str = "github.com";
 /// only care about allowlisted hosts should use [`normalize_github_repo_slug`]
 /// instead.
 pub(crate) fn parse_github_repo_url(repo_url: &str) -> Option<GithubRepoRef> {
-    let trimmed = repo_url.trim();
-    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-
-    // https://<host>/<owner>/<repo>[/...]
-    if let Some(rest) = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-    {
-        let (host, path) = rest.split_once('/')?;
-        let host = host.trim();
-        if host.is_empty() {
-            return None;
-        }
-        let mut parts = path.split('/').filter(|p| !p.is_empty());
-        let owner = parts.next()?;
-        let repo = parts.next()?;
-        return Some(GithubRepoRef {
-            host: host.to_string(),
-            slug: format!("{owner}/{repo}"),
-        });
-    }
-
-    // git@<host>:<owner>/<repo>
-    if let Some(rest) = trimmed.strip_prefix("git@") {
-        let (host, path) = rest.split_once(':')?;
-        let host = host.trim();
-        if host.is_empty() {
-            return None;
-        }
-        let mut parts = path.split('/').filter(|p| !p.is_empty());
-        let owner = parts.next()?;
-        let repo = parts.next()?;
-        return Some(GithubRepoRef {
-            host: host.to_string(),
-            slug: format!("{owner}/{repo}"),
-        });
-    }
-
-    None
+    let parsed = protocol::parse_github_repository_url(repo_url)?;
+    Some(GithubRepoRef {
+        host: parsed.host,
+        slug: format!("{}/{}", parsed.owner, parsed.repository),
+    })
 }
 
 /// Returns the `owner/repo` slug for `repo_url`, but only if the URL's host

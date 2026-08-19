@@ -24,6 +24,7 @@ tonic = { version = "0.12", features = ["transport"] }
 prost = "0.13"
 prost-types = "0.13"
 uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -43,6 +43,14 @@ impl SystemConfig {
             .map_err(|e| format!("failed to read system config {}: {e}", path.display()))?;
         let wrapped: SystemTomlFile = toml::from_str(&raw)
             .map_err(|e| format!("failed to parse system config {}: {e}", path.display()))?;
+        if let Some(github) = wrapped.system.github.as_ref()
+            && github.webhook_secret_env != "AGENT_HUB_GITHUB_WEBHOOK_SECRET"
+        {
+            return Err(
+                "system.github.webhook_secret_env must be AGENT_HUB_GITHUB_WEBHOOK_SECRET"
+                    .to_string(),
+            );
+        }
         Ok(wrapped.system)
     }
 }

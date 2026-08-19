@@ -4,11 +4,13 @@ use std::path::Path;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ImageTomlFile {
     image: ImageConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageConfig {
     pub name: String,
     pub tag: String,

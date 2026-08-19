@@ -1790,6 +1790,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-build",
+ "url",
  "uuid",
 ]
 
@@ -2303,6 +2304,7 @@ dependencies = [
  "sha2",
  "strum 0.27.2",
  "toml",
+ "url",
  "uuid",
 ]
 
