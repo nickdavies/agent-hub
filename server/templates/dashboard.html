@@ -614,6 +614,16 @@
             }
             card.innerHTML = html;
             container.appendChild(card);
+
+            // Allow pressing Enter inside a custom text input to submit the question
+            card.querySelectorAll('.custom-input input[type="text"]').forEach(input => {
+                input.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        submitQuestion(pq.id, pq.questions.length);
+                    }
+                });
+            });
         }
 
         // Ensure "no questions" placeholder is removed if we have cards
