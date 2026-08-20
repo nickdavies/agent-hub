@@ -3,8 +3,8 @@ use strum::Display;
 
 use protocol::{Tool, expand_tool_group};
 
-use crate::expand_tilde;
 use crate::tools::is_in_workspace;
+use crate::{expand_tilde, normalize_path};
 
 // --- JSON deserialization types ---
 
@@ -31,6 +31,10 @@ struct RuleJson {
     /// one of these directory prefixes. Tilde (~) is expanded at load time.
     /// Ignored for non-path tools (Shell, WebFetch, etc.).
     in_paths: Option<Vec<String>>,
+    /// If set, the canonical event working directory must equal or be below one of these roots.
+    /// Tilde (~) is expanded and roots are lexically normalized at load time. Paths need not
+    /// exist, and symlinks are not resolved through the filesystem.
+    in_cwds: Option<Vec<String>>,
 }
 
 // --- Compiled config types ---
@@ -127,6 +131,7 @@ pub(crate) struct Rule {
     pub(crate) message: Option<String>,
     pub(crate) in_workspace: Option<bool>,
     pub(crate) in_paths: Option<Vec<String>>,
+    pub(crate) in_cwds: Option<Vec<String>>,
     pub(crate) source_json: String,
 }
 
@@ -259,6 +264,31 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
                 ResolvedAction::Delegate(cmd)
             }
         };
+        let in_cwds = raw_rule
+            .in_cwds
+            .map(|roots| {
+                roots
+                    .into_iter()
+                    .map(|root| {
+                        let expanded = if root == "~" {
+                            std::env::var("HOME").map_err(|_| {
+                                "cannot expand in_cwds root \"~\": HOME is not set".to_string()
+                            })?
+                        } else {
+                            expand_tilde(&root)
+                        };
+                        if expanded.is_empty() {
+                            return Err("in_cwds roots must not be empty".to_string());
+                        }
+                        let path = std::path::Path::new(&expanded);
+                        if !path.is_absolute() {
+                            return Err(format!("in_cwds root must be absolute: {root:?}"));
+                        }
+                        Ok(normalize_path(path).to_string_lossy().into_owned())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?;
         rules.push(Rule {
             matchers,
             action: resolved_action,
@@ -267,6 +297,7 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
             in_paths: raw_rule
                 .in_paths
                 .map(|paths| paths.into_iter().map(|p| expand_tilde(&p)).collect()),
+            in_cwds,
             source_json,
         });
     }
@@ -315,6 +346,15 @@ pub fn resolve_action(
     );
 
     for (i, rule) in config.rules.iter().enumerate() {
+        if let Some(in_cwds) = &rule.in_cwds {
+            let Some(cwd) = cwd else {
+                continue;
+            };
+            if !is_in_workspace(cwd, in_cwds) {
+                continue;
+            }
+        }
+
         if let Some(required) = rule.in_workspace {
             match path_in_workspace {
                 Some(actual) if actual != required => continue,
@@ -434,6 +474,7 @@ pub fn validate_tool_config(path: &str) -> Result<(ToolConfig, Vec<String>), Str
         "pattern",
         "in_workspace",
         "in_paths",
+        "in_cwds",
     ];
     if let Some(rules) = raw.get("rules").and_then(|r| r.as_array()) {
         for (i, rule) in rules.iter().enumerate() {
@@ -587,6 +628,7 @@ mod tests {
             message: None,
             in_workspace: None,
             in_paths: None,
+            in_cwds: None,
             source_json: String::new(),
         }
     }
@@ -601,6 +643,7 @@ mod tests {
             message: Some(message.to_string()),
             in_workspace: None,
             in_paths: None,
+            in_cwds: None,
             source_json: String::new(),
         }
     }
@@ -619,6 +662,7 @@ mod tests {
             message: None,
             in_workspace,
             in_paths: None,
+            in_cwds: None,
             source_json: String::new(),
         }
     }
@@ -950,6 +994,7 @@ mod tests {
                     message: Some("Access to .ssh is not allowed".into()),
                     in_workspace: None,
                     in_paths: None,
+                    in_cwds: None,
                     source_json: String::new(),
                 },
                 make_rule(&["Read", "Write"], ResolvedAction::Allow),
@@ -1355,6 +1400,7 @@ mod tests {
             message: None,
             in_workspace: None,
             in_paths: Some(dirs.iter().map(|s| s.to_string()).collect()),
+            in_cwds: None,
             source_json: String::new(),
         }
     }
@@ -1520,6 +1566,7 @@ mod tests {
                 message: None,
                 in_workspace: Some(true),
                 in_paths: Some(vec!["/home/user/oss".to_string()]),
+                in_cwds: None,
                 source_json: String::new(),
             }],
             DefaultAction::Ask,
@@ -1567,6 +1614,7 @@ mod tests {
                 message: None,
                 in_workspace: None,
                 in_paths: Some(vec![expanded.clone()]),
+                in_cwds: None,
                 source_json: String::new(),
             }],
             DefaultAction::Ask,
