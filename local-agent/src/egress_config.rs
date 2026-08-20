@@ -281,6 +281,14 @@ pub struct ProxyConfig {
     pub image: String,
     #[serde(default = "default_proxy_port")]
     pub listen_port: u16,
+    #[serde(default = "default_proxy_runtime_uid")]
+    pub runtime_uid: u32,
+    #[serde(default = "default_proxy_runtime_gid")]
+    pub runtime_gid: u32,
+    #[serde(default = "default_proxy_writable_tmpfs_mode")]
+    pub writable_tmpfs_mode: String,
+    #[serde(default = "default_proxy_declared_volumes")]
+    pub declared_volumes: Vec<String>,
 }
 
 impl Default for ProxyConfig {
@@ -288,6 +296,10 @@ impl Default for ProxyConfig {
         Self {
             image: default_proxy_image(),
             listen_port: default_proxy_port(),
+            runtime_uid: default_proxy_runtime_uid(),
+            runtime_gid: default_proxy_runtime_gid(),
+            writable_tmpfs_mode: default_proxy_writable_tmpfs_mode(),
+            declared_volumes: default_proxy_declared_volumes(),
         }
     }
 }
@@ -683,6 +695,33 @@ fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
     config.egress.build.go_registry_hosts = normalize_hosts(&config.egress.build.go_registry_hosts);
     config.egress.build.crates_registry_hosts =
         normalize_hosts(&config.egress.build.crates_registry_hosts);
+    if config.egress.proxy.image.trim() != config.egress.proxy.image
+        || config.egress.proxy.image.is_empty()
+    {
+        anyhow::bail!("egress.proxy.image must be non-empty without surrounding whitespace");
+    }
+    if config.egress.proxy.listen_port == 0 {
+        anyhow::bail!("egress.proxy.listen_port must be non-zero");
+    }
+    if config.egress.proxy.writable_tmpfs_mode.len() != 4
+        || !config.egress.proxy.writable_tmpfs_mode.starts_with('0')
+        || !config
+            .egress
+            .proxy
+            .writable_tmpfs_mode
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'7'))
+    {
+        anyhow::bail!("egress.proxy.writable_tmpfs_mode must be a four-digit octal string");
+    }
+    config.egress.proxy.declared_volumes.sort();
+    if config.egress.proxy.declared_volumes
+        != ["/var/log/squid".to_string(), "/var/spool/squid".to_string()]
+    {
+        anyhow::bail!(
+            "egress.proxy.declared_volumes must contain exactly /var/log/squid and /var/spool/squid"
+        );
+    }
 
     config.triage_repos = config
         .triage_repos
@@ -778,6 +817,22 @@ const fn default_proxy_port() -> u16 {
     3128
 }
 
+const fn default_proxy_runtime_uid() -> u32 {
+    13
+}
+
+const fn default_proxy_runtime_gid() -> u32 {
+    13
+}
+
+fn default_proxy_writable_tmpfs_mode() -> String {
+    "0755".to_string()
+}
+
+fn default_proxy_declared_volumes() -> Vec<String> {
+    vec!["/var/log/squid".to_string(), "/var/spool/squid".to_string()]
+}
+
 fn default_github_hosts() -> Vec<String> {
     vec![
         "github.com".to_string(),
@@ -845,6 +900,31 @@ mod tests {
             ..LocalAgentConfig::default()
         };
         assert!(normalize_config(&mut config).is_err());
+    }
+
+    #[test]
+    fn proxy_declared_volume_contract_requires_exact_log_and_spool_set() {
+        let mut valid = LocalAgentConfig::default();
+        valid.egress.preflight_image = Some("test".to_string());
+        normalize_config(&mut valid).unwrap();
+        assert_eq!(
+            valid.egress.proxy.declared_volumes,
+            ["/var/log/squid", "/var/spool/squid"]
+        );
+
+        for volumes in [
+            vec!["/var/log/squid".to_string()],
+            vec![
+                "/var/log/squid".to_string(),
+                "/var/spool/squid".to_string(),
+                "/extra".to_string(),
+            ],
+        ] {
+            let mut invalid = LocalAgentConfig::default();
+            invalid.egress.preflight_image = Some("test".to_string());
+            invalid.egress.proxy.declared_volumes = volumes;
+            assert!(normalize_config(&mut invalid).is_err());
+        }
     }
 
     #[test]

@@ -411,7 +411,11 @@ fn default_egress_value() -> serde_json::Value {
         },
         "proxy": {
             "image": "ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029",
-            "listen_port": 3128
+            "listen_port": 3128,
+            "runtime_uid": 13,
+            "runtime_gid": 13,
+            "writable_tmpfs_mode": "0755",
+            "declared_volumes": ["/var/log/squid", "/var/spool/squid"]
         },
         "preflight_image": null
     })
@@ -792,7 +796,56 @@ fn canonicalize_egress(value: serde_json::Value) -> Result<serde_json::Value, St
             other => Ok(other),
         }
     }
-    Ok(canonical_set_json(walk(value, None)?))
+    let canonical = canonical_set_json(walk(value, None)?);
+    if let Some(proxy) = canonical.get("proxy") {
+        let proxy = proxy
+            .as_object()
+            .ok_or_else(|| "egress.proxy must be an object".to_string())?;
+        for field in ["runtime_uid", "runtime_gid"] {
+            if let Some(value) = proxy.get(field)
+                && value
+                    .as_u64()
+                    .is_none_or(|value| value > u64::from(u32::MAX))
+            {
+                return Err(format!(
+                    "egress.proxy.{field} must be an unsigned 32-bit integer"
+                ));
+            }
+        }
+        if let Some(value) = proxy.get("writable_tmpfs_mode") {
+            let valid = value.as_str().is_some_and(|value| {
+                value.len() == 4
+                    && value.starts_with('0')
+                    && value.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+            });
+            if !valid {
+                return Err(
+                    "egress.proxy.writable_tmpfs_mode must be a four-digit octal string"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(value) = proxy.get("declared_volumes") {
+            let mut volumes = value
+                .as_array()
+                .ok_or_else(|| "egress.proxy.declared_volumes must be an array".to_string())?
+                .iter()
+                .map(|value| {
+                    value.as_str().ok_or_else(|| {
+                        "egress.proxy.declared_volumes entries must be strings".to_string()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            volumes.sort_unstable();
+            if volumes != ["/var/log/squid", "/var/spool/squid"] {
+                return Err(
+                    "egress.proxy.declared_volumes must contain exactly /var/log/squid and /var/spool/squid"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(canonical)
 }
 
 fn default_opencode_validation_attempts() -> u32 {
@@ -932,6 +985,53 @@ mod tests {
                 .unwrap()
                 .config_digest;
             assert_ne!(digest, base_digest, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn canonical_profile_binds_proxy_runtime_contract() {
+        let base = canonical_test_config().validated().unwrap();
+        let base_profile = base.resolve_agent_profile(None).unwrap();
+        assert_eq!(base_profile.egress["proxy"]["runtime_uid"], 13);
+        assert_eq!(base_profile.egress["proxy"]["runtime_gid"], 13);
+        assert_eq!(base_profile.egress["proxy"]["writable_tmpfs_mode"], "0755");
+        assert_eq!(
+            base_profile.egress["proxy"]["declared_volumes"],
+            serde_json::json!(["/var/log/squid", "/var/spool/squid"])
+        );
+
+        for (field, value) in [
+            ("runtime_uid", serde_json::json!(14)),
+            ("runtime_gid", serde_json::json!(14)),
+            ("writable_tmpfs_mode", serde_json::json!("0700")),
+        ] {
+            let mut config = canonical_test_config();
+            config.egress["proxy"][field] = value;
+            let profile = config
+                .validated()
+                .unwrap()
+                .resolve_agent_profile(None)
+                .unwrap();
+            assert_ne!(profile.config_digest, base_profile.config_digest, "{field}");
+        }
+    }
+
+    #[test]
+    fn proxy_runtime_contract_rejects_invalid_ranges_and_modes() {
+        for (field, value) in [
+            ("runtime_uid", serde_json::json!(-1)),
+            ("runtime_gid", serde_json::json!(u64::from(u32::MAX) + 1)),
+            ("writable_tmpfs_mode", serde_json::json!("755")),
+            ("writable_tmpfs_mode", serde_json::json!("0999")),
+            ("declared_volumes", serde_json::json!(["/var/log/squid"])),
+            (
+                "declared_volumes",
+                serde_json::json!(["/var/log/squid", "/var/spool/squid", "/extra"]),
+            ),
+        ] {
+            let mut config = canonical_test_config();
+            config.egress["proxy"][field] = value.clone();
+            assert!(config.validated().is_err(), "{field}={value}");
         }
     }
 
