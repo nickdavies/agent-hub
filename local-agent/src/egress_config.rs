@@ -13,6 +13,10 @@ use crate::mcp_bridge::McpBridgeConfig;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalAgentConfig {
+    #[serde(default = "default_installation_id")]
+    pub installation_id: String,
+    #[serde(default = "default_config_identity")]
+    pub config_identity: String,
     #[serde(default)]
     pub egress: EgressConfig,
     #[serde(default)]
@@ -32,6 +36,8 @@ pub struct LocalAgentConfig {
     pub triage_repos: Vec<String>,
     #[serde(default)]
     pub approved_repository_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub triage_mounts: Vec<ManagedRunnerFileMount>,
     /// Hosts the local-agent treats as "GitHub-shaped" when parsing repo URLs
     /// for repository identity and managed GitHub actions.
     /// Empty (or missing) means just `github.com`. Add GitHub Enterprise
@@ -42,11 +48,15 @@ pub struct LocalAgentConfig {
     pub github_api_base_urls: HashMap<String, String>,
     #[serde(skip)]
     config_tree: Option<ConfigTreeSnapshot>,
+    #[serde(skip)]
+    canonical_runner_profiles: Option<agent_hub_config::RunnerProfilesConfig>,
 }
 
 impl Default for LocalAgentConfig {
     fn default() -> Self {
         Self {
+            installation_id: default_installation_id(),
+            config_identity: default_config_identity(),
             egress: EgressConfig::default(),
             credential_providers: HashMap::new(),
             default_agent: default_managed_agent_runner(),
@@ -55,11 +65,21 @@ impl Default for LocalAgentConfig {
             mcp_bridges: Vec::new(),
             triage_repos: Vec::new(),
             approved_repository_roots: Vec::new(),
+            triage_mounts: Vec::new(),
             github_hosts: Vec::new(),
             github_api_base_urls: HashMap::new(),
             config_tree: None,
+            canonical_runner_profiles: None,
         }
     }
+}
+
+fn default_installation_id() -> String {
+    "local-agent-default".to_string()
+}
+
+fn default_config_identity() -> String {
+    "durable-opencode-default".to_string()
 }
 
 impl LocalAgentConfig {
@@ -74,37 +94,49 @@ impl LocalAgentConfig {
         &'a self,
         override_id: Option<&str>,
     ) -> anyhow::Result<(&'a ManagedRunnerSpec, String)> {
+        if let Some(override_id) = override_id
+            && (override_id.is_empty() || override_id.trim() != override_id)
+        {
+            anyhow::bail!(
+                "default-agent override must be non-empty without surrounding whitespace"
+            );
+        }
+        let default_agent = self
+            .canonical_runner_profiles
+            .as_ref()
+            .map_or(&self.default_agent, |profiles| &profiles.default_agent);
+        let default_agent_id = self
+            .canonical_runner_profiles
+            .as_ref()
+            .and_then(|profiles| profiles.default_agent_id.as_deref())
+            .or(self.default_agent_id.as_deref());
+        let managed_runners = self
+            .canonical_runner_profiles
+            .as_ref()
+            .map_or(&self.managed_runners, |profiles| &profiles.managed_runners);
         let candidates = [
-            (
-                override_id.map(str::trim).filter(|s| !s.is_empty()),
-                "override",
-            ),
-            (
-                self.default_agent_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty()),
-                "config:default_agent_id",
-            ),
+            (override_id, "override"),
+            (default_agent_id, "config:default_agent_id"),
         ];
 
         for (candidate, source) in candidates {
             if let Some(name) = candidate {
-                let spec = self.managed_runners.get(name).ok_or_else(|| {
+                let spec = managed_runners.get(name).ok_or_else(|| {
                     anyhow::anyhow!("{source} names unavailable managed runner '{name}'")
                 })?;
                 return Ok((spec, format!("{source}={name}")));
             }
         }
 
-        Ok((
-            &self.default_agent,
-            "config:default_agent (inline)".to_string(),
-        ))
+        Ok((default_agent, "config:default_agent (inline)".to_string()))
     }
 
     pub fn config_tree(&self) -> Option<&ConfigTreeSnapshot> {
         self.config_tree.as_ref()
+    }
+
+    pub fn canonical_runner_profiles(&self) -> Option<&agent_hub_config::RunnerProfilesConfig> {
+        self.canonical_runner_profiles.as_ref()
     }
 
     /// Returns the effective allowlist of GitHub-shaped hosts. Falls back to
@@ -150,6 +182,7 @@ pub struct ConfigTreeSnapshot {
     pub environments: Vec<ConfiguredEnvironment>,
     pub network_policies: HashMap<String, ConfiguredNetworkPolicy>,
     pub llm_provider_hosts: HashMap<String, Vec<String>>,
+    pub triage_mounts: Vec<agent_hub_config::TriageRepositoryMount>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -157,7 +190,8 @@ pub struct ConfiguredEnvironment {
     pub name: String,
     pub allowed_overlays: Vec<String>,
     pub network_policy: String,
-    pub bundle_digests: std::collections::BTreeMap<String, String>,
+    pub bundle_digest: String,
+    pub bundle: agent_hub_config::EnvironmentBundle,
     pub network_policy_bundle_digests:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
@@ -271,14 +305,66 @@ pub fn load_local_agent_config(path_override: Option<&Path>) -> anyhow::Result<L
         None => authoritative_path,
     };
 
-    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let mut parsed: LocalAgentConfig =
-        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    let deployment = agent_hub_config::validate_authoritative_config_root(&config_root)
+        .map_err(anyhow::Error::msg)?;
+    local_agent_config_from_validated_deployment(&config_root, &path, deployment)
+}
+
+pub(crate) fn local_agent_config_from_validated_deployment(
+    config_root: &Path,
+    path: &Path,
+    deployment: agent_hub_config::ValidatedDeployment,
+) -> anyhow::Result<LocalAgentConfig> {
+    let mut parsed: LocalAgentConfig = serde_json::from_value(deployment.local_agent.clone())
+        .with_context(|| format!("parse validated snapshot {}", path.display()))?;
+    let selected = deployment
+        .runner_profiles
+        .resolve_agent_profile(None)
+        .map_err(anyhow::Error::msg)?;
+    parsed.default_agent = deployment.runner_profiles.default_agent.clone();
+    parsed.default_agent_id = deployment.runner_profiles.default_agent_id.clone();
+    parsed.managed_runners = deployment.runner_profiles.managed_runners.clone();
+    parsed.egress = serde_json::from_value(selected.egress.clone())
+        .context("parse canonical runner egress snapshot")?;
+    parsed.github_hosts = deployment.runner_profiles.github_hosts.clone();
     normalize_config(&mut parsed)?;
     parsed.config_tree = Some(
-        load_config_tree_snapshot(&config_root, &parsed.egress.llm)
-            .with_context(|| format!("load config tree from {}", config_root.display()))?,
+        load_config_tree_snapshot(
+            &deployment.system_toml,
+            &deployment.environment_bundles,
+            &deployment.network_policies,
+            &deployment.triage_mounts,
+            &parsed.egress.llm,
+        )
+        .with_context(|| format!("load config tree from {}", config_root.display()))?,
     );
+    if serde_json::to_value(&parsed.egress)? != selected.egress {
+        anyhow::bail!("operational egress does not match canonical authorized profile");
+    }
+    parsed.canonical_runner_profiles = Some(deployment.runner_profiles);
+    Ok(parsed)
+}
+
+#[cfg(test)]
+pub(crate) fn load_synthetic_runner_config_for_test(
+    bytes: &[u8],
+) -> anyhow::Result<LocalAgentConfig> {
+    let authoritative_runner_profiles: agent_hub_config::RunnerProfilesConfig =
+        serde_json::from_slice(bytes)?;
+    let authoritative_runner_profiles = authoritative_runner_profiles
+        .validated()
+        .map_err(anyhow::Error::msg)?;
+    let mut parsed: LocalAgentConfig = serde_json::from_slice(bytes)?;
+    let selected = authoritative_runner_profiles
+        .resolve_agent_profile(None)
+        .map_err(anyhow::Error::msg)?;
+    parsed.default_agent = authoritative_runner_profiles.default_agent.clone();
+    parsed.default_agent_id = authoritative_runner_profiles.default_agent_id.clone();
+    parsed.managed_runners = authoritative_runner_profiles.managed_runners.clone();
+    parsed.egress = serde_json::from_value(selected.egress)?;
+    parsed.github_hosts = authoritative_runner_profiles.github_hosts.clone();
+    normalize_config(&mut parsed)?;
+    parsed.canonical_runner_profiles = Some(authoritative_runner_profiles);
     Ok(parsed)
 }
 
@@ -337,73 +423,58 @@ struct EnvironmentToml {
     allowed_overlays: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct NetworkPolicyFile {
-    policy: NetworkPolicyToml,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct NetworkPolicyToml {
-    name: String,
-    extends: Option<String>,
-    docker_network: Option<String>,
-    unrestricted: Option<bool>,
-    #[serde(default)]
-    allow: Vec<PolicyAllowEntryToml>,
-    #[serde(default)]
-    env: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PolicyAllowEntryToml {
-    #[serde(default)]
-    hosts: Vec<String>,
-    hosts_from: Option<String>,
-}
+type NetworkPolicyToml = agent_hub_config::NetworkPolicyConfig;
 
 fn load_config_tree_snapshot(
-    root: &Path,
+    system_toml: &str,
+    bundles: &std::collections::BTreeMap<String, agent_hub_config::EnvironmentBundle>,
+    policy_snapshots: &std::collections::BTreeMap<String, agent_hub_config::ValidatedNetworkPolicy>,
+    triage_mounts: &[agent_hub_config::TriageRepositoryMount],
     local_llm: &LlmHostConfig,
 ) -> anyhow::Result<ConfigTreeSnapshot> {
-    let system_path = root.join("system.toml");
-    let system_file: SystemManifestFile = read_toml_file(&system_path, "system manifest")?;
+    let system_file: SystemManifestFile =
+        toml::from_str(system_toml).context("parse captured validated system manifest")?;
     let system = system_file.system;
 
     let mut environments = Vec::new();
     for environment_name in &system.environments.installed {
-        let environment_path = root
-            .join("environments")
-            .join(environment_name)
-            .join("environment.toml");
-        let environment_file: EnvironmentFile =
-            read_toml_file(&environment_path, "environment manifest")?;
+        let bundle = bundles
+            .get(environment_name)
+            .with_context(|| format!("validated bundle '{environment_name}' is unavailable"))?;
+        let environment_bytes = bundle
+            .files
+            .iter()
+            .find(|file| file.path == "environment.toml")
+            .with_context(|| format!("bundle '{environment_name}' has no environment.toml"))?;
+        let environment_file: EnvironmentFile = toml::from_str(
+            std::str::from_utf8(&environment_bytes.bytes)
+                .context("environment manifest is not UTF-8")?,
+        )
+        .context("parse captured environment manifest")?;
         let environment = environment_file.environment;
         environments.push(ConfiguredEnvironment {
             name: environment.name,
             allowed_overlays: environment.allowed_overlays,
             network_policy: environment.network_policy,
-            bundle_digests: agent_hub_config::directory_content_digests(
-                environment_path
-                    .parent()
-                    .expect("environment manifest has parent"),
-            )
-            .map_err(anyhow::Error::msg)?,
+            bundle_digest: bundle.digest.clone(),
+            bundle: bundle.clone(),
             network_policy_bundle_digests: std::collections::BTreeMap::new(),
         });
     }
 
     let llm_provider_hosts = validate_llm_provider_host_maps(&system.llm_providers, local_llm)?;
 
-    let mut policies_by_name = HashMap::new();
-    for policy_name in &system.network_policies.installed {
-        let policy_path = root
-            .join("network_policies")
-            .join(policy_name)
-            .join("policy.toml");
-        let policy_file: NetworkPolicyFile =
-            read_toml_file(&policy_path, "network policy manifest")?;
-        policies_by_name.insert(policy_file.policy.name.clone(), policy_file.policy);
-    }
+    let policies_by_name = system
+        .network_policies
+        .installed
+        .iter()
+        .map(|name| {
+            policy_snapshots
+                .get(name)
+                .map(|snapshot| (name.clone(), snapshot.policy.clone()))
+                .with_context(|| format!("validated network policy '{name}' is unavailable"))
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()?;
 
     for environment in &mut environments {
         let mut policy_name = Some(environment.network_policy.clone());
@@ -414,10 +485,13 @@ fn load_config_tree_snapshot(
             }
             environment.network_policy_bundle_digests.insert(
                 name.clone(),
-                agent_hub_config::directory_content_digests(
-                    &root.join("network_policies").join(&name),
-                )
-                .map_err(anyhow::Error::msg)?,
+                policy_snapshots
+                    .get(&name)
+                    .with_context(|| {
+                        format!("validated digest for policy '{name}' is unavailable")
+                    })?
+                    .file_digests
+                    .clone(),
             );
             policy_name = policies_by_name
                 .get(&name)
@@ -441,6 +515,7 @@ fn load_config_tree_snapshot(
         environments,
         network_policies,
         llm_provider_hosts,
+        triage_mounts: triage_mounts.to_vec(),
     })
 }
 
@@ -506,7 +581,7 @@ fn resolve_network_policy(
         ConfiguredNetworkPolicy::default()
     };
 
-    if policy.unrestricted.unwrap_or(false) {
+    if policy.unrestricted {
         resolved.unrestricted = true;
         resolved.hosts.clear();
         resolved.uses_llm_provider_hosts = false;
@@ -534,13 +609,25 @@ fn resolve_network_policy(
     Ok(resolved)
 }
 
-fn read_toml_file<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> anyhow::Result<T> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {label} at {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse {label} at {}", path.display()))
-}
-
 fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
+    config.installation_id = config.installation_id.trim().to_string();
+    if config.installation_id.is_empty()
+        || !config
+            .installation_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        anyhow::bail!("installation_id must be a non-empty label-safe identifier");
+    }
+    config.config_identity = config.config_identity.trim().to_string();
+    if config.config_identity.is_empty()
+        || !config
+            .config_identity
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        anyhow::bail!("config_identity must be a non-empty label-safe identifier");
+    }
     config.egress.preflight_image = Some(
         config
             .egress
@@ -597,16 +684,6 @@ fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
     config.egress.build.crates_registry_hosts =
         normalize_hosts(&config.egress.build.crates_registry_hosts);
 
-    normalize_runner_spec(&mut config.default_agent);
-    config.managed_runners = config
-        .managed_runners
-        .drain()
-        .map(|(name, mut spec)| {
-            normalize_runner_spec(&mut spec);
-            (name.trim().to_string(), spec)
-        })
-        .filter(|(name, _)| !name.is_empty())
-        .collect();
     config.triage_repos = config
         .triage_repos
         .iter()
@@ -619,49 +696,24 @@ fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
         .filter(|root| !root.as_os_str().is_empty())
         .cloned()
         .collect();
+    for mount in &mut config.triage_mounts {
+        mount.host_path = mount.host_path.trim().to_string();
+        mount.container_path = mount.container_path.trim().to_string();
+        if mount.host_path.is_empty() || mount.container_path.is_empty() || !mount.read_only {
+            anyhow::bail!("triage_mounts must contain non-empty read-only source/target pairs");
+        }
+    }
+    let mut bridge_names = HashSet::new();
+    for bridge in &config.mcp_bridges {
+        let name = bridge.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("MCP bridge name must not be empty");
+        }
+        if !bridge_names.insert(name.to_string()) {
+            anyhow::bail!("duplicate MCP bridge name '{name}'");
+        }
+    }
     Ok(())
-}
-
-fn normalize_runner_spec(spec: &mut ManagedRunnerSpec) {
-    spec.command = spec.command.trim().to_string();
-    spec.args = spec
-        .args
-        .iter()
-        .map(|arg| arg.trim().to_string())
-        .filter(|arg| !arg.is_empty())
-        .collect();
-    if spec
-        .container_image
-        .as_deref()
-        .is_some_and(|image| image.trim().is_empty())
-    {
-        spec.container_image = None;
-    }
-    spec.file_mounts = spec
-        .file_mounts
-        .iter()
-        .filter_map(|mount| {
-            let host_path = mount.host_path.trim();
-            let container_path = mount.container_path.trim();
-            if host_path.is_empty() || container_path.is_empty() {
-                return None;
-            }
-            Some(ManagedRunnerFileMount {
-                host_path: host_path.to_string(),
-                container_path: container_path.to_string(),
-                read_only: mount.read_only,
-            })
-        })
-        .collect();
-    if spec.opencode.max_validation_attempts == 0 {
-        spec.opencode.max_validation_attempts = default_opencode_validation_attempts();
-    }
-    spec.requires_credentials = spec
-        .requires_credentials
-        .iter()
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .collect();
 }
 
 pub fn normalize_hosts(hosts: &[String]) -> Vec<String> {
@@ -752,13 +804,10 @@ fn default_crates_registry_hosts() -> Vec<String> {
     ]
 }
 
-const fn default_opencode_validation_attempts() -> u32 {
-    3
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_bridge::{McpBridgeConfig, McpEndpoint};
 
     #[test]
     fn explicit_default_runner_ids_fail_when_unavailable() {
@@ -772,6 +821,72 @@ mod tests {
                 .resolve_default_agent(Some("missing-override"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn local_config_rejects_duplicate_mcp_bridge_names() {
+        let bridge = McpBridgeConfig {
+            name: "duplicate".to_string(),
+            host_endpoint: McpEndpoint::Unix {
+                path: "/tmp/source.sock".to_string(),
+            },
+            container_socket_path: None,
+        };
+        let mut config = LocalAgentConfig {
+            installation_id: default_installation_id(),
+            config_identity: default_config_identity(),
+            triage_mounts: Vec::new(),
+            canonical_runner_profiles: None,
+            egress: EgressConfig {
+                preflight_image: Some("test".to_string()),
+                ..EgressConfig::default()
+            },
+            mcp_bridges: vec![bridge.clone(), bridge],
+            ..LocalAgentConfig::default()
+        };
+        assert!(normalize_config(&mut config).is_err());
+    }
+
+    #[test]
+    fn captured_validated_runner_snapshot_survives_local_agent_file_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("validated-runner-toctou-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("system.toml"),
+            "[system]\noperator='test'\nbot_identity='test'\n[system.environments]\ninstalled=[]\ntriage_environment='none'\n[system.network_policies]\ninstalled=[]\n",
+        )
+        .unwrap();
+        let local_path = root.join("local-agent.json");
+        let local = serde_json::json!({
+            "installation_id":"test-installation",
+            "config_identity":"test-config",
+            "egress":{"preflight_image":"test-preflight"},
+            "default_agent":{"kind":"generic","command":"true"}
+        });
+        std::fs::write(&local_path, serde_json::to_vec(&local).unwrap()).unwrap();
+        let deployment = agent_hub_config::validate_authoritative_config_root(&root).unwrap();
+
+        let mut replacement = local;
+        replacement["default_agent"]["command"] = serde_json::json!("false");
+        std::fs::write(&local_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+
+        let captured =
+            local_agent_config_from_validated_deployment(&root, &local_path, deployment).unwrap();
+        assert_eq!(
+            captured.resolve_default_agent(None).unwrap().0.command,
+            "true"
+        );
+        assert_eq!(
+            agent_hub_config::validate_authoritative_config_root(&root)
+                .unwrap()
+                .runner_profiles
+                .resolve_agent_profile(None)
+                .unwrap()
+                .command,
+            "false"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -858,10 +973,12 @@ mod tests {
                 "llm-only".to_string(),
                 NetworkPolicyToml {
                     name: "llm-only".to_string(),
+                    description: "llm".to_string(),
                     extends: None,
                     docker_network: None,
-                    unrestricted: None,
-                    allow: vec![PolicyAllowEntryToml {
+                    unrestricted: false,
+                    allow: vec![agent_hub_config::PolicyAllowRule {
+                        description: None,
                         hosts: Vec::new(),
                         hosts_from: Some("system.llm_providers".to_string()),
                     }],
@@ -872,10 +989,12 @@ mod tests {
                 "build".to_string(),
                 NetworkPolicyToml {
                     name: "build".to_string(),
+                    description: "build".to_string(),
                     extends: Some("llm-only".to_string()),
                     docker_network: None,
-                    unrestricted: None,
-                    allow: vec![PolicyAllowEntryToml {
+                    unrestricted: false,
+                    allow: vec![agent_hub_config::PolicyAllowRule {
+                        description: None,
                         hosts: vec!["z.example.com".to_string(), "a.example.com".to_string()],
                         hosts_from: None,
                     }],
@@ -922,77 +1041,6 @@ mod tests {
                 "*.github.com",
                 "objects.githubusercontent.com"
             ]
-        );
-    }
-
-    #[test]
-    fn normalize_runner_spec_strips_blank_fields() {
-        let mut config = LocalAgentConfig {
-            egress: EgressConfig {
-                preflight_image: Some("job-code:locked".to_string()),
-                ..EgressConfig::default()
-            },
-            credential_providers: HashMap::new(),
-            default_agent: ManagedRunnerSpec {
-                kind: ManagedRunnerKind::Generic,
-                opencode: OpencodeRunnerConfig::default(),
-                command: " sh ".to_string(),
-                args: vec![" -lc ".to_string(), " ".to_string()],
-                container_image: Some(" ".to_string()),
-                file_mounts: vec![ManagedRunnerFileMount {
-                    host_path: " ".to_string(),
-                    container_path: "/x".to_string(),
-                    read_only: true,
-                }],
-                requires_credentials: Vec::new(),
-            },
-            default_agent_id: None,
-            managed_runners: HashMap::from([(
-                " deploy ".to_string(),
-                ManagedRunnerSpec {
-                    kind: ManagedRunnerKind::Generic,
-                    opencode: OpencodeRunnerConfig::default(),
-                    command: " runner ".to_string(),
-                    args: vec!["--go".to_string()],
-                    container_image: None,
-                    file_mounts: vec![ManagedRunnerFileMount {
-                        host_path: "/a ".to_string(),
-                        container_path: " /b".to_string(),
-                        read_only: false,
-                    }],
-                    requires_credentials: Vec::new(),
-                },
-            )]),
-            mcp_bridges: Vec::new(),
-            triage_repos: vec![
-                " https://github.com/reddit/agent-hub.git ".to_string(),
-                " ".to_string(),
-            ],
-            approved_repository_roots: Vec::new(),
-            github_hosts: Vec::new(),
-            github_api_base_urls: HashMap::new(),
-            config_tree: None,
-        };
-
-        normalize_config(&mut config).expect("normalize config");
-        assert_eq!(config.default_agent.command, "sh");
-        assert_eq!(config.default_agent.args, vec!["-lc"]);
-        assert!(config.default_agent.container_image.is_none());
-        assert!(config.default_agent.file_mounts.is_empty());
-        assert_eq!(config.default_agent.kind, ManagedRunnerKind::Generic);
-        assert_eq!(config.default_agent.opencode.max_validation_attempts, 3);
-        assert!(config.managed_runners.contains_key("deploy"));
-        assert_eq!(
-            config.triage_repos,
-            vec!["https://github.com/reddit/agent-hub.git"]
-        );
-        assert_eq!(
-            config.managed_runners["deploy"].file_mounts[0].host_path,
-            "/a"
-        );
-        assert_eq!(
-            config.managed_runners["deploy"].file_mounts[0].container_path,
-            "/b"
         );
     }
 

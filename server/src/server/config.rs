@@ -1,5 +1,5 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -196,12 +196,9 @@ pub struct SystemManifest {
     /// SCM hosts and their authoritative read-only observation credentials.
     #[serde(default)]
     pub scm_hosts: Vec<ScmHostConfig>,
-    pub images: ImagesConfig,
     pub network_policies: NetworkPoliciesConfig,
     pub environments: EnvironmentsConfig,
     pub workflows: Option<WorkflowsConfig>,
-    pub overlays: Option<OverlaysConfig>,
-    pub triage: Option<TriageConfig>,
     pub repo_discovery: Option<RepoDiscoveryConfig>,
 }
 
@@ -238,11 +235,6 @@ pub struct ScmHostConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct ImagesConfig {
-    pub installed: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
 pub struct NetworkPoliciesConfig {
     pub installed: Vec<String>,
 }
@@ -257,33 +249,8 @@ pub struct WorkflowsConfig {
     pub installed: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct OverlaysConfig {
-    pub registry: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct TriageConfig {
-    /// Path (relative to the config root) of the triage prompt manifest.
-    /// Used by the `__triage__` pseudo-workflow as the universal ingress
-    /// route into any selectable workflow.
-    pub config: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct LoadedTriagePrompt {
-    pub system: Option<String>,
-    pub user: String,
-}
-
-#[derive(serde::Deserialize)]
-struct TriageManifestFile {
-    prompt: TriagePromptToml,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct TriagePromptToml {
-    #[serde(default)]
     pub system: Option<String>,
     pub user: String,
 }
@@ -291,18 +258,23 @@ pub struct TriagePromptToml {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RepoDiscoveryConfig {
     pub enabled: Option<bool>,
+    #[allow(dead_code)]
     #[serde(default)]
     pub strategies: Vec<RepoDiscoveryStrategy>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RepoDiscoveryStrategy {
+    #[allow(dead_code)]
     #[serde(rename = "type")]
     pub strategy_type: String,
+    #[allow(dead_code)]
     pub path: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub include: Vec<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub exclude: Vec<String>,
 }
 
@@ -334,51 +306,24 @@ pub struct EnvironmentToml {
     pub runtime: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct NetworkPolicyFile {
-    policy: NetworkPolicyToml,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct NetworkPolicyToml {
-    pub name: String,
-    pub description: Option<String>,
-    pub extends: Option<String>,
-    pub docker_network: Option<String>,
-    pub unrestricted: Option<bool>,
-    #[serde(default)]
-    pub allow: Vec<PolicyAllowEntry>,
-    #[serde(default)]
-    pub env: std::collections::HashMap<String, String>,
-    pub hosts_from: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct PolicyAllowEntry {
-    pub description: Option<String>,
-    #[serde(default)]
-    pub hosts: Vec<String>,
-    pub hosts_from: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct ImageFile {
-    image: toml::Value,
-}
+pub type NetworkPolicyToml = agent_hub_config::NetworkPolicyConfig;
 
 pub struct LoadedConfigTree {
-    pub root: PathBuf,
     pub system: SystemManifest,
     pub environments: Vec<LoadedEnvironment>,
     pub network_policies: Vec<NetworkPolicyToml>,
+    pub network_policy_file_digests:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     pub overlays: Vec<EnvironmentOverlay>,
     pub triage_prompt: Option<LoadedTriagePrompt>,
     pub runner_profiles: agent_hub_config::RunnerProfilesConfig,
+    pub triage_mounts: Vec<agent_hub_config::TriageRepositoryMount>,
+    pub environment_bundles:
+        std::collections::BTreeMap<String, agent_hub_config::EnvironmentBundle>,
 }
 
 pub struct LoadedEnvironment {
     pub toml: EnvironmentToml,
-    pub dir: PathBuf,
 }
 
 impl LoadedEnvironment {
@@ -398,10 +343,6 @@ impl LoadedEnvironment {
                 .filter(|value| !value.is_empty()),
         }
     }
-
-    pub fn content_digests(&self) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-        agent_hub_config::directory_content_digests(&self.dir).map_err(anyhow::Error::msg)
-    }
 }
 
 fn map_policy_to_network_class(policy: &str) -> String {
@@ -412,140 +353,94 @@ fn map_policy_to_network_class(policy: &str) -> String {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct OverlaysFile {
-    overlays: Vec<OverlayConfigEntry>,
-}
-
-#[derive(serde::Deserialize)]
-struct OverlayConfigEntry {
-    name: String,
-    provider: String,
-    #[serde(default)]
-    config: serde_json::Value,
-    #[allow(dead_code)]
-    description: Option<String>,
-}
-
 pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
-    let system_path = root.join("system.toml");
-    let system_file: SystemManifestFile = read_toml_file(&system_path, "system manifest")?;
+    let deployment =
+        agent_hub_config::validate_authoritative_config_root(root).map_err(anyhow::Error::msg)?;
+    let system_file: SystemManifestFile = toml::from_str(&deployment.system_toml)
+        .context("parse captured validated system manifest")?;
     let system = system_file.system;
     if let Some(github) = system.github.as_ref()
         && github.webhook_secret_env != GITHUB_WEBHOOK_SECRET_ENV
     {
         anyhow::bail!("system.github.webhook_secret_env must be {GITHUB_WEBHOOK_SECRET_ENV}");
     }
-    let runner_profiles_path = root.join("local-agent.json");
-    let runner_profiles = serde_json::from_slice::<agent_hub_config::RunnerProfilesConfig>(
-        &std::fs::read(&runner_profiles_path)
-            .with_context(|| format!("read {}", runner_profiles_path.display()))?,
-    )
-    .with_context(|| format!("parse {}", runner_profiles_path.display()))?;
+    let runner_profiles = deployment.runner_profiles.clone();
 
     let mut environments = Vec::new();
     for environment_name in &system.environments.installed {
-        let dir = root.join("environments").join(environment_name);
-        ensure_exists(&dir, "environment directory")?;
-
-        let environment_path = dir.join("environment.toml");
-        let environment_file: EnvironmentFile =
-            read_toml_file(&environment_path, "environment manifest")?;
-
-        let permissions_path = dir.join("agent-hub-permissions.json");
-        let dippy_path = dir.join("dippy.conf");
-        let opencode_path = dir.join("opencode.json");
-        ensure_exists(&permissions_path, "environment permissions")?;
-        ensure_exists(&dippy_path, "environment dippy config")?;
-        ensure_exists(&opencode_path, "environment opencode config")?;
+        let bundle = deployment
+            .environment_bundles
+            .get(environment_name)
+            .with_context(|| format!("validated bundle '{environment_name}' is unavailable"))?;
+        let environment_bytes = bundle
+            .files
+            .iter()
+            .find(|file| file.path == "environment.toml")
+            .with_context(|| format!("bundle '{environment_name}' has no environment.toml"))?;
+        let environment_file: EnvironmentFile = toml::from_str(
+            std::str::from_utf8(&environment_bytes.bytes)
+                .context("captured environment manifest is not UTF-8")?,
+        )
+        .context("parse captured validated environment manifest")?;
 
         environments.push(LoadedEnvironment {
             toml: environment_file.environment,
-            dir,
         });
     }
 
-    let mut network_policies = Vec::new();
-    for policy_name in &system.network_policies.installed {
-        let policy_path = root
-            .join("network_policies")
-            .join(policy_name)
-            .join("policy.toml");
-        let policy_file: NetworkPolicyFile =
-            read_toml_file(&policy_path, "network policy manifest")?;
-        network_policies.push(policy_file.policy);
-    }
+    let network_policies = system
+        .network_policies
+        .installed
+        .iter()
+        .map(|name| {
+            deployment
+                .network_policies
+                .get(name)
+                .map(|snapshot| snapshot.policy.clone())
+                .with_context(|| format!("validated network policy '{name}' is unavailable"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let network_policy_file_digests = deployment
+        .network_policies
+        .iter()
+        .map(|(name, snapshot)| (name.clone(), snapshot.file_digests.clone()))
+        .collect();
 
-    for image_name in &system.images.installed {
-        let image_path = root.join("images").join(image_name).join("image.toml");
-        let image_file: ImageFile = read_toml_file(&image_path, "image manifest")?;
-        if !image_file.image.is_table() {
-            anyhow::bail!(
-                "image manifest '{}' must contain an image table",
-                image_path.display()
-            );
-        }
-    }
-
-    let overlays = if let Some(overlays) = &system.overlays {
-        if let Some(registry_path) = overlays.registry.as_deref() {
-            let absolute_registry_path = root.join(registry_path);
-            let overlays_file: OverlaysFile =
-                read_toml_file(&absolute_registry_path, "overlay registry")?;
-            overlays_file
+    let overlays = deployment
+        .overlay_registry
+        .as_ref()
+        .map(|registry| {
+            registry
                 .overlays
-                .into_iter()
+                .iter()
                 .map(|entry| EnvironmentOverlay {
-                    name: entry.name,
-                    provider: entry.provider,
-                    config: entry.config,
+                    name: entry.name.clone(),
+                    provider: entry.provider.clone(),
+                    config: entry.config.clone(),
                 })
                 .collect()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
-
-    let triage_prompt = if let Some(triage) = system.triage.as_ref()
-        && let Some(config_path) = triage.config.as_deref()
-    {
-        let absolute_path = root.join(config_path);
-        let manifest: TriageManifestFile =
-            read_toml_file(&absolute_path, "triage prompt manifest")?;
-        Some(LoadedTriagePrompt {
-            system: manifest.prompt.system,
-            user: manifest.prompt.user,
         })
-    } else {
-        None
-    };
+        .unwrap_or_default();
+
+    let triage_prompt = deployment
+        .triage_prompt
+        .as_ref()
+        .map(|triage| LoadedTriagePrompt {
+            system: Some(triage.prompt.system.clone()),
+            user: triage.prompt.user.clone(),
+        });
 
     Ok(LoadedConfigTree {
-        root: root.to_path_buf(),
         system,
         environments,
         network_policies,
         overlays,
         triage_prompt,
         runner_profiles,
+        triage_mounts: deployment.triage_mounts,
+        environment_bundles: deployment.environment_bundles,
+        network_policy_file_digests,
     })
-}
-
-fn read_toml_file<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> anyhow::Result<T> {
-    ensure_exists(path, label)?;
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {label} at {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse {label} at {}", path.display()))
-}
-
-fn ensure_exists(path: &Path, label: &str) -> anyhow::Result<()> {
-    if path.exists() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("missing {label} at {}", path.display()))
-    }
 }
 
 fn parse_tokens(raw: &str) -> Result<Vec<Token>, AppError> {

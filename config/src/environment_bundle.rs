@@ -1,0 +1,670 @@
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Component, Path, PathBuf};
+
+use serde_json::json;
+use sha2::{Digest, Sha256};
+
+use crate::{EnvironmentConfig, NetworkPolicyConfig, SystemConfig, flatten_policy};
+
+pub const DURABLE_OPENCODE_MODEL: &str = "openai/gpt-5.6-sol";
+pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-08-18";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentBundleFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvironmentBundle {
+    pub files: Vec<EnvironmentBundleFile>,
+    pub digest: String,
+}
+
+impl EnvironmentBundle {
+    pub fn from_files(files: Vec<EnvironmentBundleFile>) -> Result<Self, String> {
+        let mut ordered = BTreeMap::new();
+        for file in files {
+            validate_relative_path(&file.path)?;
+            if ordered.insert(file.path.clone(), file.bytes).is_some() {
+                return Err(format!(
+                    "environment bundle contains duplicate path '{}'",
+                    file.path
+                ));
+            }
+        }
+        let files = ordered
+            .into_iter()
+            .map(|(path, bytes)| EnvironmentBundleFile { path, bytes })
+            .collect::<Vec<_>>();
+        let digest = digest_files(&files);
+        Ok(Self { files, digest })
+    }
+
+    pub fn write_to(&self, destination: &Path) -> Result<(), String> {
+        if destination.exists() {
+            std::fs::remove_dir_all(destination)
+                .map_err(|error| format!("failed to clear {}: {error}", destination.display()))?;
+        }
+        std::fs::create_dir_all(destination)
+            .map_err(|error| format!("failed to create {}: {error}", destination.display()))?;
+        for file in &self.files {
+            validate_relative_path(&file.path)?;
+            let path = destination.join(&file.path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+            }
+            std::fs::write(&path, &file.bytes)
+                .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    pub fn verify_digest(&self, authorized_digest: &str) -> Result<(), String> {
+        if self.digest == authorized_digest {
+            Ok(())
+        } else {
+            Err("materialized environment bundle digest does not match authorization".to_string())
+        }
+    }
+}
+
+pub fn materialize_environment_bundle(
+    config_root: &Path,
+    environment_name: &str,
+) -> Result<EnvironmentBundle, String> {
+    let system = SystemConfig::load(&config_root.join("system.toml"))?;
+    materialize_environment_bundle_with_system(config_root, environment_name, &system)
+}
+
+pub fn materialize_environment_bundle_with_system(
+    config_root: &Path,
+    environment_name: &str,
+    system: &SystemConfig,
+) -> Result<EnvironmentBundle, String> {
+    let policies = load_network_policies(config_root, system)?;
+    materialize_environment_bundle_with_snapshot(config_root, environment_name, system, &policies)
+}
+
+pub fn materialize_environment_bundle_with_snapshot(
+    config_root: &Path,
+    environment_name: &str,
+    system: &SystemConfig,
+    policies: &HashMap<String, NetworkPolicyConfig>,
+) -> Result<EnvironmentBundle, String> {
+    validate_name(environment_name, "environment")?;
+    let source = config_root.join("environments").join(environment_name);
+    reject_symlink(&source)?;
+    let environment_path = source.join("environment.toml");
+    reject_symlink(&environment_path)?;
+    let environment_bytes = std::fs::read(&environment_path)
+        .map_err(|error| format!("failed to read {}: {error}", environment_path.display()))?;
+    let environment = EnvironmentConfig::from_toml(
+        std::str::from_utf8(&environment_bytes)
+            .map_err(|error| format!("environment config is not UTF-8: {error}"))?,
+        &environment_path.display().to_string(),
+    )?;
+    if environment.name != environment_name {
+        return Err(format!(
+            "environment directory '{environment_name}' contains manifest for '{}'",
+            environment.name
+        ));
+    }
+    if environment.image != DURABLE_OPENCODE_IMAGE {
+        return Err(format!(
+            "environment '{}' must use pinned OpenCode image '{DURABLE_OPENCODE_IMAGE}'",
+            environment.name
+        ));
+    }
+
+    let flattened = flatten_policy(&environment.network_policy, policies, system)?;
+    let network_policy = serde_json::to_vec_pretty(&json!({
+        "name": flattened.name,
+        "description": flattened.description,
+        "unrestricted": flattened.unrestricted,
+        "docker_network": flattened.docker_network,
+        "hosts": flattened.hosts,
+        "env": flattened.env,
+    }))
+    .map_err(|error| format!("failed to serialize network policy: {error}"))?;
+
+    let mut files = BTreeMap::new();
+    insert_file(&mut files, "environment.toml", environment_bytes, false)?;
+    for name in ["agent-hub-permissions.json", "dippy.conf", "opencode.json"] {
+        let path = source.join(name);
+        reject_symlink(&path)?;
+        let bytes = std::fs::read(&path).map_err(|error| {
+            format!(
+                "required environment file {} is unavailable: {error}",
+                path.display()
+            )
+        })?;
+        if name == "opencode.json" {
+            validate_durable_opencode_config(&bytes)?;
+            if environment.approval_mode == "auto" {
+                validate_automatic_opencode_plugins(&bytes)?;
+            }
+        }
+        insert_file(&mut files, name, bytes, false)?;
+    }
+    insert_file(&mut files, "network_policy.json", network_policy, false)?;
+
+    for directory in ["prompts", "instructions"] {
+        let directory_source = source.join(directory);
+        if directory_source.exists() {
+            collect_directory(&directory_source, directory, &mut files, false)?;
+        }
+    }
+    for skill in &environment.include_skills {
+        validate_name(skill, "skill")?;
+        collect_directory(
+            &config_root.join("shared").join("skills").join(skill),
+            &format!("skills/{skill}"),
+            &mut files,
+            false,
+        )?;
+    }
+    // Environment-local skills and agents intentionally replace same-path shared files.
+    // This preserves the established environment packaging precedence while the final
+    // BTreeMap still rejects every other duplicate output path.
+    collect_directory(&source.join("skills"), "skills", &mut files, true)?;
+
+    for agent in &environment.include_agents {
+        validate_name(agent, "agent")?;
+        let source_agent = config_root
+            .join("shared")
+            .join("agents")
+            .join(format!("{agent}.md"));
+        reject_symlink(&source_agent)?;
+        let bytes = std::fs::read(&source_agent).map_err(|error| {
+            format!(
+                "required shared agent {} is unavailable: {error}",
+                source_agent.display()
+            )
+        })?;
+        validate_agent_model(&bytes, &source_agent)?;
+        insert_file(&mut files, &format!("agents/{agent}.md"), bytes, false)?;
+    }
+    collect_directory(&source.join("agents"), "agents", &mut files, true)?;
+    for (path, bytes) in files
+        .iter()
+        .filter(|(path, _)| path.starts_with("agents/") && path.ends_with(".md"))
+    {
+        validate_agent_model(bytes, Path::new(path))?;
+    }
+
+    EnvironmentBundle::from_files(
+        files
+            .into_iter()
+            .map(|(path, bytes)| EnvironmentBundleFile { path, bytes })
+            .collect(),
+    )
+}
+
+pub fn validate_durable_opencode_config(bytes: &[u8]) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("failed to parse opencode.json: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "opencode.json must be an object".to_string())?;
+    for key in ["model", "small_model"] {
+        if object.get(key).and_then(serde_json::Value::as_str) != Some(DURABLE_OPENCODE_MODEL) {
+            return Err(format!(
+                "opencode.json {key} must be '{DURABLE_OPENCODE_MODEL}'"
+            ));
+        }
+    }
+    let providers = object
+        .get("enabled_providers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "opencode.json enabled_providers must be ['openai']".to_string())?;
+    if providers.as_slice() != [serde_json::Value::String("openai".to_string())] {
+        return Err("opencode.json enabled_providers must contain only 'openai'".to_string());
+    }
+    reject_copilot_declarations(&value)
+}
+
+fn validate_automatic_opencode_plugins(bytes: &[u8]) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("failed to parse opencode.json: {error}"))?;
+    if value
+        .get("plugin")
+        .is_some_and(|plugins| !plugins.as_array().is_some_and(Vec::is_empty))
+    {
+        return Err("automatic OpenCode environments must not load attended plugins".to_string());
+    }
+    Ok(())
+}
+
+fn validate_agent_model(bytes: &[u8], path: &Path) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("agent {} is not UTF-8: {error}", path.display()))?;
+    if let Some(model) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("model:").map(str::trim))
+        && model != DURABLE_OPENCODE_MODEL
+    {
+        return Err(format!(
+            "agent {} model must be '{DURABLE_OPENCODE_MODEL}'",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn reject_copilot_declarations(value: &serde_json::Value) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if key.to_ascii_lowercase().contains("copilot") {
+                    return Err("opencode.json must not declare GitHub Copilot".to_string());
+                }
+                reject_copilot_declarations(value)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                reject_copilot_declarations(value)?;
+            }
+        }
+        serde_json::Value::String(value) if value.to_ascii_lowercase().contains("copilot") => {
+            return Err("opencode.json must not declare GitHub Copilot".to_string());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn load_network_policies(
+    config_root: &Path,
+    system: &SystemConfig,
+) -> Result<HashMap<String, NetworkPolicyConfig>, String> {
+    let mut policies = HashMap::new();
+    if let Some(configured) = &system.network_policies {
+        for name in &configured.installed {
+            validate_name(name, "network policy")?;
+            let policy = NetworkPolicyConfig::load(
+                &config_root
+                    .join("network_policies")
+                    .join(name)
+                    .join("policy.toml"),
+            )?;
+            if policies.insert(policy.name.clone(), policy).is_some() {
+                return Err(format!("duplicate network policy '{name}'"));
+            }
+        }
+    }
+    Ok(policies)
+}
+
+fn collect_directory(
+    source: &Path,
+    destination: &str,
+    files: &mut BTreeMap<String, Vec<u8>>,
+    replace: bool,
+) -> Result<(), String> {
+    if !source.exists() {
+        return if replace {
+            Ok(())
+        } else {
+            Err(format!(
+                "required directory {} is unavailable",
+                source.display()
+            ))
+        };
+    }
+    reject_symlink(source)?;
+    let mut entries = std::fs::read_dir(source)
+        .map_err(|error| format!("failed to read {}: {error}", source.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to read {}: {error}", source.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", entry.path().display()))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "environment bundle source contains symlink {}",
+                entry.path().display()
+            ));
+        }
+        let name = entry.file_name().into_string().map_err(|_| {
+            format!(
+                "environment bundle path in {} is not UTF-8",
+                source.display()
+            )
+        })?;
+        let relative = format!("{destination}/{name}");
+        if file_type.is_dir() {
+            collect_directory(&entry.path(), &relative, files, replace)?;
+        } else if file_type.is_file() {
+            insert_file(
+                files,
+                &relative,
+                std::fs::read(entry.path()).map_err(|error| error.to_string())?,
+                replace,
+            )?;
+        } else {
+            return Err(format!(
+                "unsupported environment bundle entry {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_symlink(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "environment bundle source contains symlink {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn insert_file(
+    files: &mut BTreeMap<String, Vec<u8>>,
+    path: &str,
+    bytes: Vec<u8>,
+    replace: bool,
+) -> Result<(), String> {
+    validate_relative_path(path)?;
+    if !replace && files.contains_key(path) {
+        return Err(format!(
+            "environment bundle contains duplicate path '{path}'"
+        ));
+    }
+    files.insert(path.to_string(), bytes);
+    Ok(())
+}
+
+fn validate_name(name: &str, label: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(format!("invalid {label} name '{name}'"));
+    }
+    Ok(())
+}
+
+fn validate_relative_path(path: &str) -> Result<(), String> {
+    let candidate = PathBuf::from(path);
+    if path.is_empty()
+        || candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("invalid environment bundle path '{path}'"));
+    }
+    Ok(())
+}
+
+fn digest_files(files: &[EnvironmentBundleFile]) -> String {
+    let mut digest = Sha256::new();
+    for file in files {
+        digest.update((file.path.len() as u64).to_be_bytes());
+        digest.update(file.path.as_bytes());
+        digest.update((file.bytes.len() as u64).to_be_bytes());
+        digest.update(&file.bytes);
+    }
+    hex::encode(digest.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_is_order_independent_and_binds_paths_and_bytes() {
+        let first = EnvironmentBundle::from_files(vec![
+            EnvironmentBundleFile {
+                path: "b".into(),
+                bytes: vec![2],
+            },
+            EnvironmentBundleFile {
+                path: "a".into(),
+                bytes: vec![1],
+            },
+        ])
+        .unwrap();
+        let second = EnvironmentBundle::from_files(vec![
+            EnvironmentBundleFile {
+                path: "a".into(),
+                bytes: vec![1],
+            },
+            EnvironmentBundleFile {
+                path: "b".into(),
+                bytes: vec![2],
+            },
+        ])
+        .unwrap();
+        assert_eq!(first, second);
+        assert_ne!(
+            first.digest,
+            EnvironmentBundle::from_files(vec![
+                EnvironmentBundleFile {
+                    path: "a".into(),
+                    bytes: vec![1]
+                },
+                EnvironmentBundleFile {
+                    path: "b".into(),
+                    bytes: vec![3]
+                },
+            ])
+            .unwrap()
+            .digest
+        );
+        assert_ne!(
+            first.digest,
+            EnvironmentBundle::from_files(vec![
+                EnvironmentBundleFile {
+                    path: "a".into(),
+                    bytes: vec![1]
+                },
+                EnvironmentBundleFile {
+                    path: "c".into(),
+                    bytes: vec![2]
+                },
+            ])
+            .unwrap()
+            .digest
+        );
+    }
+
+    #[test]
+    fn bundle_rejects_duplicates_and_traversal() {
+        assert!(
+            EnvironmentBundle::from_files(vec![
+                EnvironmentBundleFile {
+                    path: "a".into(),
+                    bytes: vec![]
+                },
+                EnvironmentBundleFile {
+                    path: "a".into(),
+                    bytes: vec![]
+                },
+            ])
+            .is_err()
+        );
+        for path in ["", "/absolute", "../escape", "a/../escape"] {
+            assert!(
+                EnvironmentBundle::from_files(vec![EnvironmentBundleFile {
+                    path: path.into(),
+                    bytes: vec![]
+                }])
+                .is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_config_requires_openai_pins_and_rejects_copilot() {
+        let valid = serde_json::to_vec(&json!({
+            "model": DURABLE_OPENCODE_MODEL,
+            "small_model": DURABLE_OPENCODE_MODEL,
+            "enabled_providers": ["openai"]
+        }))
+        .unwrap();
+        validate_durable_opencode_config(&valid).unwrap();
+        for invalid in [
+            json!({"model":"github-copilot/gpt", "small_model":DURABLE_OPENCODE_MODEL, "enabled_providers":["openai"]}),
+            json!({"model":DURABLE_OPENCODE_MODEL, "small_model":DURABLE_OPENCODE_MODEL, "enabled_providers":["openai", "github-copilot"]}),
+            json!({"model":DURABLE_OPENCODE_MODEL, "small_model":DURABLE_OPENCODE_MODEL, "enabled_providers":["openai"], "plugin":["opencode-copilot-auth"]}),
+        ] {
+            assert!(
+                validate_durable_opencode_config(&serde_json::to_vec(&invalid).unwrap()).is_err()
+            );
+        }
+        let attended = serde_json::to_vec(&json!({
+            "model": DURABLE_OPENCODE_MODEL,
+            "small_model": DURABLE_OPENCODE_MODEL,
+            "enabled_providers": ["openai"],
+            "plugin": ["agent-hub-attended"]
+        }))
+        .unwrap();
+        assert!(validate_automatic_opencode_plugins(&attended).is_err());
+    }
+
+    #[test]
+    fn materialization_copies_shared_files_and_changes_digest_with_content() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-bundle-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for directory in [
+            "environments/test",
+            "network_policies/none",
+            "shared/skills/example",
+            "shared/agents",
+        ] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        std::fs::write(
+            root.join("system.toml"),
+            r#"[system]
+operator = "test"
+bot_identity = "test"
+[system.network_policies]
+installed = ["none"]
+[system.environments]
+installed = ["test"]
+triage_environment = "test"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("network_policies/none/policy.toml"),
+            "[policy]\nname = \"none\"\ndescription = \"none\"\ndocker_network = \"none\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("environments/test/environment.toml"),
+            r#"[environment]
+name = "test"
+description = "test"
+image = "agent-hub/job-code:2026-08-18"
+network_policy = "none"
+approval_mode = "auto"
+include_skills = ["example"]
+include_agents = ["example"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("environments/test/agent-hub-permissions.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(root.join("environments/test/dippy.conf"), "allow true\n").unwrap();
+        std::fs::write(
+            root.join("environments/test/opencode.json"),
+            serde_json::to_vec(&json!({
+                "model": DURABLE_OPENCODE_MODEL,
+                "small_model": DURABLE_OPENCODE_MODEL,
+                "enabled_providers": ["openai"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let skill = root.join("shared/skills/example/SKILL.md");
+        std::fs::write(&skill, "first").unwrap();
+        std::fs::write(
+            root.join("shared/agents/example.md"),
+            format!("---\nmodel: {DURABLE_OPENCODE_MODEL}\n---\n"),
+        )
+        .unwrap();
+
+        let local_skill = root.join("environments/test/skills/example/SKILL.md");
+        let local_agent = root.join("environments/test/agents/example.md");
+        std::fs::create_dir_all(local_skill.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(local_agent.parent().unwrap()).unwrap();
+        std::fs::write(&local_skill, "local skill").unwrap();
+        std::fs::write(
+            &local_agent,
+            format!("---\nmodel: {DURABLE_OPENCODE_MODEL}\n---\nlocal agent\n"),
+        )
+        .unwrap();
+
+        let first = materialize_environment_bundle(&root, "test").unwrap();
+        let server_authorized_digest = first.digest.clone();
+        first.verify_digest(&server_authorized_digest).unwrap();
+        assert!(
+            first
+                .files
+                .iter()
+                .any(|file| file.path == "skills/example/SKILL.md")
+        );
+        assert_eq!(
+            first
+                .files
+                .iter()
+                .find(|file| file.path == "skills/example/SKILL.md")
+                .unwrap()
+                .bytes,
+            b"local skill"
+        );
+        assert!(
+            String::from_utf8(
+                first
+                    .files
+                    .iter()
+                    .find(|file| file.path == "agents/example.md")
+                    .unwrap()
+                    .bytes
+                    .clone()
+            )
+            .unwrap()
+            .contains("local agent")
+        );
+        assert!(
+            first
+                .files
+                .iter()
+                .any(|file| file.path == "agents/example.md")
+        );
+        assert_eq!(
+            first
+                .files
+                .iter()
+                .find(|file| file.path == "opencode.json")
+                .unwrap()
+                .bytes,
+            std::fs::read(root.join("environments/test/opencode.json")).unwrap()
+        );
+        std::fs::write(&local_skill, "second local skill").unwrap();
+        let second = materialize_environment_bundle(&root, "test").unwrap();
+        assert_ne!(first.digest, second.digest);
+        assert!(second.verify_digest(&server_authorized_digest).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -171,6 +171,7 @@ impl EgressManager {
             })?;
         let args = self.preflight_container_invocation(&runtime, allowed, image);
         let mut command = tokio::process::Command::new("docker");
+        command.kill_on_drop(true);
         command.args(&args);
         let output = command
             .output()
@@ -374,6 +375,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
                 );
             }
             let mut rm = tokio::process::Command::new("docker");
+            rm.kill_on_drop(true);
             rm.arg("network").arg("rm").arg(name);
             run_status(
                 &mut rm,
@@ -383,6 +385,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
         }
 
         let mut cmd = tokio::process::Command::new("docker");
+        cmd.kill_on_drop(true);
         cmd.arg("network")
             .arg("create")
             .arg("--driver")
@@ -498,12 +501,14 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
                 );
             }
             let mut rm = tokio::process::Command::new("docker");
+            rm.kill_on_drop(true);
             rm.arg("rm").arg("-f").arg(container_name);
             run_status(&mut rm, "docker rm proxy container failed").await?;
         }
 
         if should_recreate {
             let mut run = tokio::process::Command::new("docker");
+            run.kill_on_drop(true);
             run.arg("run")
                 .arg("-d")
                 .arg("--restart")
@@ -547,6 +552,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
             }
 
             let mut connect = tokio::process::Command::new("docker");
+            connect.kill_on_drop(true);
             connect
                 .arg("network")
                 .arg("connect")
@@ -574,6 +580,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
 
     async fn ensure_container_running(&self, container_name: &str) -> anyhow::Result<bool> {
         let mut inspect = tokio::process::Command::new("docker");
+        inspect.kill_on_drop(true);
         inspect
             .arg("inspect")
             .arg("--format")
@@ -587,6 +594,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
         }
 
         let mut start = tokio::process::Command::new("docker");
+        start.kill_on_drop(true);
         start.arg("start").arg(container_name);
         run_status(&mut start, "docker start proxy container failed").await?;
         Ok(true)
@@ -598,6 +606,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
         network_name: &str,
     ) -> anyhow::Result<()> {
         let mut inspect = tokio::process::Command::new("docker");
+        inspect.kill_on_drop(true);
         inspect
             .arg("inspect")
             .arg("--format")
@@ -613,6 +622,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
         }
 
         let mut connect = tokio::process::Command::new("docker");
+        connect.kill_on_drop(true);
         connect
             .arg("network")
             .arg("connect")
@@ -703,6 +713,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
         network_name: &str,
     ) -> anyhow::Result<bool> {
         let mut inspect = tokio::process::Command::new("docker");
+        inspect.kill_on_drop(true);
         inspect
             .arg("inspect")
             .arg("--format")
@@ -721,6 +732,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
         network_name: &str,
     ) -> anyhow::Result<Option<String>> {
         let mut inspect = tokio::process::Command::new("docker");
+        inspect.kill_on_drop(true);
         inspect
             .arg("inspect")
             .arg("--format")
@@ -776,6 +788,7 @@ if curl --fail -sS --connect-timeout 5 --max-time 10 -o /dev/null https://exampl
 
 async fn docker_network_inspect(name: &str) -> anyhow::Result<Option<serde_json::Value>> {
     let mut cmd = tokio::process::Command::new("docker");
+    cmd.kill_on_drop(true);
     cmd.arg("network").arg("inspect").arg(name);
     let output = cmd.output().await?;
     if !output.status.success() {
@@ -788,6 +801,7 @@ async fn docker_network_inspect(name: &str) -> anyhow::Result<Option<serde_json:
 
 async fn docker_container_inspect(name: &str) -> anyhow::Result<Option<serde_json::Value>> {
     let mut cmd = tokio::process::Command::new("docker");
+    cmd.kill_on_drop(true);
     cmd.arg("inspect").arg(name);
     let output = cmd.output().await?;
     if !output.status.success() {
@@ -810,6 +824,7 @@ async fn run_status(cmd: &mut tokio::process::Command, context: &str) -> anyhow:
 
 async fn container_running(container_name: &str) -> anyhow::Result<bool> {
     let mut inspect = tokio::process::Command::new("docker");
+    inspect.kill_on_drop(true);
     inspect
         .arg("inspect")
         .arg("--format")

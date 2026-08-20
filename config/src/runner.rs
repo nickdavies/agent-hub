@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -66,10 +66,7 @@ pub enum ManagedRunnerKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OpencodeRunnerConfig {
-    #[serde(
-        default = "default_opencode_validation_attempts",
-        deserialize_with = "deserialize_u32_lenient"
-    )]
+    #[serde(default = "default_opencode_validation_attempts")]
     pub max_validation_attempts: u32,
 }
 
@@ -107,11 +104,20 @@ pub struct ResolvedRunnerProfile {
     pub container_image: Option<String>,
     pub file_mounts: Vec<ManagedRunnerFileMount>,
     pub credential_providers: Vec<CredentialProviderDescriptor>,
+    #[serde(default)]
+    pub trusted_mounts: Vec<TrustedMountDescriptor>,
     pub mcp_bridges: Vec<McpBridgeDescriptor>,
     pub egress: serde_json::Value,
     pub github_hosts: Vec<String>,
     pub opencode: OpencodeRunnerConfig,
     pub config_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TrustedMountDescriptor {
+    pub purpose: String,
+    pub container_path: String,
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,19 +133,104 @@ pub struct McpBridgeDescriptor {
 }
 
 impl RunnerProfilesConfig {
+    pub fn validated(mut self) -> Result<Self, String> {
+        validate_optional_identifier(self.default_agent_id.as_deref(), "default_agent_id")?;
+        validate_runner_spec(&mut self.default_agent, "default_agent")?;
+        let mut normalized_runners = HashMap::new();
+        for (name, mut spec) in self.managed_runners {
+            validate_identifier(&name, "managed runner name")?;
+            validate_runner_spec(&mut spec, &name)?;
+            if normalized_runners.insert(name.clone(), spec).is_some() {
+                return Err(format!("duplicate managed runner '{name}'"));
+            }
+        }
+        self.managed_runners = normalized_runners;
+        self.github_hosts = canonical_unique_strings(&self.github_hosts, "github_hosts", true)?;
+        self.egress = canonicalize_egress(self.egress)?;
+        for (name, definition) in &self.credential_providers {
+            validate_identifier(name, "credential provider name")?;
+            let object = definition
+                .as_object()
+                .ok_or_else(|| format!("credential provider '{name}' must be an object"))?;
+            let provider_type = definition
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("credential provider '{name}' has no type"))?;
+            validate_identifier(provider_type, "credential provider type")?;
+            if let Some(declared_name) = object.get("name").and_then(serde_json::Value::as_str) {
+                validate_identifier(declared_name, "credential provider declared name")?;
+                if declared_name != name {
+                    return Err(format!(
+                        "credential provider key '{name}' does not match declared name '{declared_name}'"
+                    ));
+                }
+            }
+            for key in [
+                "host_auth_path",
+                "container_path",
+                "capture_file",
+                "capture_env",
+            ] {
+                if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
+                    validate_exact_nonempty(value, &format!("credential provider '{name}' {key}"))?;
+                }
+            }
+        }
+        let mut bridge_names = BTreeSet::new();
+        for bridge in &self.mcp_bridges {
+            let descriptor = mcp_bridge_descriptor(bridge)?;
+            let object = bridge
+                .as_object()
+                .ok_or_else(|| "MCP bridge must be an object".to_string())?;
+            validate_identifier(&descriptor.name, "MCP bridge name")?;
+            if object.get("name").and_then(serde_json::Value::as_str)
+                != Some(descriptor.name.as_str())
+            {
+                return Err(format!(
+                    "MCP bridge '{}' name is noncanonical",
+                    descriptor.name
+                ));
+            }
+            validate_exact_nonempty(&descriptor.container_socket_path, "MCP container socket")?;
+            validate_exact_nonempty(&descriptor.target, "MCP endpoint target")?;
+            for argument in &descriptor.args {
+                validate_exact_nonempty(argument, "MCP endpoint argument")?;
+            }
+            let mut env_keys = BTreeSet::new();
+            for key in &descriptor.env_keys {
+                validate_identifier(key, "MCP environment key")?;
+                if !env_keys.insert(key) {
+                    return Err(format!(
+                        "MCP bridge '{}' has duplicate environment key",
+                        descriptor.name
+                    ));
+                }
+            }
+            if !bridge_names.insert(descriptor.name.clone()) {
+                return Err(format!("duplicate MCP bridge name '{}'", descriptor.name));
+            }
+        }
+        self.resolve_agent_profile(None)?;
+        let mut names = self.managed_runners.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            self.resolve_profile(name.clone(), &self.managed_runners[&name])?;
+        }
+        Ok(self)
+    }
+
     pub fn resolve_agent_profile(
         &self,
         requested_name: Option<&str>,
     ) -> Result<ResolvedRunnerProfile, String> {
+        if let Some(name) = requested_name
+            && name != "auto"
+        {
+            validate_identifier(name, "requested runner profile")?;
+        }
         let requested = requested_name
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != "auto")
-            .or_else(|| {
-                self.default_agent_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-            });
+            .filter(|value| *value != "auto")
+            .or(self.default_agent_id.as_deref());
         let (name, spec) = match requested {
             Some(name) => (
                 name.to_string(),
@@ -156,10 +247,8 @@ impl RunnerProfilesConfig {
         &self,
         operation: &str,
     ) -> Result<ResolvedRunnerProfile, String> {
-        let name = operation.trim();
-        if name.is_empty() {
-            return Err("managed operation must not be empty".to_string());
-        }
+        validate_identifier(operation, "managed operation")?;
+        let name = operation;
         let spec = self
             .managed_runners
             .get(name)
@@ -173,9 +262,14 @@ impl RunnerProfilesConfig {
         spec: &ManagedRunnerSpec,
     ) -> Result<ResolvedRunnerProfile, String> {
         let mut spec = spec.clone();
-        normalize_runner_spec(&mut spec);
+        validate_runner_spec(&mut spec, &name)?;
         if spec.command.is_empty() {
             return Err(format!("managed runner profile '{name}' has no command"));
+        }
+        if spec.kind == ManagedRunnerKind::Opencode && !spec.file_mounts.is_empty() {
+            return Err(format!(
+                "OpenCode runner profile '{name}' must not declare host file mounts"
+            ));
         }
         let mut credential_providers = spec
             .requires_credentials
@@ -190,14 +284,20 @@ impl RunnerProfilesConfig {
             })
             .collect::<Result<Vec<_>, _>>()?;
         credential_providers.sort_by(|left, right| left.name.cmp(&right.name));
-        credential_providers.dedup_by(|left, right| left.name == right.name);
         let mut mcp_bridges = self
             .mcp_bridges
             .iter()
             .map(mcp_bridge_descriptor)
             .collect::<Result<Vec<_>, _>>()?;
         mcp_bridges.sort_by(|left, right| left.name.cmp(&right.name));
-        mcp_bridges.dedup_by(|left, right| left.name == right.name);
+        if mcp_bridges
+            .windows(2)
+            .any(|bridges| bridges[0].name == bridges[1].name)
+        {
+            return Err(format!(
+                "managed runner profile '{name}' has duplicate MCP bridge names"
+            ));
+        }
         let mut github_hosts = self
             .github_hosts
             .iter()
@@ -215,6 +315,7 @@ impl RunnerProfilesConfig {
             container_image: spec.container_image,
             file_mounts: spec.file_mounts,
             credential_providers,
+            trusted_mounts: trusted_mounts_for_kind(spec.kind),
             mcp_bridges,
             egress: canonical_set_json(merge_json_defaults(
                 default_egress_value(),
@@ -333,6 +434,7 @@ pub fn digest_profile(profile: &ResolvedRunnerProfile) -> Result<String, String>
             &right.targets,
         ))
     });
+    canonical.trusted_mounts.sort();
     canonical
         .mcp_bridges
         .sort_by(|left, right| left.name.cmp(&right.name));
@@ -489,6 +591,7 @@ fn credential_descriptor(
             .flat_map(|key| string_target(object, key))
             .collect(),
         "kubeconfig-filter" => string_target(object, "container_path"),
+        "opencode-chatgpt-oauth" => vec!["/opencode/data/opencode/auth.json".to_string()],
         other => {
             return Err(format!(
                 "credential provider '{configured_name}' has unsupported type '{other}'"
@@ -504,6 +607,34 @@ fn credential_descriptor(
     })
 }
 
+fn trusted_mounts_for_kind(kind: ManagedRunnerKind) -> Vec<TrustedMountDescriptor> {
+    if kind != ManagedRunnerKind::Opencode {
+        return Vec::new();
+    }
+    vec![
+        TrustedMountDescriptor {
+            purpose: "environment_bundle".to_string(),
+            container_path: "/opencode/config/opencode".to_string(),
+            read_only: true,
+        },
+        TrustedMountDescriptor {
+            purpose: "xdg_data".to_string(),
+            container_path: "/opencode/data".to_string(),
+            read_only: false,
+        },
+        TrustedMountDescriptor {
+            purpose: "xdg_state".to_string(),
+            container_path: "/opencode/state".to_string(),
+            read_only: false,
+        },
+        TrustedMountDescriptor {
+            purpose: "xdg_cache".to_string(),
+            container_path: "/opencode/cache".to_string(),
+            read_only: false,
+        },
+    ]
+}
+
 fn string_target(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Vec<String> {
     object
         .get(key)
@@ -514,60 +645,158 @@ fn string_target(object: &serde_json::Map<String, serde_json::Value>, key: &str)
         .unwrap_or_default()
 }
 
-fn normalize_runner_spec(spec: &mut ManagedRunnerSpec) {
-    spec.command = spec.command.trim().to_string();
-    spec.container_image = spec
-        .container_image
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    spec.file_mounts.retain(|mount| {
-        !mount.host_path.trim().is_empty() && !mount.container_path.trim().is_empty()
-    });
-    for mount in &mut spec.file_mounts {
-        mount.host_path = mount.host_path.trim().to_string();
-        mount.container_path = mount.container_path.trim().to_string();
+fn validate_runner_spec(spec: &mut ManagedRunnerSpec, name: &str) -> Result<(), String> {
+    validate_exact_nonempty(&spec.command, &format!("runner '{name}' command"))?;
+    if let Some(image) = &spec.container_image {
+        validate_exact_nonempty(image, &format!("runner '{name}' image"))?;
     }
-    spec.requires_credentials = spec
-        .requires_credentials
-        .iter()
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .collect();
-    spec.requires_credentials.sort();
-    spec.requires_credentials.dedup();
+    for (index, argument) in spec.args.iter().enumerate() {
+        validate_exact_nonempty(argument, &format!("runner '{name}' argument {index}"))?;
+        if argument.contains('\0') {
+            return Err(format!("runner '{name}' argument {index} contains NUL"));
+        }
+    }
+    for mount in &spec.file_mounts {
+        validate_exact_nonempty(&mount.host_path, &format!("runner '{name}' mount source"))?;
+        validate_exact_nonempty(
+            &mount.container_path,
+            &format!("runner '{name}' mount destination"),
+        )?;
+    }
+    let mut credentials = BTreeSet::new();
+    for credential in &spec.requires_credentials {
+        validate_identifier(credential, &format!("runner '{name}' credential"))?;
+        if !credentials.insert(credential.clone()) {
+            return Err(format!(
+                "runner '{name}' has duplicate credential '{credential}'"
+            ));
+        }
+    }
+    spec.requires_credentials = credentials.into_iter().collect();
+    if spec.kind == ManagedRunnerKind::Opencode && spec.opencode.max_validation_attempts == 0 {
+        return Err(format!(
+            "runner '{name}' max_validation_attempts must be greater than zero"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_nonempty(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.trim() != value {
+        return Err(format!(
+            "{label} must be non-empty without surrounding whitespace"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_identifier(value: &str, label: &str) -> Result<(), String> {
+    validate_exact_nonempty(value, label)?;
+    if value.chars().any(char::is_control) {
+        return Err(format!("{label} contains control characters"));
+    }
+    Ok(())
+}
+
+fn validate_optional_identifier(value: Option<&str>, label: &str) -> Result<(), String> {
+    if let Some(value) = value {
+        validate_identifier(value, label)?;
+    }
+    Ok(())
+}
+
+fn canonical_unique_strings(
+    values: &[String],
+    label: &str,
+    lowercase: bool,
+) -> Result<Vec<String>, String> {
+    let mut canonical = BTreeSet::new();
+    for value in values {
+        validate_exact_nonempty(value, label)?;
+        let value = if lowercase {
+            value.to_ascii_lowercase()
+        } else {
+            value.clone()
+        };
+        if !canonical.insert(value.clone()) {
+            return Err(format!("{label} contains duplicate '{value}'"));
+        }
+    }
+    Ok(canonical.into_iter().collect())
+}
+
+fn canonicalize_egress(value: serde_json::Value) -> Result<serde_json::Value, String> {
+    fn walk(value: serde_json::Value, key: Option<&str>) -> Result<serde_json::Value, String> {
+        match value {
+            serde_json::Value::Object(object) => {
+                let mut output = serde_json::Map::new();
+                for (raw_key, value) in object {
+                    let key_name = if key == Some("providers") {
+                        let canonical = raw_key.to_ascii_lowercase();
+                        validate_exact_nonempty(&raw_key, "egress provider name")?;
+                        canonical
+                    } else {
+                        raw_key
+                    };
+                    let child_key = if key == Some("providers") {
+                        "provider_hosts"
+                    } else {
+                        &key_name
+                    };
+                    if output
+                        .insert(key_name.clone(), walk(value, Some(child_key))?)
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "egress contains duplicate canonical key '{key_name}'"
+                        ));
+                    }
+                }
+                Ok(serde_json::Value::Object(output))
+            }
+            serde_json::Value::Array(values) => {
+                if key.is_some_and(|key| key.contains("hosts")) || key == Some("providers") {
+                    let strings = values
+                        .into_iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(ToOwned::to_owned)
+                                .ok_or_else(|| "egress host lists must contain strings".to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(serde_json::Value::Array(
+                        canonical_unique_strings(&strings, "egress hosts", true)?
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ));
+                }
+                Ok(serde_json::Value::Array(
+                    values
+                        .into_iter()
+                        .map(|value| walk(value, key))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            }
+            serde_json::Value::String(value) => {
+                validate_exact_nonempty(&value, "egress string")?;
+                Ok(serde_json::Value::String(
+                    if key == Some("default_provider") {
+                        value.to_ascii_lowercase()
+                    } else {
+                        value
+                    },
+                ))
+            }
+            other => Ok(other),
+        }
+    }
+    Ok(canonical_set_json(walk(value, None)?))
 }
 
 fn default_opencode_validation_attempts() -> u32 {
     3
-}
-
-fn deserialize_u32_lenient<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Number(number) => {
-            if let Some(value) = number.as_u64()
-                && let Ok(value) = u32::try_from(value)
-            {
-                return Ok(value);
-            }
-            if let Some(value) = number.as_f64()
-                && value >= 0.0
-                && value <= f64::from(u32::MAX)
-                && value.fract() == 0.0
-            {
-                return Ok(value as u32);
-            }
-            Err(D::Error::custom("expected an unsigned 32-bit integer"))
-        }
-        other => Err(D::Error::custom(format!("expected a number, got {other}"))),
-    }
 }
 
 fn default_managed_agent_runner() -> ManagedRunnerSpec {
@@ -588,6 +817,183 @@ fn default_managed_agent_runner() -> ManagedRunnerSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canonical_test_config() -> RunnerProfilesConfig {
+        RunnerProfilesConfig {
+            default_agent: ManagedRunnerSpec {
+                kind: ManagedRunnerKind::Opencode,
+                command: "sh".to_string(),
+                args: vec!["-lc".to_string(), "runner script".to_string()],
+                container_image: Some("agent-hub/job-code:locked".to_string()),
+                requires_credentials: vec!["openai:oauth".to_string()],
+                ..ManagedRunnerSpec::default()
+            },
+            credential_providers: HashMap::from([(
+                "openai:oauth".to_string(),
+                serde_json::json!({"type":"opencode-chatgpt-oauth","host_auth_path":"/auth.json","safety_margin_secs":60}),
+            )]),
+            egress: serde_json::json!({
+                "llm":{"default_provider":"openai","providers":{"openai":["auth.openai.com","chatgpt.com"]}}
+            }),
+            github_hosts: vec!["github.com".to_string()],
+            ..RunnerProfilesConfig::default()
+        }
+    }
+
+    #[test]
+    fn canonical_runner_validation_rejects_ambiguous_representations() {
+        let valid = canonical_test_config().validated().unwrap();
+        assert_eq!(valid.default_agent.requires_credentials, ["openai:oauth"]);
+
+        for mutation in [
+            "command_whitespace",
+            "empty_argument",
+            "argument_whitespace",
+            "image_whitespace",
+            "zero_attempts",
+            "duplicate_credentials",
+            "duplicate_hosts",
+            "empty_egress_host",
+            "credential_name_mismatch",
+            "mcp_whitespace",
+            "duplicate_provider_casing",
+        ] {
+            let mut config = canonical_test_config();
+            match mutation {
+                "command_whitespace" => config.default_agent.command = " sh".to_string(),
+                "empty_argument" => config.default_agent.args.push(String::new()),
+                "argument_whitespace" => config.default_agent.args[0] = " -lc".to_string(),
+                "image_whitespace" => {
+                    config.default_agent.container_image = Some("image ".to_string())
+                }
+                "zero_attempts" => config.default_agent.opencode.max_validation_attempts = 0,
+                "duplicate_credentials" => config
+                    .default_agent
+                    .requires_credentials
+                    .push("openai:oauth".to_string()),
+                "duplicate_hosts" => config.github_hosts.push("GITHUB.COM".to_string()),
+                "empty_egress_host" => {
+                    config.egress["llm"]["providers"]["openai"] =
+                        serde_json::json!(["chatgpt.com", ""])
+                }
+                "credential_name_mismatch" => {
+                    config.credential_providers.get_mut("openai:oauth").unwrap()["name"] =
+                        serde_json::json!("other")
+                }
+                "mcp_whitespace" => {
+                    config.mcp_bridges = vec![serde_json::json!({
+                        "name":" bridge",
+                        "host_endpoint":{"type":"unix","path":"/tmp/bridge.sock"},
+                        "container_socket_path":"/tmp/container.sock"
+                    })]
+                }
+                "duplicate_provider_casing" => {
+                    config.egress["llm"]["providers"]["OpenAI"] =
+                        serde_json::json!(["auth.openai.com"])
+                }
+                _ => unreachable!(),
+            }
+            assert!(config.validated().is_err(), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn canonical_runner_normalizes_host_casing_and_order_once() {
+        let mut first = canonical_test_config();
+        first.egress = serde_json::json!({
+            "llm":{"default_provider":"OPENAI","providers":{"OpenAI":["CHATGPT.COM","auth.openai.com"]}}
+        });
+        first.github_hosts = vec!["GITHUB.COM".to_string()];
+        let first = first.validated().unwrap();
+        let second = canonical_test_config().validated().unwrap();
+        assert_eq!(
+            first.resolve_agent_profile(None).unwrap(),
+            second.resolve_agent_profile(None).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_profile_digest_binds_command_arguments_image_and_attempts() {
+        let base = canonical_test_config().validated().unwrap();
+        let base_digest = base.resolve_agent_profile(None).unwrap().config_digest;
+        for mutation in ["command", "argument", "image", "attempts"] {
+            let mut config = canonical_test_config();
+            match mutation {
+                "command" => config.default_agent.command = "other".to_string(),
+                "argument" => config.default_agent.args[1] = "other script".to_string(),
+                "image" => config.default_agent.container_image = Some("other:image".to_string()),
+                "attempts" => config.default_agent.opencode.max_validation_attempts = 4,
+                _ => unreachable!(),
+            }
+            let digest = config
+                .validated()
+                .unwrap()
+                .resolve_agent_profile(None)
+                .unwrap()
+                .config_digest;
+            assert_ne!(digest, base_digest, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn profile_digest_binds_every_authorized_runner_security_field() {
+        let profile = canonical_test_config()
+            .validated()
+            .unwrap()
+            .resolve_agent_profile(None)
+            .unwrap();
+        let baseline = profile.config_digest.clone();
+        for mutation in [
+            "kind",
+            "credential_identity",
+            "credential_type",
+            "credential_targets",
+            "egress_policy",
+            "provider_hosts",
+            "github_hosts",
+            "mcp_bridge",
+            "trusted_mount",
+            "file_mount",
+        ] {
+            let mut mutated = profile.clone();
+            match mutation {
+                "kind" => mutated.kind = ManagedRunnerKind::Generic,
+                "credential_identity" => {
+                    mutated.credential_providers[0].name = "other:credential".to_string()
+                }
+                "credential_type" => {
+                    mutated.credential_providers[0].provider_type = "other-type".to_string()
+                }
+                "credential_targets" => mutated.credential_providers[0]
+                    .targets
+                    .push("/other/target".to_string()),
+                "egress_policy" => mutated.egress["proxy"]["listen_port"] = serde_json::json!(9999),
+                "provider_hosts" => {
+                    mutated.egress["llm"]["providers"]["openai"] =
+                        serde_json::json!(["different.example.com"])
+                }
+                "github_hosts" => mutated
+                    .github_hosts
+                    .push("enterprise.example.com".to_string()),
+                "mcp_bridge" => mutated.mcp_bridges.push(McpBridgeDescriptor {
+                    name: "bridge".to_string(),
+                    endpoint_type: "unix".to_string(),
+                    target: "/tmp/source.sock".to_string(),
+                    container_socket_path: "/tmp/target.sock".to_string(),
+                    args: Vec::new(),
+                    env_keys: Vec::new(),
+                }),
+                "trusted_mount" => mutated.trusted_mounts[0].read_only = false,
+                "file_mount" => mutated.file_mounts.push(ManagedRunnerFileMount {
+                    host_path: "/host".to_string(),
+                    container_path: "/container".to_string(),
+                    read_only: true,
+                }),
+                _ => unreachable!(),
+            }
+            assert_ne!(digest_profile(&mutated).unwrap(), baseline, "{mutation}");
+        }
+    }
 
     #[test]
     fn profile_digest_excludes_credential_values_and_is_deterministic() {
@@ -618,5 +1024,79 @@ mod tests {
     fn named_profile_never_falls_back() {
         let config = RunnerProfilesConfig::default();
         assert!(config.resolve_agent_profile(Some("missing")).is_err());
+    }
+
+    #[test]
+    fn opencode_profile_binds_oauth_identity_and_worker_mount_plan() {
+        let config = RunnerProfilesConfig {
+            default_agent: ManagedRunnerSpec {
+                kind: ManagedRunnerKind::Opencode,
+                command: "opencode".to_string(),
+                requires_credentials: vec!["openai:chatgpt-oauth".to_string()],
+                ..ManagedRunnerSpec::default()
+            },
+            credential_providers: HashMap::from([(
+                "openai:chatgpt-oauth".to_string(),
+                serde_json::json!({
+                    "type":"opencode-chatgpt-oauth",
+                    "host_auth_path":"/not-authorized/by-profile",
+                    "safety_margin_secs":300
+                }),
+            )]),
+            ..RunnerProfilesConfig::default()
+        };
+        let profile = config.resolve_agent_profile(None).unwrap();
+        assert_eq!(
+            profile.credential_providers[0].provider_type,
+            "opencode-chatgpt-oauth"
+        );
+        assert_eq!(
+            profile.credential_providers[0].targets,
+            ["/opencode/data/opencode/auth.json"]
+        );
+        assert_eq!(profile.trusted_mounts.len(), 4);
+        assert!(
+            profile
+                .trusted_mounts
+                .iter()
+                .any(|mount| { mount.purpose == "environment_bundle" && mount.read_only })
+        );
+    }
+
+    #[test]
+    fn opencode_profile_rejects_host_mounts() {
+        let config = RunnerProfilesConfig {
+            default_agent: ManagedRunnerSpec {
+                kind: ManagedRunnerKind::Opencode,
+                command: "opencode".to_string(),
+                file_mounts: vec![ManagedRunnerFileMount {
+                    host_path: "/var/run/docker.sock".to_string(),
+                    container_path: "/var/run/docker.sock".to_string(),
+                    read_only: false,
+                }],
+                ..ManagedRunnerSpec::default()
+            },
+            ..RunnerProfilesConfig::default()
+        };
+        assert!(config.resolve_agent_profile(None).is_err());
+    }
+
+    #[test]
+    fn profile_rejects_duplicate_mcp_bridge_names() {
+        let bridge = serde_json::json!({
+            "name":"duplicate",
+            "host_endpoint":{"type":"unix","path":"/tmp/source.sock"},
+            "container_socket_path":"/tmp/target.sock"
+        });
+        let config = RunnerProfilesConfig {
+            default_agent: ManagedRunnerSpec {
+                kind: ManagedRunnerKind::Generic,
+                command: "true".to_string(),
+                ..ManagedRunnerSpec::default()
+            },
+            mcp_bridges: vec![bridge.clone(), bridge],
+            ..RunnerProfilesConfig::default()
+        };
+        assert!(config.resolve_agent_profile(None).is_err());
     }
 }

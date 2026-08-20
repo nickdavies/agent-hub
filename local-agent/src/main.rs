@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use chrono::Utc;
@@ -32,7 +35,6 @@ mod mcp_bridge;
 mod pb_conv;
 mod workspace;
 
-use agent_hub_config::RunnerProfilesConfig;
 use artifacts::{
     AdditionalRepoMountView, AgentContextWriteParams, collect_structured_transcript_artifacts,
     display_paths_for_runtime, file_len_u64, normalize_github_repo_slug_with_allowlist,
@@ -43,7 +45,7 @@ use client::{
     Client, GrpcClient, HttpClient, JobUpdateOutcome, is_worker_not_found_error,
     start_grpc_event_stream,
 };
-use credential_provider::{ResolvedCredentials, resolve_all};
+use credential_provider::{ResolvedCredentials, resolve_all_for_job};
 use egress::{EgressManager, llm_provider_from_env};
 use egress_config::{LocalAgentConfig, ManagedRunnerKind, load_local_agent_config};
 use mcp_bridge::{McpBridgeInstance, container_socket_path, mcp_socket_env_var};
@@ -59,6 +61,9 @@ pub mod pb {
 #[derive(Parser)]
 #[command(name = "local-agent", version)]
 struct Cli {
+    /// Validate immutable/local configuration without connecting or resolving credentials.
+    #[arg(long)]
+    validate_config: bool,
     #[arg(
         long,
         env = "AGENT_HUB_SERVER",
@@ -257,7 +262,13 @@ fn canonical_approved_repository_roots(
         .context("canonicalize HOME")?;
     let mut roots = Vec::new();
     for configured_root in &local_agent_config.approved_repository_roots {
-        let absolute = resolve_to_absolute(configured_root).with_context(|| {
+        let expanded = expand_home_path(&configured_root.to_string_lossy()).with_context(|| {
+            format!(
+                "expand approved repository root {}",
+                configured_root.display()
+            )
+        })?;
+        let absolute = resolve_to_absolute(&expanded).with_context(|| {
             format!(
                 "resolve approved repository root {}",
                 configured_root.display()
@@ -424,9 +435,12 @@ fn validate_triage_repos_and_prime_cache(
     repo_cache_dir: &Path,
 ) -> anyhow::Result<Vec<String>> {
     if local_agent_config.triage_repos.is_empty() {
-        anyhow::bail!(
-            "assignment-driven triage requires at least one pre-materialized triage_repos directory"
-        );
+        if !local_agent_config.approved_repository_roots.is_empty() {
+            anyhow::bail!("approved_repository_roots must be empty when triage_repos is empty");
+        }
+        std::fs::create_dir_all(repo_cache_dir)
+            .with_context(|| format!("create repo cache directory {}", repo_cache_dir.display()))?;
+        return Ok(Vec::new());
     }
     let approved_roots = canonical_approved_repository_roots(local_agent_config)?;
     std::fs::create_dir_all(repo_cache_dir)
@@ -946,7 +960,12 @@ mod tests {
         let cache = tmp.join("cache");
 
         let empty = LocalAgentConfig::default();
-        assert!(validate_triage_repos_and_prime_cache(&empty, &cache).is_err());
+        assert!(
+            validate_triage_repos_and_prime_cache(&empty, &cache)
+                .expect("explicit empty triage set")
+                .is_empty()
+        );
+        assert!(cache.is_dir());
 
         let mut remote = LocalAgentConfig::default();
         remote.triage_repos = vec!["https://github.com/reddit/agent-hub.git".to_string()];
@@ -962,6 +981,74 @@ mod tests {
                 .is_empty()
         );
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn checked_in_server_discovery_mounts_are_accepted_by_worker_before_jobs() {
+        let root =
+            std::env::temp_dir().join(format!("combined-triage-config-{}", uuid::Uuid::new_v4()));
+        let repos = root.join("repos");
+        let repo = repos.join("agent-hub");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let config_root = root.join("config");
+        std::fs::create_dir_all(&config_root).unwrap();
+        std::fs::write(
+            config_root.join("system.toml"),
+            format!(
+                "[system]\noperator='test'\nbot_identity='test'\n[system.repo_discovery]\nenabled=true\n[[system.repo_discovery.strategies]]\ntype='directory'\npath='{}'\ninclude=[]\nexclude=[]\n",
+                repo.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            config_root.join("local-agent.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "triage_repos":[repo.clone()],
+                "approved_repository_roots":[repos],
+                "triage_mounts":[{"host_path":repo.clone(),"container_path":"/repos/agent-hub","read_only":true}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mounts = agent_hub_config::checked_in_triage_repository_mounts(&config_root).unwrap();
+        let expected_mounts = mounts.clone();
+        let mut worker_config = LocalAgentConfig::default();
+        worker_config.triage_repos = vec![repo.to_string_lossy().into_owned()];
+        worker_config.approved_repository_roots = vec![repos];
+        validate_triage_repos_and_prime_cache(&worker_config, &root.join("cache")).unwrap();
+        let job = triage_validation_tests::triage_job();
+        let mut runtime = canonical_runtime_spec_for_job(&job);
+        runtime.environment.file_mounts = mounts
+            .into_iter()
+            .map(|mount| protocol::orchestration::PlannedFileMount {
+                host_path: mount.host_path.to_string_lossy().into_owned(),
+                container_path: mount.container_path,
+                read_only: true,
+            })
+            .collect();
+        runtime.environment.file_mounts =
+            validate_untrusted_runtime_mounts(&runtime, &worker_config).unwrap();
+        validate_exact_triage_mounts_against(&runtime, &expected_mounts).unwrap();
+        let runner = ResolvedRunnerSpec {
+            kind: ResolvedRunnerKind::Opencode(OpencodeManagedSpec {
+                max_validation_attempts: 1,
+            }),
+            command: "sh".to_string(),
+            args: Vec::new(),
+            file_mounts: Vec::new(),
+            requires_credentials: vec!["openai:chatgpt-oauth".to_string()],
+        };
+        validate_triage_mount_and_credential_requests(true, &runner, &runtime, &worker_config)
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1439,6 +1526,7 @@ mod tests {
                 updated_at: now,
             };
 
+            let deadline = JobDeadline::new(job.timeout_secs).unwrap();
             let status = supervise_process(
                 &job,
                 &workspace,
@@ -1446,6 +1534,7 @@ mod tests {
                 &transcript.join("stdout.log"),
                 &transcript.join("stderr.log"),
                 &std::collections::HashMap::new(),
+                &deadline,
                 None,
                 None,
                 None,
@@ -1507,6 +1596,7 @@ mod tests {
             };
 
             let started = Instant::now();
+            let deadline = JobDeadline::new(job.timeout_secs).unwrap();
             let status = supervise_process_with_output_validation(
                 &job,
                 &workspace,
@@ -1514,7 +1604,8 @@ mod tests {
                 &transcript.join("stdout.log"),
                 &transcript.join("stderr.log"),
                 &std::collections::HashMap::new(),
-                job.timeout_secs,
+                &deadline,
+                None,
                 &output_path,
                 &["job_succeeded".to_string()],
                 &serde_json::json!({}),
@@ -1581,6 +1672,7 @@ mod tests {
                 updated_at: now,
             };
 
+            let deadline = JobDeadline::new(job.timeout_secs).unwrap();
             let status = supervise_process_with_output_validation(
                 &job,
                 &workspace,
@@ -1588,7 +1680,8 @@ mod tests {
                 &transcript.join("stdout.log"),
                 &transcript.join("stderr.log"),
                 &std::collections::HashMap::new(),
-                job.timeout_secs,
+                &deadline,
+                None,
                 &output_path,
                 &["job_succeeded".to_string()],
                 &serde_json::json!({}),
@@ -1603,6 +1696,99 @@ mod tests {
             assert!(matches!(status, ExecutionStatus::TimedOut));
 
             let _ = std::fs::remove_dir_all(root);
+        });
+    }
+
+    #[test]
+    fn synthetic_auth_output_is_redacted_from_all_worker_boundaries() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let canary = "synthetic-execution-access-token";
+            let root = std::env::temp_dir().join(format!(
+                "redacted-execution-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let workspace = root.join("workspace");
+            let transcript = root.join("transcript");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::create_dir_all(&transcript).unwrap();
+            let auth = workspace.join("auth.json");
+            std::fs::write(
+                &auth,
+                format!("{{\"openai\":{{\"type\":\"oauth\",\"access\":\"{canary}\"}}}}"),
+            )
+            .unwrap();
+            let output_path = transcript.join("output.json");
+            let script = format!(
+                "token=$(sed -n 's/.*\"access\":\"\\([^\"]*\\)\".*/\\1/p' '{}'); printf '%s\\n' \"$token\"; printf '%s\\n' \"$token\" >&2; printf '{{\"next_event\":\"job_succeeded\",\"summary\":\"%s\"}}' \"$token\" > '{}'; sleep 2",
+                auth.display(),
+                output_path.display()
+            );
+            let now = Utc::now();
+            let job = Job {
+                id: uuid::Uuid::new_v4(),
+                work_item_id: uuid::Uuid::new_v4(),
+                step_id: "redaction".into(),
+                state: JobState::Assigned,
+                assigned_worker_id: Some("worker".into()),
+                execution_mode: ExecutionMode::Docker,
+                container_image: None,
+                command: "sh".into(),
+                args: vec!["-lc".into(), script],
+                env: HashMap::new(),
+                prompt: None,
+                context: serde_json::json!({}),
+                repo: None,
+                timeout_secs: Some(10),
+                max_retries: 0,
+                attempt: 0,
+                transcript_dir: None,
+                result: None,
+                lease_expires_at: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let events_path = transcript.join("job-events.jsonl");
+            let events = JobEventSink {
+                worker_id: "worker".to_string(),
+                writer: Arc::new(Mutex::new(
+                    JobEventTranscriptWriter::create(&events_path).await.unwrap(),
+                )),
+                publisher: None,
+            };
+            let redactor = ExactTokenRedactor::new(vec![canary.to_string()]);
+            let deadline = JobDeadline::new(job.timeout_secs).unwrap();
+            let stdout = transcript.join("stdout.log");
+            let stderr = transcript.join("stderr.log");
+            let transcript_jsonl = transcript.join("transcript.jsonl");
+            let status = supervise_process_with_output_validation(
+                &job,
+                &workspace,
+                &transcript_jsonl,
+                &stdout,
+                &stderr,
+                &HashMap::new(),
+                &deadline,
+                Some(redactor.clone()),
+                &output_path,
+                &["job_succeeded".to_string()],
+                &serde_json::json!({}),
+                &EnvironmentValidationTable::for_tests(),
+                Some(&events),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(status, ExecutionStatus::Exited(0)));
+            assert!(!format!("{redactor:?}").contains(canary));
+            assert_eq!(redactor.redact(canary), "[REDACTED_ACCESS_TOKEN]");
+            for path in [stdout, stderr, transcript_jsonl, events_path, output_path] {
+                let persisted = std::fs::read_to_string(&path).unwrap();
+                assert!(!persisted.contains(canary), "{}", path.display());
+                assert!(persisted.contains("[REDACTED_ACCESS_TOKEN]"));
+            }
+            std::fs::remove_dir_all(root).unwrap();
         });
     }
 
@@ -1649,6 +1835,7 @@ mod tests {
             let stderr_path = transcript.join("stderr.log");
             let env = std::collections::HashMap::new();
 
+            let deadline = JobDeadline::new(job.timeout_secs).unwrap();
             let run = supervise_process(
                 &job,
                 &workspace,
@@ -1656,7 +1843,8 @@ mod tests {
                 &stdout_path,
                 &stderr_path,
                 &env,
-                Some(60),
+                &deadline,
+                None,
                 None,
                 Some(cancel_rx),
             );
@@ -3043,6 +3231,18 @@ mod tests {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.validate_config {
+        let config = load_local_agent_config(cli.local_agent_config.as_deref())
+            .context("failed to load local-agent config")?;
+        config.resolve_default_agent(cli.default_agent.as_deref())?;
+        validate_triage_repos_and_prime_cache(
+            &config,
+            &cli.data_dir.join("config-validation-repo-cache"),
+        )
+        .context("failed to validate configured triage repos")?;
+        println!("local-agent configuration is valid");
+        return Ok(());
+    }
     let modes = vec![ExecutionMode::Docker];
 
     let client = match cli.transport {
@@ -3076,7 +3276,7 @@ async fn main() -> anyhow::Result<()> {
     let client = Arc::new(client);
 
     std::fs::create_dir_all(&cli.data_dir)?;
-    let mut local_agent_config = load_local_agent_config(cli.local_agent_config.as_deref())
+    let local_agent_config = load_local_agent_config(cli.local_agent_config.as_deref())
         .context("failed to load local-agent config")?;
 
     {
@@ -3087,8 +3287,19 @@ async fn main() -> anyhow::Result<()> {
             "info: effective default agent: {} (kind={:?}, command={:?})",
             resolved_label, resolved_clone.kind, resolved_clone.command
         );
-        local_agent_config.default_agent = resolved_clone;
     }
+    reconcile_opencode_startup(
+        &cli.data_dir,
+        &DockerCli::production(),
+        &local_agent_config.installation_id,
+        &local_agent_config.config_identity,
+        &cli.worker_id,
+        STARTUP_RECONCILIATION_MAX_ITEMS,
+        STARTUP_RECONCILIATION_TIMEOUT,
+        Arc::new(SystemWallClock),
+    )
+    .await
+    .context("startup OpenCode container/state reconciliation failed")?;
     let repo_cache_dir = cli.data_dir.join("repo-cache");
     let remote_repos = validate_triage_repos_and_prime_cache(&local_agent_config, &repo_cache_dir)
         .context("failed to validate configured triage repos")?;
@@ -3401,7 +3612,7 @@ async fn run_job(
     worker_id: &str,
     transcript_dir: &str,
     transcript_rel_dir: &str,
-    _data_dir: &Path,
+    data_dir: &Path,
     repos_root: &Path,
     worktrees_root: &Path,
     egress_manager: &EgressManager,
@@ -3412,10 +3623,34 @@ async fn run_job(
     let verified = verify_authorized_job(job, local_agent_config)?;
     let job = &verified.job;
     let runtime_spec = verified.runtime_spec;
+    let deadline = JobDeadline::new(runtime_spec.environment.timeout_secs)?;
     let resolved_runner = verified.runner;
     let work_item_context = verified.work_item_context;
     let triage_job = verified.triage;
     let github_action = verified.github_action;
+    let environment_bundle = verified.environment_bundle;
+
+    let opencode_job_state = if matches!(resolved_runner.kind, ResolvedRunnerKind::Opencode(_)) {
+        Some(
+            OpencodeJobState::prepare(
+                data_dir,
+                ContainerOwnership {
+                    installation_id: local_agent_config.installation_id.clone(),
+                    config_identity: local_agent_config.config_identity.clone(),
+                    worker_id: worker_id.to_string(),
+                    job_id: job.id,
+                    attempt: job.attempt,
+                },
+                environment_bundle
+                    .as_ref()
+                    .context("OpenCode job has no authorized environment bundle")?,
+                &DockerCli::production(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     let transcript_dir = resolve_to_absolute(Path::new(transcript_dir))
         .with_context(|| format!("resolve transcript dir {}", transcript_dir))?
@@ -3579,12 +3814,8 @@ async fn run_job(
                 error_message: None,
             })
         };
-        let operation = run_authorized_github_operation(
-            operation,
-            runtime_spec.environment.timeout_secs,
-            cancel_rx.clone(),
-        )
-        .await;
+        let operation =
+            run_authorized_github_operation(operation, &deadline, cancel_rx.clone()).await;
         return finalize_required_cleanup(
             operation,
             cleanup_workspace(job, &prepared_workspace, Some(&job_event_sink)),
@@ -3809,7 +4040,7 @@ async fn run_job(
                     &stderr_path,
                     &output_path,
                     &env,
-                    runtime_spec.environment.timeout_secs,
+                    &deadline,
                     runtime_spec.environment.container_image.clone(),
                     &runtime_spec,
                     &local_egress_plan,
@@ -3819,6 +4050,9 @@ async fn run_job(
                     workflow_valid_next_events_from_job_context(&job.context).unwrap_or_default(),
                     work_item_context.clone(),
                     &environment_table,
+                    opencode_job_state
+                        .as_ref()
+                        .context("OpenCode job state was not prepared")?,
                     Some(&job_event_sink),
                     Some(cancel_rx.clone()),
                 )
@@ -3834,7 +4068,7 @@ async fn run_job(
                     &stdout_path,
                     &stderr_path,
                     &env,
-                    runtime_spec.environment.timeout_secs,
+                    &deadline,
                     runtime_spec.environment.container_image.clone(),
                     &runtime_spec,
                     &local_egress_plan,
@@ -4017,6 +4251,16 @@ async fn run_job(
             .collect();
     }
 
+    if let Some(state) = opencode_job_state.as_ref() {
+        if let Err(error) = &execution_result {
+            execution_result = Err(state.redact_error(error));
+        }
+        if let Err(cleanup_error) = state.cleanup().await {
+            execution_result =
+                Err(state.redact_error(&cleanup_error.context("finalize OpenCode per-job state")));
+        }
+    }
+
     execution_result
 }
 
@@ -4027,6 +4271,2356 @@ struct VerifiedAuthorizedJob {
     work_item_context: serde_json::Value,
     triage: bool,
     github_action: Option<protocol::GithubAction>,
+    environment_bundle: Option<agent_hub_config::EnvironmentBundle>,
+}
+
+struct OpencodeJobState {
+    root: PathBuf,
+    bundle: PathBuf,
+    data: PathBuf,
+    state: PathBuf,
+    cache: PathBuf,
+    cleaned: AtomicBool,
+    retained: AtomicBool,
+    container_name: String,
+    docker: DockerCli,
+    redactor: RwLock<ExactTokenRedactor>,
+    ownership: ContainerOwnership,
+    ambiguous_create: AtomicBool,
+    clock: Arc<dyn WallClock>,
+    marker_store: Arc<dyn CreateMarkerStore>,
+}
+
+impl OpencodeJobState {
+    async fn prepare(
+        data_dir: &Path,
+        ownership: ContainerOwnership,
+        bundle: &agent_hub_config::EnvironmentBundle,
+        docker: &DockerCli,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::prepare_with_reconciliation_timeout(
+            data_dir,
+            ownership,
+            bundle,
+            docker,
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    async fn prepare_with_reconciliation_timeout(
+        data_dir: &Path,
+        ownership: ContainerOwnership,
+        bundle: &agent_hub_config::EnvironmentBundle,
+        docker: &DockerCli,
+        reconciliation_timeout: Duration,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::prepare_with_clock(
+            data_dir,
+            ownership,
+            bundle,
+            docker,
+            reconciliation_timeout,
+            Arc::new(SystemWallClock),
+        )
+        .await
+    }
+
+    async fn prepare_with_clock(
+        data_dir: &Path,
+        ownership: ContainerOwnership,
+        bundle: &agent_hub_config::EnvironmentBundle,
+        docker: &DockerCli,
+        reconciliation_timeout: Duration,
+        clock: Arc<dyn WallClock>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::prepare_with_dependencies(
+            data_dir,
+            ownership,
+            bundle,
+            docker,
+            reconciliation_timeout,
+            clock,
+            Arc::new(FsCreateMarkerStore),
+        )
+        .await
+    }
+
+    async fn prepare_with_dependencies(
+        data_dir: &Path,
+        ownership: ContainerOwnership,
+        bundle: &agent_hub_config::EnvironmentBundle,
+        docker: &DockerCli,
+        reconciliation_timeout: Duration,
+        clock: Arc<dyn WallClock>,
+        marker_store: Arc<dyn CreateMarkerStore>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let root = data_dir
+            .join("opencode-jobs")
+            .join(ownership.job_id.to_string());
+        if root.exists() {
+            let container_name = format!("agent-hub-opencode-{}", ownership.job_id.simple());
+            let recorded_ownership: ContainerOwnership = serde_json::from_slice(
+                &tokio::fs::read(root.join("ownership.json"))
+                    .await
+                    .with_context(|| {
+                        format!("read retained ownership marker at {}", root.display())
+                    })?,
+            )
+            .with_context(|| format!("parse retained ownership marker at {}", root.display()))?;
+            if recorded_ownership != ownership {
+                anyhow::bail!(
+                    "retained OpenCode state at '{}' has mismatched immutable ownership",
+                    root.display()
+                );
+            }
+            let recorded_name = tokio::fs::read_to_string(root.join("container-name"))
+                .await
+                .with_context(|| format!("read retained container marker at {}", root.display()))?;
+            if recorded_name.trim() != container_name {
+                anyhow::bail!("retained OpenCode state container marker mismatch");
+            }
+            if root.join(CREATE_MARKER_FAILURE).exists() {
+                anyhow::bail!(
+                    "retained state has a create-marker durability failure; operator action is required"
+                );
+            }
+            let ambiguous_path = root.join(AMBIGUOUS_CREATE_MARKER);
+            if ambiguous_path.exists() {
+                let marker: AmbiguousCreateMarker = serde_json::from_slice(
+                    &tokio::fs::read(&ambiguous_path)
+                        .await
+                        .context("read ambiguous-create marker")?,
+                )
+                .context("parse ambiguous-create marker")?;
+                if marker.ownership != ownership || marker.container_name != container_name {
+                    anyhow::bail!(
+                        "ambiguous-create marker ownership or container identity mismatch"
+                    );
+                }
+                match marker.phase {
+                    CreateLifecyclePhase::CreateSubmitting
+                    | CreateLifecyclePhase::CreateSubmitted => {
+                        let age = ambiguous_marker_age(&marker, clock.as_ref())?;
+                        if age < AMBIGUOUS_CREATE_QUARANTINE {
+                            anyhow::bail!(
+                                "ambiguous-create quarantine remains active for retained state '{}'; retry is blocked",
+                                root.display()
+                            );
+                        }
+                        let deadline = Instant::now()
+                            .checked_add(reconciliation_timeout)
+                            .context("ambiguous-create reconciliation deadline overflow")?;
+                        docker
+                            .reconcile_quarantined_create(&container_name, &ownership, deadline)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "ambiguous-create quarantine for '{}' requires operator action when ownership cannot be established",
+                                    root.display()
+                                )
+                            })?;
+                    }
+                    CreateLifecyclePhase::CreateSucceeded => {
+                        docker
+                            .reconcile_absent(&container_name, &ownership, reconciliation_timeout)
+                            .await?;
+                    }
+                    CreateLifecyclePhase::LocalRejected => anyhow::bail!(
+                        "definitive local create rejection marker could not be removed; operator action is required"
+                    ),
+                }
+            } else {
+                docker
+                    .reconcile_absent(&container_name, &ownership, reconciliation_timeout)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "retained OpenCode state at {} blocks retry until exact container '{}' is proven absent",
+                            root.display(),
+                            container_name
+                        )
+                    })?;
+            }
+            tokio::fs::remove_dir_all(&root).await.with_context(|| {
+                format!("remove reconciled OpenCode job state {}", root.display())
+            })?;
+        }
+        let container_name = format!("agent-hub-opencode-{}", ownership.job_id.simple());
+        let state = Arc::new(Self {
+            bundle: root.join("config"),
+            data: root.join("data"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            root,
+            cleaned: AtomicBool::new(false),
+            retained: AtomicBool::new(false),
+            container_name: container_name.clone(),
+            docker: docker.clone(),
+            redactor: RwLock::new(ExactTokenRedactor::default()),
+            ownership: ownership.clone(),
+            ambiguous_create: AtomicBool::new(false),
+            clock,
+            marker_store,
+        });
+        for directory in [&state.data, &state.state, &state.cache] {
+            std::fs::create_dir_all(directory).with_context(|| {
+                format!("create OpenCode job directory {}", directory.display())
+            })?;
+        }
+        bundle
+            .write_to(&state.bundle)
+            .map_err(anyhow::Error::msg)
+            .context("write authorized OpenCode environment bundle")?;
+        std::fs::write(
+            state.root.join("bundle.sha256"),
+            format!("{}\n", bundle.digest),
+        )
+        .context("write authorized OpenCode environment bundle digest")?;
+        std::fs::write(
+            state.root.join("container-name"),
+            format!("{container_name}\n"),
+        )
+        .context("write exact OpenCode container identity")?;
+        std::fs::write(
+            state.root.join("ownership.json"),
+            serde_json::to_vec_pretty(&ownership)?,
+        )
+        .context("write immutable OpenCode state ownership")?;
+        Ok(state)
+    }
+
+    fn trusted_mounts(&self) -> anyhow::Result<Vec<protocol::orchestration::PlannedFileMount>> {
+        let root = std::fs::canonicalize(&self.root)
+            .with_context(|| format!("canonicalize OpenCode job root {}", self.root.display()))?;
+        let configured = [
+            (&self.bundle, "/opencode/config/opencode", true),
+            (&self.data, "/opencode/data", false),
+            (&self.state, "/opencode/state", false),
+            (&self.cache, "/opencode/cache", false),
+        ];
+        let mut mounts = Vec::new();
+        for (source, destination, read_only) in configured {
+            let source = std::fs::canonicalize(source).with_context(|| {
+                format!("canonicalize trusted OpenCode mount {}", source.display())
+            })?;
+            if !source.starts_with(&root) {
+                anyhow::bail!(
+                    "trusted OpenCode mount '{}' escaped job root '{}'",
+                    source.display(),
+                    root.display()
+                );
+            }
+            let destination = normalize_container_mount_destination(destination)?;
+            if mounts
+                .iter()
+                .any(|existing: &protocol::orchestration::PlannedFileMount| {
+                    paths_shadow(&existing.container_path, &destination)
+                })
+            {
+                anyhow::bail!("trusted OpenCode mount target '{destination}' is ambiguous");
+            }
+            mounts.push(protocol::orchestration::PlannedFileMount {
+                host_path: source.to_string_lossy().into_owned(),
+                container_path: destination,
+                read_only,
+            });
+        }
+        Ok(mounts)
+    }
+
+    async fn cleanup(&self) -> anyhow::Result<()> {
+        if self.cleaned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.retained.load(Ordering::Acquire) {
+            anyhow::bail!(
+                "OpenCode job state retained for cleanup investigation at {}",
+                self.root.display()
+            );
+        }
+        match tokio::fs::remove_dir_all(&self.root).await {
+            Ok(()) => {
+                self.cleaned.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleaned.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("remove OpenCode job state {}", self.root.display())),
+        }
+    }
+
+    async fn retain_for_cleanup_failure(&self, reason: &str) -> anyhow::Result<()> {
+        self.retained.store(true, Ordering::Release);
+        tokio::fs::write(
+            self.root.join("CLEANUP_REQUIRED"),
+            format!("container cleanup failed: {reason}\n"),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "record retained OpenCode job state at {}",
+                self.root.display()
+            )
+        })
+    }
+
+    async fn record_resolved_image(&self, image: &ResolvedOpencodeImage) -> anyhow::Result<()> {
+        tokio::fs::write(
+            self.root.join("resolved-image.json"),
+            serde_json::to_vec_pretty(image)?,
+        )
+        .await
+        .context("write resolved OpenCode image identity")
+    }
+
+    fn create_marker(&self, phase: CreateLifecyclePhase) -> anyhow::Result<AmbiguousCreateMarker> {
+        Ok(AmbiguousCreateMarker {
+            ownership: self.ownership.clone(),
+            container_name: self.container_name.clone(),
+            observed_at_unix_ms: wall_clock_unix_ms(self.clock.as_ref())?,
+            phase,
+        })
+    }
+
+    fn persist_create_phase(&self, phase: CreateLifecyclePhase) -> anyhow::Result<()> {
+        self.marker_store
+            .persist_ambiguous(&self.root, &self.create_marker(phase)?)
+    }
+
+    fn transition_create_success(&self) -> anyhow::Result<()> {
+        self.marker_store.transition_success(
+            &self.root,
+            &self.create_marker(CreateLifecyclePhase::CreateSucceeded)?,
+        )
+    }
+
+    fn clear_definitive_local_rejection(&self) -> anyhow::Result<()> {
+        self.marker_store.clear_local_rejection(
+            &self.root,
+            &self.create_marker(CreateLifecyclePhase::LocalRejected)?,
+        )
+    }
+
+    fn set_redactor(&self, redactor: ExactTokenRedactor) -> anyhow::Result<()> {
+        *self
+            .redactor
+            .write()
+            .map_err(|_| anyhow::anyhow!("OpenCode redactor lock poisoned"))? = redactor;
+        Ok(())
+    }
+
+    fn redact_error(&self, error: &anyhow::Error) -> anyhow::Error {
+        match self.redactor.read() {
+            Ok(redactor) => anyhow::anyhow!(redactor.redact(&format!("{error:#}"))),
+            Err(_) => {
+                anyhow::anyhow!("OpenCode execution failed and redactor lock was unavailable")
+            }
+        }
+    }
+}
+
+impl Drop for OpencodeJobState {
+    fn drop(&mut self) {
+        if self.cleaned.load(Ordering::Acquire) || self.retained.load(Ordering::Acquire) {
+            return;
+        }
+        let root = self.root.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = tokio::fs::remove_dir_all(&root).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "error: failed fallback cleanup of OpenCode job state {}: {error}",
+                        root.display()
+                    );
+                }
+            });
+        } else {
+            eprintln!(
+                "error: OpenCode job state requires cleanup at {} (no async runtime available)",
+                self.root.display()
+            );
+        }
+    }
+}
+
+type ContainerCleanupFuture = Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+type ContainerRemover = Arc<dyn Fn(String) -> ContainerCleanupFuture + Send + Sync>;
+
+struct CredentialContainerCleanupGuard {
+    container_name: String,
+    job_state: Arc<OpencodeJobState>,
+    remover: ContainerRemover,
+    armed: bool,
+}
+
+impl CredentialContainerCleanupGuard {
+    fn production(container_name: String, job_state: Arc<OpencodeJobState>) -> Self {
+        let docker = job_state.docker.clone();
+        let ownership = job_state.ownership.clone();
+        let ambiguity_state = Arc::clone(&job_state);
+        Self::new(
+            container_name,
+            job_state,
+            Arc::new(move |name| {
+                let docker = docker.clone();
+                let ownership = ownership.clone();
+                let ambiguity_state = Arc::clone(&ambiguity_state);
+                Box::pin(async move {
+                    if ambiguity_state.ambiguous_create.load(Ordering::Acquire) {
+                        anyhow::bail!(
+                            "Docker create result is ambiguous; startup/retry ownership reconciliation is required"
+                        );
+                    }
+                    docker
+                        .reconcile_absent(&name, &ownership, Duration::from_secs(30))
+                        .await
+                })
+            }),
+        )
+    }
+
+    fn new(
+        container_name: String,
+        job_state: Arc<OpencodeJobState>,
+        remover: ContainerRemover,
+    ) -> Self {
+        Self {
+            container_name,
+            job_state,
+            remover,
+            armed: true,
+        }
+    }
+
+    async fn cleanup(mut self) -> anyhow::Result<()> {
+        let result = (self.remover)(self.container_name.clone()).await;
+        self.armed = false;
+        if let Err(error) = result {
+            self.job_state
+                .retain_for_cleanup_failure(&format!("{error:#}"))
+                .await?;
+            return Err(error).context("remove credential-bearing OpenCode container");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CredentialContainerCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let name = self.container_name.clone();
+        let state = Arc::clone(&self.job_state);
+        let remover = Arc::clone(&self.remover);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                match remover(name).await {
+                    Ok(()) => {
+                        if let Err(error) = state.cleanup().await {
+                            eprintln!("error: dropped OpenCode job cleanup failed: {error:#}");
+                        }
+                    }
+                    Err(error) => {
+                        if let Err(marker_error) = state
+                            .retain_for_cleanup_failure(&format!("{error:#}"))
+                            .await
+                        {
+                            eprintln!(
+                                "error: dropped OpenCode container cleanup failed and retention marker failed: {error:#}; {marker_error:#}"
+                            );
+                        } else {
+                            eprintln!(
+                                "error: dropped OpenCode container cleanup failed; state retained at {}: {error:#}",
+                                state.root.display()
+                            );
+                        }
+                    }
+                }
+            });
+        } else {
+            eprintln!(
+                "error: credential-bearing container '{}' requires cleanup; state retained at {}",
+                self.container_name,
+                self.job_state.root.display()
+            );
+            self.job_state.retained.store(true, Ordering::Release);
+        }
+    }
+}
+
+async fn finish_credential_container_operation<T>(
+    operation: anyhow::Result<T>,
+    cleanup_guard: CredentialContainerCleanupGuard,
+) -> anyhow::Result<T> {
+    let cleanup = cleanup_guard.cleanup().await;
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(operation), Err(cleanup)) => Err(anyhow::anyhow!(
+            "OpenCode operation failed: {operation:#}; container cleanup also failed: {cleanup:#}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod opencode_job_state_tests {
+    use super::{
+        AMBIGUOUS_CREATE_MARKER, AMBIGUOUS_CREATE_QUARANTINE, ContainerOwnership, ContainerRemover,
+        CreateLifecyclePhase, CreateMarkerStore, CredentialContainerCleanupGuard, DockerCli,
+        DockerRuntimeInvocation, EnvironmentValidationTable, ExactTokenRedactor, ExecutionMode,
+        FsCreateMarkerStore, Job, JobDeadline, JobState, LABEL_ATTEMPT, LABEL_CONFIG,
+        LABEL_INSTALLATION, LABEL_JOB, LABEL_WORKER, OpencodeJobState, OpencodeManagedSpec,
+        ResolvedOpencodeImage, WallClock, finish_credential_container_operation,
+        reconcile_opencode_startup, run_opencode_validation_loop, spawn_opencode_runtime_container,
+    };
+    use chrono::Utc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant, SystemTime};
+    use tokio::sync::watch;
+
+    struct FakeWallClock {
+        wall_ms: AtomicU64,
+        monotonic_base: Instant,
+        monotonic_offset_ms: AtomicU64,
+        monotonic_step_ms: AtomicU64,
+    }
+
+    impl FakeWallClock {
+        fn new(unix_ms: u64) -> Arc<Self> {
+            Arc::new(Self {
+                wall_ms: AtomicU64::new(unix_ms),
+                monotonic_base: Instant::now(),
+                monotonic_offset_ms: AtomicU64::new(0),
+                monotonic_step_ms: AtomicU64::new(0),
+            })
+        }
+
+        fn set(&self, unix_ms: u64) {
+            self.wall_ms.store(unix_ms, Ordering::Release);
+        }
+
+        fn set_monotonic_step(&self, step: Duration) {
+            self.monotonic_step_ms
+                .store(step.as_millis() as u64, Ordering::Release);
+        }
+    }
+
+    impl WallClock for FakeWallClock {
+        fn now(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH + Duration::from_millis(self.wall_ms.load(Ordering::Acquire))
+        }
+
+        fn monotonic_now(&self) -> Instant {
+            let step = self.monotonic_step_ms.load(Ordering::Acquire);
+            let offset = self.monotonic_offset_ms.fetch_add(step, Ordering::AcqRel);
+            self.monotonic_base + Duration::from_millis(offset)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MarkerFailure {
+        Persist,
+        SuccessTransition,
+        Clear,
+    }
+
+    struct FaultMarkerStore {
+        failure: MarkerFailure,
+    }
+
+    impl CreateMarkerStore for FaultMarkerStore {
+        fn persist_ambiguous(
+            &self,
+            root: &std::path::Path,
+            marker: &super::AmbiguousCreateMarker,
+        ) -> anyhow::Result<()> {
+            if matches!(self.failure, MarkerFailure::Persist) {
+                anyhow::bail!("synthetic marker write/fsync failure");
+            }
+            FsCreateMarkerStore.persist_ambiguous(root, marker)
+        }
+
+        fn transition_success(
+            &self,
+            root: &std::path::Path,
+            marker: &super::AmbiguousCreateMarker,
+        ) -> anyhow::Result<()> {
+            if matches!(self.failure, MarkerFailure::SuccessTransition) {
+                FsCreateMarkerStore.persist_ambiguous(root, marker)?;
+                anyhow::bail!("synthetic marker removal/rename failure");
+            }
+            FsCreateMarkerStore.transition_success(root, marker)
+        }
+
+        fn clear_local_rejection(
+            &self,
+            root: &std::path::Path,
+            marker: &super::AmbiguousCreateMarker,
+        ) -> anyhow::Result<()> {
+            if matches!(self.failure, MarkerFailure::Clear) {
+                FsCreateMarkerStore.persist_ambiguous(root, marker)?;
+                anyhow::bail!("synthetic local marker removal failure");
+            }
+            FsCreateMarkerStore.clear_local_rejection(root, marker)
+        }
+    }
+
+    fn bundle() -> agent_hub_config::EnvironmentBundle {
+        agent_hub_config::EnvironmentBundle::from_files(vec![
+            agent_hub_config::EnvironmentBundleFile {
+                path: "opencode.json".to_string(),
+                bytes: b"{}".to_vec(),
+            },
+        ])
+        .unwrap()
+    }
+
+    fn ownership(job_id: uuid::Uuid) -> ContainerOwnership {
+        ContainerOwnership {
+            installation_id: "test-installation".to_string(),
+            config_identity: "test-config".to_string(),
+            worker_id: "test-worker".to_string(),
+            job_id,
+            attempt: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_docker(root: &std::path::Path) -> DockerCli {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = root.join("fake-docker-state");
+        std::fs::create_dir_all(state.join("containers")).unwrap();
+        let command = root.join("fake-docker");
+        std::fs::write(
+            &command,
+            format!(
+                r#"#!/bin/sh
+state='{}'
+containers="$state/containers"
+if [ "$1" = container ] && [ "$2" = inspect ]; then
+  if [ -f "$state/inspect_slow" ]; then sleep 2; fi
+  if [ -f "$state/inspect_fail" ]; then printf 'synthetic inspect failure\n' >&2; exit 2; fi
+  for name; do :; done
+  if [ -f "$containers/$name" ]; then cat "$containers/$name"; printf '\n'; exit 0; fi
+  printf 'No such container\n' >&2; exit 1
+fi
+if [ "$1" = rm ]; then
+  for name; do :; done
+  if [ -f "$state/rm_fail" ]; then printf 'synthetic rm failure\n' >&2; exit 1; fi
+  content=$(cat "$containers/$name" 2>/dev/null)
+  rm -f "$containers/$name"
+  if [ -f "$state/race_once" ]; then printf '%s' "$content" > "$containers/$name"; rm -f "$state/race_once"; fi
+  exit 0
+fi
+if [ "$1" = ps ]; then
+  while [ $# -gt 0 ]; do
+    if [ "$1" = --filter ]; then
+      shift
+      case "$1" in
+        label={LABEL_INSTALLATION}=*) filter_installation=${{1#*=*=}} ;;
+        label={LABEL_CONFIG}=*) filter_config=${{1#*=*=}} ;;
+        label={LABEL_WORKER}=*) filter_worker=${{1#*=*=}} ;;
+      esac
+    fi
+    shift
+  done
+  for path in "$containers"/*; do
+    [ -f "$path" ] || continue
+    content=$(cat "$path")
+    printf '%s' "$content" | grep -Fq '"{LABEL_INSTALLATION}":"'"$filter_installation"'"' || continue
+    printf '%s' "$content" | grep -Fq '"{LABEL_CONFIG}":"'"$filter_config"'"' || continue
+    printf '%s' "$content" | grep -Fq '"{LABEL_WORKER}":"'"$filter_worker"'"' || continue
+    basename "$path"
+  done
+  exit 0
+fi
+if [ "$1" = image ]; then printf 'sha256:{}\n'; exit 0; fi
+if [ "$1" = run ]; then printf '1.18.18\n'; exit 0; fi
+if [ "$1" = create ]; then
+  while [ $# -gt 0 ]; do
+    if [ "$1" = --name ]; then shift; name="$1"; fi
+    if [ "$1" = --label ]; then
+      shift
+      key=${{1%%=*}}; value=${{1#*=}}
+      case "$key" in
+        {LABEL_INSTALLATION}) installation="$value" ;;
+        {LABEL_CONFIG}) config="$value" ;;
+        {LABEL_WORKER}) worker="$value" ;;
+        {LABEL_JOB}) job="$value" ;;
+        {LABEL_ATTEMPT}) attempt="$value" ;;
+      esac
+    fi
+    shift
+  done
+  if [ -f "$state/require_marker_path" ]; then marker=$(cat "$state/require_marker_path"); [ -f "$marker" ] || {{ printf 'missing durable pre-submit marker\n' >&2; exit 97; }}; fi
+  if [ -f "$state/create_fail" ]; then output=$(cat "$state/output_path" 2>/dev/null); printf '{{"next_event":"invalid","summary":"synthetic-edge-canary"}}' > "$output"; printf 'synthetic create failure\n' >&2; exit 1; fi
+  labels=$(printf '{{"{LABEL_INSTALLATION}":"%s","{LABEL_CONFIG}":"%s","{LABEL_WORKER}":"%s","{LABEL_JOB}":"%s","{LABEL_ATTEMPT}":"%s"}}' "$installation" "$config" "$worker" "$job" "$attempt")
+  if [ -f "$state/create_slow" ]; then (sleep 0.8; printf '%s' "$labels" > "$containers/$name") & sleep 2; fi
+  printf '%s' "$labels" > "$containers/$name"; printf 'created\n'; exit 0
+fi
+if [ "$1" = start ]; then
+  if [ -f "$state/start_fail" ]; then output=$(cat "$state/output_path" 2>/dev/null); printf '{{"next_event":"invalid","summary":"synthetic-edge-canary"}}' > "$output"; printf 'synthetic start failure\n' >&2; exit 1; fi
+  exit 0
+fi
+if [ "$1" = exec ]; then
+  scenario=$(cat "$state/scenario" 2>/dev/null || printf success)
+  output=$(cat "$state/output_path" 2>/dev/null)
+  if [ "$scenario" = success ]; then printf '{{"next_event":"job_succeeded"}}' > "$output"; exit 0; fi
+  if [ "$scenario" = validation ]; then printf '{{"next_event":"invalid"}}' > "$output"; exit 0; fi
+  if [ "$scenario" = timeout ] || [ "$scenario" = cancellation ]; then printf '{{"next_event":"invalid","summary":"synthetic-edge-canary"}}' > "$output"; sleep 3; exit 0; fi
+  exit 1
+fi
+exit 0
+"#,
+                state.display(),
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&command, permissions).unwrap();
+        DockerCli { command }
+    }
+
+    fn fake_invocation(
+        root: &std::path::Path,
+        state: Arc<OpencodeJobState>,
+        timeout_secs: u64,
+    ) -> DockerRuntimeInvocation {
+        let image_id = format!("sha256:{}", "a".repeat(64));
+        DockerRuntimeInvocation {
+            command: state.docker.command.to_string_lossy().into_owned(),
+            args: vec![
+                "run".to_string(),
+                "--rm".to_string(),
+                "--entrypoint".to_string(),
+                "sh".to_string(),
+                image_id.clone(),
+            ],
+            env: std::collections::HashMap::new(),
+            deadline: JobDeadline::new(Some(timeout_secs)).unwrap(),
+            workspace_dir: root.to_path_buf(),
+            transcript_jsonl_path: root.join("transcript.jsonl"),
+            stdout_path: root.join("stdout.log"),
+            stderr_path: root.join("stderr.log"),
+            job_state: state,
+            resolved_image: ResolvedOpencodeImage {
+                configured_image: agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string(),
+                image_id,
+                binary_path: "/usr/local/bin/opencode".to_string(),
+                version: "1.18.18".to_string(),
+            },
+            redactor: ExactTokenRedactor::new(vec!["synthetic-edge-canary".to_string()]),
+            mcp_bridges: Vec::new(),
+        }
+    }
+
+    fn write_owned_container(root: &std::path::Path, state: &OpencodeJobState) {
+        write_container(root, &state.container_name, &state.ownership);
+    }
+
+    fn write_container(root: &std::path::Path, name: &str, ownership: &ContainerOwnership) {
+        let labels = ownership
+            .labels()
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        std::fs::write(
+            root.join("fake-docker-state/containers").join(name),
+            serde_json::to_vec(&labels).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn read_create_marker(root: &std::path::Path) -> super::AmbiguousCreateMarker {
+        serde_json::from_slice(&std::fs::read(root.join(AMBIGUOUS_CREATE_MARKER)).unwrap()).unwrap()
+    }
+
+    fn fake_job(id: uuid::Uuid, timeout_secs: u64) -> Job {
+        let now = Utc::now();
+        Job {
+            id,
+            work_item_id: uuid::Uuid::new_v4(),
+            step_id: "fake-opencode".to_string(),
+            state: JobState::Assigned,
+            assigned_worker_id: Some("worker".to_string()),
+            execution_mode: ExecutionMode::Docker,
+            container_image: Some(agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string()),
+            command: "sh".to_string(),
+            args: vec!["-lc".to_string(), "opencode run".to_string()],
+            env: std::collections::HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: Some(timeout_secs),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn job_state_is_isolated_and_removed_after_explicit_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-opencode-state-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let bundle = bundle();
+        let first_id = uuid::Uuid::new_v4();
+        let second_id = uuid::Uuid::new_v4();
+        let docker = DockerCli::production();
+        let first = OpencodeJobState::prepare(&root, ownership(first_id), &bundle, &docker)
+            .await
+            .unwrap();
+        let second = OpencodeJobState::prepare(&root, ownership(second_id), &bundle, &docker)
+            .await
+            .unwrap();
+        assert_ne!(first.root, second.root);
+        assert!(first.bundle.join("opencode.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(first.root.join("bundle.sha256")).unwrap(),
+            format!("{}\n", bundle.digest)
+        );
+        assert!(second.bundle.join("opencode.json").exists());
+        let mounts = first.trusted_mounts().unwrap();
+        assert!(mounts.iter().any(|mount| {
+            mount.container_path == "/opencode/config/opencode" && mount.read_only
+        }));
+        for destination in ["/opencode/data", "/opencode/state", "/opencode/cache"] {
+            assert!(
+                mounts
+                    .iter()
+                    .any(|mount| { mount.container_path == destination && !mount.read_only })
+            );
+        }
+        let first_root = first.root.clone();
+        let second_root = second.root.clone();
+        first.cleanup().await.unwrap();
+        drop(first);
+        assert!(!first_root.exists());
+        assert!(second_root.exists());
+        second.cleanup().await.unwrap();
+        drop(second);
+        assert!(!second_root.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removal_failure_retains_state_and_surfaces_error_without_panicking_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-cleanup-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = OpencodeJobState::prepare(
+            &root,
+            ownership(uuid::Uuid::new_v4()),
+            &bundle(),
+            &DockerCli::production(),
+        )
+        .await
+        .unwrap();
+        let state_root = state.root.clone();
+        let remover: ContainerRemover =
+            Arc::new(|_| Box::pin(async { anyhow::bail!("synthetic container removal failure") }));
+        let error =
+            CredentialContainerCleanupGuard::new("container".into(), Arc::clone(&state), remover)
+                .cleanup()
+                .await
+                .expect_err("cleanup failure must fail the job");
+        assert!(error.to_string().contains("credential-bearing"));
+        assert!(state_root.join("CLEANUP_REQUIRED").exists());
+        assert!(state.cleanup().await.is_err());
+        drop(state);
+        assert!(state_root.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_guard_runs_async_fallback_before_state_cleanup() {
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-cleanup-drop-{}", uuid::Uuid::new_v4()));
+        let state = OpencodeJobState::prepare(
+            &root,
+            ownership(uuid::Uuid::new_v4()),
+            &bundle(),
+            &DockerCli::production(),
+        )
+        .await
+        .unwrap();
+        let state_root = state.root.clone();
+        let state_root_for_remover = state_root.clone();
+        let remover: ContainerRemover = Arc::new(move |_| {
+            let state_root = state_root_for_remover.clone();
+            Box::pin(async move {
+                assert!(state_root.exists());
+                Ok(())
+            })
+        });
+        let guard =
+            CredentialContainerCleanupGuard::new("container".into(), Arc::clone(&state), remover);
+        drop(guard);
+        drop(state);
+        for _ in 0..50 {
+            if !state_root.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!state_root.exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_job_retry_reconciles_exact_container_before_reusing_state() {
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-same-job-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        let job_id = uuid::Uuid::new_v4();
+        let state = OpencodeJobState::prepare(&root, ownership(job_id), &bundle(), &docker)
+            .await
+            .unwrap();
+        let old_auth = state.data.join("opencode/auth.json");
+        std::fs::create_dir_all(old_auth.parent().unwrap()).unwrap();
+        std::fs::write(&old_auth, "synthetic-old-secret").unwrap();
+        std::fs::write(state.root.join("CLEANUP_REQUIRED"), "retained").unwrap();
+        write_owned_container(&root, &state);
+        let old_root = state.root.clone();
+        state.retained.store(true, Ordering::Release);
+        drop(state);
+
+        let retried = OpencodeJobState::prepare(&root, ownership(job_id), &bundle(), &docker)
+            .await
+            .unwrap();
+        assert_eq!(retried.root, old_root);
+        assert!(!old_auth.exists());
+        assert!(!retried.root.join("CLEANUP_REQUIRED").exists());
+        assert!(
+            !root
+                .join("fake-docker-state/containers")
+                .join(&retried.container_name)
+                .exists()
+        );
+        retried.cleanup().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_job_retry_keeps_retained_credentials_when_absence_cannot_be_proved() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-same-job-blocked-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        let job_id = uuid::Uuid::new_v4();
+        let state = OpencodeJobState::prepare(&root, ownership(job_id), &bundle(), &docker)
+            .await
+            .unwrap();
+        let auth = state.data.join("opencode/auth.json");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        std::fs::write(&auth, "synthetic-retained-secret").unwrap();
+        write_owned_container(&root, &state);
+        std::fs::write(root.join("fake-docker-state/rm_fail"), "fail").unwrap();
+        state.retained.store(true, Ordering::Release);
+        drop(state);
+
+        assert!(
+            OpencodeJobState::prepare_with_reconciliation_timeout(
+                &root,
+                ownership(job_id),
+                &bundle(),
+                &docker,
+                Duration::from_millis(150),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&auth).unwrap(),
+            "synthetic-retained-secret"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_reconciliation_handles_delayed_creation_race_before_state_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-startup-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        let job_id = uuid::Uuid::new_v4();
+        let state = OpencodeJobState::prepare(&root, ownership(job_id), &bundle(), &docker)
+            .await
+            .unwrap();
+        write_owned_container(&root, &state);
+        std::fs::write(root.join("fake-docker-state/race_once"), "race").unwrap();
+        let state_root = state.root.clone();
+        state.retained.store(true, Ordering::Release);
+        drop(state);
+
+        reconcile_opencode_startup(
+            &root,
+            &docker,
+            "test-installation",
+            "test-config",
+            "test-worker",
+            10,
+            Duration::from_secs(5),
+            FakeWallClock::new(2_000_000_000_000),
+        )
+        .await
+        .unwrap();
+        assert!(!state_root.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_reconciliation_ignores_unrelated_prefix_and_rejects_wrong_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-startup-ownership-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        let unrelated_name = "agent-hub-opencode-unrelated";
+        let mut unrelated = ownership(uuid::Uuid::new_v4());
+        unrelated.worker_id = "other-worker".to_string();
+        write_container(&root, unrelated_name, &unrelated);
+        reconcile_opencode_startup(
+            &root,
+            &docker,
+            "test-installation",
+            "test-config",
+            "test-worker",
+            10,
+            Duration::from_secs(2),
+            FakeWallClock::new(2_000_000_000_000),
+        )
+        .await
+        .unwrap();
+        assert!(
+            root.join("fake-docker-state/containers")
+                .join(unrelated_name)
+                .exists()
+        );
+
+        let job_id = uuid::Uuid::new_v4();
+        let state = OpencodeJobState::prepare(&root, ownership(job_id), &bundle(), &docker)
+            .await
+            .unwrap();
+        let mut wrong = state.ownership.clone();
+        wrong.config_identity = "wrong-config".to_string();
+        write_container(&root, &state.container_name, &wrong);
+        state.retained.store(true, Ordering::Release);
+        let state_root = state.root.clone();
+        drop(state);
+        assert!(
+            reconcile_opencode_startup(
+                &root,
+                &docker,
+                "test-installation",
+                "test-config",
+                "test-worker",
+                10,
+                Duration::from_secs(2),
+                FakeWallClock::new(2_000_000_000_000),
+            )
+            .await
+            .is_err()
+        );
+        assert!(state_root.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_reconciliation_rejects_wrong_state_owner_and_global_bounds() {
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-startup-bounds-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        let first =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+        let second =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+        first.retained.store(true, Ordering::Release);
+        second.retained.store(true, Ordering::Release);
+        let first_root = first.root.clone();
+        let second_root = second.root.clone();
+        drop(first);
+        drop(second);
+        assert!(
+            reconcile_opencode_startup(
+                &root,
+                &docker,
+                "test-installation",
+                "test-config",
+                "test-worker",
+                1,
+                Duration::from_secs(2),
+                FakeWallClock::new(2_000_000_000_000),
+            )
+            .await
+            .is_err()
+        );
+        assert!(first_root.exists() && second_root.exists());
+
+        let mut wrong: ContainerOwnership =
+            serde_json::from_slice(&std::fs::read(first_root.join("ownership.json")).unwrap())
+                .unwrap();
+        wrong.installation_id = "wrong-installation".to_string();
+        std::fs::write(
+            first_root.join("ownership.json"),
+            serde_json::to_vec(&wrong).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            reconcile_opencode_startup(
+                &root,
+                &docker,
+                "test-installation",
+                "test-config",
+                "test-worker",
+                10,
+                Duration::from_secs(2),
+                FakeWallClock::new(2_000_000_000_000),
+            )
+            .await
+            .is_err()
+        );
+        assert!(first_root.exists());
+
+        std::fs::write(
+            first_root.join("ownership.json"),
+            serde_json::to_vec(&ownership(wrong.job_id)).unwrap(),
+        )
+        .unwrap();
+        write_container(
+            &root,
+            "agent-hub-opencode-slow-owned",
+            &ownership(uuid::Uuid::new_v4()),
+        );
+        std::fs::write(root.join("fake-docker-state/inspect_slow"), "slow").unwrap();
+        assert!(
+            reconcile_opencode_startup(
+                &root,
+                &docker,
+                "test-installation",
+                "test-config",
+                "test-worker",
+                10,
+                Duration::from_millis(100),
+                FakeWallClock::new(2_000_000_000_000),
+            )
+            .await
+            .is_err()
+        );
+        assert!(first_root.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_enumeration_is_bounded_for_large_directories_and_injected_deadlines() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-startup-enumeration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let jobs = root.join("opencode-jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        for index in 0..100 {
+            std::fs::create_dir_all(jobs.join(format!("item-{index:03}"))).unwrap();
+        }
+        let docker = fake_docker(&root);
+        assert!(
+            reconcile_opencode_startup(
+                &root,
+                &docker,
+                "test-installation",
+                "test-config",
+                "test-worker",
+                10,
+                Duration::from_secs(5),
+                FakeWallClock::new(2_000_000_000_000),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&jobs).unwrap().count(), 100);
+
+        let clock = FakeWallClock::new(2_000_000_000_000);
+        clock.set_monotonic_step(Duration::from_millis(60));
+        assert!(
+            reconcile_opencode_startup(
+                &root,
+                &docker,
+                "test-installation",
+                "test-config",
+                "test-worker",
+                200,
+                Duration::from_millis(100),
+                clock,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&jobs).unwrap().count(), 100);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_docker_create_start_failures_and_success_are_reconciled() {
+        for edge in ["success", "create_fail", "start_fail"] {
+            let root = std::env::temp_dir().join(format!(
+                "agent-hub-fake-lifecycle-{edge}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let docker = fake_docker(&root);
+            if edge != "success" {
+                std::fs::write(root.join(format!("fake-docker-state/{edge}")), edge).unwrap();
+            }
+            let state = OpencodeJobState::prepare(
+                &root,
+                ownership(uuid::Uuid::new_v4()),
+                &bundle(),
+                &docker,
+            )
+            .await
+            .unwrap();
+            std::fs::write(
+                root.join("fake-docker-state/require_marker_path"),
+                state
+                    .root
+                    .join(AMBIGUOUS_CREATE_MARKER)
+                    .to_string_lossy()
+                    .as_bytes(),
+            )
+            .unwrap();
+            let invocation = fake_invocation(&root, Arc::clone(&state), 10);
+            let guard = CredentialContainerCleanupGuard::production(
+                state.container_name.clone(),
+                Arc::clone(&state),
+            );
+            let operation =
+                spawn_opencode_runtime_container(&invocation, &state.container_name).await;
+            if edge == "success" {
+                assert!(!state.root.join(AMBIGUOUS_CREATE_MARKER).exists());
+                assert!(state.root.join(super::CREATE_OUTCOME_MARKER).exists());
+            }
+            let result = finish_credential_container_operation(operation, guard).await;
+            assert_eq!(result.is_ok(), edge == "success", "{edge}");
+            assert!(
+                !root
+                    .join("fake-docker-state/containers")
+                    .join(&state.container_name)
+                    .exists()
+            );
+            if edge == "create_fail" {
+                assert!(state.root.join(AMBIGUOUS_CREATE_MARKER).exists());
+                assert!(state.root.join("CLEANUP_REQUIRED").exists());
+            } else {
+                state.cleanup().await.unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ambiguous_create_quarantine_blocks_immediate_and_just_before_retry_then_removes_owned_container()
+     {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-ambiguous-quarantine-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        let clock = FakeWallClock::new(1_000_000);
+        let clock_trait: Arc<dyn WallClock> = clock.clone();
+        let owner = ownership(uuid::Uuid::new_v4());
+        let state = OpencodeJobState::prepare_with_clock(
+            &root,
+            owner.clone(),
+            &bundle(),
+            &docker,
+            Duration::from_secs(2),
+            Arc::clone(&clock_trait),
+        )
+        .await
+        .unwrap();
+        state
+            .persist_create_phase(CreateLifecyclePhase::CreateSubmitted)
+            .unwrap();
+        assert!(
+            state
+                .retain_for_cleanup_failure("synthetic ambiguous create")
+                .await
+                .is_ok()
+        );
+        let retained_root = state.root.clone();
+        let container_name = state.container_name.clone();
+        state.retained.store(true, Ordering::Release);
+        drop(state);
+
+        assert!(
+            OpencodeJobState::prepare_with_clock(
+                &root,
+                owner.clone(),
+                &bundle(),
+                &docker,
+                Duration::from_secs(2),
+                Arc::clone(&clock_trait),
+            )
+            .await
+            .is_err()
+        );
+        assert!(retained_root.exists());
+
+        clock.set(1_000_000 + AMBIGUOUS_CREATE_QUARANTINE.as_millis() as u64 - 1);
+        assert!(
+            OpencodeJobState::prepare_with_clock(
+                &root,
+                owner.clone(),
+                &bundle(),
+                &docker,
+                Duration::from_secs(2),
+                Arc::clone(&clock_trait),
+            )
+            .await
+            .is_err()
+        );
+        assert!(retained_root.exists());
+
+        clock.set(1_000_000 + AMBIGUOUS_CREATE_QUARANTINE.as_millis() as u64);
+        write_container(&root, &container_name, &owner);
+        let reconciled = OpencodeJobState::prepare_with_clock(
+            &root,
+            owner,
+            &bundle(),
+            &docker,
+            Duration::from_secs(2),
+            clock_trait,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reconciled.root, retained_root);
+        assert!(!reconciled.root.join("CLEANUP_REQUIRED").exists());
+        assert!(!reconciled.root.join(AMBIGUOUS_CREATE_MARKER).exists());
+        reconciled.cleanup().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn elapsed_ambiguous_quarantine_preserves_absent_or_unverifiable_state_for_operator() {
+        for scenario in ["absent", "unverifiable"] {
+            let root = std::env::temp_dir().join(format!(
+                "agent-hub-ambiguous-{scenario}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let docker = fake_docker(&root);
+            let clock = FakeWallClock::new(1_000_000);
+            let clock_trait: Arc<dyn WallClock> = clock.clone();
+            let owner = ownership(uuid::Uuid::new_v4());
+            let state = OpencodeJobState::prepare_with_clock(
+                &root,
+                owner.clone(),
+                &bundle(),
+                &docker,
+                Duration::from_secs(2),
+                Arc::clone(&clock_trait),
+            )
+            .await
+            .unwrap();
+            state
+                .persist_create_phase(CreateLifecyclePhase::CreateSubmitted)
+                .unwrap();
+            state.retained.store(true, Ordering::Release);
+            let retained_root = state.root.clone();
+            drop(state);
+            if scenario == "unverifiable" {
+                std::fs::write(root.join("fake-docker-state/inspect_fail"), "fail").unwrap();
+            }
+            clock.set(1_000_000 + AMBIGUOUS_CREATE_QUARANTINE.as_millis() as u64);
+            assert!(
+                OpencodeJobState::prepare_with_clock(
+                    &root,
+                    owner,
+                    &bundle(),
+                    &docker,
+                    Duration::from_millis(200),
+                    clock_trait,
+                )
+                .await
+                .is_err()
+            );
+            assert!(retained_root.exists());
+            assert!(retained_root.join(AMBIGUOUS_CREATE_MARKER).exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_marker_is_durable_before_submit_and_survives_pre_and_post_submit_crashes() {
+        for phase in [
+            CreateLifecyclePhase::CreateSubmitting,
+            CreateLifecyclePhase::CreateSubmitted,
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "agent-hub-create-crash-{phase:?}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let docker = fake_docker(&root);
+            let clock = FakeWallClock::new(1_000_000);
+            let owner = ownership(uuid::Uuid::new_v4());
+            let state = OpencodeJobState::prepare_with_clock(
+                &root,
+                owner.clone(),
+                &bundle(),
+                &docker,
+                Duration::from_secs(2),
+                clock.clone(),
+            )
+            .await
+            .unwrap();
+            state
+                .persist_create_phase(CreateLifecyclePhase::CreateSubmitting)
+                .unwrap();
+            if phase == CreateLifecyclePhase::CreateSubmitted {
+                state
+                    .persist_create_phase(CreateLifecyclePhase::CreateSubmitted)
+                    .unwrap();
+                write_owned_container(&root, &state);
+            }
+            assert_eq!(read_create_marker(&state.root).phase, phase);
+            let state_root = state.root.clone();
+            state.retained.store(true, Ordering::Release);
+            drop(state);
+            assert!(
+                OpencodeJobState::prepare_with_clock(
+                    &root,
+                    owner,
+                    &bundle(),
+                    &docker,
+                    Duration::from_secs(2),
+                    clock,
+                )
+                .await
+                .is_err()
+            );
+            assert!(state_root.exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_marker_failures_and_definitive_transitions_fail_closed() {
+        for failure in [
+            MarkerFailure::Persist,
+            MarkerFailure::SuccessTransition,
+            MarkerFailure::Clear,
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("agent-hub-marker-failure-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let docker = fake_docker(&root);
+            let state = OpencodeJobState::prepare_with_dependencies(
+                &root,
+                ownership(uuid::Uuid::new_v4()),
+                &bundle(),
+                &docker,
+                Duration::from_secs(2),
+                FakeWallClock::new(1_000_000),
+                Arc::new(FaultMarkerStore { failure }),
+            )
+            .await
+            .unwrap();
+            match failure {
+                MarkerFailure::Persist => {
+                    let invocation = fake_invocation(&root, Arc::clone(&state), 10);
+                    let guard = CredentialContainerCleanupGuard::production(
+                        state.container_name.clone(),
+                        Arc::clone(&state),
+                    );
+                    let operation =
+                        spawn_opencode_runtime_container(&invocation, &state.container_name).await;
+                    assert!(operation.is_err());
+                    assert!(
+                        finish_credential_container_operation(operation, guard)
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        !root
+                            .join("fake-docker-state/containers")
+                            .join(&state.container_name)
+                            .exists()
+                    );
+                    assert!(state.root.join(super::CREATE_MARKER_FAILURE).exists());
+                }
+                MarkerFailure::SuccessTransition => {
+                    state
+                        .persist_create_phase(CreateLifecyclePhase::CreateSubmitted)
+                        .unwrap();
+                    write_owned_container(&root, &state);
+                    state.ambiguous_create.store(true, Ordering::Release);
+                    assert!(state.transition_create_success().is_err());
+                    assert_eq!(
+                        read_create_marker(&state.root).phase,
+                        CreateLifecyclePhase::CreateSucceeded
+                    );
+                }
+                MarkerFailure::Clear => {
+                    state
+                        .persist_create_phase(CreateLifecyclePhase::CreateSubmitting)
+                        .unwrap();
+                    state.ambiguous_create.store(true, Ordering::Release);
+                    assert!(state.clear_definitive_local_rejection().is_err());
+                    assert_eq!(
+                        read_create_marker(&state.root).phase,
+                        CreateLifecyclePhase::LocalRejected
+                    );
+                }
+            }
+            state
+                .retain_for_cleanup_failure("synthetic marker transition failure")
+                .await
+                .unwrap();
+            assert!(state.root.join("CLEANUP_REQUIRED").exists());
+            assert!(state.cleanup().await.is_err());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-marker-success-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        let state =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+        state
+            .persist_create_phase(CreateLifecyclePhase::CreateSubmitted)
+            .unwrap();
+        state.transition_create_success().unwrap();
+        assert!(!state.root.join(AMBIGUOUS_CREATE_MARKER).exists());
+        assert!(state.root.join(super::CREATE_OUTCOME_MARKER).exists());
+        state.cleanup().await.unwrap();
+
+        let rejected =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+        rejected
+            .persist_create_phase(CreateLifecyclePhase::CreateSubmitting)
+            .unwrap();
+        rejected.clear_definitive_local_rejection().unwrap();
+        assert!(!rejected.root.join(AMBIGUOUS_CREATE_MARKER).exists());
+        rejected.cleanup().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operation_and_remove_failures_are_reported_together_and_state_is_retained() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-combined-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        let state =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+        write_owned_container(&root, &state);
+        std::fs::write(root.join("fake-docker-state/rm_fail"), "fail").unwrap();
+        let state_for_remover = Arc::clone(&state);
+        let remover: ContainerRemover = Arc::new(move |name| {
+            let state = Arc::clone(&state_for_remover);
+            Box::pin(async move {
+                state
+                    .docker
+                    .reconcile_absent(&name, &state.ownership, Duration::from_millis(150))
+                    .await
+            })
+        });
+        let guard = CredentialContainerCleanupGuard::new(
+            state.container_name.clone(),
+            Arc::clone(&state),
+            remover,
+        );
+        let error = finish_credential_container_operation::<()>(
+            Err(anyhow::anyhow!("synthetic operation failure")),
+            guard,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("synthetic operation failure"));
+        assert!(message.contains("container cleanup also failed"));
+        assert!(state.root.join("CLEANUP_REQUIRED").exists());
+        assert!(state.cleanup().await.is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_docker_execution_edges_always_reconcile_named_container() {
+        for scenario in [
+            "success",
+            "create_fail",
+            "start_fail",
+            "transcript_error",
+            "timeout",
+            "cancellation",
+            "validation",
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "agent-hub-fake-execution-{scenario}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let docker = fake_docker(&root);
+            let job = fake_job(
+                uuid::Uuid::new_v4(),
+                if scenario == "timeout" { 2 } else { 10 },
+            );
+            let state = OpencodeJobState::prepare(&root, ownership(job.id), &bundle(), &docker)
+                .await
+                .unwrap();
+            let mut invocation = fake_invocation(
+                &root,
+                Arc::clone(&state),
+                if scenario == "timeout" { 2 } else { 10 },
+            );
+            let output = root.join("output.json");
+            std::fs::write(
+                root.join("fake-docker-state/output_path"),
+                output.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("fake-docker-state/scenario"),
+                if scenario == "transcript_error" {
+                    "success"
+                } else {
+                    scenario
+                },
+            )
+            .unwrap();
+            if matches!(scenario, "create_fail" | "start_fail") {
+                std::fs::write(root.join(format!("fake-docker-state/{scenario}")), scenario)
+                    .unwrap();
+            }
+            if scenario == "transcript_error" {
+                invocation.stdout_path = root.clone();
+            }
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            if scenario == "cancellation" {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    cancel_tx.send(true).unwrap();
+                });
+            }
+            let result = run_opencode_validation_loop(
+                &job,
+                &OpencodeManagedSpec {
+                    max_validation_attempts: 2,
+                },
+                &invocation,
+                &output,
+                &["job_succeeded".to_string()],
+                &serde_json::json!({}),
+                &EnvironmentValidationTable::for_tests(),
+                None,
+                Some(cancel_rx),
+            )
+            .await;
+            match scenario {
+                "success" => assert!(matches!(result.unwrap(), super::ExecutionStatus::Exited(0))),
+                "timeout" => assert!(matches!(result.unwrap(), super::ExecutionStatus::TimedOut)),
+                "cancellation" => {
+                    assert!(matches!(result.unwrap(), super::ExecutionStatus::Cancelled))
+                }
+                "create_fail" | "start_fail" | "transcript_error" | "validation" => {
+                    assert!(result.is_err())
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !root
+                    .join("fake-docker-state/containers")
+                    .join(&state.container_name)
+                    .exists(),
+                "{scenario}"
+            );
+            if matches!(
+                scenario,
+                "create_fail" | "start_fail" | "timeout" | "cancellation"
+            ) {
+                assert!(
+                    output.exists(),
+                    "{scenario} must produce a final redacted artifact"
+                );
+            }
+            if output.exists() {
+                let persisted = std::fs::read_to_string(&output).unwrap();
+                assert!(!persisted.contains("synthetic-edge-canary"), "{scenario}");
+                if matches!(
+                    scenario,
+                    "create_fail" | "start_fail" | "timeout" | "cancellation"
+                ) {
+                    assert!(persisted.contains("[REDACTED_ACCESS_TOKEN]"), "{scenario}");
+                }
+            }
+            if scenario == "create_fail" {
+                assert!(state.root.join(AMBIGUOUS_CREATE_MARKER).exists());
+                assert!(state.root.join("CLEANUP_REQUIRED").exists());
+            } else {
+                state.cleanup().await.unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod real_docker_oauth_integration_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const CANARY: &str = "synthetic-oauth-integration-access-canary";
+
+    struct CanaryCancellationGate {
+        canary: Vec<u8>,
+        deadline: Instant,
+    }
+
+    impl CanaryCancellationGate {
+        fn observe_and_cancel(
+            &self,
+            now: Instant,
+            bytes: &[u8],
+            cancel_tx: &watch::Sender<bool>,
+        ) -> anyhow::Result<bool> {
+            if now >= self.deadline {
+                anyhow::bail!("synthetic canary was not observed before cancellation deadline");
+            }
+            if bytes
+                .windows(self.canary.len())
+                .any(|window| window == self.canary)
+            {
+                cancel_tx
+                    .send(true)
+                    .context("trigger cancellation after canary observation")?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+    }
+
+    async fn wait_for_canary_then_cancel(
+        output_path: PathBuf,
+        canary: &[u8],
+        deadline: Instant,
+        cancel_tx: watch::Sender<bool>,
+    ) -> anyhow::Result<()> {
+        let gate = CanaryCancellationGate {
+            canary: canary.to_vec(),
+            deadline,
+        };
+        loop {
+            let before_read = Instant::now();
+            if before_read >= deadline {
+                anyhow::bail!("synthetic canary was not observed before cancellation deadline");
+            }
+            let bytes = std::fs::read(&output_path).unwrap_or_default();
+            let observed_at = Instant::now();
+            if gate.observe_and_cancel(observed_at, &bytes, &cancel_tx)? {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(observed_at);
+            tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
+        }
+    }
+
+    #[test]
+    fn canary_cancellation_gate_allows_slow_startup_within_deadline() {
+        let start = Instant::now();
+        let gate = CanaryCancellationGate {
+            canary: CANARY.as_bytes().to_vec(),
+            deadline: start + Duration::from_secs(30),
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        assert!(!gate.observe_and_cancel(start, b"", &cancel_tx).unwrap());
+        assert!(
+            !gate
+                .observe_and_cancel(
+                    start + Duration::from_secs(29),
+                    b"setup complete",
+                    &cancel_tx
+                )
+                .unwrap()
+        );
+        assert!(
+            gate.observe_and_cancel(
+                start + Duration::from_secs(29),
+                CANARY.as_bytes(),
+                &cancel_tx,
+            )
+            .unwrap()
+        );
+        assert!(*cancel_rx.borrow());
+    }
+
+    #[test]
+    fn canary_cancellation_gate_fails_when_canary_never_appears() {
+        let start = Instant::now();
+        let gate = CanaryCancellationGate {
+            canary: CANARY.as_bytes().to_vec(),
+            deadline: start + Duration::from_secs(30),
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        assert!(
+            gate.observe_and_cancel(start + Duration::from_secs(30), b"no canary", &cancel_tx)
+                .is_err()
+        );
+        assert!(!*cancel_rx.borrow());
+    }
+
+    #[test]
+    fn canary_cancellation_gate_triggers_only_after_exact_canary() {
+        let start = Instant::now();
+        let gate = CanaryCancellationGate {
+            canary: CANARY.as_bytes().to_vec(),
+            deadline: start + Duration::from_secs(30),
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        assert!(
+            !gate
+                .observe_and_cancel(start, b"synthetic-oauth-integration", &cancel_tx)
+                .unwrap()
+        );
+        assert!(!*cancel_rx.borrow());
+        assert!(
+            gate.observe_and_cancel(start, CANARY.as_bytes(), &cancel_tx)
+                .unwrap()
+        );
+        assert!(*cancel_rx.borrow());
+    }
+
+    #[test]
+    fn canary_just_before_deadline_triggers_cancellation() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        let gate = CanaryCancellationGate {
+            canary: CANARY.as_bytes().to_vec(),
+            deadline,
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        assert!(
+            gate.observe_and_cancel(
+                deadline - Duration::from_nanos(1),
+                CANARY.as_bytes(),
+                &cancel_tx,
+            )
+            .unwrap()
+        );
+        assert!(*cancel_rx.borrow());
+    }
+
+    #[test]
+    fn canary_exactly_at_deadline_fails_without_cancellation() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        let gate = CanaryCancellationGate {
+            canary: CANARY.as_bytes().to_vec(),
+            deadline,
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        assert!(
+            gate.observe_and_cancel(deadline, CANARY.as_bytes(), &cancel_tx)
+                .is_err()
+        );
+        assert!(!*cancel_rx.borrow());
+    }
+
+    #[test]
+    fn canary_after_deadline_fails_without_cancellation() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        let gate = CanaryCancellationGate {
+            canary: CANARY.as_bytes().to_vec(),
+            deadline,
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        assert!(
+            gate.observe_and_cancel(
+                deadline + Duration::from_nanos(1),
+                CANARY.as_bytes(),
+                &cancel_tx,
+            )
+            .is_err()
+        );
+        assert!(!*cancel_rx.borrow());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires AGENT_HUB_DOCKER_OAUTH_INTEGRATION=1 and tester-managed Docker cleanup"]
+    async fn real_docker_synthetic_oauth_success_lifecycle() {
+        run_case(false).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires AGENT_HUB_DOCKER_OAUTH_INTEGRATION=1 and tester-managed Docker cleanup"]
+    async fn real_docker_synthetic_oauth_cancellation_lifecycle() {
+        run_case(true).await.unwrap();
+    }
+
+    async fn run_case(cancel_after_output: bool) -> anyhow::Result<()> {
+        let _lock = ENV_LOCK.lock().await;
+        require_env("AGENT_HUB_DOCKER_OAUTH_INTEGRATION", "1")?;
+        require_env("AGENT_HUB_DOCKER_OAUTH_ALLOW_CLEANUP", "1")?;
+        let source_root = PathBuf::from(
+            std::env::var("AGENT_HUB_DOCKER_OAUTH_CONFIG_ROOT")
+                .context("AGENT_HUB_DOCKER_OAUTH_CONFIG_ROOT is required")?,
+        );
+        let expected_image_id = std::env::var("AGENT_HUB_DOCKER_OAUTH_EXPECTED_IMAGE_ID")
+            .context("AGENT_HUB_DOCKER_OAUTH_EXPECTED_IMAGE_ID is required")?;
+        let docker_before = docker_snapshot("integration-oauth")?;
+        let image_before = docker_image_id(agent_hub_config::DURABLE_OPENCODE_IMAGE)?;
+        if image_before != expected_image_id {
+            anyhow::bail!("configured image ID does not match tester-provided immutable ID");
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-real-oauth-{}", uuid::Uuid::new_v4()));
+        let config_root = root.join("config");
+        copy_tree(&source_root, &config_root)?;
+        let auth_source = root.join("synthetic-auth.json");
+        write_synthetic_auth(&auth_source)?;
+        let script = assertion_script(cancel_after_output, &auth_source);
+        rewrite_test_local_config(&config_root, &auth_source, &script)?;
+
+        let deployment = agent_hub_config::validate_authoritative_config_root(&config_root)
+            .map_err(anyhow::Error::msg)?;
+        let local_config = crate::egress_config::local_agent_config_from_validated_deployment(
+            &config_root,
+            &config_root.join("local-agent.json"),
+            deployment.clone(),
+        )?;
+        let (runner_spec, _) = local_config.resolve_default_agent(None)?;
+        let profile = deployment
+            .runner_profiles
+            .resolve_agent_profile(None)
+            .map_err(anyhow::Error::msg)?;
+        let environment = local_config
+            .config_tree()
+            .and_then(|tree| {
+                tree.environments
+                    .iter()
+                    .find(|environment| environment.name == "code-auto")
+            })
+            .context("code-auto environment is required")?
+            .clone();
+        assert_eq!(
+            deployment.environment_bundle_digests.get("code-auto"),
+            Some(&environment.bundle_digest)
+        );
+
+        let now = Utc::now();
+        let work_item_id = uuid::Uuid::new_v4();
+        let job_id = uuid::Uuid::new_v4();
+        let runtime_environment = protocol::canonical_environment_for_execution(
+            ExecutionMode::Docker,
+            Some(agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string()),
+            Some(30),
+        );
+        let runtime = protocol::CanonicalRuntimeSpec {
+            runtime_version: "v2".to_string(),
+            permissions: protocol::canonical_permissions_for_environment(&runtime_environment),
+            environment: runtime_environment,
+            approval_rules: None,
+            repos: Vec::new(),
+            github_capabilities: Vec::new(),
+        };
+        let execution_context = serde_json::json!({
+            "workflow": {"valid_next_events":["job_succeeded"]},
+            "work_item": {"workflow_id":"oauth-integration"},
+            "state_invocation": {"state_id":"assert", "id":work_item_id}
+        });
+        let mut job = Job {
+            id: job_id,
+            work_item_id,
+            step_id: "assert".to_string(),
+            state: JobState::Assigned,
+            assigned_worker_id: Some("integration-oauth".to_string()),
+            execution_mode: ExecutionMode::Docker,
+            container_image: Some(agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string()),
+            command: runner_spec.command.clone(),
+            args: runner_spec.args.clone(),
+            env: HashMap::new(),
+            prompt: None,
+            context: execution_context.clone(),
+            repo: None,
+            timeout_secs: Some(30),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let request = protocol::ResolvedAuthorizationRequest {
+            version: protocol::AUTHORIZATION_REQUEST_VERSION.to_string(),
+            invocation_id: work_item_id,
+            work_unit_id: work_item_id,
+            root_work_item_id: work_item_id,
+            workflow_id: "oauth-integration".to_string(),
+            workflow_snapshot: serde_json::json!({"schema":"reactive_v2"}),
+            state_id: "assert".to_string(),
+            state_kind: protocol::ReactiveStateKind::Agent,
+            behavior: protocol::ResolvedAuthorizationBehavior {
+                execution_kind: "agent".to_string(),
+                runner_profile: serde_json::to_value(&profile)?,
+                command: runner_spec.command.clone(),
+                args: runner_spec.args.clone(),
+                env: BTreeMap::new(),
+                prompt: None,
+                primary_repo: None,
+                primary_repo_branch: None,
+                execution_context,
+                triage: false,
+                allow_remote_credentials: true,
+            },
+            permission_envelope: runtime,
+            resolved_environment: serde_json::json!({
+                "base":"code-auto",
+                "overlays":[],
+                "definition":{
+                    "bundle_digest":environment.bundle_digest,
+                    "network_policy_bundle_digests":environment.network_policy_bundle_digests
+                }
+            }),
+            provider: protocol::ResolvedAuthorizationProvider {
+                provider: Some("integration".to_string()),
+                task_id: Some("synthetic".to_string()),
+            },
+            resource_constraints: protocol::ResolvedAuthorizationResources {
+                timeout_secs: Some(30),
+                max_retries: 0,
+            },
+        };
+        protocol::project_authorization_request_into_job_context(
+            &mut job.context,
+            "integration-authorization",
+            &request,
+        )?;
+        let verified = verify_authorized_job(&job, &local_config)?;
+        let bundle = verified
+            .environment_bundle
+            .as_ref()
+            .context("verified environment bundle is required")?;
+        bundle
+            .verify_digest(
+                deployment
+                    .environment_bundle_digests
+                    .get("code-auto")
+                    .context("projected code-auto digest")?,
+            )
+            .map_err(anyhow::Error::msg)?;
+
+        let data_dir = root.join("data");
+        let workspace = root.join("workspace");
+        let transcript = root.join("transcript");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&transcript)?;
+        let state = OpencodeJobState::prepare(
+            &data_dir,
+            ContainerOwnership {
+                installation_id: local_config.installation_id.clone(),
+                config_identity: local_config.config_identity.clone(),
+                worker_id: "integration-oauth".to_string(),
+                job_id,
+                attempt: 0,
+            },
+            bundle,
+            &DockerCli::production(),
+        )
+        .await?;
+        let event_path = transcript.join("job-events.jsonl");
+        let events = JobEventSink {
+            worker_id: "integration-oauth".to_string(),
+            writer: Arc::new(Mutex::new(
+                JobEventTranscriptWriter::create(&event_path).await?,
+            )),
+            publisher: None,
+        };
+        let output_path = transcript.join("output.json");
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancel_observation_rx = cancel_rx.clone();
+        let egress_plan = resolve_local_agent_egress_plan(&verified.runtime_spec, &local_config)?;
+        let egress_manager =
+            EgressManager::new("integration-oauth", &data_dir, local_config.clone())?;
+        let validation = EnvironmentValidationTable::from_local_agent_config(&local_config)?;
+        let deadline = JobDeadline::new(Some(30))?;
+        let cancellation_watch = if cancel_after_output {
+            Some(tokio::spawn(wait_for_canary_then_cancel(
+                output_path.clone(),
+                CANARY.as_bytes(),
+                deadline
+                    .monotonic
+                    .context("cancellation integration requires an absolute deadline")?,
+                cancel_tx,
+            )))
+        } else {
+            None
+        };
+        let execution = run_docker_opencode_with_validation_retries(
+            &verified.job,
+            &local_config,
+            match &verified.runner.kind {
+                ResolvedRunnerKind::Opencode(spec) => spec,
+                _ => anyhow::bail!("integration profile is not OpenCode"),
+            },
+            &workspace,
+            transcript.to_str().context("UTF-8 transcript path")?,
+            &transcript.join("transcript.jsonl"),
+            &transcript.join("stdout.log"),
+            &transcript.join("stderr.log"),
+            &output_path,
+            &HashMap::new(),
+            &deadline,
+            Some(agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string()),
+            &verified.runtime_spec,
+            &egress_plan,
+            &egress_manager,
+            None,
+            &[],
+            vec!["job_succeeded".to_string()],
+            verified.work_item_context,
+            &validation,
+            &state,
+            Some(&events),
+            if cancel_after_output {
+                Some(cancel_rx)
+            } else {
+                None
+            },
+        )
+        .await;
+        if let Some(cancellation_watch) = cancellation_watch {
+            cancellation_watch
+                .await
+                .context("canary cancellation watcher task failed")??;
+            assert!(
+                *cancel_observation_rx.borrow(),
+                "cancellation was not triggered after canary observation"
+            );
+        }
+        let status = execution?;
+        if cancel_after_output {
+            assert!(matches!(status, ExecutionStatus::Cancelled));
+        } else {
+            assert!(matches!(status, ExecutionStatus::Exited(0)));
+        }
+        for path in [
+            transcript.join("stdout.log"),
+            transcript.join("stderr.log"),
+            transcript.join("transcript.jsonl"),
+            event_path,
+            output_path,
+        ] {
+            let bytes = std::fs::read(&path)?;
+            assert!(
+                !bytes
+                    .windows(CANARY.len())
+                    .any(|window| window == CANARY.as_bytes())
+            );
+            assert!(String::from_utf8_lossy(&bytes).contains("[REDACTED_ACCESS_TOKEN]"));
+        }
+        let container_name = state.container_name.clone();
+        assert!(
+            !DockerCli::production()
+                .inspect_named_container(&container_name, Duration::from_secs(5))
+                .await?
+                .is_some()
+        );
+        state.cleanup().await?;
+        assert!(!state.root.exists());
+        assert_eq!(docker_snapshot("integration-oauth")?, docker_before);
+        assert_eq!(
+            docker_image_id(agent_hub_config::DURABLE_OPENCODE_IMAGE)?,
+            image_before
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn assertion_script(cancel_after_output: bool, host_auth_source: &Path) -> String {
+        let next_event = if cancel_after_output {
+            "invalid"
+        } else {
+            "job_succeeded"
+        };
+        format!(
+            r#"set -eu
+test -r /opencode/config/opencode/opencode.json
+test -r /opencode/config/opencode/skills/local-workspaces/SKILL.md
+test -r /opencode/config/opencode/agents/coder.md
+! touch /opencode/config/opencode/integration-write-test
+touch /opencode/data/integration-write-test /opencode/state/integration-write-test /opencode/cache/integration-write-test
+test "$(stat -c %a /opencode/data/opencode/auth.json)" = 600
+auth=$(cat /opencode/data/opencode/auth.json)
+access=$(printf '%s' "$auth" | sed -n 's/.*"access":"\([^"]*\)".*/\1/p')
+test -n "$access"
+printf '%s' "$auth" | grep -q '"openai"'
+printf '%s' "$auth" | grep -q '"accountId":"synthetic-account"'
+printf '%s' "$auth" | grep -q '"expires":'
+printf '%s' "$auth" | grep -q '"refresh":""'
+! printf '%s' "$auth" | grep -q 'unrelated'
+test ! -e /var/run/docker.sock
+test ! -e /home/nick.davies/.config/opencode
+test ! -e /home/nick.davies/.local/share/opencode
+test ! -e /home/nick.davies/.local/state/opencode
+test ! -e /home/nick.davies/.cache/opencode
+test ! -e '{}'
+printf '%s\n' "$access"
+printf '%s\n' "$access" >&2
+printf '{{"next_event":"{next_event}","summary":"%s"}}' "$access" > /transcript/output.json
+{}"#,
+            host_auth_source.display(),
+            if cancel_after_output {
+                "sleep 60"
+            } else {
+                "exit 0"
+            }
+        )
+    }
+
+    fn rewrite_test_local_config(
+        config_root: &Path,
+        auth_source: &Path,
+        script: &str,
+    ) -> anyhow::Result<()> {
+        let path = config_root.join("local-agent.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        value["installation_id"] = serde_json::json!("integration-oauth");
+        value["config_identity"] = serde_json::json!("integration-oauth-v1");
+        value["credential_providers"]["openai:chatgpt-oauth"]["host_auth_path"] =
+            serde_json::json!(auth_source);
+        value["default_agent_id"] = serde_json::Value::Null;
+        value["default_agent"]["command"] = serde_json::json!("sh");
+        value["default_agent"]["args"] = serde_json::json!(["-lc", script]);
+        std::fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+        Ok(())
+    }
+
+    fn write_synthetic_auth(path: &Path) -> anyhow::Result<()> {
+        let expires = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .checked_add(Duration::from_secs(3600))
+            .context("expiry overflow")?
+            .as_millis() as u64;
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "openai":{"type":"oauth","access":CANARY,"refresh":"synthetic-refresh","expires":expires,"accountId":"synthetic-account"},
+                "unrelated":{"type":"api","key":"synthetic-other"}
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let target = destination.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else if file_type.is_file() {
+                std::fs::copy(entry.path(), target)?;
+            } else {
+                anyhow::bail!("integration config contains unsupported symlink or special file");
+            }
+        }
+        Ok(())
+    }
+
+    fn docker_snapshot(installation: &str) -> anyhow::Result<String> {
+        let containers = std::process::Command::new("docker")
+            .args(["ps", "-aq", "--filter"])
+            .arg(format!("label={LABEL_INSTALLATION}={installation}"))
+            .output()?;
+        let networks = std::process::Command::new("docker")
+            .args(["network", "ls", "-q", "--filter", "name=agent-hub"])
+            .output()?;
+        let volumes = std::process::Command::new("docker")
+            .args(["volume", "ls", "-q", "--filter"])
+            .arg(format!("label={LABEL_INSTALLATION}={installation}"))
+            .output()?;
+        if !containers.status.success() || !networks.status.success() || !volumes.status.success() {
+            anyhow::bail!("Docker resource snapshot failed");
+        }
+        Ok(format!(
+            "containers={}\nnetworks={}\nvolumes={}",
+            String::from_utf8(containers.stdout)?,
+            String::from_utf8(networks.stdout)?,
+            String::from_utf8(volumes.stdout)?
+        ))
+    }
+
+    fn docker_image_id(image: &str) -> anyhow::Result<String> {
+        let output = std::process::Command::new("docker")
+            .args(["image", "inspect", "--format", "{{.Id}}", image])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!("Docker image inspect failed");
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
+
+    fn require_env(name: &str, expected: &str) -> anyhow::Result<()> {
+        if std::env::var(name).ok().as_deref() != Some(expected) {
+            anyhow::bail!("{name} must be set to '{expected}'");
+        }
+        Ok(())
+    }
 }
 
 fn verify_authorized_job(
@@ -4046,7 +6640,7 @@ fn verify_authorized_job(
         .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
         .and_then(serde_json::Value::as_str)
         .context("job has no immutable request digest")?;
-    let request = protocol::authorization_request_from_job_context(&job.context)
+    let mut request = protocol::authorization_request_from_job_context(&job.context)
         .context("job has no resolved authorization request")?;
     if request.work_unit_id != job.work_item_id || request.state_id != job.step_id {
         anyhow::bail!("job authorization work-unit binding mismatch");
@@ -4061,7 +6655,7 @@ fn verify_authorized_job(
         anyhow::bail!("job execution fields do not match immutable authorization");
     }
     if request.behavior.triage != (request.workflow_id == "__triage__")
-        || request.behavior.allow_remote_credentials == request.behavior.triage
+        || !request.behavior.allow_remote_credentials
     {
         anyhow::bail!("job triage or credential classification is invalid");
     }
@@ -4084,6 +6678,7 @@ fn verify_authorized_job(
         (None, None) => {}
         _ => anyhow::bail!("authorized primary repository branch binding is invalid"),
     }
+    let mut verified_environment_bundle = None;
     if let Some(environment_name) = request
         .resolved_environment
         .get("base")
@@ -4105,19 +6700,29 @@ fn verify_authorized_job(
             .and_then(serde_json::Value::as_object)
             .context("authorized environment has no resolved definition")?;
         let authorized_bundle = definition
-            .get("bundle_digests")
-            .cloned()
+            .get("bundle_digest")
+            .and_then(serde_json::Value::as_str)
             .context("authorized environment has no bundle digest")?;
         let authorized_policies = definition
             .get("network_policy_bundle_digests")
             .cloned()
             .context("authorized environment has no network-policy digest")?;
-        if authorized_bundle != serde_json::to_value(&local_environment.bundle_digests)?
+        let bundle = local_environment.bundle.clone();
+        bundle
+            .verify_digest(authorized_bundle)
+            .map_err(anyhow::Error::msg)?;
+        if authorized_bundle != local_environment.bundle_digest
             || authorized_policies
                 != serde_json::to_value(&local_environment.network_policy_bundle_digests)?
         {
             anyhow::bail!("local environment bundle does not match authorization snapshot");
         }
+        verified_environment_bundle = Some(bundle);
+    }
+    request.permission_envelope.environment.file_mounts =
+        validate_untrusted_runtime_mounts(&request.permission_envelope, config)?;
+    if request.behavior.triage {
+        validate_exact_triage_mount_contract(&request.permission_envelope, config)?;
     }
     if request.behavior.execution_kind == "command" {
         if request.behavior.runner_profile
@@ -4145,6 +6750,7 @@ fn verify_authorized_job(
             work_item_context: work_item_contract_from_job_context(&authorized_job.context),
             triage: request.behavior.triage,
             github_action: None,
+            environment_bundle: None,
             job: authorized_job,
         });
     }
@@ -4188,49 +6794,47 @@ fn verify_authorized_job(
             work_item_context: work_item_contract_from_job_context(&authorized_job.context),
             triage: false,
             github_action: Some(operation),
+            environment_bundle: None,
             job: authorized_job,
         });
     }
     let profile: agent_hub_config::ResolvedRunnerProfile =
         serde_json::from_value(request.behavior.runner_profile.clone())
             .context("authorization has invalid runner profile")?;
-    if agent_hub_config::digest_profile(&profile).map_err(anyhow::Error::msg)?
-        != profile.config_digest
-    {
-        anyhow::bail!("authorized runner profile digest mismatch");
-    }
-    let configured_profiles = RunnerProfilesConfig {
-        default_agent: config.default_agent.clone(),
-        default_agent_id: config.default_agent_id.clone(),
-        managed_runners: config.managed_runners.clone(),
-        credential_providers: config
-            .credential_providers
-            .iter()
-            .map(|(name, provider)| Ok((name.clone(), serde_json::to_value(provider)?)))
-            .collect::<Result<HashMap<_, _>, serde_json::Error>>()?,
-        mcp_bridges: config
-            .mcp_bridges
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()?,
-        egress: serde_json::to_value(&config.egress)?,
-        github_hosts: config.github_hosts.clone(),
-    };
-    let configured = if request.behavior.execution_kind == "managed" {
-        configured_profiles
-            .resolve_managed_profile(&profile.profile_name)
-            .map_err(anyhow::Error::msg)?
-    } else {
-        configured_profiles
-            .resolve_agent_profile(if profile.profile_name == "default_agent" {
-                None
-            } else {
-                Some(profile.profile_name.as_str())
+    verify_authorized_runner_profile_projection(
+        config,
+        &profile,
+        &request.behavior.execution_kind,
+    )?;
+    if profile.kind == ManagedRunnerKind::Opencode {
+        if profile.credential_providers.as_slice()
+            != [agent_hub_config::CredentialProviderDescriptor {
+                name: "openai:chatgpt-oauth".to_string(),
+                provider_type: "opencode-chatgpt-oauth".to_string(),
+                targets: vec!["/opencode/data/opencode/auth.json".to_string()],
+            }]
+        {
+            anyhow::bail!(
+                "durable OpenCode runner requires exactly the openai:chatgpt-oauth credential"
+            );
+        }
+        let expected_mounts = [
+            ("environment_bundle", "/opencode/config/opencode", true),
+            ("xdg_data", "/opencode/data", false),
+            ("xdg_state", "/opencode/state", false),
+            ("xdg_cache", "/opencode/cache", false),
+        ];
+        if profile.trusted_mounts.len() != expected_mounts.len()
+            || !expected_mounts.iter().all(|(purpose, path, read_only)| {
+                profile.trusted_mounts.iter().any(|mount| {
+                    mount.purpose == *purpose
+                        && mount.container_path == *path
+                        && mount.read_only == *read_only
+                })
             })
-            .map_err(anyhow::Error::msg)?
-    };
-    if configured != profile {
-        anyhow::bail!("local runner profile does not match authorized config digest");
+        {
+            anyhow::bail!("durable OpenCode runner trusted mount plan is invalid");
+        }
     }
     let runner = ResolvedRunnerSpec {
         kind: match profile.kind {
@@ -4261,8 +6865,237 @@ fn verify_authorized_job(
         work_item_context: work_item_contract_from_job_context(&authorized_job.context),
         triage: request.behavior.triage,
         github_action: None,
+        environment_bundle: verified_environment_bundle,
         job: authorized_job,
     })
+}
+
+fn verify_authorized_runner_profile_projection(
+    config: &LocalAgentConfig,
+    profile: &agent_hub_config::ResolvedRunnerProfile,
+    execution_kind: &str,
+) -> anyhow::Result<()> {
+    if agent_hub_config::digest_profile(profile).map_err(anyhow::Error::msg)?
+        != profile.config_digest
+    {
+        anyhow::bail!("authorized runner profile digest mismatch");
+    }
+    let configured_profiles = config
+        .canonical_runner_profiles()
+        .context("authoritative runner profile projection is unavailable")?;
+    let configured = if execution_kind == "managed" {
+        configured_profiles
+            .resolve_managed_profile(&profile.profile_name)
+            .map_err(anyhow::Error::msg)?
+    } else {
+        configured_profiles
+            .resolve_agent_profile(if profile.profile_name == "default_agent" {
+                None
+            } else {
+                Some(profile.profile_name.as_str())
+            })
+            .map_err(anyhow::Error::msg)?
+    };
+    if configured != *profile {
+        anyhow::bail!("local runner profile does not match authorized config digest");
+    }
+    Ok(())
+}
+
+fn validate_untrusted_runtime_mounts(
+    runtime: &protocol::CanonicalRuntimeSpec,
+    config: &LocalAgentConfig,
+) -> anyhow::Result<Vec<protocol::orchestration::PlannedFileMount>> {
+    if runtime.environment.file_mounts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let approved_roots = canonical_approved_repository_roots(config)?;
+    let mut normalized = Vec::new();
+    for mount in &runtime.environment.file_mounts {
+        let configured_host = Path::new(&mount.host_path);
+        if !configured_host.is_absolute() {
+            anyhow::bail!(
+                "untrusted mount host source must be absolute: '{}'",
+                mount.host_path
+            );
+        }
+        let host = std::fs::canonicalize(configured_host).with_context(|| {
+            format!(
+                "canonicalize untrusted mount host source '{}'",
+                mount.host_path
+            )
+        })?;
+        let container = normalize_container_mount_destination(&mount.container_path)?;
+        if forbidden_host_mount(&host)
+            || ["/workspace", "/transcript", "/opencode"]
+                .iter()
+                .any(|reserved| paths_shadow(&container, reserved))
+        {
+            anyhow::bail!(
+                "runtime rejects untrusted host mount '{}:{}'",
+                mount.host_path,
+                mount.container_path
+            );
+        }
+        if !approved_roots.iter().any(|root| host.starts_with(root)) {
+            anyhow::bail!(
+                "untrusted mount host source '{}' is outside approved_repository_roots",
+                host.display()
+            );
+        }
+        if normalized
+            .iter()
+            .any(|existing: &protocol::orchestration::PlannedFileMount| {
+                paths_shadow(&existing.container_path, &container)
+            })
+        {
+            anyhow::bail!(
+                "untrusted mount target '{container}' duplicates or shadows another target"
+            );
+        }
+        normalized.push(protocol::orchestration::PlannedFileMount {
+            host_path: host.to_string_lossy().into_owned(),
+            container_path: container,
+            read_only: mount.read_only,
+        });
+    }
+    Ok(normalized)
+}
+
+fn validate_exact_triage_mount_contract(
+    runtime: &protocol::CanonicalRuntimeSpec,
+    config: &LocalAgentConfig,
+) -> anyhow::Result<()> {
+    let expected = &config
+        .config_tree()
+        .context("CONFIG_ROOT snapshot is required for triage mount validation")?
+        .triage_mounts;
+    validate_exact_triage_mounts_against(runtime, expected)
+}
+
+fn validate_exact_triage_mounts_against(
+    runtime: &protocol::CanonicalRuntimeSpec,
+    expected: &[agent_hub_config::TriageRepositoryMount],
+) -> anyhow::Result<()> {
+    if runtime.environment.file_mounts.len() != expected.len() {
+        anyhow::bail!(
+            "triage mount cardinality mismatch: expected {}, got {}",
+            expected.len(),
+            runtime.environment.file_mounts.len()
+        );
+    }
+    let mut expected = expected
+        .iter()
+        .map(|mount| {
+            (
+                mount.host_path.to_string_lossy().into_owned(),
+                mount.container_path.clone(),
+                mount.read_only,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut actual = runtime
+        .environment
+        .file_mounts
+        .iter()
+        .map(|mount| {
+            Ok((
+                std::fs::canonicalize(&mount.host_path)
+                    .with_context(|| {
+                        format!("canonicalize triage mount source '{}'", mount.host_path)
+                    })?
+                    .to_string_lossy()
+                    .into_owned(),
+                mount.container_path.clone(),
+                mount.read_only,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    expected.sort();
+    actual.sort();
+    if actual != expected {
+        anyhow::bail!("triage mounts do not exactly match checked-in server/worker configuration");
+    }
+    Ok(())
+}
+
+fn normalize_container_mount_destination(path: &str) -> anyhow::Result<String> {
+    if path.contains(':') || path.chars().any(char::is_control) {
+        anyhow::bail!("container mount destination contains forbidden characters");
+    }
+    if !path.starts_with('/') || path == "/" {
+        anyhow::bail!("container mount destination must be an absolute non-root path: '{path}'");
+    }
+    let components = path.split('/').skip(1).collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        anyhow::bail!("container mount destination must be normalized: '{path}'");
+    }
+    Ok(format!("/{}", components.join("/")))
+}
+
+fn paths_shadow(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn validate_mount_target_plan<'a>(
+    targets: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<()> {
+    let mut normalized: Vec<String> = Vec::new();
+    for target in targets {
+        let target = normalize_container_mount_destination(target)?;
+        if normalized
+            .iter()
+            .any(|existing| paths_shadow(existing, &target))
+        {
+            anyhow::bail!("container mount target '{target}' duplicates or shadows another mount");
+        }
+        normalized.push(target);
+    }
+    Ok(())
+}
+
+fn forbidden_host_mount(path: &Path) -> bool {
+    let normalized = normalize_mount_path_for_policy(&path.to_string_lossy());
+    if is_forbidden_host_path(&normalized) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_forbidden_host_path(path: &str) -> bool {
+    path == "/"
+        || path == "/var/run/docker.sock"
+        || path == "/run/docker.sock"
+        || path.starts_with("/proc/")
+        || path == "/proc"
+        || path.starts_with("/sys/")
+        || path == "/sys"
+        || path.starts_with("/dev/")
+        || path == "/dev"
+        || path.ends_with("/.config/opencode")
+        || path.contains("/.config/opencode/")
+        || path.ends_with("/.local/share/opencode")
+        || path.contains("/.local/share/opencode/")
+        || path.ends_with("/.local/state/opencode")
+        || path.contains("/.local/state/opencode/")
+        || path.ends_with("/.cache/opencode")
+        || path.contains("/.cache/opencode/")
 }
 
 fn validate_github_action_capability(
@@ -4326,7 +7159,7 @@ fn validate_github_action_capability(
 
 async fn run_authorized_github_operation<F, T>(
     operation: F,
-    timeout_secs: Option<u64>,
+    deadline: &JobDeadline,
     cancel_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<T>
 where
@@ -4335,11 +7168,11 @@ where
     let cancellation = wait_for_cancellation(cancel_rx);
     tokio::pin!(operation);
     tokio::pin!(cancellation);
-    if let Some(timeout_secs) = timeout_secs {
+    if let Some(remaining) = deadline.remaining() {
         tokio::select! {
             result = &mut operation => result,
             () = &mut cancellation => anyhow::bail!("managed GitHub action cancelled"),
-            () = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+            () = tokio::time::sleep(remaining) => {
                 anyhow::bail!("managed GitHub action exceeded authorized timeout")
             }
         }
@@ -4575,7 +7408,7 @@ async fn resolve_github_action_token(
     if configured_api_base != &authorized_api_base {
         anyhow::bail!("GitHub API base URL does not match authorized host configuration");
     }
-    let credentials = resolve_configured_credentials(config, &[expected_provider])
+    let credentials = resolve_configured_credentials(config, &[expected_provider], None, None)
         .await
         .map_err(|_| anyhow::anyhow!("GitHub credential provider resolution failed"))?;
     github_token_from_credentials(credentials)
@@ -5904,6 +8737,7 @@ mod github_action_tests {
                 true,
             )],
             temp_files: vec![temp.clone()],
+            redaction_values: Vec::new(),
         };
         let error = github_token_from_credentials(credentials).unwrap_err();
         assert!(!format!("{error:#}").contains(TOKEN));
@@ -5934,9 +8768,10 @@ mod github_action_tests {
         }
 
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let deadline = JobDeadline::new(Some(0)).unwrap();
         let timed_out = run_authorized_github_operation(
             std::future::pending::<anyhow::Result<()>>(),
-            Some(0),
+            &deadline,
             cancel_rx,
         )
         .await;
@@ -5964,7 +8799,8 @@ mod github_action_tests {
         };
         let (cancel_tx, cancel_rx) = watch::channel(false);
         cancel_tx.send(true).unwrap();
-        let cancelled = run_authorized_github_operation(operation, Some(60), cancel_rx).await;
+        let deadline = JobDeadline::new(Some(60)).unwrap();
+        let cancelled = run_authorized_github_operation(operation, &deadline, cancel_rx).await;
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         let cancel_cleanup = Arc::new(AtomicUsize::new(0));
         assert!(
@@ -6002,9 +8838,10 @@ mod github_action_tests {
         let capability = capability("github.com", vec![protocol::GithubOperation::PushBranch]);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let started = Instant::now();
+        let deadline = JobDeadline::new(Some(1)).unwrap();
         let result = run_authorized_github_operation(
             resolve_github_action_token(&config, &capability),
-            Some(1),
+            &deadline,
             cancel_rx,
         )
         .await;
@@ -6080,6 +8917,956 @@ enum ExecutionStatus {
     Exited(i32),
     TimedOut,
     Cancelled,
+}
+
+#[derive(Debug, Clone)]
+struct JobDeadline {
+    monotonic: Option<Instant>,
+    wall_clock: Option<SystemTime>,
+}
+
+/// Removes exact access-token byte sequences from worker-controlled output boundaries.
+/// This does not claim to prevent arbitrary transformed or encoded exfiltration by code
+/// running inside the container.
+#[derive(Clone, Default)]
+struct ExactTokenRedactor {
+    values: Arc<Vec<String>>,
+}
+
+impl ExactTokenRedactor {
+    fn new(values: Vec<String>) -> Self {
+        Self {
+            values: Arc::new(values),
+        }
+    }
+
+    fn redact(&self, input: &str) -> String {
+        self.values.iter().fold(input.to_string(), |output, value| {
+            if value.is_empty() {
+                output
+            } else {
+                output.replace(value, "[REDACTED_ACCESS_TOKEN]")
+            }
+        })
+    }
+
+    fn redact_bytes(&self, input: &[u8]) -> Vec<u8> {
+        let mut output = input.to_vec();
+        for value in self.values.iter().filter(|value| !value.is_empty()) {
+            let needle = value.as_bytes();
+            let replacement = b"[REDACTED_ACCESS_TOKEN]";
+            let mut redacted = Vec::with_capacity(output.len());
+            let mut offset = 0;
+            while offset < output.len() {
+                if output[offset..].starts_with(needle) {
+                    redacted.extend_from_slice(replacement);
+                    offset += needle.len();
+                } else {
+                    redacted.push(output[offset]);
+                    offset += 1;
+                }
+            }
+            output = redacted;
+        }
+        output
+    }
+}
+
+impl std::fmt::Debug for ExactTokenRedactor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactTokenRedactor")
+            .field("value_count", &self.values.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ResolvedOpencodeImage {
+    configured_image: String,
+    image_id: String,
+    binary_path: String,
+    version: String,
+}
+
+const LABEL_INSTALLATION: &str = "com.reddit.agent-hub.installation";
+const LABEL_CONFIG: &str = "com.reddit.agent-hub.config";
+const LABEL_WORKER: &str = "com.reddit.agent-hub.worker";
+const LABEL_JOB: &str = "com.reddit.agent-hub.job";
+const LABEL_ATTEMPT: &str = "com.reddit.agent-hub.attempt";
+const STARTUP_RECONCILIATION_MAX_ITEMS: usize = 100;
+const STARTUP_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(60);
+const CREATE_COMMAND_MAX_BUDGET: Duration = Duration::from_secs(30);
+// The quarantine is twice the maximum Docker create request budget. Absence after
+// this interval still requires operator action because it cannot establish ownership.
+const AMBIGUOUS_CREATE_QUARANTINE: Duration = Duration::from_secs(60);
+const AMBIGUOUS_CREATE_MARKER: &str = "AMBIGUOUS_CREATE.json";
+const CREATE_OUTCOME_MARKER: &str = "CREATE_OUTCOME.json";
+const CREATE_MARKER_FAILURE: &str = "CREATE_MARKER_FAILURE.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ContainerOwnership {
+    installation_id: String,
+    config_identity: String,
+    worker_id: String,
+    job_id: uuid::Uuid,
+    attempt: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct AmbiguousCreateMarker {
+    ownership: ContainerOwnership,
+    container_name: String,
+    observed_at_unix_ms: u64,
+    phase: CreateLifecyclePhase,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CreateLifecyclePhase {
+    CreateSubmitting,
+    CreateSubmitted,
+    CreateSucceeded,
+    LocalRejected,
+}
+
+trait WallClock: Send + Sync {
+    fn now(&self) -> SystemTime;
+    fn monotonic_now(&self) -> Instant;
+}
+
+trait CreateMarkerStore: Send + Sync {
+    fn persist_ambiguous(&self, root: &Path, marker: &AmbiguousCreateMarker) -> anyhow::Result<()>;
+    fn transition_success(&self, root: &Path, marker: &AmbiguousCreateMarker)
+    -> anyhow::Result<()>;
+    fn clear_local_rejection(
+        &self,
+        root: &Path,
+        marker: &AmbiguousCreateMarker,
+    ) -> anyhow::Result<()>;
+}
+
+#[derive(Debug)]
+struct FsCreateMarkerStore;
+
+impl CreateMarkerStore for FsCreateMarkerStore {
+    fn persist_ambiguous(&self, root: &Path, marker: &AmbiguousCreateMarker) -> anyhow::Result<()> {
+        durable_write_json(root, AMBIGUOUS_CREATE_MARKER, marker)
+    }
+
+    fn transition_success(
+        &self,
+        root: &Path,
+        marker: &AmbiguousCreateMarker,
+    ) -> anyhow::Result<()> {
+        durable_write_json(root, AMBIGUOUS_CREATE_MARKER, marker)?;
+        std::fs::rename(
+            root.join(AMBIGUOUS_CREATE_MARKER),
+            root.join(CREATE_OUTCOME_MARKER),
+        )
+        .context("atomically transition create marker to definitive outcome")?;
+        sync_directory(root)
+    }
+
+    fn clear_local_rejection(
+        &self,
+        root: &Path,
+        marker: &AmbiguousCreateMarker,
+    ) -> anyhow::Result<()> {
+        durable_write_json(root, AMBIGUOUS_CREATE_MARKER, marker)?;
+        std::fs::remove_file(root.join(AMBIGUOUS_CREATE_MARKER))
+            .context("remove definitive local-rejection marker")?;
+        sync_directory(root)
+    }
+}
+
+fn durable_write_json<T: serde::Serialize>(
+    root: &Path,
+    name: &str,
+    value: &T,
+) -> anyhow::Result<()> {
+    let target = root.join(name);
+    let temporary = root.join(format!(".{name}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let result = (|| -> anyhow::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("create durable marker {}", temporary.display()))?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)
+            .context("write durable marker")?;
+        file.sync_all().context("fsync durable marker")?;
+        std::fs::rename(&temporary, &target)
+            .with_context(|| format!("atomically replace durable marker {}", target.display()))?;
+        sync_directory(root)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(path)
+        .with_context(|| format!("open directory {} for fsync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync directory {}", path.display()))
+}
+
+#[derive(Debug)]
+struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn monotonic_now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+impl ContainerOwnership {
+    fn labels(&self) -> [(String, String); 5] {
+        [
+            (LABEL_INSTALLATION.to_string(), self.installation_id.clone()),
+            (LABEL_CONFIG.to_string(), self.config_identity.clone()),
+            (LABEL_WORKER.to_string(), self.worker_id.clone()),
+            (LABEL_JOB.to_string(), self.job_id.to_string()),
+            (LABEL_ATTEMPT.to_string(), self.attempt.to_string()),
+        ]
+    }
+
+    fn from_labels(labels: &serde_json::Map<String, serde_json::Value>) -> anyhow::Result<Self> {
+        let value = |key: &str| {
+            labels
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .with_context(|| format!("container is missing ownership label '{key}'"))
+        };
+        Ok(Self {
+            installation_id: value(LABEL_INSTALLATION)?,
+            config_identity: value(LABEL_CONFIG)?,
+            worker_id: value(LABEL_WORKER)?,
+            job_id: uuid::Uuid::parse_str(&value(LABEL_JOB)?)
+                .context("container job ownership label is not a UUID")?,
+            attempt: value(LABEL_ATTEMPT)?
+                .parse()
+                .context("container attempt ownership label is not a u32")?,
+        })
+    }
+}
+
+fn wall_clock_unix_ms(clock: &dyn WallClock) -> anyhow::Result<u64> {
+    let millis = clock
+        .now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("wall clock precedes Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).context("wall clock millisecond value overflow")
+}
+
+fn ambiguous_marker_age(
+    marker: &AmbiguousCreateMarker,
+    clock: &dyn WallClock,
+) -> anyhow::Result<Duration> {
+    let now = wall_clock_unix_ms(clock)?;
+    let elapsed = now.checked_sub(marker.observed_at_unix_ms).context(
+        "ambiguous-create marker timestamp is in the future; operator action is required",
+    )?;
+    Ok(Duration::from_millis(elapsed))
+}
+
+#[derive(Debug, Clone)]
+struct DockerCli {
+    command: PathBuf,
+}
+
+impl DockerCli {
+    fn production() -> Self {
+        Self {
+            command: PathBuf::from("docker"),
+        }
+    }
+
+    async fn inspect_named_container(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<ContainerOwnership>> {
+        let mut command = tokio::process::Command::new(&self.command);
+        command.args([
+            "container",
+            "inspect",
+            "--format",
+            "{{json .Config.Labels}}",
+            name,
+        ]);
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(timeout, command.output())
+            .await
+            .context("timed out inspecting named OpenCode container")??;
+        if output.status.success() {
+            let labels: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .context("Docker ownership labels are not valid JSON")?;
+            return ContainerOwnership::from_labels(
+                labels
+                    .as_object()
+                    .context("Docker ownership labels are not a JSON object")?,
+            )
+            .map(Some);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if stderr.contains("no such container") || stderr.contains("no such object") {
+            Ok(None)
+        } else {
+            anyhow::bail!(
+                "docker container inspect {name} failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+    }
+
+    async fn reconcile_absent(
+        &self,
+        name: &str,
+        ownership: &ContainerOwnership,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("container reconciliation deadline overflow")?;
+        self.reconcile_absent_until(name, ownership, deadline).await
+    }
+
+    async fn reconcile_absent_until(
+        &self,
+        name: &str,
+        ownership: &ContainerOwnership,
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "could not prove container '{name}' absent before reconciliation deadline: {}",
+                    errors.join("; ")
+                );
+            }
+            match self
+                .inspect_named_container(name, remaining.min(Duration::from_secs(10)))
+                .await
+            {
+                Ok(None) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    return match self.inspect_named_container(name, remaining).await? {
+                        None => Ok(()),
+                        Some(actual) if actual == *ownership => {
+                            errors.push("container appeared between absence checks".to_string());
+                            continue;
+                        }
+                        Some(actual) => anyhow::bail!(
+                            "refusing to reconcile container '{name}' with mismatched ownership: {actual:?}"
+                        ),
+                    };
+                }
+                Ok(Some(actual)) if actual == *ownership => {}
+                Ok(Some(actual)) => anyhow::bail!(
+                    "refusing to reconcile container '{name}' with mismatched ownership: {actual:?}"
+                ),
+                Err(error) => {
+                    errors.push(format!("inspect: {error:#}"));
+                }
+            }
+
+            let mut remove = tokio::process::Command::new(&self.command);
+            remove.args(["rm", "-f", name]).kill_on_drop(true);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining.min(Duration::from_secs(10)), remove.output())
+                .await
+            {
+                Ok(Ok(output)) if output.status.success() => {}
+                Ok(Ok(output)) => errors.push(format!(
+                    "remove: {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Ok(Err(error)) => errors.push(format!("remove: {error}")),
+                Err(_) => errors.push("remove: timed out".to_string()),
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self
+                .inspect_named_container(name, remaining.min(Duration::from_secs(10)))
+                .await
+            {
+                Ok(None) => return Ok(()),
+                Ok(Some(actual)) if actual == *ownership => {
+                    errors.push("reinspect: owned container still exists".to_string())
+                }
+                Ok(Some(actual)) => anyhow::bail!(
+                    "container '{name}' ownership changed during reconciliation: {actual:?}"
+                ),
+                Err(error) => {
+                    errors.push(format!("reinspect: {error:#}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "could not prove container '{name}' absent before reconciliation deadline: {}",
+                    errors.join("; ")
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn reconcile_quarantined_create(
+        &self,
+        name: &str,
+        ownership: &ContainerOwnership,
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("ambiguous-create reconciliation deadline expired");
+        }
+        match self.inspect_named_container(name, remaining).await? {
+            Some(actual) if actual == *ownership => {
+                self.reconcile_absent_until(name, ownership, deadline).await
+            }
+            Some(actual) => anyhow::bail!(
+                "ambiguous-create container '{name}' has mismatched ownership: {actual:?}"
+            ),
+            None => anyhow::bail!(
+                "ambiguous-create quarantine elapsed but container authority cannot be established from absence; operator action is required"
+            ),
+        }
+    }
+
+    async fn list_owned_opencode_containers(
+        &self,
+        installation_id: &str,
+        config_identity: &str,
+        worker_id: &str,
+        deadline: Instant,
+        max_items: usize,
+        clock: &dyn WallClock,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut command = tokio::process::Command::new(&self.command);
+        command
+            .args(["ps", "-a", "--filter"])
+            .arg(format!("label={LABEL_INSTALLATION}={installation_id}"))
+            .arg("--filter")
+            .arg(format!("label={LABEL_CONFIG}={config_identity}"))
+            .arg("--filter")
+            .arg(format!("label={LABEL_WORKER}={worker_id}"))
+            .args(["--format", "{{.Names}}"]);
+        command
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .context("spawn bounded Docker container listing")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("capture Docker container listing")?;
+        let mut lines = BufReader::new(stdout).lines();
+        let mut containers = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(clock.monotonic_now());
+            if remaining.is_zero() {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                anyhow::bail!(
+                    "startup reconciliation deadline exceeded during container enumeration"
+                );
+            }
+            let line = tokio::time::timeout(remaining, lines.next_line())
+                .await
+                .context(
+                    "startup reconciliation deadline exceeded during container enumeration",
+                )??;
+            let Some(line) = line else { break };
+            let name = line.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if containers.len() >= max_items {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                anyhow::bail!("startup reconciliation container item bound exceeded");
+            }
+            containers.push(name.to_string());
+        }
+        let remaining = deadline.saturating_duration_since(clock.monotonic_now());
+        let status = tokio::time::timeout(remaining, child.wait())
+            .await
+            .context("startup reconciliation deadline exceeded waiting for container listing")??;
+        if !status.success() {
+            anyhow::bail!("docker ps for owned OpenCode containers failed with {status}");
+        }
+        Ok(containers)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_opencode_startup(
+    data_dir: &Path,
+    docker: &DockerCli,
+    installation_id: &str,
+    config_identity: &str,
+    worker_id: &str,
+    max_items: usize,
+    timeout: Duration,
+    clock: Arc<dyn WallClock>,
+) -> anyhow::Result<()> {
+    let deadline = clock
+        .monotonic_now()
+        .checked_add(timeout)
+        .context("startup reconciliation deadline overflow")?;
+    let containers = docker
+        .list_owned_opencode_containers(
+            installation_id,
+            config_identity,
+            worker_id,
+            deadline,
+            max_items,
+            clock.as_ref(),
+        )
+        .await?;
+    let jobs_root = data_dir.join("opencode-jobs");
+    let mut retained_names = std::collections::HashSet::new();
+    let mut retained = Vec::with_capacity(max_items.saturating_sub(containers.len()));
+    if jobs_root.exists() {
+        let remaining = deadline.saturating_duration_since(clock.monotonic_now());
+        let mut entries = tokio::time::timeout(remaining, tokio::fs::read_dir(&jobs_root))
+            .await
+            .context("startup reconciliation deadline exceeded opening retained state")??;
+        loop {
+            let remaining = deadline.saturating_duration_since(clock.monotonic_now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "startup reconciliation deadline exceeded during retained-state enumeration"
+                );
+            }
+            let entry = tokio::time::timeout(remaining, entries.next_entry())
+                .await
+                .context(
+                    "startup reconciliation deadline exceeded reading retained-state item",
+                )??;
+            let Some(entry) = entry else { break };
+            let file_type = tokio::time::timeout(
+                deadline.saturating_duration_since(clock.monotonic_now()),
+                entry.file_type(),
+            )
+            .await
+            .context("startup reconciliation deadline exceeded inspecting retained-state item")??;
+            if !file_type.is_dir() {
+                continue;
+            }
+            if containers.len().saturating_add(retained.len()) >= max_items {
+                anyhow::bail!("startup reconciliation combined item bound exceeded");
+            }
+            retained.push(entry.path());
+        }
+    }
+
+    for root in retained {
+        let remaining = deadline.saturating_duration_since(clock.monotonic_now());
+        if remaining.is_zero() {
+            anyhow::bail!("startup reconciliation deadline exceeded before retained-state item");
+        }
+        let name = tokio::time::timeout(
+            remaining,
+            reconcile_retained_opencode_state(
+                &root,
+                docker,
+                installation_id,
+                config_identity,
+                worker_id,
+                deadline,
+                clock.as_ref(),
+            ),
+        )
+        .await
+        .context("startup reconciliation deadline exceeded processing retained state")??;
+        retained_names.insert(name);
+    }
+
+    for name in containers {
+        if retained_names.contains(&name) {
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(clock.monotonic_now());
+        if remaining.is_zero() {
+            anyhow::bail!("startup reconciliation deadline exceeded before container item");
+        }
+        let ownership = docker
+            .inspect_named_container(&name, remaining)
+            .await?
+            .context("owned container disappeared before startup reconciliation")?;
+        docker
+            .reconcile_absent_until(&name, &ownership, deadline)
+            .await
+            .with_context(|| format!("startup reconcile owned container '{name}'"))?;
+    }
+    Ok(())
+}
+
+async fn reconcile_retained_opencode_state(
+    root: &Path,
+    docker: &DockerCli,
+    installation_id: &str,
+    config_identity: &str,
+    worker_id: &str,
+    deadline: Instant,
+    clock: &dyn WallClock,
+) -> anyhow::Result<String> {
+    let ownership: ContainerOwnership = serde_json::from_slice(
+        &tokio::fs::read(root.join("ownership.json"))
+            .await
+            .with_context(|| format!("read retained ownership at {}", root.display()))?,
+    )
+    .with_context(|| format!("parse retained ownership at {}", root.display()))?;
+    if ownership.installation_id != installation_id
+        || ownership.config_identity != config_identity
+        || ownership.worker_id != worker_id
+    {
+        anyhow::bail!(
+            "retained OpenCode state '{}' has wrong installation/config/worker ownership",
+            root.display()
+        );
+    }
+    let job_id = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "retained OpenCode state has invalid job directory {}",
+                root.display()
+            )
+        })?;
+    if ownership.job_id != job_id {
+        anyhow::bail!("retained OpenCode state job ownership does not match directory");
+    }
+    let expected = format!("agent-hub-opencode-{}", ownership.job_id.simple());
+    let recorded = tokio::fs::read_to_string(root.join("container-name"))
+        .await
+        .with_context(|| format!("read retained container identity at {}", root.display()))?;
+    if recorded.trim() != expected {
+        anyhow::bail!(
+            "retained OpenCode state '{}' names unexpected container '{}'",
+            root.display(),
+            recorded.trim()
+        );
+    }
+    let ambiguous_path = root.join(AMBIGUOUS_CREATE_MARKER);
+    if root.join(CREATE_MARKER_FAILURE).exists() {
+        anyhow::bail!(
+            "startup found a create-marker durability failure at {}; operator action is required",
+            root.display()
+        );
+    }
+    if ambiguous_path.exists() {
+        let marker: AmbiguousCreateMarker = serde_json::from_slice(
+            &tokio::fs::read(&ambiguous_path)
+                .await
+                .context("read startup ambiguous-create marker")?,
+        )
+        .context("parse startup ambiguous-create marker")?;
+        if marker.ownership != ownership || marker.container_name != expected {
+            anyhow::bail!("startup ambiguous-create marker ownership mismatch");
+        }
+        match marker.phase {
+            CreateLifecyclePhase::CreateSubmitting | CreateLifecyclePhase::CreateSubmitted => {
+                if ambiguous_marker_age(&marker, clock)? < AMBIGUOUS_CREATE_QUARANTINE {
+                    anyhow::bail!(
+                        "startup blocked by active ambiguous-create quarantine at {}",
+                        root.display()
+                    );
+                }
+                docker
+                    .reconcile_quarantined_create(&expected, &ownership, deadline)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "startup reconcile ambiguous-create state {}",
+                            root.display()
+                        )
+                    })?;
+            }
+            CreateLifecyclePhase::CreateSucceeded => {
+                docker
+                    .reconcile_absent_until(&expected, &ownership, deadline)
+                    .await?;
+            }
+            CreateLifecyclePhase::LocalRejected => anyhow::bail!(
+                "startup found an uncleared definitive local-rejection marker; operator action is required"
+            ),
+        }
+    } else {
+        docker
+            .reconcile_absent_until(&expected, &ownership, deadline)
+            .await
+            .with_context(|| format!("startup reconcile retained state {}", root.display()))?;
+    }
+    tokio::fs::remove_dir_all(root)
+        .await
+        .with_context(|| format!("remove reconciled retained state {}", root.display()))?;
+    Ok(expected)
+}
+
+async fn resolve_opencode_image(
+    docker_command: &Path,
+    configured_image: &str,
+    deadline: &JobDeadline,
+) -> anyhow::Result<ResolvedOpencodeImage> {
+    let image_id = inspect_local_image_id(docker_command, configured_image, deadline).await?;
+    let binary_path = "/usr/local/bin/opencode";
+    let version_output = run_before_deadline(
+        tokio::process::Command::new(docker_command).args([
+            "run",
+            "--rm",
+            "--network=none",
+            "--entrypoint",
+            binary_path,
+            &image_id,
+            "--version",
+        ]),
+        deadline,
+        "inspect pinned OpenCode binary version",
+    )
+    .await?;
+    if !version_output.status.success() {
+        anyhow::bail!(
+            "failed to inspect OpenCode binary in resolved image: {}",
+            String::from_utf8_lossy(&version_output.stderr).trim()
+        );
+    }
+    let version = String::from_utf8(version_output.stdout)
+        .context("OpenCode version output is not UTF-8")?
+        .trim()
+        .to_string();
+    if version != "1.18.18" {
+        anyhow::bail!("resolved OpenCode binary version must be 1.18.18, got '{version}'");
+    }
+    Ok(ResolvedOpencodeImage {
+        configured_image: configured_image.to_string(),
+        image_id,
+        binary_path: binary_path.to_string(),
+        version,
+    })
+}
+
+async fn inspect_local_image_id(
+    docker_command: &Path,
+    configured_image: &str,
+    deadline: &JobDeadline,
+) -> anyhow::Result<String> {
+    let inspect = run_before_deadline(
+        tokio::process::Command::new(docker_command).args([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            configured_image,
+        ]),
+        deadline,
+        "resolve local OpenCode image ID",
+    )
+    .await?;
+    if !inspect.status.success() {
+        anyhow::bail!(
+            "failed to resolve local OpenCode image '{}': {}",
+            configured_image,
+            String::from_utf8_lossy(&inspect.stderr).trim()
+        );
+    }
+    let image_id = String::from_utf8(inspect.stdout)
+        .context("resolved OpenCode image ID is not UTF-8")?
+        .trim()
+        .to_string();
+    if image_id.len() != 71
+        || !image_id.starts_with("sha256:")
+        || !image_id[7..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        anyhow::bail!("resolved OpenCode image ID has invalid shape");
+    }
+
+    Ok(image_id)
+}
+
+fn verify_resolved_image_id(expected: &str, current: &str) -> anyhow::Result<()> {
+    if expected == current {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "configured OpenCode image tag changed during job setup: expected {expected}, resolved {current}"
+        )
+    }
+}
+
+async fn run_before_deadline(
+    command: &mut tokio::process::Command,
+    deadline: &JobDeadline,
+    operation: &str,
+) -> anyhow::Result<std::process::Output> {
+    run_before_deadline_with_budget(command, deadline, None, operation).await
+}
+
+async fn run_before_deadline_with_budget(
+    command: &mut tokio::process::Command,
+    deadline: &JobDeadline,
+    maximum_budget: Option<Duration>,
+    operation: &str,
+) -> anyhow::Result<std::process::Output> {
+    let remaining = deadline
+        .remaining()
+        .context("operation requires an absolute job deadline")?;
+    if remaining.is_zero() {
+        anyhow::bail!("absolute job deadline exceeded before {operation}");
+    }
+    command.kill_on_drop(true);
+    let budget = maximum_budget.map_or(remaining, |maximum| remaining.min(maximum));
+    tokio::time::timeout(budget, command.output())
+        .await
+        .with_context(|| format!("absolute job deadline exceeded during {operation}"))?
+        .with_context(|| format!("failed to execute {operation}"))
+}
+
+impl JobDeadline {
+    fn new(timeout_secs: Option<u64>) -> anyhow::Result<Self> {
+        Self::from_start(Instant::now(), SystemTime::now(), timeout_secs)
+    }
+
+    fn from_start(
+        monotonic_start: Instant,
+        wall_clock_start: SystemTime,
+        timeout_secs: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        let timeout = timeout_secs.map(Duration::from_secs);
+        Ok(Self {
+            monotonic: timeout
+                .map(|duration| {
+                    monotonic_start
+                        .checked_add(duration)
+                        .context("job monotonic deadline overflow")
+                })
+                .transpose()?,
+            wall_clock: timeout
+                .map(|duration| {
+                    wall_clock_start
+                        .checked_add(duration)
+                        .context("job wall-clock deadline overflow")
+                })
+                .transpose()?,
+        })
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        self.remaining_at(Instant::now())
+    }
+
+    fn remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.monotonic
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
+    fn is_expired(&self) -> bool {
+        self.remaining()
+            .is_some_and(|remaining| remaining.is_zero())
+    }
+
+    fn wall_clock(&self) -> Option<SystemTime> {
+        self.wall_clock
+    }
+}
+
+#[cfg(test)]
+mod job_deadline_tests {
+    use super::{JobDeadline, resolve_opencode_image, verify_resolved_image_id};
+    use std::path::Path;
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn validation_attempts_share_one_decreasing_deadline() {
+        let start = Instant::now();
+        let deadline = JobDeadline::from_start(start, SystemTime::now(), Some(10)).unwrap();
+        assert_eq!(deadline.remaining_at(start), Some(Duration::from_secs(10)));
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_secs(4)),
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_secs(10)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            deadline.remaining_at(start + Duration::from_secs(12)),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn resolved_image_uses_immutable_id_and_pinned_binary_version_without_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-image-resolver-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let command = root.join("fake-docker");
+        let log = root.join("args.log");
+        std::fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = image ]; then printf 'sha256:{}\\n'; else printf '1.18.18\\n'; fi\n",
+                log.display(),
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&command, permissions).unwrap();
+
+        let deadline = JobDeadline::new(Some(10)).unwrap();
+        let resolved = resolve_opencode_image(
+            Path::new(&command),
+            agent_hub_config::DURABLE_OPENCODE_IMAGE,
+            &deadline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.version, "1.18.18");
+        assert_eq!(resolved.binary_path, "/usr/local/bin/opencode");
+        assert_eq!(resolved.image_id, format!("sha256:{}", "a".repeat(64)));
+        let invocations = std::fs::read_to_string(log).unwrap();
+        assert!(invocations.contains("image inspect --format {{.Id}}"));
+        assert!(invocations.contains("--entrypoint /usr/local/bin/opencode"));
+        assert!(!invocations.to_ascii_lowercase().contains("token"));
+        assert!(verify_resolved_image_id(&resolved.image_id, &resolved.image_id).is_ok());
+        assert!(
+            verify_resolved_image_id(&resolved.image_id, &format!("sha256:{}", "b".repeat(64)))
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6320,7 +10107,8 @@ async fn supervise_process(
     stdout_path: &Path,
     stderr_path: &Path,
     env: &HashMap<String, String>,
-    timeout_secs: Option<u64>,
+    deadline: &JobDeadline,
+    redactor: Option<ExactTokenRedactor>,
     events: Option<&JobEventSink>,
     cancel_rx: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ExecutionStatus> {
@@ -6331,12 +10119,51 @@ async fn supervise_process(
         stdout_path,
         stderr_path,
         env,
-        timeout_secs,
+        deadline,
+        redactor,
         events,
         cancel_rx,
         false,
     )
     .await
+}
+
+async fn await_process_streams(
+    stdout: tokio::task::JoinHandle<anyhow::Result<()>>,
+    stderr: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    stdout.await.context("stdout transcript task failed")??;
+    stderr.await.context("stderr transcript task failed")??;
+    Ok(())
+}
+
+fn finish_output_boundaries(
+    stream_result: anyhow::Result<()>,
+    output_path: &Path,
+    redactor: Option<&ExactTokenRedactor>,
+) -> anyhow::Result<()> {
+    let artifact_result = finalize_redacted_output_artifact(output_path, redactor);
+    match (stream_result, artifact_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(stream), Ok(())) => Err(stream),
+        (Ok(()), Err(artifact)) => Err(artifact),
+        (Err(stream), Err(artifact)) => Err(anyhow::anyhow!(
+            "process stream persistence failed: {stream:#}; output artifact finalization also failed: {artifact:#}"
+        )),
+    }
+}
+
+fn open_process_output_file(path: &Path, append: bool) -> anyhow::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true);
+    if append {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("open process output {}", path.display()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6347,7 +10174,8 @@ async fn supervise_process_with_output_validation(
     stdout_path: &Path,
     stderr_path: &Path,
     env: &HashMap<String, String>,
-    timeout_secs: Option<u64>,
+    deadline: &JobDeadline,
+    redactor: Option<ExactTokenRedactor>,
     output_path: &Path,
     valid_next_events: &[String],
     work_item_context: &serde_json::Value,
@@ -6356,41 +10184,19 @@ async fn supervise_process_with_output_validation(
     cancel_rx: Option<watch::Receiver<bool>>,
     append: bool,
 ) -> anyhow::Result<ExecutionStatus> {
-    let stdout_std = if append {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stdout_path)?
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(stdout_path)?
-    };
-    let stderr_std = if append {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stderr_path)?
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(stderr_path)?
-    };
-    let transcript_std = if append {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(transcript_jsonl_path)?
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(transcript_jsonl_path)?
+    let opened = (|| -> anyhow::Result<_> {
+        Ok((
+            open_process_output_file(stdout_path, append)?,
+            open_process_output_file(stderr_path, append)?,
+            open_process_output_file(transcript_jsonl_path, append)?,
+        ))
+    })();
+    let (stdout_std, stderr_std, transcript_std) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            finish_output_boundaries(Err(error), output_path, redactor.as_ref())?;
+            unreachable!("transcript open failure must return an error")
+        }
     };
 
     let stdout_file = tokio::io::BufWriter::new(tokio::fs::File::from_std(stdout_std));
@@ -6400,6 +10206,7 @@ async fn supervise_process_with_output_validation(
     )));
 
     let mut cmd = tokio::process::Command::new(&job.command);
+    cmd.kill_on_drop(true);
     cmd.args(&job.args)
         .current_dir(workspace_dir)
         .stdout(Stdio::piped())
@@ -6408,10 +10215,25 @@ async fn supervise_process_with_output_validation(
         cmd.env(k, v);
     }
 
-    eprintln!("info: spawning command: {} {:?}", job.command, job.args);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn command: {} {:?}", job.command, job.args))?;
+    let spawn_description = format!("info: spawning command: {} {:?}", job.command, job.args);
+    eprintln!(
+        "{}",
+        redactor
+            .as_ref()
+            .map_or(spawn_description.clone(), |redactor| {
+                redactor.redact(&spawn_description)
+            })
+    );
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let operation = Err(error).with_context(|| {
+                format!("failed to spawn command: {} {:?}", job.command, job.args)
+            });
+            finish_output_boundaries(operation, output_path, redactor.as_ref())?;
+            unreachable!("spawn failure must return an error")
+        }
+    };
 
     let stdout = child
         .stdout
@@ -6423,6 +10245,7 @@ async fn supervise_process_with_output_validation(
         .ok_or_else(|| anyhow::anyhow!("failed to capture child stderr"))?;
 
     let stdout_events = events.cloned();
+    let stdout_redactor = redactor.clone();
     let stdout_job_id = job.id;
     let stdout_transcript_writer = Arc::clone(&transcript_writer);
     let stdout_task = tokio::spawn(async move {
@@ -6435,11 +10258,13 @@ async fn supervise_process_with_output_validation(
             stdout_events,
             stdout_job_id,
             pb::JobEventKind::JobEventStdout,
+            stdout_redactor,
         )
         .await
     });
 
     let stderr_events = events.cloned();
+    let stderr_redactor = redactor.clone();
     let stderr_job_id = job.id;
     let stderr_transcript_writer = Arc::clone(&transcript_writer);
     let stderr_task = tokio::spawn(async move {
@@ -6452,15 +10277,13 @@ async fn supervise_process_with_output_validation(
             stderr_events,
             stderr_job_id,
             pb::JobEventKind::JobEventStderr,
+            stderr_redactor,
         )
         .await
     });
 
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let start = Instant::now();
-    let timeout = timeout_secs.map(Duration::from_secs);
-
     let status = loop {
         tokio::select! {
             wait_result = child.wait() => {
@@ -6479,14 +10302,14 @@ async fn supervise_process_with_output_validation(
                     }
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    cleanup_named_docker_container_best_effort(job).await;
-                    let _ = stdout_task.await;
-                    let _ = stderr_task.await;
+                    let streams = await_process_streams(stdout_task, stderr_task).await;
+                    finish_output_boundaries(streams, output_path, redactor.as_ref())?;
                     return Ok(ExecutionStatus::Cancelled);
                 }
 
-                if validate_opencode_output(
+                if validate_opencode_output_snapshot(
                     output_path,
+                    redactor.as_ref(),
                     valid_next_events,
                     work_item_context,
                     environment_table,
@@ -6507,34 +10330,33 @@ async fn supervise_process_with_output_validation(
                     }
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    let _ = stdout_task.await;
-                    let _ = stderr_task.await;
+                    let streams = await_process_streams(stdout_task, stderr_task).await;
+                    finish_output_boundaries(streams, output_path, redactor.as_ref())?;
                     return Ok(ExecutionStatus::Exited(0));
                 }
 
-                if let Some(timeout) = timeout
-                    && start.elapsed() >= timeout {
+                if deadline.is_expired() {
                         if let Some(events) = events {
                             events
                                 .emit(
                                     job.id,
                                     pb::JobEventKind::JobEventSystem,
-                                    format!("timeout after {}s", timeout.as_secs()),
+                                    "absolute job deadline exceeded".to_string(),
                                 )
                                 .await;
                         }
                         let _ = child.kill().await;
                         let _ = child.wait().await;
-                        let _ = stdout_task.await;
-                        let _ = stderr_task.await;
+                        let streams = await_process_streams(stdout_task, stderr_task).await;
+                        finish_output_boundaries(streams, output_path, redactor.as_ref())?;
                         return Ok(ExecutionStatus::TimedOut);
                     }
             }
         }
     };
 
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    let streams = await_process_streams(stdout_task, stderr_task).await;
+    finish_output_boundaries(streams, output_path, redactor.as_ref())?;
 
     Ok(ExecutionStatus::Exited(status.code().unwrap_or(1)))
 }
@@ -6547,7 +10369,8 @@ async fn supervise_process_with_mode(
     stdout_path: &Path,
     stderr_path: &Path,
     env: &HashMap<String, String>,
-    timeout_secs: Option<u64>,
+    deadline: &JobDeadline,
+    redactor: Option<ExactTokenRedactor>,
     events: Option<&JobEventSink>,
     cancel_rx: Option<watch::Receiver<bool>>,
     append: bool,
@@ -6596,6 +10419,7 @@ async fn supervise_process_with_mode(
     )));
 
     let mut cmd = tokio::process::Command::new(&job.command);
+    cmd.kill_on_drop(true);
     cmd.args(&job.args)
         .current_dir(workspace_dir)
         .stdout(Stdio::piped())
@@ -6630,6 +10454,7 @@ async fn supervise_process_with_mode(
         .ok_or_else(|| anyhow::anyhow!("failed to capture child stderr"))?;
 
     let stdout_events = events.cloned();
+    let stdout_redactor = redactor.clone();
     let stdout_job_id = job.id;
     let stdout_transcript_writer = Arc::clone(&transcript_writer);
     let stdout_task = tokio::spawn(async move {
@@ -6642,11 +10467,13 @@ async fn supervise_process_with_mode(
             stdout_events,
             stdout_job_id,
             pb::JobEventKind::JobEventStdout,
+            stdout_redactor,
         )
         .await
     });
 
     let stderr_events = events.cloned();
+    let stderr_redactor = redactor;
     let stderr_job_id = job.id;
     let stderr_transcript_writer = Arc::clone(&transcript_writer);
     let stderr_task = tokio::spawn(async move {
@@ -6659,14 +10486,13 @@ async fn supervise_process_with_mode(
             stderr_events,
             stderr_job_id,
             pb::JobEventKind::JobEventStderr,
+            stderr_redactor,
         )
         .await
     });
 
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let start = Instant::now();
-
     let status = loop {
         tokio::select! {
             wait_result = child.wait() => {
@@ -6685,21 +10511,17 @@ async fn supervise_process_with_mode(
                     }
                     let _ = child.kill().await;
                     let _ = child.wait().await;
-                    cleanup_named_docker_container_best_effort(job).await;
-                    let _ = stdout_task.await;
-                    let _ = stderr_task.await;
+                    await_process_streams(stdout_task, stderr_task).await?;
                     return Ok(ExecutionStatus::Cancelled);
                 }
 
-                if let Some(timeout_secs) = timeout_secs
-                    && start.elapsed() >= Duration::from_secs(timeout_secs)
-                {
+                if deadline.is_expired() {
                     if let Some(events) = events {
                         events
                             .emit(
                                 job.id,
                                 pb::JobEventKind::JobEventSystem,
-                                format!("timeout after {timeout_secs}s"),
+                                "absolute job deadline exceeded".to_string(),
                             )
                             .await;
                     }
@@ -6711,8 +10533,7 @@ async fn supervise_process_with_mode(
         }
     };
 
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    await_process_streams(stdout_task, stderr_task).await?;
 
     Ok(ExecutionStatus::Exited(status.code().unwrap_or(1)))
 }
@@ -6727,12 +10548,16 @@ async fn pump_process_stream<R>(
     events: Option<JobEventSink>,
     job_id: uuid::Uuid,
     kind: pb::JobEventKind,
+    redactor: Option<ExactTokenRedactor>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
+        let line = redactor
+            .as_ref()
+            .map_or(line.clone(), |redactor| redactor.redact(&line));
         log_file.write_all(line.as_bytes()).await?;
         log_file.write_all(b"\n").await?;
         log_file.flush().await?;
@@ -6776,7 +10601,7 @@ async fn run_docker(
     stdout_path: &Path,
     stderr_path: &Path,
     env: &HashMap<String, String>,
-    timeout_secs: Option<u64>,
+    deadline: &JobDeadline,
     runtime_container_image: Option<String>,
     runtime_spec: &protocol::CanonicalRuntimeSpec,
     local_egress_plan: &LocalAgentEgressPlan,
@@ -6790,7 +10615,28 @@ async fn run_docker(
         .with_context(|| format!("resolve workspace dir {}", workspace_dir.display()))?;
     let transcript_dir = resolve_to_absolute(Path::new(transcript_dir))
         .with_context(|| format!("resolve transcript dir {}", transcript_dir))?;
-
+    let mut mount_targets = vec!["/workspace".to_string(), "/transcript".to_string()];
+    mount_targets.extend(
+        additional_repo_mounts
+            .iter()
+            .map(|mount| mount.container_path.clone()),
+    );
+    mount_targets.extend(
+        runtime_spec
+            .environment
+            .file_mounts
+            .iter()
+            .map(|mount| mount.container_path.clone()),
+    );
+    if !is_triage_job(&work_item_contract_from_job_context(&job.context)) {
+        mount_targets.extend(
+            local_agent_config
+                .mcp_bridges
+                .iter()
+                .map(container_socket_path),
+        );
+    }
+    validate_mount_target_plan(mount_targets.iter().map(String::as_str))?;
     let mut docker_env = env.clone();
     docker_env.insert("AGENT_WORKSPACE_DIR".to_string(), "/workspace".to_string());
     docker_env.insert(
@@ -7008,7 +10854,13 @@ async fn run_docker(
         anyhow::bail!("job requires credential providers outside its remote-access envelope");
     }
     let resolved_credentials = if allow_remote_credentials {
-        resolve_configured_credentials(local_agent_config, &required_credential_providers).await?
+        resolve_configured_credentials(
+            local_agent_config,
+            &required_credential_providers,
+            deadline.wall_clock(),
+            None,
+        )
+        .await?
     } else {
         ResolvedCredentials::default()
     };
@@ -7064,7 +10916,8 @@ async fn run_docker(
         stdout_path,
         stderr_path,
         &HashMap::new(),
-        timeout_secs,
+        deadline,
+        None,
         events,
         cancel_rx,
     )
@@ -7080,12 +10933,14 @@ struct DockerRuntimeInvocation {
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
-    timeout_secs: Option<u64>,
+    deadline: JobDeadline,
     workspace_dir: PathBuf,
     transcript_jsonl_path: PathBuf,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
-    credential_temp_files: Vec<PathBuf>,
+    job_state: Arc<OpencodeJobState>,
+    resolved_image: ResolvedOpencodeImage,
+    redactor: ExactTokenRedactor,
     mcp_bridges: Vec<McpBridgeInstance>,
 }
 
@@ -7101,7 +10956,7 @@ async fn run_docker_opencode_with_validation_retries(
     stderr_path: &Path,
     output_path: &Path,
     env: &HashMap<String, String>,
-    timeout_secs: Option<u64>,
+    deadline: &JobDeadline,
     runtime_container_image: Option<String>,
     runtime_spec: &protocol::CanonicalRuntimeSpec,
     local_egress_plan: &LocalAgentEgressPlan,
@@ -7111,6 +10966,7 @@ async fn run_docker_opencode_with_validation_retries(
     valid_next_events: Vec<String>,
     work_item_context: serde_json::Value,
     environment_table: &EnvironmentValidationTable,
+    opencode_job_state: &Arc<OpencodeJobState>,
     events: Option<&JobEventSink>,
     cancel_rx: Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ExecutionStatus> {
@@ -7123,13 +10979,14 @@ async fn run_docker_opencode_with_validation_retries(
         stdout_path,
         stderr_path,
         env,
-        timeout_secs,
+        deadline,
         runtime_container_image,
         runtime_spec,
         local_egress_plan,
         egress_manager,
         primary_repo_mirror_dir,
         additional_repo_mounts,
+        opencode_job_state,
         events,
     )
     .await?;
@@ -7150,13 +11007,11 @@ async fn run_docker_opencode_with_validation_retries(
         for bridge in &invocation.mcp_bridges {
             bridge.stop();
         }
-        cleanup_credential_temp_files_best_effort(&invocation.credential_temp_files);
     })
     .inspect_err(|_| {
         for bridge in &invocation.mcp_bridges {
             bridge.stop();
         }
-        cleanup_credential_temp_files_best_effort(&invocation.credential_temp_files);
     })
 }
 
@@ -7175,14 +11030,21 @@ async fn run_opencode_validation_loop(
     let max_attempts = opencode.max_validation_attempts.max(1);
     let _ = std::fs::remove_file(output_path);
 
-    let container_name = format!("agent-hub-opencode-{}", job.id.simple());
+    let container_name = invocation.job_state.container_name.clone();
+    if container_name != format!("agent-hub-opencode-{}", job.id.simple()) {
+        anyhow::bail!("OpenCode job state container identity mismatch");
+    }
     let mut attempt: u32 = 1;
     let mut continuation_prompt: Option<String> = None;
     let shell_prelude = opencode_shell_prelude(job);
+    let cleanup_guard = CredentialContainerCleanupGuard::production(
+        container_name.clone(),
+        Arc::clone(&invocation.job_state),
+    );
 
-    spawn_opencode_runtime_container(invocation, &container_name).await?;
-
-    loop {
+    let operation = async {
+        spawn_opencode_runtime_container(invocation, &container_name).await?;
+        loop {
         if let Some(events) = events {
             events
                 .emit(
@@ -7199,6 +11061,10 @@ async fn run_opencode_validation_loop(
                 )
                 .await;
         }
+        if invocation.deadline.is_expired() {
+            return Ok(ExecutionStatus::TimedOut);
+        }
+        let _ = std::fs::remove_file(output_redaction_marker(output_path));
 
         let status = run_docker_opencode_attempt(
             job,
@@ -7215,24 +11081,11 @@ async fn run_opencode_validation_loop(
             cancel_rx.clone(),
         )
         .await?;
-
         if matches!(status, ExecutionStatus::Cancelled) {
-            if let Err(error) = cleanup_opencode_container(&container_name).await {
-                eprintln!(
-                    "warning: failed to cleanup opencode container {}: {error:#}",
-                    container_name
-                );
-            }
             return Ok(status);
         }
 
         if !matches!(status, ExecutionStatus::Exited(0)) {
-            if let Err(error) = cleanup_opencode_container(&container_name).await {
-                eprintln!(
-                    "warning: failed to cleanup opencode container {}: {error:#}",
-                    container_name
-                );
-            }
             return Ok(status);
         }
 
@@ -7252,12 +11105,6 @@ async fn run_opencode_validation_loop(
                         )
                         .await;
                 }
-                if let Err(error) = cleanup_opencode_container(&container_name).await {
-                    eprintln!(
-                        "warning: failed to cleanup opencode container {}: {error:#}",
-                        container_name
-                    );
-                }
                 return Ok(status);
             }
             Err(validation_error) => {
@@ -7272,12 +11119,6 @@ async fn run_opencode_validation_loop(
                                 ),
                             )
                             .await;
-                    }
-                    if let Err(error) = cleanup_opencode_container(&container_name).await {
-                        eprintln!(
-                            "warning: failed to cleanup opencode container {}: {error:#}",
-                            container_name
-                        );
                     }
                     anyhow::bail!(
                         "opencode validation failed after {attempt} attempts: {validation_error}"
@@ -7303,7 +11144,25 @@ async fn run_opencode_validation_loop(
                 attempt = attempt.saturating_add(1);
             }
         }
+        }
     }
+    .await;
+    let operation = match operation {
+        Err(operation_error) => {
+            if !output_redaction_marker(output_path).exists() {
+                match finalize_redacted_output_artifact(output_path, Some(&invocation.redactor)) {
+                    Ok(()) => Err(operation_error),
+                    Err(artifact_error) => Err(anyhow::anyhow!(
+                        "OpenCode operation failed: {operation_error:#}; output artifact finalization also failed: {artifact_error:#}"
+                    )),
+                }
+            } else {
+                Err(operation_error)
+            }
+        }
+        Ok(status) => Ok(status),
+    };
+    finish_credential_container_operation(operation, cleanup_guard).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7354,7 +11213,8 @@ async fn run_docker_opencode_attempt(
             &invocation.stdout_path,
             &invocation.stderr_path,
             &invocation.env,
-            invocation.timeout_secs,
+            &invocation.deadline,
+            Some(invocation.redactor.clone()),
             output_path,
             valid_next_events,
             work_item_context,
@@ -7372,7 +11232,8 @@ async fn run_docker_opencode_attempt(
             &invocation.stdout_path,
             &invocation.stderr_path,
             &invocation.env,
-            invocation.timeout_secs,
+            &invocation.deadline,
+            Some(invocation.redactor.clone()),
             output_path,
             valid_next_events,
             work_item_context,
@@ -7389,55 +11250,141 @@ fn cancel_requested(cancel_rx: &Option<watch::Receiver<bool>>) -> bool {
     cancel_rx.as_ref().is_some_and(|rx| *rx.borrow())
 }
 
-async fn cleanup_named_docker_container_best_effort(job: &Job) {
-    if job.command != "docker" {
-        return;
-    }
-    let Some(name_index) = job.args.iter().position(|arg| arg == "--name") else {
-        return;
-    };
-    let Some(name) = job.args.get(name_index + 1) else {
-        return;
-    };
-    let _ = cleanup_opencode_container(name).await;
-}
-
 async fn spawn_opencode_runtime_container(
     invocation: &DockerRuntimeInvocation,
     container_name: &str,
 ) -> anyhow::Result<()> {
-    let _ = tokio::process::Command::new("docker")
-        .arg("rm")
-        .arg("-f")
-        .arg(container_name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
-    let run_args = build_opencode_spawn_run_args(&invocation.args, container_name)?;
-
-    let mut cmd = tokio::process::Command::new(&invocation.command);
-    cmd.args(&run_args).current_dir(&invocation.workspace_dir);
-    for (k, v) in &invocation.env {
-        cmd.env(k, v);
-    }
-
-    let status = cmd.status().await?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "failed to start opencode runtime container {}: {}",
+    invocation
+        .job_state
+        .docker
+        .reconcile_absent(
             container_name,
-            status
+            &invocation.job_state.ownership,
+            Duration::from_secs(30),
         )
+        .await?;
+
+    let create_args = build_opencode_create_args(
+        &invocation.args,
+        container_name,
+        &invocation.job_state.ownership,
+    )?;
+
+    let current_image_id = inspect_local_image_id(
+        Path::new(&invocation.command),
+        &invocation.resolved_image.configured_image,
+        &invocation.deadline,
+    )
+    .await?;
+    verify_resolved_image_id(&invocation.resolved_image.image_id, &current_image_id)?;
+
+    let mut create = tokio::process::Command::new(&invocation.command);
+    create
+        .args(&create_args)
+        .current_dir(&invocation.workspace_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in &invocation.env {
+        create.env(k, v);
     }
+    invocation
+        .job_state
+        .ambiguous_create
+        .store(true, Ordering::Release);
+    if let Err(marker_error) = invocation
+        .job_state
+        .persist_create_phase(CreateLifecyclePhase::CreateSubmitting)
+    {
+        let fallback = invocation
+            .job_state
+            .create_marker(CreateLifecyclePhase::CreateSubmitting)?;
+        if let Err(fallback_error) =
+            durable_write_json(&invocation.job_state.root, CREATE_MARKER_FAILURE, &fallback)
+        {
+            return Err(anyhow::anyhow!(
+                "create marker write/fsync failed: {marker_error:#}; fail-closed fallback marker also failed: {fallback_error:#}"
+            ));
+        }
+        return Err(marker_error)
+            .context("persist and fsync create-submitting marker before Docker create");
+    }
+    let remaining = invocation
+        .deadline
+        .remaining()
+        .context("Docker create requires an absolute deadline")?;
+    if remaining.is_zero() {
+        invocation.job_state.clear_definitive_local_rejection()?;
+        invocation
+            .job_state
+            .ambiguous_create
+            .store(false, Ordering::Release);
+        anyhow::bail!("absolute deadline expired before Docker create submission");
+    }
+    create.kill_on_drop(true);
+    let child = match create.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            invocation
+                .job_state
+                .clear_definitive_local_rejection()
+                .context("durably clear marker after definitive local create rejection")?;
+            invocation
+                .job_state
+                .ambiguous_create
+                .store(false, Ordering::Release);
+            return Err(error).context("submit Docker create process");
+        }
+    };
+    invocation
+        .job_state
+        .persist_create_phase(CreateLifecyclePhase::CreateSubmitted)
+        .context("durably record submitted Docker create")?;
+    let create_budget = remaining.min(CREATE_COMMAND_MAX_BUDGET);
+    let created = match tokio::time::timeout(create_budget, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return Err(error).context("wait for Docker create response"),
+        Err(_) => anyhow::bail!("Docker create response exceeded its bounded request budget"),
+    };
+    if !created.status.success() {
+        anyhow::bail!(
+            "Docker create returned an ambiguous non-success response for {}: {}: {}",
+            container_name,
+            created.status,
+            String::from_utf8_lossy(&created.stderr).trim()
+        );
+    }
+    invocation
+        .job_state
+        .transition_create_success()
+        .context("durably transition successful create to normal owned-container state")?;
+    invocation
+        .job_state
+        .ambiguous_create
+        .store(false, Ordering::Release);
+
+    let mut start = tokio::process::Command::new(&invocation.command);
+    start.args(["start", container_name]);
+    let started = run_before_deadline(
+        &mut start,
+        &invocation.deadline,
+        "start named OpenCode container",
+    )
+    .await?;
+    if !started.status.success() {
+        anyhow::bail!(
+            "failed to start OpenCode runtime container {}: {}: {}",
+            container_name,
+            started.status,
+            String::from_utf8_lossy(&started.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
-fn build_opencode_spawn_run_args(
+fn build_opencode_create_args(
     invocation_args: &[String],
     container_name: &str,
+    ownership: &ContainerOwnership,
 ) -> anyhow::Result<Vec<String>> {
     let entry_idx = invocation_args
         .iter()
@@ -7448,17 +11395,24 @@ fn build_opencode_spawn_run_args(
         anyhow::bail!("docker invocation missing image argument");
     }
 
-    let mut run_args = invocation_args[..entry_idx].to_vec();
-    run_args.retain(|arg| arg != "--rm");
-    run_args.push("--name".to_string());
-    run_args.push(container_name.to_string());
-    run_args.push("-d".to_string());
-    run_args.push("--entrypoint".to_string());
-    run_args.push("sh".to_string());
-    run_args.push(invocation_args[image_idx].clone());
-    run_args.push("-lc".to_string());
-    run_args.push("while true; do sleep 600; done".to_string());
-    Ok(run_args)
+    let mut create_args = invocation_args[..entry_idx].to_vec();
+    if create_args.first().map(String::as_str) != Some("run") {
+        anyhow::bail!("Docker invocation must begin with run");
+    }
+    create_args[0] = "create".to_string();
+    create_args.retain(|arg| arg != "--rm");
+    create_args.push("--name".to_string());
+    create_args.push(container_name.to_string());
+    for (key, value) in ownership.labels() {
+        create_args.push("--label".to_string());
+        create_args.push(format!("{key}={value}"));
+    }
+    create_args.push("--entrypoint".to_string());
+    create_args.push("sh".to_string());
+    create_args.push(invocation_args[image_idx].clone());
+    create_args.push("-lc".to_string());
+    create_args.push("while true; do sleep 600; done".to_string());
+    Ok(create_args)
 }
 
 fn opencode_shell_prelude(job: &Job) -> String {
@@ -7503,8 +11457,22 @@ fn validate_opencode_output(
     }
 
     let bytes = std::fs::read(output_path).context("read output.json")?;
+    validate_opencode_output_bytes(
+        &bytes,
+        valid_next_events,
+        work_item_context,
+        environment_table,
+    )
+}
+
+fn validate_opencode_output_bytes(
+    bytes: &[u8],
+    valid_next_events: &[String],
+    work_item_context: &serde_json::Value,
+    environment_table: &EnvironmentValidationTable,
+) -> anyhow::Result<()> {
     let raw_output: serde_json::Value =
-        serde_json::from_slice(&bytes).context("output.json parse failed")?;
+        serde_json::from_slice(bytes).context("output.json parse failed")?;
     let typed_output: AgentOutput = serde_json::from_value(raw_output.clone())
         .context("output.json is not valid AgentOutput")?;
 
@@ -7514,6 +11482,57 @@ fn validate_opencode_output(
     validate_environment_selection_structure(&raw_output, work_item_context, environment_table)?;
     validate_triage_repo_rules(work_item_context, &typed_output)?;
     Ok(())
+}
+
+fn validate_opencode_output_snapshot(
+    output_path: &Path,
+    redactor: Option<&ExactTokenRedactor>,
+    valid_next_events: &[String],
+    work_item_context: &serde_json::Value,
+    environment_table: &EnvironmentValidationTable,
+) -> anyhow::Result<()> {
+    let bytes = std::fs::read(output_path).context("read output.json snapshot")?;
+    let redacted = redactor.map_or(bytes.clone(), |redactor| redactor.redact_bytes(&bytes));
+    validate_opencode_output_bytes(
+        &redacted,
+        valid_next_events,
+        work_item_context,
+        environment_table,
+    )
+}
+
+fn finalize_redacted_output_artifact(
+    output_path: &Path,
+    redactor: Option<&ExactTokenRedactor>,
+) -> anyhow::Result<()> {
+    let marker = output_redaction_marker(output_path);
+    if !output_path.exists() {
+        std::fs::write(&marker, b"absent\n").context("write output redaction marker")?;
+        return Ok(());
+    }
+    let bytes = std::fs::read(output_path).context("read output.json for final redaction")?;
+    let redacted = redactor.map_or(bytes.clone(), |redactor| redactor.redact_bytes(&bytes));
+    if let Err(error) = serde_json::from_slice::<serde_json::Value>(&redacted) {
+        std::fs::remove_file(output_path)
+            .context("remove unsafe invalid output.json after redaction failure")?;
+        std::fs::write(&marker, b"removed-invalid\n")
+            .context("write invalid output redaction marker")?;
+        return Err(error).context("redacted output.json is invalid and was removed");
+    }
+    let temporary = output_path.with_extension("json.redacting");
+    if let Err(error) = std::fs::write(&temporary, &redacted)
+        .and_then(|()| std::fs::rename(&temporary, output_path))
+    {
+        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(output_path);
+        return Err(error).context("persist redacted output.json; unsafe artifact was removed");
+    }
+    std::fs::write(marker, b"redacted\n").context("write output redaction marker")?;
+    Ok(())
+}
+
+fn output_redaction_marker(output_path: &Path) -> PathBuf {
+    output_path.with_extension("json.redacted")
 }
 
 /// Returns `true` when the executing job is the `__triage__` pseudo-workflow's
@@ -7529,7 +11548,8 @@ fn is_triage_job(work_item_context: &serde_json::Value) -> bool {
 }
 
 fn job_allows_remote_credentials(work_item_context: &serde_json::Value) -> bool {
-    !is_triage_job(work_item_context)
+    let _ = work_item_context;
+    true
 }
 
 fn validate_triage_mount_and_credential_requests(
@@ -7541,9 +11561,11 @@ fn validate_triage_mount_and_credential_requests(
     if !triage_job {
         return Ok(());
     }
-    if !runner.file_mounts.is_empty() || !runner.requires_credentials.is_empty() {
+    if !runner.file_mounts.is_empty()
+        || runner.requires_credentials.as_slice() != ["openai:chatgpt-oauth"]
+    {
         anyhow::bail!(
-            "triage runner must not declare arbitrary file mounts or credential providers"
+            "triage runner may declare only the openai:chatgpt-oauth credential and no file mounts"
         );
     }
     let approved_roots = canonical_approved_repository_roots(config)?;
@@ -7696,17 +11718,6 @@ fn build_opencode_correction_prompt(
     )
 }
 
-async fn cleanup_opencode_container(container_name: &str) -> anyhow::Result<()> {
-    let mut cmd = tokio::process::Command::new("docker");
-    cmd.arg("rm").arg("-f").arg(container_name);
-    let status = cmd.status().await?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("docker rm -f {} failed with {}", container_name, status)
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn build_docker_runtime_invocation(
     job: &Job,
@@ -7717,19 +11728,85 @@ async fn build_docker_runtime_invocation(
     stdout_path: &Path,
     stderr_path: &Path,
     env: &HashMap<String, String>,
-    timeout_secs: Option<u64>,
+    deadline: &JobDeadline,
     runtime_container_image: Option<String>,
     runtime_spec: &protocol::CanonicalRuntimeSpec,
     local_egress_plan: &LocalAgentEgressPlan,
     egress_manager: &EgressManager,
     primary_repo_mirror_dir: Option<&Path>,
     additional_repo_mounts: &[AdditionalRepoMount],
+    opencode_job_state: &Arc<OpencodeJobState>,
     events: Option<&JobEventSink>,
 ) -> anyhow::Result<DockerRuntimeInvocation> {
     let workspace_dir = resolve_to_absolute(workspace_dir)
         .with_context(|| format!("resolve workspace dir {}", workspace_dir.display()))?;
     let transcript_dir = resolve_to_absolute(Path::new(transcript_dir))
         .with_context(|| format!("resolve transcript dir {}", transcript_dir))?;
+    let configured_image = runtime_container_image.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("runtime container_image must be set via CONFIG_ROOT configuration")
+    })?;
+    let resolved_image =
+        resolve_opencode_image(Path::new("docker"), configured_image, deadline).await?;
+    opencode_job_state
+        .record_resolved_image(&resolved_image)
+        .await?;
+    tokio::fs::write(
+        transcript_dir.join("resolved-image.json"),
+        serde_json::to_vec_pretty(&resolved_image)?,
+    )
+    .await
+    .context("write transcript OpenCode image identity")?;
+    let trusted_mounts = opencode_job_state.trusted_mounts()?;
+    let mut mount_targets = vec!["/workspace".to_string(), "/transcript".to_string()];
+    mount_targets.extend(
+        additional_repo_mounts
+            .iter()
+            .map(|mount| mount.container_path.clone()),
+    );
+    mount_targets.extend(
+        runtime_spec
+            .environment
+            .file_mounts
+            .iter()
+            .map(|mount| mount.container_path.clone()),
+    );
+    mount_targets.extend(
+        trusted_mounts
+            .iter()
+            .map(|mount| mount.container_path.clone()),
+    );
+    if !is_triage_job(&work_item_contract_from_job_context(&job.context)) {
+        mount_targets.extend(
+            local_agent_config
+                .mcp_bridges
+                .iter()
+                .map(container_socket_path),
+        );
+    }
+    validate_mount_target_plan(mount_targets.iter().map(String::as_str))?;
+    let work_item_context = work_item_contract_from_job_context(&job.context);
+    let allow_remote_credentials = job_allows_remote_credentials(&work_item_context);
+    let required_credential_providers = authorized_credential_provider_names(job)?;
+    if required_credential_providers
+        .iter()
+        .any(|provider| provider.starts_with("github:"))
+    {
+        anyhow::bail!("GitHub credentials are restricted to managed GitHub actions");
+    }
+    let resolved_credentials = if allow_remote_credentials {
+        resolve_configured_credentials(
+            local_agent_config,
+            &required_credential_providers,
+            deadline.wall_clock(),
+            Some(&opencode_job_state.data),
+        )
+        .await?
+    } else {
+        ResolvedCredentials::default()
+    };
+    validate_general_job_credentials(&resolved_credentials)?;
+    let redactor = ExactTokenRedactor::new(resolved_credentials.redaction_values.clone());
+    opencode_job_state.set_redactor(redactor.clone())?;
 
     let mut docker_env = env.clone();
     docker_env.insert("AGENT_WORKSPACE_DIR".to_string(), "/workspace".to_string());
@@ -7737,6 +11814,14 @@ async fn build_docker_runtime_invocation(
         "AGENT_TRANSCRIPT_DIR".to_string(),
         "/transcript".to_string(),
     );
+    docker_env.insert("OPENCODE_DISABLE_MODELS_FETCH".to_string(), "1".to_string());
+    docker_env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        "/opencode/config".to_string(),
+    );
+    docker_env.insert("XDG_DATA_HOME".to_string(), "/opencode/data".to_string());
+    docker_env.insert("XDG_STATE_HOME".to_string(), "/opencode/state".to_string());
+    docker_env.insert("XDG_CACHE_HOME".to_string(), "/opencode/cache".to_string());
     docker_env.insert(
         "AGENT_CONTEXT_PATH".to_string(),
         "/transcript/context.json".to_string(),
@@ -7796,10 +11881,6 @@ async fn build_docker_runtime_invocation(
     }
 
     let mut args = vec!["run".to_string(), "--rm".to_string()];
-    let container_image = runtime_container_image.ok_or_else(|| {
-        anyhow::anyhow!("runtime container_image must be set via CONFIG_ROOT configuration")
-    })?;
-
     if let Some(user) = docker_run_user_arg(&workspace_dir) {
         args.push("--user".to_string());
         args.push(user);
@@ -7910,6 +11991,15 @@ async fn build_docker_runtime_invocation(
         "-w".to_string(),
         "/workspace".to_string(),
     ]);
+    for mount in trusted_mounts {
+        args.push("-v".to_string());
+        args.push(format!(
+            "{}:{}{}",
+            mount.host_path,
+            mount.container_path.clone(),
+            if mount.read_only { ":ro" } else { "" }
+        ));
+    }
 
     if let Some(mirror_dir) = primary_repo_mirror_dir {
         let mirror_git_dir = resolve_to_absolute(mirror_dir)
@@ -7938,21 +12028,6 @@ async fn build_docker_runtime_invocation(
         ));
     }
 
-    let work_item_context = work_item_contract_from_job_context(&job.context);
-    let allow_remote_credentials = job_allows_remote_credentials(&work_item_context);
-    let required_credential_providers = authorized_credential_provider_names(job)?;
-    if required_credential_providers
-        .iter()
-        .any(|provider| provider.starts_with("github:"))
-    {
-        anyhow::bail!("GitHub credentials are restricted to managed GitHub actions");
-    }
-    let resolved_credentials = if allow_remote_credentials {
-        resolve_configured_credentials(local_agent_config, &required_credential_providers).await?
-    } else {
-        ResolvedCredentials::default()
-    };
-    validate_general_job_credentials(&resolved_credentials)?;
     append_resolved_credentials_to_docker_invocation(
         &resolved_credentials,
         &mut args,
@@ -7981,19 +12056,21 @@ async fn build_docker_runtime_invocation(
     }
     args.push("--entrypoint".to_string());
     args.push(job.command.clone());
-    args.push(container_image);
+    args.push(resolved_image.image_id.clone());
     args.extend(job.args.clone());
 
     Ok(DockerRuntimeInvocation {
         command: "docker".to_string(),
         args,
         env: HashMap::new(),
-        timeout_secs,
+        deadline: deadline.clone(),
         workspace_dir,
         transcript_jsonl_path: transcript_jsonl_path.to_path_buf(),
         stdout_path: stdout_path.to_path_buf(),
         stderr_path: stderr_path.to_path_buf(),
-        credential_temp_files: resolved_credentials.temp_files,
+        job_state: Arc::clone(opencode_job_state),
+        resolved_image,
+        redactor,
         mcp_bridges,
     })
 }
@@ -8053,6 +12130,8 @@ async fn configure_mcp_bridges_for_docker(
 async fn resolve_configured_credentials(
     local_agent_config: &LocalAgentConfig,
     required_provider_names: &[String],
+    valid_through: Option<SystemTime>,
+    credential_dir: Option<&Path>,
 ) -> anyhow::Result<ResolvedCredentials> {
     if required_provider_names.is_empty() {
         return Ok(ResolvedCredentials::default());
@@ -8069,7 +12148,202 @@ async fn resolve_configured_credentials(
                 })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    resolve_all(&providers).await
+    resolve_all_for_job(&providers, valid_through, credential_dir).await
+}
+
+#[cfg(test)]
+mod selected_credential_provider_tests {
+    use super::{LocalAgentConfig, resolve_configured_credentials};
+    use crate::credential_provider::CredentialProvider;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn only_selected_provider_executes_and_missing_selection_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-provider-selection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let selected_marker = root.join("selected");
+        let undeclared_marker = root.join("undeclared");
+        let provider = |name: &str, marker: &std::path::Path| CredentialProvider::Command {
+            name: name.to_string(),
+            command: "sh".to_string(),
+            args: vec![
+                "-lc".to_string(),
+                format!("touch '{}' && printf synthetic", marker.display()),
+            ],
+            capture_env: None,
+            capture_file: None,
+        };
+        let mut config = LocalAgentConfig::default();
+        config.credential_providers = HashMap::from([
+            (
+                "selected".to_string(),
+                provider("selected", &selected_marker),
+            ),
+            (
+                "undeclared".to_string(),
+                provider("undeclared", &undeclared_marker),
+            ),
+        ]);
+
+        resolve_configured_credentials(&config, &["selected".to_string()], None, None)
+            .await
+            .unwrap();
+        assert!(selected_marker.exists());
+        assert!(!undeclared_marker.exists());
+        assert!(
+            resolve_configured_credentials(&config, &["missing".to_string()], None, None)
+                .await
+                .is_err()
+        );
+        assert!(!undeclared_marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod runner_profile_projection_tests {
+    use super::verify_authorized_runner_profile_projection;
+    use crate::egress_config::load_synthetic_runner_config_for_test;
+
+    #[test]
+    fn server_authorized_profile_matches_worker_selection_and_mutation_fails() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "installation_id":"synthetic-installation",
+            "config_identity":"synthetic-config",
+            "egress":{
+                "preflight_image":"synthetic-preflight",
+                "llm":{"default_provider":"OPENAI","providers":{"OPENAI":["CHATGPT.COM","auth.openai.com"]}}
+            },
+            "credential_providers":{
+                "openai:chatgpt-oauth":{
+                    "type":"opencode-chatgpt-oauth",
+                    "name":"openai:chatgpt-oauth",
+                    "host_auth_path":"/synthetic/auth.json",
+                    "safety_margin_secs":60
+                }
+            },
+            "default_agent":{
+                "kind":"opencode",
+                "command":"sh",
+                "args":["-lc","synthetic assertion runner"],
+                "requires_credentials":["openai:chatgpt-oauth"]
+            }
+        }))
+        .unwrap();
+        let config = load_synthetic_runner_config_for_test(&bytes).unwrap();
+        let server_profile = config
+            .canonical_runner_profiles()
+            .unwrap()
+            .resolve_agent_profile(None)
+            .unwrap();
+        let (worker_spec, _) = config.resolve_default_agent(None).unwrap();
+        assert_eq!(server_profile.command, worker_spec.command);
+        assert_eq!(server_profile.args, worker_spec.args);
+        verify_authorized_runner_profile_projection(&config, &server_profile, "agent").unwrap();
+
+        let mut mutated = server_profile;
+        mutated.command = "different-command".to_string();
+        mutated.config_digest = agent_hub_config::digest_profile(&mutated).unwrap();
+        assert!(verify_authorized_runner_profile_projection(&config, &mutated, "agent").is_err());
+    }
+}
+
+#[cfg(test)]
+mod oauth_secret_canary_tests {
+    use super::{
+        ExactTokenRedactor, append_resolved_credentials_to_docker_invocation,
+        finalize_redacted_output_artifact, output_redaction_marker,
+    };
+    use crate::credential_provider::{CredentialProvider, resolve_all_for_job};
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn access_token_never_enters_argv_environment_logs_events_or_transcripts() {
+        let canary = "synthetic-access-token-canary";
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-secret-canary-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.json");
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .checked_add(Duration::from_secs(3600))
+            .unwrap()
+            .as_millis() as u64;
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "openai": {
+                    "type":"oauth",
+                    "access":canary,
+                    "refresh":"synthetic-refresh",
+                    "expires":expires,
+                    "accountId":"synthetic-account"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = CredentialProvider::OpencodeChatgptOauth {
+            name: "openai:chatgpt-oauth".to_string(),
+            host_auth_path: source.to_string_lossy().into_owned(),
+            safety_margin_secs: 60,
+        };
+        let data = root.join("data");
+        let resolved = resolve_all_for_job(
+            &[provider],
+            SystemTime::now().checked_add(Duration::from_secs(120)),
+            Some(&data),
+        )
+        .await
+        .unwrap();
+        let mut args = vec!["run".to_string()];
+        let mut env = HashMap::new();
+        append_resolved_credentials_to_docker_invocation(&resolved, &mut args, &mut env);
+        let observable = format!("argv={args:?}\nenv={env:?}\n");
+        assert!(!format!("{resolved:?}").contains(canary));
+        for file in [
+            "stdout.log",
+            "stderr.log",
+            "job-events.jsonl",
+            "transcript.jsonl",
+        ] {
+            std::fs::write(root.join(file), &observable).unwrap();
+            assert!(
+                !std::fs::read_to_string(root.join(file))
+                    .unwrap()
+                    .contains(canary)
+            );
+        }
+        assert!(!observable.contains(canary));
+        assert!(
+            std::fs::read_to_string(data.join("opencode/auth.json"))
+                .unwrap()
+                .contains(canary)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_output_artifact_is_removed_instead_of_preserving_secret_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-invalid-output-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = root.join("output.json");
+        let canary = "synthetic-invalid-output-token";
+        let mut bytes = canary.as_bytes().to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe]);
+        std::fs::write(&output, bytes).unwrap();
+        let redactor = ExactTokenRedactor::new(vec![canary.to_string()]);
+        assert!(finalize_redacted_output_artifact(&output, Some(&redactor)).is_err());
+        assert!(!output.exists());
+        assert!(output_redaction_marker(&output).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn authorized_credential_provider_names(job: &Job) -> anyhow::Result<Vec<String>> {
@@ -8239,10 +12513,41 @@ fn normalize_mount_path_for_policy(path: &str) -> String {
 #[cfg(test)]
 mod restricted_mount_tests {
     use super::{
-        append_git_config_env, append_git_identity_env_defaults, docker_run_user_arg,
-        is_restricted_breakout_mount,
+        LocalAgentConfig, append_git_config_env, append_git_identity_env_defaults,
+        canonical_runtime_spec_for_job, docker_run_user_arg, is_restricted_breakout_mount,
+        normalize_container_mount_destination, validate_exact_triage_mounts_against,
+        validate_untrusted_runtime_mounts,
     };
+    use chrono::Utc;
+    use protocol::{ExecutionMode, Job, JobState};
     use std::collections::HashMap;
+
+    fn mount_test_job() -> Job {
+        let now = Utc::now();
+        Job {
+            id: uuid::Uuid::new_v4(),
+            work_item_id: uuid::Uuid::new_v4(),
+            step_id: "mount-test".to_string(),
+            state: JobState::Assigned,
+            assigned_worker_id: None,
+            execution_mode: ExecutionMode::Docker,
+            container_image: Some("test".to_string()),
+            command: "true".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: Some(60),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 
     #[test]
     fn restricted_mount_rejects_obvious_breakout_paths() {
@@ -8278,6 +12583,202 @@ mod restricted_mount_tests {
             read_only: false,
         };
         assert!(!is_restricted_breakout_mount(&mount));
+    }
+
+    #[test]
+    fn untrusted_mounts_reject_noncanonical_shadowing_and_forbidden_sources() {
+        let now = Utc::now();
+        let job = Job {
+            id: uuid::Uuid::new_v4(),
+            work_item_id: uuid::Uuid::new_v4(),
+            step_id: "test".to_string(),
+            state: JobState::Assigned,
+            assigned_worker_id: None,
+            execution_mode: ExecutionMode::Docker,
+            container_image: Some("test".to_string()),
+            command: "true".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({}),
+            repo: None,
+            timeout_secs: Some(60),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let root = std::env::temp_dir().join(format!("mount-policy-{}", uuid::Uuid::new_v4()));
+        let approved = root.join("approved");
+        let source = approved.join("repo");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut config = LocalAgentConfig::default();
+        config.approved_repository_roots = vec![approved.clone()];
+
+        for container in [
+            "/repos/../opencode/data",
+            "/repos//repo",
+            "repos/repo",
+            "/opencode/data",
+            "/repos/bad:name",
+            "/repos/bad\0name",
+            "/repos/bad\nname",
+        ] {
+            let mut runtime = canonical_runtime_spec_for_job(&job);
+            runtime
+                .environment
+                .file_mounts
+                .push(protocol::orchestration::PlannedFileMount {
+                    host_path: source.to_string_lossy().into_owned(),
+                    container_path: container.to_string(),
+                    read_only: true,
+                });
+            assert!(
+                validate_untrusted_runtime_mounts(&runtime, &config).is_err(),
+                "{container}"
+            );
+        }
+
+        let mut runtime = canonical_runtime_spec_for_job(&job);
+        for child in ["one", "two"] {
+            let child = approved.join(child);
+            std::fs::create_dir_all(&child).unwrap();
+            runtime
+                .environment
+                .file_mounts
+                .push(protocol::orchestration::PlannedFileMount {
+                    host_path: child.to_string_lossy().into_owned(),
+                    container_path: "/repos/duplicate".to_string(),
+                    read_only: true,
+                });
+        }
+        assert!(validate_untrusted_runtime_mounts(&runtime, &config).is_err());
+
+        let mut dotdot = canonical_runtime_spec_for_job(&job);
+        dotdot
+            .environment
+            .file_mounts
+            .push(protocol::orchestration::PlannedFileMount {
+                host_path: "/var/run/../run/docker.sock".to_string(),
+                container_path: "/repos/socket".to_string(),
+                read_only: true,
+            });
+        assert!(validate_untrusted_runtime_mounts(&dotdot, &config).is_err());
+
+        #[cfg(unix)]
+        {
+            let socket = root.join("docker.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let link = approved.join("socket-link");
+            std::os::unix::fs::symlink(&socket, &link).unwrap();
+            let mut symlink = canonical_runtime_spec_for_job(&job);
+            symlink
+                .environment
+                .file_mounts
+                .push(protocol::orchestration::PlannedFileMount {
+                    host_path: link.to_string_lossy().into_owned(),
+                    container_path: "/repos/socket".to_string(),
+                    read_only: true,
+                });
+            assert!(validate_untrusted_runtime_mounts(&symlink, &config).is_err());
+            drop(listener);
+
+            let host_auth = root.join("home/.local/share/opencode/auth.json");
+            std::fs::create_dir_all(host_auth.parent().unwrap()).unwrap();
+            std::fs::write(&host_auth, "synthetic").unwrap();
+            let auth_link = approved.join("auth-link");
+            std::os::unix::fs::symlink(&host_auth, &auth_link).unwrap();
+            let mut auth_symlink = canonical_runtime_spec_for_job(&job);
+            auth_symlink
+                .environment
+                .file_mounts
+                .push(protocol::orchestration::PlannedFileMount {
+                    host_path: auth_link.to_string_lossy().into_owned(),
+                    container_path: "/repos/auth".to_string(),
+                    read_only: true,
+                });
+            assert!(validate_untrusted_runtime_mounts(&auth_symlink, &config).is_err());
+        }
+
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut outside_runtime = canonical_runtime_spec_for_job(&job);
+        outside_runtime
+            .environment
+            .file_mounts
+            .push(protocol::orchestration::PlannedFileMount {
+                host_path: outside.to_string_lossy().into_owned(),
+                container_path: "/repos/outside".to_string(),
+                read_only: true,
+            });
+        assert!(validate_untrusted_runtime_mounts(&outside_runtime, &config).is_err());
+        assert!(normalize_container_mount_destination("/repos/valid").is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_triage_mount_contract_rejects_every_mismatch_dimension() {
+        let root =
+            std::env::temp_dir().join(format!("exact-triage-mounts-{}", uuid::Uuid::new_v4()));
+        let first = root.join("first");
+        let second = root.join("second");
+        let third = root.join("third");
+        for path in [&first, &second, &third] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let expected = vec![
+            agent_hub_config::TriageRepositoryMount {
+                host_path: std::fs::canonicalize(&first).unwrap(),
+                container_path: "/repos/first".to_string(),
+                read_only: true,
+            },
+            agent_hub_config::TriageRepositoryMount {
+                host_path: std::fs::canonicalize(&second).unwrap(),
+                container_path: "/repos/second".to_string(),
+                read_only: true,
+            },
+        ];
+        let mount = |host: &std::path::Path, alias: &str, read_only| {
+            protocol::orchestration::PlannedFileMount {
+                host_path: host.to_string_lossy().into_owned(),
+                container_path: alias.to_string(),
+                read_only,
+            }
+        };
+        let mut runtime = canonical_runtime_spec_for_job(&mount_test_job());
+        runtime.environment.file_mounts = vec![
+            mount(&second, "/repos/second", true),
+            mount(&first, "/repos/first", true),
+        ];
+        validate_exact_triage_mounts_against(&runtime, &expected).unwrap();
+
+        let mut missing = runtime.clone();
+        missing.environment.file_mounts.pop();
+        assert!(validate_exact_triage_mounts_against(&missing, &expected).is_err());
+
+        let mut added = runtime.clone();
+        added
+            .environment
+            .file_mounts
+            .push(mount(&third, "/repos/third", true));
+        assert!(validate_exact_triage_mounts_against(&added, &expected).is_err());
+
+        let mut substituted = runtime.clone();
+        substituted.environment.file_mounts[0].host_path = third.to_string_lossy().into_owned();
+        assert!(validate_exact_triage_mounts_against(&substituted, &expected).is_err());
+
+        let mut aliases_swapped = runtime.clone();
+        aliases_swapped.environment.file_mounts[0].container_path = "/repos/first".to_string();
+        aliases_swapped.environment.file_mounts[1].container_path = "/repos/second".to_string();
+        assert!(validate_exact_triage_mounts_against(&aliases_swapped, &expected).is_err());
+
+        let mut writable = runtime;
+        writable.environment.file_mounts[0].read_only = false;
+        assert!(validate_exact_triage_mounts_against(&writable, &expected).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8590,7 +13091,7 @@ mod multi_repo_tests {
     }
 
     #[test]
-    fn build_opencode_spawn_run_args_preserves_repo_mounts() {
+    fn build_opencode_create_args_preserves_repo_mounts_without_detaching() {
         let invocation_args = vec![
             "run".to_string(),
             "--rm".to_string(),
@@ -8607,21 +13108,39 @@ mod multi_repo_tests {
             "opencode run".to_string(),
         ];
 
-        let run_args = build_opencode_spawn_run_args(&invocation_args, "agent-hub-opencode-test")
-            .expect("args");
+        let create_args = build_opencode_create_args(
+            &invocation_args,
+            "agent-hub-opencode-test",
+            &ContainerOwnership {
+                installation_id: "installation".to_string(),
+                config_identity: "config".to_string(),
+                worker_id: "worker".to_string(),
+                job_id: uuid::Uuid::nil(),
+                attempt: 0,
+            },
+        )
+        .expect("args");
 
         let repo_mount = "/host/repo:/repos/agent-hub-poc-test:ro".to_string();
-        assert!(run_args.iter().any(|arg| arg == &repo_mount));
+        assert!(create_args.iter().any(|arg| arg == &repo_mount));
         assert!(
-            run_args
+            create_args
                 .windows(2)
                 .any(|pair| pair[0] == "--user" && pair[1] == "1001:1001")
         );
-        assert!(!run_args.iter().any(|arg| arg == "--rm"));
-        assert_eq!(run_args[0], "run");
-        assert!(run_args.iter().any(|arg| arg == "--name"));
-        assert!(run_args.iter().any(|arg| arg == "agent-hub-opencode-test"));
-        assert!(run_args.iter().any(|arg| arg == "-d"));
+        assert!(!create_args.iter().any(|arg| arg == "--rm"));
+        assert_eq!(create_args[0], "create");
+        assert!(create_args.iter().any(|arg| arg == "--name"));
+        assert!(
+            create_args
+                .iter()
+                .any(|arg| arg == "agent-hub-opencode-test")
+        );
+        assert!(!create_args.iter().any(|arg| arg == "-d"));
+        assert_eq!(
+            create_args.iter().filter(|arg| *arg == "--label").count(),
+            5
+        );
     }
 }
 
@@ -8629,7 +13148,7 @@ mod multi_repo_tests {
 mod triage_validation_tests {
     use super::*;
 
-    fn triage_job() -> Job {
+    pub(super) fn triage_job() -> Job {
         let now = Utc::now();
         Job {
             id: uuid::Uuid::new_v4(),
@@ -8657,10 +13176,10 @@ mod triage_validation_tests {
     }
 
     #[test]
-    fn triage_jobs_never_receive_remote_credentials() {
+    fn triage_jobs_may_resolve_only_runner_selected_credentials() {
         let triage = serde_json::json!({"workflow_id": "__triage__"});
         let normal = serde_json::json!({"workflow_id": "implementation"});
-        assert!(!job_allows_remote_credentials(&triage));
+        assert!(job_allows_remote_credentials(&triage));
         assert!(job_allows_remote_credentials(&normal));
     }
 
@@ -8701,7 +13220,7 @@ mod triage_validation_tests {
             .is_err()
         );
 
-        runner.requires_credentials.clear();
+        runner.requires_credentials = vec!["openai:chatgpt-oauth".to_string()];
         runtime
             .environment
             .file_mounts

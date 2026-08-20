@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 fn default_true() -> bool {
@@ -48,14 +50,34 @@ pub enum CredentialProvider {
         /// Container path for filtered kubeconfig
         container_path: Option<String>,
     },
+    /// Select a non-refreshable OpenAI OAuth access credential for one job.
+    #[serde(rename = "opencode-chatgpt-oauth")]
+    OpencodeChatgptOauth {
+        name: String,
+        host_auth_path: String,
+        safety_margin_secs: u64,
+    },
 }
 
 /// Resolved credentials ready for Docker injection
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ResolvedCredentials {
     pub env_vars: HashMap<String, String>,
     pub file_mounts: Vec<(String, String, bool)>,
     pub temp_files: Vec<PathBuf>,
+    pub redaction_values: Vec<String>,
+}
+
+impl std::fmt::Debug for ResolvedCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedCredentials")
+            .field("env_var_count", &self.env_vars.len())
+            .field("file_mount_count", &self.file_mounts.len())
+            .field("temp_file_count", &self.temp_files.len())
+            .field("redaction_value_count", &self.redaction_values.len())
+            .finish()
+    }
 }
 
 impl CredentialProvider {
@@ -65,11 +87,15 @@ impl CredentialProvider {
             Self::Env { name, .. } => name,
             Self::Command { name, .. } => name,
             Self::KubeconfigFilter { name, .. } => name,
+            Self::OpencodeChatgptOauth { name, .. } => name,
         }
     }
 
-    /// Resolve this provider into concrete credentials
-    pub async fn resolve(&self) -> anyhow::Result<ResolvedCredentials> {
+    async fn resolve_for_job(
+        &self,
+        valid_through: Option<SystemTime>,
+        credential_dir: Option<&Path>,
+    ) -> anyhow::Result<ResolvedCredentials> {
         match self {
             Self::File {
                 host_path,
@@ -144,23 +170,396 @@ impl CredentialProvider {
                     ..Default::default()
                 })
             }
+            Self::OpencodeChatgptOauth {
+                host_auth_path,
+                safety_margin_secs,
+                ..
+            } => resolve_opencode_chatgpt_oauth(
+                host_auth_path,
+                *safety_margin_secs,
+                valid_through,
+                credential_dir,
+            ),
         }
     }
 }
 
-/// Resolve multiple providers and merge results
-pub async fn resolve_all(providers: &[CredentialProvider]) -> anyhow::Result<ResolvedCredentials> {
+pub async fn resolve_all_for_job(
+    providers: &[CredentialProvider],
+    valid_through: Option<SystemTime>,
+    credential_dir: Option<&Path>,
+) -> anyhow::Result<ResolvedCredentials> {
     let mut merged = ResolvedCredentials::default();
     for provider in providers {
-        let creds = provider.resolve().await.map_err(|error| {
-            anyhow::anyhow!(
-                "credential provider '{}' failed: {error:#}",
-                provider.name()
-            )
-        })?;
+        let creds = provider
+            .resolve_for_job(valid_through, credential_dir)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "credential provider '{}' failed: {error:#}",
+                    provider.name()
+                )
+            })?;
         merged.env_vars.extend(creds.env_vars);
         merged.file_mounts.extend(creds.file_mounts);
         merged.temp_files.extend(creds.temp_files);
+        merged.redaction_values.extend(creds.redaction_values);
     }
     Ok(merged)
+}
+
+fn resolve_opencode_chatgpt_oauth(
+    host_auth_path: &str,
+    safety_margin_secs: u64,
+    valid_through: Option<SystemTime>,
+    credential_dir: Option<&Path>,
+) -> anyhow::Result<ResolvedCredentials> {
+    let valid_through =
+        valid_through.context("authorized job deadline is required for ChatGPT OAuth")?;
+    if safety_margin_secs == 0 {
+        anyhow::bail!("ChatGPT OAuth safety margin must be greater than zero");
+    }
+    let credential_dir =
+        credential_dir.context("job credential directory is required for ChatGPT OAuth")?;
+    let source = shellexpand::tilde(host_auth_path).to_string();
+    let bytes = std::fs::read(&source).context("read configured ChatGPT OAuth source")?;
+    let entries = parse_auth_entries(&bytes)?;
+    let mut openai = entries
+        .into_iter()
+        .filter(|(provider, _)| provider == "openai")
+        .map(|(_, value)| value);
+    let record = openai
+        .next()
+        .context("configured auth source has no openai record")?;
+    if openai.next().is_some() {
+        anyhow::bail!("configured auth source contains duplicate openai records");
+    }
+    let record = record
+        .as_object()
+        .context("configured openai auth record must be an object")?;
+    if record.get("type").and_then(serde_json::Value::as_str) != Some("oauth") {
+        anyhow::bail!("configured openai auth record must have OAuth type");
+    }
+    let access = required_nonempty_string(record, "access")?;
+    if access.chars().any(char::is_control) {
+        anyhow::bail!("configured openai OAuth access token contains control characters");
+    }
+    let account_id = required_nonempty_string(record, "accountId")?;
+    let expires = record
+        .get("expires")
+        .and_then(serde_json::Value::as_u64)
+        .context("configured openai OAuth expiry must be an unsigned millisecond timestamp")?;
+    let required = oauth_required_expiry_millis(valid_through, safety_margin_secs)?;
+    if u128::from(expires) <= required {
+        anyhow::bail!(
+            "openai OAuth access token expires before the job deadline and safety margin"
+        );
+    }
+
+    let auth_dir = credential_dir.join("opencode");
+    std::fs::create_dir_all(&auth_dir).context("create job OpenCode data directory")?;
+    let auth_path = auth_dir.join("auth.json");
+    let output = serde_json::to_vec(&serde_json::json!({
+        "openai": {
+            "type": "oauth",
+            "access": access,
+            "refresh": "",
+            "expires": expires,
+            "accountId": account_id,
+        }
+    }))?;
+    write_secret_file(&auth_path, &output)?;
+    Ok(ResolvedCredentials {
+        file_mounts: Vec::new(),
+        env_vars: HashMap::new(),
+        temp_files: vec![auth_path],
+        redaction_values: vec![access.to_string()],
+    })
+}
+
+fn oauth_required_expiry_millis(
+    valid_through: SystemTime,
+    safety_margin_secs: u64,
+) -> anyhow::Result<u128> {
+    Ok(valid_through
+        .checked_add(Duration::from_secs(safety_margin_secs))
+        .context("OAuth validity deadline overflow")?
+        .duration_since(UNIX_EPOCH)
+        .context("OAuth validity deadline precedes Unix epoch")?
+        .as_millis())
+}
+
+fn required_nonempty_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> anyhow::Result<&'a str> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("configured openai OAuth {key} must be a non-empty string"))
+}
+
+fn parse_auth_entries(bytes: &[u8]) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+    use serde::de::{MapAccess, Visitor};
+
+    struct EntriesVisitor;
+    impl<'de> Visitor<'de> for EntriesVisitor {
+        type Value = Vec<(String, serde_json::Value)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an OpenCode auth object")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut entries = Vec::new();
+            while let Some(entry) = map.next_entry()? {
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let entries = serde::de::Deserializer::deserialize_map(&mut deserializer, EntriesVisitor)
+        .context("parse configured ChatGPT OAuth source")?;
+    deserializer
+        .end()
+        .context("parse configured ChatGPT OAuth source")?;
+    Ok(entries)
+}
+
+fn write_secret_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .context("create job OpenCode auth file")?;
+        file.write_all(bytes)
+            .context("write job OpenCode auth file")?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, bytes);
+        anyhow::bail!("secure OpenCode auth materialization requires Unix file modes")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn auth_parser_preserves_duplicate_provider_names() {
+        let entries = parse_auth_entries(br#"{"openai":{},"openai":{}}"#).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn chatgpt_oauth_materializes_only_non_refreshable_openai_access() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-oauth-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.json");
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .checked_add(Duration::from_secs(3600))
+            .unwrap()
+            .as_millis() as u64;
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "synthetic-access",
+                    "refresh": "synthetic-refresh-must-not-copy",
+                    "expires": expires,
+                    "accountId": "synthetic-account"
+                },
+                "unrelated": {"type":"api", "key":"synthetic-other-secret"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let data = root.join("job-data");
+        let provider = CredentialProvider::OpencodeChatgptOauth {
+            name: "openai:chatgpt-oauth".into(),
+            host_auth_path: source.to_string_lossy().into_owned(),
+            safety_margin_secs: 60,
+        };
+        let resolved = provider
+            .resolve_for_job(
+                SystemTime::now().checked_add(Duration::from_secs(120)),
+                Some(&data),
+            )
+            .await
+            .unwrap();
+        let auth_path = data.join("opencode/auth.json");
+        let bytes = std::fs::read(&auth_path).unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(output["openai"]["access"], "synthetic-access");
+        assert_eq!(output["openai"]["accountId"], "synthetic-account");
+        assert_eq!(output["openai"]["refresh"], "");
+        assert!(output.get("unrelated").is_none());
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("synthetic-refresh-must-not-copy")
+        );
+        assert_eq!(
+            std::fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(resolved.env_vars.is_empty());
+        assert!(resolved.file_mounts.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn chatgpt_oauth_rejects_insufficient_validity_before_materializing() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-oauth-expiry-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.json");
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .checked_add(Duration::from_secs(30))
+            .unwrap()
+            .as_millis() as u64;
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "synthetic-access",
+                    "expires": expires,
+                    "accountId": "synthetic-account"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let data = root.join("job-data");
+        let provider = CredentialProvider::OpencodeChatgptOauth {
+            name: "openai:chatgpt-oauth".into(),
+            host_auth_path: source.to_string_lossy().into_owned(),
+            safety_margin_secs: 60,
+        };
+        assert!(
+            provider
+                .resolve_for_job(
+                    SystemTime::now().checked_add(Duration::from_secs(120)),
+                    Some(&data),
+                )
+                .await
+                .is_err()
+        );
+        assert!(!data.join("opencode/auth.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn chatgpt_oauth_rejects_missing_wrong_type_and_duplicate_records() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-oauth-shape-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.json");
+        let data = root.join("job-data");
+        let provider = CredentialProvider::OpencodeChatgptOauth {
+            name: "openai:chatgpt-oauth".into(),
+            host_auth_path: source.to_string_lossy().into_owned(),
+            safety_margin_secs: 60,
+        };
+        for invalid in [
+            r#"{}"#,
+            r#"{"openai":{"type":"api","access":"synthetic","expires":9999999999999,"accountId":"synthetic"}}"#,
+            r#"{"openai":{"type":"oauth","access":"synthetic","expires":9999999999999,"accountId":"synthetic"},"openai":{"type":"oauth","access":"synthetic","expires":9999999999999,"accountId":"synthetic"}}"#,
+        ] {
+            std::fs::write(&source, invalid).unwrap();
+            assert!(
+                provider
+                    .resolve_for_job(
+                        SystemTime::now().checked_add(Duration::from_secs(120)),
+                        Some(&data),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(!data.join("opencode/auth.json").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn chatgpt_oauth_rejects_expiry_exactly_at_deadline_margin_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-oauth-boundary-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.json");
+        let valid_through = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let required = oauth_required_expiry_millis(valid_through, 60).unwrap() as u64;
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "synthetic-access",
+                    "refresh": "synthetic-refresh-must-not-run",
+                    "expires": required,
+                    "accountId": "synthetic-account"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = CredentialProvider::OpencodeChatgptOauth {
+            name: "openai:chatgpt-oauth".into(),
+            host_auth_path: source.to_string_lossy().into_owned(),
+            safety_margin_secs: 60,
+        };
+        assert!(
+            provider
+                .resolve_for_job(Some(valid_through), Some(&root.join("data")))
+                .await
+                .is_err()
+        );
+        assert!(!root.join("data/opencode/auth.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

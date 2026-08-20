@@ -1,9 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(test)]
 use anyhow::Context;
 
-use super::config::{RepoDiscoveryConfig, RepoDiscoveryStrategy};
+use super::config::RepoDiscoveryConfig;
+#[cfg(test)]
+use super::config::RepoDiscoveryStrategy;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredRepo {
@@ -14,6 +19,7 @@ pub struct DiscoveredRepo {
 
 pub fn discover_repositories_from_config(
     config: Option<&RepoDiscoveryConfig>,
+    mounts: &[agent_hub_config::TriageRepositoryMount],
 ) -> anyhow::Result<Vec<DiscoveredRepo>> {
     let Some(config) = config else {
         return Ok(Vec::new());
@@ -23,14 +29,10 @@ pub fn discover_repositories_from_config(
         return Ok(Vec::new());
     }
 
-    let mut repos = Vec::new();
-    for strategy in &config.strategies {
-        if strategy.strategy_type != "directory" {
-            continue;
-        }
-
-        repos.extend(discover_repositories_from_directory_strategy(strategy)?);
-    }
+    let mut repos = mounts
+        .iter()
+        .map(|mount| build_discovered_repo(&mount.host_path))
+        .collect::<Vec<_>>();
 
     repos.sort_by(|a, b| a.local_path.cmp(&b.local_path));
     repos.dedup_by(|a, b| a.local_path == b.local_path);
@@ -44,6 +46,7 @@ pub fn discover_repositories_from_config(
     Ok(repos)
 }
 
+#[cfg(test)]
 fn discover_repositories_from_directory_strategy(
     strategy: &RepoDiscoveryStrategy,
 ) -> anyhow::Result<Vec<DiscoveredRepo>> {
@@ -78,13 +81,14 @@ fn discover_repositories_from_directory_strategy(
     Ok(discovered)
 }
 
+#[cfg(test)]
 fn walk_for_repositories(
     root: &Path,
     current: &Path,
     strategy: &RepoDiscoveryStrategy,
     discovered: &mut Vec<DiscoveredRepo>,
 ) -> anyhow::Result<()> {
-    if current.join(".git").is_dir() {
+    if current.join(".git").exists() {
         if repo_matches(root, current, strategy) {
             discovered.push(build_discovered_repo(current));
         }
@@ -123,6 +127,7 @@ fn walk_for_repositories(
     Ok(())
 }
 
+#[cfg(test)]
 fn repo_matches(root: &Path, repo_path: &Path, strategy: &RepoDiscoveryStrategy) -> bool {
     let rel = repo_path
         .strip_prefix(root)
@@ -150,6 +155,7 @@ fn repo_matches(root: &Path, repo_path: &Path, strategy: &RepoDiscoveryStrategy)
         .any(|pattern| glob_like_match(&pattern, &rel))
 }
 
+#[cfg(test)]
 fn normalize_pattern(pattern: &str) -> String {
     pattern
         .trim()
@@ -158,6 +164,7 @@ fn normalize_pattern(pattern: &str) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn glob_like_match(pattern: &str, value: &str) -> bool {
     if pattern.is_empty() {
         return false;
@@ -168,6 +175,7 @@ fn glob_like_match(pattern: &str, value: &str) -> bool {
     match_segments(&pattern_tokens, &value_tokens)
 }
 
+#[cfg(test)]
 fn tokenize_pattern(pattern: &str) -> Vec<&str> {
     pattern
         .split('/')
@@ -175,12 +183,14 @@ fn tokenize_pattern(pattern: &str) -> Vec<&str> {
         .collect()
 }
 
+#[cfg(test)]
 fn tokenize_path(path: &str) -> Vec<&str> {
     path.split('/')
         .filter(|segment| !segment.is_empty())
         .collect()
 }
 
+#[cfg(test)]
 fn match_segments(pattern: &[&str], value: &[&str]) -> bool {
     if pattern.is_empty() {
         return value.is_empty();
@@ -210,6 +220,7 @@ fn match_segments(pattern: &[&str], value: &[&str]) -> bool {
     match_segments(&pattern[1..], &value[1..])
 }
 
+#[cfg(test)]
 fn match_segment(pattern: &str, value: &str) -> bool {
     let pattern_chars = pattern.chars().collect::<Vec<_>>();
     let value_chars = value.chars().collect::<Vec<_>>();
@@ -283,6 +294,7 @@ fn git_origin_remote_url(repo_path: &Path) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn expand_home(path: &str) -> anyhow::Result<PathBuf> {
     if path == "~" {
         return home_dir();
@@ -295,8 +307,34 @@ fn expand_home(path: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+#[cfg(test)]
 fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| anyhow::anyhow!("could not resolve HOME directory for repo discovery"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_git_worktree_root_is_discovered_without_recursive_parent_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-discovery-worktree-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: /synthetic/worktree\n").unwrap();
+        let strategy = RepoDiscoveryStrategy {
+            strategy_type: "directory".to_string(),
+            path: Some(root.to_string_lossy().into_owned()),
+            include: Vec::new(),
+            exclude: Vec::new(),
+        };
+        let discovered = discover_repositories_from_directory_strategy(&strategy).unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].local_path, root.to_string_lossy());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

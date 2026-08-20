@@ -30,8 +30,12 @@ impl EnvironmentConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read environment config {}: {e}", path.display()))?;
-        let wrapped: EnvironmentTomlFile = toml::from_str(&raw)
-            .map_err(|e| format!("failed to parse environment config {}: {e}", path.display()))?;
+        Self::from_toml(&raw, &path.display().to_string())
+    }
+
+    pub fn from_toml(raw: &str, label: &str) -> Result<Self, String> {
+        let wrapped: EnvironmentTomlFile = toml::from_str(raw)
+            .map_err(|e| format!("failed to parse environment config {label}: {e}"))?;
         Ok(wrapped.environment)
     }
 }

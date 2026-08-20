@@ -41,8 +41,12 @@ impl SystemConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read system config {}: {e}", path.display()))?;
-        let wrapped: SystemTomlFile = toml::from_str(&raw)
-            .map_err(|e| format!("failed to parse system config {}: {e}", path.display()))?;
+        Self::from_toml(&raw, &path.display().to_string())
+    }
+
+    pub fn from_toml(raw: &str, label: &str) -> Result<Self, String> {
+        let wrapped: SystemTomlFile = toml::from_str(raw)
+            .map_err(|e| format!("failed to parse system config {label}: {e}"))?;
         if let Some(github) = wrapped.system.github.as_ref()
             && github.webhook_secret_env != "AGENT_HUB_GITHUB_WEBHOOK_SECRET"
         {

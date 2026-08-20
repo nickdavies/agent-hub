@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::system::SystemConfig;
 
@@ -10,7 +10,7 @@ struct NetworkPolicyTomlFile {
     policy: NetworkPolicyConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct NetworkPolicyConfig {
     pub name: String,
     pub description: String,
@@ -34,17 +34,17 @@ impl NetworkPolicyConfig {
                 path.display()
             )
         })?;
-        let wrapped: NetworkPolicyTomlFile = toml::from_str(&raw).map_err(|e| {
-            format!(
-                "failed to parse network policy config {}: {e}",
-                path.display()
-            )
-        })?;
+        Self::from_toml(&raw, &path.display().to_string())
+    }
+
+    pub fn from_toml(raw: &str, label: &str) -> Result<Self, String> {
+        let wrapped: NetworkPolicyTomlFile = toml::from_str(raw)
+            .map_err(|e| format!("failed to parse network policy config {label}: {e}"))?;
         Ok(wrapped.policy)
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PolicyAllowRule {
     #[serde(default)]
     pub description: Option<String>,

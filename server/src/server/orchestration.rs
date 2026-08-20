@@ -4704,6 +4704,17 @@ impl OrchestrationService {
         state_kind: protocol::ReactiveStateKind,
         checkpoint_owner_id: Uuid,
     ) -> Result<(), AppError> {
+        if job.context.get("environment_base").is_some()
+            && job
+                .context
+                .get("approval_mode")
+                .and_then(serde_json::Value::as_str)
+                == Some("gateway")
+        {
+            return Err(AppError::WorkflowInvalid(
+                "approval_mode 'gateway' is unsupported for durable OpenCode execution".to_string(),
+            ));
+        }
         let execution_kind = job
             .context
             .get(CONTEXT_WORKFLOW_KEY)
@@ -4818,7 +4829,7 @@ impl OrchestrationService {
                 primary_repo_branch,
                 execution_context: protocol::authorization_execution_context(&job.context),
                 triage: item.workflow_id == TRIAGE_WORKFLOW_ID,
-                allow_remote_credentials: item.workflow_id != TRIAGE_WORKFLOW_ID,
+                allow_remote_credentials: true,
             },
             permission_envelope: runtime,
             resolved_environment: serde_json::json!({
@@ -19514,6 +19525,40 @@ kind = "terminal"
 
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn gateway_environment_is_rejected_before_authorization() {
+        let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks)) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        );
+        svc.init().await.expect("init");
+        let owner = insert_checkpoint_test_item(&svc, Uuid::new_v4(), None).await;
+        let mut job = checkpoint_test_job(&svc, owner.id).await;
+        job.context["environment_base"] = serde_json::json!("code-supervised");
+        job.context["approval_mode"] = serde_json::json!("gateway");
+        let error = svc
+            .project_resolved_authorization(
+                &mut job,
+                &owner,
+                protocol::ReactiveStateKind::Command,
+                owner.id,
+            )
+            .expect_err("gateway environment must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("approval_mode 'gateway' is unsupported")
+        );
+        let conn = Connection::open(db).expect("open orchestration db");
+        let job_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+            .expect("count jobs");
+        assert_eq!(job_count, 0, "gateway rejection must precede job creation");
     }
 
     #[tokio::test]

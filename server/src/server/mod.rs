@@ -544,6 +544,9 @@ impl<N: Notifier> AppState<N> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+        // WORKFLOWS_DIR is an independently supplied runtime catalog, not an
+        // authoritative CONFIG_ROOT deployment input. It is parsed and validated
+        // as one catalog before orchestration accepts work.
         let installed_workflows = loaded
             .system
             .workflows
@@ -635,6 +638,15 @@ impl<N: Notifier> AppState<N> {
             .environments
             .iter()
             .map(|environment| {
+                let bundle = loaded
+                    .environment_bundles
+                    .get(&environment.toml.name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "validated environment bundle '{}' is unavailable",
+                            environment.toml.name
+                        )
+                    });
                 let mut policies = Vec::new();
                 let mut policy_name = Some(environment.toml.network_policy.as_str());
                 let mut visited = std::collections::HashSet::new();
@@ -655,24 +667,26 @@ impl<N: Notifier> AppState<N> {
                     serde_json::json!({
                         "environment": environment.toml,
                         "network_policies": &policies,
-                        "bundle_digests": environment.content_digests().unwrap_or_else(|error| {
-                            panic!("failed to digest environment '{}': {error:#}", environment.toml.name)
-                        }),
+                        "bundle_digest": bundle.digest,
                         "network_policy_bundle_digests": policies.iter().map(|policy| {
-                            let directory = loaded.root.join("network_policies").join(&policy.name);
-                            let digests = agent_hub_config::directory_content_digests(&directory)
-                                .unwrap_or_else(|error| panic!("failed to digest network policy '{}': {error}", policy.name));
+                            let digests = loaded
+                                .network_policy_file_digests
+                                .get(&policy.name)
+                                .unwrap_or_else(|| panic!("validated digest for network policy '{}' is unavailable", policy.name))
+                                .clone();
                             (policy.name.clone(), digests)
                         }).collect::<std::collections::BTreeMap<_, _>>(),
                     }),
                 )
             })
             .collect();
-        let discovered_repos =
-            discover_repositories_from_config(loaded.system.repo_discovery.as_ref())
-                .unwrap_or_else(|error| {
-                    panic!("failed to discover repositories from system.repo_discovery: {error:#}")
-                });
+        let discovered_repos = discover_repositories_from_config(
+            loaded.system.repo_discovery.as_ref(),
+            &loaded.triage_mounts,
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to discover repositories from system.repo_discovery: {error:#}")
+        });
         let loaded_config_tree = Some(loaded);
         let orchestration = Arc::new(
             OrchestrationService::new_with_github_poller_and_interval(
