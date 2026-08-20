@@ -414,19 +414,20 @@ async function callGatewayQuestion(
 // Build a gateway payload for a single tool_input value
 // ---------------------------------------------------------------------------
 
-function makePayload(
+export function makePayload(
   sessionId: string,
   tool: OpenCodeTool,
   toolInput: Record<string, unknown>,
-  cwd: string,
+  directory: string,
+  worktree: string,
   title?: string,
 ): OpenCodeHookInput {
   return {
     session_id: sessionId,
     tool_name: tool,
     tool_input: toolInput,
-    cwd,
-    workspace_roots: [cwd],
+    cwd: directory,
+    workspace_roots: [worktree === "/" ? directory : worktree],
     hook_event_name: "permission.ask",
     session_title: title ?? null,
   }
@@ -435,6 +436,26 @@ function makePayload(
 // Resolve a path value against base, but only if it is relative.
 function resolvePath(value: string, base: string): string {
   return path.isAbsolute(value) ? value : path.resolve(base, value)
+}
+
+export function makeReadToolInput(pattern: string, worktree: string): Record<string, string> {
+  return { path: resolvePath(pattern, worktree) }
+}
+
+export function makeGlobToolInput(
+  metadata: Record<string, unknown>,
+  directory: string,
+): Record<string, string> {
+  const toolInput: Record<string, string> = {}
+  if (typeof metadata.pattern === "string") toolInput.pattern = metadata.pattern
+  if (typeof metadata.path === "string") {
+    toolInput.path = resolvePath(metadata.path, directory)
+  } else if (typeof metadata.directory === "string") {
+    toolInput.path = resolvePath(metadata.directory, directory)
+  } else {
+    toolInput.path = directory
+  }
+  return toolInput
 }
 
 // Apply a GatewayResult to the hook output object.
@@ -449,7 +470,7 @@ function apply(r: GatewayResult, output: PermissionOutput) {
 // fetched a non-default title yet and should retry next time.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_TITLE_RE = /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T/
+export const DEFAULT_TITLE_RE = /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T/
 
 /** The plugin receives a v1 SDK client. Extract the type from PluginInput
  *  so we track upstream changes automatically. */
@@ -557,7 +578,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // -----------------------------------------------------------------
       if (info.permission === "bash" && typeof info.metadata.command === "string") {
         const result = await callGateway(
-          sid, makePayload(sid, tool, { command: info.metadata.command }, directory, title),
+          sid, makePayload(sid, tool, { command: info.metadata.command }, directory, worktree, title),
         )
         apply(result, output)
         return
@@ -579,7 +600,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
               : undefined
             if (!filePath) continue
             const result = await callGateway(
-              sid, makePayload(sid, tool, { path: filePath }, directory, title),
+              sid, makePayload(sid, tool, { path: filePath }, directory, worktree, title),
             )
             if (!result.allowed) {
               apply(result, output)
@@ -593,7 +614,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         // write/edit: scalar filepath in metadata (already absolute)
         if (typeof info.metadata.filepath === "string") {
           const result = await callGateway(
-            sid, makePayload(sid, tool, { path: info.metadata.filepath }, directory, title),
+            sid, makePayload(sid, tool, { path: info.metadata.filepath }, directory, worktree, title),
           )
           apply(result, output)
           return
@@ -602,7 +623,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         // Fallback: patterns entries are worktree-relative — resolve against worktree
         for (const pat of info.patterns) {
           const result = await callGateway(
-            sid, makePayload(sid, tool, { path: resolvePath(pat, worktree) }, directory, title),
+            sid, makePayload(sid, tool, { path: resolvePath(pat, worktree) }, directory, worktree, title),
           )
           if (!result.allowed) {
             apply(result, output)
@@ -614,11 +635,18 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       }
 
       // -----------------------------------------------------------------
-      // read: patterns[0] is already an absolute path.
+      // read: patterns[0] is worktree-relative.
       // -----------------------------------------------------------------
       if (info.permission === "read") {
         const result = await callGateway(
-          sid, makePayload(sid, tool, { path: info.patterns[0] ?? "" }, directory, title),
+          sid, makePayload(
+            sid,
+            tool,
+            makeReadToolInput(info.patterns[0] ?? "", worktree),
+            directory,
+            worktree,
+            title,
+          ),
         )
         apply(result, output)
         return
@@ -629,7 +657,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // -----------------------------------------------------------------
       if (info.permission === "webfetch" && typeof info.metadata.url === "string") {
         const result = await callGateway(
-          sid, makePayload(sid, tool, { url: info.metadata.url }, directory, title),
+          sid, makePayload(sid, tool, { url: info.metadata.url }, directory, worktree, title),
         )
         apply(result, output)
         return
@@ -652,31 +680,26 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         } else if (typeof info.metadata.directory === "string") {
           toolInput.path = resolvePath(info.metadata.directory, directory)
         }
-        const result = await callGateway(sid, makePayload(sid, tool, toolInput, directory, title))
+        const result = await callGateway(
+          sid, makePayload(sid, tool, toolInput, directory, worktree, title),
+        )
         apply(result, output)
         return
       }
 
       // -----------------------------------------------------------------
-      // glob: patterns[0] is the glob pattern; metadata may carry
-      // path/directory. The gateway needs `path` (target directory).
+      // glob: preserve metadata.pattern as raw selector context while policy
+      // matching uses only the target path from metadata.path/directory or cwd.
       // -----------------------------------------------------------------
       if (info.permission === "glob") {
         log("INFO", "glob permission info", {
           patterns: JSON.stringify(info.patterns),
           metadata: JSON.stringify(info.metadata),
         })
-        const toolInput: Record<string, string> = {}
-        // Forward path/directory from metadata if present
-        if (typeof info.metadata.path === "string") {
-          toolInput.path = resolvePath(info.metadata.path, directory)
-        } else if (typeof info.metadata.directory === "string") {
-          toolInput.path = resolvePath(info.metadata.directory, directory)
-        } else {
-          // Fall back to cwd as the target directory
-          toolInput.path = directory
-        }
-        const result = await callGateway(sid, makePayload(sid, tool, toolInput, directory, title))
+        const toolInput = makeGlobToolInput(info.metadata, directory)
+        const result = await callGateway(
+          sid, makePayload(sid, tool, toolInput, directory, worktree, title),
+        )
         apply(result, output)
         return
       }
@@ -693,7 +716,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         patterns: JSON.stringify(info.patterns),
         metadata: JSON.stringify(info.metadata),
       })
-      const result = await callGateway(sid, makePayload(sid, tool, {}, directory, title))
+      const result = await callGateway(
+        sid, makePayload(sid, tool, {}, directory, worktree, title),
+      )
       apply(result, output)
     },
 
