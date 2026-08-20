@@ -1,13 +1,79 @@
-import { describe, expect, test } from "bun:test"
-import {
+import { beforeEach, describe, expect, mock, test } from "bun:test"
+import { EventEmitter } from "events"
+import type { OpenCodeHookInput } from "./generated/gateway-types"
+
+let approvalPayloads: OpenCodeHookInput[] = []
+
+mock.module("fs", () => ({
+  default: { appendFileSync: () => {} },
+  appendFileSync: () => {},
+}))
+
+mock.module("@opencode-ai/sdk/v2", () => ({
+  createOpencodeClient: () => ({}),
+}))
+
+mock.module("child_process", () => ({
+  spawn: (_bin: string, args: string[]) => {
+    const proc = new EventEmitter() as EventEmitter & {
+      stdin: { end: (payload: string) => void }
+      stdout: EventEmitter
+      stderr: EventEmitter
+      kill: () => boolean
+    }
+    proc.stdout = new EventEmitter()
+    proc.stderr = new EventEmitter()
+    proc.kill = () => true
+    proc.stdin = {
+      end: (payload: string) => {
+        if (args[0] !== "approval") return
+        approvalPayloads.push(JSON.parse(payload) as OpenCodeHookInput)
+        queueMicrotask(() => {
+          proc.stdout.emit("data", Buffer.from('{"allowed":true}'))
+          proc.emit("close", 0)
+        })
+      },
+    }
+    return proc
+  },
+  spawnSync: () => ({ status: 0 }),
+}))
+
+async function loadPlugin() {
+  const { default: plugin } = await import(`./agent-hub.ts?test=${Date.now()}-${Math.random()}`)
+  return plugin.server
+}
+
+function pluginInput(directory: string) {
+  return {
+    client: {
+      session: { get: async () => ({ data: {} }) },
+      _client: { getConfig: () => ({ fetch }) },
+    },
+    directory,
+    worktree: directory,
+    serverUrl: new URL("http://localhost:4096"),
+  } as any
+}
+
+function arbitraryMcpPermission() {
+  return {
+    permission: "mcp_weather_lookup",
+    patterns: [],
+    metadata: {},
+    sessionID: "session-1",
+  } as any
+}
+
+const {
   DEFAULT_TITLE_RE,
   makeGlobToolInput,
   makePayload,
   makeReadToolInput,
-} from "./agent-hub"
+} = await import("./agent-hub")
 
 describe("makePayload", () => {
-  test("uses directory for cwd and matching worktree for workspace_roots", () => {
+  test("uses directory for cwd and omits workspace_roots", () => {
     const payload = makePayload(
       "ses_abc",
       "Bash",
@@ -18,7 +84,7 @@ describe("makePayload", () => {
     )
 
     expect(payload.cwd).toBe("/home/user/project")
-    expect(payload.workspace_roots).toEqual(["/home/user/project"])
+    expect(payload).not.toHaveProperty("workspace_roots")
     expect(payload.session_title).toBe("Fix auth bug")
   })
 
@@ -32,11 +98,11 @@ describe("makePayload", () => {
     )
 
     expect(payload.cwd).toBe("/home/user/project/packages/api")
-    expect(payload.workspace_roots).toEqual(["/home/user/project"])
+    expect(payload).not.toHaveProperty("workspace_roots")
     expect(payload.session_title).toBeNull()
   })
 
-  test("uses directory as workspace root for the root sentinel", () => {
+  test("omits workspace_roots for the root sentinel", () => {
     const payload = makePayload(
       "ses_abc",
       "Read",
@@ -46,7 +112,7 @@ describe("makePayload", () => {
     )
 
     expect(payload.cwd).toBe("/home/user/project")
-    expect(payload.workspace_roots).toEqual(["/home/user/project"])
+    expect(payload).not.toHaveProperty("workspace_roots")
   })
 })
 
@@ -113,6 +179,40 @@ describe("makeGlobToolInput", () => {
       pattern,
       path: "/home/user/project",
     })
+  })
+})
+
+describe("gateway cwd forwarding", () => {
+  beforeEach(() => {
+    approvalPayloads = []
+  })
+
+  test("forwards one absolute plugin directory unchanged for arbitrary MCP permission", async () => {
+    const server = await loadPlugin()
+    const directory = "/home/user/project/./crates/.."
+    const hooks = await server(pluginInput(directory))
+    const output = { status: "ask" as const }
+
+    await hooks["permission.ask"]!(arbitraryMcpPermission(), output)
+
+    expect(approvalPayloads).toHaveLength(1)
+    expect(approvalPayloads[0]?.tool_name).toBe("mcp_weather_lookup")
+    expect(approvalPayloads[0]?.cwd).toBe(directory)
+    expect(approvalPayloads[0]).not.toHaveProperty("workspace_roots")
+  })
+
+  test("rejects an empty plugin directory", async () => {
+    const server = await loadPlugin()
+
+    await expect(server(pluginInput(""))).rejects.toThrow(/directory/i)
+    expect(approvalPayloads).toHaveLength(0)
+  })
+
+  test("rejects a relative plugin directory", async () => {
+    const server = await loadPlugin()
+
+    await expect(server(pluginInput("relative/project"))).rejects.toThrow(/absolute/i)
+    expect(approvalPayloads).toHaveLength(0)
   })
 })
 

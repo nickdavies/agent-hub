@@ -36,8 +36,8 @@ Add to the shell profile that launches opencode (e.g. `~/.zshrc`):
 ```sh
 export AGENT_HUB_SERVER="https://hub.example.com"   # your server URL
 export AGENT_HUB_TOKEN="your-bearer-token"          # server auth token
-# Optional — defaults to ~/.config/agent-hub/tools.json
-# export AGENT_HUB_CONFIG="/path/to/tools.json"
+# Optional — defaults to ~/.config/agent-hub/agent-hub-permissions.json
+# export AGENT_HUB_CONFIG="/path/to/agent-hub-permissions.json"
 # Optional — defaults to "agent-hub-gateway" on PATH
 # export AGENT_HUB_GATEWAY="/absolute/path/to/agent-hub-gateway"
 ```
@@ -48,7 +48,7 @@ placeholder values if you are not using the server escalation path.
 
 ### 3. Create a rule config
 
-The gateway looks for `~/.config/agent-hub/tools.json` by default. A minimal
+The gateway looks for `~/.config/agent-hub/agent-hub-permissions.json` by default. A minimal
 config that matches the plan:
 
 ```json
@@ -62,7 +62,13 @@ config that matches the plan:
 }
 ```
 
-See `agent-hub/gateway/config/tools.json` for the default and
+Use `in_cwds` to scope any rule to one or more working-directory roots. The
+event working directory must equal or be a descendant of a configured root;
+similarly prefixed sibling directories do not match. Matching uses lexical path
+semantics: paths need not exist, and symlinks are not resolved through the
+filesystem.
+
+See `agent-hub/gateway/config/tools.json` for a checked-in example and
 `agent-hub/gateway/config/smoke-test.json` for a fully worked example.
 
 ### 4. Register the plugin with opencode
@@ -96,7 +102,8 @@ this workspace (the one that contains `package.json` and `agent-hub.ts`).
 
 Run opencode and trigger a tool that requires permission (e.g. a bash
 command). You should see `agent-hub-gateway` debug output on stderr and
-opencode should allow or deny the action according to your `tools.json` rules
+opencode should allow or deny the action according to your
+`~/.config/agent-hub/agent-hub-permissions.json` rules
 without showing its own approval prompt.
 
 ## How it works
@@ -104,7 +111,7 @@ without showing its own approval prompt.
 ```
 opencode permission.ask hook
   └─ plugin calls agent-hub-gateway --opencode (once per pattern)
-        └─ gateway loads tools.json
+        └─ gateway loads ~/.config/agent-hub/agent-hub-permissions.json
               Allow  → plugin sets output.status = "allow"  (no prompt shown)
               Deny   → plugin sets output.status = "deny"   (LLM gets reason)
               Delegate(dippy) → Dippy allow/deny → same as above
@@ -116,7 +123,8 @@ The `permission` field from opencode (`bash`, `edit`, `read`) is normalised to
 the canonical gateway tool name (`Bash`, `Write`, `Read`) before rule
 evaluation. The `patterns` array from opencode (commands or file paths) is
 mapped to the correct `tool_input` field (`command` for shell, `path` for file
-tools) so that pattern-matching rules in `tools.json` work as expected.
+tools) so that pattern-matching rules in
+`~/.config/agent-hub/agent-hub-permissions.json` work as expected.
 
 ## Permission → tool name mapping
 
@@ -127,7 +135,8 @@ tools) so that pattern-matching rules in `tools.json` work as expected.
 | `read` | `Read` | `path` |
 | anything else | passed through unchanged | `pattern` (no rule match) |
 
-Unknown permissions fall through to the `default` action in `tools.json`.
+Unknown permissions fall through to the `default` action in
+`~/.config/agent-hub/agent-hub-permissions.json`.
 
 ## Caveats
 

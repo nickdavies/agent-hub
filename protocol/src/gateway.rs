@@ -427,7 +427,6 @@ pub struct OpenCodeHookInput {
     pub tool: OpenCodeTool,
     #[serde(default)]
     pub tool_input: serde_json::Value,
-    #[serde(default = "default_cwd")]
     pub cwd: String,
     #[serde(default)]
     pub workspace_roots: Option<Vec<String>>,
@@ -435,10 +434,6 @@ pub struct OpenCodeHookInput {
     pub hook_event_name: String,
     /// Session title from opencode (may be absent).
     pub session_title: Option<String>,
-}
-
-fn default_cwd() -> String {
-    ".".to_string()
 }
 
 fn default_opencode_hook_event() -> String {
@@ -472,6 +467,10 @@ pub struct ClaudeCodeHookInput {
     pub cwd: String,
     #[serde(default = "default_claude_hook_event")]
     pub hook_event_name: String,
+}
+
+fn default_cwd() -> String {
+    ".".to_string()
 }
 
 fn default_claude_hook_event() -> String {
@@ -699,9 +698,21 @@ mod tests {
 
     #[test]
     fn opencode_input_deserializes_tool_name_field() {
-        let json = r#"{"session_id":"s1","tool_name":"bash","tool_input":{}}"#;
+        let json = r#"{"session_id":"s1","tool_name":"bash","tool_input":{},"cwd":"/workspace"}"#;
         let input: OpenCodeHookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.tool, OpenCodeTool::Bash);
+    }
+
+    #[test]
+    fn opencode_input_missing_cwd_fails_deserialization() {
+        let json = r#"{"session_id":"s1","tool_name":"mcp_weather_lookup","tool_input":{}}"#;
+
+        let result = serde_json::from_str::<OpenCodeHookInput>(json);
+
+        assert!(
+            result.is_err(),
+            "missing cwd must fail at the wire boundary"
+        );
     }
 
     #[test]

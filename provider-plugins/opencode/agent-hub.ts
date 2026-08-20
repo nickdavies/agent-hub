@@ -9,7 +9,7 @@
  *   AGENT_HUB_GATEWAY   path to the gateway binary (default: "agent-hub-gateway")
  *   AGENT_HUB_SERVER    server URL (default: "http://localhost:8080")
  *   AGENT_HUB_TOKEN     bearer token for server auth (default: none)
- *   AGENT_HUB_CONFIG    path to tools.json rule config (optional)
+ *   AGENT_HUB_CONFIG    path to agent-hub-permissions.json rule config (optional)
  *
  * Installation: add to .opencode/config.json:
  *   { "plugin": ["file:///path/to/opencode-plugin"] }
@@ -419,7 +419,7 @@ export function makePayload(
   tool: OpenCodeTool,
   toolInput: Record<string, unknown>,
   directory: string,
-  worktree: string,
+  _worktree: string,
   title?: string,
 ): OpenCodeHookInput {
   return {
@@ -427,7 +427,6 @@ export function makePayload(
     tool_name: tool,
     tool_input: toolInput,
     cwd: directory,
-    workspace_roots: [worktree === "/" ? directory : worktree],
     hook_event_name: "permission.ask",
     session_title: title ?? null,
   }
@@ -456,6 +455,11 @@ export function makeGlobToolInput(
     toolInput.path = directory
   }
   return toolInput
+}
+
+function validatePluginDirectory(directory: string) {
+  if (directory.length === 0) throw new Error("Plugin directory must not be empty")
+  if (!path.isAbsolute(directory)) throw new Error("Plugin directory must be absolute")
 }
 
 // Apply a GatewayResult to the hook output object.
@@ -522,6 +526,7 @@ export const id = "agent-hub"
 const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const client = input.client
   const { directory, worktree } = input
+  validatePluginDirectory(directory)
 
   // Create the v2 SDK client once at plugin-init time.  We reuse the same
   // in-process fetch that input.client uses (extracted via the internal

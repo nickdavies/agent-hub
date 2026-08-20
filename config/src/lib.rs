@@ -5,7 +5,7 @@ pub use rules::{
     ConfigAction, ConfigDecision, DefaultAction, RuleAction, RuleSummary, ToolConfig,
     default_to_resolved, load_tool_config, resolve_action, validate_tool_config,
 };
-pub use tools::{is_in_workspace, resolve_path};
+pub use tools::{is_in_workspace, normalize_path, resolve_path};
 
 /// Expand a leading `~/` to the user's home directory.
 pub fn expand_tilde(path: &str) -> String {

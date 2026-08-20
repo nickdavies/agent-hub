@@ -22,7 +22,7 @@ export type OpenCodeTool = string
  * Input from the opencode hook (stdin JSON for both tool.execute.before and permission.ask).
  */
 export interface OpenCodeHookInput {
-  cwd?: string
+  cwd: string
   hook_event_name?: string
   session_id: SessionId
   /**

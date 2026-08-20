@@ -5,8 +5,7 @@
   "type": "object",
   "properties": {
     "cwd": {
-      "type": "string",
-      "default": "."
+      "type": "string"
     },
     "hook_event_name": {
       "type": "string",
@@ -41,7 +40,8 @@
   },
   "required": [
     "session_id",
-    "tool_name"
+    "tool_name",
+    "cwd"
   ],
   "$defs": {
     "OpenCodeTool": {

@@ -34,7 +34,7 @@ enum Commands {
     /// Validate gateway config, delegate commands, and server connectivity
     Validate {
         /// Path to tool routing config file (JSON)
-        #[arg(long, default_value = "~/.config/agent-hub/tools.json")]
+        #[arg(long, default_value = "~/.config/agent-hub/agent-hub-permissions.json")]
         config: String,
 
         /// Server URL (optional; enables server connectivity check)

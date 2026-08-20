@@ -67,7 +67,7 @@ struct ApprovalArgs {
     timeout: u64,
 
     /// Path to tool routing config file (JSON)
-    #[arg(long, default_value = "~/.config/agent-hub/tools.json")]
+    #[arg(long, default_value = "~/.config/agent-hub/agent-hub-permissions.json")]
     config: String,
 }
 
