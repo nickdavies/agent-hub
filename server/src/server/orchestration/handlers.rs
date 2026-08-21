@@ -2,11 +2,12 @@ use std::convert::Infallible;
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use protocol::{
     CreateWorkItemRequest, FireEventRequest, HeartbeatRequest, Job, JobState, JobUpdateRequest,
-    PollJobRequest, PollJobResponse, ReactiveWorkflowDefinition, RegisterWorkerRequest, WorkItem,
-    WorkerInfo,
+    PollJobRequest, PollJobResponse, ReactiveWorkflowDefinition, RegisterWorkerRequest,
+    RegisterWorkerResponse, WorkItem, WorkerInfo, WorkerSessionCredential,
 };
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -15,6 +16,48 @@ use uuid::Uuid;
 use crate::error::AppError;
 
 use super::map_db;
+
+const WORKER_SESSION_ID_HEADER: &str = "x-agent-hub-worker-session-id";
+const WORKER_SESSION_TOKEN_HEADER: &str = "x-agent-hub-worker-session-token";
+
+fn worker_session_from_headers(
+    headers: &HeaderMap,
+    required: bool,
+) -> Result<Option<WorkerSessionCredential>, AppError> {
+    let session_id = headers.get(WORKER_SESSION_ID_HEADER);
+    let session_token = headers.get(WORKER_SESSION_TOKEN_HEADER);
+    match (session_id, session_token) {
+        (None, None) if !required => Ok(None),
+        (Some(session_id), Some(session_token)) => {
+            let session_id = session_id
+                .to_str()
+                .ok()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or_else(|| {
+                    AppError::WorkerSessionUnauthorized(
+                        "worker session ID is missing or invalid".to_string(),
+                    )
+                })?;
+            let session_token = session_token.to_str().map_err(|_| {
+                AppError::WorkerSessionUnauthorized(
+                    "worker session token is missing or invalid".to_string(),
+                )
+            })?;
+            if session_token.is_empty() {
+                return Err(AppError::WorkerSessionUnauthorized(
+                    "worker session token is missing or invalid".to_string(),
+                ));
+            }
+            Ok(Some(WorkerSessionCredential {
+                session_id,
+                session_token: protocol::Secret::new(session_token),
+            }))
+        }
+        _ => Err(AppError::WorkerSessionUnauthorized(
+            "worker session credential is incomplete".to_string(),
+        )),
+    }
+}
 
 pub async fn create_work_item<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
@@ -46,9 +89,14 @@ pub async fn list_jobs<N: super::super::notifier::Notifier>(
 pub async fn update_job<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(req): Json<JobUpdateRequest>,
 ) -> Result<Json<Job>, AppError> {
-    let job = state.orchestration.update_job(id, req).await?;
+    let credential = worker_session_from_headers(&headers, true)?.expect("required session");
+    let job = state
+        .orchestration
+        .update_job_authenticated(id, credential, req)
+        .await?;
     if matches!(
         job.state,
         JobState::Succeeded | JobState::Failed | JobState::Cancelled
@@ -98,17 +146,31 @@ pub async fn job_events_sse<N: super::super::notifier::Notifier>(
 
 pub async fn register_worker<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
+    headers: HeaderMap,
     Json(req): Json<RegisterWorkerRequest>,
-) -> Result<Json<WorkerInfo>, AppError> {
-    Ok(Json(state.orchestration.register_worker(req).await?))
+) -> Result<Json<RegisterWorkerResponse>, AppError> {
+    let replacement = worker_session_from_headers(&headers, false)?;
+    Ok(Json(
+        state
+            .orchestration
+            .register_worker_session(req, replacement)
+            .await?,
+    ))
 }
 
 pub async fn heartbeat_worker<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<WorkerInfo>, AppError> {
-    Ok(Json(state.orchestration.heartbeat(id, req).await?))
+    let credential = worker_session_from_headers(&headers, true)?.expect("required session");
+    Ok(Json(
+        state
+            .orchestration
+            .heartbeat_authenticated(id, credential, req)
+            .await?,
+    ))
 }
 
 pub async fn list_workers<N: super::super::notifier::Notifier>(
@@ -119,9 +181,16 @@ pub async fn list_workers<N: super::super::notifier::Notifier>(
 
 pub async fn poll_job<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
+    headers: HeaderMap,
     Json(req): Json<PollJobRequest>,
 ) -> Result<Json<PollJobResponse>, AppError> {
-    Ok(Json(state.orchestration.poll_job(req).await?))
+    let credential = worker_session_from_headers(&headers, true)?.expect("required session");
+    Ok(Json(
+        state
+            .orchestration
+            .poll_job_authenticated(credential, req)
+            .await?,
+    ))
 }
 
 pub async fn dispatch<N: super::super::notifier::Notifier>(

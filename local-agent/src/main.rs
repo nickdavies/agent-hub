@@ -32,7 +32,6 @@ mod credential_provider;
 mod egress;
 mod egress_config;
 mod mcp_bridge;
-mod pb_conv;
 mod workspace;
 
 use artifacts::{
@@ -48,15 +47,12 @@ use client::{
 use credential_provider::{ResolvedCredentials, resolve_all_for_job};
 use egress::{EgressManager, llm_provider_from_env};
 use egress_config::{LocalAgentConfig, ManagedRunnerKind, load_local_agent_config};
-use mcp_bridge::{McpBridgeInstance, container_socket_path, mcp_socket_env_var};
-use pb_conv::ts_to_pb;
+use local_agent::pb;
+use local_agent::pb_conv::ts_to_pb;
 #[cfg(test)]
-use pb_conv::{job_from_pb, job_to_pb};
+use local_agent::pb_conv::{job_from_pb, job_to_pb};
+use mcp_bridge::{McpBridgeInstance, container_socket_path, mcp_socket_env_var};
 use workspace::*;
-
-pub mod pb {
-    tonic::include_proto!("worker");
-}
 
 #[derive(Parser)]
 #[command(name = "local-agent", version)]
@@ -198,7 +194,7 @@ impl JobEventTranscriptWriter {
 }
 
 fn protocol_job_event_kind(kind: pb::JobEventKind) -> JobEventKind {
-    pb_conv::protocol_job_event_kind(kind)
+    local_agent::pb_conv::protocol_job_event_kind(kind)
 }
 
 fn job_event_stream_name(kind: pb::JobEventKind) -> Option<&'static str> {
@@ -559,6 +555,32 @@ fn approval_mode_from_job_context(context: &serde_json::Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_preparation_requires_explicit_applied_running_transition() {
+        let mut preparation_started = false;
+        for outcome in [
+            local_agent::RunningTransitionOutcome::Cancelled,
+            local_agent::RunningTransitionOutcome::Rejected(
+                "replacement session rejected running transition".to_string(),
+            ),
+            local_agent::RunningTransitionOutcome::Rejected("server unavailable".to_string()),
+        ] {
+            if local_agent::running_execution_permit(outcome)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                preparation_started = true;
+            }
+        }
+        assert!(!preparation_started);
+        assert!(
+            local_agent::running_execution_permit(local_agent::RunningTransitionOutcome::Applied)
+                .unwrap()
+                .is_some()
+        );
+    }
     use crate::artifacts::{inline_job_events_json_tail, inline_transcript_jsonl_tail};
 
     #[tokio::test]
@@ -610,6 +632,13 @@ mod tests {
             lease_expires_at: Some(now),
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: Some(protocol::CanonicalAuthorizationArtifact {
+                version: 1,
+                digest: "mapping-digest".to_string(),
+                canonical_bytes: vec![0, 1, 2, 255],
+            }),
         };
 
         let pb = job_to_pb(job.clone());
@@ -617,6 +646,22 @@ mod tests {
         assert_eq!(decoded.id, job.id);
         assert_eq!(decoded.execution_mode, job.execution_mode);
         assert_eq!(decoded.max_retries, 2);
+        assert_eq!(decoded.context, job.context);
+        assert_eq!(decoded.canonical_authorization, job.canonical_authorization);
+
+        let mut missing_context = job_to_pb(job.clone());
+        missing_context.context_json.clear();
+        assert!(job_from_pb(missing_context).is_err());
+
+        let mut invalid_context = job_to_pb(job.clone());
+        invalid_context.context_json = b"{".to_vec();
+        assert!(job_from_pb(invalid_context).is_err());
+
+        let mut legacy_only = job_to_pb(job);
+        legacy_only.canonical_authorization.clear();
+        legacy_only.canonical_authorization_version = 0;
+        legacy_only.canonical_authorization_digest.clear();
+        assert!(job_from_pb(legacy_only).is_err());
     }
 
     #[test]
@@ -639,7 +684,7 @@ mod tests {
                 user: "user".to_string(),
             }),
             context: serde_json::json!({
-                "workflow": {"inputs":{"scope":"signed"}, "valid_next_events":["job_succeeded"]},
+                "workflow": {"inputs":{"scope":"signed","large":9007199254740993_u64}, "valid_next_events":["job_succeeded"]},
                 "work_item": {"workflow_id":"workflow"},
                 "state_invocation": {"state_id":"build", "id":work_item_id}
             }),
@@ -656,6 +701,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let environment = protocol::canonical_environment_for_execution(
             ExecutionMode::Docker,
@@ -706,20 +754,24 @@ mod tests {
             resource_constraints: protocol::ResolvedAuthorizationResources {
                 timeout_secs: Some(60),
                 max_retries: 3,
+                attempt: 0,
             },
         };
-        protocol::project_authorization_request_into_job_context(
-            &mut job.context,
-            "authorization",
-            &request,
-        )
-        .expect("authorization evidence");
+        let bundle =
+            protocol::ImmutableAuthorizationBundle::create(&request).expect("authorization bundle");
+        protocol::project_authorization_bundle_into_job_context(&mut job.context, &bundle)
+            .expect("authorization evidence");
+        job.canonical_authorization = Some(bundle.artifact());
         assert!(verify_authorized_job(&job, &LocalAgentConfig::default()).is_ok());
         let http_roundtrip: Job =
             serde_json::from_value(serde_json::to_value(&job).expect("HTTP job JSON"))
                 .expect("HTTP authorization evidence");
         let http_verified = verify_authorized_job(&http_roundtrip, &LocalAgentConfig::default())
             .expect("HTTP verify");
+        assert_eq!(
+            http_roundtrip.context["workflow"]["inputs"]["large"].as_u64(),
+            Some(9_007_199_254_740_993)
+        );
         let transported = job_from_pb(job_to_pb(job.clone())).expect("gRPC authorization evidence");
         let grpc_verified =
             verify_authorized_job(&transported, &LocalAgentConfig::default()).expect("gRPC verify");
@@ -744,36 +796,64 @@ mod tests {
             assert_eq!(transported_request.resource_constraints.max_retries, 3);
         }
 
+        let mut duplicate_context_tamper = job.clone();
+        duplicate_context_tamper.context[protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY]["behavior"]
+            ["primary_repo_branch"] = serde_json::json!("attacker/branch");
+        duplicate_context_tamper.context[protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY]["behavior"]
+            ["runner_profile"]["credential_providers"] = serde_json::json!([{
+            "name":"attacker",
+            "provider_type":"attacker",
+            "targets":["/tmp/attacker"]
+        }]);
+        let verified =
+            verify_authorized_job(&duplicate_context_tamper, &LocalAgentConfig::default())
+                .expect("duplicate transport authorization metadata is ignored");
+        assert!(verified.credential_provider_names.is_empty());
+        assert_eq!(
+            verified
+                .job
+                .repo
+                .as_ref()
+                .and_then(|repo| repo.branch_name.as_deref()),
+            Some(expected_branch.as_str())
+        );
+        let rebuilt_request =
+            protocol::authorization_request_from_job_context(&verified.job.context)
+                .expect("verified display request");
+        assert_eq!(rebuilt_request, request.clone().normalize());
+
+        let mut rest_id_tamper = job.clone();
+        rest_id_tamper.context[protocol::CONTEXT_AUTHORIZATION_ID_KEY] =
+            serde_json::json!("attacker-id");
+        let rest_id_tamper: Job = serde_json::from_slice(
+            &serde_json::to_vec(&rest_id_tamper).expect("REST ID tamper encode"),
+        )
+        .expect("REST ID tamper decode");
+        assert!(verify_authorized_job(&rest_id_tamper, &LocalAgentConfig::default()).is_err());
+
+        let mut protobuf_id_tamper = job.clone();
+        protobuf_id_tamper.context[protocol::CONTEXT_AUTHORIZATION_ID_KEY] =
+            serde_json::json!("attacker-id");
+        let protobuf_id_tamper =
+            job_from_pb(job_to_pb(protobuf_id_tamper)).expect("protobuf ID tamper transport");
+        assert!(verify_authorized_job(&protobuf_id_tamper, &LocalAgentConfig::default()).is_err());
+
         let mut http_attempt_mutation = job.clone();
         http_attempt_mutation.attempt = 99;
         let http_attempt_mutation: Job = serde_json::from_value(
             serde_json::to_value(http_attempt_mutation).expect("HTTP attempt mutation"),
         )
         .expect("HTTP mutated job");
-        let http_attempt_verified =
-            verify_authorized_job(&http_attempt_mutation, &LocalAgentConfig::default())
-                .expect("HTTP attempt is host-only");
-        assert_eq!(
-            resolve_target_branch_for_repo_job(
-                &http_attempt_verified.job,
-                http_attempt_verified.job.repo.as_ref().expect("HTTP repo"),
-            ),
-            expected_branch
+        assert!(
+            verify_authorized_job(&http_attempt_mutation, &LocalAgentConfig::default()).is_err()
         );
 
         let mut grpc_attempt_mutation = job.clone();
         grpc_attempt_mutation.attempt = 77;
         let grpc_attempt_mutation =
             job_from_pb(job_to_pb(grpc_attempt_mutation)).expect("gRPC attempt mutation");
-        let grpc_attempt_verified =
-            verify_authorized_job(&grpc_attempt_mutation, &LocalAgentConfig::default())
-                .expect("gRPC attempt is host-only");
-        assert_eq!(
-            resolve_target_branch_for_repo_job(
-                &grpc_attempt_verified.job,
-                grpc_attempt_verified.job.repo.as_ref().expect("gRPC repo"),
-            ),
-            expected_branch
+        assert!(
+            verify_authorized_job(&grpc_attempt_mutation, &LocalAgentConfig::default()).is_err()
         );
 
         for mutated in [
@@ -804,27 +884,59 @@ mod tests {
             assert!(verify_authorized_job(&mutated, &LocalAgentConfig::default()).is_err());
         }
 
+        let mut payload_tamper = job.clone();
+        payload_tamper
+            .canonical_authorization
+            .as_mut()
+            .unwrap()
+            .canonical_bytes[0] ^= 1;
+        assert!(verify_authorized_job(&payload_tamper, &LocalAgentConfig::default()).is_err());
+
+        let mut digest_tamper = job.clone();
+        digest_tamper
+            .canonical_authorization
+            .as_mut()
+            .unwrap()
+            .digest = "bad".to_string();
+        assert!(verify_authorized_job(&digest_tamper, &LocalAgentConfig::default()).is_err());
+
+        let mut version_tamper = job.clone();
+        version_tamper
+            .canonical_authorization
+            .as_mut()
+            .unwrap()
+            .version += 1;
+        assert!(verify_authorized_job(&version_tamper, &LocalAgentConfig::default()).is_err());
+
+        let mut legacy_only = job.clone();
+        legacy_only.canonical_authorization = None;
+        assert!(verify_authorized_job(&legacy_only, &LocalAgentConfig::default()).is_err());
+
         let mut profile_mismatch = job.clone();
         let mut mismatched_request = request.clone();
         mismatched_request.behavior.runner_profile["config_digest"] =
             serde_json::Value::String("other".to_string());
-        protocol::project_authorization_request_into_job_context(
+        let bundle = protocol::ImmutableAuthorizationBundle::create(&mismatched_request)
+            .expect("profile mismatch bundle");
+        protocol::project_authorization_bundle_into_job_context(
             &mut profile_mismatch.context,
-            "authorization",
-            &mismatched_request,
+            &bundle,
         )
         .expect("profile mismatch evidence");
+        profile_mismatch.canonical_authorization = Some(bundle.artifact());
         assert!(verify_authorized_job(&profile_mismatch, &LocalAgentConfig::default()).is_err());
 
         let mut environment_mismatch = job.clone();
         let mut mismatched_request = request.clone();
         mismatched_request.resolved_environment = serde_json::json!({"base":"missing"});
-        protocol::project_authorization_request_into_job_context(
+        let bundle = protocol::ImmutableAuthorizationBundle::create(&mismatched_request)
+            .expect("environment mismatch bundle");
+        protocol::project_authorization_bundle_into_job_context(
             &mut environment_mismatch.context,
-            "authorization",
-            &mismatched_request,
+            &bundle,
         )
         .expect("environment mismatch evidence");
+        environment_mismatch.canonical_authorization = Some(bundle.artifact());
         assert!(
             verify_authorized_job(&environment_mismatch, &LocalAgentConfig::default()).is_err()
         );
@@ -1524,6 +1636,9 @@ mod tests {
                 lease_expires_at: None,
                 created_at: now,
                 updated_at: now,
+                assigned_worker_session_id: None,
+                assigned_worker_session_generation: None,
+                canonical_authorization: None,
             };
 
             let deadline = JobDeadline::new(job.timeout_secs).unwrap();
@@ -1593,6 +1708,9 @@ mod tests {
                 lease_expires_at: None,
                 created_at: now,
                 updated_at: now,
+                assigned_worker_session_id: None,
+                assigned_worker_session_generation: None,
+                canonical_authorization: None,
             };
 
             let started = Instant::now();
@@ -1670,6 +1788,9 @@ mod tests {
                 lease_expires_at: None,
                 created_at: now,
                 updated_at: now,
+                assigned_worker_session_id: None,
+                assigned_worker_session_generation: None,
+                canonical_authorization: None,
             };
 
             let deadline = JobDeadline::new(job.timeout_secs).unwrap();
@@ -1747,6 +1868,9 @@ mod tests {
                 lease_expires_at: None,
                 created_at: now,
                 updated_at: now,
+                assigned_worker_session_id: None,
+                assigned_worker_session_generation: None,
+                canonical_authorization: None,
             };
             let events_path = transcript.join("job-events.jsonl");
             let events = JobEventSink {
@@ -1827,6 +1951,9 @@ mod tests {
                 lease_expires_at: None,
                 created_at: now,
                 updated_at: now,
+                assigned_worker_session_id: None,
+                assigned_worker_session_generation: None,
+                canonical_authorization: None,
             };
 
             let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1884,6 +2011,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
 
         let branch = branch_for_job_attempt(&job, Some("agent-hub/manual".to_string()));
@@ -1915,6 +2045,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
 
         let branch = branch_for_job_attempt(&job, None);
@@ -2063,6 +2196,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let repo = protocol::RepoSource {
             repo_url: "https://example/repo.git".to_string(),
@@ -2135,6 +2271,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let repo = protocol::RepoSource {
             repo_url: "https://example/repo.git".to_string(),
@@ -2182,6 +2321,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let repo = protocol::RepoSource {
             repo_url: "https://example/repo.git".to_string(),
@@ -2228,6 +2370,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let repo = protocol::RepoSource {
             repo_url: "https://example/repo.git".to_string(),
@@ -2583,6 +2728,9 @@ mod tests {
                 lease_expires_at: None,
                 created_at: now,
                 updated_at: now,
+                assigned_worker_session_id: None,
+                assigned_worker_session_generation: None,
+                canonical_authorization: None,
             };
 
             let workspace_dir = worktree_dir_for_job_attempt(&worktrees_root, &job);
@@ -2685,6 +2833,9 @@ mod tests {
             lease_expires_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         });
         assert_eq!(parsed.environment.execution_mode, ExecutionMode::Docker);
         assert_eq!(parsed.environment.timeout_secs, Some(77));
@@ -2725,6 +2876,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
 
         let runtime = protocol::CanonicalRuntimeSpec {
@@ -2858,6 +3012,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
 
         let runtime = protocol::CanonicalRuntimeSpec {
@@ -3039,6 +3196,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
 
         let runtime = protocol::CanonicalRuntimeSpec {
@@ -3153,6 +3313,9 @@ mod tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
 
         let runtime = protocol::CanonicalRuntimeSpec {
@@ -3258,20 +3421,12 @@ async fn main() -> anyhow::Result<()> {
             Client::Grpc(GrpcClient {
                 client: pb::worker_lifecycle_client::WorkerLifecycleClient::new(channel),
                 token: cli.token.map(Secret::new),
+                worker_session: Arc::new(RwLock::new(None)),
             })
         }
     };
 
-    let mut event_publisher = match &client {
-        Client::Grpc(grpc) => {
-            let tx = start_grpc_event_stream(grpc.client.clone(), grpc.token.clone()).await?;
-            Some(JobEventPublisher {
-                worker_id: cli.worker_id.clone(),
-                tx,
-            })
-        }
-        Client::Http(_) => None,
-    };
+    let mut event_publisher = None;
 
     let client = Arc::new(client);
 
@@ -3338,9 +3493,28 @@ async fn main() -> anyhow::Result<()> {
             id: cli.worker_id.clone(),
             hostname: cli.hostname.clone(),
             supported_modes: modes.clone(),
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .context("worker registration failed")?;
+    if let Client::Grpc(grpc) = client.as_ref() {
+        let session = client
+            .worker_session()
+            .context("worker registration returned no session")?;
+        let tx = start_grpc_event_stream(
+            grpc.client.clone(),
+            grpc.token.clone(),
+            &cli.worker_id,
+            &session,
+        )
+        .await?;
+        event_publisher = Some(JobEventPublisher {
+            worker_id: cli.worker_id.clone(),
+            tx,
+        });
+    }
 
     loop {
         if last_transcript_cleanup.elapsed()
@@ -3368,12 +3542,25 @@ async fn main() -> anyhow::Result<()> {
                         id: cli.worker_id.clone(),
                         hostname: cli.hostname.clone(),
                         supported_modes: modes.clone(),
+                        protocol_capabilities: vec![
+                            protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                        ],
                     })
                     .await
                 {
                     eprintln!("worker re-registration failed: {register_error}");
                 } else if let Client::Grpc(grpc) = client.as_ref() {
-                    match start_grpc_event_stream(grpc.client.clone(), grpc.token.clone()).await {
+                    let session = client
+                        .worker_session()
+                        .expect("re-registration returned no worker session");
+                    match start_grpc_event_stream(
+                        grpc.client.clone(),
+                        grpc.token.clone(),
+                        &cli.worker_id,
+                        &session,
+                    )
+                    .await
+                    {
                         Ok(tx) => {
                             event_publisher = Some(JobEventPublisher {
                                 worker_id: cli.worker_id.clone(),
@@ -3400,12 +3587,24 @@ async fn main() -> anyhow::Result<()> {
                             id: cli.worker_id.clone(),
                             hostname: cli.hostname.clone(),
                             supported_modes: modes.clone(),
+                            protocol_capabilities: vec![
+                                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                            ],
                         })
                         .await
                     {
                         eprintln!("worker re-registration failed: {register_error}");
                     } else if let Client::Grpc(grpc) = client.as_ref() {
-                        match start_grpc_event_stream(grpc.client.clone(), grpc.token.clone()).await
+                        let session = client
+                            .worker_session()
+                            .expect("re-registration returned no worker session");
+                        match start_grpc_event_stream(
+                            grpc.client.clone(),
+                            grpc.token.clone(),
+                            &cli.worker_id,
+                            &session,
+                        )
+                        .await
                         {
                             Ok(tx) => {
                                 event_publisher = Some(JobEventPublisher {
@@ -3425,12 +3624,42 @@ async fn main() -> anyhow::Result<()> {
         };
 
         if let Some(job) = polled_job {
-            match client
+            let Some(worker_session) = client.worker_session() else {
+                eprintln!("job {} has no live worker session; skipping", job.id);
+                continue;
+            };
+            if worker_session.worker_id != cli.worker_id {
+                eprintln!(
+                    "job {} has a mismatched local worker session; skipping",
+                    job.id
+                );
+                continue;
+            }
+            if let Err(error) = local_agent::verify_authorized_job(
+                &job,
+                &cli.worker_id,
+                worker_session.session_id,
+                worker_session.generation,
+            ) {
+                eprintln!(
+                    "job {} failed live assignment verification: {error}",
+                    job.id
+                );
+                continue;
+            }
+            let running_outcome = match client
                 .update_job(&cli.worker_id, job.id, JobState::Running, None, None)
                 .await
             {
-                Ok(JobUpdateOutcome::Applied) => {}
+                Ok(JobUpdateOutcome::Applied) => local_agent::RunningTransitionOutcome::Applied,
                 Ok(JobUpdateOutcome::CancelledOnServer) => {
+                    local_agent::RunningTransitionOutcome::Cancelled
+                }
+                Err(error) => local_agent::RunningTransitionOutcome::Rejected(error.to_string()),
+            };
+            let execution_permit = match local_agent::running_execution_permit(running_outcome) {
+                Ok(Some(permit)) => permit,
+                Ok(None) => {
                     eprintln!(
                         "job {} was cancelled before execution started; skipping",
                         job.id
@@ -3439,8 +3668,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(error) => {
                     eprintln!("failed to report running job {}: {error}", job.id);
+                    continue;
                 }
-            }
+            };
 
             let hb_client = Arc::clone(&client);
             let hb_worker_id = cli.worker_id.clone();
@@ -3468,6 +3698,8 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 Err(error) => {
                                     eprintln!("running lease renewal failed for job {hb_job_id}: {error}");
+                                    let _ = cancel_tx.send(true);
+                                    break;
                                 }
                             }
                         }
@@ -3489,7 +3721,10 @@ async fn main() -> anyhow::Result<()> {
 
             let result = run_job(
                 &job,
+                execution_permit,
                 &cli.worker_id,
+                worker_session.session_id,
+                worker_session.generation,
                 &transcript_dir,
                 &transcript_rel_dir,
                 &cli.data_dir,
@@ -3609,7 +3844,10 @@ async fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn run_job(
     job: &Job,
+    _execution_permit: local_agent::RunningExecutionPermit,
     worker_id: &str,
+    worker_session_id: uuid::Uuid,
+    worker_session_generation: u64,
     transcript_dir: &str,
     transcript_rel_dir: &str,
     data_dir: &Path,
@@ -3620,7 +3858,16 @@ async fn run_job(
     cancel_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<JobResult> {
     let local_agent_config = egress_manager.config();
-    let verified = verify_authorized_job(job, local_agent_config)?;
+    let verified = verify_authorized_job_for_session(
+        job,
+        local_agent_config,
+        worker_id,
+        worker_session_id,
+        worker_session_generation,
+    )?;
+    let authorization_digest = verified.authorization_digest.clone();
+    let authorization_version = verified.authorization_version;
+    let required_credential_providers = verified.credential_provider_names.clone();
     let job = &verified.job;
     let runtime_spec = verified.runtime_spec;
     let deadline = JobDeadline::new(runtime_spec.environment.timeout_secs)?;
@@ -3673,11 +3920,8 @@ async fn run_job(
     eprintln!(
         "info: job {} using immutable authorization {} (version={}, mode={}, timeout_secs={:?}, network={:?}, mounts={}, toolchains={})",
         job.id,
-        job.context
-            .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("missing"),
-        runtime_spec.runtime_version,
+        authorization_digest,
+        authorization_version,
         runtime_spec.environment.execution_mode,
         runtime_spec.environment.timeout_secs,
         runtime_spec.environment.network_resources,
@@ -4043,6 +4287,7 @@ async fn run_job(
                     &deadline,
                     runtime_spec.environment.container_image.clone(),
                     &runtime_spec,
+                    &required_credential_providers,
                     &local_egress_plan,
                     egress_manager,
                     prepared_workspace.mirror_dir.as_deref(),
@@ -4071,6 +4316,7 @@ async fn run_job(
                     &deadline,
                     runtime_spec.environment.container_image.clone(),
                     &runtime_spec,
+                    &required_credential_providers,
                     &local_egress_plan,
                     egress_manager,
                     prepared_workspace.mirror_dir.as_deref(),
@@ -4266,12 +4512,15 @@ async fn run_job(
 
 struct VerifiedAuthorizedJob {
     job: Job,
+    authorization_digest: String,
+    authorization_version: u32,
     runtime_spec: protocol::CanonicalRuntimeSpec,
     runner: ResolvedRunnerSpec,
     work_item_context: serde_json::Value,
     triage: bool,
     github_action: Option<protocol::GithubAction>,
     environment_bundle: Option<agent_hub_config::EnvironmentBundle>,
+    credential_provider_names: Vec<String>,
 }
 
 struct OpencodeJobState {
@@ -5070,6 +5319,9 @@ exit 0
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         }
     }
 
@@ -6303,6 +6555,9 @@ mod real_docker_oauth_integration_tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let request = protocol::ResolvedAuthorizationRequest {
             version: protocol::AUTHORIZATION_REQUEST_VERSION.to_string(),
@@ -6342,13 +6597,12 @@ mod real_docker_oauth_integration_tests {
             resource_constraints: protocol::ResolvedAuthorizationResources {
                 timeout_secs: Some(30),
                 max_retries: 0,
+                attempt: 0,
             },
         };
-        protocol::project_authorization_request_into_job_context(
-            &mut job.context,
-            "integration-authorization",
-            &request,
-        )?;
+        let bundle = protocol::ImmutableAuthorizationBundle::create(&request)?;
+        protocol::project_authorization_bundle_into_job_context(&mut job.context, &bundle)?;
+        job.canonical_authorization = Some(bundle.artifact());
         let verified = verify_authorized_job(&job, &local_config)?;
         let bundle = verified
             .environment_bundle
@@ -6426,6 +6680,7 @@ mod real_docker_oauth_integration_tests {
             &deadline,
             Some(agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string()),
             &verified.runtime_spec,
+            &verified.credential_provider_names,
             &egress_plan,
             &egress_manager,
             None,
@@ -6623,36 +6878,38 @@ printf '{{"next_event":"{next_event}","summary":"%s"}}' "$access" > /transcript/
     }
 }
 
+#[cfg(test)]
 fn verify_authorized_job(
     job: &Job,
     config: &LocalAgentConfig,
 ) -> anyhow::Result<VerifiedAuthorizedJob> {
-    let authorization_id = job
-        .context
-        .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
-        .and_then(serde_json::Value::as_str)
-        .context("job has no immutable authorization identity")?;
-    if authorization_id.trim().is_empty() {
-        anyhow::bail!("job authorization identity must not be empty");
-    }
-    let request_digest = job
-        .context
-        .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
-        .and_then(serde_json::Value::as_str)
-        .context("job has no immutable request digest")?;
-    let mut request = protocol::authorization_request_from_job_context(&job.context)
-        .context("job has no resolved authorization request")?;
-    if request.work_unit_id != job.work_item_id || request.state_id != job.step_id {
-        anyhow::bail!("job authorization work-unit binding mismatch");
-    }
-    if request.request_digest()? != request_digest {
-        anyhow::bail!("job authorization request digest mismatch");
-    }
+    let mut job = job.clone();
+    let session_id = job
+        .assigned_worker_session_id
+        .unwrap_or_else(uuid::Uuid::new_v4);
+    let generation = job.assigned_worker_session_generation.unwrap_or(1);
+    let worker_id = job
+        .assigned_worker_id
+        .clone()
+        .unwrap_or_else(|| "test-worker".to_string());
+    job.assigned_worker_id = Some(worker_id.clone());
+    job.assigned_worker_session_id = Some(session_id);
+    job.assigned_worker_session_generation = Some(generation);
+    verify_authorized_job_for_session(&job, config, &worker_id, session_id, generation)
+}
+
+fn verify_authorized_job_for_session(
+    job: &Job,
+    config: &LocalAgentConfig,
+    worker_id: &str,
+    session_id: uuid::Uuid,
+    session_generation: u64,
+) -> anyhow::Result<VerifiedAuthorizedJob> {
+    let bundle = local_agent::verify_authorized_job(job, worker_id, session_id, session_generation)
+        .map_err(anyhow::Error::msg)?;
+    let mut request = bundle.request.clone();
     if request.permission_envelope.environment.execution_mode != ExecutionMode::Docker {
         anyhow::bail!("only authorized Docker jobs are supported");
-    }
-    if !request.matches_job_execution(job) {
-        anyhow::bail!("job execution fields do not match immutable authorization");
     }
     if request.behavior.triage != (request.workflow_id == "__triage__")
         || !request.behavior.allow_remote_credentials
@@ -6736,9 +6993,10 @@ fn verify_authorized_job(
         authorized_job.env = request.behavior.env.into_iter().collect();
         authorized_job.prompt = request.behavior.prompt;
         authorized_job.repo = authorized_primary_repo;
-        authorized_job.context =
-            authorized_execution_context(job, request.behavior.execution_context);
+        authorized_job.context = authorized_execution_context(&bundle)?;
         return Ok(VerifiedAuthorizedJob {
+            authorization_digest: bundle.digest,
+            authorization_version: bundle.version,
             runtime_spec: request.permission_envelope,
             runner: ResolvedRunnerSpec {
                 kind: ResolvedRunnerKind::Generic,
@@ -6751,6 +7009,7 @@ fn verify_authorized_job(
             triage: request.behavior.triage,
             github_action: None,
             environment_bundle: None,
+            credential_provider_names: Vec::new(),
             job: authorized_job,
         });
     }
@@ -6780,9 +7039,10 @@ fn verify_authorized_job(
         authorized_job.env.clear();
         authorized_job.prompt = None;
         authorized_job.repo = authorized_primary_repo;
-        authorized_job.context =
-            authorized_execution_context(job, request.behavior.execution_context);
+        authorized_job.context = authorized_execution_context(&bundle)?;
         return Ok(VerifiedAuthorizedJob {
+            authorization_digest: bundle.digest,
+            authorization_version: bundle.version,
             runtime_spec: request.permission_envelope,
             runner: ResolvedRunnerSpec {
                 kind: ResolvedRunnerKind::Generic,
@@ -6795,6 +7055,7 @@ fn verify_authorized_job(
             triage: false,
             github_action: Some(operation),
             environment_bundle: None,
+            credential_provider_names: Vec::new(),
             job: authorized_job,
         });
     }
@@ -6852,20 +7113,24 @@ fn verify_authorized_job(
             .map(|provider| provider.name)
             .collect(),
     };
+    let credential_provider_names = authorized_credential_provider_names_from_request(&request)?;
     let mut authorized_job = job.clone();
     authorized_job.command = request.behavior.command;
     authorized_job.args = request.behavior.args;
     authorized_job.env = request.behavior.env.into_iter().collect();
     authorized_job.prompt = request.behavior.prompt;
     authorized_job.repo = authorized_primary_repo;
-    authorized_job.context = authorized_execution_context(job, request.behavior.execution_context);
+    authorized_job.context = authorized_execution_context(&bundle)?;
     Ok(VerifiedAuthorizedJob {
+        authorization_digest: bundle.digest,
+        authorization_version: bundle.version,
         runtime_spec: request.permission_envelope,
         runner,
         work_item_context: work_item_contract_from_job_context(&authorized_job.context),
         triage: request.behavior.triage,
         github_action: None,
         environment_bundle: verified_environment_bundle,
+        credential_provider_names,
         job: authorized_job,
     })
 }
@@ -6875,8 +7140,13 @@ fn verify_authorized_runner_profile_projection(
     profile: &agent_hub_config::ResolvedRunnerProfile,
     execution_kind: &str,
 ) -> anyhow::Result<()> {
-    if agent_hub_config::digest_profile(profile).map_err(anyhow::Error::msg)?
-        != profile.config_digest
+    let canonical = agent_hub_config::canonicalize_resolved_runner_profile(profile)
+        .map_err(anyhow::Error::msg)?;
+    if canonical != *profile {
+        anyhow::bail!("authorized runner profile is not canonical");
+    }
+    if agent_hub_config::digest_profile(&canonical).map_err(anyhow::Error::msg)?
+        != canonical.config_digest
     {
         anyhow::bail!("authorized runner profile digest mismatch");
     }
@@ -6896,7 +7166,9 @@ fn verify_authorized_runner_profile_projection(
             })
             .map_err(anyhow::Error::msg)?
     };
-    if configured != *profile {
+    let configured = agent_hub_config::canonicalize_resolved_runner_profile(&configured)
+        .map_err(anyhow::Error::msg)?;
+    if configured != canonical {
         anyhow::bail!("local runner profile does not match authorized config digest");
     }
     Ok(())
@@ -8876,25 +9148,28 @@ mod github_action_tests {
 }
 
 fn authorized_execution_context(
-    job: &Job,
-    mut execution_context: serde_json::Value,
-) -> serde_json::Value {
+    bundle: &protocol::ImmutableAuthorizationBundle,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut execution_context = bundle.request.behavior.execution_context.clone();
     if !execution_context.is_object() {
         execution_context = serde_json::json!({});
     }
     let object = execution_context
         .as_object_mut()
         .expect("execution context normalized as object");
-    for key in [
-        protocol::CONTEXT_AUTHORIZATION_ID_KEY,
-        protocol::CONTEXT_REQUEST_DIGEST_KEY,
-        protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY,
-    ] {
-        if let Some(value) = job.context.get(key) {
-            object.insert(key.to_string(), value.clone());
-        }
-    }
-    execution_context
+    object.insert(
+        protocol::CONTEXT_AUTHORIZATION_ID_KEY.to_string(),
+        serde_json::Value::String(bundle.authorization_id.clone()),
+    );
+    object.insert(
+        protocol::CONTEXT_REQUEST_DIGEST_KEY.to_string(),
+        serde_json::Value::String(bundle.digest.clone()),
+    );
+    object.insert(
+        protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY.to_string(),
+        serde_json::to_value(&bundle.request)?,
+    );
+    Ok(execution_context)
 }
 
 fn artifact_store_relative_path(transcript_rel_dir: &str, filename: &str) -> String {
@@ -10604,6 +10879,7 @@ async fn run_docker(
     deadline: &JobDeadline,
     runtime_container_image: Option<String>,
     runtime_spec: &protocol::CanonicalRuntimeSpec,
+    required_credential_providers: &[String],
     local_egress_plan: &LocalAgentEgressPlan,
     egress_manager: &EgressManager,
     primary_repo_mirror_dir: Option<&Path>,
@@ -10843,7 +11119,6 @@ async fn run_docker(
 
     let work_item_context = work_item_contract_from_job_context(&job.context);
     let allow_remote_credentials = job_allows_remote_credentials(&work_item_context);
-    let required_credential_providers = authorized_credential_provider_names(job)?;
     if required_credential_providers
         .iter()
         .any(|provider| provider.starts_with("github:"))
@@ -10856,7 +11131,7 @@ async fn run_docker(
     let resolved_credentials = if allow_remote_credentials {
         resolve_configured_credentials(
             local_agent_config,
-            &required_credential_providers,
+            required_credential_providers,
             deadline.wall_clock(),
             None,
         )
@@ -10959,6 +11234,7 @@ async fn run_docker_opencode_with_validation_retries(
     deadline: &JobDeadline,
     runtime_container_image: Option<String>,
     runtime_spec: &protocol::CanonicalRuntimeSpec,
+    required_credential_providers: &[String],
     local_egress_plan: &LocalAgentEgressPlan,
     egress_manager: &EgressManager,
     primary_repo_mirror_dir: Option<&Path>,
@@ -10982,6 +11258,7 @@ async fn run_docker_opencode_with_validation_retries(
         deadline,
         runtime_container_image,
         runtime_spec,
+        required_credential_providers,
         local_egress_plan,
         egress_manager,
         primary_repo_mirror_dir,
@@ -11731,6 +12008,7 @@ async fn build_docker_runtime_invocation(
     deadline: &JobDeadline,
     runtime_container_image: Option<String>,
     runtime_spec: &protocol::CanonicalRuntimeSpec,
+    required_credential_providers: &[String],
     local_egress_plan: &LocalAgentEgressPlan,
     egress_manager: &EgressManager,
     primary_repo_mirror_dir: Option<&Path>,
@@ -11786,7 +12064,6 @@ async fn build_docker_runtime_invocation(
     validate_mount_target_plan(mount_targets.iter().map(String::as_str))?;
     let work_item_context = work_item_contract_from_job_context(&job.context);
     let allow_remote_credentials = job_allows_remote_credentials(&work_item_context);
-    let required_credential_providers = authorized_credential_provider_names(job)?;
     if required_credential_providers
         .iter()
         .any(|provider| provider.starts_with("github:"))
@@ -11796,7 +12073,7 @@ async fn build_docker_runtime_invocation(
     let resolved_credentials = if allow_remote_credentials {
         resolve_configured_credentials(
             local_agent_config,
-            &required_credential_providers,
+            required_credential_providers,
             deadline.wall_clock(),
             Some(&opencode_job_state.data),
         )
@@ -12207,6 +12484,11 @@ mod selected_credential_provider_tests {
 mod runner_profile_projection_tests {
     use super::verify_authorized_runner_profile_projection;
     use crate::egress_config::load_synthetic_runner_config_for_test;
+    use local_agent::pb;
+    use local_agent::pb_conv::{job_from_pb, job_to_pb};
+    use prost::Message as _;
+    use protocol::{ExecutionMode, Job, JobState};
+    use std::collections::HashMap;
 
     #[test]
     fn server_authorized_profile_matches_worker_selection_and_mutation_fails() {
@@ -12248,6 +12530,271 @@ mod runner_profile_projection_tests {
         mutated.command = "different-command".to_string();
         mutated.config_digest = agent_hub_config::digest_profile(&mutated).unwrap();
         assert!(verify_authorized_runner_profile_projection(&config, &mutated, "agent").is_err());
+    }
+
+    #[test]
+    fn opencode_profile_survives_authorization_and_protobuf_canonically() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "installation_id":"incident-installation",
+            "config_identity":"incident-config",
+            "egress":{
+                "preflight_image":"synthetic-preflight",
+                "llm":{"default_provider":"OPENAI","providers":{
+                    "OpenAI":["CHATGPT.COM","auth.openai.com"]
+                }},
+                "proxy":{"declared_volumes":["/var/spool/squid","/var/log/squid"]}
+            },
+            "credential_providers":{
+                "openai:chatgpt-oauth":{
+                    "type":"opencode-chatgpt-oauth",
+                    "name":"openai:chatgpt-oauth",
+                    "host_auth_path":"/synthetic/auth.json",
+                    "safety_margin_secs":60
+                }
+            },
+            "mcp_bridges":[
+                {"name":"z_bridge","host_endpoint":{"type":"stdio","command":"bridge","args":["second","first"],"env":{"Z":"1","A":"2"}},"container_socket_path":"/tmp/z-container.sock"},
+                {"name":"a_bridge","host_endpoint":{"type":"unix","path":"/tmp/a.sock"},"container_socket_path":"/tmp/a-container.sock","env_keys":["Y","B"]}
+            ],
+            "default_agent":{
+                "kind":"opencode",
+                "command":"sh",
+                "args":["-lc","synthetic assertion runner"],
+                "requires_credentials":["openai:chatgpt-oauth"]
+            }
+        }))
+        .unwrap();
+        let config = load_synthetic_runner_config_for_test(&bytes).unwrap();
+        let profile = config
+            .canonical_runner_profiles()
+            .unwrap()
+            .resolve_agent_profile(None)
+            .unwrap();
+        assert_eq!(
+            profile
+                .trusted_mounts
+                .iter()
+                .map(|mount| mount.purpose.as_str())
+                .collect::<Vec<_>>(),
+            vec!["environment_bundle", "xdg_cache", "xdg_data", "xdg_state"]
+        );
+        assert_eq!(
+            profile,
+            agent_hub_config::canonicalize_resolved_runner_profile(&profile).unwrap()
+        );
+        let mut permuted = profile.clone();
+        permuted.trusted_mounts.reverse();
+        permuted.credential_providers.reverse();
+        for provider in &mut permuted.credential_providers {
+            provider.targets.reverse();
+        }
+        permuted.mcp_bridges.reverse();
+        for bridge in &mut permuted.mcp_bridges {
+            bridge.env_keys.reverse();
+        }
+        permuted.github_hosts.reverse();
+        permuted.egress["llm"]["providers"] = serde_json::json!({
+            "OPENAI":["AUTH.OPENAI.COM","chatgpt.com"]
+        });
+        permuted.egress["proxy"]["declared_volumes"] =
+            serde_json::json!(["/var/spool/squid", "/var/log/squid"]);
+        assert_eq!(
+            agent_hub_config::canonicalize_resolved_runner_profile(&permuted).unwrap(),
+            profile
+        );
+
+        let rejects = |mutated: agent_hub_config::ResolvedRunnerProfile| {
+            agent_hub_config::canonicalize_resolved_runner_profile(&mutated)
+                .map(|canonical| {
+                    verify_authorized_runner_profile_projection(&config, &canonical, "agent")
+                        .is_err()
+                })
+                .unwrap_or(true)
+        };
+        let mut mutations = Vec::new();
+        let mut mutated = profile.clone();
+        mutated.trusted_mounts[0].purpose.push_str("-changed");
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.trusted_mounts[0]
+            .container_path
+            .push_str("-changed");
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.trusted_mounts[0].read_only = !mutated.trusted_mounts[0].read_only;
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.egress["llm"]["providers"]["openai"] = serde_json::json!(["evil.example"]);
+        mutations.push(mutated);
+        for field in ["runtime_uid", "runtime_gid"] {
+            let mut mutated = profile.clone();
+            mutated.egress["proxy"][field] = serde_json::json!(999);
+            mutations.push(mutated);
+        }
+        let mut mutated = profile.clone();
+        mutated.egress["proxy"]["writable_tmpfs_mode"] = serde_json::json!("0700");
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.egress["proxy"]["declared_volumes"] = serde_json::json!(["/different"]);
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.credential_providers[0].name.push_str("-changed");
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.credential_providers[0]
+            .provider_type
+            .push_str("-changed");
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.credential_providers[0]
+            .targets
+            .push("/different".to_string());
+        mutations.push(mutated);
+        for mutation in [
+            "name",
+            "endpoint_type",
+            "endpoint",
+            "socket",
+            "ordered_args",
+            "env",
+        ] {
+            let mut mutated = profile.clone();
+            match mutation {
+                "name" => mutated.mcp_bridges[0].name.push_str("-changed"),
+                "endpoint_type" => mutated.mcp_bridges[0].endpoint_type.push_str("-changed"),
+                "endpoint" => mutated.mcp_bridges[0].target.push_str("-changed"),
+                "socket" => mutated.mcp_bridges[0]
+                    .container_socket_path
+                    .push_str("-changed"),
+                "ordered_args" => mutated
+                    .mcp_bridges
+                    .iter_mut()
+                    .find(|bridge| bridge.args.len() > 1)
+                    .unwrap()
+                    .args
+                    .reverse(),
+                "env" => mutated.mcp_bridges[0]
+                    .env_keys
+                    .push("DIFFERENT".to_string()),
+                _ => unreachable!(),
+            }
+            mutations.push(mutated);
+        }
+        let mut mutated = profile.clone();
+        mutated
+            .file_mounts
+            .push(agent_hub_config::ManagedRunnerFileMount {
+                host_path: "/host".to_string(),
+                container_path: "/container".to_string(),
+                read_only: true,
+            });
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.container_image = Some(String::new());
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.egress["preflight_image"] = serde_json::Value::Null;
+        mutations.push(mutated);
+        let mut mutated = profile.clone();
+        mutated.args.reverse();
+        mutations.push(mutated);
+        for (index, mutated) in mutations.into_iter().enumerate() {
+            assert!(
+                rejects(mutated),
+                "runner profile mutation {index} was accepted"
+            );
+        }
+
+        let now = chrono::Utc::now();
+        let work_item_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let mut job = Job {
+            id: uuid::Uuid::new_v4(),
+            work_item_id,
+            step_id: "agent".to_string(),
+            state: JobState::Assigned,
+            assigned_worker_id: Some("worker".to_string()),
+            assigned_worker_session_id: Some(session_id),
+            assigned_worker_session_generation: Some(1),
+            execution_mode: ExecutionMode::Docker,
+            container_image: profile.container_image.clone(),
+            command: profile.command.clone(),
+            args: profile.args.clone(),
+            env: HashMap::new(),
+            prompt: None,
+            context: serde_json::json!({
+                "inputs":{"incident":"runtime-7"},
+                "state_invocation":{"id":work_item_id,"state_id":"agent"}
+            }),
+            canonical_authorization: None,
+            repo: None,
+            timeout_secs: Some(120),
+            max_retries: 0,
+            attempt: 0,
+            transcript_dir: None,
+            result: None,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let environment = protocol::canonical_environment_for_execution(
+            ExecutionMode::Docker,
+            profile.container_image.clone(),
+            job.timeout_secs,
+        );
+        let request = protocol::ResolvedAuthorizationRequest {
+            version: protocol::AUTHORIZATION_REQUEST_VERSION.to_string(),
+            invocation_id: work_item_id,
+            work_unit_id: work_item_id,
+            root_work_item_id: work_item_id,
+            workflow_id: "incident".to_string(),
+            workflow_snapshot: serde_json::json!({"profile":"opencode"}),
+            state_id: job.step_id.clone(),
+            state_kind: protocol::ReactiveStateKind::Agent,
+            behavior: protocol::ResolvedAuthorizationBehavior {
+                execution_kind: "agent".to_string(),
+                runner_profile: serde_json::to_value(&profile).unwrap(),
+                command: job.command.clone(),
+                args: job.args.clone(),
+                env: Default::default(),
+                prompt: None,
+                primary_repo: None,
+                primary_repo_branch: None,
+                execution_context: protocol::authorization_execution_context(&job.context),
+                triage: false,
+                allow_remote_credentials: true,
+            },
+            permission_envelope: protocol::CanonicalRuntimeSpec {
+                runtime_version: "v2".to_string(),
+                permissions: protocol::canonical_permissions_for_environment(&environment),
+                environment,
+                approval_rules: None,
+                repos: Vec::new(),
+                github_capabilities: Vec::new(),
+            },
+            resolved_environment: serde_json::json!({}),
+            provider: protocol::ResolvedAuthorizationProvider {
+                provider: Some("incident".to_string()),
+                task_id: Some("runtime-7".to_string()),
+            },
+            resource_constraints: protocol::ResolvedAuthorizationResources {
+                timeout_secs: job.timeout_secs,
+                max_retries: job.max_retries,
+                attempt: job.attempt,
+            },
+        };
+        let bundle = protocol::ImmutableAuthorizationBundle::create(&request).unwrap();
+        protocol::project_authorization_bundle_into_job_context(&mut job.context, &bundle).unwrap();
+        job.canonical_authorization = Some(bundle.artifact());
+        let encoded = job_to_pb(job).encode_to_vec();
+        let transported = job_from_pb(pb::Job::decode(encoded.as_slice()).unwrap()).unwrap();
+        let verified =
+            local_agent::verify_authorized_job(&transported, "worker", session_id, 1).unwrap();
+        let transported_profile: agent_hub_config::ResolvedRunnerProfile =
+            serde_json::from_value(verified.request.behavior.runner_profile).unwrap();
+        assert_eq!(transported_profile, profile);
+        verify_authorized_runner_profile_projection(&config, &transported_profile, "agent")
+            .unwrap();
     }
 }
 
@@ -12346,18 +12893,18 @@ mod oauth_secret_canary_tests {
     }
 }
 
-fn authorized_credential_provider_names(job: &Job) -> anyhow::Result<Vec<String>> {
-    let request = protocol::authorization_request_from_job_context(&job.context)
-        .context("job has no resolved authorization request")?;
+fn authorized_credential_provider_names_from_request(
+    request: &protocol::ResolvedAuthorizationRequest,
+) -> anyhow::Result<Vec<String>> {
     let mut providers = request
         .permission_envelope
         .github_capabilities
-        .into_iter()
-        .map(|capability| capability.credential_provider)
+        .iter()
+        .map(|capability| capability.credential_provider.clone())
         .collect::<Vec<_>>();
     if request.behavior.execution_kind != "command" {
         let profile: agent_hub_config::ResolvedRunnerProfile =
-            serde_json::from_value(request.behavior.runner_profile)
+            serde_json::from_value(request.behavior.runner_profile.clone())
                 .context("authorization has invalid runner profile")?;
         providers.extend(
             profile
@@ -12546,6 +13093,9 @@ mod restricted_mount_tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         }
     }
 
@@ -12610,6 +13160,9 @@ mod restricted_mount_tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let root = std::env::temp_dir().join(format!("mount-policy-{}", uuid::Uuid::new_v4()));
         let approved = root.join("approved");
@@ -12964,6 +13517,9 @@ mod multi_repo_tests {
             lease_expires_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let runtime_spec = protocol::CanonicalRuntimeSpec {
             runtime_version: "v2".to_string(),
@@ -13037,6 +13593,9 @@ mod multi_repo_tests {
             lease_expires_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         };
         let runtime_spec = protocol::CanonicalRuntimeSpec {
             runtime_version: "v2".to_string(),
@@ -13172,6 +13731,9 @@ mod triage_validation_tests {
             lease_expires_at: None,
             created_at: now,
             updated_at: now,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
+            canonical_authorization: None,
         }
     }
 

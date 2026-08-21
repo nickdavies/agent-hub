@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use protocol::{
-    CONTEXT_AUTHORIZATION_ID_KEY, CONTEXT_REQUEST_DIGEST_KEY, CanonicalRuntimeSpec, Job,
-    ResolvedAuthorizationRequest, WorkItem, authorization_request_from_job_context,
+    CONTEXT_AUTHORIZATION_ID_KEY, CONTEXT_REQUEST_DIGEST_KEY, CanonicalAuthorizationArtifact,
+    CanonicalRuntimeSpec, Job, ResolvedAuthorizationRequest, WorkItem,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
@@ -18,6 +18,8 @@ pub(super) enum DbTable {
     CheckpointOutbox,
     ProviderActionInbox,
     AuthorizationRecords,
+    AuthorizationObligations,
+    Workers,
 }
 
 impl DbTable {
@@ -29,6 +31,8 @@ impl DbTable {
             Self::CheckpointOutbox => "checkpoint_outbox",
             Self::ProviderActionInbox => "provider_action_inbox",
             Self::AuthorizationRecords => "authorization_records",
+            Self::AuthorizationObligations => "authorization_obligations",
+            Self::Workers => "workers",
         }
     }
 }
@@ -83,6 +87,8 @@ pub(super) struct AuthorizationObligationInsert {
     pub request_digest: String,
     pub request_json: String,
     pub job_json: String,
+    pub canonical_authorization_version: u32,
+    pub canonical_authorization_bytes: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -283,6 +289,207 @@ pub(super) fn commit_provider_action(
     Ok(ProviderActionCommitOutcome::Committed)
 }
 
+pub(super) fn migrate_canonical_authorization_bytes(conn: &mut Connection) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    let already_applied = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE name = 'canonical_authorization_bytes_v1'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if already_applied {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    let mut affected_roots = BTreeSet::new();
+    let active_jobs = {
+        let mut stmt = tx.prepare(
+            "SELECT id, checkpoint_owner_id FROM jobs WHERE state IN ('pending', 'assigned', 'running')",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (job_id, root_id) in active_jobs {
+        let loaded = tx.query_row(
+            "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE id = ?1",
+            [&job_id],
+            row_to_job,
+        );
+        if loaded
+            .as_ref()
+            .ok()
+            .is_none_or(|job| verify_job_authorization(&tx, job).is_err())
+        {
+            affected_roots.insert(root_id);
+        }
+    }
+
+    let active_obligations = {
+        let mut stmt = tx.prepare(
+            "SELECT checkpoint_owner_id, work_item_id, request_digest
+             FROM authorization_obligations WHERE state IN ('pending', 'approved')",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (root_id, work_item_id, digest) in active_obligations {
+        if verify_authorization_obligation(&tx, &root_id, &work_item_id, &digest).is_err() {
+            affected_roots.insert(root_id);
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT work_items.id
+             FROM work_items
+             WHERE work_items.state IN ('pending', 'running')
+               AND json_type(work_items.context_json, '$.authorization_pending') IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM authorization_obligations obligation
+                 WHERE obligation.checkpoint_owner_id = work_items.id
+                   AND obligation.canonical_authorization_version IS NOT NULL
+                   AND obligation.canonical_authorization_bytes IS NOT NULL
+               )",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            affected_roots.insert(row?);
+        }
+    }
+
+    let reason = "Nonterminal work was quarantined because canonical authorization bytes were missing or invalid";
+    let action =
+        "Review recovery state and explicitly reassign this task before creating replacement work.";
+    let now = Utc::now().to_rfc3339();
+    for root_id in affected_roots {
+        tx.execute(
+            "UPDATE jobs SET state = 'cancelled', assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE checkpoint_owner_id = ?1 AND state IN ('pending', 'assigned', 'running')",
+            params![root_id, now],
+        )?;
+        tx.execute(
+            "UPDATE authorization_obligations SET state = 'quarantined', updated_at = ?2 WHERE checkpoint_owner_id = ?1 AND state IN ('pending', 'approved')",
+            params![root_id, now],
+        )?;
+        tx.execute(
+            "WITH RECURSIVE checkpoint_tree(id) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT work_items.id FROM work_items JOIN checkpoint_tree ON work_items.parent_work_item_id = checkpoint_tree.id
+             )
+             UPDATE work_items
+             SET state = 'failed', human_gate = 1, human_gate_state = 'authorization_pending',
+                 projected_state = 'authorization_pending', last_failure_reason = ?2,
+                 required_action_description = ?3,
+                 context_json = json_set(context_json, '$.authorization_recovery_required', json('true')),
+                 updated_at = ?4
+             WHERE id IN (SELECT id FROM checkpoint_tree) AND state IN ('pending', 'running')",
+            params![root_id, reason, action, now],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO ownership_return_outbox (
+                root_work_item_id, task_id, human_owner, human_owner_provider_id,
+                human_owners_json, last_error, updated_at
+             )
+             SELECT id, external_task_id,
+                    json_extract(remembered_human_owners_json, '$[0].display_name'),
+                    json_extract(remembered_human_owners_json, '$[0].provider_id'),
+                    remembered_human_owners_json, ?2, ?3
+             FROM work_items
+             WHERE id = ?1 AND external_task_id IS NOT NULL",
+            params![root_id, reason, now],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations (name, applied_at) VALUES ('canonical_authorization_bytes_v1', ?1)",
+        [now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_authorization_obligation(
+    conn: &Connection,
+    checkpoint_owner_id: &str,
+    work_item_id: &str,
+    request_digest: &str,
+) -> anyhow::Result<()> {
+    let (
+        request_json,
+        job_json,
+        canonical_version,
+        canonical_bytes,
+        state,
+        approved_authorization_id,
+    ) = conn.query_row(
+        "SELECT request_json, job_json, canonical_authorization_version,
+                canonical_authorization_bytes, state, authorization_id
+         FROM authorization_obligations
+         WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3",
+        params![checkpoint_owner_id, work_item_id, request_digest],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<u32>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        },
+    )?;
+    let canonical_version = canonical_version
+        .ok_or_else(|| anyhow::anyhow!("authorization obligation has no canonical version"))?;
+    let canonical_bytes = canonical_bytes
+        .ok_or_else(|| anyhow::anyhow!("authorization obligation has no canonical bytes"))?;
+    let job: Job = serde_json::from_str(&job_json)?;
+    let job_artifact = job
+        .canonical_authorization
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("authorization obligation job has no canonical artifact"))?;
+    if job_artifact.version != canonical_version
+        || job_artifact.digest != request_digest
+        || job_artifact.canonical_bytes != canonical_bytes
+    {
+        anyhow::bail!("authorization obligation artifact mismatch");
+    }
+    let authorization_id = job
+        .context
+        .get(CONTEXT_AUTHORIZATION_ID_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("authorization obligation job has no authorization ID"))?;
+    let bundle = protocol::ImmutableAuthorizationBundle::verify(job_artifact, authorization_id)
+        .map_err(anyhow::Error::msg)?;
+    if bundle.digest != request_digest
+        || bundle.request.root_work_item_id.to_string() != checkpoint_owner_id
+        || bundle.request.work_unit_id.to_string() != work_item_id
+        || job.work_item_id != bundle.request.work_unit_id
+        || !bundle.request.matches_job_execution(&job)
+    {
+        anyhow::bail!("authorization obligation binding mismatch");
+    }
+    verify_exact_authorization_display(&job, &bundle)?;
+    let displayed_request: serde_json::Value = serde_json::from_str(&request_json)?;
+    if displayed_request != serde_json::to_value(&bundle.request)? {
+        anyhow::bail!("authorization obligation display mismatch");
+    }
+    match state.as_str() {
+        "pending" if approved_authorization_id.is_none() => {}
+        "approved" if approved_authorization_id.as_deref() == Some(authorization_id) => {}
+        _ => anyhow::bail!("authorization obligation approval identity mismatch"),
+    }
+    Ok(())
+}
+
 pub(super) fn stage_authorization_obligation(
     conn: &mut Connection,
     root: &WorkItem,
@@ -321,30 +528,36 @@ fn insert_authorization_obligation(
 ) -> anyhow::Result<()> {
     if let Some(stored_request) = tx
         .query_row(
-            "SELECT request_json FROM authorization_obligations WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3",
+            "SELECT request_json, canonical_authorization_version, canonical_authorization_bytes FROM authorization_obligations WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3",
             params![
                 obligation.checkpoint_owner_id.to_string(),
                 obligation.work_item_id.to_string(),
                 obligation.request_digest,
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<u32>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?)),
         )
         .optional()?
     {
-        if stored_request != obligation.request_json {
+        if stored_request.0 != obligation.request_json
+            || stored_request.1 != Some(obligation.canonical_authorization_version)
+            || stored_request.2.as_deref()
+                != Some(obligation.canonical_authorization_bytes.as_slice())
+        {
             anyhow::bail!("authorization obligation digest collision");
         }
         return Ok(());
     }
     let now = Utc::now().to_rfc3339();
     tx.execute(
-        "INSERT INTO authorization_obligations (checkpoint_owner_id, work_item_id, request_digest, request_json, job_json, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
+        "INSERT INTO authorization_obligations (checkpoint_owner_id, work_item_id, request_digest, request_json, job_json, canonical_authorization_version, canonical_authorization_bytes, state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)",
         params![
             obligation.checkpoint_owner_id.to_string(),
             obligation.work_item_id.to_string(),
             obligation.request_digest,
             obligation.request_json,
             obligation.job_json,
+            obligation.canonical_authorization_version,
+            obligation.canonical_authorization_bytes,
             now,
         ],
     )?;
@@ -490,7 +703,7 @@ fn insert_job_in_transaction(
     let (authorization_id, request_digest) =
         insert_authorization_record(tx, job, insert.checkpoint_owner_id)?;
     tx.execute(
-        "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, authorization_id, request_digest, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 0)",
+        "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, authorization_id, request_digest, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, 0)",
         params![
             job.id.to_string(), job.work_item_id.to_string(), job.step_id, job.state.to_string(),
             job.assigned_worker_id, job.execution_mode.to_string(), job.container_image, job.command,
@@ -504,6 +717,11 @@ fn insert_job_in_transaction(
             insert.checkpoint_owner_id.to_string(),
             authorization_id,
             request_digest,
+            job.canonical_authorization.as_ref().map(|artifact| artifact.version),
+            job.canonical_authorization.as_ref().map(|artifact| artifact.digest.as_str()),
+            job.canonical_authorization.as_ref().map(|artifact| artifact.canonical_bytes.as_slice()),
+            job.assigned_worker_session_id.map(|value| value.to_string()),
+            job.assigned_worker_session_generation,
         ],
     )?;
     Ok(())
@@ -524,21 +742,46 @@ pub(super) fn insert_authorization_record(
         .get(CONTEXT_REQUEST_DIGEST_KEY)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("job {} has no request digest", job.id))?;
-    let request = authorization_request_from_job_context(&job.context)
-        .ok_or_else(|| anyhow::anyhow!("job {} has no resolved authorization request", job.id))?;
-    verify_request_for_job(job, checkpoint_owner_id, request_digest, &request)?;
-    let request_json = serde_json::to_string(&request.clone().normalize())?;
-    if let Some((stored_digest, stored_json)) = tx
+    let artifact = job.canonical_authorization.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "job {} is incompatible: missing canonical authorization bytes",
+            job.id
+        )
+    })?;
+    if artifact.digest != request_digest {
+        anyhow::bail!(
+            "job {} canonical authorization digest mismatch for version {}",
+            job.id,
+            artifact.version
+        );
+    }
+    let bundle = protocol::ImmutableAuthorizationBundle::verify(artifact, authorization_id)
+        .map_err(anyhow::Error::msg)?;
+    verify_exact_authorization_display(job, &bundle)?;
+    let request = bundle.request;
+    verify_request_for_job(job, checkpoint_owner_id, &request)?;
+    let request_json = serde_json::to_string(&request)?;
+    if let Some((stored_digest, stored_version, stored_bytes)) = tx
         .query_row(
-            "SELECT request_digest, request_json FROM authorization_records WHERE authorization_id = ?1",
+            "SELECT request_digest, canonical_authorization_version, canonical_authorization_bytes FROM authorization_records WHERE authorization_id = ?1",
             [authorization_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<u32>>(1)?, row.get::<_, Option<Vec<u8>>>(2)?)),
         )
         .optional()?
     {
-        if stored_digest != request_digest || stored_json != request_json {
+        if stored_digest != request_digest
+            || stored_version != Some(artifact.version)
+            || stored_bytes.as_deref() != Some(artifact.canonical_bytes.as_slice())
+        {
             anyhow::bail!("authorization identity collision for {authorization_id}");
         }
+        let stored_artifact = CanonicalAuthorizationArtifact {
+            version: stored_version.expect("version compared above"),
+            digest: stored_digest,
+            canonical_bytes: stored_bytes.expect("bytes compared above"),
+        };
+        protocol::ImmutableAuthorizationBundle::verify(&stored_artifact, authorization_id)
+            .map_err(anyhow::Error::msg)?;
         return Ok((authorization_id.to_string(), request_digest.to_string()));
     }
     if request.workflow_id != "__triage__" {
@@ -589,7 +832,7 @@ pub(super) fn insert_authorization_record(
         }
     }
     tx.execute(
-        "INSERT INTO authorization_records (authorization_id, work_item_id, checkpoint_owner_id, request_digest, invocation_id, request_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO authorization_records (authorization_id, work_item_id, checkpoint_owner_id, request_digest, invocation_id, request_json, canonical_authorization_version, canonical_authorization_bytes, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             authorization_id,
             job.work_item_id.to_string(),
@@ -597,20 +840,27 @@ pub(super) fn insert_authorization_record(
             request_digest,
             request.invocation_id.to_string(),
             request_json,
+            artifact.version,
+            artifact.canonical_bytes,
             Utc::now().to_rfc3339(),
         ],
     )?;
     Ok((authorization_id.to_string(), request_digest.to_string()))
 }
 
-pub(super) fn verify_job_authorization(conn: &Connection, job: &Job) -> anyhow::Result<()> {
-    let (authorization_id, request_digest) = conn.query_row(
-        "SELECT authorization_id, request_digest FROM jobs WHERE id = ?1",
+pub(super) fn verify_job_authorization(
+    conn: &Connection,
+    job: &Job,
+) -> anyhow::Result<protocol::ImmutableAuthorizationBundle> {
+    let (authorization_id, request_digest, checkpoint_owner_id, stored_work_item_id) = conn.query_row(
+        "SELECT authorization_id, request_digest, checkpoint_owner_id, work_item_id FROM jobs WHERE id = ?1",
         [job.id.to_string()],
         |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
                 row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         },
     )?;
@@ -630,19 +880,89 @@ pub(super) fn verify_job_authorization(conn: &Connection, job: &Job) -> anyhow::
     {
         anyhow::bail!("job {} authorization evidence mismatch", job.id);
     }
-    let request = authorization_request_from_job_context(&job.context)
-        .ok_or_else(|| anyhow::anyhow!("job {} authorization payload is missing", job.id))?;
-    verify_request_for_job(job, request.root_work_item_id, &request_digest, &request)?;
-    let stored_json = conn
+    let artifact = job.canonical_authorization.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "job {} is incompatible: missing canonical authorization bytes",
+            job.id
+        )
+    })?;
+    if artifact.digest != request_digest {
+        anyhow::bail!(
+            "job {} canonical authorization digest mismatch for version {}",
+            job.id,
+            artifact.version
+        );
+    }
+    let (
+        stored_version,
+        stored_bytes,
+        record_work_item_id,
+        record_checkpoint_owner_id,
+        record_invocation_id,
+    ) = conn
         .query_row(
-            "SELECT request_json FROM authorization_records WHERE authorization_id = ?1 AND request_digest = ?2 AND invocation_id = ?3",
-            params![authorization_id, request_digest, request.invocation_id.to_string()],
-            |row| row.get::<_, String>(0),
+            "SELECT canonical_authorization_version, canonical_authorization_bytes, work_item_id, checkpoint_owner_id, invocation_id FROM authorization_records WHERE authorization_id = ?1 AND request_digest = ?2",
+            params![authorization_id, request_digest],
+            |row| Ok((row.get::<_, Option<u32>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)),
         )
         .optional()?
         .ok_or_else(|| anyhow::anyhow!("job {} authorization record is missing", job.id))?;
-    if stored_json != serde_json::to_string(&request.normalize())? {
-        anyhow::bail!("job {} authorization record payload mismatch", job.id);
+    let (Some(stored_version), Some(stored_bytes)) = (stored_version, stored_bytes) else {
+        anyhow::bail!(
+            "job {} is incompatible: authorization record lacks canonical bytes",
+            job.id
+        );
+    };
+    if stored_version != artifact.version || stored_bytes != artifact.canonical_bytes {
+        anyhow::bail!(
+            "job {} canonical authorization artifact mismatch for version {}",
+            job.id,
+            artifact.version
+        );
+    }
+    let stored_artifact = CanonicalAuthorizationArtifact {
+        version: stored_version,
+        digest: request_digest,
+        canonical_bytes: stored_bytes,
+    };
+    let bundle =
+        protocol::ImmutableAuthorizationBundle::verify(&stored_artifact, &authorization_id)
+            .map_err(anyhow::Error::msg)?;
+    if stored_work_item_id != job.work_item_id.to_string()
+        || record_work_item_id != stored_work_item_id
+        || checkpoint_owner_id != bundle.request.root_work_item_id.to_string()
+        || record_checkpoint_owner_id != checkpoint_owner_id
+        || record_invocation_id != bundle.request.invocation_id.to_string()
+    {
+        anyhow::bail!("job {} authorization storage identity mismatch", job.id);
+    }
+    let current_invocation_id = conn
+        .query_row(
+            "SELECT json_extract(context_json, '$.state_invocation.id') FROM work_items WHERE id = ?1",
+            [job.work_item_id.to_string()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("job {} work item has no invocation identity", job.id))?;
+    if current_invocation_id != bundle.request.invocation_id.to_string() {
+        anyhow::bail!("job {} authorization invocation identity mismatch", job.id);
+    }
+    verify_request_for_job(job, bundle.request.root_work_item_id, &bundle.request)?;
+    verify_exact_authorization_display(job, &bundle)?;
+    Ok(bundle)
+}
+
+fn verify_exact_authorization_display(
+    job: &Job,
+    bundle: &protocol::ImmutableAuthorizationBundle,
+) -> anyhow::Result<()> {
+    let displayed = job
+        .context
+        .get(protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY)
+        .ok_or_else(|| anyhow::anyhow!("job {} authorization display is missing", job.id))?;
+    if displayed != &serde_json::to_value(&bundle.request)? {
+        anyhow::bail!("job {} authorization display mismatch", job.id);
     }
     Ok(())
 }
@@ -650,7 +970,6 @@ pub(super) fn verify_job_authorization(conn: &Connection, job: &Job) -> anyhow::
 fn verify_request_for_job(
     job: &Job,
     checkpoint_owner_id: Uuid,
-    request_digest: &str,
     request: &ResolvedAuthorizationRequest,
 ) -> anyhow::Result<()> {
     if request.work_unit_id != job.work_item_id
@@ -661,7 +980,7 @@ fn verify_request_for_job(
     }
     if !request.matches_job_execution(job) {
         anyhow::bail!(
-            "job {} execution payload differs from authorization (command={}, args={}, env={}, prompt={}, repo={}, mode={}, image={}, timeout={}, retries={}, context={}, invocation={})",
+            "job {} execution payload differs from authorization (command={}, args={}, env={}, prompt={}, repo={}, mode={}, image={}, timeout={}, retries={}, attempt={}, context={}, invocation={})",
             job.id,
             request.behavior.command == job.command,
             request.behavior.args == job.args,
@@ -672,6 +991,7 @@ fn verify_request_for_job(
             request.permission_envelope.environment.container_image == job.container_image,
             request.resource_constraints.timeout_secs == job.timeout_secs,
             request.resource_constraints.max_retries == job.max_retries,
+            request.resource_constraints.attempt == job.attempt,
             request.behavior.execution_context
                 == protocol::authorization_execution_context(&job.context),
             request
@@ -683,9 +1003,6 @@ fn verify_request_for_job(
                 .and_then(|value| Uuid::parse_str(value).ok())
                 == Some(request.invocation_id),
         );
-    }
-    if request.request_digest()? != request_digest {
-        anyhow::bail!("job {} request digest mismatch", job.id);
     }
     Ok(())
 }
@@ -796,6 +1113,11 @@ pub(super) fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
     let created_at: String = row.get(19)?;
     let updated_at: String = row.get(20)?;
     let runtime_spec_json: Option<String> = row.get(21)?;
+    let canonical_authorization_version: Option<u32> = row.get(22)?;
+    let canonical_authorization_digest: Option<String> = row.get(23)?;
+    let canonical_authorization_bytes: Option<Vec<u8>> = row.get(24)?;
+    let assigned_worker_session_id: Option<String> = row.get(25)?;
+    let assigned_worker_session_generation: Option<u64> = row.get(26)?;
 
     let mut job = Job {
         id: Uuid::parse_str(&id).map_err(invalid_uuid)?,
@@ -803,6 +1125,12 @@ pub(super) fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         step_id: row.get(2)?,
         state: state.parse().map_err(invalid_enum)?,
         assigned_worker_id: row.get(4)?,
+        assigned_worker_session_id: assigned_worker_session_id
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(invalid_uuid)?,
+        assigned_worker_session_generation,
         execution_mode: mode.parse().map_err(invalid_enum)?,
         container_image: row.get(6)?,
         command: row.get(7)?,
@@ -814,6 +1142,20 @@ pub(super) fn row_to_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
             .transpose()
             .map_err(invalid_json)?,
         context: serde_json::from_str(&context_json).map_err(invalid_json)?,
+        canonical_authorization: match (
+            canonical_authorization_version,
+            canonical_authorization_digest,
+            canonical_authorization_bytes,
+        ) {
+            (Some(version), Some(digest), Some(canonical_bytes)) => {
+                Some(CanonicalAuthorizationArtifact {
+                    version,
+                    digest,
+                    canonical_bytes,
+                })
+            }
+            _ => None,
+        },
         repo: repo_json
             .as_deref()
             .map(serde_json::from_str)

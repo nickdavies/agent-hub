@@ -117,6 +117,7 @@ mod immutable_authorization_tests {
             resource_constraints: ResolvedAuthorizationResources {
                 timeout_secs: Some(60),
                 max_retries: 3,
+                attempt: 0,
             },
         }
     }
@@ -230,17 +231,371 @@ mod immutable_authorization_tests {
     }
 
     #[test]
-    fn floating_transport_integer_preserves_authorization_digest() {
-        let request = request();
-        let mut transported = serde_json::to_value(&request).unwrap();
+    fn floating_transport_integer_is_not_normalized_for_authorization() {
+        let artifact = request().canonical_artifact().unwrap();
+        let mut transported: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
         transported["resource_constraints"]["max_retries"] = serde_json::json!(3.0);
-        let transported: ResolvedAuthorizationRequest =
-            serde_json::from_value(transported).unwrap();
-        assert_eq!(transported.resource_constraints.max_retries, 3);
+        let bytes = canonical_json_bytes(transported).unwrap();
+        let transported = CanonicalAuthorizationArtifact {
+            version: 1,
+            digest: canonical_authorization_digest(&bytes),
+            canonical_bytes: bytes,
+        };
+        assert!(transported.verify_and_parse().is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_v1_is_strict_and_preserves_json_numbers() {
+        let mut request = request();
+        request.resource_constraints.max_retries = 0;
+        request.resource_constraints.timeout_secs = Some(120);
+        request.workflow_snapshot = serde_json::from_str(
+            r#"{"z":{"fraction":1.25,"negative":-7,"large":9007199254740993},"runner":{"uid":1000,"gid":1000,"ports":[8080,3000],"attempts":0},"ordered":["second","first"],"empty":[],"explicit_null":null,"timestamp":"2026-08-20T19:10:51Z","a":{}}"#,
+        )
+        .unwrap();
+        request.behavior.runner_profile =
+            serde_json::json!({"profile_name":"command", "config_digest":"command_v1"});
+
+        let artifact = request.canonical_artifact().unwrap();
+        let text = std::str::from_utf8(&artifact.canonical_bytes).unwrap();
         assert_eq!(
-            request.request_digest().unwrap(),
-            transported.request_digest().unwrap()
+            text,
+            r#"{"behavior":{"allow_remote_credentials":true,"args":["test"],"command":"cargo","env":{"RUST_BACKTRACE":"1"},"execution_context":{"state_invocation":{"id":"00000000-0000-0000-0000-000000000000","state_id":"build"}},"execution_kind":"command","primary_repo":null,"primary_repo_branch":null,"prompt":null,"runner_profile":{"config_digest":"command_v1","profile_name":"command"},"triage":false},"invocation_id":"00000000-0000-0000-0000-000000000000","permission_envelope":{"approval_rules":{"auto_approve":["file_read","git"],"deny":[],"escalate":["shell_unknown"]},"environment":{"container_image":"image@sha256:abc","cpu_limit":null,"execution_mode":"docker","file_mounts":[],"filesystem":null,"memory_limit":null,"network_resources":null,"tier":"docker","timeout_secs":60,"toolchains":[]},"github_capabilities":[],"permissions":{"auto_approve_tools":[],"aws_access":"none","can_access_network":false,"can_read_workspace":true,"can_run_shell":true,"can_write_workspace":true,"escalate_tools":[],"kubernetes_access":"none","tier":"docker_default"},"repos":[{"base_ref":"origin/main","branch_name":"task/change","claim_type":"workspace","read_only":false,"repo_url":"https://example/repo.git","target_branch":"task/change"}],"runtime_version":"v2"},"provider":{"provider":"test","task_id":"task"},"resolved_environment":{"network":"none"},"resource_constraints":{"attempt":0,"max_retries":0,"timeout_secs":120},"root_work_item_id":"00000000-0000-0000-0000-000000000000","state_id":"build","state_kind":"command","version":"resolved_authorization_request_v1","work_unit_id":"00000000-0000-0000-0000-000000000000","workflow_id":"workflow","workflow_snapshot":{"a":{},"empty":[],"explicit_null":null,"ordered":["second","first"],"runner":{"attempts":0,"gid":1000,"ports":[8080,3000],"uid":1000},"timestamp":"2026-08-20T19:10:51Z","z":{"fraction":1.25,"large":9007199254740993,"negative":-7}}}"#
         );
+        assert_eq!(
+            artifact.digest,
+            "5084d6159dd3859a67b3f997fdc33f20aa2a67baf374486be552d58fab056b0a"
+        );
+        assert!(text.contains("9007199254740993"));
+        assert!(text.contains("\"negative\":-7"));
+        assert!(text.contains("\"fraction\":1.25"));
+        assert_eq!(artifact.version, 1);
+        assert_eq!(artifact.digest.len(), 64);
+        assert_eq!(artifact.verify_and_parse().unwrap(), request.normalize());
+
+        let mut unknown: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        unknown["unknown"] = serde_json::json!(true);
+        let bytes = canonical_json_bytes(unknown).unwrap();
+        let unknown = CanonicalAuthorizationArtifact {
+            version: 1,
+            digest: canonical_authorization_digest(&bytes),
+            canonical_bytes: bytes,
+        };
+        assert!(unknown.verify_and_parse().is_err());
+
+        let mut unknown_nested: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        unknown_nested["behavior"]["runner_profile"]["future_field"] = serde_json::json!(true);
+        let bytes = canonical_json_bytes(unknown_nested).unwrap();
+        let unknown_nested = CanonicalAuthorizationArtifact {
+            version: 1,
+            digest: canonical_authorization_digest(&bytes),
+            canonical_bytes: bytes,
+        };
+        assert!(unknown_nested.verify_and_parse().is_err());
+
+        let mut unknown_variant: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        unknown_variant["state_kind"] = serde_json::json!("future_kind");
+        let bytes = canonical_json_bytes(unknown_variant).unwrap();
+        let unknown_variant = CanonicalAuthorizationArtifact {
+            version: 1,
+            digest: canonical_authorization_digest(&bytes),
+            canonical_bytes: bytes,
+        };
+        assert!(unknown_variant.verify_and_parse().is_err());
+
+        let mut absent: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        absent["behavior"].as_object_mut().unwrap().remove("prompt");
+        let bytes = canonical_json_bytes(absent).unwrap();
+        let absent = CanonicalAuthorizationArtifact {
+            version: 1,
+            digest: canonical_authorization_digest(&bytes),
+            canonical_bytes: bytes,
+        };
+        assert!(absent.verify_and_parse().is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_v1_ordering_contract() {
+        let first = request();
+        let mut map_reordered = request();
+        map_reordered.workflow_snapshot = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
+        assert_eq!(
+            first.canonical_artifact().unwrap(),
+            map_reordered.canonical_artifact().unwrap()
+        );
+
+        let mut ordered = request();
+        ordered.behavior.args.push("--workspace".to_string());
+        let mut ordered_reordered = ordered.clone();
+        ordered_reordered.behavior.args.reverse();
+        assert_ne!(
+            ordered.request_digest().unwrap(),
+            ordered_reordered.request_digest().unwrap()
+        );
+
+        let mut set_reordered = request();
+        set_reordered
+            .permission_envelope
+            .approval_rules
+            .as_mut()
+            .unwrap()
+            .auto_approve
+            .reverse();
+        assert_eq!(
+            first.request_digest().unwrap(),
+            set_reordered.request_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_authorization_v1_tampering_fails_before_parsing() {
+        let artifact = request().canonical_artifact().unwrap();
+        let bundle = ImmutableAuthorizationBundle::create(&request()).unwrap();
+        assert!(
+            ImmutableAuthorizationBundle::verify(&bundle.artifact(), &bundle.authorization_id)
+                .is_ok()
+        );
+        assert!(ImmutableAuthorizationBundle::verify(&bundle.artifact(), "tampered-id").is_err());
+        let mut payload_tamper = artifact.clone();
+        payload_tamper.canonical_bytes[0] ^= 1;
+        assert!(payload_tamper.verify_and_parse().is_err());
+
+        let mut digest_tamper = artifact.clone();
+        digest_tamper.digest.push('0');
+        assert!(digest_tamper.verify_and_parse().is_err());
+
+        let mut version_tamper = artifact;
+        version_tamper.version += 1;
+        assert!(version_tamper.verify_and_parse().is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_v1_normalizes_every_set_with_total_keys() {
+        let mut first = request();
+        first.permission_envelope.environment.file_mounts = vec![
+            PlannedFileMount {
+                host_path: "/b".to_string(),
+                container_path: "/same".to_string(),
+                read_only: false,
+            },
+            PlannedFileMount {
+                host_path: "/a".to_string(),
+                container_path: "/same".to_string(),
+                read_only: true,
+            },
+        ];
+        first.permission_envelope.environment.toolchains =
+            vec!["rust".to_string(), "go".to_string()];
+        first.permission_envelope.environment.network_resources =
+            Some(NetworkResourceRequest::Resources(vec![
+                NetworkResourceKind::Github,
+                NetworkResourceKind::Llm,
+            ]));
+        first.permission_envelope.permissions.auto_approve_tools =
+            vec!["write".to_string(), "read".to_string()];
+        first.permission_envelope.permissions.escalate_tools =
+            vec!["network".to_string(), "shell".to_string()];
+        first.permission_envelope.repos = vec![
+            PlannedRepoClaim {
+                repo_url: "https://example/same.git".to_string(),
+                base_ref: "origin/main".to_string(),
+                read_only: false,
+                target_branch: None,
+                claim_type: "workspace".to_string(),
+                branch_name: None,
+            },
+            PlannedRepoClaim {
+                repo_url: "https://example/same.git".to_string(),
+                base_ref: "origin/main".to_string(),
+                read_only: false,
+                target_branch: None,
+                claim_type: "existing_branch".to_string(),
+                branch_name: None,
+            },
+        ];
+        first.permission_envelope.github_capabilities = vec![
+            GithubCapability {
+                host: "github.com".to_string(),
+                api_base_url: "https://api.github.com".to_string(),
+                repository: "example/same".to_string(),
+                operations: vec![GithubOperation::PushBranch, GithubOperation::ReadRepository],
+                branch: None,
+                head_branch: None,
+                base_branch: None,
+                pull_request: None,
+                expected_head_sha: None,
+                credential_provider: "github:github.com:read_write".to_string(),
+            },
+            GithubCapability {
+                host: "github.com".to_string(),
+                api_base_url: "https://api.github.com".to_string(),
+                repository: "example/same".to_string(),
+                operations: vec![GithubOperation::ReadPullRequest],
+                branch: None,
+                head_branch: None,
+                base_branch: None,
+                pull_request: None,
+                expected_head_sha: None,
+                credential_provider: "github:github.com:read_write".to_string(),
+            },
+        ];
+        first.behavior.runner_profile = serde_json::json!({
+            "profile_name":"agent",
+            "kind":"generic",
+            "command":"agent",
+            "args":["run"],
+            "container_image":"image@sha256:abc",
+            "file_mounts":[
+                {"host_path":"/b","container_path":"/b","read_only":true},
+                {"host_path":"/a","container_path":"/a","read_only":false}
+            ],
+            "credential_providers":[
+                {"name":"b","provider_type":"oauth","targets":["/b","/a"]},
+                {"name":"a","provider_type":"api","targets":["/z","/y"]}
+            ],
+            "trusted_mounts":[
+                {"purpose":"state","container_path":"/state","read_only":false},
+                {"purpose":"config","container_path":"/config","read_only":true}
+            ],
+            "mcp_bridges":[
+                {"name":"b","endpoint_type":"unix","target":"b","container_socket_path":"/b.sock","args":["second","first"],"env_keys":["Z","A"]},
+                {"name":"a","endpoint_type":"unix","target":"a","container_socket_path":"/a.sock","args":[],"env_keys":["Y","B"]}
+            ],
+            "egress":{
+                "llm":{"default_provider":null,"providers":{"openai":["api.openai.com","chatgpt.com"]}},
+                "build":{"github_hosts":["github.com"],"go_registry_hosts":["proxy.golang.org"],"crates_registry_hosts":["crates.io"]},
+                "proxy":{"image":"proxy@sha256:abc","listen_port":3128,"runtime_uid":13,"runtime_gid":13,"writable_tmpfs_mode":"0755","declared_volumes":["/var/spool/squid","/var/log/squid"]},
+                "preflight_image":null
+            },
+            "github_hosts":["git.example.com","github.com"],
+            "opencode":{"max_validation_attempts":0},
+            "config_digest":"fixture"
+        });
+
+        let mut reversed = first.clone();
+        reversed
+            .permission_envelope
+            .environment
+            .file_mounts
+            .reverse();
+        reversed
+            .permission_envelope
+            .environment
+            .toolchains
+            .reverse();
+        if let Some(NetworkResourceRequest::Resources(resources)) = reversed
+            .permission_envelope
+            .environment
+            .network_resources
+            .as_mut()
+        {
+            resources.reverse();
+        }
+        reversed
+            .permission_envelope
+            .permissions
+            .auto_approve_tools
+            .reverse();
+        reversed
+            .permission_envelope
+            .permissions
+            .escalate_tools
+            .reverse();
+        reversed.permission_envelope.repos.reverse();
+        reversed.permission_envelope.github_capabilities.reverse();
+        for capability in &mut reversed.permission_envelope.github_capabilities {
+            capability.operations.reverse();
+        }
+        for key in [
+            "file_mounts",
+            "credential_providers",
+            "trusted_mounts",
+            "mcp_bridges",
+            "github_hosts",
+        ] {
+            reversed.behavior.runner_profile[key]
+                .as_array_mut()
+                .unwrap()
+                .reverse();
+        }
+        for provider in reversed.behavior.runner_profile["credential_providers"]
+            .as_array_mut()
+            .unwrap()
+        {
+            provider["targets"].as_array_mut().unwrap().reverse();
+        }
+        for bridge in reversed.behavior.runner_profile["mcp_bridges"]
+            .as_array_mut()
+            .unwrap()
+        {
+            bridge["env_keys"].as_array_mut().unwrap().reverse();
+        }
+        reversed.behavior.runner_profile["egress"]["llm"]["providers"]["openai"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        reversed.behavior.runner_profile["egress"]["proxy"]["declared_volumes"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+
+        assert_eq!(
+            first.canonical_artifact().unwrap(),
+            reversed.canonical_artifact().unwrap()
+        );
+
+        let artifact = first.canonical_artifact().unwrap();
+        let mut unknown_egress: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        unknown_egress["behavior"]["runner_profile"]["egress"]["future_field"] =
+            serde_json::json!(true);
+        let bytes = canonical_json_bytes(unknown_egress).unwrap();
+        let unknown_egress = CanonicalAuthorizationArtifact {
+            version: CANONICAL_AUTHORIZATION_VERSION,
+            digest: canonical_authorization_digest(&bytes),
+            canonical_bytes: bytes,
+        };
+        assert!(unknown_egress.verify_and_parse().is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_v1_json_number_policy_is_frozen() {
+        let mut request = request();
+        request.workflow_snapshot = serde_json::from_str(
+            r#"{"i64_min":-9223372036854775808,"u64_max":18446744073709551615,"above_js_safe":9007199254740993,"integer_float":1.0,"negative_zero":-0.0,"smallest_positive":5e-324,"largest_finite":1.7976931348623157e308}"#,
+        )
+        .unwrap();
+        let artifact = request.canonical_artifact().unwrap();
+        let text = std::str::from_utf8(&artifact.canonical_bytes).unwrap();
+        for expected in [
+            "-9223372036854775808",
+            "18446744073709551615",
+            "9007199254740993",
+            "\"integer_float\":1.0",
+            "\"negative_zero\":-0.0",
+            "5e-324",
+            "1.7976931348623157e+308",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing canonical number {expected}"
+            );
+        }
+
+        let noncanonical_bytes = text
+            .replace("\"integer_float\":1.0", "\"integer_float\":1e0")
+            .into_bytes();
+        let noncanonical = CanonicalAuthorizationArtifact {
+            version: CANONICAL_AUTHORIZATION_VERSION,
+            digest: canonical_authorization_digest(&noncanonical_bytes),
+            canonical_bytes: noncanonical_bytes,
+        };
+        assert!(noncanonical.verify_and_parse().is_err());
     }
 }
 use sha2::{Digest, Sha256};
@@ -1940,6 +2295,10 @@ pub struct Job {
     pub step_id: String,
     pub state: JobState,
     pub assigned_worker_id: Option<String>,
+    #[serde(default)]
+    pub assigned_worker_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub assigned_worker_session_generation: Option<u64>,
     pub execution_mode: ExecutionMode,
     #[serde(default)]
     pub container_image: Option<String>,
@@ -1951,6 +2310,8 @@ pub struct Job {
     pub prompt: Option<PromptRef>,
     #[serde(default)]
     pub context: serde_json::Value,
+    #[serde(default)]
+    pub canonical_authorization: Option<CanonicalAuthorizationArtifact>,
     #[serde(default)]
     pub repo: Option<RepoSource>,
     #[serde(default)]
@@ -1974,6 +2335,10 @@ pub struct WorkerInfo {
     pub state: WorkerState,
     #[serde(default)]
     pub supported_modes: Vec<ExecutionMode>,
+    #[serde(default)]
+    pub protocol_capabilities: Vec<WorkerProtocolCapability>,
+    pub session_id: Option<Uuid>,
+    pub session_generation: u64,
     pub last_heartbeat_at: DateTime<Utc>,
 }
 
@@ -2000,6 +2365,55 @@ pub struct RegisterWorkerRequest {
     pub hostname: String,
     #[serde(default)]
     pub supported_modes: Vec<ExecutionMode>,
+    #[serde(default)]
+    pub protocol_capabilities: Vec<WorkerProtocolCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterWorkerResponse {
+    pub worker: WorkerInfo,
+    pub session_id: Uuid,
+    pub session_token: crate::Secret,
+    pub session_generation: u64,
+}
+
+/// Credential for one registered worker process generation. The token is
+/// transported only in worker-authentication headers/metadata over the
+/// deployment's loopback or bearer-protected channel; it must not enter job
+/// context, logs, artifacts, or persisted cleartext state.
+#[derive(Clone)]
+pub struct WorkerSessionCredential {
+    pub session_id: Uuid,
+    pub session_token: crate::Secret,
+}
+
+#[derive(Clone)]
+pub struct AuthenticatedWorkerSession {
+    pub worker_id: String,
+    pub session_id: Uuid,
+    pub session_token: crate::Secret,
+    pub generation: u64,
+}
+
+impl AuthenticatedWorkerSession {
+    pub fn credential(&self) -> WorkerSessionCredential {
+        WorkerSessionCredential {
+            session_id: self.session_id,
+            session_token: self.session_token.clone(),
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerProtocolCapability {
+    /// The worker requires lossless context bytes and canonical authorization
+    /// bytes. Servers must not assign canonical jobs when this is absent, and
+    /// workers advertising it never fall back to legacy context evidence.
+    CanonicalAuthorizationV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2243,6 +2657,10 @@ pub struct PlannedAgentJobView {
     pub prototype_state: JobState,
     #[serde(default)]
     pub assigned_worker_id: Option<String>,
+    #[serde(default)]
+    pub assigned_worker_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub assigned_worker_session_generation: Option<u64>,
     pub environment: PlannedEnvironmentSpec,
     pub permission_set: PlannedPermissionSet,
     #[serde(default)]
@@ -2276,6 +2694,983 @@ pub const CONTEXT_AUTHORIZATION_REQUEST_KEY: &str = "resolved_authorization_requ
 pub const CONTEXT_AUTHORIZATION_ID_KEY: &str = "authorization_id";
 pub const CONTEXT_REQUEST_DIGEST_KEY: &str = "request_digest";
 pub const AUTHORIZATION_REQUEST_VERSION: &str = "resolved_authorization_request_v1";
+/// Identifies the exact DTO, canonicalization, and digest domain contract below.
+/// Any change to that contract requires a distinct version and domain separator.
+pub const CANONICAL_AUTHORIZATION_VERSION: u32 = 1;
+const CANONICAL_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:resolved-authorization:v1\0";
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalAuthorizationArtifact {
+    pub version: u32,
+    pub digest: String,
+    #[serde(with = "hex_bytes")]
+    #[schemars(with = "String")]
+    pub canonical_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImmutableAuthorizationBundle {
+    pub authorization_id: String,
+    pub digest: String,
+    pub version: u32,
+    pub canonical_bytes: Vec<u8>,
+    pub request: ResolvedAuthorizationRequest,
+}
+
+impl ImmutableAuthorizationBundle {
+    pub fn create(request: &ResolvedAuthorizationRequest) -> Result<Self, serde_json::Error> {
+        let artifact = request.canonical_artifact()?;
+        let request = artifact.verify_and_parse().map_err(|error| {
+            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })?;
+        let authorization_id = authorization_id_for_request(&request, &artifact.digest);
+        Ok(Self {
+            authorization_id,
+            digest: artifact.digest,
+            version: artifact.version,
+            canonical_bytes: artifact.canonical_bytes,
+            request,
+        })
+    }
+
+    pub fn verify(
+        artifact: &CanonicalAuthorizationArtifact,
+        authorization_id: &str,
+    ) -> Result<Self, String> {
+        let request = artifact.verify_and_parse()?;
+        let expected_id = authorization_id_for_request(&request, &artifact.digest);
+        if authorization_id != expected_id {
+            return Err(format!(
+                "canonical authorization identity mismatch for version {} digest {}",
+                artifact.version, artifact.digest
+            ));
+        }
+        Ok(Self {
+            authorization_id: expected_id,
+            digest: artifact.digest.clone(),
+            version: artifact.version,
+            canonical_bytes: artifact.canonical_bytes.clone(),
+            request,
+        })
+    }
+
+    pub fn artifact(&self) -> CanonicalAuthorizationArtifact {
+        CanonicalAuthorizationArtifact {
+            version: self.version,
+            digest: self.digest.clone(),
+            canonical_bytes: self.canonical_bytes.clone(),
+        }
+    }
+}
+
+pub fn authorization_id_for_request(
+    request: &ResolvedAuthorizationRequest,
+    verified_digest: &str,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        request.root_work_item_id,
+        request.work_unit_id,
+        request.state_id,
+        request.invocation_id,
+        verified_digest
+    )
+}
+
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        hex::decode(encoded).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedAuthorizationRequestV1 {
+    version: String,
+    invocation_id: Uuid,
+    work_unit_id: Uuid,
+    root_work_item_id: Uuid,
+    workflow_id: String,
+    workflow_snapshot: serde_json::Value,
+    state_id: String,
+    state_kind: ReactiveStateKindV1,
+    behavior: ResolvedAuthorizationBehaviorV1,
+    permission_envelope: CanonicalRuntimeSpecV1,
+    resolved_environment: serde_json::Value,
+    provider: ResolvedAuthorizationProviderV1,
+    resource_constraints: ResolvedAuthorizationResourcesV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedAuthorizationBehaviorV1 {
+    execution_kind: String,
+    runner_profile: RunnerProfileV1,
+    command: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    prompt: Option<PromptRefV1>,
+    primary_repo: Option<RepoSourceV1>,
+    primary_repo_branch: Option<String>,
+    execution_context: AuthorizationExecutionContextV1,
+    triage: bool,
+    allow_remote_credentials: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptRefV1 {
+    system: Option<String>,
+    user: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoSourceV1 {
+    repo_url: String,
+    base_ref: String,
+    branch_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRuntimeSpecV1 {
+    runtime_version: String,
+    environment: PlannedEnvironmentSpecV1,
+    permissions: PlannedPermissionSetV1,
+    approval_rules: Option<ApprovalRuleSetV1>,
+    repos: Vec<PlannedRepoClaimV1>,
+    github_capabilities: Vec<GithubCapabilityV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedEnvironmentSpecV1 {
+    tier: PlannedEnvironmentTierV1,
+    execution_mode: ExecutionModeV1,
+    container_image: Option<String>,
+    timeout_secs: Option<u64>,
+    memory_limit: Option<String>,
+    cpu_limit: Option<String>,
+    network_resources: Option<NetworkResourceRequestV1>,
+    filesystem: Option<String>,
+    file_mounts: Vec<PlannedFileMountV1>,
+    toolchains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedFileMountV1 {
+    host_path: String,
+    container_path: String,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedPermissionSetV1 {
+    tier: PlannedPermissionTierV1,
+    can_read_workspace: bool,
+    can_write_workspace: bool,
+    can_run_shell: bool,
+    can_access_network: bool,
+    auto_approve_tools: Vec<String>,
+    escalate_tools: Vec<String>,
+    kubernetes_access: Option<String>,
+    aws_access: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalRuleSetV1 {
+    auto_approve: Vec<String>,
+    escalate: Vec<String>,
+    deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedRepoClaimV1 {
+    repo_url: String,
+    base_ref: String,
+    read_only: bool,
+    target_branch: Option<String>,
+    claim_type: String,
+    branch_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedAuthorizationProviderV1 {
+    provider: Option<String>,
+    task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedAuthorizationResourcesV1 {
+    timeout_secs: Option<u64>,
+    max_retries: u32,
+    attempt: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReactiveStateKindV1 {
+    Auto,
+    Agent,
+    Command,
+    Managed,
+    Human,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionModeV1 {
+    Docker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PlannedEnvironmentTierV1 {
+    Docker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PlannedPermissionTierV1 {
+    DockerDefault,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum NetworkResourceKindV1 {
+    Llm,
+    Github,
+    GoRegistry,
+    CratesRegistry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NetworkResourceRequestV1 {
+    None,
+    Full,
+    Resources(Vec<NetworkResourceKindV1>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum GithubOperationV1 {
+    ReadRepository,
+    PushBranch,
+    ReadPullRequest,
+    CreatePullRequest,
+    MarkPullRequestReady,
+    RequestReview,
+    MergePullRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GithubCapabilityV1 {
+    host: String,
+    api_base_url: String,
+    repository: String,
+    operations: Vec<GithubOperationV1>,
+    branch: Option<String>,
+    head_branch: Option<String>,
+    base_branch: Option<String>,
+    pull_request: Option<u64>,
+    expected_head_sha: Option<String>,
+    credential_provider: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RunnerProfileV1 {
+    Builtin(BuiltinRunnerProfileV1),
+    Resolved(Box<ResolvedRunnerProfileV1>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuiltinRunnerProfileV1 {
+    profile_name: String,
+    config_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedRunnerProfileV1 {
+    profile_name: String,
+    kind: ManagedRunnerKindV1,
+    command: String,
+    args: Vec<String>,
+    container_image: Option<String>,
+    file_mounts: Vec<RunnerFileMountV1>,
+    credential_providers: Vec<CredentialProviderV1>,
+    trusted_mounts: Vec<TrustedMountV1>,
+    mcp_bridges: Vec<McpBridgeV1>,
+    egress: RunnerEgressV1,
+    github_hosts: Vec<String>,
+    opencode: OpencodeRunnerV1,
+    config_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ManagedRunnerKindV1 {
+    Generic,
+    Opencode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerFileMountV1 {
+    host_path: String,
+    container_path: String,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialProviderV1 {
+    name: String,
+    provider_type: String,
+    targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedMountV1 {
+    purpose: String,
+    container_path: String,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpBridgeV1 {
+    name: String,
+    endpoint_type: String,
+    target: String,
+    container_socket_path: String,
+    args: Vec<String>,
+    env_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpencodeRunnerV1 {
+    max_validation_attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerEgressV1 {
+    llm: RunnerEgressLlmV1,
+    build: RunnerEgressBuildV1,
+    proxy: RunnerEgressProxyV1,
+    preflight_image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerEgressLlmV1 {
+    default_provider: Option<String>,
+    providers: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerEgressBuildV1 {
+    github_hosts: Vec<String>,
+    go_registry_hosts: Vec<String>,
+    crates_registry_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerEgressProxyV1 {
+    image: String,
+    listen_port: u16,
+    runtime_uid: u32,
+    runtime_gid: u32,
+    writable_tmpfs_mode: String,
+    declared_volumes: Vec<String>,
+}
+
+impl ResolvedAuthorizationRequestV1 {
+    fn from_semantic(request: ResolvedAuthorizationRequest) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            version: request.version,
+            invocation_id: request.invocation_id,
+            work_unit_id: request.work_unit_id,
+            root_work_item_id: request.root_work_item_id,
+            workflow_id: request.workflow_id,
+            workflow_snapshot: request.workflow_snapshot,
+            state_id: request.state_id,
+            state_kind: match request.state_kind {
+                ReactiveStateKind::Auto => ReactiveStateKindV1::Auto,
+                ReactiveStateKind::Agent => ReactiveStateKindV1::Agent,
+                ReactiveStateKind::Command => ReactiveStateKindV1::Command,
+                ReactiveStateKind::Managed => ReactiveStateKindV1::Managed,
+                ReactiveStateKind::Human => ReactiveStateKindV1::Human,
+                ReactiveStateKind::Terminal => ReactiveStateKindV1::Terminal,
+            },
+            behavior: ResolvedAuthorizationBehaviorV1 {
+                execution_kind: request.behavior.execution_kind,
+                runner_profile: serde_json::from_value(request.behavior.runner_profile)?,
+                command: request.behavior.command,
+                args: request.behavior.args,
+                env: request.behavior.env,
+                prompt: request.behavior.prompt.map(|prompt| PromptRefV1 {
+                    system: prompt.system,
+                    user: prompt.user,
+                }),
+                primary_repo: request.behavior.primary_repo.map(|repo| RepoSourceV1 {
+                    repo_url: repo.repo_url,
+                    base_ref: repo.base_ref,
+                    branch_name: repo.branch_name,
+                }),
+                primary_repo_branch: request.behavior.primary_repo_branch,
+                execution_context: serde_json::from_value(request.behavior.execution_context)?,
+                triage: request.behavior.triage,
+                allow_remote_credentials: request.behavior.allow_remote_credentials,
+            },
+            permission_envelope: CanonicalRuntimeSpecV1 {
+                runtime_version: request.permission_envelope.runtime_version,
+                environment: PlannedEnvironmentSpecV1 {
+                    tier: match request.permission_envelope.environment.tier {
+                        PlannedEnvironmentTier::Docker => PlannedEnvironmentTierV1::Docker,
+                    },
+                    execution_mode: match request.permission_envelope.environment.execution_mode {
+                        ExecutionMode::Docker => ExecutionModeV1::Docker,
+                    },
+                    container_image: request.permission_envelope.environment.container_image,
+                    timeout_secs: request.permission_envelope.environment.timeout_secs,
+                    memory_limit: request.permission_envelope.environment.memory_limit,
+                    cpu_limit: request.permission_envelope.environment.cpu_limit,
+                    network_resources: request
+                        .permission_envelope
+                        .environment
+                        .network_resources
+                        .map(network_request_v1_from_semantic),
+                    filesystem: request.permission_envelope.environment.filesystem,
+                    file_mounts: request
+                        .permission_envelope
+                        .environment
+                        .file_mounts
+                        .into_iter()
+                        .map(|mount| PlannedFileMountV1 {
+                            host_path: mount.host_path,
+                            container_path: mount.container_path,
+                            read_only: mount.read_only,
+                        })
+                        .collect(),
+                    toolchains: request.permission_envelope.environment.toolchains,
+                },
+                permissions: PlannedPermissionSetV1 {
+                    tier: match request.permission_envelope.permissions.tier {
+                        PlannedPermissionTier::DockerDefault => {
+                            PlannedPermissionTierV1::DockerDefault
+                        }
+                    },
+                    can_read_workspace: request.permission_envelope.permissions.can_read_workspace,
+                    can_write_workspace: request
+                        .permission_envelope
+                        .permissions
+                        .can_write_workspace,
+                    can_run_shell: request.permission_envelope.permissions.can_run_shell,
+                    can_access_network: request.permission_envelope.permissions.can_access_network,
+                    auto_approve_tools: request.permission_envelope.permissions.auto_approve_tools,
+                    escalate_tools: request.permission_envelope.permissions.escalate_tools,
+                    kubernetes_access: request.permission_envelope.permissions.kubernetes_access,
+                    aws_access: request.permission_envelope.permissions.aws_access,
+                },
+                approval_rules: request.permission_envelope.approval_rules.map(|rules| {
+                    ApprovalRuleSetV1 {
+                        auto_approve: rules.auto_approve,
+                        escalate: rules.escalate,
+                        deny: rules.deny,
+                    }
+                }),
+                repos: request
+                    .permission_envelope
+                    .repos
+                    .into_iter()
+                    .map(|repo| PlannedRepoClaimV1 {
+                        repo_url: repo.repo_url,
+                        base_ref: repo.base_ref,
+                        read_only: repo.read_only,
+                        target_branch: repo.target_branch,
+                        claim_type: repo.claim_type,
+                        branch_name: repo.branch_name,
+                    })
+                    .collect(),
+                github_capabilities: request
+                    .permission_envelope
+                    .github_capabilities
+                    .into_iter()
+                    .map(github_capability_v1_from_semantic)
+                    .collect(),
+            },
+            resolved_environment: request.resolved_environment,
+            provider: ResolvedAuthorizationProviderV1 {
+                provider: request.provider.provider,
+                task_id: request.provider.task_id,
+            },
+            resource_constraints: ResolvedAuthorizationResourcesV1 {
+                timeout_secs: request.resource_constraints.timeout_secs,
+                max_retries: request.resource_constraints.max_retries,
+                attempt: request.resource_constraints.attempt,
+            },
+        })
+    }
+
+    fn into_semantic(self) -> Result<ResolvedAuthorizationRequest, serde_json::Error> {
+        Ok(ResolvedAuthorizationRequest {
+            version: self.version,
+            invocation_id: self.invocation_id,
+            work_unit_id: self.work_unit_id,
+            root_work_item_id: self.root_work_item_id,
+            workflow_id: self.workflow_id,
+            workflow_snapshot: self.workflow_snapshot,
+            state_id: self.state_id,
+            state_kind: match self.state_kind {
+                ReactiveStateKindV1::Auto => ReactiveStateKind::Auto,
+                ReactiveStateKindV1::Agent => ReactiveStateKind::Agent,
+                ReactiveStateKindV1::Command => ReactiveStateKind::Command,
+                ReactiveStateKindV1::Managed => ReactiveStateKind::Managed,
+                ReactiveStateKindV1::Human => ReactiveStateKind::Human,
+                ReactiveStateKindV1::Terminal => ReactiveStateKind::Terminal,
+            },
+            behavior: ResolvedAuthorizationBehavior {
+                execution_kind: self.behavior.execution_kind,
+                runner_profile: serde_json::to_value(self.behavior.runner_profile)?,
+                command: self.behavior.command,
+                args: self.behavior.args,
+                env: self.behavior.env,
+                prompt: self.behavior.prompt.map(|prompt| PromptRef {
+                    system: prompt.system,
+                    user: prompt.user,
+                }),
+                primary_repo: self.behavior.primary_repo.map(|repo| RepoSource {
+                    repo_url: repo.repo_url,
+                    base_ref: repo.base_ref,
+                    branch_name: repo.branch_name,
+                }),
+                primary_repo_branch: self.behavior.primary_repo_branch,
+                execution_context: serde_json::to_value(self.behavior.execution_context)?,
+                triage: self.behavior.triage,
+                allow_remote_credentials: self.behavior.allow_remote_credentials,
+            },
+            permission_envelope: CanonicalRuntimeSpec {
+                runtime_version: self.permission_envelope.runtime_version,
+                environment: PlannedEnvironmentSpec {
+                    tier: match self.permission_envelope.environment.tier {
+                        PlannedEnvironmentTierV1::Docker => PlannedEnvironmentTier::Docker,
+                    },
+                    execution_mode: match self.permission_envelope.environment.execution_mode {
+                        ExecutionModeV1::Docker => ExecutionMode::Docker,
+                    },
+                    container_image: self.permission_envelope.environment.container_image,
+                    timeout_secs: self.permission_envelope.environment.timeout_secs,
+                    memory_limit: self.permission_envelope.environment.memory_limit,
+                    cpu_limit: self.permission_envelope.environment.cpu_limit,
+                    network_resources: self
+                        .permission_envelope
+                        .environment
+                        .network_resources
+                        .map(network_request_v1_into_semantic),
+                    filesystem: self.permission_envelope.environment.filesystem,
+                    file_mounts: self
+                        .permission_envelope
+                        .environment
+                        .file_mounts
+                        .into_iter()
+                        .map(|mount| PlannedFileMount {
+                            host_path: mount.host_path,
+                            container_path: mount.container_path,
+                            read_only: mount.read_only,
+                        })
+                        .collect(),
+                    toolchains: self.permission_envelope.environment.toolchains,
+                },
+                permissions: PlannedPermissionSet {
+                    tier: match self.permission_envelope.permissions.tier {
+                        PlannedPermissionTierV1::DockerDefault => {
+                            PlannedPermissionTier::DockerDefault
+                        }
+                    },
+                    can_read_workspace: self.permission_envelope.permissions.can_read_workspace,
+                    can_write_workspace: self.permission_envelope.permissions.can_write_workspace,
+                    can_run_shell: self.permission_envelope.permissions.can_run_shell,
+                    can_access_network: self.permission_envelope.permissions.can_access_network,
+                    auto_approve_tools: self.permission_envelope.permissions.auto_approve_tools,
+                    escalate_tools: self.permission_envelope.permissions.escalate_tools,
+                    kubernetes_access: self.permission_envelope.permissions.kubernetes_access,
+                    aws_access: self.permission_envelope.permissions.aws_access,
+                },
+                approval_rules: self.permission_envelope.approval_rules.map(|rules| {
+                    ApprovalRuleSet {
+                        auto_approve: rules.auto_approve,
+                        escalate: rules.escalate,
+                        deny: rules.deny,
+                    }
+                }),
+                repos: self
+                    .permission_envelope
+                    .repos
+                    .into_iter()
+                    .map(|repo| PlannedRepoClaim {
+                        repo_url: repo.repo_url,
+                        base_ref: repo.base_ref,
+                        read_only: repo.read_only,
+                        target_branch: repo.target_branch,
+                        claim_type: repo.claim_type,
+                        branch_name: repo.branch_name,
+                    })
+                    .collect(),
+                github_capabilities: self
+                    .permission_envelope
+                    .github_capabilities
+                    .into_iter()
+                    .map(github_capability_v1_into_semantic)
+                    .collect(),
+            },
+            resolved_environment: self.resolved_environment,
+            provider: ResolvedAuthorizationProvider {
+                provider: self.provider.provider,
+                task_id: self.provider.task_id,
+            },
+            resource_constraints: ResolvedAuthorizationResources {
+                timeout_secs: self.resource_constraints.timeout_secs,
+                max_retries: self.resource_constraints.max_retries,
+                attempt: self.resource_constraints.attempt,
+            },
+        })
+    }
+
+    fn normalize_sets(&mut self) {
+        let environment = &mut self.permission_envelope.environment;
+        environment.file_mounts.sort_by(|left, right| {
+            (&left.host_path, &left.container_path, left.read_only).cmp(&(
+                &right.host_path,
+                &right.container_path,
+                right.read_only,
+            ))
+        });
+        environment.file_mounts.dedup_by(|left, right| {
+            left.host_path == right.host_path
+                && left.container_path == right.container_path
+                && left.read_only == right.read_only
+        });
+        normalize_string_set(&mut environment.toolchains);
+        if let Some(NetworkResourceRequestV1::Resources(resources)) =
+            environment.network_resources.as_mut()
+        {
+            resources.sort();
+            resources.dedup();
+        }
+        let permissions = &mut self.permission_envelope.permissions;
+        normalize_string_set(&mut permissions.auto_approve_tools);
+        normalize_string_set(&mut permissions.escalate_tools);
+        if let Some(rules) = self.permission_envelope.approval_rules.as_mut() {
+            normalize_string_set(&mut rules.auto_approve);
+            normalize_string_set(&mut rules.escalate);
+            normalize_string_set(&mut rules.deny);
+        }
+        self.permission_envelope.repos.sort_by(|left, right| {
+            (
+                &left.repo_url,
+                &left.base_ref,
+                left.read_only,
+                &left.target_branch,
+                &left.claim_type,
+                &left.branch_name,
+            )
+                .cmp(&(
+                    &right.repo_url,
+                    &right.base_ref,
+                    right.read_only,
+                    &right.target_branch,
+                    &right.claim_type,
+                    &right.branch_name,
+                ))
+        });
+        self.permission_envelope.repos.dedup_by(|left, right| {
+            left.repo_url == right.repo_url
+                && left.base_ref == right.base_ref
+                && left.read_only == right.read_only
+                && left.target_branch == right.target_branch
+                && left.claim_type == right.claim_type
+                && left.branch_name == right.branch_name
+        });
+        if let RunnerProfileV1::Resolved(profile) = &mut self.behavior.runner_profile {
+            profile.file_mounts.sort_by(|left, right| {
+                (&left.host_path, &left.container_path, left.read_only).cmp(&(
+                    &right.host_path,
+                    &right.container_path,
+                    right.read_only,
+                ))
+            });
+            profile.file_mounts.dedup_by(|left, right| {
+                left.host_path == right.host_path
+                    && left.container_path == right.container_path
+                    && left.read_only == right.read_only
+            });
+            for provider in &mut profile.credential_providers {
+                normalize_string_set(&mut provider.targets);
+            }
+            profile.credential_providers.sort_by(|left, right| {
+                (&left.name, &left.provider_type, &left.targets).cmp(&(
+                    &right.name,
+                    &right.provider_type,
+                    &right.targets,
+                ))
+            });
+            profile.credential_providers.dedup_by(|left, right| {
+                left.name == right.name
+                    && left.provider_type == right.provider_type
+                    && left.targets == right.targets
+            });
+            profile.trusted_mounts.sort_by(|left, right| {
+                (&left.purpose, &left.container_path, left.read_only).cmp(&(
+                    &right.purpose,
+                    &right.container_path,
+                    right.read_only,
+                ))
+            });
+            profile.trusted_mounts.dedup_by(|left, right| {
+                left.purpose == right.purpose
+                    && left.container_path == right.container_path
+                    && left.read_only == right.read_only
+            });
+            for bridge in &mut profile.mcp_bridges {
+                normalize_string_set(&mut bridge.env_keys);
+            }
+            profile.mcp_bridges.sort_by(|left, right| {
+                (
+                    &left.name,
+                    &left.endpoint_type,
+                    &left.target,
+                    &left.container_socket_path,
+                    &left.args,
+                    &left.env_keys,
+                )
+                    .cmp(&(
+                        &right.name,
+                        &right.endpoint_type,
+                        &right.target,
+                        &right.container_socket_path,
+                        &right.args,
+                        &right.env_keys,
+                    ))
+            });
+            profile.mcp_bridges.dedup_by(|left, right| {
+                left.name == right.name
+                    && left.endpoint_type == right.endpoint_type
+                    && left.target == right.target
+                    && left.container_socket_path == right.container_socket_path
+                    && left.args == right.args
+                    && left.env_keys == right.env_keys
+            });
+            normalize_lowercase_string_set(&mut profile.github_hosts);
+            let mut providers = BTreeMap::<String, Vec<String>>::new();
+            for (provider, mut hosts) in std::mem::take(&mut profile.egress.llm.providers) {
+                normalize_lowercase_string_set(&mut hosts);
+                providers
+                    .entry(provider.trim().to_ascii_lowercase())
+                    .or_default()
+                    .extend(hosts);
+            }
+            for hosts in providers.values_mut() {
+                normalize_lowercase_string_set(hosts);
+            }
+            profile.egress.llm.providers = providers;
+            profile.egress.llm.default_provider = profile
+                .egress
+                .llm
+                .default_provider
+                .take()
+                .map(|provider| provider.trim().to_ascii_lowercase());
+            normalize_lowercase_string_set(&mut profile.egress.build.github_hosts);
+            normalize_lowercase_string_set(&mut profile.egress.build.go_registry_hosts);
+            normalize_lowercase_string_set(&mut profile.egress.build.crates_registry_hosts);
+            normalize_string_set(&mut profile.egress.proxy.declared_volumes);
+        }
+        for capability in &mut self.permission_envelope.github_capabilities {
+            capability.operations.sort();
+            capability.operations.dedup();
+        }
+        self.permission_envelope
+            .github_capabilities
+            .sort_by(|left, right| {
+                (
+                    &left.host,
+                    &left.api_base_url,
+                    &left.repository,
+                    &left.operations,
+                    &left.branch,
+                    &left.head_branch,
+                    &left.base_branch,
+                    left.pull_request,
+                    &left.expected_head_sha,
+                    &left.credential_provider,
+                )
+                    .cmp(&(
+                        &right.host,
+                        &right.api_base_url,
+                        &right.repository,
+                        &right.operations,
+                        &right.branch,
+                        &right.head_branch,
+                        &right.base_branch,
+                        right.pull_request,
+                        &right.expected_head_sha,
+                        &right.credential_provider,
+                    ))
+            });
+        self.permission_envelope
+            .github_capabilities
+            .dedup_by(|left, right| {
+                left.host == right.host
+                    && left.api_base_url == right.api_base_url
+                    && left.repository == right.repository
+                    && left.operations == right.operations
+                    && left.branch == right.branch
+                    && left.head_branch == right.head_branch
+                    && left.base_branch == right.base_branch
+                    && left.pull_request == right.pull_request
+                    && left.expected_head_sha == right.expected_head_sha
+                    && left.credential_provider == right.credential_provider
+            });
+    }
+}
+
+fn normalize_lowercase_string_set(values: &mut Vec<String>) {
+    for value in values.iter_mut() {
+        *value = value.trim().to_ascii_lowercase();
+    }
+    normalize_string_set(values);
+}
+
+fn network_kind_v1_from_semantic(kind: NetworkResourceKind) -> NetworkResourceKindV1 {
+    match kind {
+        NetworkResourceKind::Llm => NetworkResourceKindV1::Llm,
+        NetworkResourceKind::Github => NetworkResourceKindV1::Github,
+        NetworkResourceKind::GoRegistry => NetworkResourceKindV1::GoRegistry,
+        NetworkResourceKind::CratesRegistry => NetworkResourceKindV1::CratesRegistry,
+    }
+}
+
+fn network_kind_v1_into_semantic(kind: NetworkResourceKindV1) -> NetworkResourceKind {
+    match kind {
+        NetworkResourceKindV1::Llm => NetworkResourceKind::Llm,
+        NetworkResourceKindV1::Github => NetworkResourceKind::Github,
+        NetworkResourceKindV1::GoRegistry => NetworkResourceKind::GoRegistry,
+        NetworkResourceKindV1::CratesRegistry => NetworkResourceKind::CratesRegistry,
+    }
+}
+
+fn network_request_v1_from_semantic(request: NetworkResourceRequest) -> NetworkResourceRequestV1 {
+    match request {
+        NetworkResourceRequest::None => NetworkResourceRequestV1::None,
+        NetworkResourceRequest::Full => NetworkResourceRequestV1::Full,
+        NetworkResourceRequest::Resources(resources) => NetworkResourceRequestV1::Resources(
+            resources
+                .into_iter()
+                .map(network_kind_v1_from_semantic)
+                .collect(),
+        ),
+    }
+}
+
+fn network_request_v1_into_semantic(request: NetworkResourceRequestV1) -> NetworkResourceRequest {
+    match request {
+        NetworkResourceRequestV1::None => NetworkResourceRequest::None,
+        NetworkResourceRequestV1::Full => NetworkResourceRequest::Full,
+        NetworkResourceRequestV1::Resources(resources) => NetworkResourceRequest::Resources(
+            resources
+                .into_iter()
+                .map(network_kind_v1_into_semantic)
+                .collect(),
+        ),
+    }
+}
+
+fn github_operation_v1_from_semantic(operation: GithubOperation) -> GithubOperationV1 {
+    match operation {
+        GithubOperation::ReadRepository => GithubOperationV1::ReadRepository,
+        GithubOperation::PushBranch => GithubOperationV1::PushBranch,
+        GithubOperation::ReadPullRequest => GithubOperationV1::ReadPullRequest,
+        GithubOperation::CreatePullRequest => GithubOperationV1::CreatePullRequest,
+        GithubOperation::MarkPullRequestReady => GithubOperationV1::MarkPullRequestReady,
+        GithubOperation::RequestReview => GithubOperationV1::RequestReview,
+        GithubOperation::MergePullRequest => GithubOperationV1::MergePullRequest,
+    }
+}
+
+fn github_operation_v1_into_semantic(operation: GithubOperationV1) -> GithubOperation {
+    match operation {
+        GithubOperationV1::ReadRepository => GithubOperation::ReadRepository,
+        GithubOperationV1::PushBranch => GithubOperation::PushBranch,
+        GithubOperationV1::ReadPullRequest => GithubOperation::ReadPullRequest,
+        GithubOperationV1::CreatePullRequest => GithubOperation::CreatePullRequest,
+        GithubOperationV1::MarkPullRequestReady => GithubOperation::MarkPullRequestReady,
+        GithubOperationV1::RequestReview => GithubOperation::RequestReview,
+        GithubOperationV1::MergePullRequest => GithubOperation::MergePullRequest,
+    }
+}
+
+fn github_capability_v1_from_semantic(capability: GithubCapability) -> GithubCapabilityV1 {
+    GithubCapabilityV1 {
+        host: capability.host,
+        api_base_url: capability.api_base_url,
+        repository: capability.repository,
+        operations: capability
+            .operations
+            .into_iter()
+            .map(github_operation_v1_from_semantic)
+            .collect(),
+        branch: capability.branch,
+        head_branch: capability.head_branch,
+        base_branch: capability.base_branch,
+        pull_request: capability.pull_request,
+        expected_head_sha: capability.expected_head_sha,
+        credential_provider: capability.credential_provider,
+    }
+}
+
+fn github_capability_v1_into_semantic(capability: GithubCapabilityV1) -> GithubCapability {
+    GithubCapability {
+        host: capability.host,
+        api_base_url: capability.api_base_url,
+        repository: capability.repository,
+        operations: capability
+            .operations
+            .into_iter()
+            .map(github_operation_v1_into_semantic)
+            .collect(),
+        branch: capability.branch,
+        head_branch: capability.head_branch,
+        base_branch: capability.base_branch,
+        pull_request: capability.pull_request,
+        expected_head_sha: capability.expected_head_sha,
+        credential_provider: capability.credential_provider,
+    }
+}
 
 pub fn authorized_default_branch(work_item_id: Uuid, invocation_id: Uuid) -> String {
     format!(
@@ -2329,21 +3724,36 @@ pub struct ResolvedAuthorizationResources {
     pub timeout_secs: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_u32_lenient")]
     pub max_retries: u32,
+    pub attempt: u32,
 }
 
 impl ResolvedAuthorizationRequest {
     pub fn normalize(mut self) -> Self {
         normalize_runtime_for_authorization(&mut self.permission_envelope);
-        self.workflow_snapshot = canonical_json(self.workflow_snapshot);
-        self.behavior.runner_profile = canonical_json(self.behavior.runner_profile);
-        self.behavior.execution_context = canonical_json(self.behavior.execution_context);
-        self.resolved_environment = canonical_json(self.resolved_environment);
         self
     }
 
     pub fn request_digest(&self) -> Result<String, serde_json::Error> {
-        let canonical = self.clone().normalize();
-        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?)))
+        Ok(self.canonical_artifact()?.digest)
+    }
+
+    pub fn canonical_artifact(&self) -> Result<CanonicalAuthorizationArtifact, serde_json::Error> {
+        if self.version != AUTHORIZATION_REQUEST_VERSION {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported authorization request schema {}", self.version),
+            )));
+        }
+        let normalized = self.clone().normalize();
+        let mut dto = ResolvedAuthorizationRequestV1::from_semantic(normalized)?;
+        dto.normalize_sets();
+        let canonical_bytes = canonical_json_bytes(serde_json::to_value(dto)?)?;
+        let digest = canonical_authorization_digest(&canonical_bytes);
+        Ok(CanonicalAuthorizationArtifact {
+            version: CANONICAL_AUTHORIZATION_VERSION,
+            digest,
+            canonical_bytes,
+        })
     }
 
     pub fn behavior_matches(&self, baseline: &Self) -> bool {
@@ -2361,6 +3771,7 @@ impl ResolvedAuthorizationRequest {
                 == canonical_json(baseline.resolved_environment.clone())
             && self.provider == baseline.provider
             && self.resource_constraints.max_retries == baseline.resource_constraints.max_retries
+            && self.resource_constraints.attempt == baseline.resource_constraints.attempt
     }
 
     pub fn permissions_are_subset_of(&self, baseline: &Self) -> bool {
@@ -2385,6 +3796,7 @@ impl ResolvedAuthorizationRequest {
             && self.permission_envelope.environment.container_image == job.container_image
             && self.resource_constraints.timeout_secs == job.timeout_secs
             && self.resource_constraints.max_retries == job.max_retries
+            && self.resource_constraints.attempt == job.attempt
             && self.behavior.execution_context == authorization_execution_context(&job.context)
             && self
                 .behavior
@@ -2397,13 +3809,75 @@ impl ResolvedAuthorizationRequest {
     }
 }
 
-pub fn project_authorization_request_into_job_context(
+impl CanonicalAuthorizationArtifact {
+    pub fn verify_and_parse(&self) -> Result<ResolvedAuthorizationRequest, String> {
+        if self.version != CANONICAL_AUTHORIZATION_VERSION {
+            return Err(format!(
+                "unsupported canonical authorization version {}",
+                self.version
+            ));
+        }
+        let actual_digest = canonical_authorization_digest(&self.canonical_bytes);
+        if actual_digest != self.digest {
+            return Err(format!(
+                "canonical authorization digest mismatch for version {}",
+                self.version
+            ));
+        }
+        let mut dto: ResolvedAuthorizationRequestV1 = serde_json::from_slice(&self.canonical_bytes)
+            .map_err(|error| {
+                format!(
+                    "canonical authorization version {} is invalid: {error}",
+                    self.version
+                )
+            })?;
+        if dto.version != AUTHORIZATION_REQUEST_VERSION {
+            return Err(format!(
+                "canonical authorization version {} has incompatible request schema",
+                self.version
+            ));
+        }
+        dto.normalize_sets();
+        let canonical =
+            canonical_json_bytes(serde_json::to_value(&dto).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        if canonical != self.canonical_bytes {
+            return Err(format!(
+                "canonical authorization payload is not canonical for version {}",
+                self.version
+            ));
+        }
+        dto.into_semantic().map_err(|error| {
+            format!(
+                "canonical authorization version {} is semantically invalid: {error}",
+                self.version
+            )
+        })
+    }
+}
+
+fn canonical_authorization_digest(canonical_bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(CANONICAL_AUTHORIZATION_DOMAIN_V1);
+    digest.update(canonical_bytes);
+    hex::encode(digest.finalize())
+}
+
+/// Canonical numbers are the compact forms emitted by `serde_json` for its
+/// signed-integer, unsigned-integer, and finite-float number kinds. Integer
+/// kinds use base-10 digits without exponent or decimal point. Float kinds use
+/// the shortest round-trippable finite representation, retain a decimal point
+/// when needed to preserve float kind, and retain negative zero. Immutable
+/// parsing rejects any alternate spelling because reserialization must match
+/// the received bytes exactly.
+fn canonical_json_bytes(value: serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&canonical_json(value))
+}
+
+pub fn project_authorization_bundle_into_job_context(
     context: &mut serde_json::Value,
-    authorization_id: &str,
-    request: &ResolvedAuthorizationRequest,
-) -> Result<String, serde_json::Error> {
-    let request = request.clone().normalize();
-    let digest = request.request_digest()?;
+    bundle: &ImmutableAuthorizationBundle,
+) -> Result<(), serde_json::Error> {
     if !context.is_object() {
         *context = serde_json::json!({});
     }
@@ -2412,17 +3886,17 @@ pub fn project_authorization_request_into_job_context(
         .expect("context normalized as object");
     object.insert(
         CONTEXT_AUTHORIZATION_ID_KEY.to_string(),
-        serde_json::Value::String(authorization_id.to_string()),
+        serde_json::Value::String(bundle.authorization_id.clone()),
     );
     object.insert(
         CONTEXT_REQUEST_DIGEST_KEY.to_string(),
-        serde_json::Value::String(digest.clone()),
+        serde_json::Value::String(bundle.digest.clone()),
     );
     object.insert(
         CONTEXT_AUTHORIZATION_REQUEST_KEY.to_string(),
-        serde_json::to_value(request)?,
+        serde_json::to_value(&bundle.request)?,
     );
-    Ok(digest)
+    Ok(())
 }
 
 pub fn authorization_request_from_job_context(
@@ -2434,32 +3908,79 @@ pub fn authorization_request_from_job_context(
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationExecutionContextV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_mode: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_runtime_spec: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment_base: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment_runtime: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_pr_state: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inputs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_artifact_data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_artifact_metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_artifact_paths: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_outputs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_results: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_operation: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overlays: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_invocation_id: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_catalog: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_catalog_hint: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_invocation: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valid_next_events: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_item: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow: Option<serde_json::Value>,
+}
+
 pub fn authorization_execution_context(context: &serde_json::Value) -> serde_json::Value {
-    let mut context = context.clone();
-    if let Some(object) = context.as_object_mut() {
-        object.remove(CONTEXT_AUTHORIZATION_ID_KEY);
-        object.remove(CONTEXT_REQUEST_DIGEST_KEY);
-        object.remove(CONTEXT_AUTHORIZATION_REQUEST_KEY);
-        object.remove("proposed_authorization_epoch");
-        object.remove("authorization_pending");
-        object.remove("authorization_recovery_required");
-        for key in [
-            "task_adapter",
-            "human_gate",
-            "human_gate_state",
-            "state_entered_at",
-            "state_entered_for",
-            "last_failure_reason",
-            "required_action_description",
-            "provider_ownership",
-            "task_human_gate_state",
-            "authorization_epoch_id",
-            "used_state_invocations",
-        ] {
-            object.remove(key);
-        }
-    }
-    canonical_json(context)
+    let field = |key: &str| context.get(key).cloned();
+    let allowlisted = AuthorizationExecutionContextV1 {
+        approval_mode: field("approval_mode"),
+        canonical_runtime_spec: field(CONTEXT_RUNTIME_SPEC_KEY),
+        environment: field("environment"),
+        environment_base: field("environment_base"),
+        environment_runtime: field("environment_runtime"),
+        github_pr_state: field("github_pr_state"),
+        inputs: field("inputs"),
+        job_artifact_data: field("job_artifact_data"),
+        job_artifact_metadata: field("job_artifact_metadata"),
+        job_artifact_paths: field("job_artifact_paths"),
+        job_outputs: field("job_outputs"),
+        job_results: field("job_results"),
+        managed_operation: field("managed_operation"),
+        overlays: field("overlays"),
+        parent_invocation_id: field("parent_invocation_id"),
+        repo_catalog: field("repo_catalog"),
+        repo_catalog_hint: field("repo_catalog_hint"),
+        state_invocation: field("state_invocation"),
+        valid_next_events: field("valid_next_events"),
+        work_item: field("work_item"),
+        workflow: field("workflow"),
+    };
+    canonical_json(serde_json::to_value(allowlisted).expect("allowlisted context is serializable"))
 }
 
 fn normalize_runtime_for_authorization(runtime: &mut CanonicalRuntimeSpec) {
@@ -2491,6 +4012,7 @@ fn normalize_runtime_for_authorization(runtime: &mut CanonicalRuntimeSpec) {
             &left.base_ref,
             left.read_only,
             &left.target_branch,
+            &left.claim_type,
             &left.branch_name,
         )
             .cmp(&(
@@ -2498,6 +4020,7 @@ fn normalize_runtime_for_authorization(runtime: &mut CanonicalRuntimeSpec) {
                 &right.base_ref,
                 right.read_only,
                 &right.target_branch,
+                &right.claim_type,
                 &right.branch_name,
             ))
     });
@@ -2511,6 +4034,7 @@ fn normalize_runtime_for_authorization(runtime: &mut CanonicalRuntimeSpec) {
             &left.host,
             &left.api_base_url,
             &left.repository,
+            &left.operations,
             &left.branch,
             &left.head_branch,
             &left.base_branch,
@@ -2522,6 +4046,7 @@ fn normalize_runtime_for_authorization(runtime: &mut CanonicalRuntimeSpec) {
                 &right.host,
                 &right.api_base_url,
                 &right.repository,
+                &right.operations,
                 &right.branch,
                 &right.head_branch,
                 &right.base_branch,
@@ -2992,6 +4517,8 @@ pub fn planned_agent_job_view_from_prototype(job: &Job) -> PlannedAgentJobView {
         state_key: job.step_id.clone(),
         prototype_state: job.state.clone(),
         assigned_worker_id: job.assigned_worker_id.clone(),
+        assigned_worker_session_id: job.assigned_worker_session_id,
+        assigned_worker_session_generation: job.assigned_worker_session_generation,
         environment: runtime.environment,
         permission_set: runtime.permissions,
         repo_claim: job.repo.as_ref().map(PlannedRepoClaim::from),
@@ -3255,6 +4782,8 @@ kind = "terminal"
             step_id: "s1".into(),
             state: JobState::Pending,
             assigned_worker_id: None,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
             execution_mode: ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
@@ -3262,6 +4791,7 @@ kind = "terminal"
             env: HashMap::new(),
             prompt: None,
             context: serde_json::json!({}),
+            canonical_authorization: None,
             repo: None,
             timeout_secs: Some(5),
             max_retries: 0,
@@ -4175,6 +5705,8 @@ kind = "terminal"
             step_id: "build".into(),
             state: JobState::Running,
             assigned_worker_id: Some("w1".into()),
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
             execution_mode: ExecutionMode::Docker,
             container_image: Some("alpine:3.20".into()),
             command: "echo".into(),
@@ -4182,6 +5714,7 @@ kind = "terminal"
             env: HashMap::new(),
             prompt: None,
             context: serde_json::json!({}),
+            canonical_authorization: None,
             repo: work_item.repo.clone(),
             timeout_secs: Some(30),
             max_retries: 1,

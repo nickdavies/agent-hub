@@ -17,9 +17,14 @@ message RegisterWorkerRequest {
   string worker_id = 1;
   string hostname = 2;
   repeated ExecutionMode supported_modes = 3;
+  repeated WorkerProtocolCapability protocol_capabilities = 4;
 }
 
-message RegisterWorkerResponse {}
+message RegisterWorkerResponse {
+  string session_id = 1;
+  string session_token = 2;
+  uint64 session_generation = 3;
+}
 
 message HeartbeatWorkerRequest {
   string worker_id = 1;
@@ -86,6 +91,11 @@ enum WorkerState {
   IDLE = 1;
   BUSY = 2;
   OFFLINE = 3;
+}
+
+enum WorkerProtocolCapability {
+  WORKER_PROTOCOL_CAPABILITY_UNSPECIFIED = 0;
+  CANONICAL_AUTHORIZATION_V1 = 1;
 }
 
 enum ExecutionOutcome {
@@ -194,4 +204,10 @@ message Job {
   optional google.protobuf.Timestamp lease_expires_at = 19;
   google.protobuf.Timestamp created_at = 20;
   google.protobuf.Timestamp updated_at = 21;
+  bytes context_json = 22;
+  bytes canonical_authorization = 23;
+  uint32 canonical_authorization_version = 24;
+  string canonical_authorization_digest = 25;
+  string assigned_worker_session_id = 26;
+  uint64 assigned_worker_session_generation = 27;
 }

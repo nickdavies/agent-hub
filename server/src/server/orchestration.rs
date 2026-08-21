@@ -11,18 +11,19 @@ use protocol::{
     CreateWorkItemRequest, EnvironmentDefinition, EnvironmentOverlay, EnvironmentSelection,
     EventSource, FireEventRequest, HeartbeatRequest, Job, JobState, JobUpdateRequest,
     NetworkResourceRequest, PollJobRequest, PollJobResponse, ProviderIdentity, ProviderOwnership,
-    ReactiveTerminalOutcome, RegisterWorkerRequest, RepoSource, ResolvedAuthorizationBehavior,
-    ResolvedAuthorizationProvider, ResolvedAuthorizationRequest, ResolvedAuthorizationResources,
-    WorkItem, WorkItemState, WorkerInfo, WorkerState, WorkflowEvent, WorkflowEventKind,
-    WorkflowEventPayload, canonical_environment_for_execution,
-    canonical_permissions_for_environment, canonical_runtime_spec_for_job,
-    canonical_runtime_spec_for_job_effective, default_approval_rules_for_tier,
-    project_authorization_request_into_job_context, project_runtime_spec_into_job_context,
-    validate_agent_output_next_event, workflow_event_is_externally_fireable,
+    ReactiveTerminalOutcome, RegisterWorkerRequest, RegisterWorkerResponse, RepoSource,
+    ResolvedAuthorizationBehavior, ResolvedAuthorizationProvider, ResolvedAuthorizationRequest,
+    ResolvedAuthorizationResources, WorkItem, WorkItemState, WorkerInfo, WorkerSessionCredential,
+    WorkerState, WorkflowEvent, WorkflowEventKind, WorkflowEventPayload,
+    canonical_environment_for_execution, canonical_permissions_for_environment,
+    canonical_runtime_spec_for_job, canonical_runtime_spec_for_job_effective,
+    default_approval_rules_for_tier, project_authorization_bundle_into_job_context,
+    project_runtime_spec_into_job_context, validate_agent_output_next_event,
+    workflow_event_is_externally_fireable,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell};
 use uuid::Uuid;
 
 mod context;
@@ -68,14 +69,231 @@ use storage::{
     ProviderActionCommitOutcome, ProviderActionJobInsert, ProviderActionObligationApproval,
     ProviderActionRevisionUpdate, ProviderActionTerminalState, column_exists,
     commit_ordinary_authorized_job, commit_provider_action, invalid_enum, invalid_json,
-    migrate_provider_action_inbox_schema, parse_datetime, row_to_job, row_to_work_item,
-    stage_authorization_obligation, verify_job_authorization,
+    migrate_canonical_authorization_bytes, migrate_provider_action_inbox_schema, parse_datetime,
+    row_to_job, row_to_work_item, stage_authorization_obligation, verify_job_authorization,
 };
 
 const LEASE_TTL_SECS: i64 = 120;
 const STALE_WORKER_SECS: u64 = 90;
 const WRITE_BACK_BASE_RETRY_SECS: i64 = 30;
 const WRITE_BACK_MAX_RETRY_SECS: i64 = 30 * 60;
+const WORKER_SESSION_HASH_DOMAIN: &[u8] = b"agent-hub:worker-session:v1\0";
+
+#[derive(Debug)]
+struct WorkerSessionAuthFailure(&'static str);
+
+impl std::fmt::Display for WorkerSessionAuthFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for WorkerSessionAuthFailure {}
+
+fn new_worker_session_token() -> std::io::Result<protocol::Secret> {
+    use std::io::Read;
+
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(protocol::Secret::new(hex::encode(bytes)))
+}
+
+fn worker_session_hash(token: &protocol::Secret) -> Vec<u8> {
+    let mut digest = Sha256::new();
+    digest.update(WORKER_SESSION_HASH_DOMAIN);
+    digest.update(token.expose().as_bytes());
+    digest.finalize().to_vec()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn worker_recovery_result_json(reason: &str, now: DateTime<Utc>) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "outcome":"failed",
+        "termination_reason":"worker_error",
+        "exit_code":null,
+        "timing":{"started_at":now,"finished_at":now,"duration_ms":0},
+        "artifacts":{
+            "stdout_path":"",
+            "stderr_path":"",
+            "output_path":null,
+            "transcript_dir":null,
+            "stdout_bytes":null,
+            "stderr_bytes":null,
+            "output_bytes":null,
+            "structured_transcript_artifacts":[]
+        },
+        "output_json":null,
+        "repo":null,
+        "github_pr":null,
+        "error_message":reason
+    }))?)
+}
+
+fn worker_session_recovery_id(
+    session_id: &str,
+    generation: u64,
+    job_id: &str,
+    work_item_id: &str,
+    checkpoint_owner_id: &str,
+    reason: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"agent-hub:worker-session-recovery:v1\0");
+    let generation = generation.to_string();
+    for value in [
+        session_id,
+        generation.as_str(),
+        job_id,
+        work_item_id,
+        checkpoint_owner_id,
+        reason,
+    ] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    hex::encode(digest.finalize())
+}
+
+fn migrate_worker_assignment_sessions(conn: &Connection) -> anyhow::Result<()> {
+    let migrated = conn
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE name = 'worker_assignment_sessions_v1'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if migrated {
+        return Ok(());
+    }
+    let now = Utc::now();
+    conn.execute(
+        "UPDATE jobs SET state = 'pending', assigned_worker_id = NULL,
+            assigned_worker_session_id = NULL, assigned_worker_session_generation = NULL,
+            lease_expires_at = NULL, updated_at = ?1
+         WHERE state = 'assigned'
+           AND (assigned_worker_session_id IS NULL OR assigned_worker_session_generation IS NULL)",
+        [now.to_rfc3339()],
+    )?;
+    let legacy_running = {
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, checkpoint_owner_id FROM jobs WHERE state = 'running'
+             AND (assigned_worker_session_id IS NULL OR assigned_worker_session_generation IS NULL)",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let result = worker_recovery_result_json("legacy_assignment_session_migration", now)?;
+    for (job_id, work_item_id, checkpoint_owner_id) in legacy_running {
+        let recovery_id = worker_session_recovery_id(
+            "legacy-null-session",
+            0,
+            &job_id,
+            &work_item_id,
+            &checkpoint_owner_id,
+            "legacy_assignment_session_migration",
+        );
+        conn.execute(
+            "UPDATE jobs SET state = 'failed', lease_expires_at = NULL,
+                result_json = ?2, updated_at = ?3 WHERE id = ?1 AND state = 'running'",
+            params![job_id, result, now.to_rfc3339()],
+        )?;
+        conn.execute(
+            "INSERT INTO worker_session_recovery_inbox (
+                job_id, recovery_id, work_item_id, checkpoint_owner_id,
+                source_session_id, source_session_generation, reason,
+                state, attempts, next_attempt_at, last_error, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'legacy-null-session', 0,
+                'legacy_assignment_session_migration', 'pending', 0, ?5, NULL, ?5)
+             ON CONFLICT(job_id) DO NOTHING",
+            params![
+                job_id,
+                recovery_id,
+                work_item_id,
+                checkpoint_owner_id,
+                now.to_rfc3339()
+            ],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO schema_migrations (name, applied_at)
+         VALUES ('worker_assignment_sessions_v1', ?1)",
+        [now.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn verify_worker_session_in_connection(
+    conn: &Connection,
+    worker_id: &str,
+    credential: &WorkerSessionCredential,
+) -> anyhow::Result<WorkerInfo> {
+    let stored = conn
+        .query_row(
+            "SELECT hostname, state, supported_modes_json, protocol_capabilities_json,
+                    session_id, session_token_hash, session_generation, last_heartbeat_at
+             FROM workers WHERE id = ?1",
+            [worker_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        hostname,
+        state,
+        supported_modes,
+        protocol_capabilities,
+        Some(session_id),
+        Some(token_hash),
+        session_generation,
+        last_heartbeat_at,
+    )) = stored
+    else {
+        anyhow::bail!("invalid or expired worker session");
+    };
+    if session_id != credential.session_id.to_string()
+        || !constant_time_eq(&token_hash, &worker_session_hash(&credential.session_token))
+    {
+        anyhow::bail!("invalid or expired worker session");
+    }
+    Ok(WorkerInfo {
+        id: worker_id.to_string(),
+        hostname,
+        state: state.parse().map_err(invalid_enum)?,
+        supported_modes: serde_json::from_str(&supported_modes)?,
+        protocol_capabilities: serde_json::from_str(&protocol_capabilities)?,
+        session_id: Some(credential.session_id),
+        session_generation,
+        last_heartbeat_at: parse_datetime(&last_heartbeat_at)?,
+    })
+}
 
 #[derive(Debug)]
 enum JobTransitionError {
@@ -478,6 +696,7 @@ pub struct OrchestrationService {
     checkpoint_locks: Arc<Mutex<HashMap<Uuid, Weak<Mutex<()>>>>>,
     checkpoint_recovery_once: Arc<OnceCell<()>>,
     writer_guard: Arc<OnceCell<std::fs::File>>,
+    worker_recovery_notify: Arc<Notify>,
 }
 
 impl OrchestrationService {
@@ -566,6 +785,7 @@ impl OrchestrationService {
             checkpoint_locks: Arc::new(Mutex::new(HashMap::new())),
             checkpoint_recovery_once: Arc::new(OnceCell::new()),
             writer_guard: Arc::new(OnceCell::new()),
+            worker_recovery_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -859,6 +1079,8 @@ impl OrchestrationService {
                         step_id TEXT NOT NULL,
                         state TEXT NOT NULL,
                         assigned_worker_id TEXT,
+                        assigned_worker_session_id TEXT,
+                        assigned_worker_session_generation INTEGER,
                         execution_mode TEXT NOT NULL,
                         container_image TEXT,
                         command TEXT NOT NULL,
@@ -875,6 +1097,9 @@ impl OrchestrationService {
                         checkpoint_owner_id TEXT NOT NULL,
                         authorization_id TEXT,
                         request_digest TEXT,
+                        canonical_authorization_version INTEGER,
+                        canonical_authorization_digest TEXT,
+                        canonical_authorization_bytes BLOB,
                         dispatch_released INTEGER NOT NULL DEFAULT 0,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
@@ -887,6 +1112,8 @@ impl OrchestrationService {
                         request_digest TEXT NOT NULL,
                         invocation_id TEXT NOT NULL,
                         request_json TEXT NOT NULL,
+                        canonical_authorization_version INTEGER,
+                        canonical_authorization_bytes BLOB,
                         created_at TEXT NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS authorization_baselines (
@@ -906,6 +1133,8 @@ impl OrchestrationService {
                         request_digest TEXT NOT NULL,
                         request_json TEXT NOT NULL,
                         job_json TEXT NOT NULL,
+                        canonical_authorization_version INTEGER,
+                        canonical_authorization_bytes BLOB,
                         state TEXT NOT NULL,
                         authorization_id TEXT,
                         approved_human_json TEXT,
@@ -968,12 +1197,84 @@ impl OrchestrationService {
                         hostname TEXT NOT NULL,
                         state TEXT NOT NULL,
                         supported_modes_json TEXT NOT NULL,
+                        protocol_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                        session_id TEXT,
+                        session_token_hash BLOB,
+                        session_generation INTEGER NOT NULL DEFAULT 0,
                         last_heartbeat_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS worker_event_receipts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_id TEXT NOT NULL,
+                        worker_id TEXT NOT NULL,
+                        worker_session_id TEXT NOT NULL,
+                        worker_session_generation INTEGER NOT NULL,
+                        event_at TEXT NOT NULL,
+                        event_kind TEXT NOT NULL,
+                        stream TEXT,
+                        message TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS worker_session_recovery_inbox (
+                        job_id TEXT PRIMARY KEY,
+                        recovery_id TEXT NOT NULL UNIQUE,
+                        work_item_id TEXT NOT NULL,
+                        checkpoint_owner_id TEXT NOT NULL,
+                        source_session_id TEXT NOT NULL,
+                        source_session_generation INTEGER NOT NULL,
+                        reason TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        next_attempt_at TEXT NOT NULL,
+                        last_error TEXT,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS worker_session_recovery_applied (
+                        recovery_id TEXT PRIMARY KEY,
+                        job_id TEXT NOT NULL,
+                        outcome_json TEXT NOT NULL,
+                        applied_at TEXT NOT NULL
                     );
                     "#,
                     )?;
                     if !column_exists(conn, DbTable::Jobs, "container_image")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN container_image TEXT", [])?;
+                    }
+                    if !column_exists(conn, DbTable::Jobs, "assigned_worker_session_id")? {
+                        conn.execute(
+                            "ALTER TABLE jobs ADD COLUMN assigned_worker_session_id TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(
+                        conn,
+                        DbTable::Jobs,
+                        "assigned_worker_session_generation",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE jobs ADD COLUMN assigned_worker_session_generation INTEGER",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(conn, DbTable::Workers, "protocol_capabilities_json")? {
+                        conn.execute(
+                            "ALTER TABLE workers ADD COLUMN protocol_capabilities_json TEXT NOT NULL DEFAULT '[]'",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(conn, DbTable::Workers, "session_id")? {
+                        conn.execute("ALTER TABLE workers ADD COLUMN session_id TEXT", [])?;
+                    }
+                    if !column_exists(conn, DbTable::Workers, "session_token_hash")? {
+                        conn.execute(
+                            "ALTER TABLE workers ADD COLUMN session_token_hash BLOB",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(conn, DbTable::Workers, "session_generation")? {
+                        conn.execute(
+                            "ALTER TABLE workers ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0",
+                            [],
+                        )?;
                     }
                     if !column_exists(
                         conn,
@@ -1064,6 +1365,64 @@ impl OrchestrationService {
                     }
                     if !column_exists(conn, DbTable::Jobs, "request_digest")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN request_digest TEXT", [])?;
+                    }
+                    if !column_exists(conn, DbTable::Jobs, "canonical_authorization_version")? {
+                        conn.execute(
+                            "ALTER TABLE jobs ADD COLUMN canonical_authorization_version INTEGER",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(conn, DbTable::Jobs, "canonical_authorization_digest")? {
+                        conn.execute(
+                            "ALTER TABLE jobs ADD COLUMN canonical_authorization_digest TEXT",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(conn, DbTable::Jobs, "canonical_authorization_bytes")? {
+                        conn.execute(
+                            "ALTER TABLE jobs ADD COLUMN canonical_authorization_bytes BLOB",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(
+                        conn,
+                        DbTable::AuthorizationRecords,
+                        "canonical_authorization_version",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE authorization_records ADD COLUMN canonical_authorization_version INTEGER",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(
+                        conn,
+                        DbTable::AuthorizationRecords,
+                        "canonical_authorization_bytes",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE authorization_records ADD COLUMN canonical_authorization_bytes BLOB",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(
+                        conn,
+                        DbTable::AuthorizationObligations,
+                        "canonical_authorization_version",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE authorization_obligations ADD COLUMN canonical_authorization_version INTEGER",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(
+                        conn,
+                        DbTable::AuthorizationObligations,
+                        "canonical_authorization_bytes",
+                    )? {
+                        conn.execute(
+                            "ALTER TABLE authorization_obligations ADD COLUMN canonical_authorization_bytes BLOB",
+                            [],
+                        )?;
                     }
                     if !column_exists(
                         conn,
@@ -1439,7 +1798,7 @@ impl OrchestrationService {
                     if migrate_authorization {
                         let active_jobs = {
                             let mut stmt = conn.prepare(
-                                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE state IN (?1, ?2, ?3)",
+                                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE state IN (?1, ?2, ?3)",
                             )?;
                             let rows = stmt.query_map(
                                 params![
@@ -1523,7 +1882,9 @@ impl OrchestrationService {
                             [Utc::now().to_rfc3339()],
                         )?;
                     }
+                    migrate_worker_assignment_sessions(conn)?;
                     transaction.commit()?;
+                    migrate_canonical_authorization_bytes(&mut database)?;
                     Ok(())
                 })
                 .await??;
@@ -1603,37 +1964,353 @@ impl OrchestrationService {
             .map_err(map_db)
     }
 
-    pub async fn register_worker(
+    pub async fn register_worker_session(
         &self,
-        req: RegisterWorkerRequest,
-    ) -> Result<WorkerInfo, AppError> {
+        mut req: RegisterWorkerRequest,
+        replacement: Option<WorkerSessionCredential>,
+    ) -> Result<RegisterWorkerResponse, AppError> {
         self.ensure_ready().await?;
+        req.supported_modes.sort_by_key(ToString::to_string);
+        req.supported_modes.dedup();
+        req.protocol_capabilities.sort();
+        req.protocol_capabilities.dedup();
+        let session_id = Uuid::new_v4();
+        let session_token = new_worker_session_token()
+            .map_err(|error| AppError::Config(format!("worker session CSPRNG failed: {error}")))?;
+        let token_hash = worker_session_hash(&session_token);
+        let path = Arc::clone(&self.db_path);
+        let worker_id = req.id.clone();
+        let hostname = req.hostname.clone();
+        let supported_modes = req.supported_modes.clone();
+        let protocol_capabilities = req.protocol_capabilities.clone();
+        let replacement = replacement.clone();
+        let now = Utc::now();
+        let (session_generation, replaced_running_jobs) = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, Vec<Uuid>)> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = tx
+                .query_row(
+                    "SELECT session_id, session_token_hash, session_generation, last_heartbeat_at FROM workers WHERE id = ?1",
+                    [&worker_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                            row.get::<_, u64>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let mut previous_session = None;
+            let generation = if let Some((existing_id, existing_hash, generation, last_heartbeat)) = existing {
+                if let (Some(existing_id), Some(existing_hash)) = (existing_id, existing_hash) {
+                    if let Some(replacement) = replacement.as_ref() {
+                        if replacement.session_id.to_string() != existing_id
+                            || !constant_time_eq(
+                                &existing_hash,
+                                &worker_session_hash(&replacement.session_token),
+                            )
+                        {
+                            return Err(WorkerSessionAuthFailure(
+                                "worker session replacement credential is invalid",
+                            )
+                            .into());
+                        }
+                    } else {
+                        let last_heartbeat = parse_datetime(&last_heartbeat)?;
+                        let stale_before = now
+                            - chrono::TimeDelta::seconds(
+                                i64::try_from(STALE_WORKER_SECS).unwrap_or(i64::MAX),
+                            );
+                        if last_heartbeat >= stale_before {
+                            return Err(WorkerSessionAuthFailure(
+                                "active worker session replacement requires current credential",
+                            )
+                            .into());
+                        }
+                    }
+                    previous_session = Some((existing_id, generation));
+                }
+                generation.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("worker session generation overflow")
+                })?
+            } else {
+                1
+            };
+            let mut replaced_running_jobs = Vec::new();
+            if let Some((previous_session_id, previous_generation)) = previous_session {
+                let assigned_jobs = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id, state, work_item_id, checkpoint_owner_id FROM jobs
+                         WHERE assigned_worker_id = ?1
+                           AND assigned_worker_session_id = ?2
+                           AND assigned_worker_session_generation = ?3
+                           AND state IN ('assigned', 'running')",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![worker_id, previous_session_id, previous_generation],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for (job_id, state, work_item_id, checkpoint_owner_id) in assigned_jobs {
+                    if state == JobState::Assigned.to_string() {
+                        tx.execute(
+                            "UPDATE jobs SET state = 'pending', assigned_worker_id = NULL,
+                                assigned_worker_session_id = NULL,
+                                assigned_worker_session_generation = NULL,
+                                lease_expires_at = NULL, updated_at = ?2
+                             WHERE id = ?1 AND state = 'assigned'
+                               AND assigned_worker_session_id = ?3
+                               AND assigned_worker_session_generation = ?4",
+                            params![job_id, now.to_rfc3339(), previous_session_id, previous_generation],
+                        )?;
+                    } else {
+                        let started = now;
+                        let result = serde_json::json!({
+                            "outcome":"failed",
+                            "termination_reason":"worker_error",
+                            "exit_code":null,
+                            "timing":{"started_at":started,"finished_at":now,"duration_ms":0},
+                            "artifacts":{
+                                "stdout_path":"",
+                                "stderr_path":"",
+                                "output_path":null,
+                                "transcript_dir":null,
+                                "stdout_bytes":null,
+                                "stderr_bytes":null,
+                                "output_bytes":null,
+                                "structured_transcript_artifacts":[]
+                            },
+                            "output_json":null,
+                            "repo":null,
+                            "github_pr":null,
+                            "error_message":"worker_session_replaced"
+                        });
+                        tx.execute(
+                            "UPDATE jobs SET state = 'failed', lease_expires_at = NULL,
+                                result_json = ?2, updated_at = ?3
+                             WHERE id = ?1 AND state = 'running'
+                               AND assigned_worker_session_id = ?4
+                               AND assigned_worker_session_generation = ?5",
+                            params![job_id, serde_json::to_string(&result)?, now.to_rfc3339(), previous_session_id, previous_generation],
+                        )?;
+                        replaced_running_jobs.push(Uuid::parse_str(&job_id)?);
+                        let recovery_id = worker_session_recovery_id(
+                            &previous_session_id,
+                            previous_generation,
+                            &job_id,
+                            &work_item_id,
+                            &checkpoint_owner_id,
+                            "worker_session_replaced",
+                        );
+                        tx.execute(
+                            "INSERT INTO worker_session_recovery_inbox (
+                                job_id, recovery_id, work_item_id, checkpoint_owner_id,
+                                source_session_id, source_session_generation, reason,
+                                state, attempts, next_attempt_at, last_error, updated_at
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                                'worker_session_replaced', 'pending', 0, ?7, NULL, ?7)
+                             ON CONFLICT(job_id) DO NOTHING",
+                            params![job_id, recovery_id, work_item_id, checkpoint_owner_id, previous_session_id, previous_generation, now.to_rfc3339()],
+                        )?;
+                    }
+                    tx.execute(
+                        "INSERT INTO worker_event_receipts (
+                            job_id, worker_id, worker_session_id, worker_session_generation,
+                            event_at, event_kind, stream, message
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'system', NULL, 'worker_session_replaced')",
+                        params![job_id, worker_id, previous_session_id, previous_generation, now.to_rfc3339()],
+                    )?;
+                }
+            }
+            tx.execute(
+                "INSERT INTO workers (
+                    id, hostname, state, supported_modes_json, protocol_capabilities_json,
+                    session_id, session_token_hash, session_generation, last_heartbeat_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    hostname = excluded.hostname,
+                    state = excluded.state,
+                    supported_modes_json = excluded.supported_modes_json,
+                    protocol_capabilities_json = excluded.protocol_capabilities_json,
+                    session_id = excluded.session_id,
+                    session_token_hash = excluded.session_token_hash,
+                    session_generation = excluded.session_generation,
+                    last_heartbeat_at = excluded.last_heartbeat_at",
+                params![
+                    worker_id,
+                    hostname,
+                    WorkerState::Idle.to_string(),
+                    serde_json::to_string(&supported_modes)?,
+                    serde_json::to_string(&protocol_capabilities)?,
+                    session_id.to_string(),
+                    token_hash,
+                    generation,
+                    now.to_rfc3339(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok((generation, replaced_running_jobs))
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(|error| {
+            if error.downcast_ref::<WorkerSessionAuthFailure>().is_some() {
+                AppError::WorkerSessionUnauthorized(error.to_string())
+            } else {
+                AppError::Config(format!("worker session registration failed: {error}"))
+            }
+        })?;
+        let _ = replaced_running_jobs;
+        self.worker_recovery_notify.notify_one();
         let worker = WorkerInfo {
             id: req.id,
             hostname: req.hostname,
             state: WorkerState::Idle,
             supported_modes: req.supported_modes,
-            last_heartbeat_at: Utc::now(),
+            protocol_capabilities: req.protocol_capabilities,
+            session_id: Some(session_id),
+            session_generation,
+            last_heartbeat_at: now,
         };
-        self.upsert_worker(&worker).await.map_err(map_db)?;
-        Ok(worker)
+        Ok(RegisterWorkerResponse {
+            worker,
+            session_id,
+            session_token,
+            session_generation,
+        })
     }
 
-    pub async fn heartbeat(
+    #[cfg(test)]
+    async fn register_worker(&self, req: RegisterWorkerRequest) -> Result<WorkerInfo, AppError> {
+        self.register_worker_session(req, None)
+            .await
+            .map(|response| response.worker)
+    }
+
+    pub(crate) async fn verify_worker_session(
+        &self,
+        worker_id: &str,
+        credential: &WorkerSessionCredential,
+    ) -> Result<(), AppError> {
+        let path = Arc::clone(&self.db_path);
+        let worker_id = worker_id.to_string();
+        let credential = credential.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            verify_worker_session_in_connection(&conn, &worker_id, &credential)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(|_| {
+            AppError::WorkerSessionUnauthorized("invalid or expired worker session".to_string())
+        })
+    }
+
+    pub(crate) async fn record_worker_event_authenticated(
+        &self,
+        credential: WorkerSessionCredential,
+        event: &protocol::JobEvent,
+    ) -> Result<(), AppError> {
+        let path = Arc::clone(&self.db_path);
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let worker = verify_worker_session_in_connection(&tx, &event.worker_id, &credential)?;
+            let assignment = tx
+                .query_row(
+                    "SELECT assigned_worker_id, assigned_worker_session_id,
+                            assigned_worker_session_generation, state
+                     FROM jobs WHERE id = ?1",
+                    [event.job_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<u64>>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("event job is missing"))?;
+            let session_id = credential.session_id.to_string();
+            if assignment.0.as_deref() != Some(event.worker_id.as_str())
+                || assignment.1.as_deref() != Some(session_id.as_str())
+                || assignment.2 != Some(worker.session_generation)
+                || !matches!(assignment.3.as_str(), "assigned" | "running")
+            {
+                anyhow::bail!("worker session does not own event job");
+            }
+            tx.execute(
+                "INSERT INTO worker_event_receipts (
+                    job_id, worker_id, worker_session_id, worker_session_generation,
+                    event_at, event_kind, stream, message
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    event.job_id.to_string(),
+                    event.worker_id,
+                    worker.session_id.map(|value| value.to_string()),
+                    worker.session_generation,
+                    event.at.to_rfc3339(),
+                    format!("{:?}", event.kind).to_ascii_lowercase(),
+                    event.stream,
+                    event.message,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(|error| AppError::WorkerSessionUnauthorized(error.to_string()))
+    }
+
+    pub async fn heartbeat_authenticated(
         &self,
         worker_id: String,
+        credential: WorkerSessionCredential,
         req: HeartbeatRequest,
     ) -> Result<WorkerInfo, AppError> {
         self.ensure_ready().await?;
-        let mut worker = self
-            .get_worker(&worker_id)
-            .await
-            .map_err(map_db)?
-            .ok_or_else(|| AppError::WorkerNotFound(worker_id.clone()))?;
-        worker.state = req.state;
-        worker.last_heartbeat_at = Utc::now();
-        self.upsert_worker(&worker).await.map_err(map_db)?;
-        Ok(worker)
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<WorkerInfo> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut worker = verify_worker_session_in_connection(&tx, &worker_id, &credential)?;
+            worker.state = req.state;
+            worker.last_heartbeat_at = Utc::now();
+            let changed = tx.execute(
+                "UPDATE workers SET state = ?2, last_heartbeat_at = ?3
+                 WHERE id = ?1 AND session_id = ?4 AND session_generation = ?5",
+                params![
+                    worker.id,
+                    worker.state.to_string(),
+                    worker.last_heartbeat_at.to_rfc3339(),
+                    credential.session_id.to_string(),
+                    worker.session_generation,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("worker session changed during heartbeat");
+            }
+            tx.commit()?;
+            Ok(worker)
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(|error| AppError::WorkerSessionUnauthorized(error.to_string()))
     }
 
     pub async fn list_workers(&self) -> Result<Vec<WorkerInfo>, AppError> {
@@ -1678,6 +2355,7 @@ impl OrchestrationService {
         self.select_triage_work_items(limit).await.map_err(map_db)
     }
 
+    #[cfg(test)]
     pub async fn poll_job(&self, req: PollJobRequest) -> Result<PollJobResponse, AppError> {
         self.ensure_ready().await?;
         self.reconcile_stale_workers(Duration::from_secs(STALE_WORKER_SECS))
@@ -1688,8 +2366,23 @@ impl OrchestrationService {
             .map_err(map_db)?
             .ok_or_else(|| AppError::WorkerNotFound(req.worker_id.clone()))?;
 
+        if !worker
+            .protocol_capabilities
+            .contains(&protocol::WorkerProtocolCapability::CanonicalAuthorizationV1)
+        {
+            worker.state = WorkerState::Idle;
+            worker.last_heartbeat_at = Utc::now();
+            self.upsert_worker(&worker).await.map_err(map_db)?;
+            return Ok(PollJobResponse { job: None });
+        }
+
         if let Some(job) = self
-            .assign_next_job(req.worker_id.clone(), worker.supported_modes.clone())
+            .assign_next_job(
+                req.worker_id.clone(),
+                worker.supported_modes.clone(),
+                worker.protocol_capabilities.clone(),
+                None,
+            )
             .await
             .map_err(map_db)?
         {
@@ -1705,6 +2398,22 @@ impl OrchestrationService {
         Ok(PollJobResponse { job: None })
     }
 
+    pub async fn poll_job_authenticated(
+        &self,
+        credential: WorkerSessionCredential,
+        req: PollJobRequest,
+    ) -> Result<PollJobResponse, AppError> {
+        self.ensure_ready().await?;
+        self.reconcile_stale_workers(Duration::from_secs(STALE_WORKER_SECS))
+            .await?;
+        let job = self
+            .assign_next_job(req.worker_id, Vec::new(), Vec::new(), Some(credential))
+            .await
+            .map_err(|error| AppError::WorkerSessionUnauthorized(error.to_string()))?;
+        Ok(PollJobResponse { job })
+    }
+
+    #[cfg(test)]
     pub async fn update_job(&self, job_id: Uuid, req: JobUpdateRequest) -> Result<Job, AppError> {
         self.ensure_ready().await?;
         let mut job = self
@@ -1716,7 +2425,7 @@ impl OrchestrationService {
         let authorization_job = job.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = Connection::open(path.as_path())?;
-            verify_job_authorization(&conn, &authorization_job)
+            verify_job_authorization(&conn, &authorization_job).map(|_| ())
         })
         .await
         .map_err(|error| {
@@ -1778,6 +2487,129 @@ impl OrchestrationService {
             }
         }
 
+        Ok(job)
+    }
+
+    pub async fn update_job_authenticated(
+        &self,
+        job_id: Uuid,
+        credential: WorkerSessionCredential,
+        req: JobUpdateRequest,
+    ) -> Result<Job, AppError> {
+        self.ensure_ready().await?;
+        let path = Arc::clone(&self.db_path);
+        let worker_id = req.worker_id.clone();
+        let requested_state = req.state.clone();
+        let job = tokio::task::spawn_blocking(move || -> anyhow::Result<Job> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let worker = verify_worker_session_in_connection(&tx, &worker_id, &credential)?;
+            let mut job = tx
+                .query_row(
+                    "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE id = ?1",
+                    [job_id.to_string()],
+                    row_to_job,
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+            verify_job_authorization(&tx, &job)?;
+            if job.assigned_worker_id.as_deref() != Some(worker_id.as_str())
+                || job.assigned_worker_session_id != worker.session_id
+                || job.assigned_worker_session_generation != Some(worker.session_generation)
+            {
+                anyhow::bail!("worker session does not own job");
+            }
+            if job.state == JobState::Cancelled && requested_state != JobState::Cancelled {
+                anyhow::bail!("job already cancelled");
+            }
+            if job.state != requested_state {
+                validate_job_transition(job.state.clone(), requested_state.clone())
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            } else if !matches!(requested_state, JobState::Running | JobState::Cancelled) {
+                anyhow::bail!("duplicate terminal job update");
+            }
+            job.state = requested_state;
+            if job.state == JobState::Running {
+                job.lease_expires_at =
+                    Some(Utc::now() + chrono::TimeDelta::seconds(LEASE_TTL_SECS));
+            }
+            if let Some(dir) = req.transcript_dir {
+                job.transcript_dir = Some(dir);
+            }
+            if let Some(result) = req.result {
+                job.result = Some(result);
+            }
+            if matches!(
+                job.state,
+                JobState::Succeeded | JobState::Failed | JobState::Cancelled
+            ) {
+                job.lease_expires_at = None;
+            }
+            job.updated_at = Utc::now();
+            let changed = tx.execute(
+                "UPDATE jobs SET state = ?2, assigned_worker_id = ?3, transcript_dir = ?4,
+                    result_json = ?5, lease_expires_at = ?6, updated_at = ?7
+                 WHERE id = ?1 AND assigned_worker_id = ?8
+                   AND assigned_worker_session_id = ?9
+                   AND assigned_worker_session_generation = ?10",
+                params![
+                    job.id.to_string(),
+                    job.state.to_string(),
+                    job.assigned_worker_id,
+                    job.transcript_dir,
+                    job.result.as_ref().map(serde_json::to_string).transpose()?,
+                    job.lease_expires_at.map(|value| value.to_rfc3339()),
+                    job.updated_at.to_rfc3339(),
+                    worker_id,
+                    credential.session_id.to_string(),
+                    worker.session_generation,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("worker session changed during job update");
+            }
+            if matches!(
+                job.state,
+                JobState::Succeeded | JobState::Failed | JobState::Cancelled
+            ) {
+                let changed = tx.execute(
+                    "UPDATE workers SET state = ?2, last_heartbeat_at = ?3
+                     WHERE id = ?1 AND session_id = ?4 AND session_generation = ?5",
+                    params![
+                        worker_id,
+                        WorkerState::Idle.to_string(),
+                        Utc::now().to_rfc3339(),
+                        credential.session_id.to_string(),
+                        worker.session_generation,
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("worker session changed during terminal job update");
+                }
+            }
+            tx.commit()?;
+            Ok(job)
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("cancelled") {
+                AppError::JobCancelled(job_id.to_string())
+            } else if message.contains("session") || message.contains("own job") {
+                AppError::WorkerSessionUnauthorized(message)
+            } else if message.contains("job not found") {
+                AppError::JobNotFound(job_id.to_string())
+            } else {
+                AppError::WorkflowInvalid(message)
+            }
+        })?;
+        if matches!(
+            job.state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            self.advance_workflow_for_job(&job).await?;
+        }
         Ok(job)
     }
 
@@ -2339,6 +3171,7 @@ impl OrchestrationService {
             .reconcile_stale_workers(Duration::from_secs(STALE_WORKER_SECS))
             .await?;
         let lease_requeued = self.requeue_expired_leases().await.map_err(map_db)?;
+        self.process_worker_session_recovery_inbox().await?;
 
         let mut github_fired_events = 0usize;
         if let Some(poller) = &self.github_poller {
@@ -2453,6 +3286,10 @@ impl OrchestrationService {
             lease_requeued_jobs: lease_requeued,
             github_fired_events,
         })
+    }
+
+    pub(crate) fn worker_recovery_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.worker_recovery_notify)
     }
 
     /// Walk all active work items, fire `Timeout` for any human state
@@ -4059,36 +4896,23 @@ impl OrchestrationService {
         let path = Arc::clone(&self.db_path);
         let digest = pending.request_digest.clone();
         let item_id = pending.work_item_id;
-        let (job_json, request_json) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let (job_json, canonical_version, canonical_bytes) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let conn = Connection::open(path.as_path())?;
             conn.query_row(
-                "SELECT job_json, request_json FROM authorization_obligations WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3 AND state = 'pending'",
+                "SELECT job_json, canonical_authorization_version, canonical_authorization_bytes FROM authorization_obligations WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND request_digest = ?3 AND state = 'pending'",
                 params![
                     checkpoint_owner_id.to_string(),
                     item_id.to_string(),
                     digest,
                 ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, Vec<u8>>(2)?)),
             )
             .map_err(Into::into)
         })
         .await
         .map_err(|error| AppError::Config(error.to_string()))?
         .map_err(map_db)?;
-        let request: ResolvedAuthorizationRequest = serde_json::from_str(&request_json)
-            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
-        if request
-            .request_digest()
-            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?
-            != pending.request_digest
-            || serde_json::to_value(request.clone().normalize())
-                .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?
-                != pending.request
-        {
-            return Err(AppError::WorkflowInvalid(
-                "authorization obligation does not match checkpoint evidence".to_string(),
-            ));
-        }
         let job: Job = serde_json::from_str(&job_json)
             .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
         if self
@@ -4108,6 +4932,21 @@ impl OrchestrationService {
                 AppError::WorkflowInvalid("obligation job has no authorization id".to_string())
             })?
             .to_string();
+        let artifact = protocol::CanonicalAuthorizationArtifact {
+            version: canonical_version,
+            digest: pending.request_digest.clone(),
+            canonical_bytes,
+        };
+        let bundle = protocol::ImmutableAuthorizationBundle::verify(&artifact, &authorization_id)
+            .map_err(AppError::WorkflowInvalid)?;
+        if serde_json::to_value(&bundle.request)
+            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?
+            != pending.request
+        {
+            return Err(AppError::WorkflowInvalid(
+                "authorization obligation does not match checkpoint evidence".to_string(),
+            ));
+        }
         plan.obligation_approvals
             .push(ProviderActionObligationApproval {
                 checkpoint_owner_id,
@@ -4255,6 +5094,8 @@ impl OrchestrationService {
                 step_id: item.current_step.clone(),
                 state: JobState::Pending,
                 assigned_worker_id: None,
+                assigned_worker_session_id: None,
+                assigned_worker_session_generation: None,
                 execution_mode: protocol::ExecutionMode::Docker,
                 container_image: None,
                 command: String::new(),
@@ -4262,6 +5103,7 @@ impl OrchestrationService {
                 env: HashMap::new(),
                 prompt: Some(prompt),
                 context: item.context.clone(),
+                canonical_authorization: None,
                 repo: None,
                 timeout_secs: Some(900),
                 max_retries: 0,
@@ -4580,6 +5422,8 @@ impl OrchestrationService {
             step_id: state.id.clone(),
             state: JobState::Pending,
             assigned_worker_id: None,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
             execution_mode: protocol::ExecutionMode::Docker,
             container_image: execution.and_then(|config| config.container_image.clone()),
             command,
@@ -4587,6 +5431,7 @@ impl OrchestrationService {
             env,
             prompt,
             context: item.context.clone(),
+            canonical_authorization: None,
             repo: item.repo.clone(),
             timeout_secs: execution.and_then(|config| config.timeout_secs),
             max_retries: execution.map(|config| config.max_retries).unwrap_or(0),
@@ -4732,6 +5577,10 @@ impl OrchestrationService {
                 )
                 .map_err(AppError::WorkflowInvalid)
                 .and_then(|profile| {
+                    agent_hub_config::canonicalize_resolved_runner_profile(&profile)
+                        .map_err(AppError::WorkflowInvalid)
+                })
+                .and_then(|profile| {
                     serde_json::to_value(profile)
                         .map_err(|error| AppError::WorkflowInvalid(error.to_string()))
                 })?,
@@ -4850,21 +5699,14 @@ impl OrchestrationService {
             resource_constraints: ResolvedAuthorizationResources {
                 timeout_secs: job.timeout_secs,
                 max_retries: job.max_retries,
+                attempt: job.attempt,
             },
         };
-        let digest = request
-            .request_digest()
+        let bundle = protocol::ImmutableAuthorizationBundle::create(&request)
             .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
-        let authorization_id = format!(
-            "{}:{}:{}:{}:{}",
-            checkpoint_owner_id, item.id, job.step_id, request.invocation_id, digest
-        );
-        project_authorization_request_into_job_context(
-            &mut job.context,
-            &authorization_id,
-            &request,
-        )
-        .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+        project_authorization_bundle_into_job_context(&mut job.context, &bundle)
+            .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+        job.canonical_authorization = Some(bundle.artifact());
         Ok(())
     }
 
@@ -6661,41 +7503,342 @@ impl OrchestrationService {
     async fn requeue_jobs_for_worker(&self, worker_id: &str) -> anyhow::Result<usize> {
         let path = Arc::clone(&self.db_path);
         let worker_id = worker_id.to_string();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let conn = Connection::open(path.as_path())?;
-            let count = conn.execute(
-                "UPDATE jobs SET state = ?1, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE assigned_worker_id = ?3 AND state IN (?4, ?5) AND EXISTS (SELECT 1 FROM authorization_records ar WHERE ar.authorization_id = jobs.authorization_id AND ar.request_digest = jobs.request_digest AND ar.work_item_id = jobs.work_item_id AND ar.checkpoint_owner_id = jobs.checkpoint_owner_id AND ar.invocation_id = json_extract(jobs.context_json, '$.resolved_authorization_request.invocation_id'))",
-                params![
-                    JobState::Pending.to_string(),
-                    Utc::now().to_rfc3339(),
-                    worker_id,
-                    JobState::Assigned.to_string(),
-                    JobState::Running.to_string(),
-                ],
+        let (count, failed_jobs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = Utc::now();
+            let assigned = tx.execute(
+                "UPDATE jobs SET state = 'pending', assigned_worker_id = NULL,
+                    assigned_worker_session_id = NULL, assigned_worker_session_generation = NULL,
+                    lease_expires_at = NULL, updated_at = ?2
+                 WHERE assigned_worker_id = ?1 AND state = 'assigned'",
+                params![worker_id, now.to_rfc3339()],
             )?;
-            Ok(count)
+            let running = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM jobs WHERE assigned_worker_id = ?1 AND state = 'running'",
+                )?;
+                let rows = stmt.query_map([&worker_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let result = worker_recovery_result_json("worker_session_stale", now)?;
+            for job_id in &running {
+                tx.execute(
+                    "UPDATE jobs SET state = 'failed', lease_expires_at = NULL,
+                        result_json = ?2, updated_at = ?3 WHERE id = ?1 AND state = 'running'",
+                    params![job_id, result, now.to_rfc3339()],
+                )?;
+            }
+            tx.commit()?;
+            Ok((assigned + running.len(), running))
         })
-        .await?
+        .await??;
+        for job_id in failed_jobs {
+            let job_id = Uuid::parse_str(&job_id)?;
+            if let Some(job) = self.get_job(job_id).await? {
+                self.advance_or_recover_worker_failure(&job, "worker_session_stale")
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
+        }
+        Ok(count)
     }
 
     async fn requeue_expired_leases(&self) -> anyhow::Result<usize> {
         let path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let conn = Connection::open(path.as_path())?;
-            let now = Utc::now().to_rfc3339();
-            let count = conn.execute(
-                "UPDATE jobs SET state = ?1, assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE state IN (?3, ?4) AND lease_expires_at IS NOT NULL AND lease_expires_at < ?5 AND EXISTS (SELECT 1 FROM authorization_records ar WHERE ar.authorization_id = jobs.authorization_id AND ar.request_digest = jobs.request_digest AND ar.work_item_id = jobs.work_item_id AND ar.checkpoint_owner_id = jobs.checkpoint_owner_id AND ar.invocation_id = json_extract(jobs.context_json, '$.resolved_authorization_request.invocation_id'))",
-                params![
-                    JobState::Pending.to_string(),
-                    now,
-                    JobState::Assigned.to_string(),
-                    JobState::Running.to_string(),
-                    now,
-                ],
+        let (count, failed_jobs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = Utc::now();
+            let assigned = tx.execute(
+                "UPDATE jobs SET state = 'pending', assigned_worker_id = NULL,
+                    assigned_worker_session_id = NULL, assigned_worker_session_generation = NULL,
+                    lease_expires_at = NULL, updated_at = ?1
+                 WHERE state = 'assigned' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?1",
+                [now.to_rfc3339()],
             )?;
-            Ok(count)
+            let running = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM jobs WHERE state = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?1",
+                )?;
+                let rows = stmt.query_map([now.to_rfc3339()], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let result = worker_recovery_result_json("worker_session_lease_expired", now)?;
+            for job_id in &running {
+                tx.execute(
+                    "UPDATE jobs SET state = 'failed', lease_expires_at = NULL,
+                        result_json = ?2, updated_at = ?3 WHERE id = ?1 AND state = 'running'",
+                    params![job_id, result, now.to_rfc3339()],
+                )?;
+            }
+            tx.commit()?;
+            Ok((assigned + running.len(), running))
         })
-        .await?
+        .await??;
+        for job_id in failed_jobs {
+            let job_id = Uuid::parse_str(&job_id)?;
+            if let Some(job) = self.get_job(job_id).await? {
+                self.advance_or_recover_worker_failure(&job, "worker_session_lease_expired")
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn advance_or_recover_worker_failure(
+        &self,
+        job: &Job,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        if let Err(error) = self.advance_workflow_for_job(job).await {
+            let mut item = self
+                .get_work_item(job.work_item_id)
+                .await
+                .map_err(map_db)?
+                .ok_or_else(|| AppError::WorkItemNotFound(job.work_item_id.to_string()))?;
+            item.state = WorkItemState::Failed;
+            item.human_gate = true;
+            item.human_gate_state = Some(reason.to_string());
+            item.last_failure_reason = Some(format!(
+                "{reason}: workflow recovery requires operator review ({error})"
+            ));
+            item.required_action_description = Some(
+                "Review the abandoned worker execution and explicitly retry or recover the workflow."
+                    .to_string(),
+            );
+            item.updated_at = Utc::now();
+            self.update_work_item(&item).await.map_err(map_db)?;
+            self.persist_task_projection(&item, None)
+                .await
+                .map_err(map_config)?;
+        }
+        Ok(())
+    }
+
+    async fn process_worker_session_recovery_inbox(&self) -> Result<usize, AppError> {
+        const RECOVERY_BATCH_SIZE: usize = 32;
+        const RECOVERY_DEADLINE: Duration = Duration::from_secs(2);
+
+        let path = Arc::clone(&self.db_path);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let started = std::time::Instant::now();
+            let mut applied = 0;
+            for _ in 0..RECOVERY_BATCH_SIZE {
+                if started.elapsed() >= RECOVERY_DEADLINE {
+                    break;
+                }
+                let mut conn = Connection::open(path.as_path())?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pending = tx
+                    .query_row(
+                        "SELECT recovery_id, job_id, work_item_id, checkpoint_owner_id,
+                                source_session_id, source_session_generation, reason, attempts
+                         FROM worker_session_recovery_inbox
+                         WHERE state = 'pending' AND next_attempt_at <= ?1
+                         ORDER BY next_attempt_at, updated_at, recovery_id LIMIT 1",
+                        [Utc::now().to_rfc3339()],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, u64>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, u32>(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((
+                    recovery_id,
+                    job_id,
+                    work_item_id,
+                    checkpoint_owner_id,
+                    source_session_id,
+                    source_session_generation,
+                    reason,
+                    attempts,
+                )) = pending
+                else {
+                    tx.commit()?;
+                    break;
+                };
+                let already_applied = tx
+                    .query_row(
+                        "SELECT outcome_json FROM worker_session_recovery_applied
+                         WHERE recovery_id = ?1",
+                        [&recovery_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if already_applied.is_some() {
+                    tx.execute(
+                        "UPDATE worker_session_recovery_inbox
+                         SET state = 'applied', last_error = NULL, updated_at = ?2
+                         WHERE recovery_id = ?1",
+                        params![recovery_id, Utc::now().to_rfc3339()],
+                    )?;
+                    tx.commit()?;
+                    continue;
+                }
+                let application = (|| -> anyhow::Result<usize> {
+                    let expected_recovery_id = worker_session_recovery_id(
+                        &source_session_id,
+                        source_session_generation,
+                        &job_id,
+                        &work_item_id,
+                        &checkpoint_owner_id,
+                        &reason,
+                    );
+                    if recovery_id != expected_recovery_id {
+                        anyhow::bail!("worker session recovery identity mismatch");
+                    }
+                    let (job_work_item_id, job_checkpoint_owner_id) = tx.query_row(
+                        "SELECT work_item_id, checkpoint_owner_id FROM jobs WHERE id = ?1",
+                        [&job_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )?;
+                    if job_work_item_id != work_item_id
+                        || job_checkpoint_owner_id != checkpoint_owner_id
+                    {
+                        anyhow::bail!(
+                            "worker session recovery checkpoint ownership mismatch"
+                        );
+                    }
+                    let child_exists = tx
+                        .query_row(
+                            "SELECT 1 FROM work_items WHERE id = ?1",
+                            [&work_item_id],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some();
+                    let checkpoint_exists = tx
+                        .query_row(
+                            "SELECT 1 FROM work_items WHERE id = ?1",
+                            [&checkpoint_owner_id],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some();
+                    if !child_exists || !checkpoint_exists {
+                        anyhow::bail!(
+                            "worker session recovery checkpoint ownership is missing"
+                        );
+                    }
+                    let now = Utc::now();
+                    let child_changed = tx.execute(
+                        "UPDATE work_items SET state = 'failed', human_gate = 1,
+                            human_gate_state = ?2,
+                            last_failure_reason = ?3, required_action_description = ?4,
+                            updated_at = ?5
+                         WHERE id = ?1 AND state IN ('pending', 'running')",
+                        params![
+                            work_item_id,
+                            reason,
+                            format!("{reason}: worker execution requires operator recovery"),
+                            "Review the abandoned worker execution and explicitly retry or recover the workflow.",
+                            now.to_rfc3339(),
+                        ],
+                    )?;
+                    let root_changed = if checkpoint_owner_id == work_item_id {
+                        child_changed
+                    } else {
+                        tx.execute(
+                            "UPDATE work_items SET state = 'failed', human_gate = 1,
+                                human_gate_state = ?2, projected_state = ?2,
+                                last_failure_reason = ?3, required_action_description = ?4,
+                                updated_at = ?5
+                             WHERE id = ?1 AND state IN ('pending', 'running')",
+                            params![
+                                checkpoint_owner_id,
+                                reason,
+                                format!("{reason}: child {work_item_id} requires operator recovery"),
+                                "Review the failed child execution and explicitly retry or recover the checkpoint tree.",
+                                now.to_rfc3339(),
+                            ],
+                        )?
+                    };
+                    let outcome = serde_json::json!({
+                        "job_id":job_id,
+                        "work_item_id":work_item_id,
+                        "checkpoint_owner_id":checkpoint_owner_id,
+                        "child_changed":child_changed,
+                        "root_changed":root_changed,
+                        "state":"failed",
+                        "reason":reason,
+                    });
+                    tx.execute(
+                        "INSERT OR REPLACE INTO ownership_return_outbox (
+                            root_work_item_id, task_id, human_owner,
+                            human_owner_provider_id, human_owners_json,
+                            last_error, updated_at
+                         )
+                         SELECT id, external_task_id,
+                                json_extract(remembered_human_owners_json, '$[0].display_name'),
+                                json_extract(remembered_human_owners_json, '$[0].provider_id'),
+                                remembered_human_owners_json, ?2, ?3
+                         FROM work_items
+                         WHERE id = ?1 AND external_task_id IS NOT NULL",
+                        params![
+                            checkpoint_owner_id,
+                            format!("{reason}: provider recovery pending"),
+                            now.to_rfc3339(),
+                        ],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO worker_session_recovery_applied (
+                            recovery_id, job_id, outcome_json, applied_at
+                         ) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            recovery_id,
+                            job_id,
+                            serde_json::to_string(&outcome)?,
+                            now.to_rfc3339(),
+                        ],
+                    )?;
+                    tx.execute(
+                        "UPDATE worker_session_recovery_inbox
+                         SET state = 'applied', last_error = NULL, updated_at = ?2
+                         WHERE recovery_id = ?1 AND state = 'pending'",
+                        params![recovery_id, now.to_rfc3339()],
+                    )?;
+                    Ok(child_changed + root_changed)
+                })();
+                match application {
+                    Ok(_) => {
+                        tx.commit()?;
+                        applied += 1;
+                    }
+                    Err(error) => {
+                        tx.rollback()?;
+                        let conn = Connection::open(path.as_path())?;
+                        let delay_secs = 1_i64 << attempts.min(8);
+                        conn.execute(
+                            "UPDATE worker_session_recovery_inbox
+                             SET attempts = attempts + 1, last_error = ?2,
+                                 next_attempt_at = ?3, updated_at = ?4
+                             WHERE recovery_id = ?1 AND state = 'pending'",
+                            params![
+                                recovery_id,
+                                error.to_string(),
+                                (Utc::now() + chrono::TimeDelta::seconds(delay_secs))
+                                    .to_rfc3339(),
+                                Utc::now().to_rfc3339(),
+                            ],
+                        )?;
+                    }
+                }
+            }
+            Ok(applied)
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(map_db)
     }
 
     async fn advance_workflow_for_job(&self, job: &Job) -> Result<(), AppError> {
@@ -7146,6 +8289,8 @@ impl OrchestrationService {
                             step_id: state.id.clone(),
                             state: JobState::Pending,
                             assigned_worker_id: None,
+                            assigned_worker_session_id: None,
+                            assigned_worker_session_generation: None,
                             execution_mode: protocol::ExecutionMode::Docker,
                             container_image: execution
                                 .and_then(|config| config.container_image.clone()),
@@ -7154,6 +8299,7 @@ impl OrchestrationService {
                             env,
                             prompt,
                             context: item.context.clone(),
+                            canonical_authorization: None,
                             repo: item.repo.clone(),
                             timeout_secs,
                             max_retries: execution.map(|config| config.max_retries).unwrap_or(0),
@@ -7269,6 +8415,8 @@ impl OrchestrationService {
             step_id: item.current_step.clone(),
             state: JobState::Pending,
             assigned_worker_id: None,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
             execution_mode: protocol::ExecutionMode::Docker,
             container_image: None, // Let local-agent use its configured default image
             command: String::new(),
@@ -7276,6 +8424,7 @@ impl OrchestrationService {
             env: HashMap::new(),
             prompt: Some(prompt),
             context: item.context.clone(),
+            canonical_authorization: None,
             repo: None,
             timeout_secs: Some(900),
             max_retries: 0,
@@ -7659,30 +8808,43 @@ impl OrchestrationService {
             .context
             .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
             .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned);
-        let request_digest = request.request_digest()?;
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("job {} has no authorization identity", job.id))?;
+        let artifact = job.canonical_authorization.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "job {} is incompatible: missing canonical authorization bytes",
+                job.id
+            )
+        })?;
+        let request_digest = artifact.digest.clone();
+        if protocol::ImmutableAuthorizationBundle::verify(&artifact, &authorization_id)
+            .map_err(anyhow::Error::msg)?
+            .request
+            .normalize()
+            != request.clone().normalize()
+        {
+            anyhow::bail!("job {} canonical authorization semantic mismatch", job.id);
+        }
         tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = Connection::open(path.as_path())?;
-            if let Some(authorization_id) = authorization_id {
-                let request_json = serde_json::to_string(&request_for_check.clone().normalize())?;
-                let exact_record = conn
-                    .query_row(
-                        "SELECT 1 FROM authorization_records WHERE authorization_id = ?1 AND request_digest = ?2 AND request_json = ?3 AND work_item_id = ?4 AND checkpoint_owner_id = ?5 AND invocation_id = ?6",
+            let exact_record = conn
+                .query_row(
+                        "SELECT 1 FROM authorization_records WHERE authorization_id = ?1 AND request_digest = ?2 AND canonical_authorization_version = ?3 AND canonical_authorization_bytes = ?4 AND work_item_id = ?5 AND checkpoint_owner_id = ?6 AND invocation_id = ?7",
                         params![
                             authorization_id,
                             request_digest,
-                            request_json,
+                            artifact.version,
+                            artifact.canonical_bytes,
                             work_item_id.to_string(),
                             checkpoint_owner_id.to_string(),
                             request_for_check.invocation_id.to_string(),
                         ],
                         |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
-                if exact_record {
-                    return Ok(true);
-                }
+                )
+                .optional()?
+                .is_some();
+            if exact_record {
+                return Ok(true);
             }
             let mut stmt = conn.prepare(
                 "SELECT request_json FROM authorization_baselines WHERE checkpoint_owner_id = ?1 AND work_item_id = ?2 AND state_id = ?3",
@@ -8200,7 +9362,7 @@ impl OrchestrationService {
             let (authorization_id, request_digest) =
                 insert_authorization_record(&tx, &job, checkpoint_owner_id)?;
             tx.execute(
-                "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, authorization_id, request_digest, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, 0)",
+                "INSERT INTO jobs (id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, checkpoint_owner_id, authorization_id, request_digest, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation, dispatch_released) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, 0)",
                 params![
                     job.id.to_string(),
                     job.work_item_id.to_string(),
@@ -8227,6 +9389,11 @@ impl OrchestrationService {
                     checkpoint_owner_id.to_string(),
                     authorization_id,
                     request_digest,
+                    job.canonical_authorization.as_ref().map(|artifact| artifact.version),
+                    job.canonical_authorization.as_ref().map(|artifact| artifact.digest.as_str()),
+                    job.canonical_authorization.as_ref().map(|artifact| artifact.canonical_bytes.as_slice()),
+                    job.assigned_worker_session_id.map(|value| value.to_string()),
+                    job.assigned_worker_session_generation,
                 ],
             )?;
             tx.commit()?;
@@ -8269,7 +9436,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
             let conn = Connection::open(path.as_path())?;
             let mut stmt = conn.prepare(
-                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs ORDER BY created_at ASC",
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_job)?;
             let mut out = Vec::new();
@@ -8286,7 +9453,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
             let conn = Connection::open(path.as_path())?;
             let mut stmt = conn.prepare(
-                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE transcript_dir IS NOT NULL ORDER BY created_at DESC",
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE transcript_dir IS NOT NULL ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map([], row_to_job)?;
             let mut out = Vec::new();
@@ -8323,7 +9490,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
             let conn = Connection::open(path.as_path())?;
             let mut stmt = conn.prepare(
-                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE state IN (?1, ?2) ORDER BY updated_at DESC LIMIT ?3",
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE state IN (?1, ?2) ORDER BY updated_at DESC LIMIT ?3",
             )?;
             let rows = stmt.query_map(
                 params![
@@ -8347,7 +9514,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Job>> {
             let conn = Connection::open(path.as_path())?;
             let mut stmt = conn.prepare(
-                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE work_item_id = ?1 ORDER BY created_at ASC",
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE work_item_id = ?1 ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([work_item_id.to_string()], row_to_job)?;
             let mut out = Vec::new();
@@ -8364,7 +9531,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Job>> {
             let conn = Connection::open(path.as_path())?;
             let mut stmt = conn.prepare(
-                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE id = ?1",
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE id = ?1",
             )?;
             let job = stmt.query_row([id.to_string()], row_to_job).optional()?;
             Ok(job)
@@ -8376,20 +9543,45 @@ impl OrchestrationService {
         &self,
         worker_id: String,
         supported_modes: Vec<protocol::ExecutionMode>,
+        protocol_capabilities: Vec<protocol::WorkerProtocolCapability>,
+        credential: Option<WorkerSessionCredential>,
     ) -> anyhow::Result<Option<Job>> {
         let path = Arc::clone(&self.db_path);
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Job>> {
             let conn = Connection::open(path.as_path())?;
             conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+            let authenticated_worker = credential
+                .as_ref()
+                .map(|credential| {
+                    verify_worker_session_in_connection(&conn, &worker_id, credential)
+                })
+                .transpose()?;
+            let supported_modes = authenticated_worker
+                .as_ref()
+                .map(|worker| worker.supported_modes.clone())
+                .unwrap_or(supported_modes);
+            let protocol_capabilities = authenticated_worker
+                .as_ref()
+                .map(|worker| worker.protocol_capabilities.clone())
+                .unwrap_or(protocol_capabilities);
             let mut stmt = conn.prepare(
-                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE state = ?1 AND dispatch_released = 1 ORDER BY created_at ASC",
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE state = ?1 AND dispatch_released = 1 ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([JobState::Pending.to_string()], row_to_job)?;
             for row in rows {
                 let mut job = row?;
-                verify_job_authorization(&conn, &job)?;
+                let bundle = verify_job_authorization(&conn, &job)?;
+                protocol::project_authorization_bundle_into_job_context(
+                    &mut job.context,
+                    &bundle,
+                )?;
                 let runtime_environment = canonical_runtime_spec_for_job_effective(&job).environment;
                 if !supported_modes.contains(&runtime_environment.execution_mode) {
+                    continue;
+                }
+                if !protocol_capabilities.contains(
+                    &protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                ) {
                     continue;
                 }
                 job.execution_mode = runtime_environment.execution_mode;
@@ -8397,11 +9589,17 @@ impl OrchestrationService {
                 job.timeout_secs = runtime_environment.timeout_secs;
                 job.state = JobState::Assigned;
                 job.assigned_worker_id = Some(worker_id.clone());
+                job.assigned_worker_session_id = authenticated_worker
+                    .as_ref()
+                    .and_then(|worker| worker.session_id);
+                job.assigned_worker_session_generation = authenticated_worker
+                    .as_ref()
+                    .map(|worker| worker.session_generation);
                 job.lease_expires_at =
                     Some(Utc::now() + chrono::TimeDelta::seconds(LEASE_TTL_SECS));
                 job.updated_at = Utc::now();
                 let updated = conn.execute(
-                    "UPDATE jobs SET state = ?2, assigned_worker_id = ?3, lease_expires_at = ?4, updated_at = ?5 WHERE id = ?1 AND state = ?6 AND dispatch_released = 1",
+                    "UPDATE jobs SET state = ?2, assigned_worker_id = ?3, lease_expires_at = ?4, updated_at = ?5, assigned_worker_session_id = ?7, assigned_worker_session_generation = ?8 WHERE id = ?1 AND state = ?6 AND dispatch_released = 1",
                     params![
                         job.id.to_string(),
                         job.state.to_string(),
@@ -8409,11 +9607,31 @@ impl OrchestrationService {
                         job.lease_expires_at.map(|t| t.to_rfc3339()),
                         job.updated_at.to_rfc3339(),
                         JobState::Pending.to_string(),
+                        job.assigned_worker_session_id.map(|value| value.to_string()),
+                        job.assigned_worker_session_generation,
                     ],
                 )?;
                 if updated == 1 {
+                    if let Some(worker) = authenticated_worker.as_ref() {
+                        let changed = conn.execute(
+                            "UPDATE workers SET state = ?2, last_heartbeat_at = ?3 WHERE id = ?1 AND session_id = ?4 AND session_generation = ?5",
+                            params![worker.id, WorkerState::Busy.to_string(), Utc::now().to_rfc3339(), worker.session_id.map(|value| value.to_string()), worker.session_generation],
+                        )?;
+                        if changed != 1 {
+                            anyhow::bail!("worker session changed during assignment");
+                        }
+                    }
                     conn.execute_batch("COMMIT")?;
                     return Ok(Some(job));
+                }
+            }
+            if let Some(worker) = authenticated_worker.as_ref() {
+                let changed = conn.execute(
+                    "UPDATE workers SET state = ?2, last_heartbeat_at = ?3 WHERE id = ?1 AND session_id = ?4 AND session_generation = ?5",
+                    params![worker.id, WorkerState::Idle.to_string(), Utc::now().to_rfc3339(), worker.session_id.map(|value| value.to_string()), worker.session_generation],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("worker session changed during poll");
                 }
             }
             conn.execute_batch("COMMIT")?;
@@ -8422,6 +9640,7 @@ impl OrchestrationService {
         .await?
     }
 
+    #[cfg(test)]
     async fn update_job_row(&self, job: &Job) -> anyhow::Result<()> {
         let path = Arc::clone(&self.db_path);
         let job = job.clone();
@@ -8450,13 +9669,14 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = Connection::open(path.as_path())?;
             conn.execute(
-                "INSERT INTO workers (id, hostname, state, supported_modes_json, last_heartbeat_at) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(id) DO UPDATE SET hostname = excluded.hostname, state = excluded.state, supported_modes_json = excluded.supported_modes_json, last_heartbeat_at = excluded.last_heartbeat_at",
+                "INSERT INTO workers (id, hostname, state, supported_modes_json, protocol_capabilities_json, last_heartbeat_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET hostname = excluded.hostname, state = excluded.state, supported_modes_json = excluded.supported_modes_json, protocol_capabilities_json = excluded.protocol_capabilities_json, last_heartbeat_at = excluded.last_heartbeat_at",
                 params![
                     worker.id,
                     worker.hostname,
                     worker.state.to_string(),
                     serde_json::to_string(&worker.supported_modes)?,
+                    serde_json::to_string(&worker.protocol_capabilities)?,
                     worker.last_heartbeat_at.to_rfc3339(),
                 ],
             )?;
@@ -8465,13 +9685,14 @@ impl OrchestrationService {
         .await?
     }
 
+    #[cfg(test)]
     async fn get_worker(&self, worker_id: &str) -> anyhow::Result<Option<WorkerInfo>> {
         let path = Arc::clone(&self.db_path);
         let worker_id = worker_id.to_string();
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<WorkerInfo>> {
             let conn = Connection::open(path.as_path())?;
             let mut stmt = conn.prepare(
-                "SELECT id, hostname, state, supported_modes_json, last_heartbeat_at FROM workers WHERE id = ?1",
+                "SELECT id, hostname, state, supported_modes_json, protocol_capabilities_json, session_id, session_generation, last_heartbeat_at FROM workers WHERE id = ?1",
             )?;
             let worker = stmt
                 .query_row([worker_id], |row| {
@@ -8481,7 +9702,16 @@ impl OrchestrationService {
                         state: row.get::<_, String>(2)?.parse().map_err(invalid_enum)?,
                         supported_modes: serde_json::from_str(&row.get::<_, String>(3)?)
                             .map_err(invalid_json)?,
-                        last_heartbeat_at: parse_datetime(&row.get::<_, String>(4)?)?,
+                        protocol_capabilities: serde_json::from_str(&row.get::<_, String>(4)?)
+                            .map_err(invalid_json)?,
+                        session_id: row
+                            .get::<_, Option<String>>(5)?
+                            .as_deref()
+                            .map(Uuid::parse_str)
+                            .transpose()
+                            .map_err(invalid_enum)?,
+                        session_generation: row.get(6)?,
+                        last_heartbeat_at: parse_datetime(&row.get::<_, String>(7)?)?,
                     })
                 })
                 .optional()?;
@@ -8495,7 +9725,7 @@ impl OrchestrationService {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<WorkerInfo>> {
             let conn = Connection::open(path.as_path())?;
             let mut stmt = conn.prepare(
-                "SELECT id, hostname, state, supported_modes_json, last_heartbeat_at FROM workers ORDER BY id ASC",
+                "SELECT id, hostname, state, supported_modes_json, protocol_capabilities_json, session_id, session_generation, last_heartbeat_at FROM workers ORDER BY id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok(WorkerInfo {
@@ -8504,7 +9734,16 @@ impl OrchestrationService {
                     state: row.get::<_, String>(2)?.parse().map_err(invalid_enum)?,
                     supported_modes: serde_json::from_str(&row.get::<_, String>(3)?)
                         .map_err(invalid_json)?,
-                    last_heartbeat_at: parse_datetime(&row.get::<_, String>(4)?)?,
+                    protocol_capabilities: serde_json::from_str(&row.get::<_, String>(4)?)
+                        .map_err(invalid_json)?,
+                    session_id: row
+                        .get::<_, Option<String>>(5)?
+                        .as_deref()
+                        .map(Uuid::parse_str)
+                        .transpose()
+                        .map_err(invalid_enum)?,
+                    session_generation: row.get(6)?,
+                    last_heartbeat_at: parse_datetime(&row.get::<_, String>(7)?)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -8652,8 +9891,21 @@ fn build_authorization_obligation(
     if request.root_work_item_id != root.id || request.work_unit_id != logical_item.id {
         anyhow::bail!("authorization obligation work-unit binding mismatch");
     }
-    let digest = request.request_digest()?;
-    let request = request.clone().normalize();
+    let artifact = job.canonical_authorization.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("authorization obligation job lacks canonical authorization bytes")
+    })?;
+    let authorization_id = job
+        .context
+        .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("authorization obligation job lacks authorization ID"))?;
+    let bundle = protocol::ImmutableAuthorizationBundle::verify(artifact, authorization_id)
+        .map_err(anyhow::Error::msg)?;
+    if bundle.request.clone().normalize() != request.clone().normalize() {
+        anyhow::bail!("authorization obligation semantic request mismatch");
+    }
+    let digest = bundle.digest.clone();
+    let request = bundle.request;
     let request_json = serde_json::to_string(&request)?;
     let mut authoritative_job = job.clone();
     authoritative_job.id = Uuid::new_v5(
@@ -8674,6 +9926,8 @@ fn build_authorization_obligation(
             request_digest: digest,
             request_json,
             job_json: serde_json::to_string(&authoritative_job)?,
+            canonical_authorization_version: bundle.version,
+            canonical_authorization_bytes: bundle.canonical_bytes,
         },
         pending,
     ))
@@ -10828,7 +12082,7 @@ fn release_jobs_in_transaction(
     for job_id in job_ids {
         let row = tx
             .query_row(
-                "SELECT jobs.checkpoint_owner_id, jobs.state, jobs.dispatch_released, jobs.request_digest, jobs.authorization_id, jobs.context_json, authorization_records.request_json FROM jobs LEFT JOIN authorization_records ON authorization_records.authorization_id = jobs.authorization_id AND authorization_records.request_digest = jobs.request_digest AND authorization_records.work_item_id = jobs.work_item_id AND authorization_records.checkpoint_owner_id = jobs.checkpoint_owner_id AND authorization_records.invocation_id = json_extract(jobs.context_json, '$.resolved_authorization_request.invocation_id') WHERE jobs.id = ?1",
+                "SELECT jobs.checkpoint_owner_id, jobs.state, jobs.dispatch_released, jobs.request_digest, jobs.authorization_id, jobs.context_json, authorization_records.canonical_authorization_version, authorization_records.canonical_authorization_bytes FROM jobs LEFT JOIN authorization_records ON authorization_records.authorization_id = jobs.authorization_id AND authorization_records.request_digest = jobs.request_digest AND authorization_records.work_item_id = jobs.work_item_id AND authorization_records.checkpoint_owner_id = jobs.checkpoint_owner_id WHERE jobs.id = ?1",
                 [job_id.to_string()],
                 |row| {
                     Ok((
@@ -10838,7 +12092,8 @@ fn release_jobs_in_transaction(
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<u32>>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
                     ))
                 },
             )
@@ -10850,7 +12105,8 @@ fn release_jobs_in_transaction(
             request_digest,
             authorization_id,
             context_json,
-            record_json,
+            record_version,
+            record_bytes,
         )) = row
         else {
             if require_present {
@@ -10865,7 +12121,7 @@ fn release_jobs_in_transaction(
         }
         if released == 0 {
             let verification_job = tx.query_row(
-                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json FROM jobs WHERE id = ?1",
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE id = ?1",
                 [job_id.to_string()],
                 row_to_job,
             )?;
@@ -10880,9 +12136,12 @@ fn release_jobs_in_transaction(
                 anyhow::anyhow!("checkpoint job {job_id} has no authorization identity")
             })?;
             let context: serde_json::Value = serde_json::from_str(&context_json)?;
-            let request = protocol::authorization_request_from_job_context(&context)
-                .ok_or_else(|| anyhow::anyhow!("checkpoint job {job_id} has no request payload"))?;
-            let normalized_request_json = serde_json::to_string(&request.clone().normalize())?;
+            let artifact = verification_job
+                .canonical_authorization
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("checkpoint job {job_id} has no canonical authorization bytes")
+                })?;
             if context
                 .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
                 .and_then(serde_json::Value::as_str)
@@ -10891,8 +12150,9 @@ fn release_jobs_in_transaction(
                     .get(protocol::CONTEXT_REQUEST_DIGEST_KEY)
                     .and_then(serde_json::Value::as_str)
                     != Some(expected.as_str())
-                || request.request_digest()? != *expected
-                || record_json.as_deref() != Some(normalized_request_json.as_str())
+                || artifact.digest != *expected
+                || record_version != Some(artifact.version)
+                || record_bytes.as_deref() != Some(artifact.canonical_bytes.as_slice())
             {
                 anyhow::bail!("checkpoint job {job_id} immutable authorization is invalid");
             }
@@ -11354,6 +12614,7 @@ mod tests {
         adapter: Arc<dyn TaskAdapter>,
         work_item_id: Uuid,
         worker_id: String,
+        worker_session: Option<protocol::AuthenticatedWorkerSession>,
         db: PathBuf,
         tasks: PathBuf,
     }
@@ -11436,6 +12697,8 @@ mod tests {
                 .assign_next_job(
                     "authorization-harness".to_string(),
                     vec![protocol::ExecutionMode::Docker],
+                    vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1],
+                    None,
                 )
                 .await
                 .expect("assign triage job")
@@ -11490,21 +12753,37 @@ mod tests {
                 .expect("freeze baseline and release authorized job");
 
             let worker_id = "w1".to_string();
-            if register_worker {
-                svc.register_worker(RegisterWorkerRequest {
-                    id: worker_id.clone(),
-                    hostname: "authorized-host".to_string(),
-                    supported_modes: vec![protocol::ExecutionMode::Docker],
+            let worker_session = if register_worker {
+                let registered = svc
+                    .register_worker_session(
+                        RegisterWorkerRequest {
+                            id: worker_id.clone(),
+                            hostname: "authorized-host".to_string(),
+                            supported_modes: vec![protocol::ExecutionMode::Docker],
+                            protocol_capabilities: vec![
+                                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                            ],
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("register authorized worker");
+                Some(protocol::AuthenticatedWorkerSession {
+                    worker_id: worker_id.clone(),
+                    session_id: registered.session_id,
+                    session_token: registered.session_token,
+                    generation: registered.session_generation,
                 })
-                .await
-                .expect("register authorized worker");
-            }
+            } else {
+                None
+            };
 
             Self {
                 svc,
                 adapter,
                 work_item_id: task.id,
                 worker_id,
+                worker_session,
                 db,
                 tasks,
             }
@@ -11687,10 +12966,15 @@ mod tests {
         waiter.await.expect("waiter");
 
         assert!(
-            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Docker],)
-                .await
-                .expect("poll while blocked")
-                .is_none()
+            svc.assign_next_job(
+                "worker".to_string(),
+                vec![protocol::ExecutionMode::Docker],
+                vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1],
+                None,
+            )
+            .await
+            .expect("poll while blocked")
+            .is_none()
         );
         adapter.unblock();
         checkpoint
@@ -11714,10 +12998,15 @@ mod tests {
         );
         drop(conn);
         assert_eq!(
-            svc.assign_next_job("worker".to_string(), vec![protocol::ExecutionMode::Docker],)
-                .await
-                .expect("poll after commit")
-                .map(|assigned| assigned.id),
+            svc.assign_next_job(
+                "worker".to_string(),
+                vec![protocol::ExecutionMode::Docker],
+                vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1],
+                None,
+            )
+            .await
+            .expect("poll after commit")
+            .map(|assigned| assigned.id),
             Some(job.id)
         );
         let _ = std::fs::remove_file(db);
@@ -13340,6 +14629,644 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(db);
+    }
+
+    fn test_canonical_authorization_digest(bytes: &[u8]) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"agent-hub:resolved-authorization:v1\0");
+        digest.update(bytes);
+        hex::encode(digest.finalize())
+    }
+
+    async fn assert_canonical_migration_quarantines_corruption(mutation: &str) {
+        let mut harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let db = harness.db.clone();
+        let tasks = harness.tasks.clone();
+        let adapter = Arc::clone(&harness.adapter);
+        let job = harness
+            .svc
+            .list_jobs()
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.state == JobState::Pending)
+            .expect("pending job");
+        let authorization_id = job.context[protocol::CONTEXT_AUTHORIZATION_ID_KEY]
+            .as_str()
+            .expect("authorization ID")
+            .to_string();
+        let conn = Connection::open(&db).expect("open database");
+        match mutation {
+            "matching_corrupt_bytes" => {
+                let mut bytes: Vec<u8> = conn
+                    .query_row(
+                        "SELECT canonical_authorization_bytes FROM jobs WHERE id = ?1",
+                        [job.id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                bytes[0] ^= 1;
+                conn.execute(
+                    "UPDATE jobs SET canonical_authorization_bytes = ?2 WHERE id = ?1",
+                    params![job.id.to_string(), bytes],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE authorization_records SET canonical_authorization_bytes = ?2 WHERE authorization_id = ?1",
+                    params![authorization_id, bytes],
+                )
+                .unwrap();
+            }
+            "matching_corrupt_digest" => {
+                let digest = "00".repeat(32);
+                conn.execute(
+                    "UPDATE jobs SET request_digest = ?2, canonical_authorization_digest = ?2, context_json = json_set(context_json, '$.request_digest', ?2) WHERE id = ?1",
+                    params![job.id.to_string(), digest],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE authorization_records SET request_digest = ?2 WHERE authorization_id = ?1",
+                    params![authorization_id, digest],
+                )
+                .unwrap();
+            }
+            "matching_corrupt_id" => {
+                conn.execute(
+                    "UPDATE authorization_records SET authorization_id = 'attacker-id' WHERE authorization_id = ?1",
+                    [&authorization_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE jobs SET authorization_id = 'attacker-id', context_json = json_set(context_json, '$.authorization_id', 'attacker-id') WHERE id = ?1",
+                    [job.id.to_string()],
+                )
+                .unwrap();
+            }
+            "malformed_dto" => {
+                let bytes = b"{}".to_vec();
+                let digest = test_canonical_authorization_digest(&bytes);
+                conn.execute(
+                    "UPDATE jobs SET canonical_authorization_bytes = ?2, request_digest = ?3, canonical_authorization_digest = ?3, context_json = json_set(context_json, '$.request_digest', ?3) WHERE id = ?1",
+                    params![job.id.to_string(), bytes, digest],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE authorization_records SET canonical_authorization_bytes = ?2, request_digest = ?3 WHERE authorization_id = ?1",
+                    params![authorization_id, bytes, digest],
+                )
+                .unwrap();
+            }
+            "wrong_work_item" => {
+                conn.execute(
+                    "UPDATE authorization_records SET work_item_id = ?2 WHERE authorization_id = ?1",
+                    params![authorization_id, Uuid::new_v4().to_string()],
+                )
+                .unwrap();
+            }
+            "wrong_invocation" => {
+                conn.execute(
+                    "UPDATE work_items SET context_json = json_set(context_json, '$.state_invocation.id', ?2) WHERE id = ?1",
+                    params![job.work_item_id.to_string(), Uuid::new_v4().to_string()],
+                )
+                .unwrap();
+            }
+            "executable_mismatch" => {
+                conn.execute(
+                    "UPDATE jobs SET command = 'attacker-command' WHERE id = ?1",
+                    [job.id.to_string()],
+                )
+                .unwrap();
+            }
+            "display_mismatch" => {
+                conn.execute(
+                    "UPDATE jobs SET context_json = json_set(context_json, '$.resolved_authorization_request', json('{}')) WHERE id = ?1",
+                    [job.id.to_string()],
+                )
+                .unwrap();
+            }
+            "display_missing" => {
+                conn.execute(
+                    "UPDATE jobs SET context_json = json_remove(context_json, '$.resolved_authorization_request') WHERE id = ?1",
+                    [job.id.to_string()],
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE name = 'canonical_authorization_bytes_v1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        harness.db = PathBuf::from("unused-corrupt-migration.sqlite3");
+        harness.tasks = PathBuf::from("unused-corrupt-migration-tasks");
+        drop(harness);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            adapter,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        restarted.init().await.expect("classify corrupt migration");
+        assert_eq!(
+            restarted
+                .get_job(job.id)
+                .await
+                .expect("get corrupt job")
+                .expect("corrupt job retained")
+                .state,
+            JobState::Cancelled,
+            "{mutation}"
+        );
+        drop(restarted);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn canonical_migration_cryptographically_classifies_every_active_job() {
+        for mutation in [
+            "matching_corrupt_bytes",
+            "matching_corrupt_digest",
+            "matching_corrupt_id",
+            "malformed_dto",
+            "wrong_work_item",
+            "wrong_invocation",
+            "executable_mismatch",
+            "display_mismatch",
+            "display_missing",
+        ] {
+            assert_canonical_migration_quarantines_corruption(mutation).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_authorization_migration_quarantines_precanonical_work_idempotently() {
+        let mut harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let db = harness.db.clone();
+        let tasks = harness.tasks.clone();
+        let adapter = Arc::clone(&harness.adapter);
+        let work_item_id = harness.work_item_id;
+        let job_id = harness
+            .svc
+            .list_jobs_for_work_item(work_item_id)
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.state == JobState::Pending)
+            .expect("pending canonical job")
+            .id;
+        let root = harness.work_item().await;
+        let terminal_states = [
+            (WorkItemState::Succeeded, JobState::Succeeded),
+            (WorkItemState::Failed, JobState::Failed),
+            (WorkItemState::Cancelled, JobState::Cancelled),
+        ];
+        let mut terminal_history = Vec::new();
+        for (index, (item_state, job_state)) in terminal_states.into_iter().enumerate() {
+            let mut child = root.clone();
+            child.id = Uuid::new_v4();
+            child.parent_work_item_id = Some(root.id);
+            child.parent_step_id = Some("history".to_string());
+            child.child_work_item_id = None;
+            child.state = item_state.clone();
+            child.projected_state = Some(format!("terminal-history-{index}"));
+            child.status_comment_id = Some(10_000 + index as i64);
+            child.checkpoint_comment_id = Some(20_000 + index as i64);
+            child.human_gate = false;
+            child.human_gate_state = None;
+            harness
+                .svc
+                .insert_work_item(&child)
+                .await
+                .expect("insert terminal descendant");
+            terminal_history.push((
+                child.id,
+                item_state,
+                child.projected_state.clone(),
+                child.status_comment_id,
+                child.checkpoint_comment_id,
+                Uuid::new_v4(),
+                job_state,
+            ));
+        }
+        let conn = Connection::open(&db).expect("open database");
+        for (child_id, _, _, _, _, terminal_job_id, job_state) in &terminal_history {
+            conn.execute(
+                "INSERT INTO jobs (
+                    id, work_item_id, step_id, state, assigned_worker_id, execution_mode,
+                    container_image, command, args_json, env_json, prompt_json, context_json,
+                    repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json,
+                    lease_expires_at, created_at, updated_at, runtime_spec_json,
+                    checkpoint_owner_id, authorization_id, request_digest,
+                    canonical_authorization_version, canonical_authorization_digest,
+                    canonical_authorization_bytes, assigned_worker_session_id,
+                    assigned_worker_session_generation, dispatch_released
+                 )
+                 SELECT ?1, ?2, step_id, ?3, assigned_worker_id, execution_mode,
+                    container_image, command, args_json, env_json, prompt_json, context_json,
+                    repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json,
+                    NULL, created_at, updated_at, runtime_spec_json, ?4, authorization_id,
+                    request_digest, canonical_authorization_version,
+                    canonical_authorization_digest, canonical_authorization_bytes,
+                    assigned_worker_session_id, assigned_worker_session_generation, 1
+                 FROM jobs WHERE id = ?5",
+                params![
+                    terminal_job_id.to_string(),
+                    child_id.to_string(),
+                    job_state.to_string(),
+                    root.id.to_string(),
+                    job_id.to_string(),
+                ],
+            )
+            .expect("insert terminal job history");
+        }
+        conn.execute(
+            "INSERT INTO authorization_obligations (
+                checkpoint_owner_id, work_item_id, request_digest, request_json, job_json,
+                state, created_at, updated_at
+             ) VALUES (?1, ?1, 'legacy-obligation', '{}', '{}', 'pending', ?2, ?2)",
+            params![work_item_id.to_string(), Utc::now().to_rfc3339()],
+        )
+        .expect("insert precanonical obligation");
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE name = 'canonical_authorization_bytes_v1'",
+            [],
+        )
+        .expect("reset canonical migration");
+        drop(conn);
+        harness.db = PathBuf::from("unused-canonical-migration.sqlite3");
+        harness.tasks = PathBuf::from("unused-canonical-migration-tasks");
+        drop(harness);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        restarted.init().await.expect("canonical migration");
+        let job = restarted
+            .get_job(job_id)
+            .await
+            .expect("get quarantined job")
+            .expect("quarantined job");
+        assert_eq!(job.state, JobState::Cancelled);
+        let obligation_state: String = Connection::open(&db)
+            .expect("open migrated obligation")
+            .query_row(
+                "SELECT state FROM authorization_obligations WHERE request_digest = 'legacy-obligation'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migrated obligation state");
+        assert_eq!(obligation_state, "quarantined");
+        let item = restarted
+            .get_work_item(work_item_id)
+            .await
+            .expect("get quarantined item")
+            .expect("quarantined item");
+        assert_eq!(item.state, WorkItemState::Failed);
+        assert!(
+            item.last_failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("canonical authorization bytes"))
+        );
+        for (
+            child_id,
+            item_state,
+            projected_state,
+            status_comment_id,
+            checkpoint_comment_id,
+            terminal_job_id,
+            job_state,
+        ) in terminal_history
+        {
+            let child = restarted
+                .get_work_item(child_id)
+                .await
+                .unwrap()
+                .expect("terminal descendant preserved");
+            assert_eq!(child.state, item_state);
+            assert_eq!(child.projected_state, projected_state);
+            assert_eq!(child.status_comment_id, status_comment_id);
+            assert_eq!(child.checkpoint_comment_id, checkpoint_comment_id);
+            let terminal_job = restarted
+                .get_job(terminal_job_id)
+                .await
+                .unwrap()
+                .expect("terminal job preserved");
+            assert_eq!(terminal_job.state, job_state);
+        }
+        drop(restarted);
+
+        let mut conn = Connection::open(&db).expect("reopen database");
+        migrate_canonical_authorization_bytes(&mut conn).expect("idempotent migration replay");
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = 'canonical_authorization_bytes_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration marker count");
+        assert_eq!(marker_count, 1);
+        drop(conn);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn canonical_authorization_migration_rolls_back_and_replays_after_crash() {
+        let mut harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let db = harness.db.clone();
+        let tasks = harness.tasks.clone();
+        let adapter = Arc::clone(&harness.adapter);
+        let job_id = harness
+            .svc
+            .list_jobs()
+            .await
+            .expect("jobs")
+            .into_iter()
+            .find(|job| job.state == JobState::Pending)
+            .expect("pending job")
+            .id;
+        let conn = Connection::open(&db).expect("open database");
+        conn.execute(
+            "UPDATE jobs SET canonical_authorization_version = NULL, canonical_authorization_digest = NULL, canonical_authorization_bytes = NULL WHERE id = ?1",
+            [job_id.to_string()],
+        )
+        .expect("make job precanonical");
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE name = 'canonical_authorization_bytes_v1'",
+            [],
+        )
+        .expect("reset canonical migration");
+        conn.execute_batch(
+            "CREATE TRIGGER reject_canonical_quarantine BEFORE UPDATE ON work_items
+             BEGIN SELECT RAISE(ABORT, 'injected canonical migration interruption'); END;",
+        )
+        .expect("install migration interruption");
+        drop(conn);
+        harness.db = PathBuf::from("unused-canonical-crash.sqlite3");
+        harness.tasks = PathBuf::from("unused-canonical-crash-tasks");
+        drop(harness);
+
+        let interrupted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        assert!(interrupted.init().await.is_err());
+        drop(interrupted);
+        let conn = Connection::open(&db).expect("inspect rollback");
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM jobs WHERE id = ?1",
+                [job_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("job state after rollback");
+        assert_eq!(state, JobState::Pending.to_string());
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = 'canonical_authorization_bytes_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("marker after rollback");
+        assert_eq!(marker_count, 0);
+        conn.execute_batch("DROP TRIGGER reject_canonical_quarantine")
+            .expect("remove migration interruption");
+        drop(conn);
+
+        let replayed = OrchestrationService::new(
+            workflow_catalog(),
+            adapter,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        replayed.init().await.expect("replay canonical migration");
+        assert_eq!(
+            replayed
+                .get_job(job_id)
+                .await
+                .expect("get replayed job")
+                .expect("replayed job")
+                .state,
+            JobState::Cancelled
+        );
+        drop(replayed);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn canonical_migration_quarantines_cryptographically_corrupt_obligation() {
+        let mut harness = AuthorizedWorkflowHarness::new_configured(
+            workflow_catalog(),
+            "wf",
+            true,
+            serde_json::json!({"environment":{"base":"code-auto","overlays":["github"]}}),
+            None,
+            environments_fixture(),
+            overlays_fixture(),
+        )
+        .await;
+        harness
+            .complete_next_job(JobState::Succeeded, successful_job_result())
+            .await;
+        let db = harness.db.clone();
+        let tasks = harness.tasks.clone();
+        let adapter = Arc::clone(&harness.adapter);
+        let conn = Connection::open(&db).unwrap();
+        let digest: String = conn
+            .query_row(
+                "SELECT request_digest FROM authorization_obligations WHERE state = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending canonical obligation");
+        conn.execute(
+            "UPDATE authorization_obligations SET request_json = '{}' WHERE request_digest = ?1",
+            [&digest],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE name = 'canonical_authorization_bytes_v1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        harness.db = PathBuf::from("unused-obligation-migration.sqlite3");
+        harness.tasks = PathBuf::from("unused-obligation-migration-tasks");
+        drop(harness);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            adapter,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_environments(environments_fixture())
+        .with_overlays(overlays_fixture())
+        .with_scm_hosts(test_scm_registry());
+        restarted.init().await.expect("migrate corrupt obligation");
+        let conn = Connection::open(&db).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM authorization_obligations WHERE request_digest = ?1",
+                [&digest],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "quarantined");
+        drop(conn);
+        drop(restarted);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn assignment_session_migration_reconciles_legacy_jobs_atomically() {
+        let mut harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let db = harness.db.clone();
+        let tasks = harness.tasks.clone();
+        let adapter = Arc::clone(&harness.adapter);
+        let source = harness
+            .svc
+            .list_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.state == JobState::Pending)
+            .unwrap();
+        let root = harness.work_item().await;
+        let mut child = root.clone();
+        child.id = Uuid::new_v4();
+        child.parent_work_item_id = Some(root.id);
+        child.external_task_id = None;
+        child.state = WorkItemState::Running;
+        harness.svc.insert_work_item(&child).await.unwrap();
+        let running_id = Uuid::new_v4();
+        let terminal_id = Uuid::new_v4();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE jobs SET state = 'assigned', assigned_worker_id = 'legacy-worker',
+                assigned_worker_session_id = NULL, assigned_worker_session_generation = NULL
+             WHERE id = ?1",
+            [source.id.to_string()],
+        )
+        .unwrap();
+        for (id, state) in [(running_id, "running"), (terminal_id, "succeeded")] {
+            conn.execute(
+                "INSERT INTO jobs (
+                    id, work_item_id, step_id, state, assigned_worker_id, execution_mode,
+                    container_image, command, args_json, env_json, prompt_json, context_json,
+                    repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json,
+                    lease_expires_at, created_at, updated_at, runtime_spec_json,
+                    checkpoint_owner_id, authorization_id, request_digest,
+                    canonical_authorization_version, canonical_authorization_digest,
+                    canonical_authorization_bytes, assigned_worker_session_id,
+                    assigned_worker_session_generation, dispatch_released
+                 ) SELECT ?1, work_item_id, step_id, ?2, 'legacy-worker', execution_mode,
+                    container_image, command, args_json, env_json, prompt_json, context_json,
+                    repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json,
+                    lease_expires_at, created_at, updated_at, runtime_spec_json,
+                    checkpoint_owner_id, authorization_id, request_digest,
+                    canonical_authorization_version, canonical_authorization_digest,
+                    canonical_authorization_bytes, NULL, NULL, dispatch_released
+                 FROM jobs WHERE id = ?3",
+                params![id.to_string(), state, source.id.to_string()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE jobs SET work_item_id = ?2, checkpoint_owner_id = ?3 WHERE id = ?1",
+            params![
+                running_id.to_string(),
+                child.id.to_string(),
+                root.id.to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE name = 'worker_assignment_sessions_v1'",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_assignment_session_migration BEFORE UPDATE ON jobs
+             BEGIN SELECT RAISE(ABORT, 'injected assignment session migration crash'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        harness.db = PathBuf::from("unused-assignment-session-migration.sqlite3");
+        harness.tasks = PathBuf::from("unused-assignment-session-migration-tasks");
+        drop(harness);
+
+        let interrupted = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::clone(&adapter),
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        assert!(interrupted.init().await.is_err());
+        drop(interrupted);
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM jobs WHERE id = ?1",
+                [source.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "assigned"
+        );
+        conn.execute_batch("DROP TRIGGER reject_assignment_session_migration")
+            .unwrap();
+        drop(conn);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            adapter,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        restarted
+            .init()
+            .await
+            .expect("assignment session migration replay");
+        let assigned = restarted.get_job(source.id).await.unwrap().unwrap();
+        assert_eq!(assigned.state, JobState::Pending);
+        assert!(assigned.assigned_worker_id.is_none());
+        let running = restarted.get_job(running_id).await.unwrap().unwrap();
+        assert_eq!(running.state, JobState::Failed);
+        assert_eq!(
+            running.result.unwrap().error_message.as_deref(),
+            Some("legacy_assignment_session_migration")
+        );
+        assert_eq!(
+            restarted.get_job(terminal_id).await.unwrap().unwrap().state,
+            JobState::Succeeded
+        );
+        let conn = Connection::open(&db).unwrap();
+        let (state, inbox_child, inbox_root): (String, String, String) = conn
+            .query_row(
+                "SELECT state, work_item_id, checkpoint_owner_id
+                 FROM worker_session_recovery_inbox WHERE job_id = ?1",
+                [running_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
+        assert_eq!(inbox_child, child.id.to_string());
+        assert_eq!(inbox_root, root.id.to_string());
+        drop(conn);
+        drop(restarted);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
     }
 
     #[tokio::test]
@@ -16124,6 +18051,692 @@ kind = "terminal"
     }
 
     #[tokio::test]
+    async fn canonical_jobs_require_persisted_worker_protocol_capability() {
+        let mut harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let legacy_registration = harness
+            .svc
+            .register_worker_session(
+                RegisterWorkerRequest {
+                    id: "mixed-version-worker".to_string(),
+                    hostname: "legacy-host".to_string(),
+                    supported_modes: vec![protocol::ExecutionMode::Docker],
+                    protocol_capabilities: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("register legacy worker");
+        let legacy_credential = WorkerSessionCredential {
+            session_id: legacy_registration.session_id,
+            session_token: legacy_registration.session_token,
+        };
+        assert!(
+            harness
+                .svc
+                .poll_job(PollJobRequest {
+                    worker_id: "mixed-version-worker".to_string(),
+                })
+                .await
+                .expect("legacy poll")
+                .job
+                .is_none()
+        );
+
+        let db = harness.db.clone();
+        let tasks = harness.tasks.clone();
+        let adapter = Arc::clone(&harness.adapter);
+        harness.db = PathBuf::from("unused-capability-restart.sqlite3");
+        harness.tasks = PathBuf::from("unused-capability-restart-tasks");
+        drop(harness);
+
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            adapter,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        restarted.init().await.expect("restart server");
+        let worker = restarted
+            .list_workers()
+            .await
+            .expect("list persisted workers")
+            .into_iter()
+            .find(|worker| worker.id == "mixed-version-worker")
+            .expect("persisted worker");
+        assert!(worker.protocol_capabilities.is_empty());
+
+        let capable_registration = RegisterWorkerRequest {
+            id: "mixed-version-worker".to_string(),
+            hostname: "current-host".to_string(),
+            supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
+        };
+        let upgraded = restarted
+            .register_worker_session(
+                capable_registration.clone(),
+                Some(legacy_credential.clone()),
+            )
+            .await
+            .expect("upgrade worker capability");
+        assert!(
+            restarted
+                .register_worker_session(capable_registration.clone(), Some(legacy_credential),)
+                .await
+                .is_err()
+        );
+        let upgraded_credential = WorkerSessionCredential {
+            session_id: upgraded.session_id,
+            session_token: upgraded.session_token,
+        };
+        let replayed = restarted
+            .register_worker_session(capable_registration, Some(upgraded_credential))
+            .await
+            .expect("replay worker capability registration");
+        assert_eq!(
+            restarted
+                .list_workers()
+                .await
+                .expect("list upgraded worker")
+                .into_iter()
+                .find(|worker| worker.id == "mixed-version-worker")
+                .expect("upgraded worker")
+                .protocol_capabilities,
+            vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1]
+        );
+        let assigned = restarted
+            .poll_job_authenticated(
+                WorkerSessionCredential {
+                    session_id: replayed.session_id,
+                    session_token: replayed.session_token,
+                },
+                PollJobRequest {
+                    worker_id: "mixed-version-worker".to_string(),
+                },
+            )
+            .await
+            .expect("capable poll")
+            .job
+            .expect("canonical job assignment");
+        assert!(assigned.canonical_authorization.is_some());
+
+        drop(restarted);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn worker_sessions_reject_duplicate_spoof_tamper_and_old_generation() {
+        let mut harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let worker_a = RegisterWorkerRequest {
+            id: "worker-a".to_string(),
+            hostname: "host-a".to_string(),
+            supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
+        };
+        let first = harness
+            .svc
+            .register_worker_session(worker_a.clone(), None)
+            .await
+            .expect("register first worker session");
+        assert_eq!(first.session_generation, 1);
+        assert!(
+            harness
+                .svc
+                .register_worker_session(worker_a.clone(), None)
+                .await
+                .is_err()
+        );
+        let first_credential = WorkerSessionCredential {
+            session_id: first.session_id,
+            session_token: first.session_token.clone(),
+        };
+
+        let worker_b = harness
+            .svc
+            .register_worker_session(
+                RegisterWorkerRequest {
+                    id: "worker-b".to_string(),
+                    hostname: "host-b".to_string(),
+                    supported_modes: vec![protocol::ExecutionMode::Docker],
+                    protocol_capabilities: vec![
+                        protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                    ],
+                },
+                None,
+            )
+            .await
+            .expect("register second worker session");
+        assert!(
+            harness
+                .svc
+                .verify_worker_session("worker-b", &first_credential)
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .svc
+                .verify_worker_session(
+                    "worker-a",
+                    &WorkerSessionCredential {
+                        session_id: first.session_id,
+                        session_token: protocol::Secret::new("tampered-token"),
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .svc
+                .verify_worker_session(
+                    "worker-a",
+                    &WorkerSessionCredential {
+                        session_id: worker_b.session_id,
+                        session_token: first.session_token.clone(),
+                    },
+                )
+                .await
+                .is_err()
+        );
+        for _ in 0..2 {
+            harness
+                .svc
+                .heartbeat_authenticated(
+                    "worker-a".to_string(),
+                    first_credential.clone(),
+                    HeartbeatRequest {
+                        state: WorkerState::Idle,
+                    },
+                )
+                .await
+                .expect("valid session request replay");
+        }
+        let old_session_job = harness
+            .svc
+            .poll_job_authenticated(
+                first_credential.clone(),
+                PollJobRequest {
+                    worker_id: "worker-a".to_string(),
+                },
+            )
+            .await
+            .expect("old session poll")
+            .job
+            .expect("old session assignment");
+        assert_eq!(
+            old_session_job.assigned_worker_session_id,
+            Some(first.session_id)
+        );
+        assert_eq!(old_session_job.assigned_worker_session_generation, Some(1));
+
+        Connection::open(&harness.db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_worker_session_rotation BEFORE UPDATE ON workers
+                 BEGIN SELECT RAISE(ABORT, 'injected worker session rotation crash'); END;",
+            )
+            .unwrap();
+        assert!(
+            harness
+                .svc
+                .register_worker_session(worker_a.clone(), Some(first_credential.clone()))
+                .await
+                .is_err()
+        );
+        let after_crash = harness
+            .svc
+            .get_job(old_session_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_crash.state, JobState::Assigned);
+        assert_eq!(after_crash.assigned_worker_session_generation, Some(1));
+        Connection::open(&harness.db)
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_worker_session_rotation")
+            .unwrap();
+        harness
+            .svc
+            .heartbeat_authenticated(
+                "worker-a".to_string(),
+                first_credential.clone(),
+                HeartbeatRequest {
+                    state: WorkerState::Busy,
+                },
+            )
+            .await
+            .expect("old session remains valid after rolled-back rotation");
+
+        let replaced = harness
+            .svc
+            .register_worker_session(worker_a, Some(first_credential.clone()))
+            .await
+            .expect("replace authenticated worker session");
+        assert_eq!(replaced.session_generation, 2);
+        let requeued = harness
+            .svc
+            .get_job(old_session_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requeued.state, JobState::Pending);
+        assert!(requeued.assigned_worker_id.is_none());
+        assert!(requeued.assigned_worker_session_id.is_none());
+        assert!(requeued.assigned_worker_session_generation.is_none());
+        assert!(
+            harness
+                .svc
+                .heartbeat_authenticated(
+                    "worker-a".to_string(),
+                    first_credential.clone(),
+                    HeartbeatRequest {
+                        state: WorkerState::Idle,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .svc
+                .poll_job_authenticated(
+                    first_credential.clone(),
+                    PollJobRequest {
+                        worker_id: "worker-a".to_string(),
+                    },
+                )
+                .await
+                .is_err()
+        );
+        let replaced_credential = WorkerSessionCredential {
+            session_id: replaced.session_id,
+            session_token: replaced.session_token.clone(),
+        };
+        harness
+            .svc
+            .heartbeat_authenticated(
+                "worker-a".to_string(),
+                replaced_credential.clone(),
+                HeartbeatRequest {
+                    state: WorkerState::Idle,
+                },
+            )
+            .await
+            .expect("new worker session is active");
+        let replacement_job = harness
+            .svc
+            .poll_job_authenticated(
+                replaced_credential.clone(),
+                PollJobRequest {
+                    worker_id: "worker-a".to_string(),
+                },
+            )
+            .await
+            .expect("replacement worker polls immediately")
+            .job
+            .expect("replacement assignment");
+        assert_eq!(replacement_job.id, old_session_job.id);
+        assert_eq!(replacement_job.assigned_worker_session_generation, Some(2));
+        let session_event = protocol::JobEvent {
+            job_id: replacement_job.id,
+            worker_id: "worker-a".to_string(),
+            at: Utc::now(),
+            kind: protocol::JobEventKind::System,
+            stream: None,
+            message: "session-bound event".to_string(),
+        };
+        harness
+            .svc
+            .record_worker_event_authenticated(replaced_credential.clone(), &session_event)
+            .await
+            .expect("record session-bound event");
+        harness
+            .svc
+            .update_job_authenticated(
+                replacement_job.id,
+                replaced_credential.clone(),
+                JobUpdateRequest {
+                    worker_id: "worker-a".to_string(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .expect("start replacement-owned job");
+        let final_session = harness
+            .svc
+            .register_worker_session(
+                RegisterWorkerRequest {
+                    id: "worker-a".to_string(),
+                    hostname: "host-a-replaced".to_string(),
+                    supported_modes: vec![protocol::ExecutionMode::Docker],
+                    protocol_capabilities: vec![
+                        protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                    ],
+                },
+                Some(replaced_credential.clone()),
+            )
+            .await
+            .expect("replace running worker session");
+        assert_eq!(final_session.session_generation, 3);
+        assert!(
+            harness
+                .svc
+                .update_job_authenticated(
+                    replacement_job.id,
+                    replaced_credential.clone(),
+                    JobUpdateRequest {
+                        worker_id: "worker-a".to_string(),
+                        state: JobState::Succeeded,
+                        transcript_dir: None,
+                        result: Some(successful_job_result()),
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            harness
+                .svc
+                .record_worker_event_authenticated(replaced_credential.clone(), &session_event)
+                .await
+                .is_err()
+        );
+        let failed = harness
+            .svc
+            .get_job(replacement_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(
+            failed
+                .result
+                .as_ref()
+                .and_then(|result| result.error_message.as_deref()),
+            Some("worker_session_replaced")
+        );
+        let inbox_state: String = Connection::open(&harness.db)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM worker_session_recovery_inbox WHERE job_id = ?1",
+                [replacement_job.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("durable replacement recovery inbox");
+        assert_eq!(inbox_state, "pending");
+        for (trigger_name, trigger_sql) in [
+            (
+                "fail_before_recovery_mutation",
+                "CREATE TRIGGER fail_before_recovery_mutation BEFORE UPDATE OF state ON work_items
+                 BEGIN SELECT RAISE(ABORT, 'injected provider/workflow recovery failure'); END;",
+            ),
+            (
+                "fail_before_recovery_identity",
+                "CREATE TRIGGER fail_before_recovery_identity BEFORE INSERT ON worker_session_recovery_applied
+                 BEGIN SELECT RAISE(ABORT, 'injected crash before recovery identity'); END;",
+            ),
+            (
+                "fail_before_recovery_ack",
+                "CREATE TRIGGER fail_before_recovery_ack BEFORE UPDATE OF state ON worker_session_recovery_inbox
+                 WHEN NEW.state = 'applied'
+                 BEGIN SELECT RAISE(ABORT, 'injected crash before recovery acknowledgement'); END;",
+            ),
+        ] {
+            let conn = Connection::open(&harness.db).unwrap();
+            conn.execute_batch(trigger_sql).unwrap();
+            drop(conn);
+            assert_eq!(
+                harness
+                    .svc
+                    .process_worker_session_recovery_inbox()
+                    .await
+                    .expect("failed recovery remains retryable"),
+                0
+            );
+            let conn = Connection::open(&harness.db).unwrap();
+            conn.execute_batch(&format!("DROP TRIGGER {trigger_name}"))
+                .unwrap();
+            conn.execute(
+                "UPDATE worker_session_recovery_inbox SET next_attempt_at = ?2
+                 WHERE job_id = ?1",
+                params![replacement_job.id.to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+        let (attempts, last_error): (u32, Option<String>) = Connection::open(&harness.db)
+            .unwrap()
+            .query_row(
+                "SELECT attempts, last_error FROM worker_session_recovery_inbox
+                 WHERE job_id = ?1",
+                [replacement_job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 3);
+        assert!(last_error.is_some());
+        let (left, right) = tokio::join!(
+            harness.svc.process_worker_session_recovery_inbox(),
+            harness.svc.process_worker_session_recovery_inbox(),
+        );
+        assert_eq!(left.unwrap() + right.unwrap(), 1);
+        assert_eq!(
+            harness
+                .svc
+                .process_worker_session_recovery_inbox()
+                .await
+                .expect("idempotent replacement recovery replay"),
+            0
+        );
+        let stored_hash: Vec<u8> = Connection::open(&harness.db)
+            .expect("open worker session database")
+            .query_row(
+                "SELECT session_token_hash FROM workers WHERE id = 'worker-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stored worker session hash");
+        assert_eq!(stored_hash.len(), 32);
+        assert_ne!(stored_hash, replaced.session_token.expose().as_bytes());
+        Connection::open(&harness.db)
+            .unwrap()
+            .execute(
+                "UPDATE workers SET last_heartbeat_at = ?2 WHERE id = ?1",
+                params![
+                    "worker-a",
+                    (Utc::now() - chrono::TimeDelta::seconds(STALE_WORKER_SECS as i64 + 1))
+                        .to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        let stale_takeover = harness
+            .svc
+            .register_worker_session(
+                RegisterWorkerRequest {
+                    id: "worker-a".to_string(),
+                    hostname: "host-a-stale-takeover".to_string(),
+                    supported_modes: vec![protocol::ExecutionMode::Docker],
+                    protocol_capabilities: vec![
+                        protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                    ],
+                },
+                None,
+            )
+            .await
+            .expect("stale session takeover");
+        assert_eq!(stale_takeover.session_generation, 4);
+        let db = harness.db.clone();
+        let tasks = harness.tasks.clone();
+        let adapter = Arc::clone(&harness.adapter);
+        harness.db = PathBuf::from("unused-session-recovery-restart.sqlite3");
+        harness.tasks = PathBuf::from("unused-session-recovery-restart-tasks");
+        drop(harness);
+        let restarted = OrchestrationService::new(
+            workflow_catalog(),
+            adapter,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        restarted.init().await.expect("restart recovery consumer");
+        assert_eq!(
+            restarted
+                .process_worker_session_recovery_inbox()
+                .await
+                .expect("restart recovery replay"),
+            0
+        );
+        drop(restarted);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn nested_child_session_recovery_uses_checkpoint_owner_for_provider_state() {
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
+        let root = harness.work_item().await;
+        let mut child = root.clone();
+        child.id = Uuid::new_v4();
+        child.parent_work_item_id = Some(root.id);
+        child.external_task_id = None;
+        child.state = WorkItemState::Running;
+        child.projected_state = Some("child-running".to_string());
+        harness.svc.insert_work_item(&child).await.unwrap();
+        let job = harness
+            .svc
+            .list_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.state == JobState::Pending)
+            .unwrap();
+        let session_id = "nested-old-session";
+        let generation = 7;
+        let recovery_id = worker_session_recovery_id(
+            session_id,
+            generation,
+            &job.id.to_string(),
+            &child.id.to_string(),
+            &root.id.to_string(),
+            "worker_session_replaced",
+        );
+        let wrong_root = Uuid::new_v4();
+        let conn = Connection::open(&harness.db).unwrap();
+        conn.execute(
+            "UPDATE jobs SET state = 'failed', work_item_id = ?2,
+                checkpoint_owner_id = ?3 WHERE id = ?1",
+            params![
+                job.id.to_string(),
+                child.id.to_string(),
+                root.id.to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO worker_session_recovery_inbox (
+                job_id, recovery_id, work_item_id, checkpoint_owner_id,
+                source_session_id, source_session_generation, reason, state,
+                attempts, next_attempt_at, last_error, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'worker_session_replaced',
+                'pending', 0, ?7, NULL, ?7)",
+            params![
+                job.id.to_string(),
+                recovery_id,
+                child.id.to_string(),
+                wrong_root.to_string(),
+                session_id,
+                generation,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            harness
+                .svc
+                .process_worker_session_recovery_inbox()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            harness
+                .svc
+                .get_work_item(child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkItemState::Running
+        );
+        let conn = Connection::open(&harness.db).unwrap();
+        conn.execute(
+            "UPDATE worker_session_recovery_inbox
+             SET checkpoint_owner_id = ?2, next_attempt_at = ?3
+             WHERE job_id = ?1",
+            params![
+                job.id.to_string(),
+                root.id.to_string(),
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            harness
+                .svc
+                .process_worker_session_recovery_inbox()
+                .await
+                .unwrap(),
+            1
+        );
+        let child_after = harness.svc.get_work_item(child.id).await.unwrap().unwrap();
+        let root_after = harness.svc.get_work_item(root.id).await.unwrap().unwrap();
+        assert_eq!(child_after.state, WorkItemState::Failed);
+        assert_eq!(
+            child_after.projected_state.as_deref(),
+            Some("child-running")
+        );
+        assert_eq!(root_after.state, WorkItemState::Failed);
+        assert_eq!(
+            root_after.human_gate_state.as_deref(),
+            Some("worker_session_replaced")
+        );
+        let conn = Connection::open(&harness.db).unwrap();
+        let outbox_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ownership_return_outbox WHERE root_work_item_id = ?1",
+                [root.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_rows, 1);
+        let child_outbox_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ownership_return_outbox WHERE root_work_item_id = ?1",
+                [child.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_outbox_rows, 0);
+        let outcome_json: String = conn
+            .query_row(
+                "SELECT outcome_json FROM worker_session_recovery_applied WHERE recovery_id = ?1",
+                [&recovery_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let outcome: serde_json::Value = serde_json::from_str(&outcome_json).unwrap();
+        assert_eq!(outcome["work_item_id"], child.id.to_string());
+        assert_eq!(outcome["checkpoint_owner_id"], root.id.to_string());
+    }
+
+    #[tokio::test]
     async fn sse_events_endpoint_replays_buffered_events() {
         let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
         let svc = &harness.svc;
@@ -16330,7 +18943,27 @@ kind = "terminal"
 
         let job_events = crate::server::job_events::JobEventHub::new();
         let item = harness.work_item().await;
-        let job = harness.poll_job().await;
+        let session = harness.worker_session.as_ref().expect("worker session");
+        let job = svc
+            .poll_job_authenticated(
+                session.credential(),
+                PollJobRequest {
+                    worker_id: harness.worker_id.clone(),
+                },
+            )
+            .await
+            .expect("session poll")
+            .job
+            .expect("session-bound job");
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert(
+            "x-agent-hub-worker-session-id",
+            session.session_id.to_string().parse().unwrap(),
+        );
+        session_headers.insert(
+            "x-agent-hub-worker-session-token",
+            session.session_token.expose().parse().unwrap(),
+        );
 
         let state = super::super::AppState {
             config: Arc::new(super::super::config::ServerConfig {
@@ -16388,6 +19021,7 @@ kind = "terminal"
         let _ = update_job::<super::super::notifier::NullNotifier>(
             State(state.clone()),
             Path(job.id),
+            session_headers.clone(),
             Json(req),
         )
         .await
@@ -16403,6 +19037,7 @@ kind = "terminal"
         let _ = update_job::<super::super::notifier::NullNotifier>(
             State(state),
             Path(job.id),
+            session_headers,
             Json(req),
         )
         .await
@@ -16422,6 +19057,8 @@ kind = "terminal"
             step_id: "build".into(),
             state: JobState::Succeeded,
             assigned_worker_id: Some("w1".into()),
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
             execution_mode: protocol::ExecutionMode::Docker,
             container_image: None,
             command: "echo".into(),
@@ -16429,6 +19066,7 @@ kind = "terminal"
             env: HashMap::new(),
             prompt: None,
             context: serde_json::json!({}),
+            canonical_authorization: None,
             repo: None,
             timeout_secs: None,
             max_retries: 0,
@@ -17489,6 +20127,9 @@ kind = "terminal"
             id: "stale".into(),
             hostname: "host".into(),
             supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .expect("reg");
@@ -17624,6 +20265,9 @@ kind = "terminal"
             id: "w-default-terminal".into(),
             hostname: "h".into(),
             supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .expect("worker");
@@ -17958,6 +20602,9 @@ kind = "terminal"
             id: "w1".into(),
             hostname: "h".into(),
             supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .expect("worker");
@@ -18142,9 +20789,16 @@ kind = "terminal"
         assert_eq!(requeued, 1);
 
         let refreshed = svc.get_job(job.id).await.expect("get").expect("exists");
-        assert_eq!(refreshed.state, JobState::Pending);
-        assert!(refreshed.assigned_worker_id.is_none());
+        assert_eq!(refreshed.state, JobState::Failed);
+        assert_eq!(refreshed.assigned_worker_id.as_deref(), Some("w1"));
         assert!(refreshed.lease_expires_at.is_none());
+        assert_eq!(
+            refreshed
+                .result
+                .as_ref()
+                .and_then(|result| result.error_message.as_deref()),
+            Some("worker_session_lease_expired")
+        );
     }
 
     #[tokio::test]
@@ -19696,6 +22350,9 @@ kind = "terminal"
             id: "docker-worker".into(),
             hostname: "h".into(),
             supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .expect("register worker");
@@ -20149,6 +22806,53 @@ kind = "terminal"
             .into_iter()
             .next()
             .expect("triage job");
+        let artifact = job
+            .canonical_authorization
+            .as_ref()
+            .expect("reloaded canonical authorization");
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        let (stored_digest, stored_version, stored_bytes): (String, u32, Vec<u8>) = conn
+            .query_row(
+                "SELECT request_digest, canonical_authorization_version, canonical_authorization_bytes FROM authorization_records WHERE authorization_id = ?1",
+                [job.context[protocol::CONTEXT_AUTHORIZATION_ID_KEY]
+                    .as_str()
+                    .expect("authorization id")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("persisted canonical authorization");
+        assert_eq!(stored_digest, artifact.digest);
+        assert_eq!(stored_version, artifact.version);
+        assert_eq!(stored_bytes, artifact.canonical_bytes);
+        drop(conn);
+        let rest_job: Job = serde_json::from_slice(
+            &serde_json::to_vec(&job).expect("REST encode canonical authorization"),
+        )
+        .expect("REST decode canonical authorization");
+        assert_eq!(
+            rest_job.canonical_authorization,
+            job.canonical_authorization
+        );
+
+        for display in [None, Some(serde_json::json!({"different":true}))] {
+            let mut invalid_display = job.clone();
+            invalid_display.id = Uuid::new_v4();
+            if let Some(display) = display {
+                invalid_display.context[protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY] = display;
+            } else {
+                invalid_display
+                    .context
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY);
+            }
+            assert!(svc.insert_job(&invalid_display).await.is_err());
+            assert!(
+                svc.get_job(invalid_display.id)
+                    .await
+                    .expect("lookup rejected display job")
+                    .is_none()
+            );
+        }
 
         let mut collision = job.clone();
         collision.id = Uuid::new_v4();
@@ -20166,19 +22870,41 @@ kind = "terminal"
             .user
             .push_str(" changed");
         collision.prompt = request.behavior.prompt.clone();
-        protocol::project_authorization_request_into_job_context(
+        let changed_bundle = protocol::ImmutableAuthorizationBundle::create(&request)
+            .expect("changed authorization bundle");
+        protocol::project_authorization_bundle_into_job_context(
             &mut collision.context,
-            &authorization_id,
-            &request,
+            &changed_bundle,
         )
         .expect("changed request");
+        collision.context[protocol::CONTEXT_AUTHORIZATION_ID_KEY] =
+            serde_json::Value::String(authorization_id.clone());
+        collision.canonical_authorization = Some(changed_bundle.artifact());
         let collision_error = svc
             .insert_job(&collision)
             .await
             .expect_err("same authorization identity with changed payload must fail");
-        assert!(collision_error.to_string().contains("identity collision"));
+        assert!(collision_error.to_string().contains("identity mismatch"));
 
         let conn = Connection::open(db.as_path()).expect("sqlite");
+        conn.execute(
+            "UPDATE jobs SET dispatch_released = 0, authorization_id = 'attacker-id' WHERE id = ?1",
+            [job.id.to_string()],
+        )
+        .expect("tamper stored authorization ID");
+        drop(conn);
+        assert!(
+            svc.release_staged_jobs_exact(item.id, &[job.id])
+                .await
+                .is_err()
+        );
+
+        let conn = Connection::open(db.as_path()).expect("sqlite");
+        conn.execute(
+            "UPDATE jobs SET authorization_id = ?2 WHERE id = ?1",
+            params![job.id.to_string(), &authorization_id],
+        )
+        .expect("restore stored authorization ID");
         conn.execute(
             "UPDATE jobs SET dispatch_released = 0, request_digest = 'bad' WHERE id = ?1",
             [job.id.to_string()],
@@ -20202,6 +22928,9 @@ kind = "terminal"
             id: "worker".to_string(),
             hostname: "host".to_string(),
             supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .expect("worker");
@@ -20217,7 +22946,7 @@ kind = "terminal"
         let digest: String = conn
             .query_row(
                 "SELECT request_digest FROM authorization_records WHERE authorization_id = ?1",
-                [authorization_id],
+                [&authorization_id],
                 |row| row.get(0),
             )
             .expect("stored digest");
@@ -20226,11 +22955,19 @@ kind = "terminal"
             params![job.id.to_string(), digest],
         )
         .expect("restore assignment");
+        let mut canonical_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT canonical_authorization_bytes FROM authorization_records WHERE authorization_id = ?1",
+                [&authorization_id],
+                |row| row.get(0),
+            )
+            .expect("stored canonical bytes");
+        canonical_bytes[0] ^= 1;
         conn.execute(
-            "UPDATE authorization_records SET request_json = '{}' WHERE authorization_id = (SELECT authorization_id FROM jobs WHERE id = ?1)",
-            [job.id.to_string()],
+            "UPDATE authorization_records SET canonical_authorization_bytes = ?2 WHERE authorization_id = ?1",
+            params![authorization_id, canonical_bytes],
         )
-        .expect("tamper record");
+        .expect("tamper canonical record");
         drop(conn);
         assert!(
             svc.update_job(
@@ -20248,6 +22985,197 @@ kind = "terminal"
 
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn canonical_authorization_cross_crate_transport_end_to_end() {
+        use prost::Message as _;
+
+        let harness = AuthorizedWorkflowHarness::new_with_task(
+            workflow_catalog(),
+            "wf",
+            true,
+            serde_json::json!({
+                "inputs": {
+                    "large": 9_007_199_254_740_993_u64,
+                    "fraction": 1.25,
+                    "zero": 0
+                }
+            }),
+            None,
+        )
+        .await;
+        let session = harness.worker_session.clone().expect("worker session");
+        let assigned = harness
+            .svc
+            .poll_job_authenticated(
+                session.credential(),
+                PollJobRequest {
+                    worker_id: harness.worker_id.clone(),
+                },
+            )
+            .await
+            .expect("production assignment")
+            .job
+            .expect("assigned canonical job");
+        assert!(
+            harness
+                .svc
+                .update_job_authenticated(
+                    assigned.id,
+                    WorkerSessionCredential {
+                        session_id: Uuid::new_v4(),
+                        session_token: protocol::Secret::new("replayed-old-session"),
+                    },
+                    JobUpdateRequest {
+                        worker_id: harness.worker_id.clone(),
+                        state: JobState::Running,
+                        transcript_dir: None,
+                        result: None,
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            harness
+                .svc
+                .get_job(assigned.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Assigned
+        );
+        assert!(
+            local_agent::running_execution_permit(local_agent::RunningTransitionOutcome::Rejected(
+                "server rejected replayed running transition".to_string(),
+            ),)
+            .is_err()
+        );
+        let reloaded = harness
+            .svc
+            .get_job(assigned.id)
+            .await
+            .unwrap()
+            .expect("SQLite reload");
+        let rest: Job = serde_json::from_slice(&serde_json::to_vec(&reloaded).unwrap()).unwrap();
+        assert_eq!(rest.assigned_worker_session_id, Some(session.session_id));
+        assert_eq!(
+            rest.assigned_worker_session_generation,
+            Some(session.generation)
+        );
+        assert_eq!(
+            rest.context["inputs"]["large"].as_u64(),
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(rest.context["inputs"]["fraction"], serde_json::json!(1.25));
+        assert_eq!(rest.context["inputs"]["zero"], serde_json::json!(0));
+
+        let source_artifact = rest.canonical_authorization.clone().unwrap();
+        let source_id = rest.context[protocol::CONTEXT_AUTHORIZATION_ID_KEY]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut server_pb = crate::grpc::job_to_pb(rest.clone()).expect("server protobuf mapping");
+        server_pb.context = Some(prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(
+                "attacker-controlled display Value".to_string(),
+            )),
+        });
+        let local_pb = local_agent::pb::Job::decode(server_pb.encode_to_vec().as_slice())
+            .expect("prost cross-crate decode");
+        let worker_job =
+            local_agent::pb_conv::job_from_pb(local_pb).expect("worker protobuf mapping");
+        let verified = local_agent::verify_authorized_job(
+            &worker_job,
+            &harness.worker_id,
+            session.session_id,
+            session.generation,
+        )
+        .expect("actual worker authorization verification");
+        assert_eq!(verified.authorization_id, source_id);
+        assert_eq!(verified.digest, source_artifact.digest);
+        assert_eq!(verified.version, source_artifact.version);
+        assert_eq!(verified.canonical_bytes, source_artifact.canonical_bytes);
+        assert_eq!(worker_job.command, rest.command);
+        assert_eq!(worker_job.args, rest.args);
+        harness
+            .svc
+            .update_job_authenticated(
+                assigned.id,
+                session.credential(),
+                JobUpdateRequest {
+                    worker_id: session.worker_id.clone(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .expect("accepted production Running transition");
+        let permit =
+            local_agent::running_execution_permit(local_agent::RunningTransitionOutcome::Applied)
+                .expect("production execution gate")
+                .expect("Applied yields execution permit");
+        let _permit = permit;
+        local_agent::verify_authorized_job(
+            &worker_job,
+            &session.worker_id,
+            session.session_id,
+            session.generation,
+        )
+        .expect("execution verifier uses registered authenticated session");
+
+        let mut context_tamper = worker_job.clone();
+        context_tamper.context["inputs"]["large"] = serde_json::json!(1);
+        assert!(
+            local_agent::verify_authorized_job(
+                &context_tamper,
+                &harness.worker_id,
+                session.session_id,
+                session.generation,
+            )
+            .is_err()
+        );
+        let mut bytes_tamper = worker_job.clone();
+        bytes_tamper
+            .canonical_authorization
+            .as_mut()
+            .unwrap()
+            .canonical_bytes[0] ^= 1;
+        assert!(
+            local_agent::verify_authorized_job(
+                &bytes_tamper,
+                &harness.worker_id,
+                session.session_id,
+                session.generation,
+            )
+            .is_err()
+        );
+        let mut session_tamper = worker_job.clone();
+        session_tamper.assigned_worker_session_generation =
+            Some(session.generation.saturating_add(1));
+        assert!(
+            local_agent::verify_authorized_job(
+                &session_tamper,
+                &harness.worker_id,
+                session.session_id,
+                session.generation,
+            )
+            .is_err()
+        );
+        let mut executable_tamper = worker_job;
+        executable_tamper.command.push_str("-tampered");
+        assert!(
+            local_agent::verify_authorized_job(
+                &executable_tamper,
+                &harness.worker_id,
+                session.session_id,
+                session.generation,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -20378,6 +23306,9 @@ kind = "terminal"
                 protocol::ExecutionMode::Docker,
                 protocol::ExecutionMode::Docker,
             ],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .expect("register");
@@ -20454,6 +23385,9 @@ kind = "terminal"
             supported_modes: vec![
                 protocol::ExecutionMode::Docker,
                 protocol::ExecutionMode::Docker,
+            ],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
             ],
         })
         .await
@@ -20555,6 +23489,9 @@ kind = "terminal"
             supported_modes: vec![
                 protocol::ExecutionMode::Docker,
                 protocol::ExecutionMode::Docker,
+            ],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
             ],
         })
         .await
@@ -20947,6 +23884,9 @@ kind = "terminal"
             id: "worker".to_string(),
             hostname: "host".to_string(),
             supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .expect("worker");
@@ -22580,6 +25520,9 @@ kind = "terminal"
             id: "w1".into(),
             hostname: "host".into(),
             supported_modes: vec![protocol::ExecutionMode::Docker],
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+            ],
         })
         .await
         .expect("register");
@@ -23163,7 +26106,17 @@ kind = "terminal"
         harness
             .complete_next_job(JobState::Succeeded, successful_job_result())
             .await;
-        harness.authorize_pending().await;
+        svc.process_provider_action(
+            item.id,
+            TaskHumanAction {
+                kind: HumanActionKind::Approve,
+                workflow_id: None,
+                reason: Some("approve environment-specific execution".to_string()),
+            },
+            u64::MAX - 1,
+        )
+        .await
+        .expect("apply authorization approval");
 
         let test_job = svc
             .list_jobs_for_work_item(item.id)

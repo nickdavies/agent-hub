@@ -8,7 +8,7 @@ use protocol::{
 
 use crate::pb;
 
-pub(crate) fn protocol_job_event_kind(kind: pb::JobEventKind) -> protocol::JobEventKind {
+pub fn protocol_job_event_kind(kind: pb::JobEventKind) -> protocol::JobEventKind {
     match kind {
         pb::JobEventKind::JobEventStdout => protocol::JobEventKind::Stdout,
         pb::JobEventKind::JobEventStderr => protocol::JobEventKind::Stderr,
@@ -18,13 +18,13 @@ pub(crate) fn protocol_job_event_kind(kind: pb::JobEventKind) -> protocol::JobEv
     }
 }
 
-pub(crate) fn execution_mode_to_pb(v: ExecutionMode) -> i32 {
+pub fn execution_mode_to_pb(v: ExecutionMode) -> i32 {
     match v {
         ExecutionMode::Docker => pb::ExecutionMode::Docker as i32,
     }
 }
 
-pub(crate) fn worker_state_to_pb(v: WorkerState) -> i32 {
+pub fn worker_state_to_pb(v: WorkerState) -> i32 {
     match v {
         WorkerState::Idle => pb::WorkerState::Idle as i32,
         WorkerState::Busy => pb::WorkerState::Busy as i32,
@@ -32,7 +32,7 @@ pub(crate) fn worker_state_to_pb(v: WorkerState) -> i32 {
     }
 }
 
-pub(crate) fn job_state_to_pb(v: JobState) -> i32 {
+pub fn job_state_to_pb(v: JobState) -> i32 {
     match v {
         JobState::Pending => pb::JobState::Pending as i32,
         JobState::Assigned => pb::JobState::Assigned as i32,
@@ -114,7 +114,7 @@ fn termination_reason_from_pb(v: i32) -> anyhow::Result<TerminationReason> {
     )
 }
 
-pub(crate) fn ts_to_pb(v: chrono::DateTime<Utc>) -> prost_types::Timestamp {
+pub fn ts_to_pb(v: chrono::DateTime<Utc>) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: v.timestamp(),
         nanos: v.timestamp_subsec_nanos() as i32,
@@ -179,7 +179,6 @@ fn json_from_pb(v: prost_types::Value) -> anyhow::Result<serde_json::Value> {
     })
 }
 
-#[cfg(test)]
 fn prompt_to_pb(v: protocol::PromptRef) -> pb::PromptRef {
     pb::PromptRef {
         system: v.system,
@@ -194,7 +193,6 @@ fn prompt_from_pb(v: pb::PromptRef) -> protocol::PromptRef {
     }
 }
 
-#[cfg(test)]
 fn repo_to_pb(v: protocol::RepoSource) -> pb::RepoSource {
     pb::RepoSource {
         repo_url: v.repo_url,
@@ -331,7 +329,7 @@ fn github_pr_from_pb(v: pb::GithubPullRequestMetadata) -> GithubPullRequestMetad
     }
 }
 
-pub(crate) fn job_result_to_pb(v: JobResult) -> pb::JobResult {
+pub fn job_result_to_pb(v: JobResult) -> pb::JobResult {
     pb::JobResult {
         outcome: execution_outcome_to_pb(v.outcome),
         termination_reason: termination_reason_to_pb(v.termination_reason),
@@ -359,20 +357,39 @@ pub(crate) fn job_result_from_pb(v: pb::JobResult) -> anyhow::Result<JobResult> 
     })
 }
 
-pub(crate) fn job_from_pb(v: pb::Job) -> anyhow::Result<Job> {
+pub fn job_from_pb(v: pb::Job) -> anyhow::Result<Job> {
+    anyhow::ensure!(!v.context_json.is_empty(), "missing lossless context_json");
+    let context: serde_json::Value =
+        serde_json::from_slice(&v.context_json).context("invalid lossless context_json")?;
+    anyhow::ensure!(
+        !v.canonical_authorization.is_empty(),
+        "job is incompatible: missing canonical authorization bytes"
+    );
+    let canonical_authorization = protocol::CanonicalAuthorizationArtifact {
+        version: v.canonical_authorization_version,
+        digest: v.canonical_authorization_digest,
+        canonical_bytes: v.canonical_authorization,
+    };
     Ok(Job {
         id: uuid::Uuid::parse_str(&v.id).context("invalid job id")?,
         work_item_id: uuid::Uuid::parse_str(&v.work_item_id).context("invalid work_item_id")?,
         step_id: v.step_id,
         state: job_state_from_pb(v.state)?,
         assigned_worker_id: v.assigned_worker_id,
+        assigned_worker_session_id: (!v.assigned_worker_session_id.is_empty())
+            .then(|| uuid::Uuid::parse_str(&v.assigned_worker_session_id))
+            .transpose()
+            .context("invalid assigned worker session ID")?,
+        assigned_worker_session_generation: (v.assigned_worker_session_generation != 0)
+            .then_some(v.assigned_worker_session_generation),
         execution_mode: execution_mode_from_pb(v.execution_mode)?,
         container_image: v.container_image,
         command: v.command,
         args: v.args,
         env: v.env,
         prompt: v.prompt.map(prompt_from_pb),
-        context: json_from_pb(v.context.context("missing context")?)?,
+        context,
+        canonical_authorization: Some(canonical_authorization),
         repo: v.repo.map(repo_from_pb),
         timeout_secs: v.timeout_secs,
         max_retries: v.max_retries,
@@ -385,14 +402,25 @@ pub(crate) fn job_from_pb(v: pb::Job) -> anyhow::Result<Job> {
     })
 }
 
-#[cfg(test)]
-pub(crate) fn job_to_pb(v: Job) -> pb::Job {
+pub fn job_to_pb(v: Job) -> pb::Job {
+    let context_json = serde_json::to_vec(&v.context).expect("serialize job context");
+    let (canonical_authorization, canonical_authorization_version, canonical_authorization_digest) =
+        v.canonical_authorization
+            .map(|artifact| (artifact.canonical_bytes, artifact.version, artifact.digest))
+            .unwrap_or_default();
     pb::Job {
         id: v.id.to_string(),
         work_item_id: v.work_item_id.to_string(),
         step_id: v.step_id,
         state: job_state_to_pb(v.state),
         assigned_worker_id: v.assigned_worker_id,
+        assigned_worker_session_id: v
+            .assigned_worker_session_id
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        assigned_worker_session_generation: v
+            .assigned_worker_session_generation
+            .unwrap_or_default(),
         execution_mode: execution_mode_to_pb(v.execution_mode),
         container_image: v.container_image,
         command: v.command,
@@ -409,5 +437,9 @@ pub(crate) fn job_to_pb(v: Job) -> pb::Job {
         lease_expires_at: v.lease_expires_at.map(ts_to_pb),
         created_at: Some(ts_to_pb(v.created_at)),
         updated_at: Some(ts_to_pb(v.updated_at)),
+        context_json,
+        canonical_authorization,
+        canonical_authorization_version,
+        canonical_authorization_digest,
     }
 }

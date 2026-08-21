@@ -30,7 +30,8 @@ pub use rules::{
 pub use runner::{
     CredentialProviderDescriptor, ManagedRunnerFileMount, ManagedRunnerKind, ManagedRunnerSpec,
     McpBridgeDescriptor, OpencodeRunnerConfig, ResolvedRunnerProfile, RunnerProfilesConfig,
-    TrustedMountDescriptor, digest_profile, directory_content_digests,
+    TrustedMountDescriptor, canonicalize_resolved_runner_profile, digest_profile,
+    directory_content_digests,
 };
 pub use system::SystemConfig;
 pub use tools::{is_in_workspace, normalize_path, resolve_path};

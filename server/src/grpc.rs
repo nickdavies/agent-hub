@@ -5,7 +5,8 @@ use protocol::{
     ArtifactSummary, ExecutionMode, ExecutionOutcome, ExecutionTiming, GithubPullRequestMetadata,
     HeartbeatRequest, Job, JobEvent, JobEventKind, JobResult, JobState, JobUpdateRequest,
     PollJobRequest, PromptRef, RegisterWorkerRequest, RepoExecutionMetadata, RepoSource,
-    StructuredTranscriptArtifact, TerminationReason, WorkerState,
+    StructuredTranscriptArtifact, TerminationReason, WorkerProtocolCapability,
+    WorkerSessionCredential, WorkerState,
 };
 use std::sync::Arc;
 use tokio_stream::StreamExt;
@@ -28,6 +29,41 @@ pub struct WorkerLifecycleGrpc {
     job_events: Arc<JobEventHub>,
 }
 
+const WORKER_SESSION_ID_METADATA: &str = "x-agent-hub-worker-session-id";
+const WORKER_SESSION_TOKEN_METADATA: &str = "x-agent-hub-worker-session-token";
+const WORKER_ID_METADATA: &str = "x-agent-hub-worker-id";
+
+fn worker_session_from_metadata<T>(
+    request: &Request<T>,
+    required: bool,
+) -> Result<Option<WorkerSessionCredential>, Status> {
+    let session_id = request.metadata().get(WORKER_SESSION_ID_METADATA);
+    let session_token = request.metadata().get(WORKER_SESSION_TOKEN_METADATA);
+    match (session_id, session_token) {
+        (None, None) if !required => Ok(None),
+        (Some(session_id), Some(session_token)) => {
+            let session_id = session_id
+                .to_str()
+                .ok()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or_else(|| Status::unauthenticated("invalid worker session ID"))?;
+            let session_token = session_token
+                .to_str()
+                .map_err(|_| Status::unauthenticated("invalid worker session token"))?;
+            if session_token.is_empty() {
+                return Err(Status::unauthenticated("invalid worker session token"));
+            }
+            Ok(Some(WorkerSessionCredential {
+                session_id,
+                session_token: protocol::Secret::new(session_token),
+            }))
+        }
+        _ => Err(Status::unauthenticated(
+            "incomplete worker session credential",
+        )),
+    }
+}
+
 impl WorkerLifecycleGrpc {
     pub fn new(
         orchestration: std::sync::Arc<OrchestrationService>,
@@ -43,6 +79,7 @@ impl WorkerLifecycleGrpc {
 fn map_orchestration_error(error: AppError) -> Status {
     match error {
         AppError::JobCancelled(message) => Status::failed_precondition(message),
+        AppError::WorkerSessionUnauthorized(message) => Status::unauthenticated(message),
         other => Status::internal(other.to_string()),
     }
 }
@@ -84,6 +121,7 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
         &self,
         request: Request<pb::RegisterWorkerRequest>,
     ) -> Result<Response<pb::RegisterWorkerResponse>, Status> {
+        let replacement = worker_session_from_metadata(&request, false)?;
         let req = request.into_inner();
         let supported_modes = req
             .supported_modes
@@ -91,27 +129,43 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
             .copied()
             .map(execution_mode_from_pb)
             .collect::<Result<Vec<_>, _>>()?;
+        let protocol_capabilities = req
+            .protocol_capabilities
+            .iter()
+            .copied()
+            .map(worker_protocol_capability_from_pb)
+            .collect::<Result<Vec<_>, _>>()?;
 
-        self.orchestration
-            .register_worker(RegisterWorkerRequest {
-                id: req.worker_id,
-                hostname: req.hostname,
-                supported_modes,
-            })
+        let registered = self
+            .orchestration
+            .register_worker_session(
+                RegisterWorkerRequest {
+                    id: req.worker_id,
+                    hostname: req.hostname,
+                    supported_modes,
+                    protocol_capabilities,
+                },
+                replacement,
+            )
             .await
             .map_err(map_orchestration_error)?;
 
-        Ok(Response::new(pb::RegisterWorkerResponse {}))
+        Ok(Response::new(pb::RegisterWorkerResponse {
+            session_id: registered.session_id.to_string(),
+            session_token: registered.session_token.expose().to_string(),
+            session_generation: registered.session_generation,
+        }))
     }
 
     async fn heartbeat_worker(
         &self,
         request: Request<pb::HeartbeatWorkerRequest>,
     ) -> Result<Response<pb::HeartbeatWorkerResponse>, Status> {
+        let credential = worker_session_from_metadata(&request, true)?.expect("required session");
         let req = request.into_inner();
         let state = worker_state_from_pb(req.state)?;
         self.orchestration
-            .heartbeat(req.worker_id, HeartbeatRequest { state })
+            .heartbeat_authenticated(req.worker_id, credential, HeartbeatRequest { state })
             .await
             .map_err(map_orchestration_error)?;
 
@@ -122,12 +176,16 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
         &self,
         request: Request<pb::PollJobRequest>,
     ) -> Result<Response<pb::PollJobResponse>, Status> {
+        let credential = worker_session_from_metadata(&request, true)?.expect("required session");
         let req = request.into_inner();
         let response = self
             .orchestration
-            .poll_job(PollJobRequest {
-                worker_id: req.worker_id,
-            })
+            .poll_job_authenticated(
+                credential,
+                PollJobRequest {
+                    worker_id: req.worker_id,
+                },
+            )
             .await
             .map_err(map_orchestration_error)?;
 
@@ -140,6 +198,7 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
         &self,
         request: Request<pb::UpdateJobRequest>,
     ) -> Result<Response<pb::UpdateJobResponse>, Status> {
+        let credential = worker_session_from_metadata(&request, true)?.expect("required session");
         let req = request.into_inner();
         let state = job_state_from_pb(req.state)?;
         let job_id = Uuid::parse_str(&req.job_id)
@@ -148,8 +207,9 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
         let result = req.result.map(job_result_from_pb).transpose()?;
 
         self.orchestration
-            .update_job(
+            .update_job_authenticated(
                 job_id,
+                credential,
                 JobUpdateRequest {
                     worker_id: req.worker_id,
                     state,
@@ -167,10 +227,27 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
         &self,
         request: Request<tonic::Streaming<pb::JobEventChunk>>,
     ) -> Result<Response<pb::StreamJobEventsResponse>, Status> {
+        let credential = worker_session_from_metadata(&request, true)?.expect("required session");
+        let worker_id = request
+            .metadata()
+            .get(WORKER_ID_METADATA)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Status::unauthenticated("missing worker identity metadata"))?
+            .to_string();
+        self.orchestration
+            .verify_worker_session(&worker_id, &credential)
+            .await
+            .map_err(map_orchestration_error)?;
         let mut stream = request.into_inner();
         let mut accepted: u32 = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| Status::internal(e.to_string()))?;
+            if chunk.worker_id != worker_id {
+                return Err(Status::unauthenticated(
+                    "event worker identity does not match session",
+                ));
+            }
             let job_id = Uuid::parse_str(&chunk.job_id)
                 .map_err(|e| Status::invalid_argument(format!("invalid job id: {e}")))?;
 
@@ -181,16 +258,19 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
                 .transpose()?
                 .unwrap_or_else(Utc::now);
 
-            self.job_events
-                .push(JobEvent {
-                    job_id,
-                    worker_id: chunk.worker_id,
-                    at,
-                    kind,
-                    stream: chunk.stream,
-                    message: chunk.message,
-                })
-                .await;
+            let event = JobEvent {
+                job_id,
+                worker_id: chunk.worker_id,
+                at,
+                kind,
+                stream: chunk.stream,
+                message: chunk.message,
+            };
+            self.orchestration
+                .record_worker_event_authenticated(credential.clone(), &event)
+                .await
+                .map_err(map_orchestration_error)?;
+            self.job_events.push(event).await;
             accepted = accepted.saturating_add(1);
         }
 
@@ -264,6 +344,19 @@ fn worker_state_from_pb(value: i32) -> Result<WorkerState, Status> {
         pb::WorkerState::WorkerUnspecified => {
             Err(Status::invalid_argument("worker_state unspecified"))
         }
+    }
+}
+
+fn worker_protocol_capability_from_pb(value: i32) -> Result<WorkerProtocolCapability, Status> {
+    match pb::WorkerProtocolCapability::try_from(value)
+        .unwrap_or(pb::WorkerProtocolCapability::Unspecified)
+    {
+        pb::WorkerProtocolCapability::CanonicalAuthorizationV1 => {
+            Ok(WorkerProtocolCapability::CanonicalAuthorizationV1)
+        }
+        pb::WorkerProtocolCapability::Unspecified => Err(Status::invalid_argument(
+            "worker protocol capability unspecified",
+        )),
     }
 }
 
@@ -566,13 +659,37 @@ fn job_result_from_pb(v: pb::JobResult) -> Result<JobResult, Status> {
     })
 }
 
-fn job_to_pb(v: Job) -> Result<pb::Job, Status> {
+pub(crate) fn job_to_pb(v: Job) -> Result<pb::Job, Status> {
+    let context_json = serde_json::to_vec(&v.context)
+        .map_err(|error| Status::internal(format!("serialize job context: {error}")))?;
+    let artifact = v.canonical_authorization.ok_or_else(|| {
+        Status::failed_precondition(
+            "job is incompatible: missing canonical authorization bytes; recreate it with a current server",
+        )
+    })?;
+    let authorization_id = v
+        .context
+        .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Status::failed_precondition("job has no authorization identity"))?;
+    let bundle = protocol::ImmutableAuthorizationBundle::verify(&artifact, authorization_id)
+        .map_err(Status::failed_precondition)?;
+    let canonical_authorization = bundle.canonical_bytes;
+    let canonical_authorization_version = bundle.version;
+    let canonical_authorization_digest = bundle.digest;
     Ok(pb::Job {
         id: v.id.to_string(),
         work_item_id: v.work_item_id.to_string(),
         step_id: v.step_id,
         state: job_state_to_pb(v.state),
         assigned_worker_id: v.assigned_worker_id,
+        assigned_worker_session_id: v
+            .assigned_worker_session_id
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        assigned_worker_session_generation: v
+            .assigned_worker_session_generation
+            .unwrap_or_default(),
         execution_mode: execution_mode_to_pb(v.execution_mode),
         container_image: v.container_image,
         command: v.command,
@@ -589,11 +706,29 @@ fn job_to_pb(v: Job) -> Result<pb::Job, Status> {
         lease_expires_at: v.lease_expires_at.map(ts_to_pb),
         created_at: Some(ts_to_pb(v.created_at)),
         updated_at: Some(ts_to_pb(v.updated_at)),
+        context_json,
+        canonical_authorization,
+        canonical_authorization_version,
+        canonical_authorization_digest,
     })
 }
 
 #[cfg(test)]
 fn job_from_pb(v: pb::Job) -> Result<Job, Status> {
+    if v.context_json.is_empty() {
+        return Err(Status::invalid_argument("missing lossless context_json"));
+    }
+    let context = serde_json::from_slice(&v.context_json)
+        .map_err(|error| Status::invalid_argument(format!("invalid context_json: {error}")))?;
+    let canonical_authorization = if v.canonical_authorization.is_empty() {
+        None
+    } else {
+        Some(protocol::CanonicalAuthorizationArtifact {
+            version: v.canonical_authorization_version,
+            digest: v.canonical_authorization_digest,
+            canonical_bytes: v.canonical_authorization,
+        })
+    };
     Ok(Job {
         id: Uuid::parse_str(&v.id)
             .map_err(|e| Status::invalid_argument(format!("invalid job.id: {e}")))?,
@@ -602,16 +737,22 @@ fn job_from_pb(v: pb::Job) -> Result<Job, Status> {
         step_id: v.step_id,
         state: job_state_from_pb(v.state)?,
         assigned_worker_id: v.assigned_worker_id,
+        assigned_worker_session_id: (!v.assigned_worker_session_id.is_empty())
+            .then(|| Uuid::parse_str(&v.assigned_worker_session_id))
+            .transpose()
+            .map_err(|error| {
+                Status::invalid_argument(format!("invalid assigned worker session ID: {error}"))
+            })?,
+        assigned_worker_session_generation: (v.assigned_worker_session_generation != 0)
+            .then_some(v.assigned_worker_session_generation),
         execution_mode: execution_mode_from_pb(v.execution_mode)?,
         container_image: v.container_image,
         command: v.command,
         args: v.args,
         env: v.env,
         prompt: v.prompt.map(prompt_from_pb),
-        context: json_from_pb(
-            v.context
-                .ok_or_else(|| Status::invalid_argument("missing context"))?,
-        )?,
+        context,
+        canonical_authorization,
         repo: v.repo.map(repo_from_pb),
         timeout_secs: v.timeout_secs,
         max_retries: v.max_retries,
@@ -634,6 +775,7 @@ fn job_from_pb(v: pb::Job) -> Result<Job, Status> {
 mod tests {
     use super::*;
     use crate::server::config::{AuthMode, Token};
+    use prost::Message;
     use tonic::service::Interceptor;
 
     fn config(auth_mode: AuthMode, tokens: Vec<Token>) -> Arc<ServerConfig> {
@@ -669,7 +811,7 @@ mod tests {
     #[test]
     fn job_roundtrip_proto_mapping() {
         let now = Utc::now();
-        let job = Job {
+        let mut job = Job {
             id: Uuid::new_v4(),
             work_item_id: Uuid::new_v4(),
             step_id: "s1".into(),
@@ -684,7 +826,8 @@ mod tests {
                 system: Some("sys".into()),
                 user: "user".into(),
             }),
-            context: serde_json::json!({"a":1}),
+            context: serde_json::from_str(r#"{"a":9007199254740993,"fraction":1.25}"#)
+                .expect("lossless context fixture"),
             repo: Some(RepoSource {
                 repo_url: "https://example/repo.git".into(),
                 base_ref: "origin/main".into(),
@@ -698,17 +841,142 @@ mod tests {
             lease_expires_at: Some(now),
             created_at: now,
             updated_at: now,
+            canonical_authorization: None,
+            assigned_worker_session_id: None,
+            assigned_worker_session_generation: None,
         };
+        let environment = protocol::canonical_environment_for_execution(
+            ExecutionMode::Docker,
+            job.container_image.clone(),
+            job.timeout_secs,
+        );
+        let request = protocol::ResolvedAuthorizationRequest {
+            version: protocol::AUTHORIZATION_REQUEST_VERSION.to_string(),
+            invocation_id: job.work_item_id,
+            work_unit_id: job.work_item_id,
+            root_work_item_id: job.work_item_id,
+            workflow_id: "workflow".to_string(),
+            workflow_snapshot: serde_json::json!({"schema":"fixture"}),
+            state_id: job.step_id.clone(),
+            state_kind: protocol::ReactiveStateKind::Command,
+            behavior: protocol::ResolvedAuthorizationBehavior {
+                execution_kind: "command".to_string(),
+                runner_profile: serde_json::json!({
+                    "profile_name":"command",
+                    "config_digest":"command_v1"
+                }),
+                command: job.command.clone(),
+                args: job.args.clone(),
+                env: job.env.clone().into_iter().collect(),
+                prompt: job.prompt.clone(),
+                primary_repo: job.repo.clone(),
+                primary_repo_branch: job.repo.as_ref().and_then(|repo| repo.branch_name.clone()),
+                execution_context: protocol::authorization_execution_context(&job.context),
+                triage: false,
+                allow_remote_credentials: true,
+            },
+            permission_envelope: protocol::CanonicalRuntimeSpec {
+                runtime_version: "v2".to_string(),
+                permissions: protocol::canonical_permissions_for_environment(&environment),
+                environment,
+                approval_rules: None,
+                repos: Vec::new(),
+                github_capabilities: Vec::new(),
+            },
+            resolved_environment: serde_json::json!({}),
+            provider: protocol::ResolvedAuthorizationProvider {
+                provider: Some("fixture".to_string()),
+                task_id: Some("fixture".to_string()),
+            },
+            resource_constraints: protocol::ResolvedAuthorizationResources {
+                timeout_secs: job.timeout_secs,
+                max_retries: job.max_retries,
+                attempt: job.attempt,
+            },
+        };
+        let bundle = protocol::ImmutableAuthorizationBundle::create(&request)
+            .expect("canonical authorization bundle");
+        protocol::project_authorization_bundle_into_job_context(&mut job.context, &bundle)
+            .expect("project authorization bundle");
+        job.canonical_authorization = Some(bundle.artifact());
 
         let pb = job_to_pb(job.clone()).expect("to pb");
+        let pb = pb::Job::decode(pb.encode_to_vec().as_slice()).expect("protobuf roundtrip");
         let decoded = job_from_pb(pb).expect("from pb");
         assert_eq!(decoded.id, job.id);
         assert_eq!(decoded.step_id, job.step_id);
         assert_eq!(decoded.execution_mode, job.execution_mode);
+        assert_eq!(decoded.context, job.context);
+        assert_eq!(decoded.canonical_authorization, job.canonical_authorization);
         assert_eq!(
             decoded.repo.unwrap().branch_name,
             Some("agent-hub/test".into())
         );
+        let mut id_tamper = job;
+        id_tamper.context[protocol::CONTEXT_AUTHORIZATION_ID_KEY] =
+            serde_json::json!("attacker-id");
+        assert!(job_to_pb(id_tamper).is_err());
+    }
+
+    #[test]
+    fn worker_protocol_capability_roundtrips_and_rejects_legacy_values() {
+        let request = pb::RegisterWorkerRequest {
+            worker_id: "worker".to_string(),
+            hostname: "host".to_string(),
+            supported_modes: vec![pb::ExecutionMode::Docker as i32],
+            protocol_capabilities: vec![
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32,
+            ],
+        };
+        let decoded = pb::RegisterWorkerRequest::decode(request.encode_to_vec().as_slice())
+            .expect("registration protobuf roundtrip");
+        assert_eq!(
+            worker_protocol_capability_from_pb(decoded.protocol_capabilities[0]).unwrap(),
+            WorkerProtocolCapability::CanonicalAuthorizationV1
+        );
+        assert!(
+            worker_protocol_capability_from_pb(pb::WorkerProtocolCapability::Unspecified as i32)
+                .is_err()
+        );
+        assert!(worker_protocol_capability_from_pb(i32::MAX).is_err());
+
+        let response = pb::RegisterWorkerResponse {
+            session_id: Uuid::new_v4().to_string(),
+            session_token: "opaque-test-token".to_string(),
+            session_generation: 7,
+        };
+        let decoded = pb::RegisterWorkerResponse::decode(response.encode_to_vec().as_slice())
+            .expect("registration response protobuf roundtrip");
+        assert_eq!(decoded.session_generation, 7);
+    }
+
+    #[test]
+    fn worker_session_metadata_requires_complete_credential() {
+        let request = Request::new(());
+        assert!(worker_session_from_metadata(&request, true).is_err());
+
+        let mut partial = Request::new(());
+        partial.metadata_mut().insert(
+            WORKER_SESSION_ID_METADATA,
+            Uuid::new_v4().to_string().parse().unwrap(),
+        );
+        assert!(worker_session_from_metadata(&partial, true).is_err());
+
+        let session_id = Uuid::new_v4();
+        let mut complete = Request::new(());
+        complete.metadata_mut().insert(
+            WORKER_SESSION_ID_METADATA,
+            session_id.to_string().parse().unwrap(),
+        );
+        complete.metadata_mut().insert(
+            WORKER_SESSION_TOKEN_METADATA,
+            "opaque-test-token".parse().unwrap(),
+        );
+        let parsed = worker_session_from_metadata(&complete, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.session_id, session_id);
+        assert_eq!(parsed.session_token.expose(), "opaque-test-token");
     }
 
     #[test]

@@ -891,11 +891,37 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         app.clone().oneshot(req).await.unwrap()
     }
 
-    async fn put_json_response(app: &Router, path: &str, body: &str) -> axum::response::Response {
+    async fn post_json_response_with_worker_session(
+        app: &Router,
+        path: &str,
+        body: &str,
+        session_id: &str,
+        session_token: &str,
+    ) -> axum::response::Response {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-agent-hub-worker-session-id", session_id)
+            .header("x-agent-hub-worker-session-token", session_token)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn put_json_response_with_worker_session(
+        app: &Router,
+        path: &str,
+        body: &str,
+        session_id: &str,
+        session_token: &str,
+    ) -> axum::response::Response {
         let req = Request::builder()
             .method("PUT")
             .uri(path)
             .header("content-type", "application/json")
+            .header("x-agent-hub-worker-session-id", session_id)
+            .header("x-agent-hub-worker-session-token", session_token)
             .body(Body::from(body.to_string()))
             .unwrap();
         app.clone().oneshot(req).await.unwrap()
@@ -1167,17 +1193,51 @@ kind = "terminal"
         .await;
         assert_eq!(create_resp.status(), AxumStatus::OK);
 
-        let _ = post_json_response(
+        let registration = post_json_response(
             &app,
             "/api/v1/orchestration/workers",
-            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"]}"#,
+            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1"]}"#,
         )
         .await;
+        assert_eq!(registration.status(), AxumStatus::OK);
+        let registration: Value = serde_json::from_slice(
+            &axum::body::to_bytes(registration.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let session_id = registration["session_id"].as_str().unwrap();
+        let session_token = registration["session_token"].as_str().unwrap();
 
-        let poll_resp = post_json_response(
+        assert_eq!(
+            post_json_response(
+                &app,
+                "/api/v1/orchestration/poll",
+                r#"{"worker_id":"worker-artifacts"}"#,
+            )
+            .await
+            .status(),
+            AxumStatus::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_json_response_with_worker_session(
+                &app,
+                "/api/v1/orchestration/poll",
+                r#"{"worker_id":"worker-artifacts"}"#,
+                session_id,
+                "tampered-token",
+            )
+            .await
+            .status(),
+            AxumStatus::UNAUTHORIZED
+        );
+
+        let poll_resp = post_json_response_with_worker_session(
             &app,
             "/api/v1/orchestration/poll",
             r#"{"worker_id":"worker-artifacts"}"#,
+            session_id,
+            session_token,
         )
         .await;
         assert_eq!(poll_resp.status(), AxumStatus::OK);
@@ -1208,10 +1268,12 @@ kind = "terminal"
         })
         .to_string();
 
-        let running_resp = put_json_response(
+        let running_resp = put_json_response_with_worker_session(
             &app,
             &format!("/api/v1/orchestration/jobs/{job_id}"),
             &running_body,
+            session_id,
+            session_token,
         )
         .await;
         assert_eq!(running_resp.status(), AxumStatus::OK);
@@ -1247,10 +1309,12 @@ kind = "terminal"
         })
         .to_string();
 
-        let update_resp = put_json_response(
+        let update_resp = put_json_response_with_worker_session(
             &app,
             &format!("/api/v1/orchestration/jobs/{job_id}"),
             &update_body,
+            session_id,
+            session_token,
         )
         .await;
         assert_eq!(update_resp.status(), AxumStatus::OK);

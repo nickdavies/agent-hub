@@ -283,13 +283,27 @@ impl RunnerProfilesConfig {
                 credential_descriptor(provider_name, definition)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        credential_providers.sort_by(|left, right| left.name.cmp(&right.name));
+        for provider in &mut credential_providers {
+            provider.targets.sort();
+            provider.targets.dedup();
+        }
+        credential_providers.sort_by(|left, right| {
+            (&left.name, &left.provider_type, &left.targets).cmp(&(
+                &right.name,
+                &right.provider_type,
+                &right.targets,
+            ))
+        });
         let mut mcp_bridges = self
             .mcp_bridges
             .iter()
             .map(mcp_bridge_descriptor)
             .collect::<Result<Vec<_>, _>>()?;
-        mcp_bridges.sort_by(|left, right| left.name.cmp(&right.name));
+        for bridge in &mut mcp_bridges {
+            bridge.env_keys.sort();
+            bridge.env_keys.dedup();
+        }
+        mcp_bridges.sort_by(mcp_bridge_sort_key);
         if mcp_bridges
             .windows(2)
             .any(|bridges| bridges[0].name == bridges[1].name)
@@ -307,7 +321,7 @@ impl RunnerProfilesConfig {
         github_hosts.sort();
         github_hosts.dedup();
 
-        let mut profile = ResolvedRunnerProfile {
+        let profile = ResolvedRunnerProfile {
             profile_name: name,
             kind: spec.kind,
             command: spec.command,
@@ -325,8 +339,7 @@ impl RunnerProfilesConfig {
             opencode: spec.opencode,
             config_digest: String::new(),
         };
-        profile.config_digest = digest_profile(&profile)?;
-        Ok(profile)
+        canonicalize_resolved_runner_profile(&profile)
     }
 }
 
@@ -421,7 +434,9 @@ fn default_egress_value() -> serde_json::Value {
     })
 }
 
-pub fn digest_profile(profile: &ResolvedRunnerProfile) -> Result<String, String> {
+fn canonical_profile_without_digest(
+    profile: &ResolvedRunnerProfile,
+) -> Result<ResolvedRunnerProfile, String> {
     let mut canonical = profile.clone();
     canonical.config_digest.clear();
     canonical.file_mounts.sort_by(|left, right| {
@@ -431,6 +446,11 @@ pub fn digest_profile(profile: &ResolvedRunnerProfile) -> Result<String, String>
             right.read_only,
         ))
     });
+    canonical.file_mounts.dedup();
+    for provider in &mut canonical.credential_providers {
+        provider.targets.sort();
+        provider.targets.dedup();
+    }
     canonical.credential_providers.sort_by(|left, right| {
         (&left.name, &left.provider_type, &left.targets).cmp(&(
             &right.name,
@@ -439,11 +459,140 @@ pub fn digest_profile(profile: &ResolvedRunnerProfile) -> Result<String, String>
         ))
     });
     canonical.trusted_mounts.sort();
-    canonical
-        .mcp_bridges
-        .sort_by(|left, right| left.name.cmp(&right.name));
+    canonical.trusted_mounts.dedup();
+    for bridge in &mut canonical.mcp_bridges {
+        bridge.env_keys.sort();
+        bridge.env_keys.dedup();
+    }
+    canonical.mcp_bridges.sort_by(mcp_bridge_sort_key);
+    canonical.github_hosts = canonical
+        .github_hosts
+        .iter()
+        .map(|host| host.trim().to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    canonical.egress = canonicalize_resolved_egress(canonical.egress)?;
+    Ok(canonical)
+}
+
+pub fn canonicalize_resolved_runner_profile(
+    profile: &ResolvedRunnerProfile,
+) -> Result<ResolvedRunnerProfile, String> {
+    let mut canonical = canonical_profile_without_digest(profile)?;
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
+    canonical.config_digest = hex::encode(Sha256::digest(bytes));
+    Ok(canonical)
+}
+
+pub fn digest_profile(profile: &ResolvedRunnerProfile) -> Result<String, String> {
+    let canonical = canonical_profile_without_digest(profile)?;
     let bytes = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
     Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn canonicalize_resolved_egress(value: serde_json::Value) -> Result<serde_json::Value, String> {
+    fn merge_set_values(left: &mut serde_json::Value, right: serde_json::Value) {
+        if let (Some(left), Some(right)) = (left.as_array_mut(), right.as_array()) {
+            left.extend(right.iter().cloned());
+        }
+    }
+
+    fn walk(value: serde_json::Value, key: Option<&str>) -> Result<serde_json::Value, String> {
+        match value {
+            serde_json::Value::Object(object) => {
+                let mut output = BTreeMap::<String, serde_json::Value>::new();
+                for (raw_key, value) in object {
+                    let canonical_key = if key == Some("providers") {
+                        raw_key.trim().to_ascii_lowercase()
+                    } else {
+                        raw_key
+                    };
+                    let child_key = if key == Some("providers") {
+                        "provider_hosts"
+                    } else {
+                        canonical_key.as_str()
+                    };
+                    let value = walk(value, Some(child_key))?;
+                    if let Some(existing) = output.get_mut(&canonical_key) {
+                        merge_set_values(existing, value);
+                    } else {
+                        output.insert(canonical_key, value);
+                    }
+                }
+                if key == Some("providers") {
+                    for value in output.values_mut() {
+                        if let Some(values) = value.as_array_mut() {
+                            values.sort_by_key(ToString::to_string);
+                            values.dedup();
+                        }
+                    }
+                }
+                Ok(serde_json::Value::Object(output.into_iter().collect()))
+            }
+            serde_json::Value::Array(values)
+                if key.is_some_and(|key| key.contains("hosts"))
+                    || key == Some("declared_volumes") =>
+            {
+                let lowercase = key != Some("declared_volumes");
+                let mut values = values
+                    .into_iter()
+                    .map(|value| {
+                        let value = value
+                            .as_str()
+                            .ok_or_else(|| "egress set values must be strings".to_string())?
+                            .trim()
+                            .to_string();
+                        Ok(if lowercase {
+                            value.to_ascii_lowercase()
+                        } else {
+                            value
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                values.sort();
+                values.dedup();
+                Ok(serde_json::Value::Array(
+                    values.into_iter().map(serde_json::Value::String).collect(),
+                ))
+            }
+            serde_json::Value::Array(values) => Ok(serde_json::Value::Array(
+                values
+                    .into_iter()
+                    .map(|value| walk(value, key))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            serde_json::Value::String(value) if key == Some("default_provider") => {
+                Ok(serde_json::Value::String(value.trim().to_ascii_lowercase()))
+            }
+            other => Ok(other),
+        }
+    }
+
+    canonicalize_egress(walk(value, None)?)
+}
+
+fn mcp_bridge_sort_key(
+    left: &McpBridgeDescriptor,
+    right: &McpBridgeDescriptor,
+) -> std::cmp::Ordering {
+    (
+        &left.name,
+        &left.endpoint_type,
+        &left.target,
+        &left.container_socket_path,
+        &left.args,
+        &left.env_keys,
+    )
+        .cmp(&(
+            &right.name,
+            &right.endpoint_type,
+            &right.target,
+            &right.container_socket_path,
+            &right.args,
+            &right.env_keys,
+        ))
 }
 
 fn mcp_bridge_descriptor(value: &serde_json::Value) -> Result<McpBridgeDescriptor, String> {
@@ -962,6 +1111,148 @@ mod tests {
         assert_eq!(
             first.resolve_agent_profile(None).unwrap(),
             second.resolve_agent_profile(None).unwrap()
+        );
+    }
+
+    #[test]
+    fn profile_digest_normalizes_all_set_collections_with_total_keys() {
+        let mut first = canonical_test_config()
+            .validated()
+            .unwrap()
+            .resolve_agent_profile(None)
+            .unwrap();
+        first.file_mounts = vec![
+            ManagedRunnerFileMount {
+                host_path: "/b".to_string(),
+                container_path: "/same".to_string(),
+                read_only: false,
+            },
+            ManagedRunnerFileMount {
+                host_path: "/a".to_string(),
+                container_path: "/same".to_string(),
+                read_only: true,
+            },
+        ];
+        first.credential_providers = vec![
+            CredentialProviderDescriptor {
+                name: "same".to_string(),
+                provider_type: "oauth".to_string(),
+                targets: vec!["/b".to_string(), "/a".to_string()],
+            },
+            CredentialProviderDescriptor {
+                name: "same".to_string(),
+                provider_type: "api".to_string(),
+                targets: vec!["/z".to_string(), "/y".to_string()],
+            },
+        ];
+        first.trusted_mounts = vec![
+            TrustedMountDescriptor {
+                purpose: "state".to_string(),
+                container_path: "/same".to_string(),
+                read_only: false,
+            },
+            TrustedMountDescriptor {
+                purpose: "config".to_string(),
+                container_path: "/same".to_string(),
+                read_only: true,
+            },
+        ];
+        first.mcp_bridges = vec![
+            McpBridgeDescriptor {
+                name: "same".to_string(),
+                endpoint_type: "unix".to_string(),
+                target: "b".to_string(),
+                container_socket_path: "/b.sock".to_string(),
+                args: vec!["second".to_string(), "first".to_string()],
+                env_keys: vec!["Z".to_string(), "A".to_string()],
+            },
+            McpBridgeDescriptor {
+                name: "same".to_string(),
+                endpoint_type: "unix".to_string(),
+                target: "a".to_string(),
+                container_socket_path: "/a.sock".to_string(),
+                args: Vec::new(),
+                env_keys: vec!["Y".to_string(), "B".to_string()],
+            },
+        ];
+        first.github_hosts = vec!["git.example.com".to_string(), "github.com".to_string()];
+        first.egress["llm"]["providers"] = serde_json::json!({
+            "OpenAI":["CHATGPT.COM","auth.openai.com"],
+            "openai":["chatgpt.com"]
+        });
+        first.egress["proxy"]["declared_volumes"] =
+            serde_json::json!(["/var/spool/squid", "/var/log/squid"]);
+
+        let mut reversed = first.clone();
+        reversed.file_mounts.reverse();
+        reversed.credential_providers.reverse();
+        for provider in &mut reversed.credential_providers {
+            provider.targets.reverse();
+        }
+        reversed.trusted_mounts.reverse();
+        reversed.mcp_bridges.reverse();
+        for bridge in &mut reversed.mcp_bridges {
+            bridge.env_keys.reverse();
+        }
+        reversed.github_hosts.reverse();
+        reversed.egress["llm"]["providers"] = serde_json::json!({
+            "openai":["AUTH.OPENAI.COM","chatgpt.com"]
+        });
+        reversed.egress["proxy"]["declared_volumes"] =
+            serde_json::json!(["/var/log/squid", "/var/spool/squid"]);
+
+        assert_eq!(
+            digest_profile(&first).unwrap(),
+            digest_profile(&reversed).unwrap()
+        );
+        let canonical_first = canonicalize_resolved_runner_profile(&first).unwrap();
+        let canonical_reversed = canonicalize_resolved_runner_profile(&reversed).unwrap();
+        assert_eq!(canonical_first, canonical_reversed);
+        assert_eq!(
+            canonical_first.args, first.args,
+            "ordered command arguments are preserved"
+        );
+        reversed
+            .mcp_bridges
+            .iter_mut()
+            .find(|bridge| !bridge.args.is_empty())
+            .unwrap()
+            .args
+            .reverse();
+        assert_ne!(
+            digest_profile(&first).unwrap(),
+            digest_profile(&reversed).unwrap()
+        );
+    }
+
+    #[test]
+    fn omitted_and_explicit_runner_defaults_resolve_to_identical_canonical_profile() {
+        let configured = canonical_test_config();
+        let mut omitted = serde_json::to_value(&configured).unwrap();
+        omitted["default_agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("opencode");
+        let mut explicit = serde_json::to_value(configured).unwrap();
+        explicit["default_agent"]["opencode"] = serde_json::json!({
+            "max_validation_attempts": default_opencode_validation_attempts()
+        });
+        let omitted: RunnerProfilesConfig = serde_json::from_value(omitted).unwrap();
+        let explicit: RunnerProfilesConfig = serde_json::from_value(explicit).unwrap();
+        let omitted = omitted
+            .validated()
+            .unwrap()
+            .resolve_agent_profile(None)
+            .unwrap();
+        let explicit = explicit
+            .validated()
+            .unwrap()
+            .resolve_agent_profile(None)
+            .unwrap();
+        assert_eq!(omitted, explicit);
+        assert_eq!(
+            omitted,
+            canonicalize_resolved_runner_profile(&omitted).unwrap()
         );
     }
 

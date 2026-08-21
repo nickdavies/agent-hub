@@ -228,11 +228,15 @@ async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result
 
     // Spawn orchestration maintenance loop (faster cadence than session cleanup)
     let orchestration_bg = Arc::clone(&state.orchestration);
+    let worker_recovery_notify = orchestration_bg.worker_recovery_notify();
     let job_events_bg = Arc::clone(&state.job_events);
     let maintenance_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = worker_recovery_notify.notified() => {}
+            }
             tracing::debug!("maintenance tick starting");
             match tokio::time::timeout(
                 Duration::from_secs(120),

@@ -1,15 +1,17 @@
 use anyhow::Context;
 use protocol::{
-    HeartbeatRequest, Job, JobResult, JobState, JobUpdateRequest, PollJobRequest, PollJobResponse,
-    RegisterWorkerRequest, Secret, WorkerState,
+    AuthenticatedWorkerSession, HeartbeatRequest, Job, JobResult, JobState, JobUpdateRequest,
+    PollJobRequest, PollJobResponse, RegisterWorkerRequest, RegisterWorkerResponse, Secret,
+    WorkerState,
 };
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 
-use crate::pb;
-use crate::pb_conv::{
+use local_agent::pb;
+use local_agent::pb_conv::{
     execution_mode_to_pb, job_from_pb, job_result_to_pb, job_state_to_pb, worker_state_to_pb,
 };
 
@@ -26,12 +28,14 @@ pub(crate) struct HttpClient {
     pub(crate) http: reqwest::Client,
     pub(crate) base: String,
     pub(crate) token: Option<Secret>,
+    pub(crate) worker_session: Arc<RwLock<Option<AuthenticatedWorkerSession>>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct GrpcClient {
     pub(crate) client: pb::worker_lifecycle_client::WorkerLifecycleClient<Channel>,
     pub(crate) token: Option<Secret>,
+    pub(crate) worker_session: Arc<RwLock<Option<AuthenticatedWorkerSession>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +65,7 @@ impl HttpClient {
             http: reqwest::Client::new(),
             base,
             token,
+            worker_session: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -71,22 +76,72 @@ impl HttpClient {
             req
         }
     }
+
+    fn worker_session(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let session = self
+            .worker_session
+            .read()
+            .expect("worker session lock poisoned")
+            .clone();
+        if let Some(session) = session {
+            req.header(
+                "x-agent-hub-worker-session-id",
+                session.session_id.to_string(),
+            )
+            .header(
+                "x-agent-hub-worker-session-token",
+                session.session_token.expose(),
+            )
+        } else {
+            req
+        }
+    }
 }
 
 impl Client {
+    pub(crate) fn worker_session(&self) -> Option<AuthenticatedWorkerSession> {
+        match self {
+            Client::Http(client) => client
+                .worker_session
+                .read()
+                .expect("worker session lock poisoned")
+                .clone(),
+            Client::Grpc(client) => client
+                .worker_session
+                .read()
+                .expect("worker session lock poisoned")
+                .clone(),
+        }
+    }
+
     pub(crate) async fn register_worker(&self, req: &RegisterWorkerRequest) -> anyhow::Result<()> {
         match self {
             Client::Http(client) => {
                 let url = format!("{}/api/v1/orchestration/workers", client.base);
-                let resp = client.auth(client.http.post(url)).json(req).send().await?;
+                let resp = client
+                    .worker_session(client.auth(client.http.post(url)))
+                    .json(req)
+                    .send()
+                    .await?;
                 if !resp.status().is_success() {
                     anyhow::bail!("register failed: {}", resp.status());
                 }
+                let registered: RegisterWorkerResponse = resp.json().await?;
+                *client
+                    .worker_session
+                    .write()
+                    .expect("worker session lock poisoned") = Some(AuthenticatedWorkerSession {
+                    worker_id: req.id.clone(),
+                    session_id: registered.session_id,
+                    session_token: registered.session_token,
+                    generation: registered.session_generation,
+                });
                 Ok(())
             }
             Client::Grpc(client) => {
+                let worker_id = req.id.clone();
                 let mut inner = client.client.clone();
-                let req = apply_grpc_bearer(
+                let mut req = apply_grpc_bearer(
                     client.token.as_ref(),
                     tonic::Request::new(pb::RegisterWorkerRequest {
                         worker_id: req.id.clone(),
@@ -97,9 +152,37 @@ impl Client {
                             .cloned()
                             .map(execution_mode_to_pb)
                             .collect(),
+                        protocol_capabilities: req
+                            .protocol_capabilities
+                            .iter()
+                            .map(|capability| match capability {
+                                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1 => {
+                                    pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32
+                                }
+                            })
+                            .collect(),
                     }),
                 )?;
-                inner.register_worker(req).await?;
+                apply_worker_session_metadata(
+                    &mut req,
+                    client
+                        .worker_session
+                        .read()
+                        .expect("worker session lock poisoned")
+                        .as_ref(),
+                )?;
+                let registered = inner.register_worker(req).await?.into_inner();
+                let session_id = uuid::Uuid::parse_str(&registered.session_id)
+                    .context("invalid worker session ID from server")?;
+                *client
+                    .worker_session
+                    .write()
+                    .expect("worker session lock poisoned") = Some(AuthenticatedWorkerSession {
+                    worker_id,
+                    session_id,
+                    session_token: Secret::new(registered.session_token),
+                    generation: registered.session_generation,
+                });
                 Ok(())
             }
         }
@@ -113,7 +196,7 @@ impl Client {
                     client.base
                 );
                 let resp = client
-                    .auth(client.http.post(url))
+                    .worker_session(client.auth(client.http.post(url)))
                     .json(&HeartbeatRequest { state })
                     .send()
                     .await?;
@@ -127,12 +210,20 @@ impl Client {
             }
             Client::Grpc(client) => {
                 let mut inner = client.client.clone();
-                let req = apply_grpc_bearer(
+                let mut req = apply_grpc_bearer(
                     client.token.as_ref(),
                     tonic::Request::new(pb::HeartbeatWorkerRequest {
                         worker_id: id.to_string(),
                         state: worker_state_to_pb(state),
                     }),
+                )?;
+                apply_worker_session_metadata(
+                    &mut req,
+                    client
+                        .worker_session
+                        .read()
+                        .expect("worker session lock poisoned")
+                        .as_ref(),
                 )?;
                 match inner.heartbeat_worker(req).await {
                     Ok(_) => {}
@@ -154,7 +245,7 @@ impl Client {
             Client::Http(client) => {
                 let url = format!("{}/api/v1/orchestration/poll", client.base);
                 let resp = client
-                    .auth(client.http.post(url))
+                    .worker_session(client.auth(client.http.post(url)))
                     .json(&PollJobRequest {
                         worker_id: worker_id.to_string(),
                     })
@@ -167,15 +258,50 @@ impl Client {
                     anyhow::bail!("poll failed: {}", resp.status());
                 }
                 let parsed: PollJobResponse = resp.json().await?;
+                if parsed
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.canonical_authorization.is_none())
+                {
+                    anyhow::bail!(
+                        "job is incompatible: missing canonical authorization bytes; recreate it with a current server"
+                    );
+                }
+                if let Some(job) = parsed.job.as_ref() {
+                    let session = client
+                        .worker_session
+                        .read()
+                        .expect("worker session lock poisoned")
+                        .clone()
+                        .context("worker has no authenticated session")?;
+                    if session.worker_id != worker_id {
+                        anyhow::bail!("authenticated worker session identity mismatch");
+                    }
+                    local_agent::verify_authorized_job(
+                        job,
+                        worker_id,
+                        session.session_id,
+                        session.generation,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
                 Ok(parsed.job)
             }
             Client::Grpc(client) => {
                 let mut inner = client.client.clone();
-                let req = apply_grpc_bearer(
+                let mut req = apply_grpc_bearer(
                     client.token.as_ref(),
                     tonic::Request::new(pb::PollJobRequest {
                         worker_id: worker_id.to_string(),
                     }),
+                )?;
+                apply_worker_session_metadata(
+                    &mut req,
+                    client
+                        .worker_session
+                        .read()
+                        .expect("worker session lock poisoned")
+                        .as_ref(),
                 )?;
                 let resp = match inner.poll_job(req).await {
                     Ok(resp) => resp,
@@ -188,7 +314,26 @@ impl Client {
                     Err(status) => return Err(status.into()),
                 }
                 .into_inner();
-                Ok(resp.job.map(job_from_pb).transpose()?)
+                let job = resp.job.map(job_from_pb).transpose()?;
+                if let Some(job) = job.as_ref() {
+                    let session = client
+                        .worker_session
+                        .read()
+                        .expect("worker session lock poisoned")
+                        .clone()
+                        .context("worker has no authenticated session")?;
+                    if session.worker_id != worker_id {
+                        anyhow::bail!("authenticated worker session identity mismatch");
+                    }
+                    local_agent::verify_authorized_job(
+                        job,
+                        worker_id,
+                        session.session_id,
+                        session.generation,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                }
+                Ok(job)
             }
         }
     }
@@ -205,7 +350,7 @@ impl Client {
             Client::Http(client) => {
                 let url = format!("{}/api/v1/orchestration/jobs/{job_id}", client.base);
                 let resp = client
-                    .auth(client.http.put(url))
+                    .worker_session(client.auth(client.http.put(url)))
                     .json(&JobUpdateRequest {
                         worker_id: worker_id.to_string(),
                         state,
@@ -228,7 +373,7 @@ impl Client {
             }
             Client::Grpc(client) => {
                 let mut inner = client.client.clone();
-                let req = apply_grpc_bearer(
+                let mut req = apply_grpc_bearer(
                     client.token.as_ref(),
                     tonic::Request::new(pb::UpdateJobRequest {
                         worker_id: worker_id.to_string(),
@@ -237,6 +382,14 @@ impl Client {
                         transcript_dir,
                         result: result.map(job_result_to_pb),
                     }),
+                )?;
+                apply_worker_session_metadata(
+                    &mut req,
+                    client
+                        .worker_session
+                        .read()
+                        .expect("worker session lock poisoned")
+                        .as_ref(),
                 )?;
                 match inner.update_job(req).await {
                     Ok(_) => Ok(JobUpdateOutcome::Applied),
@@ -270,15 +423,41 @@ impl Client {
 pub(crate) async fn start_grpc_event_stream(
     mut client: pb::worker_lifecycle_client::WorkerLifecycleClient<Channel>,
     token: Option<Secret>,
+    worker_id: &str,
+    worker_session: &AuthenticatedWorkerSession,
 ) -> anyhow::Result<mpsc::Sender<pb::JobEventChunk>> {
     let (tx, rx) = mpsc::channel::<pb::JobEventChunk>(512);
-    let req = apply_grpc_bearer(token.as_ref(), tonic::Request::new(ReceiverStream::new(rx)))?;
+    let mut req = apply_grpc_bearer(token.as_ref(), tonic::Request::new(ReceiverStream::new(rx)))?;
+    apply_worker_session_metadata(&mut req, Some(worker_session))?;
+    req.metadata_mut().insert(
+        "x-agent-hub-worker-id",
+        MetadataValue::try_from(worker_id).context("invalid worker ID for gRPC metadata")?,
+    );
     tokio::spawn(async move {
         if let Err(error) = client.stream_job_events(req).await {
             eprintln!("gRPC event stream ended: {error}");
         }
     });
     Ok(tx)
+}
+
+fn apply_worker_session_metadata<T>(
+    request: &mut tonic::Request<T>,
+    credential: Option<&AuthenticatedWorkerSession>,
+) -> anyhow::Result<()> {
+    if let Some(credential) = credential {
+        request.metadata_mut().insert(
+            "x-agent-hub-worker-session-id",
+            MetadataValue::try_from(credential.session_id.to_string())
+                .context("invalid worker session ID for gRPC metadata")?,
+        );
+        request.metadata_mut().insert(
+            "x-agent-hub-worker-session-token",
+            MetadataValue::try_from(credential.session_token.expose())
+                .context("invalid worker session token for gRPC metadata")?,
+        );
+    }
+    Ok(())
 }
 
 fn apply_grpc_bearer<T>(

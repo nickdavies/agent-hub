@@ -28,9 +28,14 @@ pub enum AppError {
     JobNotFound(String),
 
     #[error("worker not found: {0}")]
+    #[allow(dead_code)]
     WorkerNotFound(String),
 
+    #[error("worker session unauthorized: {0}")]
+    WorkerSessionUnauthorized(String),
+
     #[error("job ownership violation: {0}")]
+    #[allow(dead_code)]
     JobOwnership(String),
 
     #[error("job already cancelled: {0}")]
@@ -47,6 +52,7 @@ impl IntoResponse for AppError {
             AppError::WorkItemNotFound(_) => StatusCode::NOT_FOUND,
             AppError::JobNotFound(_) => StatusCode::NOT_FOUND,
             AppError::WorkerNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::WorkerSessionUnauthorized(_) => StatusCode::UNAUTHORIZED,
             AppError::WorkflowInvalid(_) => StatusCode::BAD_REQUEST,
             AppError::JobOwnership(_) => StatusCode::CONFLICT,
             AppError::JobCancelled(_) => StatusCode::CONFLICT,
