@@ -95,3 +95,22 @@ are never made available to agent or command jobs.
 - Artifact paths in job metadata are now stored relative to artifact root (for local-agent-produced artifacts), so server no longer depends on arbitrary host absolute paths.
 - `simple-code-change` uses the configured `job-code` image.
 - `VIKUNJA_BASE_URL` should be the Vikunja service root (for local compose: `http://vikunja:3456` inside the server container), not the `/api/v1` path.
+## Authorization protocol rollback
+
+Before rolling the server back to a v1-only build, stop dispatch, drain or explicitly quarantine
+every pending/assigned/running canonical-authorization-v2 job, and invalidate/re-register all v2
+worker sessions. The rollback is prohibited until this preflight succeeds:
+
+```bash
+agent-hub-server rollback-preflight-v1 --database "$ORCHESTRATION_DB"
+```
+
+The check fails closed while either active v2 jobs or registered v2 sessions remain. Do not rewrite
+v2 authorization bytes as v1 or reuse a v2 session with a v1-only server.
+
+The successful preflight commits a durable v1 fence. A compatible server may lift it only through
+the explicit command below; startup never changes an existing fence:
+
+```bash
+agent-hub-server set-authorization-protocol-mode --database "$ORCHESTRATION_DB" --max-version 2
+```

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use rusqlite::{Connection, TransactionBehavior};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -29,6 +30,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Refuse a rollback to a v1-only server while v2 work or sessions remain.
+    RollbackPreflightV1 {
+        #[arg(long, env = "ORCHESTRATION_DB")]
+        database: PathBuf,
+    },
+    /// Explicitly change the durable authorization protocol fence.
+    SetAuthorizationProtocolMode {
+        #[arg(long, env = "ORCHESTRATION_DB")]
+        database: PathBuf,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=2))]
+        max_version: u32,
+    },
     /// Start the notification server
     Serve {
         #[command(subcommand)]
@@ -90,6 +103,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::RollbackPreflightV1 { database } => rollback_preflight_v1(&database),
+        Command::SetAuthorizationProtocolMode {
+            database,
+            max_version,
+        } => set_authorization_protocol_mode(&database, max_version),
         Command::Serve { notifier } => match notifier {
             NotifierArgs::Pushover {
                 token,
@@ -106,6 +124,87 @@ async fn main() -> anyhow::Result<()> {
             NotifierArgs::Noop { storage } => serve_with_storage(NullNotifier, storage).await,
         },
     }
+}
+
+fn rollback_preflight_v1(database: &std::path::Path) -> anyhow::Result<()> {
+    let mut connection = Connection::open(database)
+        .with_context(|| format!("open orchestration database {}", database.display()))?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    let updated = tx.execute(
+        "UPDATE authorization_protocol_mode SET max_authorization_version = 1, updated_at = ?1 WHERE id = 1",
+        [chrono::Utc::now().to_rfc3339()],
+    )?;
+    if updated != 1 {
+        anyhow::bail!("authorization protocol fence row is missing or malformed");
+    }
+    let v2_jobs: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE canonical_authorization_version >= 2 AND state IN ('pending','assigned','running')",
+        [],
+        |row| row.get(0),
+    )?;
+    let v2_sessions: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM workers WHERE protocol_capabilities_json LIKE '%canonical_authorization_v2%'",
+        [],
+        |row| row.get(0),
+    )?;
+    let v2_obligations: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM authorization_obligations WHERE canonical_authorization_version >= 2 AND state IN ('pending','approved')",
+        [], |row| row.get(0),
+    )?;
+    let v2_records: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM authorization_records r JOIN work_items w ON w.id = r.work_item_id WHERE r.canonical_authorization_version >= 2 AND w.state NOT IN ('succeeded','failed','cancelled')",
+        [], |row| row.get(0),
+    )?;
+    let v2_recovery: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM worker_session_recovery_inbox i JOIN jobs j ON j.id = i.job_id WHERE j.canonical_authorization_version >= 2 AND i.state IN ('pending','approved')",
+        [], |row| row.get(0),
+    )?;
+    let reactivatable_workflows: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM work_items WHERE state NOT IN ('succeeded','failed','cancelled','human_gate')",
+        [], |row| row.get(0),
+    )?;
+    if [
+        v2_jobs,
+        v2_sessions,
+        v2_obligations,
+        v2_records,
+        v2_recovery,
+        reactivatable_workflows,
+    ]
+    .into_iter()
+    .any(|count| count != 0)
+    {
+        let ids = tx.prepare(
+            "SELECT id FROM jobs WHERE canonical_authorization_version >= 2 AND state IN ('pending','assigned','running') LIMIT 10"
+        )?.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        anyhow::bail!(
+            "v1 rollback refused: active_v2_jobs={v2_jobs}, v2_workers={v2_sessions}, v2_obligations={v2_obligations}, reactivatable_v2_records={v2_records}, v2_recovery={v2_recovery}, reactivatable_workflows={reactivatable_workflows}, bounded_job_ids={ids:?}"
+        );
+    }
+    tx.commit()?;
+    println!("v1 rollback preflight passed");
+    Ok(())
+}
+
+fn set_authorization_protocol_mode(
+    database: &std::path::Path,
+    max_version: u32,
+) -> anyhow::Result<()> {
+    if max_version == 1 {
+        return rollback_preflight_v1(database);
+    }
+    let mut connection = Connection::open(database)?;
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    let updated = tx.execute(
+        "UPDATE authorization_protocol_mode SET max_authorization_version = 2, updated_at = ?1 WHERE id = 1",
+        [chrono::Utc::now().to_rfc3339()],
+    )?;
+    if updated != 1 {
+        anyhow::bail!("authorization protocol fence row is missing or malformed");
+    }
+    tx.commit()?;
+    println!("authorization protocol fence set to v2");
+    Ok(())
 }
 
 async fn serve_with_storage(
@@ -348,4 +447,65 @@ async fn shutdown_signal() {
         .await
         .expect("failed to install ctrl+c handler");
     info!("shutting down");
+}
+
+#[cfg(test)]
+mod rollback_preflight_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rollback_preflight_rejects_v2_jobs_and_sessions_then_allows_v1() {
+        let path = std::env::temp_dir().join(format!(
+            "rollback-preflight-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let tasks = std::env::temp_dir().join(format!("rollback-tasks-{}", uuid::Uuid::new_v4()));
+        let service = server::orchestration::OrchestrationService::new(
+            Arc::new(server::workflows::WorkflowCatalog::empty_for_test()),
+            Arc::new(server::task_files::TaskFileStore::new(tasks.clone())),
+            path.to_string_lossy().into_owned(),
+        );
+        service.init().await.unwrap();
+        drop(service);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute(
+            "INSERT INTO workers (id, hostname, state, supported_modes_json, protocol_capabilities_json, session_id, session_generation, last_heartbeat_at) VALUES ('worker-v2','host','idle','[]','[\"canonical_authorization_v2\"]','session',1,'now')",
+            [],
+        ).unwrap();
+        assert!(rollback_preflight_v1(&path).is_err());
+        connection.execute("DELETE FROM workers", []).unwrap();
+        assert!(rollback_preflight_v1(&path).is_ok());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            connection.execute(
+                "INSERT INTO authorization_obligations (checkpoint_owner_id, work_item_id, request_digest, request_json, job_json, canonical_authorization_version, canonical_authorization_bytes, state, created_at, updated_at) VALUES ('owner','item','digest','{}','{}',2,X'00','pending','now','now')",
+                [],
+            ).is_err(),
+            "v2 obligation insertion must lose the race against a committed v1 fence"
+        );
+        set_authorization_protocol_mode(&path, 2).unwrap();
+        assert_eq!(
+            connection.execute(
+                "INSERT INTO authorization_obligations (checkpoint_owner_id, work_item_id, request_digest, request_json, job_json, canonical_authorization_version, canonical_authorization_bytes, state, created_at, updated_at) VALUES ('owner','item','digest','{}','{}',2,X'00','pending','now','now')",
+                [],
+            ).unwrap(),
+            1
+        );
+        connection
+            .execute("DELETE FROM authorization_protocol_mode", [])
+            .unwrap();
+        assert!(set_authorization_protocol_mode(&path, 2).is_err());
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_dir_all(tasks);
+    }
 }

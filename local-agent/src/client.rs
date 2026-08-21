@@ -17,6 +17,77 @@ use local_agent::pb_conv::{
 
 const WORKER_NOT_FOUND_MARKER: &str = "worker not found";
 
+fn capabilities_from_header(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<protocol::WorkerProtocolCapability> {
+    let value = headers
+        .get("x-agent-hub-server-capabilities")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let mut capabilities = Vec::new();
+    for value in value.split(',').map(str::trim) {
+        let capability = match value {
+            "canonical_authorization_v1" => {
+                Some(protocol::WorkerProtocolCapability::CanonicalAuthorizationV1)
+            }
+            "canonical_authorization_v2" => {
+                Some(protocol::WorkerProtocolCapability::CanonicalAuthorizationV2)
+            }
+            _ => None,
+        };
+        if let Some(capability) = capability
+            && !capabilities.contains(&capability)
+        {
+            capabilities.push(capability);
+        }
+    }
+    capabilities
+}
+
+fn capabilities_from_pb(
+    values: Vec<i32>,
+) -> anyhow::Result<Vec<protocol::WorkerProtocolCapability>> {
+    values
+        .into_iter()
+        .map(|capability| {
+            match pb::WorkerProtocolCapability::try_from(capability)
+                .context("unknown server worker protocol capability")?
+            {
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV1 => {
+                    Ok(protocol::WorkerProtocolCapability::CanonicalAuthorizationV1)
+                }
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV2 => {
+                    Ok(protocol::WorkerProtocolCapability::CanonicalAuthorizationV2)
+                }
+                pb::WorkerProtocolCapability::Unspecified => {
+                    anyhow::bail!("server advertised unspecified worker capability")
+                }
+            }
+        })
+        .collect()
+}
+
+fn update_bound_capabilities(
+    state: &Arc<RwLock<Option<BoundServerCapabilities>>>,
+    expected: &AuthenticatedWorkerSession,
+    capabilities: Vec<protocol::WorkerProtocolCapability>,
+) -> anyhow::Result<()> {
+    let mut current = state
+        .write()
+        .expect("server capability state lock poisoned");
+    if current.as_ref().is_none_or(|current| {
+        current.session_id != expected.session_id || current.generation != expected.generation
+    }) {
+        anyhow::bail!("stale server response for replaced worker session");
+    }
+    *current = Some(BoundServerCapabilities {
+        session_id: expected.session_id,
+        generation: expected.generation,
+        capabilities,
+    });
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) enum Client {
     Http(HttpClient),
@@ -29,6 +100,7 @@ pub(crate) struct HttpClient {
     pub(crate) base: String,
     pub(crate) token: Option<Secret>,
     pub(crate) worker_session: Arc<RwLock<Option<AuthenticatedWorkerSession>>>,
+    pub(crate) server_capability_state: Arc<RwLock<Option<BoundServerCapabilities>>>,
 }
 
 #[derive(Clone)]
@@ -36,6 +108,14 @@ pub(crate) struct GrpcClient {
     pub(crate) client: pb::worker_lifecycle_client::WorkerLifecycleClient<Channel>,
     pub(crate) token: Option<Secret>,
     pub(crate) worker_session: Arc<RwLock<Option<AuthenticatedWorkerSession>>>,
+    pub(crate) server_capability_state: Arc<RwLock<Option<BoundServerCapabilities>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct BoundServerCapabilities {
+    pub(crate) session_id: uuid::Uuid,
+    pub(crate) generation: u64,
+    pub(crate) capabilities: Vec<protocol::WorkerProtocolCapability>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +146,7 @@ impl HttpClient {
             base,
             token,
             worker_session: Arc::new(RwLock::new(None)),
+            server_capability_state: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -99,6 +180,27 @@ impl HttpClient {
 }
 
 impl Client {
+    pub(crate) fn server_supports_authorization_version(&self, version: u32) -> bool {
+        let state = match self {
+            Client::Http(client) => &client.server_capability_state,
+            Client::Grpc(client) => &client.server_capability_state,
+        };
+        let Some(session) = self.worker_session() else {
+            return false;
+        };
+        state
+            .read()
+            .expect("server capability state lock poisoned")
+            .as_ref()
+            .is_some_and(|state| {
+                state.session_id == session.session_id
+                    && state.generation == session.generation
+                    && protocol::worker_supports_canonical_authorization(
+                        &state.capabilities,
+                        version,
+                    )
+            })
+    }
     pub(crate) fn worker_session(&self) -> Option<AuthenticatedWorkerSession> {
         match self {
             Client::Http(client) => client
@@ -114,7 +216,10 @@ impl Client {
         }
     }
 
-    pub(crate) async fn register_worker(&self, req: &RegisterWorkerRequest) -> anyhow::Result<()> {
+    pub(crate) async fn register_worker(
+        &self,
+        req: &RegisterWorkerRequest,
+    ) -> anyhow::Result<Vec<protocol::WorkerProtocolCapability>> {
         match self {
             Client::Http(client) => {
                 let url = format!("{}/api/v1/orchestration/workers", client.base);
@@ -126,7 +231,14 @@ impl Client {
                 if !resp.status().is_success() {
                     anyhow::bail!("register failed: {}", resp.status());
                 }
+                let header_capabilities = capabilities_from_header(resp.headers());
                 let registered: RegisterWorkerResponse = resp.json().await?;
+                let mut server_capabilities = registered.server_protocol_capabilities.clone();
+                for capability in header_capabilities {
+                    if !server_capabilities.contains(&capability) {
+                        server_capabilities.push(capability);
+                    }
+                }
                 *client
                     .worker_session
                     .write()
@@ -136,7 +248,16 @@ impl Client {
                     session_token: registered.session_token,
                     generation: registered.session_generation,
                 });
-                Ok(())
+                *client
+                    .server_capability_state
+                    .write()
+                    .expect("server capability state lock poisoned") =
+                    Some(BoundServerCapabilities {
+                        session_id: registered.session_id,
+                        generation: registered.session_generation,
+                        capabilities: server_capabilities.clone(),
+                    });
+                Ok(server_capabilities)
             }
             Client::Grpc(client) => {
                 let worker_id = req.id.clone();
@@ -158,6 +279,9 @@ impl Client {
                             .map(|capability| match capability {
                                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1 => {
                                     pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32
+                                }
+                                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2 => {
+                                    pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32
                                 }
                             })
                             .collect(),
@@ -183,7 +307,18 @@ impl Client {
                     session_token: Secret::new(registered.session_token),
                     generation: registered.session_generation,
                 });
-                Ok(())
+                let server_capabilities =
+                    capabilities_from_pb(registered.server_protocol_capabilities)?;
+                *client
+                    .server_capability_state
+                    .write()
+                    .expect("server capability state lock poisoned") =
+                    Some(BoundServerCapabilities {
+                        session_id,
+                        generation: registered.session_generation,
+                        capabilities: server_capabilities.clone(),
+                    });
+                Ok(server_capabilities)
             }
         }
     }
@@ -191,6 +326,12 @@ impl Client {
     pub(crate) async fn heartbeat(&self, id: &str, state: WorkerState) -> anyhow::Result<()> {
         match self {
             Client::Http(client) => {
+                let expected_session = client
+                    .worker_session
+                    .read()
+                    .expect("worker session lock poisoned")
+                    .clone()
+                    .context("worker has no authenticated session")?;
                 let url = format!(
                     "{}/api/v1/orchestration/workers/{id}/heartbeat",
                     client.base
@@ -206,9 +347,20 @@ impl Client {
                     }
                     anyhow::bail!("heartbeat failed: {}", resp.status());
                 }
+                update_bound_capabilities(
+                    &client.server_capability_state,
+                    &expected_session,
+                    capabilities_from_header(resp.headers()),
+                )?;
                 Ok(())
             }
             Client::Grpc(client) => {
+                let expected_session = client
+                    .worker_session
+                    .read()
+                    .expect("worker session lock poisoned")
+                    .clone()
+                    .context("worker has no authenticated session")?;
                 let mut inner = client.client.clone();
                 let mut req = apply_grpc_bearer(
                     client.token.as_ref(),
@@ -226,7 +378,15 @@ impl Client {
                         .as_ref(),
                 )?;
                 match inner.heartbeat_worker(req).await {
-                    Ok(_) => {}
+                    Ok(response) => {
+                        update_bound_capabilities(
+                            &client.server_capability_state,
+                            &expected_session,
+                            capabilities_from_pb(
+                                response.into_inner().server_protocol_capabilities,
+                            )?,
+                        )?;
+                    }
                     Err(status)
                         if status.code() == tonic::Code::NotFound
                             && status.message().contains(WORKER_NOT_FOUND_MARKER) =>
@@ -243,6 +403,12 @@ impl Client {
     pub(crate) async fn poll(&self, worker_id: &str) -> anyhow::Result<Option<Job>> {
         match self {
             Client::Http(client) => {
+                let expected_session = client
+                    .worker_session
+                    .read()
+                    .expect("worker session lock poisoned")
+                    .clone()
+                    .context("worker has no authenticated session")?;
                 let url = format!("{}/api/v1/orchestration/poll", client.base);
                 let resp = client
                     .worker_session(client.auth(client.http.post(url)))
@@ -257,6 +423,11 @@ impl Client {
                     }
                     anyhow::bail!("poll failed: {}", resp.status());
                 }
+                update_bound_capabilities(
+                    &client.server_capability_state,
+                    &expected_session,
+                    capabilities_from_header(resp.headers()),
+                )?;
                 let parsed: PollJobResponse = resp.json().await?;
                 if parsed
                     .job
@@ -288,6 +459,12 @@ impl Client {
                 Ok(parsed.job)
             }
             Client::Grpc(client) => {
+                let expected_session = client
+                    .worker_session
+                    .read()
+                    .expect("worker session lock poisoned")
+                    .clone()
+                    .context("worker has no authenticated session")?;
                 let mut inner = client.client.clone();
                 let mut req = apply_grpc_bearer(
                     client.token.as_ref(),
@@ -314,6 +491,11 @@ impl Client {
                     Err(status) => return Err(status.into()),
                 }
                 .into_inner();
+                update_bound_capabilities(
+                    &client.server_capability_state,
+                    &expected_session,
+                    capabilities_from_pb(resp.server_protocol_capabilities.clone())?,
+                )?;
                 let job = resp.job.map(job_from_pb).transpose()?;
                 if let Some(job) = job.as_ref() {
                     let session = client

@@ -1192,6 +1192,11 @@ impl OrchestrationService {
                         name TEXT PRIMARY KEY,
                         applied_at TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS authorization_protocol_mode (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2)),
+                        updated_at TEXT NOT NULL
+                    );
                     CREATE TABLE IF NOT EXISTS workers (
                         id TEXT PRIMARY KEY,
                         hostname TEXT NOT NULL,
@@ -1234,7 +1239,41 @@ impl OrchestrationService {
                         outcome_json TEXT NOT NULL,
                         applied_at TEXT NOT NULL
                     );
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_jobs_insert
+                    BEFORE INSERT ON jobs WHEN NEW.canonical_authorization_version > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects job'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_jobs_update
+                    BEFORE UPDATE ON jobs WHEN NEW.canonical_authorization_version > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects job update'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_records_insert
+                    BEFORE INSERT ON authorization_records WHEN NEW.canonical_authorization_version > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects record'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_records_update
+                    BEFORE UPDATE ON authorization_records WHEN NEW.canonical_authorization_version > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects record update'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_obligations_insert
+                    BEFORE INSERT ON authorization_obligations WHEN NEW.canonical_authorization_version > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects obligation'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_obligations_update
+                    BEFORE UPDATE ON authorization_obligations WHEN NEW.canonical_authorization_version > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects obligation update'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_workers_insert
+                    BEFORE INSERT ON workers WHEN (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1) < 2 AND NEW.protocol_capabilities_json LIKE '%canonical_authorization_v2%'
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects worker'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_workers_update
+                    BEFORE UPDATE ON workers WHEN (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1) < 2 AND NEW.protocol_capabilities_json LIKE '%canonical_authorization_v2%'
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects worker update'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_recovery_insert
+                    BEFORE INSERT ON worker_session_recovery_inbox WHEN (SELECT canonical_authorization_version FROM jobs WHERE id = NEW.job_id) > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects recovery'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_recovery_update
+                    BEFORE UPDATE ON worker_session_recovery_inbox WHEN (SELECT canonical_authorization_version FROM jobs WHERE id = NEW.job_id) > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects recovery update'); END;
                     "#,
+                    )?;
+                    conn.execute(
+                        "INSERT OR IGNORE INTO authorization_protocol_mode (id, max_authorization_version, updated_at) VALUES (1, 2, ?1)",
+                        [Utc::now().to_rfc3339()],
                     )?;
                     if !column_exists(conn, DbTable::Jobs, "container_image")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN container_image TEXT", [])?;
@@ -1988,6 +2027,21 @@ impl OrchestrationService {
         let (session_generation, replaced_running_jobs) = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, Vec<Uuid>)> {
             let mut conn = Connection::open(path.as_path())?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let max_authorization_version: u32 = tx.query_row(
+                "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            if max_authorization_version < protocol::CANONICAL_AUTHORIZATION_VERSION
+                && protocol_capabilities.contains(
+                    &protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                )
+            {
+                return Err(WorkerSessionAuthFailure(
+                    "authorization protocol fence rejects v2 worker registration",
+                )
+                .into());
+            }
             let existing = tx
                 .query_row(
                     "SELECT session_id, session_token_hash, session_generation, last_heartbeat_at FROM workers WHERE id = ?1",
@@ -2182,11 +2236,13 @@ impl OrchestrationService {
             session_generation,
             last_heartbeat_at: now,
         };
+        let server_protocol_capabilities = self.authorization_protocol_capabilities().await?;
         Ok(RegisterWorkerResponse {
             worker,
             session_id,
             session_token,
             session_generation,
+            server_protocol_capabilities,
         })
     }
 
@@ -2318,6 +2374,28 @@ impl OrchestrationService {
         self.select_workers().await.map_err(map_db)
     }
 
+    pub async fn authorization_protocol_capabilities(
+        &self,
+    ) -> Result<Vec<protocol::WorkerProtocolCapability>, AppError> {
+        let path = Arc::clone(&self.db_path);
+        let max: u32 = tokio::task::spawn_blocking(move || -> anyhow::Result<u32> {
+            let connection = Connection::open(path.as_path())?;
+            Ok(connection.query_row(
+                "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(map_db)?;
+        let mut capabilities = vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1];
+        if max >= 2 {
+            capabilities.push(protocol::WorkerProtocolCapability::CanonicalAuthorizationV2);
+        }
+        Ok(capabilities)
+    }
+
     pub async fn work_item_state_counts(&self) -> Result<HashMap<String, usize>, AppError> {
         self.ensure_ready().await?;
         self.select_work_item_state_counts().await.map_err(map_db)
@@ -2366,10 +2444,13 @@ impl OrchestrationService {
             .map_err(map_db)?
             .ok_or_else(|| AppError::WorkerNotFound(req.worker_id.clone()))?;
 
-        if !worker
-            .protocol_capabilities
-            .contains(&protocol::WorkerProtocolCapability::CanonicalAuthorizationV1)
-        {
+        if !worker.protocol_capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1
+                    | protocol::WorkerProtocolCapability::CanonicalAuthorizationV2
+            )
+        }) {
             worker.state = WorkerState::Idle;
             worker.last_heartbeat_at = Utc::now();
             self.upsert_worker(&worker).await.map_err(map_db)?;
@@ -5597,6 +5678,8 @@ impl OrchestrationService {
                 )));
             }
         };
+        Self::validate_opencode_job_environment(&runner_profile, &job.env)
+            .map_err(AppError::WorkflowInvalid)?;
         let mut runtime = canonical_runtime_spec_for_job_effective(job);
         if !runtime.github_capabilities.is_empty() && execution_kind != "managed" {
             return Err(AppError::WorkflowInvalid(
@@ -5708,6 +5791,21 @@ impl OrchestrationService {
             .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
         job.canonical_authorization = Some(bundle.artifact());
         Ok(())
+    }
+
+    fn validate_opencode_job_environment(
+        runner_profile: &serde_json::Value,
+        env: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        let Ok(profile) = serde_json::from_value::<agent_hub_config::ResolvedRunnerProfile>(
+            runner_profile.clone(),
+        ) else {
+            return Ok(());
+        };
+        if profile.kind != agent_hub_config::ManagedRunnerKind::Opencode {
+            return Ok(());
+        }
+        agent_hub_config::validate_untrusted_opencode_env(&env.clone().into_iter().collect())
     }
 
     async fn plan_provider_cancel_descendants(
@@ -9564,6 +9662,11 @@ impl OrchestrationService {
                 .as_ref()
                 .map(|worker| worker.protocol_capabilities.clone())
                 .unwrap_or(protocol_capabilities);
+            let max_authorization_version: u32 = conn.query_row(
+                "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
             let mut stmt = conn.prepare(
                 "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE state = ?1 AND dispatch_released = 1 ORDER BY created_at ASC",
             )?;
@@ -9571,6 +9674,9 @@ impl OrchestrationService {
             for row in rows {
                 let mut job = row?;
                 let bundle = verify_job_authorization(&conn, &job)?;
+                if bundle.version > max_authorization_version {
+                    continue;
+                }
                 protocol::project_authorization_bundle_into_job_context(
                     &mut job.context,
                     &bundle,
@@ -9579,8 +9685,9 @@ impl OrchestrationService {
                 if !supported_modes.contains(&runtime_environment.execution_mode) {
                     continue;
                 }
-                if !protocol_capabilities.contains(
-                    &protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                if !protocol::worker_supports_canonical_authorization(
+                    &protocol_capabilities,
+                    bundle.version,
                 ) {
                     continue;
                 }
@@ -12697,7 +12804,10 @@ mod tests {
                 .assign_next_job(
                     "authorization-harness".to_string(),
                     vec![protocol::ExecutionMode::Docker],
-                    vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1],
+                    vec![
+                        protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                        protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                    ],
                     None,
                 )
                 .await
@@ -12762,6 +12872,7 @@ mod tests {
                             supported_modes: vec![protocol::ExecutionMode::Docker],
                             protocol_capabilities: vec![
                                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                             ],
                         },
                         None,
@@ -14765,7 +14876,7 @@ mod tests {
 
         let restarted = OrchestrationService::new(
             workflow_catalog(),
-            adapter,
+            Arc::clone(&adapter),
             db.to_string_lossy().into_owned(),
         )
         .with_scm_hosts(test_scm_registry());
@@ -15106,7 +15217,7 @@ mod tests {
 
         let restarted = OrchestrationService::new(
             workflow_catalog(),
-            adapter,
+            Arc::clone(&adapter),
             db.to_string_lossy().into_owned(),
         )
         .with_environments(environments_fixture())
@@ -18091,7 +18202,7 @@ kind = "terminal"
 
         let restarted = OrchestrationService::new(
             workflow_catalog(),
-            adapter,
+            Arc::clone(&adapter),
             db.to_string_lossy().into_owned(),
         )
         .with_scm_hosts(test_scm_registry());
@@ -18105,7 +18216,7 @@ kind = "terminal"
             .expect("persisted worker");
         assert!(worker.protocol_capabilities.is_empty());
 
-        let capable_registration = RegisterWorkerRequest {
+        let v1_registration = RegisterWorkerRequest {
             id: "mixed-version-worker".to_string(),
             hostname: "current-host".to_string(),
             supported_modes: vec![protocol::ExecutionMode::Docker],
@@ -18114,15 +18225,12 @@ kind = "terminal"
             ],
         };
         let upgraded = restarted
-            .register_worker_session(
-                capable_registration.clone(),
-                Some(legacy_credential.clone()),
-            )
+            .register_worker_session(v1_registration.clone(), Some(legacy_credential.clone()))
             .await
             .expect("upgrade worker capability");
         assert!(
             restarted
-                .register_worker_session(capable_registration.clone(), Some(legacy_credential),)
+                .register_worker_session(v1_registration.clone(), Some(legacy_credential),)
                 .await
                 .is_err()
         );
@@ -18130,10 +18238,10 @@ kind = "terminal"
             session_id: upgraded.session_id,
             session_token: upgraded.session_token,
         };
-        let replayed = restarted
-            .register_worker_session(capable_registration, Some(upgraded_credential))
+        let v1_session = restarted
+            .register_worker_session(v1_registration.clone(), Some(upgraded_credential))
             .await
-            .expect("replay worker capability registration");
+            .expect("persist v1-only worker capability registration");
         assert_eq!(
             restarted
                 .list_workers()
@@ -18145,11 +18253,74 @@ kind = "terminal"
                 .protocol_capabilities,
             vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1]
         );
+        let v1_credential = WorkerSessionCredential {
+            session_id: v1_session.session_id,
+            session_token: v1_session.session_token,
+        };
+        let v1_job = restarted
+            .poll_job_authenticated(
+                v1_credential.clone(),
+                PollJobRequest {
+                    worker_id: "mixed-version-worker".to_string(),
+                },
+            )
+            .await
+            .expect("v1-only poll against v1 job")
+            .job
+            .expect("v1 job is assignable to v1 worker");
+        assert_eq!(
+            v1_job
+                .canonical_authorization
+                .as_ref()
+                .map(|artifact| artifact.version),
+            Some(1)
+        );
+        assert_eq!(
+            restarted
+                .cancel_active_jobs_for_work_item(v1_job.work_item_id)
+                .await
+                .expect("cancel assigned v1 fixture job"),
+            1
+        );
+        restarted
+            .create_work_item(CreateWorkItemRequest {
+                workflow_id: TRIAGE_WORKFLOW_ID.to_string(),
+                session_id: None,
+                context: serde_json::json!({}),
+                repo: None,
+            })
+            .await
+            .expect("create v2 triage job");
+        assert!(
+            restarted
+                .poll_job_authenticated(
+                    v1_credential.clone(),
+                    PollJobRequest {
+                        worker_id: "mixed-version-worker".to_string(),
+                    },
+                )
+                .await
+                .expect("v1-only poll against v2 job")
+                .job
+                .is_none()
+        );
+
+        let v2_registration = RegisterWorkerRequest {
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+            ],
+            ..v1_registration.clone()
+        };
+        let v2_session = restarted
+            .register_worker_session(v2_registration, Some(v1_credential))
+            .await
+            .expect("upgrade worker to v2 capability");
         let assigned = restarted
             .poll_job_authenticated(
                 WorkerSessionCredential {
-                    session_id: replayed.session_id,
-                    session_token: replayed.session_token,
+                    session_id: v2_session.session_id,
+                    session_token: v2_session.session_token.clone(),
                 },
                 PollJobRequest {
                     worker_id: "mixed-version-worker".to_string(),
@@ -18160,8 +18331,89 @@ kind = "terminal"
             .job
             .expect("canonical job assignment");
         assert!(assigned.canonical_authorization.is_some());
+        assert_eq!(
+            assigned
+                .canonical_authorization
+                .as_ref()
+                .map(|artifact| artifact.version),
+            Some(protocol::CANONICAL_AUTHORIZATION_VERSION)
+        );
+
+        let rolled_back = restarted
+            .register_worker_session(
+                v1_registration,
+                Some(WorkerSessionCredential {
+                    session_id: v2_session.session_id,
+                    session_token: v2_session.session_token,
+                }),
+            )
+            .await
+            .expect("replace v2 session with v1-only rollback session");
+        let rolled_back_credential = WorkerSessionCredential {
+            session_id: rolled_back.session_id,
+            session_token: rolled_back.session_token,
+        };
+        assert!(
+            restarted
+                .poll_job_authenticated(
+                    rolled_back_credential.clone(),
+                    PollJobRequest {
+                        worker_id: "mixed-version-worker".to_string(),
+                    },
+                )
+                .await
+                .expect("rolled-back v1-only poll")
+                .job
+                .is_none(),
+            "v2 job must remain pending rather than downgrade under rollback"
+        );
+        let pending_v2 = restarted
+            .get_job(assigned.id)
+            .await
+            .expect("read v2 job after rollback")
+            .expect("v2 job exists");
+        assert_eq!(pending_v2.state, JobState::Pending);
+        assert!(pending_v2.assigned_worker_id.is_none());
+        assert_eq!(
+            pending_v2
+                .canonical_authorization
+                .map(|artifact| artifact.version),
+            Some(protocol::CANONICAL_AUTHORIZATION_VERSION)
+        );
 
         drop(restarted);
+        let rollback_restarted = OrchestrationService::new(
+            workflow_catalog(),
+            adapter,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        rollback_restarted.init().await.expect("rollback restart");
+        assert_eq!(
+            rollback_restarted
+                .list_workers()
+                .await
+                .expect("list rollback worker")
+                .into_iter()
+                .find(|worker| worker.id == "mixed-version-worker")
+                .expect("rollback worker persisted")
+                .protocol_capabilities,
+            vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1]
+        );
+        assert!(
+            rollback_restarted
+                .poll_job_authenticated(
+                    rolled_back_credential,
+                    PollJobRequest {
+                        worker_id: "mixed-version-worker".to_string(),
+                    },
+                )
+                .await
+                .expect("v1-only poll after rollback restart")
+                .job
+                .is_none()
+        );
+        drop(rollback_restarted);
         let _ = std::fs::remove_file(db);
         let _ = std::fs::remove_dir_all(tasks);
     }
@@ -18175,6 +18427,7 @@ kind = "terminal"
             supported_modes: vec![protocol::ExecutionMode::Docker],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         };
         let first = harness
@@ -20129,6 +20382,7 @@ kind = "terminal"
             supported_modes: vec![protocol::ExecutionMode::Docker],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -20267,6 +20521,7 @@ kind = "terminal"
             supported_modes: vec![protocol::ExecutionMode::Docker],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -20604,6 +20859,7 @@ kind = "terminal"
             supported_modes: vec![protocol::ExecutionMode::Docker],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -22215,6 +22471,34 @@ kind = "terminal"
         assert_eq!(job_count, 0, "gateway rejection must precede job creation");
     }
 
+    #[test]
+    fn server_authorization_rejects_opencode_control_environment() {
+        let profile = agent_hub_config::RunnerProfilesConfig::default()
+            .resolve_agent_profile(None)
+            .expect("default OpenCode profile");
+        let profile = serde_json::to_value(profile).unwrap();
+        for name in [
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+            "XDG_CONFIG_HOME",
+            "HOME",
+            "OPENAI_API_KEY",
+        ] {
+            let env = HashMap::from([(name.to_string(), "attacker".to_string())]);
+            assert!(
+                OrchestrationService::validate_opencode_job_environment(&profile, &env).is_err(),
+                "accepted {name}"
+            );
+        }
+        assert!(
+            OrchestrationService::validate_opencode_job_environment(
+                &profile,
+                &HashMap::from([("TASK_NAME".to_string(), "allowed".to_string())]),
+            )
+            .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn insert_job_prefers_runtime_spec_from_context_when_present() {
         let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
@@ -22352,6 +22636,7 @@ kind = "terminal"
             supported_modes: vec![protocol::ExecutionMode::Docker],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -22930,6 +23215,7 @@ kind = "terminal"
             supported_modes: vec![protocol::ExecutionMode::Docker],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -23308,6 +23594,7 @@ kind = "terminal"
             ],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -23388,6 +23675,7 @@ kind = "terminal"
             ],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -23492,6 +23780,7 @@ kind = "terminal"
             ],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -23886,6 +24175,7 @@ kind = "terminal"
             supported_modes: vec![protocol::ExecutionMode::Docker],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await
@@ -25522,6 +25812,7 @@ kind = "terminal"
             supported_modes: vec![protocol::ExecutionMode::Docker],
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
             ],
         })
         .await

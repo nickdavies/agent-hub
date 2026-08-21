@@ -4,6 +4,14 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub const OPENCODE_PROJECT_CONFIG_ALIASES: &[&str] = &[
+    "opencode.json",
+    "opencode.jsonc",
+    ".opencode/opencode.json",
+    ".opencode/opencode.jsonc",
+];
+pub const DURABLE_OPENCODE_PATH: &str = "/usr/local/go/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerProfilesConfig {
     #[serde(default = "default_managed_agent_runner")]
@@ -68,13 +76,202 @@ pub enum ManagedRunnerKind {
 pub struct OpencodeRunnerConfig {
     #[serde(default = "default_opencode_validation_attempts")]
     pub max_validation_attempts: u32,
+    #[serde(default = "trusted_opencode_runtime_env")]
+    pub trusted_env: BTreeMap<String, String>,
 }
 
 impl Default for OpencodeRunnerConfig {
     fn default() -> Self {
         Self {
             max_validation_attempts: default_opencode_validation_attempts(),
+            trusted_env: trusted_opencode_runtime_env(),
         }
+    }
+}
+
+pub fn trusted_opencode_runtime_env() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("HOME".to_string(), "/opencode/state/home".to_string()),
+        (
+            "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS".to_string(),
+            "1".to_string(),
+        ),
+        (
+            "OPENCODE_DISABLE_EXTERNAL_SKILLS".to_string(),
+            "1".to_string(),
+        ),
+        ("OPENCODE_DISABLE_MODELS_FETCH".to_string(), "1".to_string()),
+        (
+            "OPENCODE_DISABLE_PROJECT_CONFIG".to_string(),
+            "1".to_string(),
+        ),
+        ("OPENCODE_PURE".to_string(), "1".to_string()),
+        (
+            "OPENCODE_EXPERIMENTAL_WEBSOCKETS".to_string(),
+            "0".to_string(),
+        ),
+        ("PATH".to_string(), DURABLE_OPENCODE_PATH.to_string()),
+        ("XDG_CACHE_HOME".to_string(), "/opencode/cache".to_string()),
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            "/opencode/config".to_string(),
+        ),
+        ("XDG_DATA_HOME".to_string(), "/opencode/data".to_string()),
+        ("XDG_STATE_HOME".to_string(), "/opencode/state".to_string()),
+    ])
+}
+
+pub fn validate_untrusted_opencode_env(env: &BTreeMap<String, String>) -> Result<(), String> {
+    for name in env.keys() {
+        validate_untrusted_opencode_env_name(name)?;
+    }
+    Ok(())
+}
+
+pub fn validate_untrusted_opencode_env_name(name: &str) -> Result<(), String> {
+    const EXACT_DENY: &[&str] = &[
+        "PATH",
+        "HOME",
+        "AWKLIBPATH",
+        "AWKPATH",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "BASH_ENV",
+        "BASHOPTS",
+        "CARGO_HOME",
+        "CDPATH",
+        "CLAUDE_CONFIG_DIR",
+        "CLASSPATH",
+        "COREPACK_HOME",
+        "ENV",
+        "FPATH",
+        "GCONV_PATH",
+        "GEM_HOME",
+        "GEM_PATH",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_SSH_COMMAND",
+        "GOENV",
+        "GOROOT",
+        "GOTOOLDIR",
+        "GOWORK",
+        "IFS",
+        "INI_SCAN_DIR",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "KSH_ENV",
+        "LIBPATH",
+        "LOCPATH",
+        "LUA_CPATH",
+        "LUA_INIT",
+        "LUA_PATH",
+        "NLSPATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PHPRC",
+        "POSIXLY_CORRECT",
+        "PROMPT_COMMAND",
+        "PS4",
+        "PYTHONBREAKPOINT",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "PYTHONWARNINGS",
+        "PERL5DB",
+        "PERL5LIB",
+        "PERL5OPT",
+        "PERL5SHELL",
+        "PERLLIB",
+        "RUBYLIB",
+        "RUBYOPT",
+        "RUBYGEMS_GEMDEPS",
+        "SHELL",
+        "SHELLOPTS",
+        "SHLIB_PATH",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTUP_HOME",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "TCLLIBPATH",
+        "GLIBC_TUNABLES",
+        "MUSL_LOCPATH",
+        "ZDOTDIR",
+        "ZSH_ENV",
+        "_JAVA_OPTIONS",
+    ];
+    const RUNTIME_PREFIX_DENY: &[&str] = &[
+        "BASH_FUNC_",
+        "BUN_",
+        "BUNDLE_",
+        "DENO_",
+        "DYLD_",
+        "LD_",
+        "NPM_CONFIG_",
+        "PNPM_",
+        "YARN_",
+    ];
+    const PROVIDER_PREFIX_DENY: &[&str] = &[
+        "ANTHROPIC_",
+        "AWS_",
+        "AZURE_",
+        "CEREBRAS_",
+        "CLOUDFLARE_",
+        "COHERE_",
+        "DATABRICKS_",
+        "DEEPSEEK_",
+        "FIREWORKS_",
+        "GEMINI_",
+        "GOOGLE_",
+        "GROQ_",
+        "HF_",
+        "HUGGINGFACE_",
+        "LMSTUDIO_",
+        "MISTRAL_",
+        "NVIDIA_",
+        "OCI_",
+        "OLLAMA_",
+        "OPENAI_",
+        "OPENROUTER_",
+        "PERPLEXITY_",
+        "REPLICATE_",
+        "SAMBANOVA_",
+        "TOGETHER_",
+        "VERTEX_",
+        "XAI_",
+    ];
+    const CREDENTIAL_SUFFIX_DENY: &[&str] = &[
+        "_API_KEY",
+        "_AUTH_TOKEN",
+        "_ACCESS_TOKEN",
+        "_API_TOKEN",
+        "_SECRET_ACCESS_KEY",
+        "_TOKEN",
+    ];
+
+    let denied = name.starts_with("OPENCODE_")
+        || EXACT_DENY.contains(&name)
+        || PROVIDER_PREFIX_DENY
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || RUNTIME_PREFIX_DENY
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || CREDENTIAL_SUFFIX_DENY
+            .iter()
+            .any(|suffix| name.ends_with(suffix));
+    if denied {
+        Err(format!(
+            "untrusted OpenCode environment variable '{name}' is not allowed"
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -831,6 +1028,13 @@ fn validate_runner_spec(spec: &mut ManagedRunnerSpec, name: &str) -> Result<(), 
             "runner '{name}' max_validation_attempts must be greater than zero"
         ));
     }
+    if spec.kind == ManagedRunnerKind::Opencode
+        && spec.opencode.trusted_env != trusted_opencode_runtime_env()
+    {
+        return Err(format!(
+            "runner '{name}' trusted OpenCode environment is not canonical"
+        ));
+    }
     Ok(())
 }
 
@@ -1005,10 +1209,10 @@ fn default_managed_agent_runner() -> ManagedRunnerSpec {
     ManagedRunnerSpec {
         kind: ManagedRunnerKind::Opencode,
         opencode: OpencodeRunnerConfig::default(),
-        command: "sh".to_string(),
+        command: "/usr/bin/sh".to_string(),
         args: vec![
             "-lc".to_string(),
-            "if [ -f \"$AGENT_PROMPT_USER_PATH\" ]; then opencode run < \"$AGENT_PROMPT_USER_PATH\"; else opencode run; fi".to_string(),
+            "if [ -f \"$AGENT_PROMPT_USER_PATH\" ]; then /usr/local/bin/opencode run < \"$AGENT_PROMPT_USER_PATH\"; else /usr/local/bin/opencode run; fi".to_string(),
         ],
         container_image: None,
         file_mounts: Vec::new(),
@@ -1451,6 +1655,155 @@ mod tests {
                 .trusted_mounts
                 .iter()
                 .any(|mount| { mount.purpose == "environment_bundle" && mount.read_only })
+        );
+        assert_eq!(profile.opencode.trusted_env, trusted_opencode_runtime_env());
+    }
+
+    #[test]
+    fn default_opencode_runner_uses_pinned_absolute_executables() {
+        let runner = RunnerProfilesConfig::default().default_agent;
+        assert_eq!(runner.command, "/usr/bin/sh");
+        assert_eq!(runner.args.first().map(String::as_str), Some("-lc"));
+        assert!(runner.args[1].contains("/usr/local/bin/opencode run"));
+        assert!(!runner.args[1].contains(" then opencode "));
+        assert_eq!(
+            runner.opencode.trusted_env.get("PATH").map(String::as_str),
+            Some(DURABLE_OPENCODE_PATH)
+        );
+    }
+
+    #[test]
+    fn opencode_trusted_environment_is_unique_and_digest_bound() {
+        let expected = BTreeMap::from([
+            ("HOME".to_string(), "/opencode/state/home".to_string()),
+            (
+                "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "OPENCODE_DISABLE_EXTERNAL_SKILLS".to_string(),
+                "1".to_string(),
+            ),
+            ("OPENCODE_DISABLE_MODELS_FETCH".to_string(), "1".to_string()),
+            (
+                "OPENCODE_DISABLE_PROJECT_CONFIG".to_string(),
+                "1".to_string(),
+            ),
+            ("OPENCODE_PURE".to_string(), "1".to_string()),
+            (
+                "OPENCODE_EXPERIMENTAL_WEBSOCKETS".to_string(),
+                "0".to_string(),
+            ),
+            ("PATH".to_string(), DURABLE_OPENCODE_PATH.to_string()),
+            ("XDG_CACHE_HOME".to_string(), "/opencode/cache".to_string()),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                "/opencode/config".to_string(),
+            ),
+            ("XDG_DATA_HOME".to_string(), "/opencode/data".to_string()),
+            ("XDG_STATE_HOME".to_string(), "/opencode/state".to_string()),
+        ]);
+        assert_eq!(trusted_opencode_runtime_env(), expected);
+        assert!(!expected.contains_key("OPENCODE_DISABLE_DEFAULT_PLUGINS"));
+
+        let profile = canonical_test_config()
+            .validated()
+            .unwrap()
+            .resolve_agent_profile(None)
+            .unwrap();
+        let mut mutated = profile.clone();
+        mutated
+            .opencode
+            .trusted_env
+            .insert("OPENCODE_PURE".to_string(), "0".to_string());
+        assert_ne!(digest_profile(&mutated).unwrap(), profile.config_digest);
+    }
+
+    #[test]
+    fn opencode_control_environment_policy_denies_discovery_and_auth_controls() {
+        for name in [
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_CONFIG_DIR",
+            "OPENCODE_AUTH_CONTENT",
+            "OPENCODE_PERMISSION",
+            "OPENCODE_MODEL",
+            "OPENCODE_PROVIDER",
+            "OPENCODE_PLUGIN",
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+            "OPENCODE_EXPERIMENTAL_WEBSOCKETS",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "HOME",
+            "NODE_PATH",
+            "BUN_INSTALL",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "AZURE_OPENAI_API_KEY",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "PATH",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "NODE_OPTIONS",
+            "BUN_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "RUBYOPT",
+            "RUBYLIB",
+            "PERL5OPT",
+            "PERL5LIB",
+            "BASH_ENV",
+            "ENV",
+            "IFS",
+            "SHELLOPTS",
+            "GCONV_PATH",
+            "LUA_INIT",
+            "JAVA_TOOL_OPTIONS",
+        ] {
+            assert!(
+                validate_untrusted_opencode_env_name(name).is_err(),
+                "accepted {name}"
+            );
+        }
+        for name in [
+            "path",
+            "ld_preload",
+            "CI",
+            "TASK_NAME",
+            "PYTHONUNBUFFERED",
+            "PYTHONIOENCODING",
+            "PERL_UNICODE",
+            "RUBY_THREAD_VM_STACK_SIZE",
+            "opencode_config",
+            "Home",
+        ] {
+            assert!(
+                validate_untrusted_opencode_env_name(name).is_ok(),
+                "rejected case-sensitive non-control name {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_project_config_discovery_aliases_are_explicit() {
+        assert_eq!(
+            OPENCODE_PROJECT_CONFIG_ALIASES,
+            [
+                "opencode.json",
+                "opencode.jsonc",
+                ".opencode/opencode.json",
+                ".opencode/opencode.jsonc",
+            ]
+        );
+        assert_eq!(
+            OPENCODE_PROJECT_CONFIG_ALIASES
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            OPENCODE_PROJECT_CONFIG_ALIASES.len()
         );
     }
 

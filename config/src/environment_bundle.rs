@@ -8,6 +8,10 @@ use crate::{EnvironmentConfig, NetworkPolicyConfig, SystemConfig, flatten_policy
 
 pub const DURABLE_OPENCODE_MODEL: &str = "openai/gpt-5.6-sol";
 pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-08-18";
+pub const OPENCODE_CONFIG_SENTINEL: &[u8] =
+    b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore";
+pub const OPENCODE_CONFIG_SENTINEL_SHA256: &str =
+    "663a068e76d264d0bc6740f5450b6c4193c7b41ecf5e0dc222485b8a17404d95";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentBundleFile {
@@ -62,10 +66,21 @@ impl EnvironmentBundle {
     }
 
     pub fn verify_digest(&self, authorized_digest: &str) -> Result<(), String> {
+        self.verify_opencode_sentinel()?;
         if self.digest == authorized_digest {
             Ok(())
         } else {
             Err("materialized environment bundle digest does not match authorization".to_string())
+        }
+    }
+
+    pub fn verify_opencode_sentinel(&self) -> Result<(), String> {
+        match self.files.iter().find(|file| file.path == ".gitignore") {
+            Some(file) if file.bytes == OPENCODE_CONFIG_SENTINEL => Ok(()),
+            Some(_) => {
+                Err("environment bundle has invalid OpenCode .gitignore sentinel".to_string())
+            }
+            None => Err("environment bundle is missing OpenCode .gitignore sentinel".to_string()),
         }
     }
 }
@@ -130,6 +145,12 @@ pub fn materialize_environment_bundle_with_snapshot(
     .map_err(|error| format!("failed to serialize network policy: {error}"))?;
 
     let mut files = BTreeMap::new();
+    insert_file(
+        &mut files,
+        ".gitignore",
+        OPENCODE_CONFIG_SENTINEL.to_vec(),
+        false,
+    )?;
     insert_file(&mut files, "environment.toml", environment_bytes, false)?;
     for name in ["agent-hub-permissions.json", "dippy.conf", "opencode.json"] {
         let path = source.join(name);
@@ -618,6 +639,16 @@ include_agents = ["example"]
         let first = materialize_environment_bundle(&root, "test").unwrap();
         let server_authorized_digest = first.digest.clone();
         first.verify_digest(&server_authorized_digest).unwrap();
+        let sentinel = first
+            .files
+            .iter()
+            .find(|file| file.path == ".gitignore")
+            .expect("OpenCode bundle sentinel");
+        assert_eq!(sentinel.bytes, OPENCODE_CONFIG_SENTINEL);
+        assert_eq!(
+            hex::encode(Sha256::digest(OPENCODE_CONFIG_SENTINEL)),
+            OPENCODE_CONFIG_SENTINEL_SHA256
+        );
         assert!(
             first
                 .files
@@ -665,6 +696,51 @@ include_agents = ["example"]
         let second = materialize_environment_bundle(&root, "test").unwrap();
         assert_ne!(first.digest, second.digest);
         assert!(second.verify_digest(&server_authorized_digest).is_err());
+
+        let without_sentinel = EnvironmentBundle::from_files(
+            first
+                .files
+                .iter()
+                .filter(|file| file.path != ".gitignore")
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+        assert_ne!(first.digest, without_sentinel.digest);
+        assert!(without_sentinel.verify_opencode_sentinel().is_err());
+
+        let mut changed_sentinel = first.files.clone();
+        changed_sentinel
+            .iter_mut()
+            .find(|file| file.path == ".gitignore")
+            .unwrap()
+            .bytes
+            .push(b' ');
+        assert_ne!(
+            first.digest,
+            EnvironmentBundle::from_files(changed_sentinel)
+                .unwrap()
+                .digest
+        );
+        assert!(
+            EnvironmentBundle::from_files(
+                first
+                    .files
+                    .iter()
+                    .map(|file| EnvironmentBundleFile {
+                        path: file.path.clone(),
+                        bytes: if file.path == ".gitignore" {
+                            b"wrong\n".to_vec()
+                        } else {
+                            file.bytes.clone()
+                        },
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .verify_opencode_sentinel()
+            .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

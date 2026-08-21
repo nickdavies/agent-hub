@@ -320,6 +320,66 @@ mod immutable_authorization_tests {
     }
 
     #[test]
+    fn canonical_authorization_v2_binds_trusted_opencode_environment() {
+        let mut request = request();
+        request.behavior.runner_profile = serde_json::json!({
+            "profile_name":"agent",
+            "kind":"opencode",
+            "command":"opencode",
+            "args":["run"],
+            "container_image":"image@sha256:abc",
+            "file_mounts":[],
+            "credential_providers":[],
+            "trusted_mounts":[],
+            "mcp_bridges":[],
+            "egress":{
+                "llm":{"default_provider":null,"providers":{}},
+                "build":{"github_hosts":[],"go_registry_hosts":[],"crates_registry_hosts":[]},
+                "proxy":{"image":"proxy@sha256:abc","listen_port":3128,"runtime_uid":13,"runtime_gid":13,"writable_tmpfs_mode":"0755","declared_volumes":["/var/log/squid","/var/spool/squid"]},
+                "preflight_image":null
+            },
+            "github_hosts":[],
+            "opencode":{
+                "max_validation_attempts":3,
+                "trusted_env":{"OPENCODE_PURE":"1"}
+            },
+            "config_digest":"fixture"
+        });
+        let artifact = request.canonical_artifact().unwrap();
+        assert_eq!(artifact.version, CANONICAL_AUTHORIZATION_VERSION);
+        assert_eq!(
+            artifact.digest,
+            "d20e4db6eeee997f8615acf4218462b086cd57aaa30cbbd18672b3d35206a229"
+        );
+        assert_eq!(artifact.verify_and_parse().unwrap(), request.normalize());
+
+        let v1 = CanonicalAuthorizationArtifact {
+            version: 1,
+            digest: canonical_authorization_digest(&artifact.canonical_bytes),
+            canonical_bytes: artifact.canonical_bytes,
+        };
+        assert!(v1.verify_and_parse().is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_capability_matrix_is_version_exact() {
+        let v1 = [WorkerProtocolCapability::CanonicalAuthorizationV1];
+        let v2 = [WorkerProtocolCapability::CanonicalAuthorizationV2];
+        let both = [
+            WorkerProtocolCapability::CanonicalAuthorizationV1,
+            WorkerProtocolCapability::CanonicalAuthorizationV2,
+        ];
+        assert!(worker_supports_canonical_authorization(&v1, 1));
+        assert!(!worker_supports_canonical_authorization(&v1, 2));
+        assert!(!worker_supports_canonical_authorization(&v2, 1));
+        assert!(worker_supports_canonical_authorization(&v2, 2));
+        assert!(worker_supports_canonical_authorization(&both, 1));
+        assert!(worker_supports_canonical_authorization(&both, 2));
+        assert!(!worker_supports_canonical_authorization(&both, 0));
+        assert!(!worker_supports_canonical_authorization(&both, 3));
+    }
+
+    #[test]
     fn canonical_authorization_v1_ordering_contract() {
         let first = request();
         let mut map_reordered = request();
@@ -556,8 +616,8 @@ mod immutable_authorization_tests {
             serde_json::json!(true);
         let bytes = canonical_json_bytes(unknown_egress).unwrap();
         let unknown_egress = CanonicalAuthorizationArtifact {
-            version: CANONICAL_AUTHORIZATION_VERSION,
-            digest: canonical_authorization_digest(&bytes),
+            version: artifact.version,
+            digest: canonical_authorization_digest_for_version(artifact.version, &bytes).unwrap(),
             canonical_bytes: bytes,
         };
         assert!(unknown_egress.verify_and_parse().is_err());
@@ -591,8 +651,12 @@ mod immutable_authorization_tests {
             .replace("\"integer_float\":1.0", "\"integer_float\":1e0")
             .into_bytes();
         let noncanonical = CanonicalAuthorizationArtifact {
-            version: CANONICAL_AUTHORIZATION_VERSION,
-            digest: canonical_authorization_digest(&noncanonical_bytes),
+            version: artifact.version,
+            digest: canonical_authorization_digest_for_version(
+                artifact.version,
+                &noncanonical_bytes,
+            )
+            .unwrap(),
             canonical_bytes: noncanonical_bytes,
         };
         assert!(noncanonical.verify_and_parse().is_err());
@@ -2376,6 +2440,8 @@ pub struct RegisterWorkerResponse {
     pub session_id: Uuid,
     pub session_token: crate::Secret,
     pub session_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_protocol_capabilities: Vec<WorkerProtocolCapability>,
 }
 
 /// Credential for one registered worker process generation. The token is
@@ -2414,6 +2480,27 @@ pub enum WorkerProtocolCapability {
     /// bytes. Servers must not assign canonical jobs when this is absent, and
     /// workers advertising it never fall back to legacy context evidence.
     CanonicalAuthorizationV1,
+    /// The worker verifies canonical authorization v2, including trusted
+    /// OpenCode runtime environment fields and its distinct digest domain.
+    CanonicalAuthorizationV2,
+}
+
+pub fn worker_capability_for_canonical_authorization_version(
+    version: u32,
+) -> Option<WorkerProtocolCapability> {
+    match version {
+        1 => Some(WorkerProtocolCapability::CanonicalAuthorizationV1),
+        CANONICAL_AUTHORIZATION_VERSION => Some(WorkerProtocolCapability::CanonicalAuthorizationV2),
+        _ => None,
+    }
+}
+
+pub fn worker_supports_canonical_authorization(
+    capabilities: &[WorkerProtocolCapability],
+    version: u32,
+) -> bool {
+    worker_capability_for_canonical_authorization_version(version)
+        .is_some_and(|required| capabilities.contains(&required))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2696,8 +2783,9 @@ pub const CONTEXT_REQUEST_DIGEST_KEY: &str = "request_digest";
 pub const AUTHORIZATION_REQUEST_VERSION: &str = "resolved_authorization_request_v1";
 /// Identifies the exact DTO, canonicalization, and digest domain contract below.
 /// Any change to that contract requires a distinct version and domain separator.
-pub const CANONICAL_AUTHORIZATION_VERSION: u32 = 1;
+pub const CANONICAL_AUTHORIZATION_VERSION: u32 = 2;
 const CANONICAL_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:resolved-authorization:v1\0";
+const CANONICAL_AUTHORIZATION_DOMAIN_V2: &[u8] = b"agent-hub:resolved-authorization:v2\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -3073,6 +3161,17 @@ struct McpBridgeV1 {
 #[serde(deny_unknown_fields)]
 struct OpencodeRunnerV1 {
     max_validation_attempts: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    trusted_env: BTreeMap<String, String>,
+}
+
+impl RunnerProfileV1 {
+    fn has_trusted_opencode_environment(&self) -> bool {
+        matches!(
+            self,
+            Self::Resolved(profile) if !profile.opencode.trusted_env.is_empty()
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3747,10 +3846,20 @@ impl ResolvedAuthorizationRequest {
         let normalized = self.clone().normalize();
         let mut dto = ResolvedAuthorizationRequestV1::from_semantic(normalized)?;
         dto.normalize_sets();
+        let version = if dto
+            .behavior
+            .runner_profile
+            .has_trusted_opencode_environment()
+        {
+            CANONICAL_AUTHORIZATION_VERSION
+        } else {
+            1
+        };
         let canonical_bytes = canonical_json_bytes(serde_json::to_value(dto)?)?;
-        let digest = canonical_authorization_digest(&canonical_bytes);
+        let digest = canonical_authorization_digest_for_version(version, &canonical_bytes)
+            .expect("supported canonical authorization version");
         Ok(CanonicalAuthorizationArtifact {
-            version: CANONICAL_AUTHORIZATION_VERSION,
+            version,
             digest,
             canonical_bytes,
         })
@@ -3811,13 +3920,8 @@ impl ResolvedAuthorizationRequest {
 
 impl CanonicalAuthorizationArtifact {
     pub fn verify_and_parse(&self) -> Result<ResolvedAuthorizationRequest, String> {
-        if self.version != CANONICAL_AUTHORIZATION_VERSION {
-            return Err(format!(
-                "unsupported canonical authorization version {}",
-                self.version
-            ));
-        }
-        let actual_digest = canonical_authorization_digest(&self.canonical_bytes);
+        let actual_digest =
+            canonical_authorization_digest_for_version(self.version, &self.canonical_bytes)?;
         if actual_digest != self.digest {
             return Err(format!(
                 "canonical authorization digest mismatch for version {}",
@@ -3831,6 +3935,18 @@ impl CanonicalAuthorizationArtifact {
                     self.version
                 )
             })?;
+        let has_trusted_environment = dto
+            .behavior
+            .runner_profile
+            .has_trusted_opencode_environment();
+        if (self.version == 1 && has_trusted_environment)
+            || (self.version == CANONICAL_AUTHORIZATION_VERSION && !has_trusted_environment)
+        {
+            return Err(format!(
+                "canonical authorization version {} has incompatible OpenCode runner controls",
+                self.version
+            ));
+        }
         if dto.version != AUTHORIZATION_REQUEST_VERSION {
             return Err(format!(
                 "canonical authorization version {} has incompatible request schema",
@@ -3856,11 +3972,28 @@ impl CanonicalAuthorizationArtifact {
     }
 }
 
+#[cfg(test)]
 fn canonical_authorization_digest(canonical_bytes: &[u8]) -> String {
+    canonical_authorization_digest_for_version(1, canonical_bytes)
+        .expect("canonical authorization version 1 is supported")
+}
+
+fn canonical_authorization_digest_for_version(
+    version: u32,
+    canonical_bytes: &[u8],
+) -> Result<String, String> {
     let mut digest = Sha256::new();
-    digest.update(CANONICAL_AUTHORIZATION_DOMAIN_V1);
+    digest.update(match version {
+        1 => CANONICAL_AUTHORIZATION_DOMAIN_V1,
+        CANONICAL_AUTHORIZATION_VERSION => CANONICAL_AUTHORIZATION_DOMAIN_V2,
+        _ => {
+            return Err(format!(
+                "unsupported canonical authorization version {version}"
+            ));
+        }
+    });
     digest.update(canonical_bytes);
-    hex::encode(digest.finalize())
+    Ok(hex::encode(digest.finalize()))
 }
 
 /// Canonical numbers are the compact forms emitted by `serde_json` for its

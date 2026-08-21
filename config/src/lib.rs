@@ -18,8 +18,9 @@ pub use deployment_validation::{
 pub use environment::EnvironmentConfig;
 pub use environment_bundle::{
     DURABLE_OPENCODE_IMAGE, DURABLE_OPENCODE_MODEL, EnvironmentBundle, EnvironmentBundleFile,
-    materialize_environment_bundle, materialize_environment_bundle_with_snapshot,
-    materialize_environment_bundle_with_system, validate_durable_opencode_config,
+    OPENCODE_CONFIG_SENTINEL, OPENCODE_CONFIG_SENTINEL_SHA256, materialize_environment_bundle,
+    materialize_environment_bundle_with_snapshot, materialize_environment_bundle_with_system,
+    validate_durable_opencode_config,
 };
 pub use image::{ImageConfig, resolve_build_order};
 pub use network_policy::{FlattenedPolicy, NetworkPolicyConfig, PolicyAllowRule, flatten_policy};
@@ -28,10 +29,12 @@ pub use rules::{
     default_to_resolved, load_tool_config, resolve_action, validate_tool_config,
 };
 pub use runner::{
-    CredentialProviderDescriptor, ManagedRunnerFileMount, ManagedRunnerKind, ManagedRunnerSpec,
-    McpBridgeDescriptor, OpencodeRunnerConfig, ResolvedRunnerProfile, RunnerProfilesConfig,
-    TrustedMountDescriptor, canonicalize_resolved_runner_profile, digest_profile,
-    directory_content_digests,
+    CredentialProviderDescriptor, DURABLE_OPENCODE_PATH, ManagedRunnerFileMount, ManagedRunnerKind,
+    ManagedRunnerSpec, McpBridgeDescriptor, OPENCODE_PROJECT_CONFIG_ALIASES, OpencodeRunnerConfig,
+    ResolvedRunnerProfile, RunnerProfilesConfig, TrustedMountDescriptor,
+    canonicalize_resolved_runner_profile, digest_profile, directory_content_digests,
+    trusted_opencode_runtime_env, validate_untrusted_opencode_env,
+    validate_untrusted_opencode_env_name,
 };
 pub use system::SystemConfig;
 pub use tools::{is_in_workspace, normalize_path, resolve_path};

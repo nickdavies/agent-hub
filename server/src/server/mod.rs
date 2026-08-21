@@ -1196,16 +1196,24 @@ kind = "terminal"
         let registration = post_json_response(
             &app,
             "/api/v1/orchestration/workers",
-            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1"]}"#,
+            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2"]}"#,
         )
         .await;
         assert_eq!(registration.status(), AxumStatus::OK);
+        assert_eq!(
+            registration
+                .headers()
+                .get("x-agent-hub-server-capabilities")
+                .and_then(|value| value.to_str().ok()),
+            Some("canonical_authorization_v1, canonical_authorization_v2")
+        );
         let registration: Value = serde_json::from_slice(
             &axum::body::to_bytes(registration.into_body(), usize::MAX)
                 .await
                 .unwrap(),
         )
         .unwrap();
+        assert!(registration.get("server_protocol_capabilities").is_none());
         let session_id = registration["session_id"].as_str().unwrap();
         let session_token = registration["session_token"].as_str().unwrap();
 

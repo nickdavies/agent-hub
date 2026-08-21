@@ -802,10 +802,10 @@ fn default_managed_agent_runner() -> ManagedRunnerSpec {
     ManagedRunnerSpec {
         kind: ManagedRunnerKind::Opencode,
         opencode: OpencodeRunnerConfig::default(),
-        command: "sh".to_string(),
+        command: "/usr/bin/sh".to_string(),
         args: vec![
             "-lc".to_string(),
-            "if [ -f \"$AGENT_PROMPT_USER_PATH\" ]; then opencode run < \"$AGENT_PROMPT_USER_PATH\"; else opencode run; fi".to_string(),
+            "if [ -f \"$AGENT_PROMPT_USER_PATH\" ]; then /usr/local/bin/opencode run < \"$AGENT_PROMPT_USER_PATH\"; else /usr/local/bin/opencode run; fi".to_string(),
         ],
         container_image: None,
         file_mounts: Vec::new(),
@@ -1130,9 +1130,9 @@ mod tests {
 
         assert_eq!(runner.kind, ManagedRunnerKind::Opencode);
         assert_eq!(runner.opencode.max_validation_attempts, 3);
-        assert_eq!(runner.command, "sh");
+        assert_eq!(runner.command, "/usr/bin/sh");
         assert_eq!(runner.args[0], "-lc");
-        assert!(runner.args[1].contains("opencode run"));
+        assert!(runner.args[1].contains("/usr/local/bin/opencode run"));
         assert!(runner.args[1].contains("$AGENT_PROMPT_USER_PATH"));
         assert!(runner.container_image.is_none());
     }

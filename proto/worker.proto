@@ -24,6 +24,7 @@ message RegisterWorkerResponse {
   string session_id = 1;
   string session_token = 2;
   uint64 session_generation = 3;
+  repeated WorkerProtocolCapability server_protocol_capabilities = 4;
 }
 
 message HeartbeatWorkerRequest {
@@ -31,7 +32,9 @@ message HeartbeatWorkerRequest {
   WorkerState state = 2;
 }
 
-message HeartbeatWorkerResponse {}
+message HeartbeatWorkerResponse {
+  repeated WorkerProtocolCapability server_protocol_capabilities = 1;
+}
 
 message PollJobRequest {
   string worker_id = 1;
@@ -39,6 +42,7 @@ message PollJobRequest {
 
 message PollJobResponse {
   optional Job job = 1;
+  repeated WorkerProtocolCapability server_protocol_capabilities = 2;
 }
 
 message UpdateJobRequest {
@@ -96,6 +100,7 @@ enum WorkerState {
 enum WorkerProtocolCapability {
   WORKER_PROTOCOL_CAPABILITY_UNSPECIFIED = 0;
   CANONICAL_AUTHORIZATION_V1 = 1;
+  CANONICAL_AUTHORIZATION_V2 = 2;
 }
 
 enum ExecutionOutcome {

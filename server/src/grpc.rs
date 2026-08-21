@@ -154,6 +154,18 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
             session_id: registered.session_id.to_string(),
             session_token: registered.session_token.expose().to_string(),
             session_generation: registered.session_generation,
+            server_protocol_capabilities: registered
+                .server_protocol_capabilities
+                .into_iter()
+                .map(|capability| match capability {
+                    WorkerProtocolCapability::CanonicalAuthorizationV1 => {
+                        pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32
+                    }
+                    WorkerProtocolCapability::CanonicalAuthorizationV2 => {
+                        pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32
+                    }
+                })
+                .collect(),
         }))
     }
 
@@ -168,8 +180,15 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
             .heartbeat_authenticated(req.worker_id, credential, HeartbeatRequest { state })
             .await
             .map_err(map_orchestration_error)?;
+        let capabilities = self
+            .orchestration
+            .authorization_protocol_capabilities()
+            .await
+            .map_err(map_orchestration_error)?;
 
-        Ok(Response::new(pb::HeartbeatWorkerResponse {}))
+        Ok(Response::new(pb::HeartbeatWorkerResponse {
+            server_protocol_capabilities: server_protocol_capabilities_pb(&capabilities),
+        }))
     }
 
     async fn poll_job(
@@ -188,9 +207,15 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
             )
             .await
             .map_err(map_orchestration_error)?;
+        let capabilities = self
+            .orchestration
+            .authorization_protocol_capabilities()
+            .await
+            .map_err(map_orchestration_error)?;
 
         Ok(Response::new(pb::PollJobResponse {
             job: response.job.map(job_to_pb).transpose()?,
+            server_protocol_capabilities: server_protocol_capabilities_pb(&capabilities),
         }))
     }
 
@@ -278,6 +303,20 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
     }
 }
 
+fn server_protocol_capabilities_pb(capabilities: &[WorkerProtocolCapability]) -> Vec<i32> {
+    capabilities
+        .iter()
+        .map(|capability| match capability {
+            WorkerProtocolCapability::CanonicalAuthorizationV1 => {
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32
+            }
+            WorkerProtocolCapability::CanonicalAuthorizationV2 => {
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32
+            }
+        })
+        .collect()
+}
+
 fn execution_mode_to_pb(mode: ExecutionMode) -> i32 {
     match mode {
         ExecutionMode::Docker => pb::ExecutionMode::Docker as i32,
@@ -353,6 +392,9 @@ fn worker_protocol_capability_from_pb(value: i32) -> Result<WorkerProtocolCapabi
     {
         pb::WorkerProtocolCapability::CanonicalAuthorizationV1 => {
             Ok(WorkerProtocolCapability::CanonicalAuthorizationV1)
+        }
+        pb::WorkerProtocolCapability::CanonicalAuthorizationV2 => {
+            Ok(WorkerProtocolCapability::CanonicalAuthorizationV2)
         }
         pb::WorkerProtocolCapability::Unspecified => Err(Status::invalid_argument(
             "worker protocol capability unspecified",
@@ -926,6 +968,7 @@ mod tests {
             supported_modes: vec![pb::ExecutionMode::Docker as i32],
             protocol_capabilities: vec![
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32,
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32,
             ],
         };
         let decoded = pb::RegisterWorkerRequest::decode(request.encode_to_vec().as_slice())
@@ -933,6 +976,10 @@ mod tests {
         assert_eq!(
             worker_protocol_capability_from_pb(decoded.protocol_capabilities[0]).unwrap(),
             WorkerProtocolCapability::CanonicalAuthorizationV1
+        );
+        assert_eq!(
+            worker_protocol_capability_from_pb(decoded.protocol_capabilities[1]).unwrap(),
+            WorkerProtocolCapability::CanonicalAuthorizationV2
         );
         assert!(
             worker_protocol_capability_from_pb(pb::WorkerProtocolCapability::Unspecified as i32)
@@ -944,6 +991,10 @@ mod tests {
             session_id: Uuid::new_v4().to_string(),
             session_token: "opaque-test-token".to_string(),
             session_generation: 7,
+            server_protocol_capabilities: vec![
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32,
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32,
+            ],
         };
         let decoded = pb::RegisterWorkerResponse::decode(response.encode_to_vec().as_slice())
             .expect("registration response protobuf roundtrip");

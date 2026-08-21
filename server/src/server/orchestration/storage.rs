@@ -748,6 +748,17 @@ pub(super) fn insert_authorization_record(
             job.id
         )
     })?;
+    let max_authorization_version: u32 = tx.query_row(
+        "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if artifact.version > max_authorization_version {
+        anyhow::bail!(
+            "authorization protocol fence rejects canonical authorization v{}",
+            artifact.version
+        );
+    }
     if artifact.digest != request_digest {
         anyhow::bail!(
             "job {} canonical authorization digest mismatch for version {}",

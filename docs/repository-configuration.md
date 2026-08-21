@@ -81,3 +81,17 @@ This base ref is propagated as `AGENT_BASE_REF` and is used by downstream review
 (`~/.config/agent-hub/local-agent.json`, or a path passed via `--local-agent-config`), local-agent
 expands `~` to `$HOME` and mounts each existing directory read-only into job containers at
 `/repos/<dirname>`.
+
+## Repository instructions are task content
+
+Repository `AGENTS.md` files and equivalent instruction files are untrusted task content. An
+agent may use them as guidance while working in that repository, but they are not part of the
+authorized runner configuration. They cannot change tools, permissions, models, providers,
+plugins, credentials, environment controls, mounts, resolved authorization, or any other
+authorization boundary. They may influence how the model uses tools that were already authorized,
+subject to those immutable controls.
+
+OpenCode job environment policy denies executable search paths, dynamic loaders, shell startup
+hooks, and language-specific code-loading or startup variables. Ordinary runtime formatting and
+buffering settings remain allowed; for example, `PYTHONUNBUFFERED` and `PYTHONIOENCODING` do not
+select code and are permitted, while `PYTHONPATH`, `PYTHONHOME`, and `PYTHONSTARTUP` are denied.

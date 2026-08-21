@@ -139,6 +139,20 @@ pub struct ValidatedDeployment {
 }
 
 impl ValidatedDeployment {
+    pub fn provenance_digest(&self) -> Result<String, String> {
+        let snapshot = serde_json::json!({
+            "system_toml": self.system_toml,
+            "local_agent": self.local_agent,
+            "environment_bundle_digests": self.environment_bundle_digests,
+            "runner_profile_digests": self.runner_profile_digests,
+            "network_policy_digests": self.network_policies.iter().map(|(name, policy)| (name, &policy.directory_digest)).collect::<BTreeMap<_, _>>(),
+            "images": self.images.iter().map(|(name, image)| (name, &image.file.digest)).collect::<BTreeMap<_, _>>(),
+            "authoritative_paths": self.authoritative_paths,
+        });
+        let bytes = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
     pub fn assert_authoritative_inventory_complete(&self) -> Result<(), String> {
         let mut expected =
             BTreeSet::from(["local-agent.json".to_string(), "system.toml".to_string()]);
@@ -223,6 +237,7 @@ pub fn validate_authoritative_config_root(root: &Path) -> Result<ValidatedDeploy
                     .expect("installed environments require parsed system config"),
                 &policy_objects,
             )?;
+            bundle.verify_opencode_sentinel()?;
             environment_bundle_digests.insert(name.clone(), bundle.digest.clone());
             environment_bundles.insert(name.clone(), bundle);
             authoritative_paths.insert(format!("environment_bundle:{name}"));

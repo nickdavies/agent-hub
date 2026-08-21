@@ -13,6 +13,13 @@ pub struct WorkflowCatalog {
 
 impl WorkflowCatalog {
     #[cfg(test)]
+    pub fn empty_for_test() -> Self {
+        Self {
+            definitions: HashMap::new(),
+            triage_hints: HashMap::new(),
+        }
+    }
+    #[cfg(test)]
     pub fn load_from_dir(dir: &str) -> anyhow::Result<Self> {
         Self::load_from_dir_with_installed(dir, None)
     }

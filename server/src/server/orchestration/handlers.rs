@@ -20,6 +20,21 @@ use super::map_db;
 const WORKER_SESSION_ID_HEADER: &str = "x-agent-hub-worker-session-id";
 const WORKER_SESSION_TOKEN_HEADER: &str = "x-agent-hub-worker-session-token";
 
+fn server_capability_headers(capabilities: &[protocol::WorkerProtocolCapability]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-agent-hub-server-capabilities",
+        if capabilities.contains(&protocol::WorkerProtocolCapability::CanonicalAuthorizationV2) {
+            "canonical_authorization_v1, canonical_authorization_v2"
+                .parse()
+                .unwrap()
+        } else {
+            "canonical_authorization_v1".parse().unwrap()
+        },
+    );
+    headers
+}
+
 fn worker_session_from_headers(
     headers: &HeaderMap,
     required: bool,
@@ -148,14 +163,15 @@ pub async fn register_worker<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
     headers: HeaderMap,
     Json(req): Json<RegisterWorkerRequest>,
-) -> Result<Json<RegisterWorkerResponse>, AppError> {
+) -> Result<(HeaderMap, Json<RegisterWorkerResponse>), AppError> {
     let replacement = worker_session_from_headers(&headers, false)?;
-    Ok(Json(
-        state
-            .orchestration
-            .register_worker_session(req, replacement)
-            .await?,
-    ))
+    let mut registered = state
+        .orchestration
+        .register_worker_session(req, replacement)
+        .await?;
+    let response_headers = server_capability_headers(&registered.server_protocol_capabilities);
+    registered.server_protocol_capabilities.clear();
+    Ok((response_headers, Json(registered)))
 }
 
 pub async fn heartbeat_worker<N: super::super::notifier::Notifier>(
@@ -163,13 +179,20 @@ pub async fn heartbeat_worker<N: super::super::notifier::Notifier>(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(req): Json<HeartbeatRequest>,
-) -> Result<Json<WorkerInfo>, AppError> {
+) -> Result<(HeaderMap, Json<WorkerInfo>), AppError> {
     let credential = worker_session_from_headers(&headers, true)?.expect("required session");
-    Ok(Json(
-        state
-            .orchestration
-            .heartbeat_authenticated(id, credential, req)
-            .await?,
+    let capabilities = state
+        .orchestration
+        .authorization_protocol_capabilities()
+        .await?;
+    Ok((
+        server_capability_headers(&capabilities),
+        Json(
+            state
+                .orchestration
+                .heartbeat_authenticated(id, credential, req)
+                .await?,
+        ),
     ))
 }
 
@@ -183,13 +206,20 @@ pub async fn poll_job<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
     headers: HeaderMap,
     Json(req): Json<PollJobRequest>,
-) -> Result<Json<PollJobResponse>, AppError> {
+) -> Result<(HeaderMap, Json<PollJobResponse>), AppError> {
     let credential = worker_session_from_headers(&headers, true)?.expect("required session");
-    Ok(Json(
-        state
-            .orchestration
-            .poll_job_authenticated(credential, req)
-            .await?,
+    let capabilities = state
+        .orchestration
+        .authorization_protocol_capabilities()
+        .await?;
+    Ok((
+        server_capability_headers(&capabilities),
+        Json(
+            state
+                .orchestration
+                .poll_job_authenticated(credential, req)
+                .await?,
+        ),
     ))
 }
 
