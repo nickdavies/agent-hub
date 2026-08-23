@@ -18,7 +18,7 @@ use protocol::{
     AgentOutput, ArtifactSummary, ExecutionMode, ExecutionOutcome, ExecutionTiming,
     JOB_RUN_SCHEMA_NAME, Job, JobEvent, JobEventKind, JobResult, JobState, NetworkResourceKind,
     NetworkResourceRequest, RegisterWorkerRequest, Secret, TerminationReason, WorkerState,
-    validate_agent_output_next_event,
+    validate_agent_output_event,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
@@ -36,9 +36,9 @@ mod workspace;
 
 use artifacts::{
     AdditionalRepoMountView, AgentContextWriteParams, collect_structured_transcript_artifacts,
-    display_paths_for_runtime, file_len_u64, normalize_github_repo_slug_with_allowlist,
-    parse_github_pr_from_output, parse_github_repo_url, work_item_contract_from_job_context,
-    workflow_valid_next_events_from_job_context, write_agent_context_file,
+    display_paths_for_runtime, file_len_u64, legacy_workflow_valid_next_events_from_job_context,
+    normalize_github_repo_slug_with_allowlist, parse_github_pr_from_output, parse_github_repo_url,
+    work_item_contract_from_job_context, write_agent_context_file,
 };
 use client::{
     Client, GrpcClient, HttpClient, JobUpdateOutcome, is_worker_not_found_error,
@@ -58,6 +58,7 @@ fn worker_protocol_capabilities() -> Vec<protocol::WorkerProtocolCapability> {
     vec![
         protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
         protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+        protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
     ]
 }
 
@@ -68,10 +69,14 @@ fn initial_worker_protocol_capabilities() -> Vec<protocol::WorkerProtocolCapabil
 fn negotiated_worker_protocol_capabilities(
     server_capabilities: &[protocol::WorkerProtocolCapability],
 ) -> Vec<protocol::WorkerProtocolCapability> {
-    if server_capabilities.contains(&protocol::WorkerProtocolCapability::CanonicalAuthorizationV2) {
-        worker_protocol_capabilities()
-    } else {
+    let negotiated = worker_protocol_capabilities()
+        .into_iter()
+        .filter(|capability| server_capabilities.contains(capability))
+        .collect::<Vec<_>>();
+    if negotiated.is_empty() {
         initial_worker_protocol_capabilities()
+    } else {
+        negotiated
     }
 }
 
@@ -766,6 +771,7 @@ mod tests {
             workflow_snapshot: serde_json::json!({"schema":"reactive_v2"}),
             state_id: job.step_id.clone(),
             state_kind: protocol::ReactiveStateKind::Command,
+            agent_output_events: Vec::new(),
             behavior: protocol::ResolvedAuthorizationBehavior {
                 execution_kind: "command".to_string(),
                 runner_profile: serde_json::json!({
@@ -804,9 +810,40 @@ mod tests {
                 attempt: 0,
             },
         };
-        let bundle =
-            protocol::ImmutableAuthorizationBundle::create(&request).expect("authorization bundle");
+        let artifact = request
+            .canonical_artifact()
+            .expect("legacy authorization artifact");
+        let authorization_id = protocol::authorization_id_for_request(&request, &artifact.digest);
+        let bundle = protocol::ImmutableAuthorizationBundle::verify(&artifact, &authorization_id)
+            .expect("authorization bundle");
         assert_eq!(bundle.version, 1, "old-server authorization fixture is v1");
+        for forbidden in ["cancel", "human_approved", "timeout"] {
+            let mut legacy_request = request.clone();
+            legacy_request.behavior.execution_context["workflow"]["inputs"]["valid_next_events"] =
+                serde_json::json!([forbidden]);
+            let legacy_artifact = legacy_request.canonical_artifact().unwrap();
+            let legacy_id =
+                protocol::authorization_id_for_request(&legacy_request, &legacy_artifact.digest);
+            let legacy_bundle =
+                protocol::ImmutableAuthorizationBundle::verify(&legacy_artifact, &legacy_id)
+                    .unwrap();
+            let allowed = authorized_agent_output_events(&legacy_bundle).unwrap();
+            assert!(allowed.is_empty());
+            assert!(
+                validate_agent_output_event(
+                    &AgentOutput {
+                        next_event: Some(forbidden.to_string()),
+                        ..AgentOutput::default()
+                    },
+                    &allowed,
+                )
+                .is_err()
+            );
+            assert!(
+                validate_agent_output_event(&AgentOutput::default(), &allowed).is_ok(),
+                "legacy output without next_event keeps exit-status semantics"
+            );
+        }
         protocol::project_authorization_bundle_into_job_context(&mut job.context, &bundle)
             .expect("authorization evidence");
         job.canonical_authorization = Some(bundle.artifact());
@@ -836,10 +873,8 @@ mod tests {
                 protocol::authorization_request_from_job_context(&verified.job.context)
                     .expect("transported request");
             assert_eq!(
-                transported_request
-                    .request_digest()
-                    .expect("transported digest"),
-                request.request_digest().expect("source digest")
+                transported_request.canonical_artifact().unwrap().digest,
+                artifact.digest
             );
             assert_eq!(transported_request.resource_constraints.max_retries, 3);
         }
@@ -964,7 +999,10 @@ mod tests {
         let mut mismatched_request = request.clone();
         mismatched_request.behavior.runner_profile["config_digest"] =
             serde_json::Value::String("other".to_string());
-        let bundle = protocol::ImmutableAuthorizationBundle::create(&mismatched_request)
+        let artifact = mismatched_request.canonical_artifact().unwrap();
+        let authorization_id =
+            protocol::authorization_id_for_request(&mismatched_request, &artifact.digest);
+        let bundle = protocol::ImmutableAuthorizationBundle::verify(&artifact, &authorization_id)
             .expect("profile mismatch bundle");
         protocol::project_authorization_bundle_into_job_context(
             &mut profile_mismatch.context,
@@ -977,7 +1015,10 @@ mod tests {
         let mut environment_mismatch = job.clone();
         let mut mismatched_request = request.clone();
         mismatched_request.resolved_environment = serde_json::json!({"base":"missing"});
-        let bundle = protocol::ImmutableAuthorizationBundle::create(&mismatched_request)
+        let artifact = mismatched_request.canonical_artifact().unwrap();
+        let authorization_id =
+            protocol::authorization_id_for_request(&mismatched_request, &artifact.digest);
+        let bundle = protocol::ImmutableAuthorizationBundle::verify(&artifact, &authorization_id)
             .expect("environment mismatch bundle");
         protocol::project_authorization_bundle_into_job_context(
             &mut environment_mismatch.context,
@@ -1044,12 +1085,13 @@ mod tests {
     }
 
     #[test]
-    fn worker_advertises_both_canonical_authorization_versions() {
+    fn worker_advertises_all_canonical_authorization_versions() {
         assert_eq!(
             worker_protocol_capabilities(),
             vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ]
         );
         assert_eq!(
@@ -1061,14 +1103,16 @@ mod tests {
             negotiated_worker_protocol_capabilities(&[
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ]),
             worker_protocol_capabilities(),
-            "a new server enables the atomic v2 session replacement"
+            "a new server enables the atomic v3 session replacement"
         );
 
         let old_server = Client::Http(HttpClient::new("http://old-server".to_string(), None));
         assert!(!old_server.server_supports_authorization_version(1));
         assert!(!old_server.server_supports_authorization_version(2));
+        assert!(!old_server.server_supports_authorization_version(3));
         if let Client::Http(client) = &old_server {
             let session_id = uuid::Uuid::new_v4();
             *client.worker_session.write().unwrap() = Some(protocol::AuthenticatedWorkerSession {
@@ -1088,6 +1132,7 @@ mod tests {
         }
         assert!(old_server.server_supports_authorization_version(1));
         assert!(!old_server.server_supports_authorization_version(2));
+        assert!(!old_server.server_supports_authorization_version(3));
         if let Client::Http(client) = &old_server {
             client
                 .worker_session
@@ -3075,6 +3120,7 @@ mod tests {
                 workspace_dir: workspace_dir.clone(),
                 runtime_spec: runtime.clone(),
                 additional_repo_mounts: vec![],
+                agent_output_events: Vec::new(),
             },
         )
         .expect("write agent context");
@@ -3100,6 +3146,7 @@ mod tests {
                 workspace_dir: workspace_dir.clone(),
                 runtime_spec: runtime,
                 additional_repo_mounts: vec![],
+                agent_output_events: Vec::new(),
             },
         )
         .expect("write changed-attempt context");
@@ -3211,6 +3258,7 @@ mod tests {
                 workspace_dir: workspace_dir.clone(),
                 runtime_spec: runtime,
                 additional_repo_mounts: vec![],
+                agent_output_events: Vec::new(),
             },
         )
         .expect("write agent context");
@@ -3261,7 +3309,7 @@ mod tests {
             .expect("workflow.inputs object");
         assert_eq!(
             workflow_inputs
-                .get("valid_next_events")
+                .get("agent_output_events")
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len),
             Some(0)
@@ -3395,6 +3443,7 @@ mod tests {
                 workspace_dir: workspace_dir.clone(),
                 runtime_spec: runtime,
                 additional_repo_mounts: vec![],
+                agent_output_events: vec!["job_succeeded".to_string()],
             },
         )
         .expect("write agent context");
@@ -3404,8 +3453,8 @@ mod tests {
                 .expect("parse context");
 
         assert_eq!(
-            parsed["workflow"]["inputs"]["valid_next_events"],
-            serde_json::json!(["submit", "cancel"])
+            parsed["workflow"]["inputs"]["agent_output_events"],
+            serde_json::json!(["job_succeeded"])
         );
         assert_eq!(
             parsed["workflow"]["inputs"]["job_artifact_paths"]["build"]["agent_context"],
@@ -3416,8 +3465,8 @@ mod tests {
             serde_json::json!(protocol::AGENT_CONTEXT_SCHEMA_NAME)
         );
         assert_eq!(
-            parsed["workflow"]["valid_next_events"],
-            serde_json::json!(["submit", "cancel"])
+            parsed["workflow"]["agent_output_events"],
+            serde_json::json!(["job_succeeded"])
         );
         assert_eq!(parsed["work_item"]["id"], serde_json::json!("w-123"));
         assert_eq!(
@@ -4051,6 +4100,7 @@ async fn run_job(
     let triage_job = verified.triage;
     let github_action = verified.github_action;
     let environment_bundle = verified.environment_bundle;
+    let agent_output_events = verified.agent_output_events;
 
     let opencode_job_state = if matches!(resolved_runner.kind, ResolvedRunnerKind::Opencode(_)) {
         Some(
@@ -4394,6 +4444,7 @@ async fn run_job(
                     writable: mount.writable,
                 })
                 .collect(),
+            agent_output_events: agent_output_events.clone(),
         },
     ) {
         job_event_sink
@@ -4467,7 +4518,7 @@ async fn run_job(
                     egress_manager,
                     prepared_workspace.mirror_dir.as_deref(),
                     &prepared_workspace.additional_repo_mounts,
-                    workflow_valid_next_events_from_job_context(&job.context).unwrap_or_default(),
+                    agent_output_events.clone(),
                     work_item_context.clone(),
                     &environment_table,
                     opencode_job_state
@@ -4562,21 +4613,10 @@ async fn run_job(
             let raw_output_json: serde_json::Value =
                 serde_json::from_slice(&bytes).context("invalid output.json")?;
 
-            if let Ok(typed_output) = serde_json::from_value::<AgentOutput>(raw_output_json.clone())
-                && let Some(valid_next_events) =
-                    workflow_valid_next_events_from_job_context(&job.context)
-                && let Err(validation_error) =
-                    validate_agent_output_next_event(&typed_output, &valid_next_events)
-            {
-                let message = format!(
-                    "warning: output.json next_event validation failed for job {}: {}",
-                    job.id, validation_error
-                );
-                eprintln!("{message}");
-                job_event_sink
-                    .emit(job.id, pb::JobEventKind::JobEventSystem, message)
-                    .await;
-            }
+            let typed_output = serde_json::from_value::<AgentOutput>(raw_output_json.clone())
+                .context("output.json does not match AgentOutput")?;
+            validate_agent_output_event(&typed_output, &agent_output_events)
+                .map_err(anyhow::Error::msg)?;
 
             Some(raw_output_json)
         } else {
@@ -4696,6 +4736,7 @@ struct VerifiedAuthorizedJob {
     github_action: Option<protocol::GithubAction>,
     environment_bundle: Option<agent_hub_config::EnvironmentBundle>,
     credential_provider_names: Vec<String>,
+    agent_output_events: Vec<String>,
 }
 
 struct OpencodeJobState {
@@ -6938,6 +6979,7 @@ mod real_docker_oauth_integration_tests {
             workflow_snapshot: serde_json::json!({"schema":"reactive_v2"}),
             state_id: "assert".to_string(),
             state_kind: protocol::ReactiveStateKind::Agent,
+            agent_output_events: Vec::new(),
             behavior: protocol::ResolvedAuthorizationBehavior {
                 execution_kind: "agent".to_string(),
                 runner_profile: serde_json::to_value(&profile)?,
@@ -7639,6 +7681,7 @@ fn verify_authorized_job_for_session(
 ) -> anyhow::Result<VerifiedAuthorizedJob> {
     let bundle = local_agent::verify_authorized_job(job, worker_id, session_id, session_generation)
         .map_err(anyhow::Error::msg)?;
+    let agent_output_events = authorized_agent_output_events(&bundle)?;
     let mut request = bundle.request.clone();
     if request.permission_envelope.environment.execution_mode != ExecutionMode::Docker {
         anyhow::bail!("only authorized Docker jobs are supported");
@@ -7742,6 +7785,7 @@ fn verify_authorized_job_for_session(
             github_action: None,
             environment_bundle: None,
             credential_provider_names: Vec::new(),
+            agent_output_events,
             job: authorized_job,
         });
     }
@@ -7788,6 +7832,7 @@ fn verify_authorized_job_for_session(
             github_action: Some(operation),
             environment_bundle: None,
             credential_provider_names: Vec::new(),
+            agent_output_events,
             job: authorized_job,
         });
     }
@@ -7866,6 +7911,7 @@ fn verify_authorized_job_for_session(
         github_action: None,
         environment_bundle: verified_environment_bundle,
         credential_provider_names,
+        agent_output_events,
         job: authorized_job,
     })
 }
@@ -9904,7 +9950,56 @@ fn authorized_execution_context(
         protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY.to_string(),
         serde_json::to_value(&bundle.request)?,
     );
+    if bundle.version == protocol::CANONICAL_AUTHORIZATION_VERSION {
+        let workflow = object
+            .entry("workflow".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let workflow = workflow.as_object_mut().ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "authorized workflow context is not an object",
+            ))
+        })?;
+        let inputs = workflow
+            .entry("inputs".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let inputs = inputs.as_object_mut().ok_or_else(|| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "authorized workflow inputs are not an object",
+            ))
+        })?;
+        inputs.remove("valid_next_events");
+        inputs.insert(
+            "agent_output_events".to_string(),
+            serde_json::to_value(&bundle.request.agent_output_events)?,
+        );
+    }
     Ok(execution_context)
+}
+
+fn authorized_agent_output_events(
+    bundle: &protocol::ImmutableAuthorizationBundle,
+) -> anyhow::Result<Vec<String>> {
+    match bundle.version {
+        protocol::CANONICAL_AUTHORIZATION_VERSION => Ok(bundle
+            .request
+            .agent_output_events
+            .iter()
+            .map(ToString::to_string)
+            .collect()),
+        1 | protocol::CANONICAL_AUTHORIZATION_VERSION_V2 => {
+            Ok(legacy_workflow_valid_next_events_from_job_context(
+                &bundle.request.behavior.execution_context,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|event| event.parse::<protocol::AgentOutputEvent>().ok())
+            .map(|event| event.to_string())
+            .collect())
+        }
+        version => anyhow::bail!("unsupported canonical authorization version {version}"),
+    }
 }
 
 fn artifact_store_relative_path(transcript_rel_dir: &str, filename: &str) -> String {
@@ -11188,7 +11283,7 @@ async fn supervise_process_with_output_validation(
     deadline: &JobDeadline,
     redactor: Option<ExactTokenRedactor>,
     output_path: &Path,
-    valid_next_events: &[String],
+    agent_output_events: &[String],
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
     events: Option<&JobEventSink>,
@@ -11321,7 +11416,7 @@ async fn supervise_process_with_output_validation(
                 if validate_opencode_output_snapshot(
                     output_path,
                     redactor.as_ref(),
-                    valid_next_events,
+                    agent_output_events,
                     work_item_context,
                     environment_table,
                 )
@@ -11975,7 +12070,7 @@ async fn run_docker_opencode_with_validation_retries(
     egress_manager: &EgressManager,
     primary_repo_mirror_dir: Option<&Path>,
     additional_repo_mounts: &[AdditionalRepoMount],
-    valid_next_events: Vec<String>,
+    agent_output_events: Vec<String>,
     work_item_context: serde_json::Value,
     environment_table: &EnvironmentValidationTable,
     opencode_job_state: &Arc<OpencodeJobState>,
@@ -12010,7 +12105,7 @@ async fn run_docker_opencode_with_validation_retries(
         opencode,
         &invocation,
         output_path,
-        &valid_next_events,
+        &agent_output_events,
         &work_item_context,
         environment_table,
         events,
@@ -12035,7 +12130,7 @@ async fn run_opencode_validation_loop(
     opencode: &OpencodeManagedSpec,
     invocation: &DockerRuntimeInvocation,
     output_path: &Path,
-    valid_next_events: &[String],
+    agent_output_events: &[String],
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
     events: Option<&JobEventSink>,
@@ -12088,7 +12183,7 @@ async fn run_opencode_validation_loop(
             &shell_prelude,
             attempt > 1,
             output_path,
-            valid_next_events,
+            agent_output_events,
             work_item_context,
             environment_table,
             events,
@@ -12105,7 +12200,7 @@ async fn run_opencode_validation_loop(
 
         match validate_opencode_output(
             output_path,
-            valid_next_events,
+            agent_output_events,
             work_item_context,
             environment_table,
         ) {
@@ -12151,7 +12246,7 @@ async fn run_opencode_validation_loop(
                         .await;
                 }
                 continuation_prompt = Some(build_opencode_correction_prompt(
-                    valid_next_events,
+                    agent_output_events,
                     &validation_error.to_string(),
                     environment_table,
                 ));
@@ -12188,7 +12283,7 @@ async fn run_docker_opencode_attempt(
     shell_prelude: &str,
     append_logs: bool,
     output_path: &Path,
-    valid_next_events: &[String],
+    agent_output_events: &[String],
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
     events: Option<&JobEventSink>,
@@ -12230,7 +12325,7 @@ async fn run_docker_opencode_attempt(
             &invocation.deadline,
             Some(invocation.redactor.clone()),
             output_path,
-            valid_next_events,
+            agent_output_events,
             work_item_context,
             environment_table,
             events,
@@ -12249,7 +12344,7 @@ async fn run_docker_opencode_attempt(
             &invocation.deadline,
             Some(invocation.redactor.clone()),
             output_path,
-            valid_next_events,
+            agent_output_events,
             work_item_context,
             environment_table,
             events,
@@ -12462,7 +12557,7 @@ fn build_opencode_continue_script(shell_prelude: &str, prompt: &str) -> String {
 
 fn validate_opencode_output(
     output_path: &Path,
-    valid_next_events: &[String],
+    agent_output_events: &[String],
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
 ) -> anyhow::Result<()> {
@@ -12473,7 +12568,7 @@ fn validate_opencode_output(
     let bytes = std::fs::read(output_path).context("read output.json")?;
     validate_opencode_output_bytes(
         &bytes,
-        valid_next_events,
+        agent_output_events,
         work_item_context,
         environment_table,
     )
@@ -12481,7 +12576,7 @@ fn validate_opencode_output(
 
 fn validate_opencode_output_bytes(
     bytes: &[u8],
-    valid_next_events: &[String],
+    agent_output_events: &[String],
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
 ) -> anyhow::Result<()> {
@@ -12490,18 +12585,46 @@ fn validate_opencode_output_bytes(
     let typed_output: AgentOutput = serde_json::from_value(raw_output.clone())
         .context("output.json is not valid AgentOutput")?;
 
-    validate_agent_output_next_event(&typed_output, valid_next_events)
-        .map_err(anyhow::Error::msg)?;
+    validate_agent_output_event(&typed_output, agent_output_events).map_err(anyhow::Error::msg)?;
 
     validate_environment_selection_structure(&raw_output, work_item_context, environment_table)?;
     validate_triage_repo_rules(work_item_context, &typed_output)?;
     Ok(())
 }
 
+#[cfg(test)]
+mod executable_output_validation_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_10_retry_fixture_accepts_only_authorized_agent_output_events() {
+        let allowed = vec!["job_succeeded".to_string(), "job_failed".to_string()];
+        let work_item = serde_json::json!({"workflow_id":"runtime-10"});
+        let environments = EnvironmentValidationTable::for_tests();
+
+        assert!(
+            validate_opencode_output_bytes(
+                br#"{"next_event":"job_succeeded"}"#,
+                &allowed,
+                &work_item,
+                &environments,
+            )
+            .is_ok()
+        );
+        for forbidden in ["human_approved", "cancel"] {
+            let output = serde_json::to_vec(&serde_json::json!({"next_event": forbidden})).unwrap();
+            assert!(
+                validate_opencode_output_bytes(&output, &allowed, &work_item, &environments,)
+                    .is_err()
+            );
+        }
+    }
+}
+
 fn validate_opencode_output_snapshot(
     output_path: &Path,
     redactor: Option<&ExactTokenRedactor>,
-    valid_next_events: &[String],
+    agent_output_events: &[String],
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
 ) -> anyhow::Result<()> {
@@ -12509,7 +12632,7 @@ fn validate_opencode_output_snapshot(
     let redacted = redactor.map_or(bytes.clone(), |redactor| redactor.redact_bytes(&bytes));
     validate_opencode_output_bytes(
         &redacted,
-        valid_next_events,
+        agent_output_events,
         work_item_context,
         environment_table,
     )
@@ -12721,13 +12844,13 @@ fn validate_triage_repo_rules(
 }
 
 fn build_opencode_correction_prompt(
-    valid_next_events: &[String],
+    agent_output_events: &[String],
     validation_error: &str,
     environment_table: &EnvironmentValidationTable,
 ) -> String {
     format!(
         "Your previous output.json failed validation in local-agent.\n\nValidation error:\n{validation_error}\n\nYou must write a corrected /transcript/output.json that:\n1) parses as AgentOutput JSON\n2) sets next_event to one of: {:?}\n3) if next_event is job_succeeded for a __triage__ job, include a concrete repo object with non-empty repo_url and base_ref\n4) if environment is present, it must be an object with non-empty string base and overlays as an array of strings, and semantic values must be valid.\n5) valid base environments: {}.\n\nOnly fix output.json and avoid unrelated changes.",
-        valid_next_events,
+        agent_output_events,
         environment_table.options_string(),
     )
 }
@@ -13488,6 +13611,7 @@ mod runner_profile_projection_tests {
             workflow_snapshot: serde_json::json!({"profile":"opencode"}),
             state_id: job.step_id.clone(),
             state_kind: protocol::ReactiveStateKind::Agent,
+            agent_output_events: Vec::new(),
             behavior: protocol::ResolvedAuthorizationBehavior {
                 execution_kind: "agent".to_string(),
                 runner_profile: serde_json::to_value(&profile).unwrap(),

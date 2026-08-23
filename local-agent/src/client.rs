@@ -33,6 +33,9 @@ fn capabilities_from_header(
             "canonical_authorization_v2" => {
                 Some(protocol::WorkerProtocolCapability::CanonicalAuthorizationV2)
             }
+            "canonical_authorization_v3" => {
+                Some(protocol::WorkerProtocolCapability::CanonicalAuthorizationV3)
+            }
             _ => None,
         };
         if let Some(capability) = capability
@@ -58,6 +61,9 @@ fn capabilities_from_pb(
                 }
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV2 => {
                     Ok(protocol::WorkerProtocolCapability::CanonicalAuthorizationV2)
+                }
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV3 => {
+                    Ok(protocol::WorkerProtocolCapability::CanonicalAuthorizationV3)
                 }
                 pb::WorkerProtocolCapability::Unspecified => {
                     anyhow::bail!("server advertised unspecified worker capability")
@@ -282,6 +288,9 @@ impl Client {
                                 }
                                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2 => {
                                     pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32
+                                }
+                                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3 => {
+                                    pb::WorkerProtocolCapability::CanonicalAuthorizationV3 as i32
                                 }
                             })
                             .collect(),

@@ -522,7 +522,7 @@ pub(super) fn commit_ordinary_authorized_job(
     Ok(())
 }
 
-fn insert_authorization_obligation(
+pub(super) fn insert_authorization_obligation(
     tx: &Transaction<'_>,
     obligation: &AuthorizationObligationInsert,
 ) -> anyhow::Result<()> {
@@ -564,7 +564,10 @@ fn insert_authorization_obligation(
     Ok(())
 }
 
-fn insert_work_item_in_transaction(tx: &Transaction<'_>, item: &WorkItem) -> anyhow::Result<()> {
+pub(super) fn insert_work_item_in_transaction(
+    tx: &Transaction<'_>,
+    item: &WorkItem,
+) -> anyhow::Result<()> {
     tx.execute(
         "INSERT INTO work_items (id, workflow_id, external_task_id, external_task_source, title, description, labels_json, priority, session_id, current_step, projected_state, last_failure_reason, required_action_description, triage_status, human_gate, human_gate_state, blocked_on, state, context_json, repo_json, parent_work_item_id, parent_step_id, child_work_item_id, created_at, updated_at, last_written_at, write_back_failures, write_back_retry_after, status_comment_id, checkpoint_comment_id, job_result_comment_ids_json, provider_ownership_json, remembered_human_owners_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
         work_item_params(item)?,
@@ -572,7 +575,10 @@ fn insert_work_item_in_transaction(tx: &Transaction<'_>, item: &WorkItem) -> any
     Ok(())
 }
 
-fn update_work_item_in_transaction(tx: &Transaction<'_>, item: &WorkItem) -> anyhow::Result<()> {
+pub(super) fn update_work_item_in_transaction(
+    tx: &Transaction<'_>,
+    item: &WorkItem,
+) -> anyhow::Result<()> {
     let updated = tx.execute(
         "UPDATE work_items SET workflow_id = ?2, external_task_id = ?3, external_task_source = ?4, title = ?5, description = ?6, labels_json = ?7, priority = ?8, current_step = ?9, projected_state = ?10, last_failure_reason = ?11, required_action_description = ?12, triage_status = ?13, human_gate = ?14, human_gate_state = ?15, blocked_on = ?16, state = ?17, context_json = ?18, repo_json = ?19, parent_work_item_id = ?20, parent_step_id = ?21, child_work_item_id = ?22, updated_at = ?23, last_written_at = ?24, write_back_failures = ?25, write_back_retry_after = ?26, status_comment_id = ?27, checkpoint_comment_id = ?28, job_result_comment_ids_json = ?29, provider_ownership_json = ?30, remembered_human_owners_json = ?31 WHERE id = ?1",
         params![
@@ -695,7 +701,7 @@ fn work_item_params(
     Ok(rusqlite::params_from_iter(values))
 }
 
-fn insert_job_in_transaction(
+pub(super) fn insert_job_in_transaction(
     tx: &Transaction<'_>,
     insert: &ProviderActionJobInsert,
 ) -> anyhow::Result<()> {
@@ -863,6 +869,26 @@ pub(super) fn verify_job_authorization(
     conn: &Connection,
     job: &Job,
 ) -> anyhow::Result<protocol::ImmutableAuthorizationBundle> {
+    let bundle = verify_job_authorization_frozen(conn, job)?;
+    let current_invocation_id = conn
+        .query_row(
+            "SELECT json_extract(context_json, '$.state_invocation.id') FROM work_items WHERE id = ?1",
+            [job.work_item_id.to_string()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("job {} work item has no invocation identity", job.id))?;
+    if current_invocation_id != bundle.request.invocation_id.to_string() {
+        anyhow::bail!("job {} authorization invocation identity mismatch", job.id);
+    }
+    Ok(bundle)
+}
+
+pub(super) fn verify_job_authorization_frozen(
+    conn: &Connection,
+    job: &Job,
+) -> anyhow::Result<protocol::ImmutableAuthorizationBundle> {
     let (authorization_id, request_digest, checkpoint_owner_id, stored_work_item_id) = conn.query_row(
         "SELECT authorization_id, request_digest, checkpoint_owner_id, work_item_id FROM jobs WHERE id = ?1",
         [job.id.to_string()],
@@ -946,18 +972,6 @@ pub(super) fn verify_job_authorization(
         || record_invocation_id != bundle.request.invocation_id.to_string()
     {
         anyhow::bail!("job {} authorization storage identity mismatch", job.id);
-    }
-    let current_invocation_id = conn
-        .query_row(
-            "SELECT json_extract(context_json, '$.state_invocation.id') FROM work_items WHERE id = ?1",
-            [job.work_item_id.to_string()],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten()
-        .ok_or_else(|| anyhow::anyhow!("job {} work item has no invocation identity", job.id))?;
-    if current_invocation_id != bundle.request.invocation_id.to_string() {
-        anyhow::bail!("job {} authorization invocation identity mismatch", job.id);
     }
     verify_request_for_job(job, bundle.request.root_work_item_id, &bundle.request)?;
     verify_exact_authorization_display(job, &bundle)?;

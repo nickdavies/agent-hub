@@ -19,6 +19,7 @@ pub(crate) struct AgentContextWriteParams {
     pub workspace_dir: std::path::PathBuf,
     pub runtime_spec: protocol::CanonicalRuntimeSpec,
     pub additional_repo_mounts: Vec<AdditionalRepoMountView>,
+    pub agent_output_events: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,13 +52,15 @@ pub(crate) fn write_agent_context_file(
         &params.runtime_spec,
     );
     let transcript_root = std::path::PathBuf::from(&transcript_dir_display);
-    let workflow_inputs = workflow_inputs_contract_from_job_context(&job.context);
+    let mut workflow_inputs = workflow_inputs_contract_from_job_context(&job.context);
+    if let Some(inputs) = workflow_inputs.as_object_mut() {
+        inputs.remove("valid_next_events");
+        inputs.insert(
+            "agent_output_events".to_string(),
+            serde_json::to_value(&params.agent_output_events)?,
+        );
+    }
     let work_item = work_item_contract_from_job_context(&job.context);
-    let workflow_valid_next_events = workflow_inputs
-        .as_object()
-        .and_then(|obj| obj.get("valid_next_events"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
     let artifact_paths = workflow_inputs
         .as_object()
         .and_then(|obj| obj.get("job_artifact_paths"))
@@ -68,16 +71,6 @@ pub(crate) fn write_agent_context_file(
         .and_then(|obj| obj.get("job_artifact_metadata"))
         .cloned()
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-    let valid_next_events = workflow_valid_next_events
-        .as_array()
-        .map(|events| {
-            events
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let repo_value = serde_json::to_value(&job.repo)?;
     let additional_repo_values = params
         .additional_repo_mounts
@@ -160,7 +153,7 @@ pub(crate) fn write_agent_context_file(
         work_item: Some(work_item),
         workflow: AgentContextWorkflow {
             inputs: workflow_inputs,
-            valid_next_events,
+            agent_output_events: params.agent_output_events,
         },
         artifacts: AgentContextArtifacts {
             paths: artifact_paths,
@@ -354,7 +347,7 @@ pub(crate) fn display_paths_for_runtime(
     }
 }
 
-pub(crate) fn workflow_valid_next_events_from_job_context(
+pub(crate) fn legacy_workflow_valid_next_events_from_job_context(
     job_context: &serde_json::Value,
 ) -> Option<Vec<String>> {
     job_context
@@ -447,10 +440,10 @@ fn workflow_inputs_contract_from_job_context(job_context: &serde_json::Value) ->
         .and_then(|obj| obj.get("inputs"))
         .cloned();
 
-    let valid_next_events = workflow_inputs
+    let agent_output_events = workflow_inputs
         .as_ref()
         .and_then(serde_json::Value::as_object)
-        .and_then(|obj| obj.get("valid_next_events"))
+        .and_then(|obj| obj.get("agent_output_events"))
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -476,7 +469,7 @@ fn workflow_inputs_contract_from_job_context(job_context: &serde_json::Value) ->
         });
 
     serde_json::json!({
-        "valid_next_events": valid_next_events,
+        "agent_output_events": agent_output_events,
         "job_artifact_paths": job_artifact_paths,
         "job_artifact_metadata": job_artifact_metadata,
     })

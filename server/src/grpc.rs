@@ -164,6 +164,9 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
                     WorkerProtocolCapability::CanonicalAuthorizationV2 => {
                         pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32
                     }
+                    WorkerProtocolCapability::CanonicalAuthorizationV3 => {
+                        pb::WorkerProtocolCapability::CanonicalAuthorizationV3 as i32
+                    }
                 })
                 .collect(),
         }))
@@ -313,6 +316,9 @@ fn server_protocol_capabilities_pb(capabilities: &[WorkerProtocolCapability]) ->
             WorkerProtocolCapability::CanonicalAuthorizationV2 => {
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32
             }
+            WorkerProtocolCapability::CanonicalAuthorizationV3 => {
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV3 as i32
+            }
         })
         .collect()
 }
@@ -395,6 +401,9 @@ fn worker_protocol_capability_from_pb(value: i32) -> Result<WorkerProtocolCapabi
         }
         pb::WorkerProtocolCapability::CanonicalAuthorizationV2 => {
             Ok(WorkerProtocolCapability::CanonicalAuthorizationV2)
+        }
+        pb::WorkerProtocolCapability::CanonicalAuthorizationV3 => {
+            Ok(WorkerProtocolCapability::CanonicalAuthorizationV3)
         }
         pb::WorkerProtocolCapability::Unspecified => Err(Status::invalid_argument(
             "worker protocol capability unspecified",
@@ -834,6 +843,7 @@ mod tests {
             workflows_dir: "workflows".to_string(),
             config_root: "../agent-hub-configs".to_string(),
             task_dir: "tasks".to_string(),
+            task_state_dir: "task-state".to_string(),
             task_adapter: "file".to_string(),
             vikunja_base_url: None,
             vikunja_token: None,
@@ -901,6 +911,7 @@ mod tests {
             workflow_snapshot: serde_json::json!({"schema":"fixture"}),
             state_id: job.step_id.clone(),
             state_kind: protocol::ReactiveStateKind::Command,
+            agent_output_events: vec![protocol::AgentOutputEvent::JobSucceeded],
             behavior: protocol::ResolvedAuthorizationBehavior {
                 execution_kind: "command".to_string(),
                 runner_profile: serde_json::json!({
@@ -969,6 +980,7 @@ mod tests {
             protocol_capabilities: vec![
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32,
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32,
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV3 as i32,
             ],
         };
         let decoded = pb::RegisterWorkerRequest::decode(request.encode_to_vec().as_slice())
@@ -980,6 +992,10 @@ mod tests {
         assert_eq!(
             worker_protocol_capability_from_pb(decoded.protocol_capabilities[1]).unwrap(),
             WorkerProtocolCapability::CanonicalAuthorizationV2
+        );
+        assert_eq!(
+            worker_protocol_capability_from_pb(decoded.protocol_capabilities[2]).unwrap(),
+            WorkerProtocolCapability::CanonicalAuthorizationV3
         );
         assert!(
             worker_protocol_capability_from_pb(pb::WorkerProtocolCapability::Unspecified as i32)

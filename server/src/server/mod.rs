@@ -20,6 +20,7 @@ pub mod sessions;
 pub mod storage;
 pub mod task_adapter;
 pub mod task_files;
+#[allow(dead_code)]
 pub mod task_vikunja;
 pub mod web;
 pub mod webhook;
@@ -560,52 +561,15 @@ impl<N: Notifier> AppState<N> {
             .unwrap_or_else(|error| panic!("failed to load installed workflows: {error:#}")),
         );
         let task_adapter: Arc<dyn TaskAdapter> = match server_config.task_adapter.as_str() {
-            "vikunja" => {
-                let base_url = server_config
-                    .vikunja_base_url
-                    .clone()
-                    .unwrap_or_else(|| "http://localhost:3456".to_string());
-                let auth = if let (Some(username), Some(password)) = (
-                    server_config.vikunja_bot_username.clone(),
-                    server_config.vikunja_bot_password.clone(),
-                ) {
-                    task_vikunja::VikunjaAuthConfig::BotCredentials { username, password }
-                } else {
-                    let token = server_config
-                        .vikunja_token
-                        .clone()
-                        .expect("VIKUNJA_TOKEN required when TASK_ADAPTER=vikunja and VIKUNJA_BOT_USERNAME/VIKUNJA_BOT_PASSWORD are not both set");
-                    task_vikunja::VikunjaAuthConfig::StaticToken(token)
-                };
-                let project_id = server_config
-                    .vikunja_project_id
-                    .expect("VIKUNJA_PROJECT_ID required when TASK_ADAPTER=vikunja");
-                let bot_username = server_config
-                    .vikunja_bot_username
-                    .clone()
-                    .expect("VIKUNJA_BOT_USERNAME required when TASK_ADAPTER=vikunja");
-                let operator_username = system_operator_login
-                    .clone()
-                    .expect("system.operator required in system.toml when TASK_ADAPTER=vikunja");
-                Arc::new(
-                    task_vikunja::VikunjaAdapter::new(
-                        base_url,
-                        auth,
-                        project_id,
-                        server_config.vikunja_label_prefix.clone(),
-                        bot_username,
-                        operator_username,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!("failed to initialize Vikunja adapter: {error:#}")
-                    }),
-                )
-            }
-            _ => {
-                let store = task_files::TaskFileStore::new(server_config.task_dir.clone());
+            "file" => {
+                let store = task_files::TaskFileStore::new_with_state_dir(
+                    server_config.task_dir.clone(),
+                    server_config.task_state_dir.clone(),
+                );
                 store.ensure_dir().expect("create task dir");
                 Arc::new(store)
             }
+            other => panic!("unsupported TASK_ADAPTER '{other}'; only exact 'file' is allowed"),
         };
         let orchestration_db_path = if server_config.orchestration_db_path == ":memory:" {
             std::env::temp_dir()
@@ -844,6 +808,10 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
             workflows_dir: workflows_dir.to_string_lossy().into_owned(),
             config_root: config_root.to_string_lossy().into_owned(),
             task_dir: task_dir.to_string_lossy().into_owned(),
+            task_state_dir: task_dir
+                .with_extension("private-state")
+                .to_string_lossy()
+                .into_owned(),
             task_adapter: "file".into(),
             vikunja_base_url: None,
             vikunja_token: None,
@@ -1196,7 +1164,7 @@ kind = "terminal"
         let registration = post_json_response(
             &app,
             "/api/v1/orchestration/workers",
-            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2"]}"#,
+            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3"]}"#,
         )
         .await;
         assert_eq!(registration.status(), AxumStatus::OK);
@@ -1205,7 +1173,9 @@ kind = "terminal"
                 .headers()
                 .get("x-agent-hub-server-capabilities")
                 .and_then(|value| value.to_str().ok()),
-            Some("canonical_authorization_v1, canonical_authorization_v2")
+            Some(
+                "canonical_authorization_v1, canonical_authorization_v2, canonical_authorization_v3"
+            )
         );
         let registration: Value = serde_json::from_slice(
             &axum::body::to_bytes(registration.into_body(), usize::MAX)

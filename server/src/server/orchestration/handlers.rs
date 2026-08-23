@@ -24,7 +24,13 @@ fn server_capability_headers(capabilities: &[protocol::WorkerProtocolCapability]
     let mut headers = HeaderMap::new();
     headers.insert(
         "x-agent-hub-server-capabilities",
-        if capabilities.contains(&protocol::WorkerProtocolCapability::CanonicalAuthorizationV2) {
+        if capabilities.contains(&protocol::WorkerProtocolCapability::CanonicalAuthorizationV3) {
+            "canonical_authorization_v1, canonical_authorization_v2, canonical_authorization_v3"
+                .parse()
+                .unwrap()
+        } else if capabilities
+            .contains(&protocol::WorkerProtocolCapability::CanonicalAuthorizationV2)
+        {
             "canonical_authorization_v1, canonical_authorization_v2"
                 .parse()
                 .unwrap()

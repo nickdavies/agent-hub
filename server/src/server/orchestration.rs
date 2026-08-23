@@ -18,7 +18,7 @@ use protocol::{
     canonical_environment_for_execution, canonical_permissions_for_environment,
     canonical_runtime_spec_for_job, canonical_runtime_spec_for_job_effective,
     default_approval_rules_for_tier, project_authorization_bundle_into_job_context,
-    project_runtime_spec_into_job_context, validate_agent_output_next_event,
+    project_runtime_spec_into_job_context, validate_agent_output_event,
     workflow_event_is_externally_fireable,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -40,10 +40,11 @@ use super::task_adapter::task_from_work_item;
 use super::task_adapter::{
     AdapterIntent, CheckpointAuthorizationPending, HumanActionKind, JobResultComment,
     ProviderActionIdentity, ProviderActionNamespace, ProviderActionRejectionDelivery,
-    ProviderActionRejectionSource, TaskAdapter, TaskAdapterError, TaskCheckpoint, TaskHumanAction,
-    TaskHumanGateState, TaskLabels, TaskProjection, TaskSyncRecord, TaskToolRecord,
-    TaskTriageStatus, TriageResult, action_to_fire_event, choose_workflow_id, infer_intents,
-    task_from_work_item_with_valid_next_events, work_item_from_create,
+    ProviderActionRejectionSource, ProviderOperationDeadline, TaskAdapter, TaskAdapterError,
+    TaskCheckpoint, TaskHumanAction, TaskHumanGateState, TaskLabels, TaskProjection,
+    TaskSyncRecord, TaskToolRecord, TaskTriageStatus, TriageResult, action_to_fire_event,
+    choose_workflow_id, infer_intents, task_from_work_item_with_valid_next_events,
+    work_item_from_create,
 };
 #[cfg(test)]
 use super::task_files::TaskFileStore;
@@ -51,11 +52,11 @@ use super::workflows::WorkflowCatalog;
 use crate::error::AppError;
 pub(crate) use context::CONTEXT_GITHUB_PR_STATE_KEY;
 use context::{
-    CONTEXT_JOB_ARTIFACT_DATA_KEY, CONTEXT_JOB_ARTIFACT_METADATA_KEY,
-    CONTEXT_JOB_ARTIFACT_PATHS_KEY, CONTEXT_JOB_EXECUTION_KIND_KEY, CONTEXT_JOB_OUTPUTS_KEY,
-    CONTEXT_JOB_RESULTS_KEY, CONTEXT_MANAGED_OPERATION_KEY, CONTEXT_REPO_CATALOG_HINT_KEY,
-    CONTEXT_REPO_CATALOG_KEY, CONTEXT_VALID_NEXT_EVENTS_KEY, CONTEXT_WORK_ITEM_KEY,
-    CONTEXT_WORKFLOW_INPUTS_KEY, CONTEXT_WORKFLOW_KEY, TRIAGE_WORKFLOW_ID,
+    CONTEXT_AGENT_OUTPUT_EVENTS_KEY, CONTEXT_JOB_ARTIFACT_DATA_KEY,
+    CONTEXT_JOB_ARTIFACT_METADATA_KEY, CONTEXT_JOB_ARTIFACT_PATHS_KEY,
+    CONTEXT_JOB_EXECUTION_KIND_KEY, CONTEXT_JOB_OUTPUTS_KEY, CONTEXT_JOB_RESULTS_KEY,
+    CONTEXT_MANAGED_OPERATION_KEY, CONTEXT_REPO_CATALOG_HINT_KEY, CONTEXT_REPO_CATALOG_KEY,
+    CONTEXT_WORK_ITEM_KEY, CONTEXT_WORKFLOW_INPUTS_KEY, CONTEXT_WORKFLOW_KEY, TRIAGE_WORKFLOW_ID,
 };
 pub(crate) use github::{GithubPrLifecycleState, GithubPrState, MergeReadiness};
 use github::{
@@ -68,9 +69,11 @@ use storage::{
     AuthorizationObligationInsert, DbTable, ProviderActionBaselineInsert, ProviderActionCommit,
     ProviderActionCommitOutcome, ProviderActionJobInsert, ProviderActionObligationApproval,
     ProviderActionRevisionUpdate, ProviderActionTerminalState, column_exists,
-    commit_ordinary_authorized_job, commit_provider_action, invalid_enum, invalid_json,
+    commit_ordinary_authorized_job, commit_provider_action, insert_authorization_obligation,
+    insert_job_in_transaction, insert_work_item_in_transaction, invalid_enum, invalid_json,
     migrate_canonical_authorization_bytes, migrate_provider_action_inbox_schema, parse_datetime,
-    row_to_job, row_to_work_item, stage_authorization_obligation, verify_job_authorization,
+    row_to_job, row_to_work_item, stage_authorization_obligation, update_work_item_in_transaction,
+    verify_job_authorization, verify_job_authorization_frozen,
 };
 
 const LEASE_TTL_SECS: i64 = 120;
@@ -200,7 +203,6 @@ fn migrate_worker_assignment_sessions(conn: &Connection) -> anyhow::Result<()> {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let result = worker_recovery_result_json("legacy_assignment_session_migration", now)?;
     for (job_id, work_item_id, checkpoint_owner_id) in legacy_running {
         let recovery_id = worker_session_recovery_id(
             "legacy-null-session",
@@ -210,11 +212,6 @@ fn migrate_worker_assignment_sessions(conn: &Connection) -> anyhow::Result<()> {
             &checkpoint_owner_id,
             "legacy_assignment_session_migration",
         );
-        conn.execute(
-            "UPDATE jobs SET state = 'failed', lease_expires_at = NULL,
-                result_json = ?2, updated_at = ?3 WHERE id = ?1 AND state = 'running'",
-            params![job_id, result, now.to_rfc3339()],
-        )?;
         conn.execute(
             "INSERT INTO worker_session_recovery_inbox (
                 job_id, recovery_id, work_item_id, checkpoint_owner_id,
@@ -313,6 +310,22 @@ enum EventIngress {
     TrustedInternal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalReceiptDecision {
+    Apply,
+    Noop,
+    Quarantined(String),
+}
+
+fn terminal_result_digest(job: &Job) -> anyhow::Result<String> {
+    let value = serde_json::json!({
+        "state": job.state,
+        "transcript_dir": job.transcript_dir,
+        "result": job.result,
+    });
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&value)?)))
+}
+
 #[derive(Default)]
 struct ProviderActionPlan {
     work_item_updates: Vec<WorkItem>,
@@ -323,6 +336,21 @@ struct ProviderActionPlan {
     obligation_inserts: Vec<AuthorizationObligationInsert>,
     authorization_pending: Option<CheckpointAuthorizationPending>,
     cancel_active_work_item_ids: Vec<Uuid>,
+}
+
+#[derive(Clone)]
+struct ParentTransitionBinding {
+    parent_id: Uuid,
+    step_id: String,
+    invocation_id: Uuid,
+}
+
+#[derive(Clone)]
+struct TerminalDeliveryFence {
+    job_id: Uuid,
+    claim_owner: String,
+    delivery_token: String,
+    lease_duration: Duration,
 }
 
 struct ProviderActionPostCommit {
@@ -1047,6 +1075,14 @@ impl OrchestrationService {
                     let mut database = Connection::open(path.as_path())?;
                     let transaction = database.transaction()?;
                     let conn = &transaction;
+                    let existing_protocol_mode = conn
+                        .query_row(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'authorization_protocol_mode'",
+                            [],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some();
                     conn.execute_batch(
                         r#"
                     CREATE TABLE IF NOT EXISTS work_items (
@@ -1194,7 +1230,7 @@ impl OrchestrationService {
                     );
                     CREATE TABLE IF NOT EXISTS authorization_protocol_mode (
                         id INTEGER PRIMARY KEY CHECK (id = 1),
-                        max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2)),
+                        max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2,3)),
                         updated_at TEXT NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS workers (
@@ -1230,6 +1266,9 @@ impl OrchestrationService {
                         state TEXT NOT NULL,
                         attempts INTEGER NOT NULL DEFAULT 0,
                         next_attempt_at TEXT NOT NULL,
+                        claim_owner TEXT,
+                        claim_token TEXT,
+                        claim_expires_at TEXT,
                         last_error TEXT,
                         updated_at TEXT NOT NULL
                     );
@@ -1238,6 +1277,32 @@ impl OrchestrationService {
                         job_id TEXT NOT NULL,
                         outcome_json TEXT NOT NULL,
                         applied_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS job_output_receipts (
+                        job_id TEXT PRIMARY KEY,
+                        work_item_id TEXT NOT NULL,
+                        checkpoint_owner_id TEXT NOT NULL,
+                        step_id TEXT NOT NULL,
+                        invocation_id TEXT NOT NULL,
+                        result_digest TEXT NOT NULL,
+                        application_state TEXT NOT NULL CHECK (application_state IN ('applied','quarantined')),
+                        quarantine_reason TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS terminal_completion_outbox (
+                        job_id TEXT PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        work_item_id TEXT NOT NULL,
+                        checkpoint_owner_id TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN ('pending','processing','applied')),
+                        claim_owner TEXT,
+                        delivery_token TEXT,
+                        claim_expires_at TEXT,
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        next_attempt_at TEXT NOT NULL,
+                        last_error TEXT,
+                        updated_at TEXT NOT NULL
                     );
                     CREATE TRIGGER IF NOT EXISTS authorization_protocol_jobs_insert
                     BEFORE INSERT ON jobs WHEN NEW.canonical_authorization_version > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
@@ -1263,6 +1328,12 @@ impl OrchestrationService {
                     CREATE TRIGGER IF NOT EXISTS authorization_protocol_workers_update
                     BEFORE UPDATE ON workers WHEN (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1) < 2 AND NEW.protocol_capabilities_json LIKE '%canonical_authorization_v2%'
                     BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects worker update'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_workers_v3_insert
+                    BEFORE INSERT ON workers WHEN (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1) < 3 AND NEW.protocol_capabilities_json LIKE '%canonical_authorization_v3%'
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects v3 worker'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_workers_v3_update
+                    BEFORE UPDATE ON workers WHEN (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1) < 3 AND NEW.protocol_capabilities_json LIKE '%canonical_authorization_v3%'
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects v3 worker update'); END;
                     CREATE TRIGGER IF NOT EXISTS authorization_protocol_recovery_insert
                     BEFORE INSERT ON worker_session_recovery_inbox WHEN (SELECT canonical_authorization_version FROM jobs WHERE id = NEW.job_id) > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
                     BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects recovery'); END;
@@ -1271,10 +1342,45 @@ impl OrchestrationService {
                     BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects recovery update'); END;
                     "#,
                     )?;
-                    conn.execute(
-                        "INSERT OR IGNORE INTO authorization_protocol_mode (id, max_authorization_version, updated_at) VALUES (1, 2, ?1)",
-                        [Utc::now().to_rfc3339()],
+                    let protocol_mode_schema: String = conn.query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'authorization_protocol_mode'",
+                        [],
+                        |row| row.get(0),
                     )?;
+                    if !protocol_mode_schema.contains("1,2,3") {
+                        conn.execute_batch(
+                            "PRAGMA legacy_alter_table = ON;
+                             ALTER TABLE authorization_protocol_mode RENAME TO authorization_protocol_mode_v2;
+                             CREATE TABLE authorization_protocol_mode (
+                                id INTEGER PRIMARY KEY CHECK (id = 1),
+                                max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2,3)),
+                                updated_at TEXT NOT NULL
+                             );
+                             INSERT INTO authorization_protocol_mode SELECT * FROM authorization_protocol_mode_v2;
+                             DROP TABLE authorization_protocol_mode_v2;
+                             PRAGMA legacy_alter_table = OFF;",
+                        )?;
+                    }
+                    if existing_protocol_mode {
+                        let rows: u32 = conn.query_row(
+                            "SELECT COUNT(*) FROM authorization_protocol_mode",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        let valid: u32 = conn.query_row(
+                            "SELECT COUNT(*) FROM authorization_protocol_mode WHERE id = 1 AND max_authorization_version IN (1,2,3)",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if rows != 1 || valid != 1 {
+                            anyhow::bail!("authorization protocol fence row is missing or malformed");
+                        }
+                    } else {
+                        conn.execute(
+                            "INSERT INTO authorization_protocol_mode (id, max_authorization_version, updated_at) VALUES (1, 3, ?1)",
+                            [Utc::now().to_rfc3339()],
+                        )?;
+                    }
                     if !column_exists(conn, DbTable::Jobs, "container_image")? {
                         conn.execute("ALTER TABLE jobs ADD COLUMN container_image TEXT", [])?;
                     }
@@ -1937,6 +2043,12 @@ impl OrchestrationService {
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
+        self.process_worker_session_recovery_inbox()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.drain_terminal_completion_outbox(16)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         self.sync_tasks_from_adapter().await?;
         Ok(())
     }
@@ -2032,13 +2144,23 @@ impl OrchestrationService {
                 [],
                 |row| row.get(0),
             )?;
-            if max_authorization_version < protocol::CANONICAL_AUTHORIZATION_VERSION
+            if max_authorization_version < 2
                 && protocol_capabilities.contains(
                     &protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 )
             {
                 return Err(WorkerSessionAuthFailure(
                     "authorization protocol fence rejects v2 worker registration",
+                )
+                .into());
+            }
+            if max_authorization_version < protocol::CANONICAL_AUTHORIZATION_VERSION
+                && protocol_capabilities.contains(
+                    &protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                )
+            {
+                return Err(WorkerSessionAuthFailure(
+                    "authorization protocol fence rejects v3 worker registration",
                 )
                 .into());
             }
@@ -2128,35 +2250,6 @@ impl OrchestrationService {
                             params![job_id, now.to_rfc3339(), previous_session_id, previous_generation],
                         )?;
                     } else {
-                        let started = now;
-                        let result = serde_json::json!({
-                            "outcome":"failed",
-                            "termination_reason":"worker_error",
-                            "exit_code":null,
-                            "timing":{"started_at":started,"finished_at":now,"duration_ms":0},
-                            "artifacts":{
-                                "stdout_path":"",
-                                "stderr_path":"",
-                                "output_path":null,
-                                "transcript_dir":null,
-                                "stdout_bytes":null,
-                                "stderr_bytes":null,
-                                "output_bytes":null,
-                                "structured_transcript_artifacts":[]
-                            },
-                            "output_json":null,
-                            "repo":null,
-                            "github_pr":null,
-                            "error_message":"worker_session_replaced"
-                        });
-                        tx.execute(
-                            "UPDATE jobs SET state = 'failed', lease_expires_at = NULL,
-                                result_json = ?2, updated_at = ?3
-                             WHERE id = ?1 AND state = 'running'
-                               AND assigned_worker_session_id = ?4
-                               AND assigned_worker_session_generation = ?5",
-                            params![job_id, serde_json::to_string(&result)?, now.to_rfc3339(), previous_session_id, previous_generation],
-                        )?;
                         replaced_running_jobs.push(Uuid::parse_str(&job_id)?);
                         let recovery_id = worker_session_recovery_id(
                             &previous_session_id,
@@ -2393,6 +2486,9 @@ impl OrchestrationService {
         if max >= 2 {
             capabilities.push(protocol::WorkerProtocolCapability::CanonicalAuthorizationV2);
         }
+        if max >= 3 {
+            capabilities.push(protocol::WorkerProtocolCapability::CanonicalAuthorizationV3);
+        }
         Ok(capabilities)
     }
 
@@ -2449,6 +2545,7 @@ impl OrchestrationService {
                 capability,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1
                     | protocol::WorkerProtocolCapability::CanonicalAuthorizationV2
+                    | protocol::WorkerProtocolCapability::CanonicalAuthorizationV3
             )
         }) {
             worker.state = WorkerState::Idle;
@@ -2578,10 +2675,18 @@ impl OrchestrationService {
         req: JobUpdateRequest,
     ) -> Result<Job, AppError> {
         self.ensure_ready().await?;
+        if matches!(
+            req.state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            return self
+                .apply_terminal_job_update_authenticated(job_id, credential, req)
+                .await;
+        }
         let path = Arc::clone(&self.db_path);
         let worker_id = req.worker_id.clone();
         let requested_state = req.state.clone();
-        let job = tokio::task::spawn_blocking(move || -> anyhow::Result<Job> {
+        let job = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let mut conn = Connection::open(path.as_path())?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let worker = verify_worker_session_in_connection(&tx, &worker_id, &credential)?;
@@ -2603,30 +2708,32 @@ impl OrchestrationService {
             if job.state == JobState::Cancelled && requested_state != JobState::Cancelled {
                 anyhow::bail!("job already cancelled");
             }
+            let mut proposed = job.clone();
+            proposed.state = requested_state.clone();
+            if proposed.state == JobState::Running {
+                proposed.lease_expires_at =
+                    Some(Utc::now() + chrono::TimeDelta::seconds(LEASE_TTL_SECS));
+            }
+            if let Some(dir) = req.transcript_dir {
+                proposed.transcript_dir = Some(dir);
+            }
+            if let Some(result) = req.result {
+                proposed.result = Some(result);
+            }
+            if matches!(
+                proposed.state,
+                JobState::Succeeded | JobState::Failed | JobState::Cancelled
+            ) {
+                proposed.lease_expires_at = None;
+            }
+            proposed.updated_at = Utc::now();
             if job.state != requested_state {
                 validate_job_transition(job.state.clone(), requested_state.clone())
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             } else if !matches!(requested_state, JobState::Running | JobState::Cancelled) {
                 anyhow::bail!("duplicate terminal job update");
             }
-            job.state = requested_state;
-            if job.state == JobState::Running {
-                job.lease_expires_at =
-                    Some(Utc::now() + chrono::TimeDelta::seconds(LEASE_TTL_SECS));
-            }
-            if let Some(dir) = req.transcript_dir {
-                job.transcript_dir = Some(dir);
-            }
-            if let Some(result) = req.result {
-                job.result = Some(result);
-            }
-            if matches!(
-                job.state,
-                JobState::Succeeded | JobState::Failed | JobState::Cancelled
-            ) {
-                job.lease_expires_at = None;
-            }
-            job.updated_at = Utc::now();
+            job = proposed;
             let changed = tx.execute(
                 "UPDATE jobs SET state = ?2, assigned_worker_id = ?3, transcript_dir = ?4,
                     result_json = ?5, lease_expires_at = ?6, updated_at = ?7
@@ -2685,13 +2792,722 @@ impl OrchestrationService {
                 AppError::WorkflowInvalid(message)
             }
         })?;
-        if matches!(
-            job.state,
-            JobState::Succeeded | JobState::Failed | JobState::Cancelled
-        ) {
-            self.advance_workflow_for_job(&job).await?;
-        }
         Ok(job)
+    }
+
+    async fn apply_terminal_job_update_authenticated(
+        &self,
+        job_id: Uuid,
+        credential: WorkerSessionCredential,
+        req: JobUpdateRequest,
+    ) -> Result<Job, AppError> {
+        let stored = self
+            .get_job(job_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::JobNotFound(job_id.to_string()))?;
+        let artifact = stored.canonical_authorization.as_ref().ok_or_else(|| {
+            AppError::WorkflowInvalid("job has no canonical authorization".to_string())
+        })?;
+        let authorization_id = stored
+            .context
+            .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid("job has no authorization identity".to_string())
+            })?;
+        let bundle = protocol::ImmutableAuthorizationBundle::verify(artifact, authorization_id)
+            .map_err(AppError::WorkflowInvalid)?;
+        let root_id = bundle.request.root_work_item_id;
+        let lock = self.checkpoint_lock(root_id).await;
+        let _guard = lock.lock().await;
+
+        let mut proposed = stored.clone();
+        proposed.state = req.state;
+        if let Some(dir) = req.transcript_dir {
+            proposed.transcript_dir = Some(dir);
+        }
+        if let Some(result) = req.result {
+            proposed.result = Some(result);
+        }
+        proposed.lease_expires_at = None;
+        proposed.updated_at = Utc::now();
+        let replay_digest = terminal_result_digest(&proposed).map_err(map_db)?;
+        let replay_path = Arc::clone(&self.db_path);
+        let replay = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let conn = Connection::open(replay_path.as_path())?;
+            conn.query_row(
+                "SELECT result_digest, application_state, quarantine_reason FROM job_output_receipts WHERE job_id = ?1",
+                [job_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(map_db)?;
+        if let Some((stored_digest, state, reason)) = replay {
+            if stored_digest != replay_digest {
+                return Err(AppError::WorkflowInvalid(format!(
+                    "conflicting terminal output replay for job {job_id}"
+                )));
+            }
+            return match state.as_str() {
+                "applied" => {
+                    drop(_guard);
+                    let _ = self.process_terminal_completion_outbox(job_id).await;
+                    Ok(proposed)
+                }
+                "quarantined" => {
+                    Err(AppError::WorkflowInvalid(reason.unwrap_or_else(|| {
+                        "terminal output was quarantined".to_string()
+                    })))
+                }
+                other => Err(AppError::WorkflowInvalid(format!(
+                    "unexpected terminal output receipt state '{other}'"
+                ))),
+            };
+        }
+
+        let mut item = self
+            .get_work_item(proposed.work_item_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(proposed.work_item_id.to_string()))?;
+        let original_step = item.current_step.clone();
+        let original_invocation = current_state_invocation_id(&item).ok_or_else(|| {
+            AppError::WorkflowInvalid("work item has no current invocation".to_string())
+        })?;
+        let mut plan = ProviderActionPlan::default();
+        let parent_binding = self
+            .plan_terminal_job_transition(&mut item, &proposed, root_id, &mut plan)
+            .await?;
+        if let Some(pending) = plan.authorization_pending.clone() {
+            mark_authorization_pending(&mut item, pending).map_err(map_db)?;
+        }
+        item.updated_at = proposed.updated_at;
+        item.blocked_on = block_reason_for_state_name(&item.current_step);
+        item.projected_state = Some(project_workflow_state(&item));
+        self.refresh_operator_visibility_fields(&mut item);
+
+        let path = Arc::clone(&self.db_path);
+        let worker_id = req.worker_id;
+        let proposed_for_commit = proposed.clone();
+        let item_for_commit = item.clone();
+        let decision = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let worker = verify_worker_session_in_connection(&tx, &worker_id, &credential)?;
+            let stored_job = tx.query_row(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE id = ?1",
+                [job_id.to_string()],
+                row_to_job,
+            )?;
+            let verified = verify_job_authorization_frozen(&tx, &stored_job)?;
+            if stored_job.assigned_worker_id.as_deref() != Some(worker_id.as_str())
+                || stored_job.assigned_worker_session_id != worker.session_id
+                || stored_job.assigned_worker_session_generation != Some(worker.session_generation)
+            {
+                anyhow::bail!("worker session does not own job");
+            }
+            let digest = terminal_result_digest(&proposed_for_commit)?;
+            if let Some((stored_digest, state, reason)) = tx
+                .query_row(
+                    "SELECT result_digest, application_state, quarantine_reason FROM job_output_receipts WHERE job_id = ?1",
+                    [job_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                )
+                .optional()?
+            {
+                if stored_digest != digest {
+                    anyhow::bail!("conflicting terminal output replay for job {job_id}");
+                }
+                return match state.as_str() {
+                    "applied" => {
+                        tx.commit()?;
+                        Ok(TerminalReceiptDecision::Noop)
+                    }
+                    "quarantined" => {
+                        tx.commit()?;
+                        Ok(TerminalReceiptDecision::Quarantined(reason.unwrap_or_else(|| "terminal output was quarantined".to_string())))
+                    }
+                    other => anyhow::bail!("unexpected terminal output receipt state '{other}'"),
+                };
+            }
+            let binding_matches = verified.request.root_work_item_id == root_id
+                && verified.request.work_unit_id == proposed_for_commit.work_item_id
+                && verified.request.state_id == original_step
+                && verified.request.invocation_id == original_invocation
+                && proposed_for_commit.step_id == original_step;
+            let now = Utc::now().to_rfc3339();
+            let cas = if binding_matches {
+                tx.execute(
+                    "UPDATE work_items SET context_json = context_json WHERE id = ?1 AND current_step = ?2 AND json_extract(context_json, '$.state_invocation.id') = ?3 AND state IN ('pending','running')",
+                    params![proposed_for_commit.work_item_id.to_string(), original_step, original_invocation.to_string()],
+                )?
+            } else {
+                0
+            };
+            if cas != 1 {
+                let reason = "stale terminal output binding".to_string();
+                tx.execute(
+                    "INSERT INTO job_output_receipts (job_id, work_item_id, checkpoint_owner_id, step_id, invocation_id, result_digest, application_state, quarantine_reason, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'quarantined', ?7, ?8, ?8)",
+                    params![job_id.to_string(), proposed_for_commit.work_item_id.to_string(), root_id.to_string(), proposed_for_commit.step_id, original_invocation.to_string(), digest, reason, now],
+                )?;
+                tx.commit()?;
+                return Ok(TerminalReceiptDecision::Quarantined(reason));
+            }
+            for parent in &parent_binding {
+                let parent_cas = tx.execute(
+                    "UPDATE work_items SET context_json = context_json WHERE id = ?1 AND current_step = ?2 AND json_extract(context_json, '$.state_invocation.id') = ?3 AND state IN ('pending','running')",
+                    params![parent.parent_id.to_string(), parent.step_id, parent.invocation_id.to_string()],
+                )?;
+                if parent_cas != 1 {
+                    let reason = "stale parent transition binding".to_string();
+                    tx.execute(
+                        "INSERT INTO job_output_receipts (job_id, work_item_id, checkpoint_owner_id, step_id, invocation_id, result_digest, application_state, quarantine_reason, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'quarantined', ?7, ?8, ?8)",
+                        params![job_id.to_string(), proposed_for_commit.work_item_id.to_string(), root_id.to_string(), proposed_for_commit.step_id, original_invocation.to_string(), digest, reason, now],
+                    )?;
+                    tx.commit()?;
+                    return Ok(TerminalReceiptDecision::Quarantined(reason));
+                }
+            }
+            update_work_item_in_transaction(&tx, &item_for_commit)?;
+            for update in &plan.work_item_updates {
+                if update.id != item_for_commit.id {
+                    update_work_item_in_transaction(&tx, update)?;
+                }
+            }
+            for insert in &plan.work_item_inserts {
+                insert_work_item_in_transaction(&tx, insert)?;
+            }
+            for obligation in &plan.obligation_inserts {
+                insert_authorization_obligation(&tx, obligation)?;
+            }
+            for insert in &plan.job_inserts {
+                insert_job_in_transaction(&tx, insert)?;
+            }
+            let changed = tx.execute(
+                "UPDATE jobs SET state = ?2, transcript_dir = ?3, result_json = ?4, lease_expires_at = NULL, updated_at = ?5 WHERE id = ?1 AND state IN ('assigned','running') AND assigned_worker_id = ?6 AND assigned_worker_session_id = ?7 AND assigned_worker_session_generation = ?8",
+                params![job_id.to_string(), proposed_for_commit.state.to_string(), proposed_for_commit.transcript_dir, proposed_for_commit.result.as_ref().map(serde_json::to_string).transpose()?, proposed_for_commit.updated_at.to_rfc3339(), worker_id, credential.session_id.to_string(), worker.session_generation],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("terminal job state CAS failed");
+            }
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO job_output_receipts (job_id, work_item_id, checkpoint_owner_id, step_id, invocation_id, result_digest, application_state, quarantine_reason, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'applied', NULL, ?7, ?7)",
+                params![job_id.to_string(), proposed_for_commit.work_item_id.to_string(), root_id.to_string(), proposed_for_commit.step_id, original_invocation.to_string(), digest, now],
+            )?;
+            tx.execute(
+                "INSERT INTO terminal_completion_outbox (job_id, idempotency_key, work_item_id, checkpoint_owner_id, state, claim_owner, delivery_token, claim_expires_at, attempts, next_attempt_at, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, 'pending', NULL, NULL, NULL, 0, ?5, NULL, ?5)",
+                params![job_id.to_string(), format!("terminal:{job_id}"), proposed_for_commit.work_item_id.to_string(), root_id.to_string(), now],
+            )?;
+            tx.execute(
+                "UPDATE workers SET state = 'idle', last_heartbeat_at = ?2 WHERE id = ?1 AND session_id = ?3 AND session_generation = ?4",
+                params![worker_id, now, credential.session_id.to_string(), worker.session_generation],
+            )?;
+            tx.commit()?;
+            Ok(TerminalReceiptDecision::Apply)
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("session") || message.contains("own job") {
+                AppError::WorkerSessionUnauthorized(message)
+            } else {
+                AppError::WorkflowInvalid(message)
+            }
+        })?;
+        if let TerminalReceiptDecision::Quarantined(reason) = decision {
+            return Err(AppError::WorkflowInvalid(reason));
+        }
+        drop(_guard);
+        if matches!(decision, TerminalReceiptDecision::Apply) {
+            let _ = self.process_terminal_completion_outbox(job_id).await;
+        }
+        Ok(proposed)
+    }
+
+    async fn plan_terminal_job_transition(
+        &self,
+        item: &mut WorkItem,
+        job: &Job,
+        checkpoint_owner_id: Uuid,
+        plan: &mut ProviderActionPlan,
+    ) -> Result<Vec<ParentTransitionBinding>, AppError> {
+        self.merge_job_output_into_context(item, job)
+            .map_err(AppError::WorkflowInvalid)?;
+        update_last_failure_reason_fields(item, Some(job));
+        if item.workflow_id == TRIAGE_WORKFLOW_ID {
+            match job.state {
+                JobState::Succeeded => {
+                    let workflow_id = item
+                        .context
+                        .get("workflow_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned);
+                    if let Some(pin) = item
+                        .context
+                        .get("pinned_workflow_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        && workflow_id.as_deref() != Some(pin.as_str())
+                    {
+                        self.reject_triage_result_with_reason(
+                            item,
+                            format!("triage result conflicts with pinned workflow '{pin}'"),
+                        );
+                    } else if let Some(workflow_id) = workflow_id {
+                        let requests = self
+                            .propose_initial_authorization_epoch(item, &workflow_id)
+                            .await?;
+                        item.context["workflow_id"] = serde_json::Value::String(workflow_id);
+                        item.context["proposed_authorization_epoch"] =
+                            serde_json::to_value(requests)
+                                .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?;
+                        item.current_step = "await_triage_approval".to_string();
+                        item.human_gate = true;
+                        item.human_gate_state = Some("triage_completed".to_string());
+                        item.state = WorkItemState::Running;
+                        item.triage_status = Some("pending_approval".to_string());
+                    } else {
+                        self.reject_triage_result_with_reason(
+                            item,
+                            "triage did not select a valid workflow".to_string(),
+                        );
+                    }
+                }
+                JobState::Failed => {
+                    let reason = item
+                        .last_failure_reason
+                        .clone()
+                        .unwrap_or_else(|| "triage job failed".to_string());
+                    self.reject_triage_result_with_reason(item, reason);
+                }
+                JobState::Cancelled => item.state = WorkItemState::Cancelled,
+                _ => {
+                    return Err(AppError::WorkflowInvalid(
+                        "nonterminal job entered terminal transition planner".to_string(),
+                    ));
+                }
+            }
+            return Ok(Vec::new());
+        }
+
+        let valid_next_events = self.valid_next_events_for_work_item_internal(item);
+        let agent_event = reactive_next_event_from_agent_output(job, &valid_next_events)
+            .map_err(AppError::WorkflowInvalid)?;
+        if job.state == JobState::Failed && job.attempt < job.max_retries {
+            let workflow = self
+                .workflows
+                .get(&item.workflow_id)
+                .ok_or_else(|| AppError::WorkflowNotFound(item.workflow_id.clone()))?;
+            let state = workflow
+                .states
+                .iter()
+                .find(|state| state.id == job.step_id)
+                .ok_or_else(|| AppError::WorkflowInvalid("retry state is missing".to_string()))?;
+            let mut retry = job.clone();
+            retry.id = Uuid::new_v4();
+            retry.state = JobState::Pending;
+            retry.assigned_worker_id = None;
+            retry.assigned_worker_session_id = None;
+            retry.assigned_worker_session_generation = None;
+            retry.transcript_dir = None;
+            retry.result = None;
+            retry.lease_expires_at = None;
+            retry.attempt = job.attempt.saturating_add(1);
+            retry.created_at = Utc::now();
+            retry.updated_at = retry.created_at;
+            enter_workflow_state(item, &job.step_id);
+            retry.context["state_invocation"] = item.context["state_invocation"].clone();
+            let events = self.agent_output_events_for_job(item);
+            project_workflow_inputs_into_job_context(
+                &mut retry.context,
+                &events,
+                item,
+                &item.context,
+            );
+            self.project_resolved_authorization(
+                &mut retry,
+                item,
+                state.kind(),
+                checkpoint_owner_id,
+            )?;
+            if self
+                .plan_authorized_job(item, &retry, checkpoint_owner_id, plan)
+                .await?
+            {
+                plan.job_inserts.push(ProviderActionJobInsert {
+                    runtime: canonical_runtime_spec_for_job_effective(&retry),
+                    job: retry,
+                    checkpoint_owner_id,
+                });
+            }
+            item.state = WorkItemState::Running;
+            return self
+                .plan_parent_progression(item, checkpoint_owner_id, plan, 0, &mut Vec::new())
+                .await;
+        }
+        let default_event = match job.state {
+            JobState::Succeeded => WorkflowEventKind::JobSucceeded,
+            JobState::Failed | JobState::Cancelled => WorkflowEventKind::JobFailed,
+            _ => {
+                return Err(AppError::WorkflowInvalid(
+                    "nonterminal job entered terminal transition planner".to_string(),
+                ));
+            }
+        };
+        let event = agent_event.unwrap_or(default_event);
+        let workflow = self
+            .workflows
+            .get(&item.workflow_id)
+            .ok_or_else(|| AppError::WorkflowNotFound(item.workflow_id.clone()))?;
+        let state = workflow
+            .states
+            .iter()
+            .find(|state| state.id == item.current_step)
+            .ok_or_else(|| AppError::WorkflowInvalid("reactive state missing".to_string()))?;
+        let transition = state
+            .on
+            .iter()
+            .find(|transition| transition.event.kind() == event)
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(format!(
+                    "reactive state '{}' has no transition for event '{}'",
+                    state.id,
+                    workflow_event_kind_name(&event)
+                ))
+            })?;
+        enter_workflow_state(item, &transition.target);
+        self.plan_reactive_current_state_excluding(item, checkpoint_owner_id, plan, Some(job.id))
+            .await?;
+        self.plan_parent_progression(item, checkpoint_owner_id, plan, 0, &mut Vec::new())
+            .await
+    }
+
+    async fn plan_parent_progression(
+        &self,
+        child: &WorkItem,
+        checkpoint_owner_id: Uuid,
+        plan: &mut ProviderActionPlan,
+        depth: usize,
+        visited: &mut Vec<Uuid>,
+    ) -> Result<Vec<ParentTransitionBinding>, AppError> {
+        if depth >= 32 {
+            return Err(AppError::WorkflowInvalid(
+                "parent progression depth exceeds 32".to_string(),
+            ));
+        }
+        let (Some(parent_id), Some(parent_step_id)) =
+            (child.parent_work_item_id, child.parent_step_id.clone())
+        else {
+            return Ok(Vec::new());
+        };
+        if !matches!(
+            child.state,
+            WorkItemState::Succeeded | WorkItemState::Failed | WorkItemState::Cancelled
+        ) {
+            return Ok(Vec::new());
+        }
+        if visited.contains(&parent_id) {
+            return Err(AppError::WorkflowInvalid(
+                "parent progression cycle detected".to_string(),
+            ));
+        }
+        visited.push(parent_id);
+        let mut parent = self
+            .get_work_item(parent_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(parent_id.to_string()))?;
+        let expected_invocation = child
+            .context
+            .get("parent_invocation_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid("child has no signed parent invocation".to_string())
+            })?;
+        if parent.current_step != parent_step_id
+            || current_state_invocation_id(&parent) != Some(expected_invocation)
+        {
+            return Ok(vec![ParentTransitionBinding {
+                parent_id,
+                step_id: parent_step_id,
+                invocation_id: expected_invocation,
+            }]);
+        }
+        let mut children = self
+            .select_children_for_parent_step(parent.id, &parent_step_id)
+            .await
+            .map_err(map_db)?;
+        if let Some(existing) = children
+            .iter_mut()
+            .find(|candidate| candidate.id == child.id)
+        {
+            *existing = child.clone();
+        } else {
+            children.push(child.clone());
+        }
+        if !children.iter().all(|candidate| {
+            matches!(
+                candidate.state,
+                WorkItemState::Succeeded | WorkItemState::Failed | WorkItemState::Cancelled
+            )
+        }) {
+            return Ok(vec![ParentTransitionBinding {
+                parent_id,
+                step_id: parent_step_id,
+                invocation_id: expected_invocation,
+            }]);
+        }
+        for candidate in &children {
+            merge_child_result_into_parent_context(&mut parent, candidate)
+                .map_err(AppError::WorkflowInvalid)?;
+        }
+        parent.child_work_item_id = None;
+        let event = if children
+            .iter()
+            .any(|candidate| !matches!(candidate.state, WorkItemState::Succeeded))
+        {
+            WorkflowEventKind::ChildFailed
+        } else {
+            WorkflowEventKind::AllChildrenCompleted
+        };
+        self.plan_reactive_event(&mut parent, event, checkpoint_owner_id, plan)
+            .await?;
+        parent.updated_at = Utc::now();
+        parent.projected_state = Some(project_workflow_state(&parent));
+        let mut bindings = vec![ParentTransitionBinding {
+            parent_id,
+            step_id: parent_step_id,
+            invocation_id: expected_invocation,
+        }];
+        plan.work_item_updates.push(parent.clone());
+        bindings.extend(
+            Box::pin(self.plan_parent_progression(
+                &parent,
+                checkpoint_owner_id,
+                plan,
+                depth + 1,
+                visited,
+            ))
+            .await?,
+        );
+        Ok(bindings)
+    }
+
+    async fn process_terminal_completion_outbox(&self, _job_id: Uuid) -> Result<(), AppError> {
+        self.drain_terminal_completion_outbox(16).await.map(|_| ())
+    }
+
+    async fn drain_terminal_completion_outbox(&self, limit: usize) -> Result<usize, AppError> {
+        let owner = Uuid::new_v4().to_string();
+        let operation_bound = self.task_adapter.operation_timeout();
+        let lease_duration = operation_bound + Duration::from_secs(20);
+        let mut applied = 0usize;
+        for _ in 0..limit {
+            let path = Arc::clone(&self.db_path);
+            let claim_owner = owner.clone();
+            let delivery_token = Uuid::new_v4().to_string();
+            let token_for_claim = delivery_token.clone();
+            let lease_secs = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
+            let claimed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let mut conn = Connection::open(path.as_path())?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let now = Utc::now();
+                let row = tx
+                    .query_row(
+                        "SELECT job_id, idempotency_key, attempts FROM terminal_completion_outbox
+                         WHERE (state = 'pending' AND next_attempt_at <= ?1)
+                            OR (state = 'processing' AND claim_expires_at < ?1)
+                         ORDER BY next_attempt_at, job_id LIMIT 1",
+                        [now.to_rfc3339()],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, u32>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((job_id, key, attempts)) = row else {
+                    tx.commit()?;
+                    return Ok(None);
+                };
+                let changed = tx.execute(
+                    "UPDATE terminal_completion_outbox SET state = 'processing', claim_owner = ?2,
+                        delivery_token = ?3, claim_expires_at = ?4, attempts = attempts + 1, updated_at = ?5
+                     WHERE job_id = ?1 AND ((state = 'pending' AND next_attempt_at <= ?5)
+                        OR (state = 'processing' AND claim_expires_at < ?5))",
+                    params![
+                        job_id,
+                        claim_owner,
+                        token_for_claim,
+                        (now + chrono::TimeDelta::seconds(lease_secs)).to_rfc3339(),
+                        now.to_rfc3339(),
+                    ],
+                )?;
+                if changed != 1 {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                tx.commit()?;
+                Ok(Some((Uuid::parse_str(&job_id)?, key, attempts + 1)))
+            })
+            .await
+            .map_err(|error| AppError::Config(error.to_string()))?
+            .map_err(map_db)?;
+            let Some((job_id, idempotency_key, attempts)) = claimed else {
+                break;
+            };
+            let fence = TerminalDeliveryFence {
+                job_id,
+                claim_owner: owner.clone(),
+                delivery_token: delivery_token.clone(),
+                lease_duration,
+            };
+            let operation_deadline = ProviderOperationDeadline::from_now(operation_bound);
+            let heartbeat_service = self.clone();
+            let heartbeat_fence = fence.clone();
+            let (heartbeat_stop_tx, mut heartbeat_stop_rx) = tokio::sync::watch::channel(false);
+            let heartbeat = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                let mut lease_deadline = Instant::now() + heartbeat_fence.lease_duration;
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            match heartbeat_service.renew_terminal_delivery_fence(&heartbeat_fence).await {
+                                Ok(()) => lease_deadline = Instant::now() + heartbeat_fence.lease_duration,
+                                Err(_) if Instant::now() < lease_deadline => continue,
+                                Err(_) => return false,
+                            }
+                        }
+                        changed = heartbeat_stop_rx.changed() => {
+                            if changed.is_err() || *heartbeat_stop_rx.borrow() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            });
+            let result = self
+                .deliver_terminal_projection(&fence, &idempotency_key, operation_deadline)
+                .await;
+            let _ = heartbeat_stop_tx.send(true);
+            let heartbeat_ok = heartbeat.await.unwrap_or(false);
+            let result = if heartbeat_ok {
+                result
+            } else {
+                Err(anyhow::anyhow!("terminal delivery lease renewal failed"))
+            };
+            let path = Arc::clone(&self.db_path);
+            let claim_owner = owner.clone();
+            let error = result.as_ref().err().map(ToString::to_string);
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let conn = Connection::open(path.as_path())?;
+                let now = Utc::now();
+                let changed = if let Some(error) = error {
+                    let delay = 1_i64 << attempts.min(8);
+                    conn.execute(
+                        "UPDATE terminal_completion_outbox SET state = 'pending', claim_owner = NULL,
+                            delivery_token = NULL, claim_expires_at = NULL, next_attempt_at = ?4, last_error = ?5, updated_at = ?6
+                         WHERE job_id = ?1 AND state = 'processing' AND claim_owner = ?2 AND delivery_token = ?3 AND claim_expires_at > ?6",
+                        params![job_id.to_string(), claim_owner, delivery_token, (now + chrono::TimeDelta::seconds(delay)).to_rfc3339(), error, now.to_rfc3339()],
+                    )?
+                } else {
+                    conn.execute(
+                        "UPDATE terminal_completion_outbox SET state = 'applied', claim_owner = NULL,
+                            delivery_token = NULL, claim_expires_at = NULL, last_error = NULL, updated_at = ?4
+                         WHERE job_id = ?1 AND state = 'processing' AND claim_owner = ?2 AND delivery_token = ?3 AND claim_expires_at > ?4",
+                        params![job_id.to_string(), claim_owner, delivery_token, now.to_rfc3339()],
+                    )?
+                };
+                if changed != 1 {
+                    anyhow::bail!("terminal completion outbox claim was lost");
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| AppError::Config(error.to_string()))?
+            .map_err(map_db)?;
+            if result.is_ok() {
+                applied += 1;
+            }
+        }
+        Ok(applied)
+    }
+
+    async fn deliver_terminal_projection(
+        &self,
+        fence: &TerminalDeliveryFence,
+        idempotency_key: &str,
+        deadline: ProviderOperationDeadline,
+    ) -> anyhow::Result<()> {
+        self.renew_terminal_delivery_fence(fence).await?;
+        let job_id = fence.job_id;
+        let job = self
+            .get_job(job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job {job_id} disappeared"))?;
+        let mut item = self
+            .get_work_item(job.work_item_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("work item {} disappeared", job.work_item_id))?;
+        if job.state == JobState::Failed {
+            self.renew_terminal_delivery_fence(fence).await?;
+            self.append_failure_log_idempotent(&item, idempotency_key, deadline)
+                .await?;
+        }
+        self.renew_terminal_delivery_fence(fence).await?;
+        self.write_job_result_comment_idempotent(&mut item, &job, idempotency_key, deadline)
+            .await?;
+        self.renew_terminal_delivery_fence(fence).await?;
+        self.persist_task_projection(&item, None).await
+    }
+
+    async fn renew_terminal_delivery_fence(
+        &self,
+        fence: &TerminalDeliveryFence,
+    ) -> anyhow::Result<()> {
+        let path = Arc::clone(&self.db_path);
+        let fence = fence.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = Connection::open(path.as_path())?;
+            let now = Utc::now();
+            let lease_secs = i64::try_from(fence.lease_duration.as_secs()).unwrap_or(i64::MAX);
+            let changed = conn.execute(
+                "UPDATE terminal_completion_outbox SET claim_expires_at = ?4, updated_at = ?3
+                 WHERE job_id = ?1 AND state = 'processing' AND claim_owner = ?2
+                   AND delivery_token = ?5 AND claim_expires_at > ?3",
+                params![
+                    fence.job_id.to_string(),
+                    fence.claim_owner,
+                    now.to_rfc3339(),
+                    (now + chrono::TimeDelta::seconds(lease_secs)).to_rfc3339(),
+                    fence.delivery_token
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("terminal delivery fence is stale or expired");
+            }
+            Ok(())
+        })
+        .await??;
+        Ok(())
     }
 
     async fn fire_event_internal(
@@ -2708,6 +3524,13 @@ impl OrchestrationService {
                 "pr_merged requires authoritative SCM observation".to_string(),
             ));
         }
+        let checkpoint_owner_id = self
+            .checkpoint_owner_for_work_item(work_item_id)
+            .await
+            .map_err(map_db)?
+            .id;
+        let transition_lock = self.checkpoint_lock(checkpoint_owner_id).await;
+        let _transition_guard = transition_lock.lock().await;
         let workflow_event = WorkflowEvent {
             work_item_id: work_item_id.to_string(),
             event_type: req.event.clone(),
@@ -2788,7 +3611,53 @@ impl OrchestrationService {
                 }
             }
         } else if self.workflows.get(&item.workflow_id).is_some() {
-            self.fire_reactive_event(&mut item, req.event).await?;
+            let mut plan = ProviderActionPlan::default();
+            self.plan_reactive_event(&mut item, req.event, checkpoint_owner_id, &mut plan)
+                .await?;
+            if let Some(pending) = plan.authorization_pending.clone() {
+                mark_authorization_pending(&mut item, pending).map_err(map_db)?;
+            }
+            item.updated_at = Utc::now();
+            item.blocked_on = block_reason_for_state_name(&item.current_step);
+            item.projected_state = Some(project_workflow_state(&item));
+            self.refresh_operator_visibility_fields(&mut item);
+            let path = Arc::clone(&self.db_path);
+            let committed_item = item.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let mut conn = Connection::open(path.as_path())?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                update_work_item_in_transaction(&tx, &committed_item)?;
+                for update in &plan.work_item_updates {
+                    if update.id != committed_item.id {
+                        update_work_item_in_transaction(&tx, update)?;
+                    }
+                }
+                for insert in &plan.work_item_inserts {
+                    insert_work_item_in_transaction(&tx, insert)?;
+                }
+                for obligation in &plan.obligation_inserts {
+                    insert_authorization_obligation(&tx, obligation)?;
+                }
+                for insert in &plan.job_inserts {
+                    insert_job_in_transaction(&tx, insert)?;
+                }
+                for work_item_id in &plan.cancel_active_work_item_ids {
+                    tx.execute(
+                        "UPDATE jobs SET state = 'cancelled', lease_expires_at = NULL, updated_at = ?2 WHERE work_item_id = ?1 AND state IN ('pending','assigned','running')",
+                        params![work_item_id.to_string(), Utc::now().to_rfc3339()],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| AppError::Config(error.to_string()))?
+            .map_err(map_db)?;
+            drop(_transition_guard);
+            self.persist_task_projection(&item, None)
+                .await
+                .map_err(map_config)?;
+            return Ok(item);
         } else {
             return Err(AppError::WorkflowNotFound(item.workflow_id.clone()));
         }
@@ -2797,7 +3666,7 @@ impl OrchestrationService {
         item.blocked_on = block_reason_for_state_name(&item.current_step);
         item.projected_state = Some(project_workflow_state(&item));
         self.update_work_item(&item).await.map_err(map_db)?;
-        self.persist_task_projection(&item, None)
+        self.persist_task_projection_locked(&item, None, checkpoint_owner_id)
             .await
             .map_err(map_config)?;
         Ok(item)
@@ -3253,6 +4122,7 @@ impl OrchestrationService {
             .await?;
         let lease_requeued = self.requeue_expired_leases().await.map_err(map_db)?;
         self.process_worker_session_recovery_inbox().await?;
+        self.drain_terminal_completion_outbox(16).await?;
 
         let mut github_fired_events = 0usize;
         if let Some(poller) = &self.github_poller {
@@ -4854,10 +5724,10 @@ impl OrchestrationService {
                             previous.step_id
                         ))
                     })?;
-                let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+                let agent_output_events = self.agent_output_events_for_job(item);
                 project_workflow_inputs_into_job_context(
                     &mut retry.context,
-                    &valid_next_events,
+                    &agent_output_events,
                     item,
                     &item.context,
                 );
@@ -5203,10 +6073,10 @@ impl OrchestrationService {
             runtime.permissions.can_write_workspace = false;
             add_triage_repository_mounts(&mut runtime, self.discovered_repos.as_slice())
                 .map_err(AppError::WorkflowInvalid)?;
-            let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+            let agent_output_events = self.agent_output_events_for_job(item);
             project_workflow_inputs_into_job_context(
                 &mut job.context,
-                &valid_next_events,
+                &agent_output_events,
                 item,
                 &item.context,
             );
@@ -5285,6 +6155,17 @@ impl OrchestrationService {
         item: &mut WorkItem,
         checkpoint_owner_id: Uuid,
         plan: &mut ProviderActionPlan,
+    ) -> Result<(), AppError> {
+        self.plan_reactive_current_state_excluding(item, checkpoint_owner_id, plan, None)
+            .await
+    }
+
+    async fn plan_reactive_current_state_excluding(
+        &self,
+        item: &mut WorkItem,
+        checkpoint_owner_id: Uuid,
+        plan: &mut ProviderActionPlan,
+        excluded_job_id: Option<Uuid>,
     ) -> Result<(), AppError> {
         let reactive = self
             .workflows
@@ -5399,7 +6280,7 @@ impl OrchestrationService {
                 | protocol::ReactiveStateKind::Managed => {
                     item.human_gate = false;
                     if self
-                        .has_pending_job_for_step(item.id, &state.id)
+                        .has_pending_job_for_step_excluding(item.id, &state.id, excluded_job_id)
                         .await
                         .map_err(map_db)?
                     {
@@ -5549,10 +6430,10 @@ impl OrchestrationService {
             state.kind(),
             managed_operation.as_ref(),
         );
-        let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+        let agent_output_events = self.agent_output_events_for_job(item);
         project_workflow_inputs_into_job_context(
             &mut job.context,
-            &valid_next_events,
+            &agent_output_events,
             item,
             &item.context,
         );
@@ -5630,6 +6511,7 @@ impl OrchestrationService {
         state_kind: protocol::ReactiveStateKind,
         checkpoint_owner_id: Uuid,
     ) -> Result<(), AppError> {
+        remove_legacy_event_aliases(&mut job.context);
         if job.context.get("environment_base").is_some()
             && job
                 .context
@@ -5750,6 +6632,7 @@ impl OrchestrationService {
             workflow_snapshot,
             state_id: job.step_id.clone(),
             state_kind,
+            agent_output_events: self.agent_output_events_for_step(item, &job.step_id),
             behavior: ResolvedAuthorizationBehavior {
                 execution_kind,
                 runner_profile,
@@ -6150,6 +7033,16 @@ impl OrchestrationService {
             .await
     }
 
+    async fn persist_task_projection_locked(
+        &self,
+        item: &WorkItem,
+        existing: Option<&TaskToolRecord>,
+        root_id: Uuid,
+    ) -> anyhow::Result<()> {
+        self.checkpoint_and_project_locked(item, existing, CheckpointIntent::Transition, root_id)
+            .await
+    }
+
     async fn checkpoint_and_project(
         &self,
         item: &WorkItem,
@@ -6163,6 +7056,17 @@ impl OrchestrationService {
         // generations: an older projection must finish (or remain durably
         // pending) before a newer root generation can be published.
         let _guard = lock.lock().await;
+        self.checkpoint_and_project_locked(item, existing, intent, root_id)
+            .await
+    }
+
+    async fn checkpoint_and_project_locked(
+        &self,
+        item: &WorkItem,
+        existing: Option<&TaskToolRecord>,
+        intent: CheckpointIntent,
+        root_id: Uuid,
+    ) -> anyhow::Result<()> {
         let root = self
             .get_work_item(root_id)
             .await?
@@ -7385,6 +8289,7 @@ impl OrchestrationService {
         .await?
     }
 
+    #[cfg(test)]
     async fn write_job_result_comment_best_effort(&self, item: &mut WorkItem, job: &Job) {
         if !matches!(job.state, JobState::Succeeded | JobState::Failed) {
             return;
@@ -7419,6 +8324,7 @@ impl OrchestrationService {
                 output: &output,
                 context: &context,
                 stored_comment_id,
+                idempotency_key: None,
             }) {
             Ok(Some(comment_id)) => {
                 item.job_result_comment_ids.insert(step_id, comment_id);
@@ -7436,6 +8342,7 @@ impl OrchestrationService {
         }
     }
 
+    #[cfg(test)]
     async fn append_failure_log(&self, item: &WorkItem) -> anyhow::Result<()> {
         if self.should_skip_write_back(item) {
             return Ok(());
@@ -7462,6 +8369,84 @@ impl OrchestrationService {
         Ok(())
     }
 
+    async fn append_failure_log_idempotent(
+        &self,
+        item: &WorkItem,
+        idempotency_key: &str,
+        deadline: ProviderOperationDeadline,
+    ) -> anyhow::Result<()> {
+        let (Some(task_id), Some(reason)) = (
+            item.external_task_id.as_deref(),
+            item.last_failure_reason.as_deref(),
+        ) else {
+            return Ok(());
+        };
+        let adapter = Arc::clone(&self.task_adapter);
+        let task_id = task_id.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        let message = format!("❌ Step '{}' failed: {}", item.current_step, reason);
+        tokio::task::spawn_blocking(move || {
+            deadline.check()?;
+            adapter.append_log_idempotent(&task_id, &idempotency_key, &message)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("provider log task failed: {error}"))?
+    }
+
+    async fn write_job_result_comment_idempotent(
+        &self,
+        item: &mut WorkItem,
+        job: &Job,
+        idempotency_key: &str,
+        deadline: ProviderOperationDeadline,
+    ) -> anyhow::Result<()> {
+        if !matches!(job.state, JobState::Succeeded | JobState::Failed) {
+            return Ok(());
+        }
+        let Some(task_id) = item.external_task_id.as_deref() else {
+            return Ok(());
+        };
+        let output = item
+            .context
+            .get(CONTEXT_JOB_OUTPUTS_KEY)
+            .and_then(|outputs| outputs.get(&job.step_id))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let context = item
+            .context
+            .get(CONTEXT_JOB_ARTIFACT_DATA_KEY)
+            .and_then(|data| data.get(&job.step_id))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let work_item_id = item.id.to_string();
+        let adapter = Arc::clone(&self.task_adapter);
+        let task_id = task_id.to_string();
+        let step_id = job.step_id.clone();
+        let succeeded = job.state == JobState::Succeeded;
+        let stored_comment_id = item.job_result_comment_ids.get(&job.step_id).copied();
+        let idempotency_key = idempotency_key.to_string();
+        let comment_id = tokio::task::spawn_blocking(move || {
+            deadline.check()?;
+            adapter.write_job_result_comment(JobResultComment {
+                task_id: &task_id,
+                step_id: &step_id,
+                work_item_id: &work_item_id,
+                succeeded,
+                output: &output,
+                context: &context,
+                stored_comment_id,
+                idempotency_key: Some(&idempotency_key),
+            })
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("provider job-result task failed: {error}"))??;
+        if let Some(comment_id) = comment_id {
+            item.job_result_comment_ids
+                .insert(job.step_id.clone(), comment_id);
+        }
+        Ok(())
+    }
+
     pub(crate) fn valid_next_events_for_work_item(
         &self,
         item: &WorkItem,
@@ -7480,26 +8465,27 @@ impl OrchestrationService {
             format_required_action_description(item, &valid_next_events);
     }
 
-    fn projected_valid_next_events_for_job_context(
+    fn agent_output_events_for_job(&self, item: &WorkItem) -> Vec<protocol::AgentOutputEvent> {
+        self.agent_output_events_for_step(item, &item.current_step)
+    }
+
+    fn agent_output_events_for_step(
         &self,
         item: &WorkItem,
-    ) -> Vec<WorkflowEventKind> {
+        step_id: &str,
+    ) -> Vec<protocol::AgentOutputEvent> {
         // Triage is a pseudo-workflow without a registered state machine, but its
         // jobs still need the standard completion events so the agent can signal
         // success or failure.
         if item.workflow_id == "__triage__" {
             return vec![
-                WorkflowEventKind::JobSucceeded,
-                WorkflowEventKind::JobFailed,
-                WorkflowEventKind::Cancel,
+                protocol::AgentOutputEvent::JobSucceeded,
+                protocol::AgentOutputEvent::JobFailed,
             ];
         }
 
         if let Some(reactive) = self.workflows.get(&item.workflow_id)
-            && let Some(state) = reactive
-                .states
-                .iter()
-                .find(|state| state.id == item.current_step)
+            && let Some(state) = reactive.states.iter().find(|state| state.id == step_id)
             && matches!(
                 state.kind(),
                 protocol::ReactiveStateKind::Agent
@@ -7507,10 +8493,16 @@ impl OrchestrationService {
                     | protocol::ReactiveStateKind::Managed
             )
         {
-            return self.valid_next_events_for_work_item_internal(item);
+            return state
+                .on
+                .iter()
+                .filter_map(|transition| {
+                    protocol::AgentOutputEvent::try_from(transition.event.kind()).ok()
+                })
+                .collect();
         }
 
-        self.valid_next_events_for_work_item(item)
+        Vec::new()
     }
 
     pub(crate) fn github_pr_state_for_work_item(&self, item: &WorkItem) -> Option<GithubPrState> {
@@ -7619,25 +8611,15 @@ impl OrchestrationService {
                 let rows = stmt.query_map([&worker_id], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            let result = worker_recovery_result_json("worker_session_stale", now)?;
-            for job_id in &running {
-                tx.execute(
-                    "UPDATE jobs SET state = 'failed', lease_expires_at = NULL,
-                        result_json = ?2, updated_at = ?3 WHERE id = ?1 AND state = 'running'",
-                    params![job_id, result, now.to_rfc3339()],
-                )?;
-            }
             tx.commit()?;
             Ok((assigned + running.len(), running))
         })
         .await??;
         for job_id in failed_jobs {
             let job_id = Uuid::parse_str(&job_id)?;
-            if let Some(job) = self.get_job(job_id).await? {
-                self.advance_or_recover_worker_failure(&job, "worker_session_stale")
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            }
+            self.apply_internal_terminal_failure(job_id, "worker_session_stale")
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         Ok(count)
     }
@@ -7662,56 +8644,186 @@ impl OrchestrationService {
                 let rows = stmt.query_map([now.to_rfc3339()], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            let result = worker_recovery_result_json("worker_session_lease_expired", now)?;
-            for job_id in &running {
-                tx.execute(
-                    "UPDATE jobs SET state = 'failed', lease_expires_at = NULL,
-                        result_json = ?2, updated_at = ?3 WHERE id = ?1 AND state = 'running'",
-                    params![job_id, result, now.to_rfc3339()],
-                )?;
-            }
             tx.commit()?;
             Ok((assigned + running.len(), running))
         })
         .await??;
         for job_id in failed_jobs {
             let job_id = Uuid::parse_str(&job_id)?;
-            if let Some(job) = self.get_job(job_id).await? {
-                self.advance_or_recover_worker_failure(&job, "worker_session_lease_expired")
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            }
+            self.apply_internal_terminal_failure(job_id, "worker_session_lease_expired")
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         Ok(count)
     }
 
-    async fn advance_or_recover_worker_failure(
+    async fn apply_internal_terminal_failure(
         &self,
-        job: &Job,
+        job_id: Uuid,
         reason: &str,
     ) -> Result<(), AppError> {
-        if let Err(error) = self.advance_workflow_for_job(job).await {
-            let mut item = self
-                .get_work_item(job.work_item_id)
-                .await
-                .map_err(map_db)?
-                .ok_or_else(|| AppError::WorkItemNotFound(job.work_item_id.to_string()))?;
-            item.state = WorkItemState::Failed;
-            item.human_gate = true;
-            item.human_gate_state = Some(reason.to_string());
-            item.last_failure_reason = Some(format!(
-                "{reason}: workflow recovery requires operator review ({error})"
-            ));
-            item.required_action_description = Some(
-                "Review the abandoned worker execution and explicitly retry or recover the workflow."
-                    .to_string(),
-            );
-            item.updated_at = Utc::now();
-            self.update_work_item(&item).await.map_err(map_db)?;
-            self.persist_task_projection(&item, None)
-                .await
-                .map_err(map_config)?;
+        let mut job = self
+            .get_job(job_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::JobNotFound(job_id.to_string()))?;
+        let artifact = job.canonical_authorization.as_ref().ok_or_else(|| {
+            AppError::WorkflowInvalid("job has no canonical authorization".to_string())
+        })?;
+        let authorization_id = job
+            .context
+            .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::WorkflowInvalid("job has no authorization id".to_string()))?;
+        let bundle = protocol::ImmutableAuthorizationBundle::verify(artifact, authorization_id)
+            .map_err(AppError::WorkflowInvalid)?;
+        let root_id = bundle.request.root_work_item_id;
+        let lock = self.checkpoint_lock(root_id).await;
+        let _guard = lock.lock().await;
+        let now = Utc::now();
+        job.state = JobState::Failed;
+        job.result = Some(
+            serde_json::from_str(&worker_recovery_result_json(reason, now).map_err(map_db)?)
+                .map_err(|error| AppError::WorkflowInvalid(error.to_string()))?,
+        );
+        job.lease_expires_at = None;
+        job.updated_at = now;
+        let mut item = self
+            .get_work_item(job.work_item_id)
+            .await
+            .map_err(map_db)?
+            .ok_or_else(|| AppError::WorkItemNotFound(job.work_item_id.to_string()))?;
+        let original_step = item.current_step.clone();
+        let original_invocation = current_state_invocation_id(&item).ok_or_else(|| {
+            AppError::WorkflowInvalid("work item has no invocation identity".to_string())
+        })?;
+        let mut plan = ProviderActionPlan::default();
+        let parent_binding = match self
+            .plan_terminal_job_transition(&mut item, &job, root_id, &mut plan)
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                item.state = WorkItemState::Failed;
+                item.human_gate = true;
+                item.human_gate_state = Some(reason.to_string());
+                item.last_failure_reason = Some(format!(
+                    "{reason}: workflow recovery requires operator review ({error})"
+                ));
+                item.required_action_description = Some(
+                    "Review the abandoned worker execution and explicitly retry or recover the workflow."
+                        .to_string(),
+                );
+                item.updated_at = Utc::now();
+                plan = ProviderActionPlan::default();
+                Vec::new()
+            }
+        };
+        if let Some(pending) = plan.authorization_pending.clone() {
+            mark_authorization_pending(&mut item, pending).map_err(map_db)?;
         }
+        item.updated_at = now;
+        item.projected_state = Some(project_workflow_state(&item));
+        let path = Arc::clone(&self.db_path);
+        let committed_job = job.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = Connection::open(path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let stored = tx.query_row(
+                "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE id = ?1",
+                [job_id.to_string()],
+                row_to_job,
+            )?;
+            let verified = verify_job_authorization_frozen(&tx, &stored)?;
+            let digest = terminal_result_digest(&committed_job)?;
+            if let Some(stored_digest) = tx
+                .query_row(
+                    "SELECT result_digest FROM job_output_receipts WHERE job_id = ?1",
+                    [job_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                if stored_digest != digest {
+                    anyhow::bail!("conflicting terminal output replay for job {job_id}");
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+            let binding_matches = verified.request.root_work_item_id == root_id
+                && verified.request.work_unit_id == committed_job.work_item_id
+                && verified.request.state_id == original_step
+                && verified.request.invocation_id == original_invocation
+                && committed_job.step_id == original_step;
+            let cas = if binding_matches {
+                tx.execute(
+                    "UPDATE work_items SET context_json = context_json WHERE id = ?1 AND current_step = ?2 AND json_extract(context_json, '$.state_invocation.id') = ?3 AND state IN ('pending','running')",
+                    params![committed_job.work_item_id.to_string(), original_step, original_invocation.to_string()],
+                )?
+            } else {
+                0
+            };
+            let at = Utc::now().to_rfc3339();
+            if cas != 1 {
+                tx.execute(
+                    "INSERT INTO job_output_receipts (job_id, work_item_id, checkpoint_owner_id, step_id, invocation_id, result_digest, application_state, quarantine_reason, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'quarantined', 'stale internal terminal failure', ?7, ?7)",
+                    params![job_id.to_string(), committed_job.work_item_id.to_string(), root_id.to_string(), committed_job.step_id, original_invocation.to_string(), digest, at],
+                )?;
+                tx.commit()?;
+                return Ok(());
+            }
+            for parent in &parent_binding {
+                let parent_cas = tx.execute(
+                    "UPDATE work_items SET context_json = context_json WHERE id = ?1 AND current_step = ?2 AND json_extract(context_json, '$.state_invocation.id') = ?3 AND state IN ('pending','running')",
+                    params![parent.parent_id.to_string(), parent.step_id, parent.invocation_id.to_string()],
+                )?;
+                if parent_cas != 1 {
+                    tx.execute(
+                        "INSERT INTO job_output_receipts (job_id, work_item_id, checkpoint_owner_id, step_id, invocation_id, result_digest, application_state, quarantine_reason, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'quarantined', 'stale parent transition binding', ?7, ?7)",
+                        params![job_id.to_string(), committed_job.work_item_id.to_string(), root_id.to_string(), committed_job.step_id, original_invocation.to_string(), digest, at],
+                    )?;
+                    tx.commit()?;
+                    return Ok(());
+                }
+            }
+            update_work_item_in_transaction(&tx, &item)?;
+            for update in &plan.work_item_updates {
+                if update.id != item.id {
+                    update_work_item_in_transaction(&tx, update)?;
+                }
+            }
+            for insert in &plan.work_item_inserts {
+                insert_work_item_in_transaction(&tx, insert)?;
+            }
+            for obligation in &plan.obligation_inserts {
+                insert_authorization_obligation(&tx, obligation)?;
+            }
+            for insert in &plan.job_inserts {
+                insert_job_in_transaction(&tx, insert)?;
+            }
+            let changed = tx.execute(
+                "UPDATE jobs SET state = 'failed', result_json = ?2, lease_expires_at = NULL, updated_at = ?3 WHERE id = ?1 AND state = 'running'",
+                params![job_id.to_string(), committed_job.result.as_ref().map(serde_json::to_string).transpose()?, committed_job.updated_at.to_rfc3339()],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("internal terminal job state CAS failed");
+            }
+            tx.execute(
+                "INSERT INTO job_output_receipts (job_id, work_item_id, checkpoint_owner_id, step_id, invocation_id, result_digest, application_state, quarantine_reason, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'applied', NULL, ?7, ?7)",
+                params![job_id.to_string(), committed_job.work_item_id.to_string(), root_id.to_string(), committed_job.step_id, original_invocation.to_string(), digest, at],
+            )?;
+            tx.execute(
+                "INSERT INTO terminal_completion_outbox (job_id, idempotency_key, work_item_id, checkpoint_owner_id, state, claim_owner, delivery_token, claim_expires_at, attempts, next_attempt_at, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, 'pending', NULL, NULL, NULL, 0, ?5, NULL, ?5)",
+                params![job_id.to_string(), format!("terminal:{job_id}"), committed_job.work_item_id.to_string(), root_id.to_string(), at],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(map_db)?;
+        drop(_guard);
+        let _ = self.process_terminal_completion_outbox(job_id).await;
         Ok(())
     }
 
@@ -7719,8 +8831,53 @@ impl OrchestrationService {
         const RECOVERY_BATCH_SIZE: usize = 32;
         const RECOVERY_DEADLINE: Duration = Duration::from_secs(2);
 
+        let claim_owner = Uuid::new_v4().to_string();
+        let roots_path = Arc::clone(&self.db_path);
+        let owner_for_claim = claim_owner.clone();
+        let mut root_ids = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Uuid>> {
+            let mut conn = Connection::open(roots_path.as_path())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = Utc::now();
+            let rows = {
+                let mut stmt = tx.prepare(
+                    "SELECT recovery_id, checkpoint_owner_id FROM worker_session_recovery_inbox
+                     WHERE (state = 'pending' AND next_attempt_at <= ?1)
+                        OR (state = 'processing' AND claim_expires_at < ?1)
+                     ORDER BY next_attempt_at, recovery_id LIMIT 32",
+                )?;
+                stmt.query_map([now.to_rfc3339()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut roots = Vec::new();
+            for (recovery_id, root_id) in rows {
+                let token = Uuid::new_v4().to_string();
+                let changed = tx.execute(
+                    "UPDATE worker_session_recovery_inbox SET state = 'processing', claim_owner = ?2,
+                        claim_token = ?3, claim_expires_at = ?4, attempts = attempts + 1, updated_at = ?5
+                     WHERE recovery_id = ?1 AND ((state = 'pending' AND next_attempt_at <= ?5)
+                        OR (state = 'processing' AND claim_expires_at < ?5))",
+                    params![recovery_id, owner_for_claim, token, (now + chrono::TimeDelta::seconds(30)).to_rfc3339(), now.to_rfc3339()],
+                )?;
+                if changed == 1 {
+                    roots.push(Uuid::parse_str(&root_id)?);
+                }
+            }
+            tx.commit()?;
+            Ok(roots)
+        })
+        .await
+        .map_err(|error| AppError::Config(error.to_string()))?
+        .map_err(map_db)?;
+        root_ids.sort();
+        root_ids.dedup();
+        let mut recovery_guards = Vec::with_capacity(root_ids.len());
+        for root_id in root_ids {
+            recovery_guards.push(self.checkpoint_lock(root_id).await.lock_owned().await);
+        }
         let path = Arc::clone(&self.db_path);
-        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        let applied = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let started = std::time::Instant::now();
             let mut applied = 0;
             for _ in 0..RECOVERY_BATCH_SIZE {
@@ -7732,11 +8889,11 @@ impl OrchestrationService {
                 let pending = tx
                     .query_row(
                         "SELECT recovery_id, job_id, work_item_id, checkpoint_owner_id,
-                                source_session_id, source_session_generation, reason, attempts
+                                source_session_id, source_session_generation, reason, attempts, claim_token
                          FROM worker_session_recovery_inbox
-                         WHERE state = 'pending' AND next_attempt_at <= ?1
+                         WHERE state = 'processing' AND claim_owner = ?1 AND claim_expires_at > ?2
                          ORDER BY next_attempt_at, updated_at, recovery_id LIMIT 1",
-                        [Utc::now().to_rfc3339()],
+                        params![claim_owner, Utc::now().to_rfc3339()],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -7747,6 +8904,7 @@ impl OrchestrationService {
                                 row.get::<_, u64>(5)?,
                                 row.get::<_, String>(6)?,
                                 row.get::<_, u32>(7)?,
+                                row.get::<_, String>(8)?,
                             ))
                         },
                     )
@@ -7760,6 +8918,7 @@ impl OrchestrationService {
                     source_session_generation,
                     reason,
                     attempts,
+                    claim_token,
                 )) = pending
                 else {
                     tx.commit()?;
@@ -7776,9 +8935,11 @@ impl OrchestrationService {
                 if already_applied.is_some() {
                     tx.execute(
                         "UPDATE worker_session_recovery_inbox
-                         SET state = 'applied', last_error = NULL, updated_at = ?2
-                         WHERE recovery_id = ?1",
-                        params![recovery_id, Utc::now().to_rfc3339()],
+                         SET state = 'applied', claim_owner = NULL, claim_token = NULL,
+                             claim_expires_at = NULL, last_error = NULL, updated_at = ?4
+                         WHERE recovery_id = ?1 AND state = 'processing' AND claim_owner = ?2
+                           AND claim_token = ?3 AND claim_expires_at > ?4",
+                        params![recovery_id, claim_owner, claim_token, Utc::now().to_rfc3339()],
                     )?;
                     tx.commit()?;
                     continue;
@@ -7794,6 +8955,79 @@ impl OrchestrationService {
                     );
                     if recovery_id != expected_recovery_id {
                         anyhow::bail!("worker session recovery identity mismatch");
+                    }
+                    let mut recovery_job = tx.query_row(
+                        "SELECT id, work_item_id, step_id, state, assigned_worker_id, execution_mode, container_image, command, args_json, env_json, prompt_json, context_json, repo_json, timeout_secs, max_retries, attempt, transcript_dir, result_json, lease_expires_at, created_at, updated_at, runtime_spec_json, canonical_authorization_version, canonical_authorization_digest, canonical_authorization_bytes, assigned_worker_session_id, assigned_worker_session_generation FROM jobs WHERE id = ?1",
+                        [&job_id],
+                        row_to_job,
+                    )?;
+                    let recovery_bundle = match verify_job_authorization_frozen(&tx, &recovery_job)
+                    {
+                        Ok(bundle) => bundle,
+                        Err(error) => {
+                            let artifact = recovery_job
+                                .canonical_authorization
+                                .as_ref()
+                                .ok_or_else(|| anyhow::anyhow!("recovery job has no artifact"))?;
+                            let authorization_id = recovery_job
+                                .context
+                                .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| anyhow::anyhow!("recovery job has no authorization id"))?;
+                            let bundle = protocol::ImmutableAuthorizationBundle::verify(
+                                artifact,
+                                authorization_id,
+                            )
+                            .map_err(anyhow::Error::msg)?;
+                            let digest = terminal_result_digest(&recovery_job)?;
+                            let at = Utc::now().to_rfc3339();
+                            tx.execute(
+                                "INSERT OR IGNORE INTO job_output_receipts (job_id, work_item_id, checkpoint_owner_id, step_id, invocation_id, result_digest, application_state, quarantine_reason, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'quarantined', ?7, ?8, ?8)",
+                                params![job_id, work_item_id, checkpoint_owner_id, recovery_job.step_id, bundle.request.invocation_id.to_string(), digest, format!("worker session recovery authorization mismatch: {error}"), at],
+                            )?;
+                            let outcome = serde_json::json!({
+                                "job_id":job_id,
+                                "work_item_id":work_item_id,
+                                "checkpoint_owner_id":checkpoint_owner_id,
+                                "state":"quarantined",
+                                "reason":error.to_string(),
+                            });
+                            tx.execute(
+                                "INSERT INTO worker_session_recovery_applied (recovery_id, job_id, outcome_json, applied_at) VALUES (?1, ?2, ?3, ?4)",
+                                params![recovery_id, job_id, serde_json::to_string(&outcome)?, at],
+                            )?;
+                            tx.execute(
+                                "UPDATE worker_session_recovery_inbox SET state = 'applied', claim_owner = NULL, claim_token = NULL, claim_expires_at = NULL, last_error = NULL, updated_at = ?4 WHERE recovery_id = ?1 AND state = 'processing' AND claim_owner = ?2 AND claim_token = ?3 AND claim_expires_at > ?4",
+                                params![recovery_id, claim_owner, claim_token, at],
+                            )?;
+                            return Ok(0);
+                        }
+                    };
+                    if recovery_bundle.request.root_work_item_id.to_string()
+                        != checkpoint_owner_id
+                        || recovery_bundle.request.work_unit_id.to_string() != work_item_id
+                    {
+                        anyhow::bail!("worker session recovery authorization binding mismatch");
+                    }
+                    if recovery_job.state == JobState::Running {
+                        recovery_job.state = JobState::Failed;
+                        recovery_job.result = Some(serde_json::from_str(
+                            &worker_recovery_result_json(&reason, Utc::now())?,
+                        )?);
+                        recovery_job.lease_expires_at = None;
+                        recovery_job.updated_at = Utc::now();
+                    }
+                    let receipt_digest = terminal_result_digest(&recovery_job)?;
+                    if let Some(existing_digest) = tx
+                        .query_row(
+                            "SELECT result_digest FROM job_output_receipts WHERE job_id = ?1",
+                            [&job_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                        && existing_digest != receipt_digest
+                    {
+                        anyhow::bail!("conflicting worker session recovery receipt");
                     }
                     let (job_work_item_id, job_checkpoint_owner_id) = tx.query_row(
                         "SELECT work_item_id, checkpoint_owner_id FROM jobs WHERE id = ?1",
@@ -7834,45 +9068,112 @@ impl OrchestrationService {
                             human_gate_state = ?2,
                             last_failure_reason = ?3, required_action_description = ?4,
                             updated_at = ?5
-                         WHERE id = ?1 AND state IN ('pending', 'running')",
+                         WHERE id = ?1 AND state IN ('pending', 'running')
+                           AND current_step = ?6
+                           AND json_extract(context_json, '$.state_invocation.id') = ?7",
                         params![
                             work_item_id,
                             reason,
                             format!("{reason}: worker execution requires operator recovery"),
                             "Review the abandoned worker execution and explicitly retry or recover the workflow.",
                             now.to_rfc3339(),
+                            recovery_bundle.request.state_id,
+                            recovery_bundle.request.invocation_id.to_string(),
                         ],
                     )?;
                     let root_changed = if checkpoint_owner_id == work_item_id {
                         child_changed
                     } else {
+                        let (parent_id, parent_step_id, parent_invocation_id): (
+                            Option<String>,
+                            Option<String>,
+                            Option<String>,
+                        ) = tx.query_row(
+                            "SELECT parent_work_item_id, parent_step_id, json_extract(context_json, '$.parent_invocation_id') FROM work_items WHERE id = ?1",
+                            [&work_item_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )?;
+                        if parent_id.as_deref() != Some(checkpoint_owner_id.as_str())
+                            || parent_step_id.is_none()
+                            || parent_invocation_id.is_none()
+                        {
+                            0
+                        } else {
                         tx.execute(
                             "UPDATE work_items SET state = 'failed', human_gate = 1,
                                 human_gate_state = ?2, projected_state = ?2,
                                 last_failure_reason = ?3, required_action_description = ?4,
                                 updated_at = ?5
-                             WHERE id = ?1 AND state IN ('pending', 'running')",
+                             WHERE id = ?1 AND state IN ('pending', 'running')
+                               AND current_step = ?6
+                               AND json_extract(context_json, '$.state_invocation.id') = ?7",
                             params![
                                 checkpoint_owner_id,
                                 reason,
                                 format!("{reason}: child {work_item_id} requires operator recovery"),
                                 "Review the failed child execution and explicitly retry or recover the checkpoint tree.",
                                 now.to_rfc3339(),
+                                parent_step_id,
+                                parent_invocation_id,
                             ],
                         )?
+                        }
                     };
+                    let recovery_binding_applied = child_changed == 1 && root_changed == 1;
+                    if recovery_job.state == JobState::Failed && recovery_binding_applied {
+                        let changed = tx.execute(
+                            "UPDATE jobs SET state = 'failed', result_json = ?2, lease_expires_at = NULL, updated_at = ?3 WHERE id = ?1 AND state = 'running' AND ((?4 = 'legacy-null-session' AND assigned_worker_session_id IS NULL AND assigned_worker_session_generation IS NULL) OR (assigned_worker_session_id = ?4 AND assigned_worker_session_generation = ?5))",
+                            params![job_id, recovery_job.result.as_ref().map(serde_json::to_string).transpose()?, recovery_job.updated_at.to_rfc3339(), source_session_id, source_session_generation],
+                        )?;
+                        if changed != 1 {
+                            anyhow::bail!("worker session recovery job CAS failed");
+                        }
+                    }
+                    if tx
+                        .query_row(
+                            "SELECT 1 FROM job_output_receipts WHERE job_id = ?1",
+                            [&job_id],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_none()
+                    {
+                        let at = Utc::now().to_rfc3339();
+                        let receipt_state = if recovery_binding_applied {
+                            "applied"
+                        } else {
+                            "quarantined"
+                        };
+                        let quarantine_reason = if recovery_binding_applied {
+                            None
+                        } else {
+                            Some("stale worker session recovery binding")
+                        };
+                        tx.execute(
+                            "INSERT INTO job_output_receipts (job_id, work_item_id, checkpoint_owner_id, step_id, invocation_id, result_digest, application_state, quarantine_reason, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                            params![job_id, work_item_id, checkpoint_owner_id, recovery_job.step_id, recovery_bundle.request.invocation_id.to_string(), receipt_digest, receipt_state, quarantine_reason, at],
+                        )?;
+                    }
+                    if recovery_binding_applied {
+                        let at = Utc::now().to_rfc3339();
+                        tx.execute(
+                            "INSERT OR IGNORE INTO terminal_completion_outbox (job_id, idempotency_key, work_item_id, checkpoint_owner_id, state, claim_owner, delivery_token, claim_expires_at, attempts, next_attempt_at, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, 'pending', NULL, NULL, NULL, 0, ?5, NULL, ?5)",
+                            params![job_id, format!("terminal:{job_id}"), work_item_id, checkpoint_owner_id, at],
+                        )?;
+                    }
                     let outcome = serde_json::json!({
                         "job_id":job_id,
                         "work_item_id":work_item_id,
                         "checkpoint_owner_id":checkpoint_owner_id,
                         "child_changed":child_changed,
                         "root_changed":root_changed,
-                        "state":"failed",
+                        "state": if recovery_binding_applied { "failed" } else { "quarantined" },
                         "reason":reason,
                     });
-                    tx.execute(
-                        "INSERT OR REPLACE INTO ownership_return_outbox (
-                            root_work_item_id, task_id, human_owner,
+                    if recovery_binding_applied {
+                        tx.execute(
+                            "INSERT OR REPLACE INTO ownership_return_outbox (
+                             root_work_item_id, task_id, human_owner,
                             human_owner_provider_id, human_owners_json,
                             last_error, updated_at
                          )
@@ -7882,12 +9183,13 @@ impl OrchestrationService {
                                 remembered_human_owners_json, ?2, ?3
                          FROM work_items
                          WHERE id = ?1 AND external_task_id IS NOT NULL",
-                        params![
-                            checkpoint_owner_id,
-                            format!("{reason}: provider recovery pending"),
-                            now.to_rfc3339(),
-                        ],
-                    )?;
+                            params![
+                                checkpoint_owner_id,
+                                format!("{reason}: provider recovery pending"),
+                                now.to_rfc3339(),
+                            ],
+                        )?;
+                    }
                     tx.execute(
                         "INSERT INTO worker_session_recovery_applied (
                             recovery_id, job_id, outcome_json, applied_at
@@ -7901,9 +9203,11 @@ impl OrchestrationService {
                     )?;
                     tx.execute(
                         "UPDATE worker_session_recovery_inbox
-                         SET state = 'applied', last_error = NULL, updated_at = ?2
-                         WHERE recovery_id = ?1 AND state = 'pending'",
-                        params![recovery_id, now.to_rfc3339()],
+                         SET state = 'applied', claim_owner = NULL, claim_token = NULL,
+                             claim_expires_at = NULL, last_error = NULL, updated_at = ?4
+                         WHERE recovery_id = ?1 AND state = 'processing' AND claim_owner = ?2
+                           AND claim_token = ?3 AND claim_expires_at > ?4",
+                        params![recovery_id, claim_owner, claim_token, now.to_rfc3339()],
                     )?;
                     Ok(child_changed + root_changed)
                 })();
@@ -7918,11 +9222,15 @@ impl OrchestrationService {
                         let delay_secs = 1_i64 << attempts.min(8);
                         conn.execute(
                             "UPDATE worker_session_recovery_inbox
-                             SET attempts = attempts + 1, last_error = ?2,
-                                 next_attempt_at = ?3, updated_at = ?4
-                             WHERE recovery_id = ?1 AND state = 'pending'",
+                             SET state = 'pending', claim_owner = NULL, claim_token = NULL,
+                                 claim_expires_at = NULL, last_error = ?4,
+                                 next_attempt_at = ?5, updated_at = ?6
+                             WHERE recovery_id = ?1 AND state = 'processing' AND claim_owner = ?2
+                               AND claim_token = ?3",
                             params![
                                 recovery_id,
+                                claim_owner,
+                                claim_token,
                                 error.to_string(),
                                 (Utc::now() + chrono::TimeDelta::seconds(delay_secs))
                                     .to_rfc3339(),
@@ -7936,9 +9244,12 @@ impl OrchestrationService {
         })
         .await
         .map_err(|error| AppError::Config(error.to_string()))?
-        .map_err(map_db)
+        .map_err(map_db)?;
+        drop(recovery_guards);
+        Ok(applied)
     }
 
+    #[cfg(test)]
     async fn advance_workflow_for_job(&self, job: &Job) -> Result<(), AppError> {
         let mut item = self
             .get_work_item(job.work_item_id)
@@ -8062,8 +9373,7 @@ impl OrchestrationService {
                         "{error}"
                     );
                 })
-                .ok()
-                .flatten();
+                .map_err(AppError::WorkflowInvalid)?;
 
             let default_event = match job.state {
                 JobState::Succeeded => WorkflowEventKind::JobSucceeded,
@@ -8442,11 +9752,10 @@ impl OrchestrationService {
                             state.kind(),
                             managed_operation.as_ref(),
                         );
-                        let valid_next_events =
-                            self.projected_valid_next_events_for_job_context(item);
+                        let agent_output_events = self.agent_output_events_for_job(item);
                         project_workflow_inputs_into_job_context(
                             &mut job.context,
-                            &valid_next_events,
+                            &agent_output_events,
                             item,
                             &item.context,
                         );
@@ -8544,10 +9853,10 @@ impl OrchestrationService {
         runtime.permissions.can_write_workspace = false;
         add_triage_repository_mounts(&mut runtime, self.discovered_repos.as_slice())
             .map_err(anyhow::Error::msg)?;
-        let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+        let agent_output_events = self.agent_output_events_for_job(item);
         project_workflow_inputs_into_job_context(
             &mut job.context,
-            &valid_next_events,
+            &agent_output_events,
             item,
             &item.context,
         );
@@ -8652,6 +9961,7 @@ impl OrchestrationService {
         })
     }
 
+    #[cfg(test)]
     async fn fire_reactive_event(
         &self,
         item: &mut WorkItem,
@@ -8704,6 +10014,7 @@ impl OrchestrationService {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn try_progress_parent(&self, child_id: Uuid) -> Result<(), AppError> {
         let child = match self.get_work_item(child_id).await.map_err(map_db)? {
             Some(c) => c,
@@ -8783,6 +10094,7 @@ impl OrchestrationService {
         Err(AppError::WorkflowNotFound(parent.workflow_id))
     }
 
+    #[cfg(test)]
     async fn cancel_work_item(&self, id: Uuid) -> anyhow::Result<()> {
         if let Some(mut item) = self.get_work_item(id).await? {
             item.state = WorkItemState::Cancelled;
@@ -8818,10 +10130,10 @@ impl OrchestrationService {
         next.updated_at = next.created_at;
         enter_workflow_state(item, &previous.step_id);
         next.context["state_invocation"] = item.context["state_invocation"].clone();
-        let valid_next_events = self.projected_valid_next_events_for_job_context(item);
+        let agent_output_events = self.agent_output_events_for_job(item);
         project_workflow_inputs_into_job_context(
             &mut next.context,
-            &valid_next_events,
+            &agent_output_events,
             item,
             &item.context,
         );
@@ -8969,6 +10281,14 @@ impl OrchestrationService {
     }
 
     fn merge_job_output_into_context(&self, item: &mut WorkItem, job: &Job) -> Result<(), String> {
+        Self::merge_job_output_into_context_with_scm(self.scm_hosts.as_ref(), item, job)
+    }
+
+    fn merge_job_output_into_context_with_scm(
+        scm_hosts: &super::scm::ScmHostRegistry,
+        item: &mut WorkItem,
+        job: &Job,
+    ) -> Result<(), String> {
         let raw_output_json = job.result.as_ref().and_then(|r| r.output_json.clone());
         let parsed_output = raw_output_json
             .as_ref()
@@ -9052,7 +10372,7 @@ impl OrchestrationService {
                     "managed GitHub result pull request number does not match URL".to_string(),
                 );
             }
-            if self.scm_hosts.find(&parts.host).is_none() {
+            if scm_hosts.find(&parts.host).is_none() {
                 return Err(format!(
                     "managed GitHub result host '{}' is not in the SCM registry",
                     parts.host
@@ -9204,19 +10524,30 @@ impl OrchestrationService {
         work_item_id: Uuid,
         step_id: &str,
     ) -> anyhow::Result<bool> {
+        self.has_pending_job_for_step_excluding(work_item_id, step_id, None)
+            .await
+    }
+
+    async fn has_pending_job_for_step_excluding(
+        &self,
+        work_item_id: Uuid,
+        step_id: &str,
+        excluded_job_id: Option<Uuid>,
+    ) -> anyhow::Result<bool> {
         let path = Arc::clone(&self.db_path);
         let step_id = step_id.to_string();
         tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = Connection::open(path.as_path())?;
             let exists: Option<String> = conn
                 .query_row(
-                    "SELECT id FROM jobs WHERE work_item_id = ?1 AND step_id = ?2 AND state IN (?3, ?4, ?5) LIMIT 1",
+                    "SELECT id FROM jobs WHERE work_item_id = ?1 AND step_id = ?2 AND state IN (?3, ?4, ?5) AND (?6 IS NULL OR id != ?6) LIMIT 1",
                     params![
                         work_item_id.to_string(),
                         step_id,
                         JobState::Pending.to_string(),
                         JobState::Assigned.to_string(),
                         JobState::Running.to_string(),
+                        excluded_job_id.map(|value| value.to_string()),
                     ],
                     |row| row.get(0),
                 )
@@ -11224,9 +12555,29 @@ fn clone_context_object_field_or_empty(
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
 }
 
+fn remove_legacy_event_aliases(context: &mut serde_json::Value) {
+    let Some(root) = context.as_object_mut() else {
+        return;
+    };
+    root.remove("valid_next_events");
+    let Some(workflow) = root
+        .get_mut(CONTEXT_WORKFLOW_KEY)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    workflow.remove("valid_next_events");
+    if let Some(inputs) = workflow
+        .get_mut(CONTEXT_WORKFLOW_INPUTS_KEY)
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        inputs.remove("valid_next_events");
+    }
+}
+
 fn project_workflow_inputs_into_job_context(
     context: &mut serde_json::Value,
-    valid_next_events: &[WorkflowEventKind],
+    agent_output_events: &[protocol::AgentOutputEvent],
     item: &WorkItem,
     work_item_context: &serde_json::Value,
 ) {
@@ -11257,14 +12608,14 @@ fn project_workflow_inputs_into_job_context(
         return;
     };
 
-    let valid_event_names = valid_next_events
+    let agent_output_event_names = agent_output_events
         .iter()
-        .map(workflow_event_kind_name)
+        .map(ToString::to_string)
         .map(serde_json::Value::String)
         .collect::<Vec<_>>();
     inputs_obj.insert(
-        CONTEXT_VALID_NEXT_EVENTS_KEY.to_string(),
-        serde_json::Value::Array(valid_event_names),
+        CONTEXT_AGENT_OUTPUT_EVENTS_KEY.to_string(),
+        serde_json::Value::Array(agent_output_event_names),
     );
     inputs_obj.insert(
         CONTEXT_JOB_ARTIFACT_PATHS_KEY.to_string(),
@@ -11768,10 +13119,8 @@ fn reactive_next_event_from_agent_output(
         return Ok(None);
     };
 
-    let parsed = match serde_json::from_value::<AgentOutput>(raw_output_json.clone()) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(None),
-    };
+    let parsed = serde_json::from_value::<AgentOutput>(raw_output_json.clone())
+        .map_err(|error| format!("agent output is invalid: {error}"))?;
     let Some(next_event) = parsed.next_event.as_deref() else {
         return Ok(None);
     };
@@ -11780,7 +13129,9 @@ fn reactive_next_event_from_agent_output(
         .iter()
         .map(workflow_event_kind_name)
         .collect::<Vec<_>>();
-    validate_agent_output_next_event(&parsed, &valid_event_names)?;
+    validate_agent_output_event(&parsed, &valid_event_names)?;
+    let authorized_event_names = canonical_agent_output_event_names(job)?;
+    validate_agent_output_event(&parsed, &authorized_event_names)?;
 
     next_event
         .parse::<WorkflowEventKind>()
@@ -11791,6 +13142,47 @@ fn reactive_next_event_from_agent_output(
                 next_event
             )
         })
+}
+
+fn canonical_agent_output_event_names(job: &Job) -> Result<Vec<String>, String> {
+    let artifact = job
+        .canonical_authorization
+        .as_ref()
+        .ok_or_else(|| "job has no canonical authorization artifact".to_string())?;
+    let authorization_id = job
+        .context
+        .get(protocol::CONTEXT_AUTHORIZATION_ID_KEY)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "job has no canonical authorization identity".to_string())?;
+    let bundle = protocol::ImmutableAuthorizationBundle::verify(artifact, authorization_id)?;
+    match bundle.version {
+        protocol::CANONICAL_AUTHORIZATION_VERSION => Ok(bundle
+            .request
+            .agent_output_events
+            .iter()
+            .map(ToString::to_string)
+            .collect()),
+        1 | protocol::CANONICAL_AUTHORIZATION_VERSION_V2 => Ok(bundle
+            .request
+            .behavior
+            .execution_context
+            .get(CONTEXT_WORKFLOW_KEY)
+            .and_then(|workflow| workflow.get(CONTEXT_WORKFLOW_INPUTS_KEY))
+            .and_then(|inputs| inputs.get("valid_next_events"))
+            .and_then(serde_json::Value::as_array)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(|event| event.parse::<protocol::AgentOutputEvent>().ok())
+                    .map(|event| event.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()),
+        version => Err(format!(
+            "unsupported canonical authorization version {version}"
+        )),
+    }
 }
 
 fn mark_human_gate_state(
@@ -12377,6 +13769,9 @@ mod tests {
     }
 
     impl TaskAdapter for ControlledCheckpointAdapter {
+        fn operation_timeout(&self) -> Duration {
+            Duration::from_secs(30)
+        }
         fn adapter_name(&self) -> &'static str {
             "controlled"
         }
@@ -12550,6 +13945,9 @@ mod tests {
     struct NoCheckpointAdapter;
 
     impl TaskAdapter for NoCheckpointAdapter {
+        fn operation_timeout(&self) -> Duration {
+            Duration::from_secs(30)
+        }
         fn adapter_name(&self) -> &'static str {
             "no-checkpoint"
         }
@@ -12807,6 +14205,7 @@ mod tests {
                     vec![
                         protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                         protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                        protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
                     ],
                     None,
                 )
@@ -12873,6 +14272,7 @@ mod tests {
                             protocol_capabilities: vec![
                                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
                             ],
                         },
                         None,
@@ -12917,6 +14317,20 @@ mod tests {
                 .expect("poll authorized job")
                 .job
                 .expect("authorized job")
+        }
+
+        async fn poll_job_authenticated(&self) -> Job {
+            self.svc
+                .poll_job_authenticated(
+                    self.worker_session.as_ref().unwrap().credential(),
+                    PollJobRequest {
+                        worker_id: self.worker_id.clone(),
+                    },
+                )
+                .await
+                .expect("authenticated poll")
+                .job
+                .expect("authenticated job")
         }
 
         async fn authorize_pending(&self) {
@@ -13080,7 +14494,7 @@ mod tests {
             svc.assign_next_job(
                 "worker".to_string(),
                 vec![protocol::ExecutionMode::Docker],
-                vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1],
+                vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV3],
                 None,
             )
             .await
@@ -13112,7 +14526,7 @@ mod tests {
             svc.assign_next_job(
                 "worker".to_string(),
                 vec![protocol::ExecutionMode::Docker],
-                vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV1],
+                vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV3],
                 None,
             )
             .await
@@ -14914,6 +16328,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authorization_protocol_mode_schema_upgrade_preserves_v2_fence() {
+        let db = std::env::temp_dir().join(format!("protocol-v3-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("protocol-v3-tasks-{}", Uuid::new_v4()));
+        let conn = Connection::open(db.as_path()).expect("create legacy database");
+        conn.execute_batch(
+            "CREATE TABLE authorization_protocol_mode (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2)),
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO authorization_protocol_mode VALUES (1, 2, 'legacy');",
+        )
+        .expect("seed v2 protocol fence");
+        drop(conn);
+
+        let adapter = Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>;
+        let svc = OrchestrationService::new(
+            workflow_catalog(),
+            adapter,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        svc.init().await.expect("migrate protocol fence");
+
+        let conn = Connection::open(db.as_path()).expect("open migrated database");
+        let (max_version, schema): (u32, String) = conn
+            .query_row(
+                "SELECT max_authorization_version, (SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'authorization_protocol_mode') FROM authorization_protocol_mode WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated protocol fence");
+        assert_eq!(max_version, protocol::CANONICAL_AUTHORIZATION_VERSION_V2);
+        assert!(schema.contains("1,2,3"));
+        drop(conn);
+        drop(svc);
+        Connection::open(db.as_path())
+            .unwrap()
+            .execute("DELETE FROM authorization_protocol_mode", [])
+            .unwrap();
+        let malformed = OrchestrationService::new(
+            workflow_catalog(),
+            Arc::new(TaskFileStore::new(tasks.clone())) as Arc<dyn TaskAdapter>,
+            db.to_string_lossy().into_owned(),
+        )
+        .with_scm_hosts(test_scm_registry());
+        assert!(malformed.init().await.is_err());
+        drop(malformed);
+        let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
     async fn canonical_authorization_migration_quarantines_precanonical_work_idempotently() {
         let mut harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
         let db = harness.db.clone();
@@ -15353,16 +16820,21 @@ mod tests {
         assert_eq!(assigned.state, JobState::Pending);
         assert!(assigned.assigned_worker_id.is_none());
         let running = restarted.get_job(running_id).await.unwrap().unwrap();
-        assert_eq!(running.state, JobState::Failed);
-        assert_eq!(
-            running.result.unwrap().error_message.as_deref(),
-            Some("legacy_assignment_session_migration")
-        );
+        assert_eq!(running.state, JobState::Running);
+        assert!(running.result.is_none());
         assert_eq!(
             restarted.get_job(terminal_id).await.unwrap().unwrap().state,
             JobState::Succeeded
         );
         let conn = Connection::open(&db).unwrap();
+        let receipt_state: String = conn
+            .query_row(
+                "SELECT application_state FROM job_output_receipts WHERE job_id = ?1",
+                [running_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_state, "quarantined");
         let (state, inbox_child, inbox_root): (String, String, String) = conn
             .query_row(
                 "SELECT state, work_item_id, checkpoint_owner_id
@@ -15371,7 +16843,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(state, "pending");
+        assert_eq!(state, "applied");
         assert_eq!(inbox_child, child.id.to_string());
         assert_eq!(inbox_root, root.id.to_string());
         drop(conn);
@@ -17718,6 +19190,329 @@ kind = "terminal"
     }
 
     #[tokio::test]
+    async fn terminal_output_receipts_dedupe_conflict_and_quarantine_stale_invocations() {
+        let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let credential = harness.worker_session.as_ref().unwrap().credential();
+        let job = harness.poll_job_authenticated().await;
+        harness
+            .svc
+            .update_job_authenticated(
+                job.id,
+                credential.clone(),
+                JobUpdateRequest {
+                    worker_id: harness.worker_id.clone(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .unwrap();
+        let request = JobUpdateRequest {
+            worker_id: harness.worker_id.clone(),
+            state: JobState::Succeeded,
+            transcript_dir: Some("/tmp/receipt".to_string()),
+            result: Some(successful_job_result()),
+        };
+        harness
+            .svc
+            .update_job_authenticated(job.id, credential.clone(), request.clone())
+            .await
+            .expect("first completion");
+        harness
+            .svc
+            .update_job_authenticated(job.id, credential.clone(), request.clone())
+            .await
+            .expect("exact replay is a no-op");
+        let mut conflicting = request;
+        conflicting.result.as_mut().unwrap().error_message = Some("conflict".to_string());
+        assert!(
+            harness
+                .svc
+                .update_job_authenticated(job.id, credential, conflicting)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting terminal output replay")
+        );
+        let receipt: (String, i64) = Connection::open(&harness.db)
+            .unwrap()
+            .query_row(
+                "SELECT application_state, COUNT(*) FROM job_output_receipts WHERE job_id = ?1",
+                [job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt, ("applied".to_string(), 1));
+
+        let concurrent = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let concurrent_credential = concurrent.worker_session.as_ref().unwrap().credential();
+        let concurrent_job = concurrent.poll_job_authenticated().await;
+        concurrent
+            .svc
+            .update_job_authenticated(
+                concurrent_job.id,
+                concurrent_credential.clone(),
+                JobUpdateRequest {
+                    worker_id: concurrent.worker_id.clone(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .unwrap();
+        let concurrent_request = JobUpdateRequest {
+            worker_id: concurrent.worker_id.clone(),
+            state: JobState::Succeeded,
+            transcript_dir: None,
+            result: Some(successful_job_result()),
+        };
+        let first_svc = concurrent.svc.clone();
+        let second_svc = concurrent.svc.clone();
+        let first_credential = concurrent_credential.clone();
+        let second_credential = concurrent_credential;
+        let first_request = concurrent_request.clone();
+        let second_request = concurrent_request;
+        let (first, second) = tokio::join!(
+            first_svc.update_job_authenticated(concurrent_job.id, first_credential, first_request,),
+            second_svc.update_job_authenticated(
+                concurrent_job.id,
+                second_credential,
+                second_request,
+            )
+        );
+        first.expect("first concurrent completion");
+        second.expect("second concurrent completion is a no-op");
+        let receipt_count: i64 = Connection::open(&concurrent.db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM job_output_receipts WHERE job_id = ?1 AND application_state = 'applied'",
+                [concurrent_job.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_count, 1);
+        Connection::open(&concurrent.db)
+            .unwrap()
+            .execute(
+                "UPDATE terminal_completion_outbox SET state = 'pending', claim_owner = NULL,
+                    claim_expires_at = NULL, attempts = 0, next_attempt_at = ?2
+                 WHERE job_id = ?1",
+                params![concurrent_job.id.to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        let first_consumer = concurrent.svc.clone();
+        let second_consumer = concurrent.svc.clone();
+        let (first_drain, second_drain) = tokio::join!(
+            first_consumer.drain_terminal_completion_outbox(1),
+            second_consumer.drain_terminal_completion_outbox(1),
+        );
+        assert_eq!(first_drain.unwrap() + second_drain.unwrap(), 1);
+        let (outbox_state, attempts): (String, u32) = Connection::open(&concurrent.db)
+            .unwrap()
+            .query_row(
+                "SELECT state, attempts FROM terminal_completion_outbox WHERE job_id = ?1",
+                [concurrent_job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(outbox_state, "applied");
+        assert_eq!(attempts, 1);
+
+        let stale = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let stale_credential = stale.worker_session.as_ref().unwrap().credential();
+        let stale_job = stale.poll_job_authenticated().await;
+        stale
+            .svc
+            .update_job_authenticated(
+                stale_job.id,
+                stale_credential.clone(),
+                JobUpdateRequest {
+                    worker_id: stale.worker_id.clone(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .unwrap();
+        let replacement_invocation = Uuid::new_v4();
+        Connection::open(&stale.db)
+            .unwrap()
+            .execute(
+                "UPDATE work_items SET context_json = json_set(context_json, '$.state_invocation.id', ?2) WHERE id = ?1",
+                params![stale_job.work_item_id.to_string(), replacement_invocation.to_string()],
+            )
+            .unwrap();
+        assert!(
+            stale
+                .svc
+                .update_job_authenticated(
+                    stale_job.id,
+                    stale_credential,
+                    JobUpdateRequest {
+                        worker_id: stale.worker_id.clone(),
+                        state: JobState::Succeeded,
+                        transcript_dir: None,
+                        result: Some({
+                            let mut result = successful_job_result();
+                            result.output_json =
+                                Some(serde_json::json!({"next_event":"job_succeeded"}));
+                            result
+                        }),
+                    },
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale terminal output binding")
+        );
+        let (receipt_state, current_step): (String, String) = Connection::open(&stale.db)
+            .unwrap()
+            .query_row(
+                "SELECT job_output_receipts.application_state, work_items.current_step FROM job_output_receipts JOIN work_items ON work_items.id = job_output_receipts.work_item_id WHERE job_output_receipts.job_id = ?1",
+                [stale_job.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt_state, "quarantined");
+        assert_eq!(current_step, stale_job.step_id);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_receipt_recovers_crashes_before_and_after_application() {
+        let before = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let before_credential = before.worker_session.as_ref().unwrap().credential();
+        let before_job = before.poll_job_authenticated().await;
+        before
+            .svc
+            .update_job_authenticated(
+                before_job.id,
+                before_credential.clone(),
+                JobUpdateRequest {
+                    worker_id: before.worker_id.clone(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .unwrap();
+        let terminal = JobUpdateRequest {
+            worker_id: before.worker_id.clone(),
+            state: JobState::Succeeded,
+            transcript_dir: None,
+            result: Some(successful_job_result()),
+        };
+        let conn = Connection::open(&before.db).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER crash_before_output_receipt BEFORE INSERT ON job_output_receipts BEGIN SELECT RAISE(ABORT, 'crash before receipt'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            before
+                .svc
+                .update_job_authenticated(
+                    before_job.id,
+                    before_credential.clone(),
+                    terminal.clone(),
+                )
+                .await
+                .is_err()
+        );
+        let conn = Connection::open(&before.db).unwrap();
+        conn.execute_batch("DROP TRIGGER crash_before_output_receipt")
+            .unwrap();
+        drop(conn);
+        before
+            .svc
+            .update_job_authenticated(before_job.id, before_credential, terminal)
+            .await
+            .expect("retry after pre-commit crash");
+
+        let after = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
+        let after_credential = after.worker_session.as_ref().unwrap().credential();
+        let after_job = after.poll_job_authenticated().await;
+        after
+            .svc
+            .update_job_authenticated(
+                after_job.id,
+                after_credential.clone(),
+                JobUpdateRequest {
+                    worker_id: after.worker_id.clone(),
+                    state: JobState::Running,
+                    transcript_dir: None,
+                    result: None,
+                },
+            )
+            .await
+            .unwrap();
+        let terminal = JobUpdateRequest {
+            worker_id: after.worker_id.clone(),
+            state: JobState::Succeeded,
+            transcript_dir: None,
+            result: Some(successful_job_result()),
+        };
+        let conn = Connection::open(&after.db).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER crash_after_output_application BEFORE UPDATE OF state ON terminal_completion_outbox WHEN NEW.state = 'applied' BEGIN SELECT RAISE(ABORT, 'crash after application'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        after
+            .svc
+            .update_job_authenticated(after_job.id, after_credential.clone(), terminal.clone())
+            .await
+            .expect("workflow commit survives projection crash");
+        let pending_outbox: String = Connection::open(&after.db)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM terminal_completion_outbox WHERE job_id = ?1",
+                [after_job.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_outbox, "processing");
+        let conn = Connection::open(&after.db).unwrap();
+        conn.execute_batch("DROP TRIGGER crash_after_output_application")
+            .unwrap();
+        conn.execute(
+            "UPDATE terminal_completion_outbox SET claim_expires_at = ?2 WHERE job_id = ?1",
+            params![
+                after_job.id.to_string(),
+                (Utc::now() - chrono::TimeDelta::seconds(1)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        after
+            .svc
+            .update_job_authenticated(after_job.id, after_credential, terminal)
+            .await
+            .expect("retry after post-application crash");
+        let receipt_state: String = Connection::open(&after.db)
+            .unwrap()
+            .query_row(
+                "SELECT application_state FROM job_output_receipts WHERE job_id = ?1",
+                [after_job.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_state, "applied");
+        let outbox_state: String = Connection::open(&after.db)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM terminal_completion_outbox WHERE job_id = ?1",
+                [after_job.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_state, "applied");
+    }
+
+    #[tokio::test]
     async fn successful_job_advances_workflow() {
         let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", true).await;
         let svc = &harness.svc;
@@ -17831,6 +19626,53 @@ kind = "terminal"
         )
         .await
         .expect("success");
+        let pending_item = harness.work_item().await;
+        assert_eq!(
+            svc.valid_next_events_for_work_item(&pending_item),
+            vec![WorkflowEventKind::HumanApproved, WorkflowEventKind::Cancel]
+        );
+        assert!(
+            svc.select_jobs_for_work_item(item.id)
+                .await
+                .expect("jobs before approval")
+                .iter()
+                .all(|job| job.step_id != "test"),
+            "authorization pending must not create the next executable job"
+        );
+        let provider_task = harness
+            .adapter
+            .get_task(item.id)
+            .expect("provider task read")
+            .expect("provider task");
+        assert_eq!(
+            provider_task.valid_next_events,
+            vec![WorkflowEventKind::HumanApproved, WorkflowEventKind::Cancel]
+        );
+        let obligation_job_json: String = Connection::open(harness.db.as_path())
+            .expect("sqlite")
+            .query_row(
+                "SELECT job_json FROM authorization_obligations WHERE state = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pending obligation job");
+        let obligation_job: Job =
+            serde_json::from_str(&obligation_job_json).expect("obligation job JSON");
+        let artifact = obligation_job
+            .canonical_authorization
+            .as_ref()
+            .expect("canonical authorization");
+        assert_eq!(artifact.version, protocol::CANONICAL_AUTHORIZATION_VERSION);
+        assert_eq!(
+            artifact
+                .verify_and_parse()
+                .expect("verified obligation")
+                .agent_output_events,
+            vec![
+                protocol::AgentOutputEvent::JobSucceeded,
+                protocol::AgentOutputEvent::JobFailed,
+            ]
+        );
         harness.authorize_pending().await;
 
         let updated = svc
@@ -17845,6 +19687,58 @@ kind = "terminal"
 
         let jobs = svc.list_jobs().await.expect("jobs");
         assert!(jobs.iter().any(|j| j.step_id == "test"));
+        let approved_job = jobs.iter().find(|job| job.step_id == "test").unwrap();
+        assert_eq!(
+            approved_job.canonical_authorization.as_ref(),
+            Some(artifact)
+        );
+        for forbidden in ["human_approved", "cancel"] {
+            let mut hostile = approved_job.clone();
+            let mut result = successful_job_result();
+            result.output_json = Some(serde_json::json!({"next_event": forbidden}));
+            hostile.result = Some(result);
+            assert!(
+                reactive_next_event_from_agent_output(
+                    &hostile,
+                    &[
+                        WorkflowEventKind::JobSucceeded,
+                        WorkflowEventKind::JobFailed
+                    ],
+                )
+                .is_err()
+            );
+        }
+        for forbidden in ["human_approved", "cancel", "timeout"] {
+            let mut legacy_request = artifact.verify_and_parse().unwrap();
+            legacy_request.agent_output_events.clear();
+            legacy_request.behavior.execution_context["workflow"]["inputs"]["valid_next_events"] =
+                serde_json::json!([forbidden]);
+            let legacy_artifact = legacy_request.canonical_artifact().unwrap();
+            let legacy_id =
+                protocol::authorization_id_for_request(&legacy_request, &legacy_artifact.digest);
+            let legacy_bundle =
+                protocol::ImmutableAuthorizationBundle::verify(&legacy_artifact, &legacy_id)
+                    .unwrap();
+            let mut hostile = approved_job.clone();
+            hostile.context = legacy_request.behavior.execution_context.clone();
+            project_authorization_bundle_into_job_context(&mut hostile.context, &legacy_bundle)
+                .unwrap();
+            hostile.canonical_authorization = Some(legacy_artifact);
+            let mut result = successful_job_result();
+            result.output_json = Some(serde_json::json!({"next_event": forbidden}));
+            hostile.result = Some(result);
+            assert!(
+                reactive_next_event_from_agent_output(
+                    &hostile,
+                    &[
+                        WorkflowEventKind::HumanApproved,
+                        WorkflowEventKind::Cancel,
+                        WorkflowEventKind::Timeout,
+                    ],
+                )
+                .is_err()
+            );
+        }
         assert_eq!(
             jobs.iter()
                 .find(|j| j.step_id == "build")
@@ -17994,8 +19888,8 @@ kind = "terminal"
             .find(|j| j.step_id == "test")
             .expect("next step job");
         assert_eq!(
-            next_job.context["workflow"]["inputs"]["valid_next_events"],
-            serde_json::json!(["job_succeeded", "job_failed", "cancel"])
+            next_job.context["workflow"]["inputs"]["agent_output_events"],
+            serde_json::json!(["job_succeeded", "job_failed"])
         );
         assert_eq!(
             next_job.context["workflow"]["inputs"]["job_artifact_paths"]["build"]["agent_context"],
@@ -18119,8 +20013,8 @@ kind = "terminal"
             .expect("build job");
 
         assert_eq!(
-            initial_job.context["workflow"]["inputs"]["valid_next_events"],
-            serde_json::json!(["job_succeeded", "cancel"])
+            initial_job.context["workflow"]["inputs"]["agent_output_events"],
+            serde_json::json!(["job_succeeded"])
         );
         assert_eq!(
             initial_job.context["workflow"]["inputs"]["job_artifact_paths"],
@@ -18257,40 +20151,6 @@ kind = "terminal"
             session_id: v1_session.session_id,
             session_token: v1_session.session_token,
         };
-        let v1_job = restarted
-            .poll_job_authenticated(
-                v1_credential.clone(),
-                PollJobRequest {
-                    worker_id: "mixed-version-worker".to_string(),
-                },
-            )
-            .await
-            .expect("v1-only poll against v1 job")
-            .job
-            .expect("v1 job is assignable to v1 worker");
-        assert_eq!(
-            v1_job
-                .canonical_authorization
-                .as_ref()
-                .map(|artifact| artifact.version),
-            Some(1)
-        );
-        assert_eq!(
-            restarted
-                .cancel_active_jobs_for_work_item(v1_job.work_item_id)
-                .await
-                .expect("cancel assigned v1 fixture job"),
-            1
-        );
-        restarted
-            .create_work_item(CreateWorkItemRequest {
-                workflow_id: TRIAGE_WORKFLOW_ID.to_string(),
-                session_id: None,
-                context: serde_json::json!({}),
-                repo: None,
-            })
-            .await
-            .expect("create v2 triage job");
         assert!(
             restarted
                 .poll_job_authenticated(
@@ -18300,7 +20160,7 @@ kind = "terminal"
                     },
                 )
                 .await
-                .expect("v1-only poll against v2 job")
+                .expect("v1-only poll against v3 job")
                 .job
                 .is_none()
         );
@@ -18316,11 +20176,45 @@ kind = "terminal"
             .register_worker_session(v2_registration, Some(v1_credential))
             .await
             .expect("upgrade worker to v2 capability");
+        let v2_credential = WorkerSessionCredential {
+            session_id: v2_session.session_id,
+            session_token: v2_session.session_token,
+        };
+        let v2_polled = restarted
+            .poll_job_authenticated(
+                v2_credential.clone(),
+                PollJobRequest {
+                    worker_id: "mixed-version-worker".to_string(),
+                },
+            )
+            .await
+            .expect("v2-only poll against v3 job")
+            .job;
+        assert!(
+            v2_polled.is_none(),
+            "v2 worker received authorization version {:?}",
+            v2_polled
+                .as_ref()
+                .and_then(|job| job.canonical_authorization.as_ref())
+                .map(|artifact| artifact.version)
+        );
+        let v3_registration = RegisterWorkerRequest {
+            protocol_capabilities: vec![
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+            ],
+            ..v1_registration.clone()
+        };
+        let v3_session = restarted
+            .register_worker_session(v3_registration, Some(v2_credential))
+            .await
+            .expect("upgrade worker to v3 capability");
         let assigned = restarted
             .poll_job_authenticated(
                 WorkerSessionCredential {
-                    session_id: v2_session.session_id,
-                    session_token: v2_session.session_token.clone(),
+                    session_id: v3_session.session_id,
+                    session_token: v3_session.session_token.clone(),
                 },
                 PollJobRequest {
                     worker_id: "mixed-version-worker".to_string(),
@@ -18343,8 +20237,8 @@ kind = "terminal"
             .register_worker_session(
                 v1_registration,
                 Some(WorkerSessionCredential {
-                    session_id: v2_session.session_id,
-                    session_token: v2_session.session_token,
+                    session_id: v3_session.session_id,
+                    session_token: v3_session.session_token,
                 }),
             )
             .await
@@ -18428,6 +20322,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         };
         let first = harness
@@ -18701,15 +20596,15 @@ kind = "terminal"
                 .await
                 .is_err()
         );
-        let failed = harness
+        let awaiting_recovery = harness
             .svc
             .get_job(replacement_job.id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(awaiting_recovery.state, JobState::Failed);
         assert_eq!(
-            failed
+            awaiting_recovery
                 .result
                 .as_ref()
                 .and_then(|result| result.error_message.as_deref()),
@@ -18723,62 +20618,21 @@ kind = "terminal"
                 |row| row.get(0),
             )
             .expect("durable replacement recovery inbox");
-        assert_eq!(inbox_state, "pending");
-        for (trigger_name, trigger_sql) in [
-            (
-                "fail_before_recovery_mutation",
-                "CREATE TRIGGER fail_before_recovery_mutation BEFORE UPDATE OF state ON work_items
-                 BEGIN SELECT RAISE(ABORT, 'injected provider/workflow recovery failure'); END;",
-            ),
-            (
-                "fail_before_recovery_identity",
-                "CREATE TRIGGER fail_before_recovery_identity BEFORE INSERT ON worker_session_recovery_applied
-                 BEGIN SELECT RAISE(ABORT, 'injected crash before recovery identity'); END;",
-            ),
-            (
-                "fail_before_recovery_ack",
-                "CREATE TRIGGER fail_before_recovery_ack BEFORE UPDATE OF state ON worker_session_recovery_inbox
-                 WHEN NEW.state = 'applied'
-                 BEGIN SELECT RAISE(ABORT, 'injected crash before recovery acknowledgement'); END;",
-            ),
-        ] {
-            let conn = Connection::open(&harness.db).unwrap();
-            conn.execute_batch(trigger_sql).unwrap();
-            drop(conn);
-            assert_eq!(
-                harness
-                    .svc
-                    .process_worker_session_recovery_inbox()
-                    .await
-                    .expect("failed recovery remains retryable"),
-                0
-            );
-            let conn = Connection::open(&harness.db).unwrap();
-            conn.execute_batch(&format!("DROP TRIGGER {trigger_name}"))
-                .unwrap();
-            conn.execute(
-                "UPDATE worker_session_recovery_inbox SET next_attempt_at = ?2
-                 WHERE job_id = ?1",
-                params![replacement_job.id.to_string(), Utc::now().to_rfc3339()],
-            )
-            .unwrap();
-        }
-        let (attempts, last_error): (u32, Option<String>) = Connection::open(&harness.db)
+        assert_eq!(inbox_state, "applied");
+        let recovered_job = harness
+            .svc
+            .get_job(replacement_job.id)
+            .await
             .unwrap()
-            .query_row(
-                "SELECT attempts, last_error FROM worker_session_recovery_inbox
-                 WHERE job_id = ?1",
-                [replacement_job.id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
             .unwrap();
-        assert_eq!(attempts, 3);
-        assert!(last_error.is_some());
-        let (left, right) = tokio::join!(
-            harness.svc.process_worker_session_recovery_inbox(),
-            harness.svc.process_worker_session_recovery_inbox(),
+        assert_eq!(recovered_job.state, JobState::Failed);
+        assert_eq!(
+            recovered_job
+                .result
+                .as_ref()
+                .and_then(|result| result.error_message.as_deref()),
+            Some("worker_session_replaced")
         );
-        assert_eq!(left.unwrap() + right.unwrap(), 1);
         assert_eq!(
             harness
                 .svc
@@ -18850,7 +20704,7 @@ kind = "terminal"
     }
 
     #[tokio::test]
-    async fn nested_child_session_recovery_uses_checkpoint_owner_for_provider_state() {
+    async fn nested_child_session_recovery_rejects_unbound_checkpoint_owner() {
         let harness = AuthorizedWorkflowHarness::new(workflow_catalog(), "wf", false).await;
         let root = harness.work_item().await;
         let mut child = root.clone();
@@ -18940,26 +20794,29 @@ kind = "terminal"
         )
         .unwrap();
         drop(conn);
-        assert_eq!(
-            harness
-                .svc
-                .process_worker_session_recovery_inbox()
-                .await
-                .unwrap(),
-            1
-        );
+        let applied = harness
+            .svc
+            .process_worker_session_recovery_inbox()
+            .await
+            .unwrap();
+        let recovery_error: Option<String> = Connection::open(&harness.db)
+            .unwrap()
+            .query_row(
+                "SELECT last_error FROM worker_session_recovery_inbox WHERE job_id = ?1",
+                [job.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert!(recovery_error.is_none());
         let child_after = harness.svc.get_work_item(child.id).await.unwrap().unwrap();
         let root_after = harness.svc.get_work_item(root.id).await.unwrap().unwrap();
-        assert_eq!(child_after.state, WorkItemState::Failed);
+        assert_eq!(child_after.state, WorkItemState::Running);
         assert_eq!(
             child_after.projected_state.as_deref(),
             Some("child-running")
         );
-        assert_eq!(root_after.state, WorkItemState::Failed);
-        assert_eq!(
-            root_after.human_gate_state.as_deref(),
-            Some("worker_session_replaced")
-        );
+        assert_ne!(root_after.state, WorkItemState::Failed);
         let conn = Connection::open(&harness.db).unwrap();
         let outbox_rows: i64 = conn
             .query_row(
@@ -18968,7 +20825,7 @@ kind = "terminal"
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(outbox_rows, 1);
+        assert_eq!(outbox_rows, 0);
         let child_outbox_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM ownership_return_outbox WHERE root_work_item_id = ?1",
@@ -18977,16 +20834,14 @@ kind = "terminal"
             )
             .unwrap();
         assert_eq!(child_outbox_rows, 0);
-        let outcome_json: String = conn
+        let applied_rows: i64 = conn
             .query_row(
-                "SELECT outcome_json FROM worker_session_recovery_applied WHERE recovery_id = ?1",
+                "SELECT COUNT(*) FROM worker_session_recovery_applied WHERE recovery_id = ?1",
                 [&recovery_id],
                 |row| row.get(0),
             )
             .unwrap();
-        let outcome: serde_json::Value = serde_json::from_str(&outcome_json).unwrap();
-        assert_eq!(outcome["work_item_id"], child.id.to_string());
-        assert_eq!(outcome["checkpoint_owner_id"], root.id.to_string());
+        assert_eq!(applied_rows, 1);
     }
 
     #[tokio::test]
@@ -19029,6 +20884,7 @@ kind = "terminal"
                 workflows_dir: "workflows".into(),
                 config_root: "../agent-hub-configs".into(),
                 task_dir: "tasks".into(),
+                task_state_dir: "task-state".into(),
                 task_adapter: "file".into(),
                 vikunja_base_url: None,
                 vikunja_token: None,
@@ -19232,6 +21088,7 @@ kind = "terminal"
                 workflows_dir: "workflows".into(),
                 config_root: "../agent-hub-configs".into(),
                 task_dir: "tasks".into(),
+                task_state_dir: "task-state".into(),
                 task_adapter: "file".into(),
                 vikunja_base_url: None,
                 vikunja_token: None,
@@ -19585,7 +21442,7 @@ kind = "terminal"
         let mut context = serde_json::json!({});
         project_workflow_inputs_into_job_context(
             &mut context,
-            &[WorkflowEventKind::OwnerPrApproved],
+            &[protocol::AgentOutputEvent::JobSucceeded],
             &item,
             &item.context,
         );
@@ -20383,6 +22240,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -20522,6 +22380,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -20860,6 +22719,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -22637,6 +24497,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -23216,6 +25077,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -23595,6 +25457,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -23676,6 +25539,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -23781,6 +25645,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -24176,6 +26041,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -24670,6 +26536,7 @@ kind = "terminal"
                 workflows_dir: "workflows".into(),
                 config_root: "../agent-hub-configs".into(),
                 task_dir: "tasks".into(),
+                task_state_dir: "task-state".into(),
                 task_adapter: "file".into(),
                 vikunja_base_url: None,
                 vikunja_token: None,
@@ -24782,6 +26649,7 @@ kind = "terminal"
                 workflows_dir: "workflows".into(),
                 config_root: "../agent-hub-configs".into(),
                 task_dir: "tasks".into(),
+                task_state_dir: "task-state".into(),
                 task_adapter: "file".into(),
                 vikunja_base_url: None,
                 vikunja_token: None,
@@ -25211,6 +27079,17 @@ kind = "terminal"
             .await;
         assert_eq!(failed.state, WorkItemState::Failed);
         assert_eq!(failed.current_step, "failed");
+        Connection::open(&harness.db)
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET context_json = json_set(context_json,
+                    '$.valid_next_events', json('[\"cancel\"]'),
+                    '$.workflow.valid_next_events', json('[\"human_approved\"]'),
+                    '$.workflow.inputs.valid_next_events', json('[\"timeout\"]'))
+                 WHERE work_item_id = ?1 AND step_id = 'run' AND state = 'failed'",
+                [item.id.to_string()],
+            )
+            .unwrap();
 
         let pending_retry = svc
             .apply_operator_action(
@@ -25249,9 +27128,20 @@ kind = "terminal"
         assert_eq!(retried.context["operator_override"]["action"], "retry");
 
         let jobs = svc.list_jobs_for_work_item(item.id).await.expect("jobs");
+        let retry = jobs
+            .iter()
+            .find(|j| j.step_id == "run" && j.state == JobState::Pending && j.attempt == 1)
+            .expect("pending operator retry");
+        assert_eq!(
+            retry.canonical_authorization.as_ref().unwrap().version,
+            protocol::CANONICAL_AUTHORIZATION_VERSION
+        );
+        assert!(retry.context.get("valid_next_events").is_none());
+        assert!(retry.context["workflow"].get("valid_next_events").is_none());
         assert!(
-            jobs.iter()
-                .any(|j| j.step_id == "run" && j.state == JobState::Pending && j.attempt == 1)
+            retry.context["workflow"]["inputs"]
+                .get("valid_next_events")
+                .is_none()
         );
     }
 
@@ -25411,6 +27301,70 @@ kind = "terminal"
     }
 
     #[tokio::test]
+    async fn timeout_only_executable_issues_v3_with_empty_agent_output_set() {
+        let tmp = std::env::temp_dir().join(format!("wf-timeout-only-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        write_workflow(
+            &tmp,
+            "timeout_only",
+            r#"
+[workflow]
+id = "timeout_only"
+schema = "reactive_v2"
+initial_state = "run"
+
+[[workflow.states]]
+id = "run"
+kind = "command"
+executor = "docker"
+repo_access = "read_write"
+container_image = "local/agent-hub-test:latest"
+command = "true"
+
+[[workflow.states.on]]
+event = "timeout"
+target = "done"
+
+[[workflow.states]]
+id = "done"
+kind = "terminal"
+terminal_outcome = "failed"
+"#,
+        );
+        let catalog = Arc::new(WorkflowCatalog::load_from_dir(tmp.to_str().unwrap()).unwrap());
+        let harness = AuthorizedWorkflowHarness::new(catalog, "timeout_only", false).await;
+        let job = harness
+            .svc
+            .list_jobs_for_work_item(harness.work_item_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|job| job.step_id == "run")
+            .expect("timeout-only job");
+        let artifact = job.canonical_authorization.as_ref().unwrap();
+        assert_eq!(artifact.version, protocol::CANONICAL_AUTHORIZATION_VERSION);
+        assert!(
+            artifact
+                .verify_and_parse()
+                .unwrap()
+                .agent_output_events
+                .is_empty()
+        );
+        let mut hostile = job.clone();
+        let mut result = successful_job_result();
+        result.output_json = Some(serde_json::json!({"next_event":"job_succeeded"}));
+        hostile.result = Some(result);
+        assert!(
+            reactive_next_event_from_agent_output(
+                &hostile,
+                &[WorkflowEventKind::Timeout, WorkflowEventKind::Cancel],
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
     async fn reactive_agent_job_context_projects_internal_transition_events() {
         let harness =
             AuthorizedWorkflowHarness::new(reactive_workflow_catalog(), "reactive_wf", false).await;
@@ -25426,8 +27380,8 @@ kind = "terminal"
             .expect("run_agent job");
 
         assert_eq!(
-            job.context["workflow"]["inputs"]["valid_next_events"],
-            serde_json::json!(["job_succeeded", "job_failed", "cancel"])
+            job.context["workflow"]["inputs"]["agent_output_events"],
+            serde_json::json!(["job_succeeded", "job_failed"])
         );
     }
 
@@ -25813,6 +27767,7 @@ kind = "terminal"
             protocol_capabilities: vec![
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
             ],
         })
         .await
@@ -25927,8 +27882,8 @@ kind = "terminal"
             .expect("run_managed job");
 
         assert_eq!(
-            job.context["workflow"]["inputs"]["valid_next_events"],
-            serde_json::json!(["job_succeeded", "job_failed", "cancel"])
+            job.context["workflow"]["inputs"]["agent_output_events"],
+            serde_json::json!(["job_succeeded", "job_failed"])
         );
         let runtime = protocol::runtime_spec_from_job_context(&job.context).expect("runtime");
         assert_eq!(
@@ -25954,8 +27909,8 @@ kind = "terminal"
             .expect("run command job");
 
         assert_eq!(
-            job.context["workflow"]["inputs"]["valid_next_events"],
-            serde_json::json!(["job_succeeded", "cancel"])
+            job.context["workflow"]["inputs"]["agent_output_events"],
+            serde_json::json!(["job_succeeded"])
         );
     }
 

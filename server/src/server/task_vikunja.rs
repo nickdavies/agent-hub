@@ -2067,6 +2067,12 @@ impl TaskAdapter for VikunjaAdapter {
         "vikunja"
     }
 
+    fn operation_timeout(&self) -> Duration {
+        // Each HTTP exchange is bounded to 30 seconds. A full projection can
+        // perform several independently retried exchanges plus authentication.
+        Duration::from_secs(900)
+    }
+
     fn pull_tasks(&self) -> anyhow::Result<Vec<TaskSyncRecord>> {
         Ok(self.pull_tasks_with_assignment_tracking(true)?.records)
     }
@@ -2225,6 +2231,27 @@ impl TaskAdapter for VikunjaAdapter {
         self.append_task_comment(vikunja_task_id, comment)
     }
 
+    fn append_log_idempotent(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        let vikunja_task_id = self.resolve_task_numeric_id(task_id)?;
+        let marker = format!("<!-- agent-hub-idempotency:{idempotency_key} -->");
+        if self
+            .get_task_comments(vikunja_task_id)?
+            .iter()
+            .any(|comment| comment.comment.contains(&marker))
+        {
+            return Ok(());
+        }
+        self.append_task_comment(
+            vikunja_task_id,
+            format!("{}\n\n{marker}", self.format_failure_log_comment(message)),
+        )
+    }
+
     fn write_job_result_comment(
         &self,
         result: super::task_adapter::JobResultComment<'_>,
@@ -2235,18 +2262,31 @@ impl TaskAdapter for VikunjaAdapter {
         } else {
             "failed"
         };
-        let comment = self.format_job_result_comment(
+        let mut comment = self.format_job_result_comment(
             result.step_id,
             job_state,
             result.output,
             result.context,
         );
+        let mut stored_comment_id = result.stored_comment_id;
+        if let Some(key) = result.idempotency_key {
+            let marker = format!("<!-- agent-hub-idempotency:{key}:job-result -->");
+            if stored_comment_id.is_none() {
+                stored_comment_id = self
+                    .get_task_comments(vikunja_task_id)?
+                    .iter()
+                    .find(|existing| existing.comment.contains(&marker))
+                    .map(|existing| existing.id);
+            }
+            comment.push_str("\n\n");
+            comment.push_str(&marker);
+        }
         let comment_id = self.write_comment(
             vikunja_task_id,
             Some(CommentKind::JobResult(result.step_id.to_string())),
             Some(result.work_item_id),
             &comment,
-            result.stored_comment_id,
+            stored_comment_id,
         )?;
         Ok(Some(comment_id))
     }

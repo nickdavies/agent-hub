@@ -35,11 +35,16 @@ enum Command {
         #[arg(long, env = "ORCHESTRATION_DB")]
         database: PathBuf,
     },
+    /// Refuse a rollback to a v2-only server while v3 work or sessions remain.
+    RollbackPreflightV2 {
+        #[arg(long, env = "ORCHESTRATION_DB")]
+        database: PathBuf,
+    },
     /// Explicitly change the durable authorization protocol fence.
     SetAuthorizationProtocolMode {
         #[arg(long, env = "ORCHESTRATION_DB")]
         database: PathBuf,
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=2))]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3))]
         max_version: u32,
     },
     /// Start the notification server
@@ -104,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::RollbackPreflightV1 { database } => rollback_preflight_v1(&database),
+        Command::RollbackPreflightV2 { database } => rollback_preflight_v2(&database),
         Command::SetAuthorizationProtocolMode {
             database,
             max_version,
@@ -127,62 +133,71 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn rollback_preflight_v1(database: &std::path::Path) -> anyhow::Result<()> {
+    rollback_preflight(database, 1)
+}
+
+fn rollback_preflight_v2(database: &std::path::Path) -> anyhow::Result<()> {
+    rollback_preflight(database, 2)
+}
+
+fn rollback_preflight(database: &std::path::Path, target_version: u32) -> anyhow::Result<()> {
+    let rejected_version = target_version + 1;
     let mut connection = Connection::open(database)
         .with_context(|| format!("open orchestration database {}", database.display()))?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     let updated = tx.execute(
-        "UPDATE authorization_protocol_mode SET max_authorization_version = 1, updated_at = ?1 WHERE id = 1",
-        [chrono::Utc::now().to_rfc3339()],
+        "UPDATE authorization_protocol_mode SET max_authorization_version = ?1, updated_at = ?2 WHERE id = 1",
+        rusqlite::params![target_version, chrono::Utc::now().to_rfc3339()],
     )?;
     if updated != 1 {
         anyhow::bail!("authorization protocol fence row is missing or malformed");
     }
-    let v2_jobs: u64 = tx.query_row(
-        "SELECT COUNT(*) FROM jobs WHERE canonical_authorization_version >= 2 AND state IN ('pending','assigned','running')",
-        [],
+    let higher_jobs: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE canonical_authorization_version >= ?1 AND state IN ('pending','assigned','running')",
+        [rejected_version],
         |row| row.get(0),
     )?;
-    let v2_sessions: u64 = tx.query_row(
-        "SELECT COUNT(*) FROM workers WHERE protocol_capabilities_json LIKE '%canonical_authorization_v2%'",
-        [],
+    let capable_sessions: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM workers WHERE (?1 <= 2 AND protocol_capabilities_json LIKE '%canonical_authorization_v2%') OR protocol_capabilities_json LIKE '%canonical_authorization_v3%'",
+        [rejected_version],
         |row| row.get(0),
     )?;
-    let v2_obligations: u64 = tx.query_row(
-        "SELECT COUNT(*) FROM authorization_obligations WHERE canonical_authorization_version >= 2 AND state IN ('pending','approved')",
-        [], |row| row.get(0),
+    let higher_obligations: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM authorization_obligations WHERE canonical_authorization_version >= ?1 AND state IN ('pending','approved')",
+        [rejected_version], |row| row.get(0),
     )?;
-    let v2_records: u64 = tx.query_row(
-        "SELECT COUNT(*) FROM authorization_records r JOIN work_items w ON w.id = r.work_item_id WHERE r.canonical_authorization_version >= 2 AND w.state NOT IN ('succeeded','failed','cancelled')",
-        [], |row| row.get(0),
+    let higher_records: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM authorization_records r JOIN work_items w ON w.id = r.work_item_id WHERE r.canonical_authorization_version >= ?1 AND w.state NOT IN ('succeeded','failed','cancelled')",
+        [rejected_version], |row| row.get(0),
     )?;
-    let v2_recovery: u64 = tx.query_row(
-        "SELECT COUNT(*) FROM worker_session_recovery_inbox i JOIN jobs j ON j.id = i.job_id WHERE j.canonical_authorization_version >= 2 AND i.state IN ('pending','approved')",
-        [], |row| row.get(0),
+    let higher_recovery: u64 = tx.query_row(
+        "SELECT COUNT(*) FROM worker_session_recovery_inbox i JOIN jobs j ON j.id = i.job_id WHERE j.canonical_authorization_version >= ?1 AND i.state IN ('pending','approved')",
+        [rejected_version], |row| row.get(0),
     )?;
     let reactivatable_workflows: u64 = tx.query_row(
         "SELECT COUNT(*) FROM work_items WHERE state NOT IN ('succeeded','failed','cancelled','human_gate')",
         [], |row| row.get(0),
     )?;
     if [
-        v2_jobs,
-        v2_sessions,
-        v2_obligations,
-        v2_records,
-        v2_recovery,
+        higher_jobs,
+        capable_sessions,
+        higher_obligations,
+        higher_records,
+        higher_recovery,
         reactivatable_workflows,
     ]
     .into_iter()
     .any(|count| count != 0)
     {
         let ids = tx.prepare(
-            "SELECT id FROM jobs WHERE canonical_authorization_version >= 2 AND state IN ('pending','assigned','running') LIMIT 10"
-        )?.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            "SELECT id FROM jobs WHERE canonical_authorization_version >= ?1 AND state IN ('pending','assigned','running') LIMIT 10"
+        )?.query_map([rejected_version], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         anyhow::bail!(
-            "v1 rollback refused: active_v2_jobs={v2_jobs}, v2_workers={v2_sessions}, v2_obligations={v2_obligations}, reactivatable_v2_records={v2_records}, v2_recovery={v2_recovery}, reactivatable_workflows={reactivatable_workflows}, bounded_job_ids={ids:?}"
+            "v{target_version} rollback refused: active_higher_jobs={higher_jobs}, higher_capability_workers={capable_sessions}, higher_obligations={higher_obligations}, reactivatable_higher_records={higher_records}, higher_recovery={higher_recovery}, reactivatable_workflows={reactivatable_workflows}, bounded_job_ids={ids:?}"
         );
     }
     tx.commit()?;
-    println!("v1 rollback preflight passed");
+    println!("v{target_version} rollback preflight passed");
     Ok(())
 }
 
@@ -193,17 +208,20 @@ fn set_authorization_protocol_mode(
     if max_version == 1 {
         return rollback_preflight_v1(database);
     }
+    if max_version == 2 {
+        return rollback_preflight_v2(database);
+    }
     let mut connection = Connection::open(database)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     let updated = tx.execute(
-        "UPDATE authorization_protocol_mode SET max_authorization_version = 2, updated_at = ?1 WHERE id = 1",
+        "UPDATE authorization_protocol_mode SET max_authorization_version = 3, updated_at = ?1 WHERE id = 1",
         [chrono::Utc::now().to_rfc3339()],
     )?;
     if updated != 1 {
         anyhow::bail!("authorization protocol fence row is missing or malformed");
     }
     tx.commit()?;
-    println!("authorization protocol fence set to v2");
+    println!("authorization protocol fence set to v3");
     Ok(())
 }
 
@@ -468,6 +486,17 @@ mod rollback_preflight_tests {
         service.init().await.unwrap();
         drop(service);
         let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap(),
+            3,
+            "new databases explicitly initialize the current v3 fence"
+        );
         connection.execute(
             "INSERT INTO workers (id, hostname, state, supported_modes_json, protocol_capabilities_json, session_id, session_generation, last_heartbeat_at) VALUES ('worker-v2','host','idle','[]','[\"canonical_authorization_v2\"]','session',1,'now')",
             [],
@@ -499,6 +528,38 @@ mod rollback_preflight_tests {
                 [],
             ).unwrap(),
             1
+        );
+        connection
+            .execute("DELETE FROM authorization_obligations", [])
+            .unwrap();
+        set_authorization_protocol_mode(&path, 3).unwrap();
+        connection.execute(
+            "INSERT INTO workers (id, hostname, state, supported_modes_json, protocol_capabilities_json, session_id, session_generation, last_heartbeat_at) VALUES ('worker-v3','host','idle','[]','[\"canonical_authorization_v3\"]','session-v3',1,'now')",
+            [],
+        ).unwrap();
+        assert!(rollback_preflight_v2(&path).is_err());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap(),
+            3,
+            "failed rollback must preserve the durable v3 fence"
+        );
+        connection.execute("DELETE FROM workers", []).unwrap();
+        assert!(rollback_preflight_v2(&path).is_ok());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap(),
+            2
         );
         connection
             .execute("DELETE FROM authorization_protocol_mode", [])

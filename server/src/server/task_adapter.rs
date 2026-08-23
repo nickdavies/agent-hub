@@ -353,8 +353,33 @@ pub enum TaskHumanGateState {
     RetryRequested,
 }
 
+#[derive(Clone, Copy)]
+pub struct ProviderOperationDeadline {
+    deadline: std::time::Instant,
+}
+
+impl ProviderOperationDeadline {
+    pub fn from_now(duration: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + duration,
+        }
+    }
+
+    pub fn remaining(self) -> anyhow::Result<std::time::Duration> {
+        self.deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("provider operation deadline expired"))
+    }
+
+    pub fn check(self) -> anyhow::Result<()> {
+        self.remaining().map(|_| ())
+    }
+}
+
 pub trait TaskAdapter: Send + Sync {
     fn adapter_name(&self) -> &'static str;
+    fn operation_timeout(&self) -> std::time::Duration;
     fn pull_tasks(&self) -> anyhow::Result<Vec<TaskSyncRecord>>;
     fn pull_task_snapshot(&self) -> anyhow::Result<TaskSyncSnapshot> {
         let records = self.pull_tasks()?;
@@ -407,6 +432,14 @@ pub trait TaskAdapter: Send + Sync {
             "task adapter '{}' does not support provider-visible logs",
             self.adapter_name()
         ))
+    }
+    fn append_log_idempotent(
+        &self,
+        task_id: &str,
+        _idempotency_key: &str,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        self.append_log(task_id, message)
     }
 
     /// Write/update a structured job result comment on the task
@@ -475,6 +508,7 @@ pub struct JobResultComment<'a> {
     pub output: &'a serde_json::Value,
     pub context: &'a serde_json::Value,
     pub stored_comment_id: Option<i64>,
+    pub idempotency_key: Option<&'a str>,
 }
 
 pub fn work_item_from_create(

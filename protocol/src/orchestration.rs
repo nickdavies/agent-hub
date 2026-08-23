@@ -75,6 +75,7 @@ mod immutable_authorization_tests {
             workflow_snapshot: serde_json::json!({"b":2,"a":1}),
             state_id: "build".to_string(),
             state_kind: ReactiveStateKind::Command,
+            agent_output_events: Vec::new(),
             behavior: ResolvedAuthorizationBehavior {
                 execution_kind: "command".to_string(),
                 runner_profile: serde_json::json!({"config_digest":"command_v1","profile_name":"command"}),
@@ -346,7 +347,7 @@ mod immutable_authorization_tests {
             "config_digest":"fixture"
         });
         let artifact = request.canonical_artifact().unwrap();
-        assert_eq!(artifact.version, CANONICAL_AUTHORIZATION_VERSION);
+        assert_eq!(artifact.version, CANONICAL_AUTHORIZATION_VERSION_V2);
         assert_eq!(
             artifact.digest,
             "d20e4db6eeee997f8615acf4218462b086cd57aaa30cbbd18672b3d35206a229"
@@ -365,6 +366,7 @@ mod immutable_authorization_tests {
     fn canonical_authorization_capability_matrix_is_version_exact() {
         let v1 = [WorkerProtocolCapability::CanonicalAuthorizationV1];
         let v2 = [WorkerProtocolCapability::CanonicalAuthorizationV2];
+        let v3 = [WorkerProtocolCapability::CanonicalAuthorizationV3];
         let both = [
             WorkerProtocolCapability::CanonicalAuthorizationV1,
             WorkerProtocolCapability::CanonicalAuthorizationV2,
@@ -375,8 +377,104 @@ mod immutable_authorization_tests {
         assert!(worker_supports_canonical_authorization(&v2, 2));
         assert!(worker_supports_canonical_authorization(&both, 1));
         assert!(worker_supports_canonical_authorization(&both, 2));
+        assert!(!worker_supports_canonical_authorization(&v2, 3));
+        assert!(worker_supports_canonical_authorization(&v3, 3));
         assert!(!worker_supports_canonical_authorization(&both, 0));
         assert!(!worker_supports_canonical_authorization(&both, 3));
+    }
+
+    #[test]
+    fn canonical_authorization_v3_requires_and_normalizes_agent_output_events() {
+        let mut first = request();
+        first.agent_output_events =
+            vec![AgentOutputEvent::JobFailed, AgentOutputEvent::JobSucceeded];
+        let mut reordered = first.clone();
+        reordered.agent_output_events.reverse();
+
+        let artifact = first.canonical_artifact().unwrap();
+        assert_eq!(artifact.version, 3);
+        assert_eq!(artifact, reordered.canonical_artifact().unwrap());
+        assert_eq!(artifact.verify_and_parse().unwrap(), first.normalize());
+
+        let mut missing: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_output_events");
+        let bytes = canonical_json_bytes(missing).unwrap();
+        let missing = CanonicalAuthorizationArtifact {
+            version: 3,
+            digest: canonical_authorization_digest_for_version(3, &bytes).unwrap(),
+            canonical_bytes: bytes,
+        };
+        assert!(missing.verify_and_parse().is_err());
+
+        let empty = request().canonical_artifact_v3().unwrap();
+        assert_eq!(empty.version, CANONICAL_AUTHORIZATION_VERSION);
+        assert!(
+            empty
+                .verify_and_parse()
+                .unwrap()
+                .agent_output_events
+                .is_empty()
+        );
+        let explicit = AgentOutput {
+            next_event: Some("job_succeeded".to_string()),
+            ..AgentOutput::default()
+        };
+        assert!(validate_agent_output_event(&explicit, &[]).is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_v3_rejects_human_and_external_output_events() {
+        let mut request = request();
+        request.agent_output_events = vec![AgentOutputEvent::JobSucceeded];
+        let artifact = request.canonical_artifact().unwrap();
+        let mut hostile: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        hostile["agent_output_events"] = serde_json::json!(["human_approved"]);
+        let bytes = canonical_json_bytes(hostile).unwrap();
+        let hostile = CanonicalAuthorizationArtifact {
+            version: 3,
+            digest: canonical_authorization_digest_for_version(3, &bytes).unwrap(),
+            canonical_bytes: bytes,
+        };
+        assert!(hostile.verify_and_parse().is_err());
+
+        let mut cancellation: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        cancellation["agent_output_events"] = serde_json::json!(["cancel"]);
+        let bytes = canonical_json_bytes(cancellation).unwrap();
+        let cancellation = CanonicalAuthorizationArtifact {
+            version: 3,
+            digest: canonical_authorization_digest_for_version(3, &bytes).unwrap(),
+            canonical_bytes: bytes,
+        };
+        assert!(cancellation.verify_and_parse().is_err());
+
+        let mut stale_projection = request;
+        stale_projection.behavior.execution_context["workflow"] = serde_json::json!({
+            "inputs": {"valid_next_events": ["human_approved", "cancel"]}
+        });
+        assert!(stale_projection.canonical_artifact().is_err());
+    }
+
+    #[test]
+    fn agent_output_validation_rejects_human_and_cancel_actions() {
+        let allowed = vec!["job_succeeded".to_string(), "job_failed".to_string()];
+        for next_event in ["human_approved", "cancel"] {
+            let output = AgentOutput {
+                next_event: Some(next_event.to_string()),
+                ..AgentOutput::default()
+            };
+            assert!(validate_agent_output_event(&output, &allowed).is_err());
+        }
+        let output = AgentOutput {
+            next_event: Some("job_succeeded".to_string()),
+            ..AgentOutput::default()
+        };
+        assert!(validate_agent_output_event(&output, &allowed).is_ok());
     }
 
     #[test]
@@ -810,6 +908,60 @@ pub enum WorkflowEventKind {
     CiFailureEscalate,
     Timeout,
     Cancel,
+}
+
+/// Workflow transitions that an executable agent is permitted to emit.
+/// Human/provider actions and external orchestration events are deliberately
+/// not representable by this type.
+#[derive(
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Display,
+    EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AgentOutputEvent {
+    JobSucceeded,
+    JobFailed,
+    CiFailureTrivial,
+    CiFailureEscalate,
+}
+
+impl TryFrom<WorkflowEventKind> for AgentOutputEvent {
+    type Error = String;
+
+    fn try_from(event: WorkflowEventKind) -> Result<Self, Self::Error> {
+        match event {
+            WorkflowEventKind::JobSucceeded => Ok(Self::JobSucceeded),
+            WorkflowEventKind::JobFailed => Ok(Self::JobFailed),
+            WorkflowEventKind::CiFailureTrivial => Ok(Self::CiFailureTrivial),
+            WorkflowEventKind::CiFailureEscalate => Ok(Self::CiFailureEscalate),
+            other => Err(format!(
+                "workflow event '{}' is not an agent output event",
+                other
+            )),
+        }
+    }
+}
+
+impl From<AgentOutputEvent> for WorkflowEventKind {
+    fn from(event: AgentOutputEvent) -> Self {
+        match event {
+            AgentOutputEvent::JobSucceeded => Self::JobSucceeded,
+            AgentOutputEvent::JobFailed => Self::JobFailed,
+            AgentOutputEvent::CiFailureTrivial => Self::CiFailureTrivial,
+            AgentOutputEvent::CiFailureEscalate => Self::CiFailureEscalate,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2483,6 +2635,9 @@ pub enum WorkerProtocolCapability {
     /// The worker verifies canonical authorization v2, including trusted
     /// OpenCode runtime environment fields and its distinct digest domain.
     CanonicalAuthorizationV2,
+    /// The worker verifies canonical authorization v3 and derives executable
+    /// agent transitions only from its signed agent_output_events set.
+    CanonicalAuthorizationV3,
 }
 
 pub fn worker_capability_for_canonical_authorization_version(
@@ -2490,7 +2645,10 @@ pub fn worker_capability_for_canonical_authorization_version(
 ) -> Option<WorkerProtocolCapability> {
     match version {
         1 => Some(WorkerProtocolCapability::CanonicalAuthorizationV1),
-        CANONICAL_AUTHORIZATION_VERSION => Some(WorkerProtocolCapability::CanonicalAuthorizationV2),
+        CANONICAL_AUTHORIZATION_VERSION_V2 => {
+            Some(WorkerProtocolCapability::CanonicalAuthorizationV2)
+        }
+        CANONICAL_AUTHORIZATION_VERSION => Some(WorkerProtocolCapability::CanonicalAuthorizationV3),
         _ => None,
     }
 }
@@ -2549,7 +2707,7 @@ pub struct JobResult {
 /// Agents MAY include any of these fields. All are optional for backward compat.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentOutput {
-    /// The workflow event the agent wants to fire (must be in valid_next_events)
+    /// The workflow event the agent wants to fire (must be in agent_output_events)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_event: Option<String>,
 
@@ -2783,9 +2941,11 @@ pub const CONTEXT_REQUEST_DIGEST_KEY: &str = "request_digest";
 pub const AUTHORIZATION_REQUEST_VERSION: &str = "resolved_authorization_request_v1";
 /// Identifies the exact DTO, canonicalization, and digest domain contract below.
 /// Any change to that contract requires a distinct version and domain separator.
-pub const CANONICAL_AUTHORIZATION_VERSION: u32 = 2;
+pub const CANONICAL_AUTHORIZATION_VERSION_V2: u32 = 2;
+pub const CANONICAL_AUTHORIZATION_VERSION: u32 = 3;
 const CANONICAL_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:resolved-authorization:v1\0";
 const CANONICAL_AUTHORIZATION_DOMAIN_V2: &[u8] = b"agent-hub:resolved-authorization:v2\0";
+const CANONICAL_AUTHORIZATION_DOMAIN_V3: &[u8] = b"agent-hub:resolved-authorization:v3\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -2808,7 +2968,7 @@ pub struct ImmutableAuthorizationBundle {
 
 impl ImmutableAuthorizationBundle {
     pub fn create(request: &ResolvedAuthorizationRequest) -> Result<Self, serde_json::Error> {
-        let artifact = request.canonical_artifact()?;
+        let artifact = request.canonical_artifact_v3()?;
         let request = artifact.verify_and_parse().map_err(|error| {
             serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         })?;
@@ -3354,6 +3514,7 @@ impl ResolvedAuthorizationRequestV1 {
                 ReactiveStateKindV1::Human => ReactiveStateKind::Human,
                 ReactiveStateKindV1::Terminal => ReactiveStateKind::Terminal,
             },
+            agent_output_events: Vec::new(),
             behavior: ResolvedAuthorizationBehavior {
                 execution_kind: self.behavior.execution_kind,
                 runner_profile: serde_json::to_value(self.behavior.runner_profile)?,
@@ -3789,6 +3950,8 @@ pub struct ResolvedAuthorizationRequest {
     pub workflow_snapshot: serde_json::Value,
     pub state_id: String,
     pub state_kind: ReactiveStateKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_output_events: Vec<AgentOutputEvent>,
     pub behavior: ResolvedAuthorizationBehavior,
     pub permission_envelope: CanonicalRuntimeSpec,
     pub resolved_environment: serde_json::Value,
@@ -3829,14 +3992,29 @@ pub struct ResolvedAuthorizationResources {
 impl ResolvedAuthorizationRequest {
     pub fn normalize(mut self) -> Self {
         normalize_runtime_for_authorization(&mut self.permission_envelope);
+        self.agent_output_events.sort();
+        self.agent_output_events.dedup();
         self
     }
 
     pub fn request_digest(&self) -> Result<String, serde_json::Error> {
-        Ok(self.canonical_artifact()?.digest)
+        Ok(self.canonical_artifact_v3()?.digest)
     }
 
     pub fn canonical_artifact(&self) -> Result<CanonicalAuthorizationArtifact, serde_json::Error> {
+        self.canonical_artifact_with_v3(!self.agent_output_events.is_empty())
+    }
+
+    pub fn canonical_artifact_v3(
+        &self,
+    ) -> Result<CanonicalAuthorizationArtifact, serde_json::Error> {
+        self.canonical_artifact_with_v3(true)
+    }
+
+    fn canonical_artifact_with_v3(
+        &self,
+        issue_v3: bool,
+    ) -> Result<CanonicalAuthorizationArtifact, serde_json::Error> {
         if self.version != AUTHORIZATION_REQUEST_VERSION {
             return Err(serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -3844,18 +4022,38 @@ impl ResolvedAuthorizationRequest {
             )));
         }
         let normalized = self.clone().normalize();
+        let agent_output_events = normalized.agent_output_events.clone();
         let mut dto = ResolvedAuthorizationRequestV1::from_semantic(normalized)?;
         dto.normalize_sets();
-        let version = if dto
+        let legacy_version = if dto
             .behavior
             .runner_profile
             .has_trusted_opencode_environment()
         {
-            CANONICAL_AUTHORIZATION_VERSION
+            CANONICAL_AUTHORIZATION_VERSION_V2
         } else {
             1
         };
-        let canonical_bytes = canonical_json_bytes(serde_json::to_value(dto)?)?;
+        let (version, value) = if !issue_v3 {
+            (legacy_version, serde_json::to_value(dto)?)
+        } else {
+            if authorization_execution_context_has_legacy_events(&dto.behavior.execution_context) {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "canonical authorization v3 execution context must not contain valid_next_events",
+                )));
+            }
+            let mut value = serde_json::to_value(dto)?;
+            value
+                .as_object_mut()
+                .expect("request DTO is an object")
+                .insert(
+                    "agent_output_events".to_string(),
+                    serde_json::to_value(agent_output_events)?,
+                );
+            (CANONICAL_AUTHORIZATION_VERSION, value)
+        };
+        let canonical_bytes = canonical_json_bytes(value)?;
         let digest = canonical_authorization_digest_for_version(version, &canonical_bytes)
             .expect("supported canonical authorization version");
         Ok(CanonicalAuthorizationArtifact {
@@ -3875,6 +4073,7 @@ impl ResolvedAuthorizationRequest {
                 == canonical_json(baseline.workflow_snapshot.clone())
             && self.state_id == baseline.state_id
             && self.state_kind == baseline.state_kind
+            && self.agent_output_events == baseline.agent_output_events
             && self.behavior == baseline.behavior
             && canonical_json(self.resolved_environment.clone())
                 == canonical_json(baseline.resolved_environment.clone())
@@ -3928,19 +4127,57 @@ impl CanonicalAuthorizationArtifact {
                 self.version
             ));
         }
-        let mut dto: ResolvedAuthorizationRequestV1 = serde_json::from_slice(&self.canonical_bytes)
-            .map_err(|error| {
-                format!(
-                    "canonical authorization version {} is invalid: {error}",
-                    self.version
-                )
-            })?;
+        let (mut dto, mut agent_output_events) = if self.version == CANONICAL_AUTHORIZATION_VERSION
+        {
+            let mut value: serde_json::Value = serde_json::from_slice(&self.canonical_bytes)
+                .map_err(|error| {
+                    format!(
+                        "canonical authorization version {} is invalid: {error}",
+                        self.version
+                    )
+                })?;
+            let events = value
+                .as_object_mut()
+                .and_then(|object| object.remove("agent_output_events"))
+                .ok_or_else(|| {
+                    "canonical authorization version 3 requires agent_output_events".to_string()
+                })?;
+            let events: Vec<AgentOutputEvent> =
+                serde_json::from_value(events).map_err(|error| {
+                    format!(
+                        "canonical authorization version 3 has invalid agent_output_events: {error}"
+                    )
+                })?;
+            let dto: ResolvedAuthorizationRequestV1 =
+                serde_json::from_value(value).map_err(|error| {
+                    format!(
+                        "canonical authorization version {} is invalid: {error}",
+                        self.version
+                    )
+                })?;
+            if authorization_execution_context_has_legacy_events(&dto.behavior.execution_context) {
+                return Err(
+                    "canonical authorization version 3 execution context contains valid_next_events"
+                        .to_string(),
+                );
+            }
+            (dto, events)
+        } else {
+            let dto: ResolvedAuthorizationRequestV1 = serde_json::from_slice(&self.canonical_bytes)
+                .map_err(|error| {
+                    format!(
+                        "canonical authorization version {} is invalid: {error}",
+                        self.version
+                    )
+                })?;
+            (dto, Vec::new())
+        };
         let has_trusted_environment = dto
             .behavior
             .runner_profile
             .has_trusted_opencode_environment();
         if (self.version == 1 && has_trusted_environment)
-            || (self.version == CANONICAL_AUTHORIZATION_VERSION && !has_trusted_environment)
+            || (self.version == CANONICAL_AUTHORIZATION_VERSION_V2 && !has_trusted_environment)
         {
             return Err(format!(
                 "canonical authorization version {} has incompatible OpenCode runner controls",
@@ -3954,22 +4191,47 @@ impl CanonicalAuthorizationArtifact {
             ));
         }
         dto.normalize_sets();
-        let canonical =
-            canonical_json_bytes(serde_json::to_value(&dto).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
+        agent_output_events.sort();
+        agent_output_events.dedup();
+        let mut value = serde_json::to_value(&dto).map_err(|error| error.to_string())?;
+        if self.version == CANONICAL_AUTHORIZATION_VERSION {
+            value
+                .as_object_mut()
+                .expect("request DTO is an object")
+                .insert(
+                    "agent_output_events".to_string(),
+                    serde_json::to_value(&agent_output_events)
+                        .map_err(|error| error.to_string())?,
+                );
+        }
+        let canonical = canonical_json_bytes(value).map_err(|error| error.to_string())?;
         if canonical != self.canonical_bytes {
             return Err(format!(
                 "canonical authorization payload is not canonical for version {}",
                 self.version
             ));
         }
-        dto.into_semantic().map_err(|error| {
+        let mut request = dto.into_semantic().map_err(|error| {
             format!(
                 "canonical authorization version {} is semantically invalid: {error}",
                 self.version
             )
-        })
+        })?;
+        request.agent_output_events = agent_output_events;
+        Ok(request)
     }
+}
+
+fn authorization_execution_context_has_legacy_events(
+    context: &AuthorizationExecutionContextV1,
+) -> bool {
+    context.valid_next_events.is_some()
+        || context.workflow.as_ref().is_some_and(|workflow| {
+            workflow.get("valid_next_events").is_some()
+                || workflow
+                    .get("inputs")
+                    .is_some_and(|inputs| inputs.get("valid_next_events").is_some())
+        })
 }
 
 #[cfg(test)]
@@ -3985,7 +4247,8 @@ fn canonical_authorization_digest_for_version(
     let mut digest = Sha256::new();
     digest.update(match version {
         1 => CANONICAL_AUTHORIZATION_DOMAIN_V1,
-        CANONICAL_AUTHORIZATION_VERSION => CANONICAL_AUTHORIZATION_DOMAIN_V2,
+        CANONICAL_AUTHORIZATION_VERSION_V2 => CANONICAL_AUTHORIZATION_DOMAIN_V2,
+        CANONICAL_AUTHORIZATION_VERSION => CANONICAL_AUTHORIZATION_DOMAIN_V3,
         _ => {
             return Err(format!(
                 "unsupported canonical authorization version {version}"
@@ -4392,24 +4655,23 @@ fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 pub const AGENT_CONTEXT_SCHEMA_NAME: &str = "agent_context_v1";
-pub const AGENT_CONTEXT_SCHEMA_VERSION: &str = "agent_context_v2";
+pub const AGENT_CONTEXT_SCHEMA_VERSION: &str = "agent_context_v3";
 pub const AGENT_OUTPUT_SCHEMA_NAME: &str = "agent_output_v1";
 pub const JOB_RUN_SCHEMA_NAME: &str = "job_run_v1";
 
-/// Validate an AgentOutput's next_event against valid_next_events.
+/// Validate an AgentOutput's next_event against authorized agent output events.
 /// Returns Ok(()) if next_event is None or is in the valid set.
 /// Returns Err with a message if next_event is set but not valid.
-pub fn validate_agent_output_next_event(
+pub fn validate_agent_output_event(
     output: &AgentOutput,
-    valid_next_events: &[String],
+    agent_output_events: &[String],
 ) -> Result<(), String> {
     if let Some(ref event) = output.next_event
-        && !valid_next_events.is_empty()
-        && !valid_next_events.contains(event)
+        && !agent_output_events.contains(event)
     {
         return Err(format!(
-            "next_event '{}' not in valid_next_events: {:?}",
-            event, valid_next_events
+            "next_event '{}' not in agent_output_events: {:?}",
+            event, agent_output_events
         ));
     }
     Ok(())
@@ -4464,7 +4726,7 @@ pub struct AgentContextPaths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentContextWorkflow {
     pub inputs: serde_json::Value,
-    pub valid_next_events: Vec<String>,
+    pub agent_output_events: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

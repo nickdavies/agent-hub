@@ -45,12 +45,19 @@ pub struct ServerConfig {
     pub workflows_dir: String,
     pub config_root: String,
     pub task_dir: String,
+    pub task_state_dir: String,
     pub task_adapter: String,
+    #[allow(dead_code)]
     pub vikunja_base_url: Option<String>,
+    #[allow(dead_code)]
     pub vikunja_token: Option<String>,
+    #[allow(dead_code)]
     pub vikunja_bot_username: Option<String>,
+    #[allow(dead_code)]
     pub vikunja_bot_password: Option<String>,
+    #[allow(dead_code)]
     pub vikunja_project_id: Option<i64>,
+    #[allow(dead_code)]
     pub vikunja_label_prefix: Option<String>,
     pub orchestration_db_path: String,
     pub artifact_store_root: String,
@@ -67,6 +74,10 @@ pub struct Token {
 
 impl ServerConfig {
     pub fn from_env() -> Result<Self, AppError> {
+        let task_adapter = env::var("TASK_ADAPTER").unwrap_or_else(|_| "file".into());
+        validate_task_adapter(&task_adapter)?;
+        let task_state_dir = env::var("TASK_STATE_DIR")
+            .map_err(|_| AppError::Config("TASK_STATE_DIR is required for file mode".into()))?;
         let auth_mode = match env::var("AUTH_MODE").unwrap_or_default().as_str() {
             "none" => AuthMode::None,
             _ => AuthMode::Token,
@@ -143,7 +154,8 @@ impl ServerConfig {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "./config".to_string()),
             task_dir: env::var("TASK_DIR").unwrap_or_else(|_| "tasks".into()),
-            task_adapter: env::var("TASK_ADAPTER").unwrap_or_else(|_| "file".into()),
+            task_state_dir,
+            task_adapter,
             vikunja_base_url: env::var("VIKUNJA_BASE_URL").ok(),
             vikunja_token: env::var("VIKUNJA_TOKEN").ok(),
             vikunja_bot_username: env::var("VIKUNJA_BOT_USERNAME").ok(),
@@ -181,6 +193,18 @@ impl ServerConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
         })
+    }
+}
+
+fn validate_task_adapter(value: &str) -> Result<(), AppError> {
+    match value {
+        "file" => Ok(()),
+        "vikunja" => Err(AppError::Config(
+            "TASK_ADAPTER=vikunja is temporarily unsupported; this milestone is file-only".into(),
+        )),
+        _ => Err(AppError::Config(
+            "TASK_ADAPTER must be exactly 'file' for this milestone".into(),
+        )),
     }
 }
 
@@ -474,6 +498,20 @@ pub type SharedNotifyConfig = Arc<RwLock<NotifyConfig>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_only_adapter_boundary_rejects_vikunja_and_unknown_values() {
+        assert!(validate_task_adapter("file").is_ok());
+        assert!(
+            validate_task_adapter("vikunja")
+                .unwrap_err()
+                .to_string()
+                .contains("temporarily unsupported")
+        );
+        for value in ["", "FILE", "unknown"] {
+            assert!(validate_task_adapter(value).is_err());
+        }
+    }
 
     #[test]
     fn parse_labeled_tokens() {
