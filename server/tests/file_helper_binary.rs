@@ -12,4 +12,6 @@ fn production_binary_does_not_expose_file_adapter_test_helper() {
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
     assert!(!help.contains("file-helper"));
     assert!(!help.contains("AGENT_HUB_FILE_HELPER"));
+    assert!(!help.contains("durable-cancellation-e2e"));
+    assert!(!help.contains("AGENT_HUB_DURABLE_CANCELLATION_E2E"));
 }

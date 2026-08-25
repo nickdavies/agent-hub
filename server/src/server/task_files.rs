@@ -467,17 +467,15 @@ fn reviewed_filesystem_type(path: &Path) -> anyhow::Result<&'static str> {
 }
 
 fn ephemeral_filesystem_waiver(path: &str) -> bool {
-    if cfg!(test) && Path::new(path).starts_with(std::env::temp_dir()) {
-        return true;
+    #[cfg(test)]
+    {
+        Path::new(path).starts_with(std::env::temp_dir())
     }
-    if std::env::var("AGENT_HUB_ALLOW_EPHEMERAL_FILE_ADAPTER_FS").as_deref() == Ok("1") {
-        tracing::warn!(
-            filesystem_path = path,
-            "durability waiver enabled: ephemeral filesystem accepted for file adapter"
-        );
-        return true;
+    #[cfg(not(test))]
+    {
+        let _ = path;
+        false
     }
-    false
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -5,9 +5,10 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use protocol::{
-    CreateWorkItemRequest, FireEventRequest, HeartbeatRequest, Job, JobState, JobUpdateRequest,
-    PollJobRequest, PollJobResponse, ReactiveWorkflowDefinition, RegisterWorkerRequest,
-    RegisterWorkerResponse, WorkItem, WorkerInfo, WorkerSessionCredential,
+    CreateWorkItemRequest, FireEventRequest, FireEventResponse, HeartbeatRequest,
+    HeartbeatResponse, Job, JobState, JobUpdateRequest, PollJobRequest, PollJobResponse,
+    ReactiveWorkflowDefinition, RegisterWorkerRequest, RegisterWorkerResponse, WorkItem,
+    WorkerInfo, WorkerSessionCredential,
 };
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -97,8 +98,10 @@ pub async fn fire_work_item_event<N: super::super::notifier::Notifier>(
     State(state): State<super::super::AppState<N>>,
     Path(id): Path<Uuid>,
     Json(req): Json<FireEventRequest>,
-) -> Result<Json<WorkItem>, AppError> {
-    Ok(Json(state.orchestration.fire_event(id, req).await?))
+) -> Result<Json<FireEventResponse>, AppError> {
+    Ok(Json(
+        state.orchestration.fire_event_response(id, req).await?,
+    ))
 }
 
 pub async fn list_jobs<N: super::super::notifier::Notifier>(
@@ -126,6 +129,34 @@ pub async fn update_job<N: super::super::notifier::Notifier>(
         state.job_events.push(terminal_job_event(&job)).await;
     }
     Ok(Json(job))
+}
+
+pub async fn get_job<N: super::super::notifier::Notifier>(
+    State(state): State<super::super::AppState<N>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Job>, AppError> {
+    let credential = worker_session_from_headers(&headers, true)?.expect("required session");
+    Ok(Json(
+        state
+            .orchestration
+            .get_job_authenticated(id, credential)
+            .await?,
+    ))
+}
+
+pub async fn get_job_cancellation_command<N: super::super::notifier::Notifier>(
+    State(state): State<super::super::AppState<N>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Option<protocol::CancellationCommand>>, AppError> {
+    let credential = worker_session_from_headers(&headers, true)?.expect("required session");
+    Ok(Json(
+        state
+            .orchestration
+            .get_job_cancellation_command_authenticated(id, credential)
+            .await?,
+    ))
 }
 
 pub async fn job_events_sse<N: super::super::notifier::Notifier>(
@@ -185,7 +216,7 @@ pub async fn heartbeat_worker<N: super::super::notifier::Notifier>(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(req): Json<HeartbeatRequest>,
-) -> Result<(HeaderMap, Json<WorkerInfo>), AppError> {
+) -> Result<(HeaderMap, Json<HeartbeatResponse>), AppError> {
     let credential = worker_session_from_headers(&headers, true)?.expect("required session");
     let capabilities = state
         .orchestration
@@ -193,12 +224,20 @@ pub async fn heartbeat_worker<N: super::super::notifier::Notifier>(
         .await?;
     Ok((
         server_capability_headers(&capabilities),
-        Json(
-            state
+        Json({
+            let worker = state
                 .orchestration
-                .heartbeat_authenticated(id, credential, req)
-                .await?,
-        ),
+                .heartbeat_authenticated(id.clone(), credential.clone(), req)
+                .await?;
+            let cancellation = state
+                .orchestration
+                .pending_cancellation_command(&id, &credential)
+                .await?;
+            HeartbeatResponse {
+                worker,
+                cancellation,
+            }
+        }),
     ))
 }
 

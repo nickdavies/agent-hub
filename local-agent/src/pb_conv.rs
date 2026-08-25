@@ -340,6 +340,9 @@ pub fn job_result_to_pb(v: JobResult) -> pb::JobResult {
         repo: v.repo.map(repo_meta_to_pb),
         github_pr: v.github_pr.map(github_pr_to_pb),
         error_message: v.error_message,
+        cancellation_acknowledgement: v
+            .cancellation_acknowledgement
+            .map(cancellation_acknowledgement_to_pb),
     }
 }
 
@@ -354,7 +357,129 @@ pub(crate) fn job_result_from_pb(v: pb::JobResult) -> anyhow::Result<JobResult> 
         repo: v.repo.map(repo_meta_from_pb),
         github_pr: v.github_pr.map(github_pr_from_pb),
         error_message: v.error_message,
+        cancellation_acknowledgement: v
+            .cancellation_acknowledgement
+            .map(cancellation_acknowledgement_from_pb)
+            .transpose()?,
     })
+}
+
+pub fn cancellation_command_from_pb(
+    command: pb::CancellationCommand,
+) -> anyhow::Result<protocol::CancellationCommand> {
+    Ok(protocol::CancellationCommand {
+        cancellation_id: uuid::Uuid::parse_str(&command.cancellation_id)
+            .context("invalid cancellation id")?,
+        generation: command.generation,
+        job_id: uuid::Uuid::parse_str(&command.job_id).context("invalid cancellation job id")?,
+        invocation_id: uuid::Uuid::parse_str(&command.invocation_id)
+            .context("invalid cancellation invocation id")?,
+        attempt: command.attempt,
+        assignment_id: uuid::Uuid::parse_str(&command.assignment_id)
+            .context("invalid cancellation assignment id")?,
+        runtime_assignment_id: uuid::Uuid::parse_str(&command.runtime_assignment_id)
+            .context("invalid cancellation runtime assignment id")?,
+        worker_id: command.worker_id,
+        worker_session_id: uuid::Uuid::parse_str(&command.worker_session_id)
+            .context("invalid cancellation worker session id")?,
+        worker_session_generation: command.worker_session_generation,
+    })
+}
+
+pub(crate) fn cancellation_command_to_pb(
+    command: protocol::CancellationCommand,
+) -> pb::CancellationCommand {
+    pb::CancellationCommand {
+        cancellation_id: command.cancellation_id.to_string(),
+        generation: command.generation,
+        job_id: command.job_id.to_string(),
+        invocation_id: command.invocation_id.to_string(),
+        attempt: command.attempt,
+        assignment_id: command.assignment_id.to_string(),
+        runtime_assignment_id: command.runtime_assignment_id.to_string(),
+        worker_id: command.worker_id,
+        worker_session_id: command.worker_session_id.to_string(),
+        worker_session_generation: command.worker_session_generation,
+    }
+}
+
+fn cancellation_acknowledgement_to_pb(
+    acknowledgement: protocol::CancellationAcknowledgement,
+) -> pb::CancellationAcknowledgement {
+    pb::CancellationAcknowledgement {
+        command: Some(cancellation_command_to_pb(acknowledgement.command)),
+        containment: Some(pb::ContainmentAbsenceEvidence {
+            checked_at: Some(ts_to_pb(acknowledgement.containment.checked_at)),
+            process: containment_status_to_pb(&acknowledgement.containment.process),
+            container: containment_status_to_pb(&acknowledgement.containment.container),
+            process_error: containment_error(&acknowledgement.containment.process),
+            container_error: containment_error(&acknowledgement.containment.container),
+        }),
+    }
+}
+
+fn cancellation_acknowledgement_from_pb(
+    acknowledgement: pb::CancellationAcknowledgement,
+) -> anyhow::Result<protocol::CancellationAcknowledgement> {
+    let containment = acknowledgement
+        .containment
+        .context("missing cancellation containment evidence")?;
+    Ok(protocol::CancellationAcknowledgement {
+        command: cancellation_command_from_pb(
+            acknowledgement
+                .command
+                .context("missing cancellation command")?,
+        )?,
+        containment: protocol::ContainmentAbsenceEvidence {
+            checked_at: ts_from_pb(containment.checked_at.context("missing containment time")?)?,
+            process: containment_status_from_pb(containment.process, containment.process_error)?,
+            container: containment_status_from_pb(
+                containment.container,
+                containment.container_error,
+            )?,
+        },
+    })
+}
+
+fn containment_status_to_pb(status: &protocol::ContainmentStatus) -> i32 {
+    match status {
+        protocol::ContainmentStatus::NotApplicable => {
+            pb::ContainmentStatus::ContainmentNotApplicable as i32
+        }
+        protocol::ContainmentStatus::VerifiedAbsent => {
+            pb::ContainmentStatus::ContainmentVerifiedAbsent as i32
+        }
+        protocol::ContainmentStatus::Failed { .. } => {
+            pb::ContainmentStatus::ContainmentFailed as i32
+        }
+    }
+}
+
+fn containment_error(status: &protocol::ContainmentStatus) -> Option<String> {
+    match status {
+        protocol::ContainmentStatus::Failed { error } => Some(error.clone()),
+        _ => None,
+    }
+}
+
+fn containment_status_from_pb(
+    status: i32,
+    error: Option<String>,
+) -> anyhow::Result<protocol::ContainmentStatus> {
+    match pb::ContainmentStatus::try_from(status).context("invalid containment status")? {
+        pb::ContainmentStatus::ContainmentNotApplicable => {
+            Ok(protocol::ContainmentStatus::NotApplicable)
+        }
+        pb::ContainmentStatus::ContainmentVerifiedAbsent => {
+            Ok(protocol::ContainmentStatus::VerifiedAbsent)
+        }
+        pb::ContainmentStatus::ContainmentFailed => Ok(protocol::ContainmentStatus::Failed {
+            error: error.context("missing containment error")?,
+        }),
+        pb::ContainmentStatus::ContainmentUnspecified => {
+            anyhow::bail!("unspecified containment status")
+        }
+    }
 }
 
 pub fn job_from_pb(v: pb::Job) -> anyhow::Result<Job> {

@@ -8,8 +8,10 @@ use protocol::{
     StructuredTranscriptArtifact, TerminationReason, WorkerProtocolCapability,
     WorkerSessionCredential, WorkerState,
 };
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -117,6 +119,9 @@ impl tonic::service::Interceptor for GrpcAuthInterceptor {
 
 #[tonic::async_trait]
 impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
+    type StreamCancellationCommandsStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::CancellationCommand, Status>> + Send>>;
+
     async fn register_worker(
         &self,
         request: Request<pb::RegisterWorkerRequest>,
@@ -178,9 +183,14 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
     ) -> Result<Response<pb::HeartbeatWorkerResponse>, Status> {
         let credential = worker_session_from_metadata(&request, true)?.expect("required session");
         let req = request.into_inner();
+        let worker_id = req.worker_id.clone();
         let state = worker_state_from_pb(req.state)?;
         self.orchestration
-            .heartbeat_authenticated(req.worker_id, credential, HeartbeatRequest { state })
+            .heartbeat_authenticated(
+                worker_id.clone(),
+                credential.clone(),
+                HeartbeatRequest { state },
+            )
             .await
             .map_err(map_orchestration_error)?;
         let capabilities = self
@@ -191,6 +201,12 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
 
         Ok(Response::new(pb::HeartbeatWorkerResponse {
             server_protocol_capabilities: server_protocol_capabilities_pb(&capabilities),
+            cancellation: self
+                .orchestration
+                .pending_cancellation_command(&worker_id, &credential)
+                .await
+                .map_err(map_orchestration_error)?
+                .map(cancellation_command_to_pb),
         }))
     }
 
@@ -203,7 +219,7 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
         let response = self
             .orchestration
             .poll_job_authenticated(
-                credential,
+                credential.clone(),
                 PollJobRequest {
                     worker_id: req.worker_id,
                 },
@@ -219,6 +235,7 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
         Ok(Response::new(pb::PollJobResponse {
             job: response.job.map(job_to_pb).transpose()?,
             server_protocol_capabilities: server_protocol_capabilities_pb(&capabilities),
+            cancellation: response.cancellation.map(cancellation_command_to_pb),
         }))
     }
 
@@ -234,10 +251,11 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
         let transcript_dir = req.transcript_dir;
         let result = req.result.map(job_result_from_pb).transpose()?;
 
+        let worker_id = req.worker_id.clone();
         self.orchestration
             .update_job_authenticated(
                 job_id,
-                credential,
+                credential.clone(),
                 JobUpdateRequest {
                     worker_id: req.worker_id,
                     state,
@@ -248,7 +266,53 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
             .await
             .map_err(map_orchestration_error)?;
 
-        Ok(Response::new(pb::UpdateJobResponse {}))
+        Ok(Response::new(pb::UpdateJobResponse {
+            cancellation: self
+                .orchestration
+                .pending_cancellation_command(&worker_id, &credential)
+                .await
+                .map_err(map_orchestration_error)?
+                .map(cancellation_command_to_pb),
+        }))
+    }
+
+    async fn stream_cancellation_commands(
+        &self,
+        request: Request<pb::ControlStreamRequest>,
+    ) -> Result<Response<Self::StreamCancellationCommandsStream>, Status> {
+        let credential = worker_session_from_metadata(&request, true)?.expect("required session");
+        let worker_id = request.into_inner().worker_id;
+        self.orchestration
+            .verify_worker_session(&worker_id, &credential)
+            .await
+            .map_err(map_orchestration_error)?;
+        let orchestration = Arc::clone(&self.orchestration);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            loop {
+                match orchestration
+                    .pending_cancellation_command(&worker_id, &credential)
+                    .await
+                {
+                    Ok(Some(command)) => {
+                        if sender
+                            .send(Ok(cancellation_command_to_pb(command)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+                    Err(error) => {
+                        let _ = sender.send(Err(map_orchestration_error(error))).await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
     async fn stream_job_events(
@@ -687,6 +751,9 @@ fn job_result_to_pb(v: JobResult) -> Result<pb::JobResult, Status> {
         repo: v.repo.map(repo_meta_to_pb),
         github_pr: v.github_pr.map(github_pr_to_pb),
         error_message: v.error_message,
+        cancellation_acknowledgement: v
+            .cancellation_acknowledgement
+            .map(cancellation_acknowledgement_to_pb),
     })
 }
 
@@ -707,7 +774,135 @@ fn job_result_from_pb(v: pb::JobResult) -> Result<JobResult, Status> {
         repo: v.repo.map(repo_meta_from_pb),
         github_pr: v.github_pr.map(github_pr_from_pb),
         error_message: v.error_message,
+        cancellation_acknowledgement: v
+            .cancellation_acknowledgement
+            .map(cancellation_acknowledgement_from_pb)
+            .transpose()?,
     })
+}
+
+fn cancellation_command_to_pb(command: protocol::CancellationCommand) -> pb::CancellationCommand {
+    pb::CancellationCommand {
+        cancellation_id: command.cancellation_id.to_string(),
+        generation: command.generation,
+        job_id: command.job_id.to_string(),
+        invocation_id: command.invocation_id.to_string(),
+        attempt: command.attempt,
+        assignment_id: command.assignment_id.to_string(),
+        runtime_assignment_id: command.runtime_assignment_id.to_string(),
+        worker_id: command.worker_id,
+        worker_session_id: command.worker_session_id.to_string(),
+        worker_session_generation: command.worker_session_generation,
+    }
+}
+
+fn cancellation_command_from_pb(
+    command: pb::CancellationCommand,
+) -> Result<protocol::CancellationCommand, Status> {
+    let parse = |value: &str, name: &str| {
+        Uuid::parse_str(value)
+            .map_err(|error| Status::invalid_argument(format!("invalid {name}: {error}")))
+    };
+    Ok(protocol::CancellationCommand {
+        cancellation_id: parse(&command.cancellation_id, "cancellation id")?,
+        generation: command.generation,
+        job_id: parse(&command.job_id, "cancellation job id")?,
+        invocation_id: parse(&command.invocation_id, "cancellation invocation id")?,
+        attempt: command.attempt,
+        assignment_id: parse(&command.assignment_id, "cancellation assignment id")?,
+        runtime_assignment_id: parse(
+            &command.runtime_assignment_id,
+            "cancellation runtime assignment id",
+        )?,
+        worker_id: command.worker_id,
+        worker_session_id: parse(&command.worker_session_id, "cancellation worker session id")?,
+        worker_session_generation: command.worker_session_generation,
+    })
+}
+
+fn cancellation_acknowledgement_to_pb(
+    acknowledgement: protocol::CancellationAcknowledgement,
+) -> pb::CancellationAcknowledgement {
+    pb::CancellationAcknowledgement {
+        command: Some(cancellation_command_to_pb(acknowledgement.command)),
+        containment: Some(pb::ContainmentAbsenceEvidence {
+            checked_at: Some(ts_to_pb(acknowledgement.containment.checked_at)),
+            process: containment_status_to_pb(&acknowledgement.containment.process),
+            container: containment_status_to_pb(&acknowledgement.containment.container),
+            process_error: containment_error(&acknowledgement.containment.process),
+            container_error: containment_error(&acknowledgement.containment.container),
+        }),
+    }
+}
+
+fn cancellation_acknowledgement_from_pb(
+    acknowledgement: pb::CancellationAcknowledgement,
+) -> Result<protocol::CancellationAcknowledgement, Status> {
+    let containment = acknowledgement
+        .containment
+        .ok_or_else(|| Status::invalid_argument("missing cancellation containment evidence"))?;
+    Ok(protocol::CancellationAcknowledgement {
+        command: cancellation_command_from_pb(
+            acknowledgement
+                .command
+                .ok_or_else(|| Status::invalid_argument("missing cancellation command"))?,
+        )?,
+        containment: protocol::ContainmentAbsenceEvidence {
+            checked_at: containment
+                .checked_at
+                .map(ts_from_pb)
+                .transpose()?
+                .ok_or_else(|| Status::invalid_argument("missing containment check time"))?,
+            process: containment_status_from_pb(containment.process, containment.process_error)?,
+            container: containment_status_from_pb(
+                containment.container,
+                containment.container_error,
+            )?,
+        },
+    })
+}
+
+fn containment_status_to_pb(status: &protocol::ContainmentStatus) -> i32 {
+    match status {
+        protocol::ContainmentStatus::NotApplicable => {
+            pb::ContainmentStatus::ContainmentNotApplicable as i32
+        }
+        protocol::ContainmentStatus::VerifiedAbsent => {
+            pb::ContainmentStatus::ContainmentVerifiedAbsent as i32
+        }
+        protocol::ContainmentStatus::Failed { .. } => {
+            pb::ContainmentStatus::ContainmentFailed as i32
+        }
+    }
+}
+
+fn containment_error(status: &protocol::ContainmentStatus) -> Option<String> {
+    match status {
+        protocol::ContainmentStatus::Failed { error } => Some(error.clone()),
+        _ => None,
+    }
+}
+
+fn containment_status_from_pb(
+    status: i32,
+    error: Option<String>,
+) -> Result<protocol::ContainmentStatus, Status> {
+    match pb::ContainmentStatus::try_from(status)
+        .map_err(|_| Status::invalid_argument("invalid containment status"))?
+    {
+        pb::ContainmentStatus::ContainmentNotApplicable => {
+            Ok(protocol::ContainmentStatus::NotApplicable)
+        }
+        pb::ContainmentStatus::ContainmentVerifiedAbsent => {
+            Ok(protocol::ContainmentStatus::VerifiedAbsent)
+        }
+        pb::ContainmentStatus::ContainmentFailed => Ok(protocol::ContainmentStatus::Failed {
+            error: error.ok_or_else(|| Status::invalid_argument("missing containment error"))?,
+        }),
+        pb::ContainmentStatus::ContainmentUnspecified => {
+            Err(Status::invalid_argument("unspecified containment status"))
+        }
+    }
 }
 
 pub(crate) fn job_to_pb(v: Job) -> Result<pb::Job, Status> {
@@ -1123,6 +1318,7 @@ mod tests {
                 base_ref_name: Some("main".into()),
             }),
             error_message: None,
+            cancellation_acknowledgement: None,
         };
 
         let pb = job_result_to_pb(result).expect("to pb");

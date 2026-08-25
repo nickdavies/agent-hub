@@ -2,6 +2,8 @@
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -42,7 +44,7 @@ use artifacts::{
 };
 use client::{
     Client, GrpcClient, HttpClient, JobUpdateOutcome, is_worker_not_found_error,
-    start_grpc_event_stream,
+    start_grpc_cancellation_stream, start_grpc_event_stream,
 };
 use credential_provider::{ResolvedCredentials, resolve_all_for_job};
 use egress::{EgressManager, llm_provider_from_env};
@@ -53,6 +55,1602 @@ use local_agent::pb_conv::ts_to_pb;
 use local_agent::pb_conv::{job_from_pb, job_to_pb};
 use mcp_bridge::{McpBridgeInstance, container_socket_path, mcp_socket_env_var};
 use workspace::*;
+
+#[derive(Debug, Clone)]
+enum WorkerStopReason {
+    CancelRequested(protocol::CancellationCommand),
+    LeaseLost,
+    ControlPlaneUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AttemptPhase {
+    Initialized,
+    WorkspacePreparing,
+    WorkspacePrepared,
+    CredentialsResolving,
+    CredentialsResolved,
+    BundleMaterializing,
+    BundleMaterialized,
+    DockerCreateSubmitting,
+    DockerCreateSubmitted,
+    DockerCreated,
+    DockerStartSubmitting,
+    DockerStarted,
+    Running,
+    PostExit,
+    CleanupRunning,
+    TerminalReporting,
+    ContainmentFailed,
+    Completed,
+}
+
+impl AttemptPhase {
+    fn rank(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AttemptPhaseRecord {
+    phase: AttemptPhase,
+    assignment_id: uuid::Uuid,
+    job_id: uuid::Uuid,
+    attempt: u32,
+    updated_at: chrono::DateTime<Utc>,
+    cleanup_error: Option<String>,
+}
+
+struct AttemptPhaseStore {
+    root: PathBuf,
+    record: std::sync::Mutex<AttemptPhaseRecord>,
+}
+
+impl AttemptPhaseStore {
+    fn initialize(
+        root: &Path,
+        assignment_id: uuid::Uuid,
+        job_id: uuid::Uuid,
+        attempt: u32,
+    ) -> anyhow::Result<Self> {
+        ensure_private_directory(root)?;
+        let path = root.join("attempt-phase.json");
+        let created = !path.exists();
+        let record = if !created {
+            let record: AttemptPhaseRecord =
+                serde_json::from_slice(&read_private_regular(root, "attempt-phase.json")?)?;
+            anyhow::ensure!(
+                record.assignment_id == assignment_id,
+                "persisted attempt phase assignment mismatch"
+            );
+            anyhow::ensure!(
+                record.job_id == job_id && record.attempt == attempt,
+                "persisted attempt phase job/attempt mismatch"
+            );
+            record
+        } else {
+            execution_fault_hook(&lifecycle_fault_boundary(
+                AttemptPhase::Initialized,
+                "before",
+            ))?;
+            AttemptPhaseRecord {
+                phase: AttemptPhase::Initialized,
+                assignment_id,
+                job_id,
+                attempt,
+                updated_at: Utc::now(),
+                cleanup_error: None,
+            }
+        };
+        durable_write_json(root, "attempt-phase.json", &record)?;
+        if created {
+            execution_fault_hook(&lifecycle_fault_boundary(
+                AttemptPhase::Initialized,
+                "after",
+            ))?;
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            record: std::sync::Mutex::new(record),
+        })
+    }
+
+    fn transition(&self, next: AttemptPhase) -> anyhow::Result<()> {
+        let mut record = self.record.lock().expect("attempt phase lock poisoned");
+        if next == record.phase {
+            return Ok(());
+        }
+        execution_fault_hook(&lifecycle_fault_boundary(next, "before"))?;
+        anyhow::ensure!(
+            next == AttemptPhase::ContainmentFailed || next.rank() > record.phase.rank(),
+            "invalid attempt phase regression {:?} -> {:?}",
+            record.phase,
+            next
+        );
+        anyhow::ensure!(
+            record.phase != AttemptPhase::ContainmentFailed,
+            "containment-failed attempt requires restart reconciliation before progression"
+        );
+        record.phase = next;
+        record.updated_at = Utc::now();
+        if next != AttemptPhase::ContainmentFailed {
+            record.cleanup_error = None;
+        }
+        durable_write_json(&self.root, "attempt-phase.json", &*record)?;
+        execution_fault_hook(&lifecycle_fault_boundary(next, "after"))
+    }
+
+    fn containment_failed(&self, error: &anyhow::Error) -> anyhow::Result<()> {
+        execution_fault_hook(&lifecycle_fault_boundary(
+            AttemptPhase::ContainmentFailed,
+            "before",
+        ))?;
+        let mut record = self.record.lock().expect("attempt phase lock poisoned");
+        record.phase = AttemptPhase::ContainmentFailed;
+        record.updated_at = Utc::now();
+        record.cleanup_error = Some(format!("{error:#}"));
+        durable_write_json(&self.root, "attempt-phase.json", &*record)?;
+        execution_fault_hook(&lifecycle_fault_boundary(
+            AttemptPhase::ContainmentFailed,
+            "after",
+        ))
+    }
+
+    fn begin_terminal_reporting(&self) -> anyhow::Result<bool> {
+        if self
+            .record
+            .lock()
+            .expect("attempt phase lock poisoned")
+            .phase
+            == AttemptPhase::ContainmentFailed
+        {
+            return Ok(false);
+        }
+        self.transition(AttemptPhase::TerminalReporting)?;
+        Ok(true)
+    }
+
+    fn recover_to_cleanup(&self) -> anyhow::Result<()> {
+        execution_fault_hook(&lifecycle_fault_boundary(
+            AttemptPhase::CleanupRunning,
+            "before",
+        ))?;
+        let mut record = self.record.lock().expect("attempt phase lock poisoned");
+        anyhow::ensure!(
+            record.phase == AttemptPhase::ContainmentFailed
+                || record.phase.rank() <= AttemptPhase::CleanupRunning.rank(),
+            "attempt is not eligible for cleanup recovery"
+        );
+        record.phase = AttemptPhase::CleanupRunning;
+        record.updated_at = Utc::now();
+        record.cleanup_error = None;
+        durable_write_json(&self.root, "attempt-phase.json", &*record)?;
+        execution_fault_hook(&lifecycle_fault_boundary(
+            AttemptPhase::CleanupRunning,
+            "after",
+        ))
+    }
+
+    fn current(&self) -> AttemptPhase {
+        self.record
+            .lock()
+            .expect("attempt phase lock poisoned")
+            .phase
+    }
+}
+
+fn private_attempt_root(data_dir: &Path, assignment_id: uuid::Uuid) -> anyhow::Result<PathBuf> {
+    let attempts = data_dir.join("attempts");
+    ensure_private_directory(&attempts)?;
+    let root = attempts.join(assignment_id.to_string());
+    ensure_private_directory(&root)?;
+    Ok(root)
+}
+
+fn runtime_attempt_root(data_dir: &Path, assignment_id: uuid::Uuid) -> anyhow::Result<PathBuf> {
+    let attempts = data_dir.join("runtime-attempts");
+    ensure_private_directory(&attempts)?;
+    let root = attempts.join(assignment_id.to_string());
+    ensure_private_directory(&root)?;
+    Ok(root)
+}
+
+fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "private state path is not a directory"
+        );
+    }
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "private state path is not a directory"
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            metadata.mode() & 0o777 == 0o700,
+            "private state directory mode is not 0700"
+        );
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        anyhow::ensure!(
+            metadata.uid() == unsafe { geteuid() },
+            "private state directory owner mismatch"
+        );
+    }
+    Ok(())
+}
+
+const OPERATION_JOURNAL_FILE: &str = "external-effects.jsonl";
+const OPERATION_JOURNAL_QUARANTINE: &str = "EXTERNAL_EFFECTS_QUARANTINED";
+const MAX_OPERATION_RESOURCE_BYTES: usize = 1024;
+const MAX_OPERATION_ERROR_CATEGORY_BYTES: usize = 128;
+
+fn execution_fault_hook(boundary: &str) -> anyhow::Result<()> {
+    #[cfg(any(test, feature = "test-fault-hooks"))]
+    {
+        let Ok(spec) = std::env::var("AGENT_HUB_TEST_EXECUTION_FAULT") else {
+            return Ok(());
+        };
+        let Some((action, target)) = spec.split_once(':') else {
+            anyhow::bail!("invalid AGENT_HUB_TEST_EXECUTION_FAULT");
+        };
+        if target != boundary {
+            return Ok(());
+        }
+        match action {
+            "error" => anyhow::bail!("injected execution fault at {boundary}"),
+            "abort" => std::process::abort(),
+            "pause" => {
+                let ready = std::env::var("AGENT_HUB_TEST_EXECUTION_FAULT_READY")
+                    .context("pause fault requires ready control path")?;
+                let release = std::env::var("AGENT_HUB_TEST_EXECUTION_FAULT_RELEASE")
+                    .context("pause fault requires release control path")?;
+                std::fs::write(&ready, format!("{boundary}\n"))?;
+                while !Path::new(&release).exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(())
+            }
+            _ => anyhow::bail!("unknown execution fault action '{action}'"),
+        }
+    }
+    #[cfg(not(any(test, feature = "test-fault-hooks")))]
+    {
+        let _ = boundary;
+        Ok(())
+    }
+}
+
+fn lifecycle_fault_boundary(phase: AttemptPhase, edge: &str) -> String {
+    format!(
+        "lifecycle:{}:{edge}",
+        serde_json::to_value(phase)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+fn operation_fault_boundary(kind: &str, status: &ExternalOperationStatus, edge: &str) -> String {
+    let status = serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("operation:{kind}:{status}:{edge}")
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExternalOperationStatus {
+    Started,
+    Completed,
+    Ambiguous,
+    CleanupFailed,
+    Reconciled,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExternalOperationClass {
+    PreCleanupProducer,
+    Cleanup,
+    TerminalReporting,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct ExternalOperationRecord {
+    sequence: u64,
+    operation_id: uuid::Uuid,
+    operation_kind: String,
+    operation_class: ExternalOperationClass,
+    lifecycle_phase: AttemptPhase,
+    resource_identity: String,
+    status: ExternalOperationStatus,
+    recorded_at: chrono::DateTime<Utc>,
+    assignment_id: uuid::Uuid,
+    job_id: uuid::Uuid,
+    attempt: u32,
+    error_category: Option<String>,
+}
+
+#[derive(Debug)]
+struct OperationJournalState {
+    next_sequence: u64,
+    records: Vec<ExternalOperationRecord>,
+    quarantined: bool,
+}
+
+struct OperationJournal {
+    root: PathBuf,
+    assignment_id: uuid::Uuid,
+    job_id: uuid::Uuid,
+    attempt: u32,
+    state: std::sync::Mutex<OperationJournalState>,
+}
+
+impl OperationJournal {
+    fn initialize(
+        root: &Path,
+        assignment_id: uuid::Uuid,
+        job_id: uuid::Uuid,
+        attempt: u32,
+    ) -> anyhow::Result<Self> {
+        ensure_private_directory(root)?;
+        anyhow::ensure!(
+            !root.join(OPERATION_JOURNAL_QUARANTINE).exists(),
+            "operation journal is quarantined"
+        );
+        let path = root.join(OPERATION_JOURNAL_FILE);
+        let mut records = Vec::new();
+        if path.exists() {
+            let bytes = read_private_regular(root, OPERATION_JOURNAL_FILE)
+                .with_context(|| format!("read operation journal {}", path.display()))?;
+            if !bytes.is_empty() {
+                anyhow::ensure!(
+                    bytes.last() == Some(&b'\n'),
+                    "operation journal is truncated"
+                );
+                for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let record: ExternalOperationRecord = serde_json::from_slice(line)
+                        .with_context(|| {
+                            format!("malformed operation journal record {}", index + 1)
+                        })?;
+                    let expected = u64::try_from(records.len())?.saturating_add(1);
+                    anyhow::ensure!(
+                        record.sequence == expected,
+                        "operation journal sequence gap: expected {expected}, got {}",
+                        record.sequence
+                    );
+                    anyhow::ensure!(
+                        record.assignment_id == assignment_id
+                            && record.job_id == job_id
+                            && record.attempt == attempt,
+                        "operation journal attempt identity mismatch"
+                    );
+                    validate_operation_record(&record)?;
+                    records.push(record);
+                }
+                validate_operation_history(&records)?;
+            }
+        }
+        let next_sequence = u64::try_from(records.len())?
+            .checked_add(1)
+            .context("operation journal sequence overflow")?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            assignment_id,
+            job_id,
+            attempt,
+            state: std::sync::Mutex::new(OperationJournalState {
+                next_sequence,
+                records,
+                quarantined: false,
+            }),
+        })
+    }
+
+    fn append(
+        &self,
+        operation_id: uuid::Uuid,
+        operation_kind: &str,
+        lifecycle_phase: AttemptPhase,
+        resource_identity: &str,
+        status: ExternalOperationStatus,
+        error_category: Option<&str>,
+    ) -> anyhow::Result<()> {
+        execution_fault_hook(&operation_fault_boundary(operation_kind, &status, "before"))?;
+        let mut state = self.state.lock().expect("operation journal lock poisoned");
+        anyhow::ensure!(!state.quarantined, "operation journal is quarantined");
+        let candidate = ExternalOperationRecord {
+            sequence: state.next_sequence,
+            operation_id,
+            operation_kind: operation_kind.to_string(),
+            operation_class: classify_external_operation(operation_kind)?,
+            lifecycle_phase,
+            resource_identity: resource_identity.to_string(),
+            status,
+            recorded_at: Utc::now(),
+            assignment_id: self.assignment_id,
+            job_id: self.job_id,
+            attempt: self.attempt,
+            error_category: error_category.map(ToOwned::to_owned),
+        };
+        validate_operation_record(&candidate)?;
+        if let Some(existing) = state.records.iter().find(|record| {
+            record.operation_id == candidate.operation_id && record.status == candidate.status
+        }) {
+            let idempotent = existing.operation_kind == candidate.operation_kind
+                && existing.operation_class == candidate.operation_class
+                && existing.lifecycle_phase == candidate.lifecycle_phase
+                && existing.resource_identity == candidate.resource_identity
+                && existing.error_category == candidate.error_category;
+            if idempotent {
+                return Ok(());
+            }
+            state.quarantined = true;
+            durable_write_json(
+                &self.root,
+                OPERATION_JOURNAL_QUARANTINE,
+                &serde_json::json!({"reason":"conflicting_duplicate"}),
+            )?;
+            anyhow::bail!("conflicting duplicate operation journal record; journal quarantined");
+        }
+        if let Err(error) = validate_operation_transition(&state.records, &candidate) {
+            state.quarantined = true;
+            durable_write_json(
+                &self.root,
+                OPERATION_JOURNAL_QUARANTINE,
+                &serde_json::json!({"reason":"invalid_transition"}),
+            )?;
+            return Err(error);
+        }
+        append_durable_json_line(&self.root, OPERATION_JOURNAL_FILE, &candidate)?;
+        state.next_sequence = state
+            .next_sequence
+            .checked_add(1)
+            .context("operation journal sequence overflow")?;
+        state.records.push(candidate);
+        execution_fault_hook(&operation_fault_boundary(operation_kind, &status, "after"))
+    }
+
+    fn unresolved(&self) -> anyhow::Result<Vec<ExternalOperationRecord>> {
+        let state = self.state.lock().expect("operation journal lock poisoned");
+        anyhow::ensure!(!state.quarantined, "operation journal is quarantined");
+        let mut latest = std::collections::BTreeMap::new();
+        for record in &state.records {
+            latest.insert(record.operation_id, record.clone());
+        }
+        Ok(latest
+            .into_values()
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    ExternalOperationStatus::Started
+                        | ExternalOperationStatus::Ambiguous
+                        | ExternalOperationStatus::CleanupFailed
+                ) || (record.status == ExternalOperationStatus::Completed
+                    && operation_owns_reconcilable_resource(&record.operation_kind))
+            })
+            .collect())
+    }
+
+    fn reload_from_disk(&self) -> anyhow::Result<()> {
+        let refreshed =
+            Self::initialize(&self.root, self.assignment_id, self.job_id, self.attempt)?;
+        let refreshed_state = refreshed
+            .state
+            .into_inner()
+            .expect("refreshed operation journal lock poisoned");
+        *self.state.lock().expect("operation journal lock poisoned") = refreshed_state;
+        Ok(())
+    }
+
+    fn reconcile_owned_resources_under(&self, root: &Path) -> anyhow::Result<()> {
+        let root = root.to_string_lossy();
+        let records = {
+            let state = self.state.lock().expect("operation journal lock poisoned");
+            state.records.clone()
+        };
+        let mut latest = std::collections::BTreeMap::new();
+        for record in records {
+            latest.insert(record.operation_id, record);
+        }
+        for record in latest.into_values().filter(|record| {
+            record.status == ExternalOperationStatus::Completed
+                && operation_owns_reconcilable_resource(&record.operation_kind)
+                && (record.resource_identity == root
+                    || record.resource_identity.starts_with(&format!("{root}/")))
+        }) {
+            self.append(
+                record.operation_id,
+                &record.operation_kind,
+                record.lifecycle_phase,
+                &record.resource_identity,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_owned_resource(&self, resource_identity: &str) -> anyhow::Result<()> {
+        let records = {
+            let state = self.state.lock().expect("operation journal lock poisoned");
+            state.records.clone()
+        };
+        let mut latest = std::collections::BTreeMap::new();
+        for record in records {
+            latest.insert(record.operation_id, record);
+        }
+        for record in latest.into_values().filter(|record| {
+            record.status == ExternalOperationStatus::Completed
+                && operation_owns_reconcilable_resource(&record.operation_kind)
+                && record.resource_identity == resource_identity
+        }) {
+            self.append(
+                record.operation_id,
+                &record.operation_kind,
+                record.lifecycle_phase,
+                &record.resource_identity,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn classify_external_operation(kind: &str) -> anyhow::Result<ExternalOperationClass> {
+    if kind.starts_with("terminal_report") || kind.starts_with("terminal_event_") {
+        return Ok(ExternalOperationClass::TerminalReporting);
+    }
+    if is_cleanup_operation_kind(kind) {
+        return Ok(ExternalOperationClass::Cleanup);
+    }
+    let reviewed = [
+        "workspace_",
+        "credential_",
+        "bundle_",
+        "environment_bundle_",
+        "docker_",
+        "container_",
+        "create_",
+        "github_",
+        "managed_github_",
+        "mcp_",
+        "process_",
+        "output_",
+        "artifact_",
+        "authority_",
+        "runtime_",
+        "model_",
+        "transcript_",
+        "repo_",
+        "recovery_",
+        "resolved_image_",
+        "event_",
+        "helper_process",
+        "external_request_",
+        "producer_",
+        "late_producer",
+    ];
+    anyhow::ensure!(
+        reviewed.iter().any(|prefix| kind.starts_with(prefix)),
+        "external operation kind has no reviewed class: {kind}"
+    );
+    Ok(ExternalOperationClass::PreCleanupProducer)
+}
+
+fn operation_owns_reconcilable_resource(operation_kind: &str) -> bool {
+    matches!(
+        operation_kind,
+        "workspace_create"
+            | "workspace_worktree_create"
+            | "credential_materialize"
+            | "credential_secret_write"
+            | "credential_directory_create"
+            | "mcp_socket_bind"
+            | "bundle_state_directory_create"
+            | "bundle_home_directory_create"
+            | "environment_bundle_materialize"
+            | "docker_create_request"
+            | "github_askpass_create"
+            | "output_redaction_temporary_write"
+    )
+}
+
+fn validate_operation_record(record: &ExternalOperationRecord) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !record.operation_kind.trim().is_empty(),
+        "empty operation kind"
+    );
+    anyhow::ensure!(
+        record.operation_kind.len() <= MAX_OPERATION_ERROR_CATEGORY_BYTES,
+        "operation kind exceeds journal bound"
+    );
+    anyhow::ensure!(
+        record.resource_identity.len() <= MAX_OPERATION_RESOURCE_BYTES,
+        "operation resource identity exceeds journal bound"
+    );
+    anyhow::ensure!(
+        !record.resource_identity.chars().any(char::is_control),
+        "operation resource identity contains control characters"
+    );
+    if let Some(error_category) = &record.error_category {
+        anyhow::ensure!(
+            error_category.len() <= MAX_OPERATION_ERROR_CATEGORY_BYTES
+                && !error_category.chars().any(char::is_control),
+            "operation error category exceeds journal bound"
+        );
+    }
+    Ok(())
+}
+
+fn validate_operation_history(records: &[ExternalOperationRecord]) -> anyhow::Result<()> {
+    let mut accepted = Vec::new();
+    for record in records {
+        if let Some(existing) = accepted.iter().find(|existing: &&ExternalOperationRecord| {
+            existing.operation_id == record.operation_id && existing.status == record.status
+        }) {
+            anyhow::ensure!(
+                existing.operation_kind == record.operation_kind
+                    && existing.lifecycle_phase == record.lifecycle_phase
+                    && existing.resource_identity == record.resource_identity
+                    && existing.error_category == record.error_category,
+                "conflicting duplicate operation journal record"
+            );
+            continue;
+        }
+        validate_operation_transition(
+            &accepted
+                .iter()
+                .map(|record| (*record).clone())
+                .collect::<Vec<_>>(),
+            record,
+        )?;
+        accepted.push(record.clone());
+    }
+    Ok(())
+}
+
+fn validate_operation_transition(
+    records: &[ExternalOperationRecord],
+    candidate: &ExternalOperationRecord,
+) -> anyhow::Result<()> {
+    if candidate.status == ExternalOperationStatus::Started
+        && let Some(previous) = records
+            .iter()
+            .rev()
+            .find(|record| record.status == ExternalOperationStatus::Started)
+    {
+        anyhow::ensure!(
+            candidate.lifecycle_phase.rank() >= previous.lifecycle_phase.rank(),
+            "operation journal lifecycle phase regressed"
+        );
+    }
+    let prior = records
+        .iter()
+        .rev()
+        .find(|record| record.operation_id == candidate.operation_id);
+    match (&candidate.status, prior.map(|record| &record.status)) {
+        (ExternalOperationStatus::Started, None)
+        | (ExternalOperationStatus::Completed, Some(ExternalOperationStatus::Started))
+        | (ExternalOperationStatus::Ambiguous, Some(ExternalOperationStatus::Started))
+        | (ExternalOperationStatus::CleanupFailed, Some(ExternalOperationStatus::Started))
+        | (ExternalOperationStatus::CleanupFailed, Some(ExternalOperationStatus::Ambiguous))
+        | (ExternalOperationStatus::Reconciled, Some(ExternalOperationStatus::Started))
+        | (ExternalOperationStatus::Reconciled, Some(ExternalOperationStatus::Ambiguous))
+        | (ExternalOperationStatus::Reconciled, Some(ExternalOperationStatus::Completed))
+        | (ExternalOperationStatus::Reconciled, Some(ExternalOperationStatus::CleanupFailed)) => {}
+        _ => anyhow::bail!("invalid operation journal status transition"),
+    }
+    if let Some(prior) = prior {
+        anyhow::ensure!(
+            prior.operation_kind == candidate.operation_kind
+                && prior.lifecycle_phase == candidate.lifecycle_phase
+                && prior.resource_identity == candidate.resource_identity,
+            "operation journal identity changed during lifecycle"
+        );
+    }
+    Ok(())
+}
+
+fn append_durable_json_line<T: serde::Serialize>(
+    root: &Path,
+    name: &str,
+    value: &T,
+) -> anyhow::Result<()> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        options.mode(0o600).custom_flags(0x0002_0000);
+        let path = root.join(name);
+        if path.exists() {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "private journal is not regular"
+            );
+            anyhow::ensure!(metadata.nlink() == 1, "private journal has multiple links");
+            anyhow::ensure!(
+                metadata.mode() & 0o777 == 0o600,
+                "private journal mode is not 0600"
+            );
+        }
+    }
+    let mut file = options
+        .open(root.join(name))
+        .with_context(|| format!("open append-only journal {name}"))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("append journal {name}"))?;
+    file.sync_all()
+        .with_context(|| format!("fsync journal {name}"))?;
+    sync_directory(root)
+}
+
+fn read_private_regular(root: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
+    ensure_private_directory(root)?;
+    let path = root.join(name);
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let metadata = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "private state file is not regular"
+        );
+        anyhow::ensure!(
+            metadata.nlink() == 1,
+            "private state file has multiple links"
+        );
+        anyhow::ensure!(
+            metadata.mode() & 0o777 == 0o600,
+            "private state file mode is not 0600"
+        );
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        anyhow::ensure!(
+            metadata.uid() == unsafe { geteuid() },
+            "private state file owner mismatch"
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0002_0000)
+            .open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read(path).map_err(Into::into)
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionInterrupted(WorkerStopReason);
+
+impl std::fmt::Display for ExecutionInterrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "execution interrupted: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for ExecutionInterrupted {}
+
+#[derive(Clone)]
+struct ExecutionCancellationContext {
+    stop_reason: Arc<std::sync::Mutex<Option<WorkerStopReason>>>,
+    stop_rx: watch::Receiver<bool>,
+    phase: Arc<AttemptPhaseStore>,
+    operations: Arc<OperationJournal>,
+    assignment_id: uuid::Uuid,
+    pre_cleanup_closed: Arc<std::sync::atomic::AtomicBool>,
+    active_pre_cleanup_operations: Arc<std::sync::atomic::AtomicUsize>,
+    active_terminal_operations: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct ExternalOperation<'a> {
+    cancellation: &'a ExecutionCancellationContext,
+    operation_id: uuid::Uuid,
+    operation_kind: String,
+    lifecycle_phase: AttemptPhase,
+    resource_identity: String,
+    resolved: bool,
+    pre_cleanup_token: bool,
+    terminal_token: bool,
+}
+
+impl ExternalOperation<'_> {
+    fn completed(mut self) -> anyhow::Result<()> {
+        self.finish(ExternalOperationStatus::Completed, None)
+    }
+
+    fn ambiguous(mut self, error_category: &'static str) -> anyhow::Result<()> {
+        self.finish(ExternalOperationStatus::Ambiguous, Some(error_category))
+    }
+
+    fn cleanup_failed(mut self, error_category: &'static str) -> anyhow::Result<()> {
+        self.finish(ExternalOperationStatus::CleanupFailed, Some(error_category))
+    }
+
+    fn reconciled(mut self) -> anyhow::Result<()> {
+        self.finish(ExternalOperationStatus::Reconciled, None)
+    }
+
+    fn finish(
+        &mut self,
+        status: ExternalOperationStatus,
+        error_category: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let result = self.cancellation.operations.append(
+            self.operation_id,
+            &self.operation_kind,
+            self.lifecycle_phase,
+            &self.resource_identity,
+            status,
+            error_category,
+        );
+        if self.pre_cleanup_token {
+            self.cancellation
+                .active_pre_cleanup_operations
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.pre_cleanup_token = false;
+        }
+        if self.terminal_token {
+            self.cancellation
+                .active_terminal_operations
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.terminal_token = false;
+        }
+        result?;
+        self.resolved = true;
+        Ok(())
+    }
+}
+
+impl Drop for ExternalOperation<'_> {
+    fn drop(&mut self) {
+        if !self.resolved {
+            let _ = self.cancellation.operations.append(
+                self.operation_id,
+                &self.operation_kind,
+                self.lifecycle_phase,
+                &self.resource_identity,
+                ExternalOperationStatus::Ambiguous,
+                Some("operation_future_dropped"),
+            );
+            if self.pre_cleanup_token {
+                self.cancellation
+                    .active_pre_cleanup_operations
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                self.pre_cleanup_token = false;
+            }
+            if self.terminal_token {
+                self.cancellation
+                    .active_terminal_operations
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                self.terminal_token = false;
+            }
+        }
+    }
+}
+
+impl ExecutionCancellationContext {
+    fn check(&self) -> anyhow::Result<()> {
+        if !*self.stop_rx.borrow() {
+            return Ok(());
+        }
+        let reason = self
+            .stop_reason
+            .lock()
+            .expect("worker stop reason lock poisoned")
+            .clone()
+            .unwrap_or(WorkerStopReason::ControlPlaneUnavailable);
+        Err(ExecutionInterrupted(reason).into())
+    }
+
+    fn transition(&self, phase: AttemptPhase) -> anyhow::Result<()> {
+        self.check()?;
+        self.phase.transition(phase)?;
+        self.check()
+    }
+
+    async fn transition_cleanup(&self) -> anyhow::Result<()> {
+        self.pre_cleanup_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while self
+            .active_pre_cleanup_operations
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "timed out joining pre-cleanup operation producers"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        self.close_pre_cleanup_operations()?;
+        self.phase.transition(AttemptPhase::CleanupRunning)
+    }
+
+    fn begin_terminal_reporting(&self) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            self.operations.unresolved()?.is_empty(),
+            "cleanup/resource operations remain unresolved before terminal_reporting"
+        );
+        self.phase.begin_terminal_reporting()
+    }
+
+    fn close_pre_cleanup_operations(&self) -> anyhow::Result<()> {
+        let unresolved = self.operations.unresolved()?;
+        let mut blocked = unresolved
+            .into_iter()
+            .filter(|record| {
+                record.operation_class == ExternalOperationClass::PreCleanupProducer
+                    && matches!(
+                        record.status,
+                        ExternalOperationStatus::Started
+                            | ExternalOperationStatus::Ambiguous
+                            | ExternalOperationStatus::CleanupFailed
+                    )
+            })
+            .map(|record| {
+                format!(
+                    "id={} kind={} class={:?} status={:?} phase={:?}",
+                    record.operation_id,
+                    record.operation_kind,
+                    record.operation_class,
+                    record.status,
+                    record.lifecycle_phase
+                )
+            })
+            .collect::<Vec<_>>();
+        blocked.sort();
+        blocked.truncate(16);
+        anyhow::ensure!(
+            blocked.is_empty(),
+            "pre-cleanup operations remain unresolved: {}",
+            blocked.join(",")
+        );
+        Ok(())
+    }
+
+    fn begin_external_operation<'a>(
+        &'a self,
+        operation_kind: &str,
+        resource_identity: &str,
+    ) -> anyhow::Result<ExternalOperation<'a>> {
+        let operation_id = uuid::Uuid::new_v4();
+        let lifecycle_phase = self.phase.current();
+        let operation_class = classify_external_operation(operation_kind)?;
+        let pre_cleanup_token = operation_class == ExternalOperationClass::PreCleanupProducer;
+        let terminal_token = operation_class == ExternalOperationClass::TerminalReporting;
+        if terminal_token {
+            anyhow::ensure!(
+                lifecycle_phase.rank() >= AttemptPhase::TerminalReporting.rank(),
+                "terminal-reporting operation started before terminal_reporting"
+            );
+        }
+        if self
+            .pre_cleanup_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            match operation_class {
+                ExternalOperationClass::PreCleanupProducer => {
+                    anyhow::bail!("pre-cleanup operation producer is closed")
+                }
+                ExternalOperationClass::Cleanup => anyhow::ensure!(
+                    lifecycle_phase.rank() >= AttemptPhase::CleanupRunning.rank(),
+                    "cleanup operation started before cleanup_running"
+                ),
+                ExternalOperationClass::TerminalReporting => anyhow::ensure!(
+                    lifecycle_phase.rank() >= AttemptPhase::TerminalReporting.rank(),
+                    "terminal-reporting operation started before terminal_reporting"
+                ),
+            }
+        }
+        if pre_cleanup_token {
+            anyhow::ensure!(
+                !self
+                    .pre_cleanup_closed
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "pre-cleanup operation producer is closed"
+            );
+            self.active_pre_cleanup_operations
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if self
+                .pre_cleanup_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.active_pre_cleanup_operations
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                anyhow::bail!("pre-cleanup operation producer closed during acquisition");
+            }
+        }
+        if terminal_token {
+            self.active_terminal_operations
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        if let Err(error) = self.operations.append(
+            operation_id,
+            operation_kind,
+            lifecycle_phase,
+            resource_identity,
+            ExternalOperationStatus::Started,
+            None,
+        ) {
+            if pre_cleanup_token {
+                self.active_pre_cleanup_operations
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            if terminal_token {
+                self.active_terminal_operations
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            return Err(error);
+        }
+        Ok(ExternalOperation {
+            cancellation: self,
+            operation_id,
+            operation_kind: operation_kind.to_string(),
+            lifecycle_phase,
+            resource_identity: resource_identity.to_string(),
+            resolved: false,
+            pre_cleanup_token,
+            terminal_token,
+        })
+    }
+
+    async fn cancelled(&self) {
+        if *self.stop_rx.borrow() {
+            return;
+        }
+        let mut receiver = self.stop_rx.clone();
+        let _ = receiver.changed().await;
+    }
+
+    fn create_dir_all(&self, operation_kind: &str, path: &Path) -> anyhow::Result<()> {
+        let operation = self.begin_external_operation(operation_kind, &path.to_string_lossy())?;
+        match std::fs::create_dir_all(path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent)?;
+                }
+                operation.completed()
+            }
+            Err(error) => {
+                operation.ambiguous("filesystem_create_failed")?;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn write_file(
+        &self,
+        operation_kind: &str,
+        path: &Path,
+        bytes: impl AsRef<[u8]>,
+    ) -> anyhow::Result<()> {
+        let operation = self.begin_external_operation(operation_kind, &path.to_string_lossy())?;
+        match std::fs::write(path, bytes) {
+            Ok(()) => {
+                std::fs::File::open(path)?.sync_all()?;
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent)?;
+                }
+                operation.completed()
+            }
+            Err(error) => {
+                operation.ambiguous("filesystem_write_failed")?;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn remove_file(&self, operation_kind: &str, path: &Path) -> anyhow::Result<()> {
+        if !path.exists() {
+            return self
+                .operations
+                .reconcile_owned_resource(&path.to_string_lossy());
+        }
+        let operation = self.begin_external_operation(operation_kind, &path.to_string_lossy())?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent)?;
+                }
+                operation.completed()?;
+                self.operations.reconcile_owned_resources_under(path)
+            }
+            Err(error) => {
+                operation.cleanup_failed("filesystem_remove_failed")?;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn copy_file(&self, operation_kind: &str, source: &Path, target: &Path) -> anyhow::Result<()> {
+        let operation = self.begin_external_operation(
+            operation_kind,
+            &format!("{}->{}", source.to_string_lossy(), target.to_string_lossy()),
+        )?;
+        match std::fs::copy(source, target) {
+            Ok(_) => {
+                std::fs::File::open(target)?.sync_all()?;
+                if let Some(parent) = target.parent() {
+                    sync_directory(parent)?;
+                }
+                operation.completed()
+            }
+            Err(error) => {
+                operation.ambiguous("filesystem_copy_failed")?;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn rename_file(
+        &self,
+        operation_kind: &str,
+        source: &Path,
+        target: &Path,
+    ) -> anyhow::Result<()> {
+        let operation = self.begin_external_operation(
+            operation_kind,
+            &format!("{}->{}", source.to_string_lossy(), target.to_string_lossy()),
+        )?;
+        match std::fs::rename(source, target) {
+            Ok(()) => {
+                if let Some(parent) = target.parent() {
+                    sync_directory(parent)?;
+                }
+                operation.completed()?;
+                self.operations
+                    .reconcile_owned_resource(&source.to_string_lossy())
+            }
+            Err(error) => {
+                operation.ambiguous("filesystem_rename_failed")?;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn finalize_private_state(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.phase.current() == AttemptPhase::Completed,
+            "private attempt state cannot be removed before completion"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while self
+            .active_terminal_operations
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "timed out joining terminal-reporting operations"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        anyhow::ensure!(
+            self.operations.unresolved()?.is_empty(),
+            "private attempt state has unresolved operations"
+        );
+        let parent = self
+            .phase
+            .root
+            .parent()
+            .context("private attempt root has no parent")?;
+        std::fs::remove_dir_all(&self.phase.root)?;
+        sync_directory(parent)
+    }
+
+    #[cfg(test)]
+    fn for_test(root: &Path, stop_rx: watch::Receiver<bool>) -> anyhow::Result<Self> {
+        let assignment_id = if root.join("attempt-phase.json").exists() {
+            serde_json::from_slice::<AttemptPhaseRecord>(&read_private_regular(
+                root,
+                "attempt-phase.json",
+            )?)?
+            .assignment_id
+        } else {
+            uuid::Uuid::new_v4()
+        };
+        let (job_id, attempt) = if root.join(OPERATION_JOURNAL_FILE).exists() {
+            let bytes = read_private_regular(root, OPERATION_JOURNAL_FILE)?;
+            let first = bytes
+                .split(|byte| *byte == b'\n')
+                .find(|line| !line.is_empty())
+                .map(serde_json::from_slice::<ExternalOperationRecord>)
+                .transpose()?;
+            first.map_or((uuid::Uuid::nil(), 0), |record| {
+                (record.job_id, record.attempt)
+            })
+        } else {
+            (uuid::Uuid::nil(), 0)
+        };
+        Ok(Self {
+            stop_reason: Arc::new(std::sync::Mutex::new(None)),
+            stop_rx,
+            phase: Arc::new(AttemptPhaseStore::initialize(
+                root,
+                assignment_id,
+                job_id,
+                attempt,
+            )?),
+            operations: Arc::new(OperationJournal::initialize(
+                root,
+                assignment_id,
+                job_id,
+                attempt,
+            )?),
+            assignment_id,
+            pre_cleanup_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_pre_cleanup_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            active_terminal_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test_attempt(
+        root: &Path,
+        stop_rx: watch::Receiver<bool>,
+        assignment_id: uuid::Uuid,
+        job_id: uuid::Uuid,
+        attempt: u32,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            stop_reason: Arc::new(std::sync::Mutex::new(None)),
+            stop_rx,
+            phase: Arc::new(AttemptPhaseStore::initialize(
+                root,
+                assignment_id,
+                job_id,
+                attempt,
+            )?),
+            operations: Arc::new(OperationJournal::initialize(
+                root,
+                assignment_id,
+                job_id,
+                attempt,
+            )?),
+            assignment_id,
+            pre_cleanup_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_pre_cleanup_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            active_terminal_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+}
+
+async fn ensure_cleanup_phase_after_reconciliation(
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
+    cancellation.operations.reload_from_disk()?;
+    match cancellation.phase.current() {
+        AttemptPhase::ContainmentFailed => {
+            cancellation
+                .pre_cleanup_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            cancellation.close_pre_cleanup_operations()?;
+            cancellation.phase.recover_to_cleanup()
+        }
+        phase if phase.rank() < AttemptPhase::CleanupRunning.rank() => {
+            cancellation.transition_cleanup().await
+        }
+        AttemptPhase::CleanupRunning
+        | AttemptPhase::TerminalReporting
+        | AttemptPhase::Completed => Ok(()),
+        phase => anyhow::bail!("unexpected post-cleanup lifecycle phase {phase:?}"),
+    }
+}
+
+fn is_cleanup_operation_kind(kind: &str) -> bool {
+    [
+        "cleanup",
+        "remove",
+        "delete",
+        "teardown",
+        "reconcile",
+        "inspect",
+        "stop",
+        "kill",
+        "redact",
+        "_rm_",
+        "unlink",
+        "close",
+        "release",
+        "shutdown",
+        "finalize",
+        "terminal_report",
+    ]
+    .iter()
+    .any(|token| kind.contains(token))
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedContainmentAbsence {
+    checked_at: chrono::DateTime<Utc>,
+    process: protocol::ContainmentStatus,
+    container: protocol::ContainmentStatus,
+}
+
+#[derive(Debug, Clone)]
+struct CancellationAttempt {
+    execution_error: Option<String>,
+    stop_reason: Option<WorkerStopReason>,
+    cleanup_error: Option<String>,
+    containment: VerifiedContainmentAbsence,
+    explicitly_interrupted: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedTerminalReport {
+    assignment_id: uuid::Uuid,
+    job_id: uuid::Uuid,
+    cancellation_id: Option<uuid::Uuid>,
+    runtime_assignment_id: uuid::Uuid,
+    invocation_id: Option<uuid::Uuid>,
+    attempt: u32,
+    delivery_command: Option<protocol::CancellationCommand>,
+    state: JobState,
+    transcript_dir: Option<String>,
+    result: JobResult,
+}
+
+fn persist_terminal_report(
+    cancellation: &ExecutionCancellationContext,
+    job_id: uuid::Uuid,
+    attempt: u32,
+    state: JobState,
+    transcript_dir: Option<String>,
+    result: &JobResult,
+) -> anyhow::Result<()> {
+    let delivery_command = result
+        .cancellation_acknowledgement
+        .as_ref()
+        .map(|acknowledgement| acknowledgement.command.clone());
+    durable_write_json(
+        &cancellation.phase.root,
+        "terminal-report.json",
+        &PersistedTerminalReport {
+            assignment_id: cancellation.assignment_id,
+            job_id,
+            cancellation_id: delivery_command
+                .as_ref()
+                .map(|command| command.cancellation_id),
+            runtime_assignment_id: delivery_command
+                .as_ref()
+                .map_or(cancellation.assignment_id, |command| {
+                    command.runtime_assignment_id
+                }),
+            invocation_id: delivery_command
+                .as_ref()
+                .map(|command| command.invocation_id),
+            attempt,
+            delivery_command,
+            state,
+            transcript_dir,
+            result: result.clone(),
+        },
+    )
+}
+
+fn rebind_terminal_report(
+    report: &mut PersistedTerminalReport,
+    current: &protocol::CancellationCommand,
+) -> anyhow::Result<bool> {
+    protocol::verify_cancellation_assignment_id(current).map_err(anyhow::Error::msg)?;
+    let previous = report
+        .delivery_command
+        .as_ref()
+        .context("cancelled terminal report has no delivery command")?;
+    anyhow::ensure!(
+        current.cancellation_id == report.cancellation_id.unwrap_or_default()
+            && current.runtime_assignment_id == report.runtime_assignment_id
+            && current.job_id == report.job_id
+            && current.attempt == report.attempt
+            && Some(current.invocation_id) == report.invocation_id
+            && current.generation >= previous.generation
+            && (current == previous || current.generation > previous.generation),
+        "rebound cancellation command conflicts with immutable report"
+    );
+    if current == previous {
+        return Ok(false);
+    }
+    report
+        .result
+        .cancellation_acknowledgement
+        .as_mut()
+        .context("cancelled terminal report has no acknowledgement")?
+        .command = current.clone();
+    report.delivery_command = Some(current.clone());
+    Ok(true)
+}
+
+impl CancellationAttempt {
+    fn can_acknowledge(&self) -> bool {
+        self.explicitly_interrupted
+            && self.execution_error.is_none()
+            && self.cleanup_error.is_none()
+            && matches!(self.stop_reason, Some(WorkerStopReason::CancelRequested(_)))
+            && matches!(
+                self.containment.process,
+                protocol::ContainmentStatus::VerifiedAbsent
+                    | protocol::ContainmentStatus::NotApplicable
+            )
+            && matches!(
+                self.containment.container,
+                protocol::ContainmentStatus::VerifiedAbsent
+                    | protocol::ContainmentStatus::NotApplicable
+            )
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.execution_error
+            .clone()
+            .or_else(|| self.cleanup_error.clone())
+            .or_else(|| {
+                (!self.can_acknowledge()).then(|| {
+                    "cancellation was not an explicit interruption with complete containment"
+                        .to_string()
+                })
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttemptReconciliationScope {
+    workspace: bool,
+    credentials: bool,
+    bundle: bool,
+    runtime: bool,
+    terminal_report: bool,
+}
+
+fn reconciliation_scope(phase: AttemptPhase) -> AttemptReconciliationScope {
+    let rank = phase.rank();
+    AttemptReconciliationScope {
+        workspace: rank >= AttemptPhase::WorkspacePreparing.rank(),
+        credentials: rank >= AttemptPhase::CredentialsResolving.rank(),
+        bundle: rank >= AttemptPhase::BundleMaterializing.rank(),
+        runtime: rank >= AttemptPhase::DockerCreateSubmitting.rank()
+            || matches!(
+                phase,
+                AttemptPhase::Running
+                    | AttemptPhase::PostExit
+                    | AttemptPhase::CleanupRunning
+                    | AttemptPhase::TerminalReporting
+                    | AttemptPhase::ContainmentFailed
+                    | AttemptPhase::Completed
+            ),
+        terminal_report: matches!(
+            phase,
+            AttemptPhase::TerminalReporting
+                | AttemptPhase::ContainmentFailed
+                | AttemptPhase::Completed
+        ),
+    }
+}
+
+fn validate_operation_within_reconciliation_scope(
+    scope: AttemptReconciliationScope,
+    operation_kind: &str,
+) -> anyhow::Result<()> {
+    let allowed = if operation_kind.starts_with("workspace_") {
+        scope.workspace
+    } else if operation_kind.starts_with("credential_") {
+        scope.credentials
+    } else if operation_kind.starts_with("bundle_")
+        || operation_kind.starts_with("environment_bundle_")
+        || operation_kind.starts_with("mcp_")
+    {
+        scope.bundle
+    } else if operation_kind.starts_with("docker_")
+        || operation_kind.starts_with("github_")
+        || operation_kind.ends_with("helper_process")
+        || operation_kind == "managed_github_operation"
+    {
+        scope.runtime
+    } else if operation_kind.starts_with("terminal_report") {
+        scope.terminal_report
+    } else {
+        true
+    };
+    anyhow::ensure!(
+        allowed,
+        "operation journal effect is impossible for lifecycle phase"
+    );
+    Ok(())
+}
+
+impl VerifiedContainmentAbsence {
+    fn into_protocol(self) -> protocol::ContainmentAbsenceEvidence {
+        protocol::ContainmentAbsenceEvidence {
+            checked_at: self.checked_at,
+            process: self.process,
+            container: self.container,
+        }
+    }
+}
+
+fn latch_stop_reason(
+    latch: &std::sync::Mutex<Option<WorkerStopReason>>,
+    reason: WorkerStopReason,
+    stop: &watch::Sender<bool>,
+) {
+    let mut current = latch.lock().expect("worker stop reason lock poisoned");
+    let durable_cancel_supersedes_transport = matches!(
+        (&*current, &reason),
+        (
+            Some(WorkerStopReason::LeaseLost | WorkerStopReason::ControlPlaneUnavailable),
+            WorkerStopReason::CancelRequested(_)
+        )
+    );
+    if current.is_none() || durable_cancel_supersedes_transport {
+        *current = Some(reason);
+        let _ = stop.send(true);
+    }
+}
+
+fn verify_cancellation_command(
+    command: &protocol::CancellationCommand,
+    job: &Job,
+    session: &protocol::AuthenticatedWorkerSession,
+) -> anyhow::Result<()> {
+    protocol::verify_cancellation_assignment_id(command).map_err(anyhow::Error::msg)?;
+    let invocation_id = protocol::authorization_request_from_job_context(&job.context)
+        .context("job has no signed invocation for cancellation")?
+        .invocation_id;
+    anyhow::ensure!(command.job_id == job.id, "cancellation job fence mismatch");
+    anyhow::ensure!(
+        command.attempt == job.attempt,
+        "cancellation attempt fence mismatch"
+    );
+    anyhow::ensure!(
+        command.invocation_id == invocation_id,
+        "cancellation invocation fence mismatch"
+    );
+    anyhow::ensure!(
+        command.worker_id == session.worker_id
+            && command.worker_session_id == session.session_id
+            && command.worker_session_generation == session.generation,
+        "cancellation worker session fence mismatch"
+    );
+    let runtime_assignment_id = protocol::cancellation_assignment_id(
+        job.id,
+        invocation_id,
+        job.attempt,
+        &session.worker_id,
+        session.session_id,
+        session.generation,
+    );
+    anyhow::ensure!(
+        command.runtime_assignment_id == runtime_assignment_id,
+        "cancellation runtime assignment fence mismatch"
+    );
+    Ok(())
+}
 
 fn worker_protocol_capabilities() -> Vec<protocol::WorkerProtocolCapability> {
     vec![
@@ -173,10 +1771,12 @@ struct JobEventSink {
     worker_id: String,
     writer: Arc<Mutex<JobEventTranscriptWriter>>,
     publisher: Option<JobEventPublisher>,
+    cancellation: ExecutionCancellationContext,
 }
 
 struct JobEventTranscriptWriter {
     file: tokio::fs::File,
+    path: PathBuf,
 }
 
 impl JobEventPublisher {
@@ -186,9 +1786,8 @@ impl JobEventPublisher {
         at: chrono::DateTime<Utc>,
         kind: pb::JobEventKind,
         message: String,
-    ) {
-        let _ = self
-            .tx
+    ) -> anyhow::Result<()> {
+        self.tx
             .send(pb::JobEventChunk {
                 worker_id: self.worker_id.clone(),
                 job_id: job_id.to_string(),
@@ -197,7 +1796,8 @@ impl JobEventPublisher {
                 stream: job_event_stream_name(kind).map(ToOwned::to_owned),
                 message,
             })
-            .await;
+            .await
+            .context("publish job event stream chunk")
     }
 }
 
@@ -214,34 +1814,92 @@ impl JobEventSink {
         };
         {
             let mut writer = self.writer.lock().await;
-            if let Err(error) = writer.write_event(&event).await {
-                eprintln!(
-                    "failed to append local job event transcript for {}: {error:#}",
+            if let Err(error) = writer.write_event(&event, &self.cancellation).await {
+                let _ = self.cancellation.phase.containment_failed(&error);
+                panic!(
+                    "failed to append required local job event transcript for {}: {error:#}",
                     event.job_id
                 );
             }
         }
 
         if let Some(publisher) = &self.publisher {
-            publisher.emit(job_id, at, kind, message).await;
+            let operation_kind = event_operation_kind(
+                self.cancellation.phase.current(),
+                "event_stream_publish",
+                "cleanup_event_stream_publish",
+                "terminal_event_stream_publish",
+            );
+            let operation = self
+                .cancellation
+                .begin_external_operation(operation_kind, &format!("job:{job_id}"))
+                .expect("journal event stream publication");
+            if let Err(error) = publisher.emit(job_id, at, kind, message).await {
+                operation
+                    .ambiguous("event_stream_publish_failed")
+                    .expect("journal ambiguous event stream publication");
+                let _ = self.cancellation.phase.containment_failed(&error);
+                panic!("failed required job event stream publication: {error:#}");
+            }
+            operation
+                .completed()
+                .expect("journal completed event stream publication");
         }
     }
 }
 
 impl JobEventTranscriptWriter {
-    async fn create(path: &Path) -> anyhow::Result<Self> {
+    async fn create(
+        path: &Path,
+        cancellation: &ExecutionCancellationContext,
+    ) -> anyhow::Result<Self> {
+        let operation = cancellation
+            .begin_external_operation("event_transcript_create", &path.to_string_lossy())?;
         let file = tokio::fs::File::create(path)
             .await
             .with_context(|| format!("create {}", path.display()))?;
-        Ok(Self { file })
+        file.sync_all().await?;
+        operation.completed()?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+        })
     }
 
-    async fn write_event(&mut self, event: &JobEvent) -> anyhow::Result<()> {
+    async fn write_event(
+        &mut self,
+        event: &JobEvent,
+        cancellation: &ExecutionCancellationContext,
+    ) -> anyhow::Result<()> {
+        let operation_kind = event_operation_kind(
+            cancellation.phase.current(),
+            "event_transcript_append",
+            "cleanup_event_transcript_append",
+            "terminal_event_transcript_append",
+        );
+        let operation =
+            cancellation.begin_external_operation(operation_kind, &self.path.to_string_lossy())?;
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
         self.file.write_all(&line).await?;
         self.file.flush().await?;
-        Ok(())
+        self.file.sync_data().await?;
+        operation.completed()
+    }
+}
+
+fn event_operation_kind(
+    phase: AttemptPhase,
+    pre_cleanup: &'static str,
+    cleanup: &'static str,
+    terminal: &'static str,
+) -> &'static str {
+    if phase.rank() >= AttemptPhase::TerminalReporting.rank() {
+        terminal
+    } else if phase.rank() >= AttemptPhase::CleanupRunning.rank() {
+        cleanup
+    } else {
+        pre_cleanup
     }
 }
 
@@ -1842,6 +3500,9 @@ mod tests {
             };
 
             let deadline = JobDeadline::new(job.timeout_secs).unwrap();
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            let cancellation =
+                ExecutionCancellationContext::for_test(&transcript, stop_rx).unwrap();
             let status = supervise_process(
                 &job,
                 &workspace,
@@ -1852,7 +3513,7 @@ mod tests {
                 &deadline,
                 None,
                 None,
-                None,
+                &cancellation,
             )
             .await
             .expect("supervise_process");
@@ -1860,6 +3521,23 @@ mod tests {
             assert!(matches!(status, ExecutionStatus::Exited(0)));
             let n = std::fs::read_to_string(&counter).expect("counter exists");
             assert_eq!(n.trim(), "1");
+            let records = cancellation
+                .operations
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .clone();
+            assert!(records.iter().any(|record| {
+                record.operation_kind == "helper_process"
+                    && record.status == ExternalOperationStatus::Started
+                    && record.resource_identity.contains("pid=")
+            }));
+            assert!(records.iter().any(|record| {
+                record.operation_kind == "helper_process"
+                    && record.status == ExternalOperationStatus::Reconciled
+            }));
+            assert!(cancellation.operations.unresolved().unwrap().is_empty());
 
             let _ = std::fs::remove_dir_all(root);
         });
@@ -1915,6 +3593,9 @@ mod tests {
 
             let started = Instant::now();
             let deadline = JobDeadline::new(job.timeout_secs).unwrap();
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            let cancellation =
+                ExecutionCancellationContext::for_test(&transcript, stop_rx).unwrap();
             let status = supervise_process_with_output_validation(
                 &job,
                 &workspace,
@@ -1929,7 +3610,7 @@ mod tests {
                 &serde_json::json!({}),
                 &EnvironmentValidationTable::for_tests(),
                 None,
-                None,
+                &cancellation,
                 false,
             )
             .await
@@ -1961,7 +3642,7 @@ mod tests {
             let output_path = transcript.join("output.json");
 
             let script = format!(
-                "printf '%s' '{{\"next_event\":\"not_allowed\"}}' > \"{}\"; sleep 5",
+                "printf '%s' '{{\"next_event\":\"not_allowed\"}}' > \"{}\"; trap 'printf trailing-timeout-output; exit 0' TERM; while :; do sleep 1; done",
                 output_path.display()
             );
 
@@ -1994,6 +3675,9 @@ mod tests {
             };
 
             let deadline = JobDeadline::new(job.timeout_secs).unwrap();
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            let cancellation =
+                ExecutionCancellationContext::for_test(&transcript, stop_rx).unwrap();
             let status = supervise_process_with_output_validation(
                 &job,
                 &workspace,
@@ -2008,13 +3692,24 @@ mod tests {
                 &serde_json::json!({}),
                 &EnvironmentValidationTable::for_tests(),
                 None,
-                None,
+                &cancellation,
                 false,
             )
             .await
             .expect("supervise_process_with_output_validation");
 
             assert!(matches!(status, ExecutionStatus::TimedOut));
+            assert!(
+                std::fs::read_to_string(transcript.join("stdout.log"))
+                    .unwrap()
+                    .contains("trailing-timeout-output")
+            );
+            assert_eq!(
+                cancellation
+                    .active_pre_cleanup_operations
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
 
             let _ = std::fs::remove_dir_all(root);
         });
@@ -2073,12 +3768,18 @@ mod tests {
                 canonical_authorization: None,
             };
             let events_path = transcript.join("job-events.jsonl");
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            let cancellation =
+                ExecutionCancellationContext::for_test(&transcript, stop_rx).unwrap();
             let events = JobEventSink {
                 worker_id: "worker".to_string(),
                 writer: Arc::new(Mutex::new(
-                    JobEventTranscriptWriter::create(&events_path).await.unwrap(),
+                    JobEventTranscriptWriter::create(&events_path, &cancellation)
+                        .await
+                        .unwrap(),
                 )),
                 publisher: None,
+                cancellation: cancellation.clone(),
             };
             let redactor = ExactTokenRedactor::new(vec![canary.to_string()]);
             let deadline = JobDeadline::new(job.timeout_secs).unwrap();
@@ -2099,7 +3800,7 @@ mod tests {
                 &serde_json::json!({}),
                 &EnvironmentValidationTable::for_tests(),
                 Some(&events),
-                None,
+                &cancellation,
                 false,
             )
             .await
@@ -2137,8 +3838,11 @@ mod tests {
                 assigned_worker_id: Some("w1".into()),
                 execution_mode: ExecutionMode::Docker,
                 container_image: None,
-                command: "sh".into(),
-                args: vec!["-lc".into(), "sleep 30".into()],
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & echo $$ > parent.pid; echo $! > grandchild.pid; while :; do sleep 1; done".into(),
+                ],
                 env: std::collections::HashMap::new(),
                 prompt: None,
                 context: serde_json::json!({}),
@@ -2161,6 +3865,8 @@ mod tests {
             let stdout_path = transcript.join("stdout.log");
             let stderr_path = transcript.join("stderr.log");
             let env = std::collections::HashMap::new();
+            let cancellation =
+                ExecutionCancellationContext::for_test(&transcript, cancel_rx).unwrap();
 
             let deadline = JobDeadline::new(job.timeout_secs).unwrap();
             let run = supervise_process(
@@ -2173,16 +3879,1177 @@ mod tests {
                 &deadline,
                 None,
                 None,
-                Some(cancel_rx),
+                &cancellation,
             );
 
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            cancel_tx.send(true).expect("send cancel");
+            let monitor_workspace = workspace.clone();
+            let cancel = tokio::spawn(async move {
+                let pid_deadline = Instant::now() + Duration::from_secs(2);
+                while (!monitor_workspace.join("parent.pid").exists()
+                    || !monitor_workspace.join("grandchild.pid").exists())
+                    && Instant::now() < pid_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let parent_pid: i32 =
+                    std::fs::read_to_string(monitor_workspace.join("parent.pid"))
+                        .expect("parent pid")
+                        .trim()
+                        .parse()
+                        .expect("numeric parent pid");
+                let grandchild_pid: i32 =
+                    std::fs::read_to_string(monitor_workspace.join("grandchild.pid"))
+                        .expect("grandchild pid")
+                        .trim()
+                        .parse()
+                        .expect("numeric grandchild pid");
+                cancel_tx.send(true).expect("send cancel");
+                (parent_pid, grandchild_pid)
+            });
 
             let status = run.await.expect("supervise_process");
+            let (parent_pid, grandchild_pid) = cancel.await.expect("cancellation monitor");
             assert!(matches!(status, ExecutionStatus::Cancelled));
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            assert_ne!(unsafe { kill(parent_pid, 0) }, 0);
+            assert_ne!(unsafe { kill(grandchild_pid, 0) }, 0);
 
             let _ = std::fs::remove_dir_all(root);
+        });
+    }
+
+    #[test]
+    fn attempt_phase_store_rejects_regression_and_requires_explicit_recovery() {
+        let root = std::env::temp_dir().join(format!("attempt-phase-{}", uuid::Uuid::new_v4()));
+        let assignment_id = uuid::Uuid::new_v4();
+        let store = AttemptPhaseStore::initialize(&root, assignment_id, uuid::Uuid::nil(), 0)
+            .expect("initialize");
+        store
+            .transition(AttemptPhase::WorkspacePreparing)
+            .expect("workspace preparing");
+        store
+            .transition(AttemptPhase::WorkspacePrepared)
+            .expect("workspace prepared");
+        assert!(store.transition(AttemptPhase::Initialized).is_err());
+        store
+            .containment_failed(&anyhow::anyhow!("synthetic cleanup failure"))
+            .expect("containment failure");
+        assert!(store.transition(AttemptPhase::Completed).is_err());
+        store.recover_to_cleanup().expect("explicit recovery");
+        store
+            .transition(AttemptPhase::Completed)
+            .expect("complete recovery");
+        std::fs::remove_dir_all(root).expect("cleanup phase fixture");
+    }
+
+    #[test]
+    fn operation_journal_is_append_only_idempotent_and_fail_closed() {
+        let root = std::env::temp_dir().join(format!("operation-journal-{}", uuid::Uuid::new_v4()));
+        let assignment_id = uuid::Uuid::new_v4();
+        let job_id = uuid::Uuid::new_v4();
+        let operation_id = uuid::Uuid::new_v4();
+        let journal = OperationJournal::initialize(&root, assignment_id, job_id, 3).unwrap();
+        journal
+            .append(
+                operation_id,
+                "docker_exec_request",
+                AttemptPhase::Running,
+                "container:test",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        journal
+            .append(
+                operation_id,
+                "docker_exec_request",
+                AttemptPhase::Running,
+                "container:test",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .expect("exact duplicate is idempotent");
+        journal
+            .append(
+                operation_id,
+                "docker_exec_request",
+                AttemptPhase::Running,
+                "container:test",
+                ExternalOperationStatus::Completed,
+                None,
+            )
+            .unwrap();
+        assert!(journal.unresolved().unwrap().is_empty());
+        drop(journal);
+
+        let reloaded = OperationJournal::initialize(&root, assignment_id, job_id, 3).unwrap();
+        assert!(reloaded.unresolved().unwrap().is_empty());
+        assert!(
+            reloaded
+                .append(
+                    operation_id,
+                    "docker_exec_request",
+                    AttemptPhase::Running,
+                    "container:conflict",
+                    ExternalOperationStatus::Completed,
+                    None,
+                )
+                .is_err()
+        );
+        assert!(root.join(OPERATION_JOURNAL_QUARANTINE).exists());
+        assert!(OperationJournal::initialize(&root, assignment_id, job_id, 3).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operation_journal_reload_eliminates_split_in_memory_authority() {
+        let root = std::env::temp_dir().join(format!("journal-reload-{}", uuid::Uuid::new_v4()));
+        let assignment = uuid::Uuid::new_v4();
+        let job = uuid::Uuid::new_v4();
+        let first = OperationJournal::initialize(&root, assignment, job, 0).unwrap();
+        let second = OperationJournal::initialize(&root, assignment, job, 0).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        first
+            .append(
+                operation,
+                "producer_reload_test",
+                AttemptPhase::Running,
+                "resource",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        second.reload_from_disk().unwrap();
+        second
+            .append(
+                operation,
+                "producer_reload_test",
+                AttemptPhase::Running,
+                "resource",
+                ExternalOperationStatus::Completed,
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.unresolved().unwrap().len(), 1);
+        first.reload_from_disk().unwrap();
+        assert!(first.unresolved().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hostile_transcript_authority_names_do_not_affect_private_attempt_state() {
+        let root = std::env::temp_dir().join(format!("private-attempt-{}", uuid::Uuid::new_v4()));
+        let data_dir = root.join("worker-data");
+        let transcript = root.join("transcript-mount");
+        std::fs::create_dir_all(&transcript).unwrap();
+        let assignment = uuid::Uuid::new_v4();
+        let job_id = uuid::Uuid::new_v4();
+        let private = private_attempt_root(&data_dir, assignment).unwrap();
+        let phase = AttemptPhaseStore::initialize(&private, assignment, job_id, 3).unwrap();
+        phase.transition(AttemptPhase::WorkspacePreparing).unwrap();
+        let journal = OperationJournal::initialize(&private, assignment, job_id, 3).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        journal
+            .append(
+                operation,
+                "workspace_create",
+                AttemptPhase::WorkspacePreparing,
+                "owned-workspace",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        for name in [
+            "attempt-phase.json",
+            OPERATION_JOURNAL_FILE,
+            "process-runtime.json",
+            AMBIGUOUS_CREATE_MARKER,
+            OPERATION_JOURNAL_QUARANTINE,
+        ] {
+            std::fs::write(transcript.join(name), b"hostile").unwrap();
+            std::fs::remove_file(transcript.join(name)).unwrap();
+        }
+        let reloaded_phase =
+            AttemptPhaseStore::initialize(&private, assignment, job_id, 3).unwrap();
+        assert_eq!(reloaded_phase.current(), AttemptPhase::WorkspacePreparing);
+        let reloaded_journal =
+            OperationJournal::initialize(&private, assignment, job_id, 3).unwrap();
+        assert_eq!(reloaded_journal.unresolved().unwrap().len(), 1);
+        assert!(!transcript.join("attempt-phase.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_attempt_requires_explicit_interrupt_and_positive_cleanup() {
+        let command = protocol::CancellationCommand {
+            cancellation_id: uuid::Uuid::new_v4(),
+            generation: 1,
+            job_id: uuid::Uuid::new_v4(),
+            invocation_id: uuid::Uuid::new_v4(),
+            attempt: 0,
+            assignment_id: uuid::Uuid::new_v4(),
+            runtime_assignment_id: uuid::Uuid::new_v4(),
+            worker_id: "worker".to_string(),
+            worker_session_id: uuid::Uuid::new_v4(),
+            worker_session_generation: 1,
+        };
+        let positive = CancellationAttempt {
+            execution_error: None,
+            stop_reason: Some(WorkerStopReason::CancelRequested(command.clone())),
+            cleanup_error: None,
+            containment: VerifiedContainmentAbsence {
+                checked_at: Utc::now(),
+                process: protocol::ContainmentStatus::VerifiedAbsent,
+                container: protocol::ContainmentStatus::VerifiedAbsent,
+            },
+            explicitly_interrupted: true,
+        };
+        assert!(positive.can_acknowledge());
+        let mut execution_failed = positive.clone();
+        execution_failed.execution_error = Some("unrelated execution error".to_string());
+        assert!(!execution_failed.can_acknowledge());
+        let mut cleanup_failed = positive.clone();
+        cleanup_failed.cleanup_error = Some("cleanup failed".to_string());
+        assert!(!cleanup_failed.can_acknowledge());
+        let mut transport_only = positive;
+        transport_only.stop_reason = Some(WorkerStopReason::ControlPlaneUnavailable);
+        assert!(!transport_only.can_acknowledge());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_mount_plan_rejects_every_private_attempt_overlap_and_alias() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = std::env::temp_dir().join(format!("mount-private-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let assignment = uuid::Uuid::new_v4();
+        let private = private_attempt_root(&data, assignment).unwrap();
+        let runtime = runtime_attempt_root(&data, assignment).unwrap();
+        let other_runtime = runtime_attempt_root(&data, uuid::Uuid::new_v4()).unwrap();
+        durable_write_json(
+            &private,
+            "authority.json",
+            &serde_json::json!({"owned":true}),
+        )
+        .unwrap();
+        let sibling = root.join("safe-sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let private_child = private.join("child");
+        let args = |source: &Path| vec!["-v".to_string(), format!("{}:/safe:ro", source.display())];
+        for source in [&private, private.parent().unwrap(), &data, &private_child] {
+            if !source.exists() {
+                std::fs::create_dir_all(source).unwrap();
+            }
+            assert!(validate_final_docker_mount_plan(&private, &args(source)).is_err());
+        }
+        let alias = root.join("attempt-alias");
+        symlink(private.parent().unwrap(), &alias).unwrap();
+        assert!(validate_final_docker_mount_plan(&private, &args(&alias)).is_err());
+        let hardlink = root.join("authority-hardlink");
+        std::fs::hard_link(private.join("authority.json"), &hardlink).unwrap();
+        std::fs::set_permissions(&hardlink, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_final_docker_mount_plan(&private, &args(&hardlink)).is_err());
+        assert!(validate_final_docker_mount_plan(&private, &args(&runtime)).is_ok());
+        assert!(validate_final_docker_mount_plan(&private, &args(&other_runtime)).is_err());
+        for category in ["additional-repo", "credential", "trusted-runtime", "mcp"] {
+            let safe = sibling.join(category);
+            std::fs::create_dir_all(&safe).unwrap();
+            assert!(validate_final_docker_mount_plan(&private, &args(&safe)).is_ok());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operation_journal_rejects_truncation_malformed_records_and_sequence_gaps() {
+        for (name, bytes) in [
+            ("truncated", br#"{"sequence":1}"#.as_slice()),
+            ("malformed", b"not-json\n".as_slice()),
+            (
+                "gap",
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&ExternalOperationRecord {
+                        sequence: 2,
+                        operation_id: uuid::Uuid::new_v4(),
+                        operation_kind: "workspace_create".to_string(),
+                        operation_class: ExternalOperationClass::PreCleanupProducer,
+                        lifecycle_phase: AttemptPhase::WorkspacePreparing,
+                        resource_identity: "workspace:test".to_string(),
+                        status: ExternalOperationStatus::Started,
+                        recorded_at: Utc::now(),
+                        assignment_id: uuid::Uuid::nil(),
+                        job_id: uuid::Uuid::nil(),
+                        attempt: 0,
+                        error_category: None,
+                    })
+                    .unwrap()
+                )
+                .as_bytes(),
+            ),
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("operation-journal-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(OPERATION_JOURNAL_FILE), bytes).unwrap();
+            assert!(
+                OperationJournal::initialize(&root, uuid::Uuid::nil(), uuid::Uuid::nil(), 0)
+                    .is_err(),
+                "{name}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn operation_journal_tracks_owned_resources_and_rejects_phase_regression() {
+        let root = std::env::temp_dir().join(format!(
+            "operation-resource-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let journal =
+            OperationJournal::initialize(&root, uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 0)
+                .unwrap();
+        let create_id = uuid::Uuid::new_v4();
+        journal
+            .append(
+                create_id,
+                "credential_materialize",
+                AttemptPhase::CredentialsResolving,
+                "/tmp/agent-hub-cred-test",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        journal
+            .append(
+                create_id,
+                "credential_materialize",
+                AttemptPhase::CredentialsResolving,
+                "/tmp/agent-hub-cred-test",
+                ExternalOperationStatus::Completed,
+                None,
+            )
+            .unwrap();
+        assert_eq!(journal.unresolved().unwrap().len(), 1);
+        journal
+            .reconcile_owned_resource("/tmp/agent-hub-cred-test")
+            .unwrap();
+        assert!(journal.unresolved().unwrap().is_empty());
+        assert!(
+            journal
+                .append(
+                    uuid::Uuid::new_v4(),
+                    "workspace_create",
+                    AttemptPhase::WorkspacePreparing,
+                    "/tmp/workspace",
+                    ExternalOperationStatus::Started,
+                    None,
+                )
+                .is_err()
+        );
+        assert!(root.join(OPERATION_JOURNAL_QUARANTINE).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restart_reconciliation_dispatches_every_lifecycle_phase() {
+        let phases = [
+            AttemptPhase::Initialized,
+            AttemptPhase::WorkspacePreparing,
+            AttemptPhase::WorkspacePrepared,
+            AttemptPhase::CredentialsResolving,
+            AttemptPhase::CredentialsResolved,
+            AttemptPhase::BundleMaterializing,
+            AttemptPhase::BundleMaterialized,
+            AttemptPhase::DockerCreateSubmitting,
+            AttemptPhase::DockerCreateSubmitted,
+            AttemptPhase::DockerCreated,
+            AttemptPhase::DockerStartSubmitting,
+            AttemptPhase::DockerStarted,
+            AttemptPhase::Running,
+            AttemptPhase::PostExit,
+            AttemptPhase::CleanupRunning,
+            AttemptPhase::TerminalReporting,
+            AttemptPhase::ContainmentFailed,
+            AttemptPhase::Completed,
+        ];
+        for phase in phases {
+            let scope = reconciliation_scope(phase);
+            assert_eq!(
+                scope.workspace,
+                phase.rank() >= AttemptPhase::WorkspacePreparing.rank(),
+                "{phase:?}"
+            );
+            assert_eq!(
+                scope.credentials,
+                phase.rank() >= AttemptPhase::CredentialsResolving.rank(),
+                "{phase:?}"
+            );
+            assert_eq!(
+                scope.bundle,
+                phase.rank() >= AttemptPhase::BundleMaterializing.rank(),
+                "{phase:?}"
+            );
+        }
+        assert!(
+            validate_operation_within_reconciliation_scope(
+                reconciliation_scope(AttemptPhase::Initialized),
+                "workspace_create",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_operation_within_reconciliation_scope(
+                reconciliation_scope(AttemptPhase::WorkspacePreparing),
+                "credential_materialize",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_operation_within_reconciliation_scope(
+                reconciliation_scope(AttemptPhase::BundleMaterialized),
+                "docker_create_request",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_operation_within_reconciliation_scope(
+                reconciliation_scope(AttemptPhase::DockerCreateSubmitting),
+                "docker_create_request",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cleanup_running_after_hook_observes_persisted_phase_before_cleanup() {
+        let _environment = execution_fault_environment_lock();
+        let root = std::env::temp_dir().join(format!("cleanup-hook-{}", uuid::Uuid::new_v4()));
+        let ready = root.with_extension("ready");
+        let release = root.with_extension("release");
+        let assignment = uuid::Uuid::new_v4();
+        let job = uuid::Uuid::new_v4();
+        let store = Arc::new(AttemptPhaseStore::initialize(&root, assignment, job, 0).unwrap());
+        unsafe {
+            std::env::set_var(
+                "AGENT_HUB_TEST_EXECUTION_FAULT",
+                "pause:lifecycle:cleanup_running:after",
+            );
+            std::env::set_var("AGENT_HUB_TEST_EXECUTION_FAULT_READY", &ready);
+            std::env::set_var("AGENT_HUB_TEST_EXECUTION_FAULT_RELEASE", &release);
+        }
+        let transition = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.transition(AttemptPhase::CleanupRunning))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready.exists());
+        let persisted: AttemptPhaseRecord =
+            serde_json::from_slice(&read_private_regular(&root, "attempt-phase.json").unwrap())
+                .unwrap();
+        assert_eq!(persisted.phase, AttemptPhase::CleanupRunning);
+        assert!(!transition.is_finished());
+        std::fs::write(&release, b"release").unwrap();
+        transition.join().unwrap().unwrap();
+        unsafe {
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT");
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT_READY");
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT_RELEASE");
+        }
+        let _ = std::fs::remove_file(ready);
+        let _ = std::fs::remove_file(release);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_running_allows_unresolved_operations_until_reconciled() {
+        let root = std::env::temp_dir().join(format!("cleanup-open-{}", uuid::Uuid::new_v4()));
+        let assignment = uuid::Uuid::new_v4();
+        let job = uuid::Uuid::new_v4();
+        let store = AttemptPhaseStore::initialize(&root, assignment, job, 0).unwrap();
+        store.transition(AttemptPhase::CleanupRunning).unwrap();
+        let journal = OperationJournal::initialize(&root, assignment, job, 0).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        journal
+            .append(
+                operation,
+                "workspace_remove",
+                AttemptPhase::CleanupRunning,
+                "/tmp/owned-cleanup",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        assert_eq!(journal.unresolved().unwrap().len(), 1);
+        assert_eq!(store.current(), AttemptPhase::CleanupRunning);
+        journal
+            .append(
+                operation,
+                "workspace_remove",
+                AttemptPhase::CleanupRunning,
+                "/tmp/owned-cleanup",
+                ExternalOperationStatus::Reconciled,
+                None,
+            )
+            .unwrap();
+        assert!(journal.unresolved().unwrap().is_empty());
+        assert!(store.begin_terminal_reporting().is_ok());
+        assert_eq!(store.current(), AttemptPhase::TerminalReporting);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cleanup_barrier_joins_all_producers_and_fences_late_starts() {
+        for iteration in 0..32 {
+            let root = std::env::temp_dir().join(format!(
+                "cleanup-barrier-{iteration}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            let context = Arc::new(ExecutionCancellationContext::for_test(&root, stop_rx).unwrap());
+            context.phase.transition(AttemptPhase::Running).unwrap();
+            let entered = Arc::new(std::sync::Barrier::new(9));
+            let release = Arc::new(std::sync::Barrier::new(9));
+            let mut producers = Vec::new();
+            for index in 0..8 {
+                let context = Arc::clone(&context);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                producers.push(std::thread::spawn(move || {
+                    let operation = context
+                        .begin_external_operation(
+                            &format!("producer_{index}"),
+                            &format!("resource-{index}"),
+                        )
+                        .unwrap();
+                    entered.wait();
+                    release.wait();
+                    operation.completed().unwrap();
+                }));
+            }
+            entered.wait();
+            let cleanup = {
+                let context = Arc::clone(&context);
+                tokio::spawn(async move { context.transition_cleanup().await })
+            };
+            tokio::task::yield_now().await;
+            assert_eq!(context.phase.current(), AttemptPhase::Running);
+            release.wait();
+            for producer in producers {
+                producer.join().unwrap();
+            }
+            cleanup.await.unwrap().unwrap();
+            assert_eq!(context.phase.current(), AttemptPhase::CleanupRunning);
+            assert!(
+                context
+                    .begin_external_operation("late_producer", "late")
+                    .is_err(),
+                "pre-cleanup producer must remain fenced"
+            );
+            context
+                .begin_external_operation("workspace_remove", "cleanup")
+                .unwrap()
+                .completed()
+                .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_barrier_reports_exact_unresolved_pre_cleanup_operation() {
+        let root =
+            std::env::temp_dir().join(format!("cleanup-diagnostic-{}", uuid::Uuid::new_v4()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let context = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
+        context.phase.transition(AttemptPhase::Running).unwrap();
+        let operation_id = uuid::Uuid::new_v4();
+        context
+            .operations
+            .append(
+                operation_id,
+                "docker_logs_helper_process",
+                AttemptPhase::Running,
+                "helper",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        let error = context.transition_cleanup().await.unwrap_err();
+        assert!(error.to_string().contains(&operation_id.to_string()));
+        assert!(error.to_string().contains("docker_logs_helper_process"));
+        assert_eq!(context.phase.current(), AttemptPhase::Running);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconciled_workspace_preparing_enters_persisted_cleanup_before_reporting() {
+        let _environment = execution_fault_environment_lock();
+        let root = std::env::temp_dir().join(format!("early-cleanup-{}", uuid::Uuid::new_v4()));
+        let ready = root.with_extension("ready");
+        let release = root.with_extension("release");
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let context = Arc::new(ExecutionCancellationContext::for_test(&root, stop_rx).unwrap());
+        context
+            .phase
+            .transition(AttemptPhase::WorkspacePreparing)
+            .unwrap();
+        let operation = uuid::Uuid::new_v4();
+        context
+            .operations
+            .append(
+                operation,
+                "workspace_git_inspect",
+                AttemptPhase::WorkspacePreparing,
+                "workspace",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        context
+            .operations
+            .append(
+                operation,
+                "workspace_git_inspect",
+                AttemptPhase::WorkspacePreparing,
+                "workspace",
+                ExternalOperationStatus::Reconciled,
+                None,
+            )
+            .unwrap();
+        unsafe {
+            std::env::set_var(
+                "AGENT_HUB_TEST_EXECUTION_FAULT",
+                "pause:lifecycle:cleanup_running:after",
+            );
+            std::env::set_var("AGENT_HUB_TEST_EXECUTION_FAULT_READY", &ready);
+            std::env::set_var("AGENT_HUB_TEST_EXECUTION_FAULT_RELEASE", &release);
+        }
+        let transition = {
+            let context = Arc::clone(&context);
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(ensure_cleanup_phase_after_reconciliation(&context))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready.exists());
+        let persisted: AttemptPhaseRecord =
+            serde_json::from_slice(&read_private_regular(&root, "attempt-phase.json").unwrap())
+                .unwrap();
+        assert_eq!(persisted.phase, AttemptPhase::CleanupRunning);
+        assert_ne!(persisted.phase, AttemptPhase::TerminalReporting);
+        std::fs::write(&release, b"release").unwrap();
+        transition.join().unwrap().unwrap();
+        unsafe {
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT");
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT_READY");
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT_RELEASE");
+        }
+        let _ = std::fs::remove_file(ready);
+        let _ = std::fs::remove_file(release);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn operation_classes_enforce_cleanup_and_terminal_reporting_boundaries() {
+        let root = std::env::temp_dir().join(format!("operation-class-{}", uuid::Uuid::new_v4()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let context = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
+        context.phase.transition(AttemptPhase::Running).unwrap();
+        assert_eq!(
+            classify_external_operation("process_stream_persist").unwrap(),
+            ExternalOperationClass::PreCleanupProducer
+        );
+        assert_eq!(
+            classify_external_operation("workspace_remove").unwrap(),
+            ExternalOperationClass::Cleanup
+        );
+        assert_eq!(
+            classify_external_operation("terminal_event_transcript_append").unwrap(),
+            ExternalOperationClass::TerminalReporting
+        );
+        assert_eq!(
+            classify_external_operation("terminal_report").unwrap(),
+            ExternalOperationClass::TerminalReporting
+        );
+        context.transition_cleanup().await.unwrap();
+        assert!(
+            context
+                .begin_external_operation("process_stream_persist", "late")
+                .is_err()
+        );
+        context
+            .begin_external_operation("workspace_remove", "owned")
+            .unwrap()
+            .reconciled()
+            .unwrap();
+        assert!(
+            context
+                .begin_external_operation("terminal_event_transcript_append", "event")
+                .is_err()
+        );
+        context.begin_terminal_reporting().unwrap();
+        context
+            .begin_external_operation("terminal_event_transcript_append", "event")
+            .unwrap()
+            .completed()
+            .unwrap();
+        context.phase.transition(AttemptPhase::Completed).unwrap();
+        context.finalize_private_state().unwrap();
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn real_job_event_sink_uses_cleanup_class_for_success_and_warning() {
+        let root = std::env::temp_dir().join(format!("cleanup-events-{}", uuid::Uuid::new_v4()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let context = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
+        context.phase.transition(AttemptPhase::Running).unwrap();
+        let writer = JobEventTranscriptWriter::create(&root.join("events.jsonl"), &context)
+            .await
+            .unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let sink = JobEventSink {
+            worker_id: "worker".to_string(),
+            writer: Arc::new(Mutex::new(writer)),
+            publisher: Some(JobEventPublisher {
+                worker_id: "worker".to_string(),
+                tx: event_tx,
+            }),
+            cancellation: context.clone(),
+        };
+        context.transition_cleanup().await.unwrap();
+        sink.emit(
+            uuid::Uuid::new_v4(),
+            pb::JobEventKind::JobEventSystem,
+            "workspace cleaned".to_string(),
+        )
+        .await;
+        assert!(event_rx.recv().await.is_some());
+        sink.emit(
+            uuid::Uuid::new_v4(),
+            pb::JobEventKind::JobEventSystem,
+            "branch-delete warning".to_string(),
+        )
+        .await;
+        assert!(event_rx.recv().await.is_some());
+        let records = context.operations.state.lock().unwrap().records.clone();
+        let cleanup_events = records
+            .iter()
+            .filter(|record| record.operation_kind == "cleanup_event_transcript_append")
+            .collect::<Vec<_>>();
+        assert_eq!(cleanup_events.len(), 4);
+        assert!(cleanup_events.iter().all(|record| {
+            record.operation_class == ExternalOperationClass::Cleanup
+                && matches!(
+                    record.status,
+                    ExternalOperationStatus::Started | ExternalOperationStatus::Completed
+                )
+        }));
+        let cleanup_publishes = records
+            .iter()
+            .filter(|record| record.operation_kind == "cleanup_event_stream_publish")
+            .collect::<Vec<_>>();
+        assert_eq!(cleanup_publishes.len(), 4);
+        assert!(
+            cleanup_publishes
+                .iter()
+                .all(|record| record.operation_class == ExternalOperationClass::Cleanup)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_report_rebind_updates_only_delivery_fence_and_is_repeatable() {
+        let job_id = uuid::Uuid::new_v4();
+        let invocation_id = uuid::Uuid::new_v4();
+        let cancellation_id = uuid::Uuid::new_v4();
+        let runtime_assignment_id = uuid::Uuid::new_v4();
+        let old_session = uuid::Uuid::new_v4();
+        let old_assignment = protocol::cancellation_assignment_id(
+            job_id,
+            invocation_id,
+            2,
+            "worker",
+            old_session,
+            1,
+        );
+        let old = protocol::CancellationCommand {
+            cancellation_id,
+            generation: 1,
+            job_id,
+            invocation_id,
+            attempt: 2,
+            assignment_id: old_assignment,
+            runtime_assignment_id,
+            worker_id: "worker".to_string(),
+            worker_session_id: old_session,
+            worker_session_generation: 1,
+        };
+        let mut result = cancelled_before_execution_result("transcript");
+        result.cancellation_acknowledgement = Some(protocol::CancellationAcknowledgement {
+            command: old.clone(),
+            containment: protocol::ContainmentAbsenceEvidence {
+                checked_at: Utc::now(),
+                process: protocol::ContainmentStatus::VerifiedAbsent,
+                container: protocol::ContainmentStatus::VerifiedAbsent,
+            },
+        });
+        let mut report = PersistedTerminalReport {
+            assignment_id: runtime_assignment_id,
+            job_id,
+            cancellation_id: Some(cancellation_id),
+            runtime_assignment_id,
+            invocation_id: Some(invocation_id),
+            attempt: 2,
+            delivery_command: Some(old),
+            state: JobState::Cancelled,
+            transcript_dir: Some("transcript".to_string()),
+            result,
+        };
+        let new_session = uuid::Uuid::new_v4();
+        let current = protocol::CancellationCommand {
+            assignment_id: protocol::cancellation_assignment_id(
+                job_id,
+                invocation_id,
+                2,
+                "worker",
+                new_session,
+                2,
+            ),
+            generation: 2,
+            worker_session_id: new_session,
+            worker_session_generation: 2,
+            ..report.delivery_command.clone().unwrap()
+        };
+        assert!(rebind_terminal_report(&mut report, &current).unwrap());
+        assert_eq!(report.runtime_assignment_id, runtime_assignment_id);
+        assert_eq!(report.cancellation_id, Some(cancellation_id));
+        assert_eq!(report.delivery_command.as_ref(), Some(&current));
+        assert!(!rebind_terminal_report(&mut report, &current).unwrap());
+        let mut tampered = current;
+        tampered.invocation_id = uuid::Uuid::new_v4();
+        assert!(rebind_terminal_report(&mut report, &tampered).is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_16_containment_failed_ambiguous_report_reenters_cleanup() {
+        let root =
+            std::env::temp_dir().join(format!("runtime-16-recovery-{}", uuid::Uuid::new_v4()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let context = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
+        context.phase.transition(AttemptPhase::Running).unwrap();
+        context
+            .phase
+            .containment_failed(&anyhow::anyhow!("seeded containment failure"))
+            .unwrap();
+        let operation = uuid::Uuid::new_v4();
+        context
+            .operations
+            .append(
+                operation,
+                "terminal_report",
+                AttemptPhase::TerminalReporting,
+                "job:seeded:cancelled",
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        context
+            .operations
+            .append(
+                operation,
+                "terminal_report",
+                AttemptPhase::TerminalReporting,
+                "job:seeded:cancelled",
+                ExternalOperationStatus::Ambiguous,
+                Some("response_lost"),
+            )
+            .unwrap();
+        context
+            .operations
+            .append(
+                operation,
+                "terminal_report",
+                AttemptPhase::TerminalReporting,
+                "job:seeded:cancelled",
+                ExternalOperationStatus::Reconciled,
+                None,
+            )
+            .unwrap();
+        ensure_cleanup_phase_after_reconciliation(&context)
+            .await
+            .unwrap();
+        assert_eq!(context.phase.current(), AttemptPhase::CleanupRunning);
+        assert!(context.operations.unresolved().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn execution_fault_environment_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    #[test]
+    fn central_execution_fault_hook_targets_every_lifecycle_and_operation_boundary() {
+        let _guard = execution_fault_environment_lock();
+        let phases = [
+            AttemptPhase::Initialized,
+            AttemptPhase::WorkspacePreparing,
+            AttemptPhase::WorkspacePrepared,
+            AttemptPhase::CredentialsResolving,
+            AttemptPhase::CredentialsResolved,
+            AttemptPhase::BundleMaterializing,
+            AttemptPhase::BundleMaterialized,
+            AttemptPhase::DockerCreateSubmitting,
+            AttemptPhase::DockerCreateSubmitted,
+            AttemptPhase::DockerCreated,
+            AttemptPhase::DockerStartSubmitting,
+            AttemptPhase::DockerStarted,
+            AttemptPhase::Running,
+            AttemptPhase::PostExit,
+            AttemptPhase::CleanupRunning,
+            AttemptPhase::TerminalReporting,
+            AttemptPhase::ContainmentFailed,
+            AttemptPhase::Completed,
+        ];
+        let statuses = [
+            ExternalOperationStatus::Started,
+            ExternalOperationStatus::Completed,
+            ExternalOperationStatus::Ambiguous,
+            ExternalOperationStatus::CleanupFailed,
+            ExternalOperationStatus::Reconciled,
+        ];
+        let mut boundaries = Vec::new();
+        for phase in phases {
+            for edge in ["before", "after"] {
+                boundaries.push(lifecycle_fault_boundary(phase, edge));
+            }
+        }
+        for status in statuses {
+            for edge in ["before", "after"] {
+                boundaries.push(operation_fault_boundary("audit_effect", &status, edge));
+            }
+        }
+        for boundary in boundaries {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_HUB_TEST_EXECUTION_FAULT",
+                    format!("error:{boundary}"),
+                );
+            }
+            assert!(execution_fault_hook(&boundary).is_err(), "{boundary}");
+        }
+        unsafe {
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT");
+        }
+    }
+
+    #[test]
+    fn central_execution_pause_hook_uses_ready_and_release_files() {
+        let _guard = execution_fault_environment_lock();
+        let root =
+            std::env::temp_dir().join(format!("execution-pause-hook-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ready = root.join("ready");
+        let release = root.join("release");
+        unsafe {
+            std::env::set_var(
+                "AGENT_HUB_TEST_EXECUTION_FAULT",
+                "pause:operation:audit_effect:started:before",
+            );
+            std::env::set_var("AGENT_HUB_TEST_EXECUTION_FAULT_READY", &ready);
+            std::env::set_var("AGENT_HUB_TEST_EXECUTION_FAULT_RELEASE", &release);
+        }
+        let ready_for_release = ready.clone();
+        let release_for_thread = release.clone();
+        let releaser = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready_for_release.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::write(release_for_thread, b"release\n").unwrap();
+        });
+        execution_fault_hook("operation:audit_effect:started:before").unwrap();
+        releaser.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ready).unwrap(),
+            "operation:audit_effect:started:before\n"
+        );
+        unsafe {
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT");
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT_READY");
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT_RELEASE");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "subprocess helper; set AGENT_HUB_EXECUTION_FAULT_HELPER=1"]
+    fn subprocess_execution_fault_helper() {
+        if std::env::var("AGENT_HUB_EXECUTION_FAULT_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+        let boundary = std::env::var("AGENT_HUB_EXECUTION_FAULT_BOUNDARY")
+            .expect("helper boundary is required");
+        execution_fault_hook(&boundary).expect("fault helper boundary");
+    }
+
+    #[test]
+    fn production_external_effect_inventory_is_reviewed() {
+        use std::hash::{Hash, Hasher};
+
+        const HELPERS: &[&str] = &[
+            "AttemptPhaseStore",
+            "OperationJournal",
+            "JobEventPublisher",
+            "JobEventTranscriptWriter",
+            "ExecutionCancellationContext",
+            "prepare_workspace",
+            "cleanup_workspace",
+            "run_status",
+            "git_output",
+            "resolve_all_for_job",
+            "resolve_opencode_chatgpt_oauth",
+            "McpBridgeInstance",
+            "handle_mcp_connection",
+            "ReqwestGithubHttpTransport",
+            "TokioGitCommandRunner",
+            "TemporaryCredentialFile",
+            "DockerCli",
+            "reconcile_operation_journals",
+            "run_before_deadline_with_budget",
+            "supervise_process_with_output_validation",
+            "supervise_process_with_mode",
+            "pump_process_stream",
+            "validate_opencode_output",
+            "validate_opencode_output_snapshot",
+            "finalize_redacted_output_artifact",
+            "write_agent_context_file",
+        ];
+        const TOKENS: &[&str] = &[
+            "std::fs::write",
+            "tokio::fs::write",
+            "std::fs::remove_file",
+            "tokio::fs::remove_file",
+            "std::fs::remove_dir_all",
+            "tokio::fs::remove_dir_all",
+            "std::fs::rename",
+            "std::fs::copy",
+            ".spawn()",
+            ".output()",
+            ".status()",
+            ".send(",
+            "UnixListener::bind",
+            "UnixStream::connect",
+            "TcpStream::connect",
+            ".write_all(",
+            ".flush()",
+            ".sync_all()",
+            ".sync_data()",
+        ];
+        let sources = [
+            ("main.rs", include_str!("main.rs")),
+            ("workspace.rs", include_str!("workspace.rs")),
+            (
+                "credential_provider.rs",
+                include_str!("credential_provider.rs"),
+            ),
+            ("mcp_bridge.rs", include_str!("mcp_bridge.rs")),
+            ("artifacts.rs", include_str!("artifacts.rs")),
+        ];
+        for helper in HELPERS {
+            assert!(
+                sources.iter().any(|(_, source)| source.contains(helper)),
+                "external-effect helper '{helper}' disappeared without inventory review"
+            );
+        }
+        let mut effects = Vec::new();
+        for (file, source) in sources {
+            for (index, line) in source.lines().enumerate() {
+                if TOKENS.iter().any(|token| line.contains(token)) {
+                    effects.push(format!("{file}:{}:{}", index + 1, line.trim()));
+                }
+            }
+        }
+        effects.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        effects.hash(&mut hasher);
+        assert_eq!(
+            hasher.finish(),
+            3_799_050_633_098_046_889,
+            "external-effect source inventory changed; audit every changed helper and update the reviewed fingerprint"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_recovery_refuses_reused_process_identity() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let mut identity = read_process_identity(i32::try_from(std::process::id()).unwrap())
+                .expect("current process identity");
+            identity.proc_start_time_ticks = identity.proc_start_time_ticks.saturating_add(1);
+            let error = terminate_persisted_process(&identity)
+                .await
+                .expect_err("reused PID identity must be rejected");
+            assert!(error.to_string().contains("PID-reuse"));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_cleanup_rediscovers_members_added_after_enumeration() {
+        use std::os::unix::process::CommandExt as _;
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let mut leader_command = std::process::Command::new("sleep");
+            leader_command.arg("30").process_group(0);
+            let mut leader = leader_command.spawn().expect("spawn process group leader");
+            let leader_pid = i32::try_from(leader.id()).unwrap();
+            let identity = read_process_identity(leader_pid).expect("leader identity");
+            let spawned_member = Arc::new(std::sync::Mutex::new(None));
+            let hook_member = Arc::clone(&spawned_member);
+            let invoked = Arc::new(AtomicBool::new(false));
+            let hook_invoked = Arc::clone(&invoked);
+            *process_group_membership_fault_hook().lock().unwrap() = Some(Box::new(move || {
+                if hook_invoked.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let mut command = std::process::Command::new("sleep");
+                command.arg("30").process_group(identity.pgid);
+                *hook_member.lock().unwrap() = Some(command.spawn().expect("spawn late member"));
+            }));
+
+            terminate_persisted_process(&identity)
+                .await
+                .expect("terminate mutating process group");
+            *process_group_membership_fault_hook().lock().unwrap() = None;
+            let _ = leader.wait();
+            let mut member = spawned_member
+                .lock()
+                .unwrap()
+                .take()
+                .expect("fault hook spawned member");
+            let status = member.wait().expect("reap late member");
+            assert!(!status.success());
+            assert!(
+                owned_process_group_members(identity.pgid, &identity.linux_boot_id)
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -2948,6 +5815,8 @@ mod tests {
                 .expect("git worktree add");
             assert!(add_wt.success());
 
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
             cleanup_workspace(
                 &job,
                 &PreparedWorkspace {
@@ -2957,6 +5826,7 @@ mod tests {
                     additional_repo_mounts: Vec::new(),
                 },
                 None,
+                &cancellation,
             )
             .await
             .expect("cleanup");
@@ -3112,6 +5982,9 @@ mod tests {
         };
 
         let agent_context_path = transcript_dir.join(".agent-context.json");
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let cancellation =
+            ExecutionCancellationContext::for_test(&transcript_dir, stop_rx).unwrap();
         write_agent_context_file(
             &agent_context_path,
             &job,
@@ -3122,6 +5995,7 @@ mod tests {
                 additional_repo_mounts: vec![],
                 agent_output_events: Vec::new(),
             },
+            &cancellation,
         )
         .expect("write agent context");
 
@@ -3148,6 +6022,7 @@ mod tests {
                 additional_repo_mounts: vec![],
                 agent_output_events: Vec::new(),
             },
+            &cancellation,
         )
         .expect("write changed-attempt context");
         let changed: serde_json::Value = serde_json::from_slice(
@@ -3250,6 +6125,9 @@ mod tests {
         };
 
         let agent_context_path = transcript_dir.join(".agent-context.json");
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let cancellation =
+            ExecutionCancellationContext::for_test(&transcript_dir, stop_rx).unwrap();
         write_agent_context_file(
             &agent_context_path,
             &job,
@@ -3260,6 +6138,7 @@ mod tests {
                 additional_repo_mounts: vec![],
                 agent_output_events: Vec::new(),
             },
+            &cancellation,
         )
         .expect("write agent context");
 
@@ -3435,6 +6314,9 @@ mod tests {
         };
 
         let agent_context_path = transcript_dir.join(".agent-context.json");
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let cancellation =
+            ExecutionCancellationContext::for_test(&transcript_dir, stop_rx).unwrap();
         write_agent_context_file(
             &agent_context_path,
             &job,
@@ -3445,6 +6327,7 @@ mod tests {
                 additional_repo_mounts: vec![],
                 agent_output_events: vec!["job_succeeded".to_string()],
             },
+            &cancellation,
         )
         .expect("write agent context");
 
@@ -3635,6 +6518,8 @@ async fn main() -> anyhow::Result<()> {
                 .context("failed to connect gRPC endpoint")?;
             Client::Grpc(GrpcClient {
                 client: pb::worker_lifecycle_client::WorkerLifecycleClient::new(channel),
+                http: reqwest::Client::new(),
+                base: cli.server.trim_end_matches('/').to_string(),
                 token: cli.token.map(Secret::new),
                 worker_session: Arc::new(RwLock::new(None)),
                 server_capability_state: Arc::new(RwLock::new(None)),
@@ -3643,6 +6528,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut event_publisher = None;
+    let mut cancellation_stream = None;
+    let mut event_stream_task = None;
+    let mut cancellation_stream_task = None;
 
     let client = Arc::new(client);
 
@@ -3659,18 +6547,6 @@ async fn main() -> anyhow::Result<()> {
             resolved_label, resolved_clone.kind, resolved_clone.command
         );
     }
-    reconcile_opencode_startup(
-        &cli.data_dir,
-        &DockerCli::production(),
-        &local_agent_config.installation_id,
-        &local_agent_config.config_identity,
-        &cli.worker_id,
-        STARTUP_RECONCILIATION_MAX_ITEMS,
-        STARTUP_RECONCILIATION_TIMEOUT,
-        Arc::new(SystemWallClock),
-    )
-    .await
-    .context("startup OpenCode container/state reconciliation failed")?;
     let repo_cache_dir = cli.data_dir.join("repo-cache");
     let remote_repos = validate_triage_repos_and_prime_cache(&local_agent_config, &repo_cache_dir)
         .context("failed to validate configured triage repos")?;
@@ -3681,10 +6557,17 @@ async fn main() -> anyhow::Result<()> {
     );
     let egress_manager = EgressManager::new(&cli.worker_id, &cli.data_dir, local_agent_config)
         .context("failed to initialize local-agent egress manager")?;
-    egress_manager
-        .preflight_llm_only()
-        .await
-        .context("assignment-driven triage requires enforceable agent/model API egress")?;
+    #[cfg(any(test, feature = "test-fault-hooks"))]
+    let skip_egress_preflight =
+        std::env::var("AGENT_HUB_TEST_SKIP_EGRESS_PREFLIGHT").as_deref() == Ok("1");
+    #[cfg(not(any(test, feature = "test-fault-hooks")))]
+    let skip_egress_preflight = false;
+    if !skip_egress_preflight {
+        egress_manager
+            .preflight_llm_only()
+            .await
+            .context("assignment-driven triage requires enforceable agent/model API egress")?;
+    }
     let repos_root = cli.data_dir.join("repos");
     std::fs::create_dir_all(&repos_root)?;
     let worktrees_root = cli.data_dir.join("worktrees");
@@ -3696,6 +6579,17 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&artifact_store_root)?;
     let transcripts_root = artifact_store_root.join("transcripts");
     std::fs::create_dir_all(&transcripts_root)?;
+    reconcile_cancellation_resources(
+        &cli.data_dir,
+        &transcripts_root,
+        &egress_manager.config().installation_id,
+        &egress_manager.config().config_identity,
+        &cli.worker_id,
+        STARTUP_RECONCILIATION_MAX_ITEMS,
+        STARTUP_RECONCILIATION_TIMEOUT,
+    )
+    .await
+    .context("startup execution resource reconciliation failed")?;
 
     if let Err(error) =
         cleanup_old_transcripts(&transcripts_root, cli.transcript_retention_hours).await
@@ -3716,7 +6610,7 @@ async fn main() -> anyhow::Result<()> {
         let session = client
             .worker_session()
             .context("worker registration returned no session")?;
-        let tx = start_grpc_event_stream(
+        let event_stream = start_grpc_event_stream(
             grpc.client.clone(),
             grpc.token.clone(),
             &cli.worker_id,
@@ -3725,9 +6619,27 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         event_publisher = Some(JobEventPublisher {
             worker_id: cli.worker_id.clone(),
-            tx,
+            tx: event_stream.sender,
         });
+        event_stream_task = Some(event_stream.task);
+        let control_stream = start_grpc_cancellation_stream(
+            grpc.client.clone(),
+            grpc.token.clone(),
+            &cli.worker_id,
+            &session,
+        )
+        .await?;
+        cancellation_stream = Some(Arc::new(Mutex::new(control_stream.receiver)));
+        cancellation_stream_task = Some(control_stream.task);
     }
+    recover_terminal_reporting_attempts(
+        &cli.data_dir,
+        client.as_ref(),
+        &cli.worker_id,
+        &egress_manager.config().installation_id,
+        &egress_manager.config().config_identity,
+    )
+    .await?;
 
     loop {
         if last_transcript_cleanup.elapsed()
@@ -3760,6 +6672,16 @@ async fn main() -> anyhow::Result<()> {
                 {
                     eprintln!("worker re-registration failed: {register_error}");
                 } else if let Client::Grpc(grpc) = client.as_ref() {
+                    event_publisher = None;
+                    cancellation_stream = None;
+                    if let Some(task) = event_stream_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    if let Some(task) = cancellation_stream_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
                     let session = client
                         .worker_session()
                         .expect("re-registration returned no worker session");
@@ -3771,11 +6693,32 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                     {
-                        Ok(tx) => {
+                        Ok(event_stream) => {
                             event_publisher = Some(JobEventPublisher {
                                 worker_id: cli.worker_id.clone(),
-                                tx,
+                                tx: event_stream.sender,
                             });
+                            event_stream_task = Some(event_stream.task);
+                            match start_grpc_cancellation_stream(
+                                grpc.client.clone(),
+                                grpc.token.clone(),
+                                &cli.worker_id,
+                                &session,
+                            )
+                            .await
+                            {
+                                Ok(control_stream) => {
+                                    cancellation_stream =
+                                        Some(Arc::new(Mutex::new(control_stream.receiver)));
+                                    cancellation_stream_task = Some(control_stream.task);
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "failed to restart gRPC cancellation stream: {error:#}"
+                                    );
+                                    cancellation_stream = None;
+                                }
+                            }
                         }
                         Err(stream_error) => {
                             eprintln!("failed to restart gRPC event stream: {stream_error:#}");
@@ -3792,8 +6735,8 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        let polled_job = match client.poll(&cli.worker_id).await {
-            Ok(job) => job,
+        let poll_response = match client.poll(&cli.worker_id).await {
+            Ok(response) => response,
             Err(error) => {
                 eprintln!("poll failed: {error}");
                 if is_worker_not_found_error(&error) {
@@ -3808,6 +6751,16 @@ async fn main() -> anyhow::Result<()> {
                     {
                         eprintln!("worker re-registration failed: {register_error}");
                     } else if let Client::Grpc(grpc) = client.as_ref() {
+                        event_publisher = None;
+                        cancellation_stream = None;
+                        if let Some(task) = event_stream_task.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        if let Some(task) = cancellation_stream_task.take() {
+                            task.abort();
+                            let _ = task.await;
+                        }
                         let session = client
                             .worker_session()
                             .expect("re-registration returned no worker session");
@@ -3819,11 +6772,32 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                         {
-                            Ok(tx) => {
+                            Ok(event_stream) => {
                                 event_publisher = Some(JobEventPublisher {
                                     worker_id: cli.worker_id.clone(),
-                                    tx,
+                                    tx: event_stream.sender,
                                 });
+                                event_stream_task = Some(event_stream.task);
+                                match start_grpc_cancellation_stream(
+                                    grpc.client.clone(),
+                                    grpc.token.clone(),
+                                    &cli.worker_id,
+                                    &session,
+                                )
+                                .await
+                                {
+                                    Ok(control_stream) => {
+                                        cancellation_stream =
+                                            Some(Arc::new(Mutex::new(control_stream.receiver)));
+                                        cancellation_stream_task = Some(control_stream.task);
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "failed to restart gRPC cancellation stream: {error:#}"
+                                        );
+                                        cancellation_stream = None;
+                                    }
+                                }
                             }
                             Err(stream_error) => {
                                 eprintln!("failed to restart gRPC event stream: {stream_error:#}");
@@ -3835,6 +6809,150 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+        if let Some(command) = poll_response.cancellation {
+            protocol::verify_cancellation_assignment_id(&command).map_err(anyhow::Error::msg)?;
+            let session = client
+                .worker_session()
+                .context("recovery cancellation has no authenticated worker session")?;
+            anyhow::ensure!(
+                command.worker_id == session.worker_id
+                    && command.worker_session_id == session.session_id
+                    && command.worker_session_generation == session.generation,
+                "recovery cancellation session fence mismatch"
+            );
+            let reconciliation = reconcile_cancellation_resources(
+                &cli.data_dir,
+                &transcripts_root,
+                &egress_manager.config().installation_id,
+                &egress_manager.config().config_identity,
+                &cli.worker_id,
+                STARTUP_RECONCILIATION_MAX_ITEMS,
+                STARTUP_RECONCILIATION_TIMEOUT,
+            )
+            .await;
+            let recovery_root = private_attempt_root(&cli.data_dir, command.runtime_assignment_id)?;
+            let recovery_phase = AttemptPhaseStore::initialize(
+                &recovery_root,
+                command.runtime_assignment_id,
+                command.job_id,
+                command.attempt,
+            )?;
+            let recovery_journal = Arc::new(OperationJournal::initialize(
+                &recovery_root,
+                command.runtime_assignment_id,
+                command.job_id,
+                command.attempt,
+            )?);
+            let (_recovery_stop_tx, recovery_stop_rx) = watch::channel(false);
+            let recovery_context = ExecutionCancellationContext {
+                stop_reason: Arc::new(std::sync::Mutex::new(Some(
+                    WorkerStopReason::CancelRequested(command.clone()),
+                ))),
+                stop_rx: recovery_stop_rx,
+                phase: Arc::new(recovery_phase),
+                operations: recovery_journal,
+                assignment_id: command.runtime_assignment_id,
+                pre_cleanup_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                active_pre_cleanup_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                active_terminal_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            };
+            match &reconciliation {
+                Ok(_) => {
+                    ensure_cleanup_phase_after_reconciliation(&recovery_context).await?;
+                }
+                Err(error) => recovery_context.phase.containment_failed(error)?,
+            }
+            let now = Utc::now();
+            let containment = match &reconciliation {
+                Ok(evidence) => evidence.clone().into_protocol(),
+                Err(error) => protocol::ContainmentAbsenceEvidence {
+                    checked_at: now,
+                    process: protocol::ContainmentStatus::Failed {
+                        error: format!("{error:#}"),
+                    },
+                    container: protocol::ContainmentStatus::Failed {
+                        error: format!("{error:#}"),
+                    },
+                },
+            };
+            let result = JobResult {
+                outcome: ExecutionOutcome::Cancelled,
+                termination_reason: TerminationReason::Cancelled,
+                exit_code: None,
+                timing: ExecutionTiming {
+                    started_at: now,
+                    finished_at: Utc::now(),
+                    duration_ms: 0,
+                },
+                artifacts: ArtifactSummary {
+                    stdout_path: format!("transcripts/{}/stdout.log", command.job_id),
+                    stderr_path: format!("transcripts/{}/stderr.log", command.job_id),
+                    output_path: None,
+                    transcript_dir: Some(format!("transcripts/{}", command.job_id)),
+                    stdout_bytes: None,
+                    stderr_bytes: None,
+                    output_bytes: None,
+                    structured_transcript_artifacts: Vec::new(),
+                },
+                output_json: None,
+                repo: None,
+                github_pr: None,
+                error_message: reconciliation
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("{error:#}")),
+                cancellation_acknowledgement: Some(protocol::CancellationAcknowledgement {
+                    command: command.clone(),
+                    containment,
+                }),
+            };
+            if let Err(error) = &reconciliation {
+                eprintln!(
+                    "recovery cancellation {} containment remains unresolved: {error:#}",
+                    command.cancellation_id
+                );
+                tokio::time::sleep(Duration::from_secs(cli.poll_interval_secs)).await;
+                continue;
+            }
+            persist_terminal_report(
+                &recovery_context,
+                command.job_id,
+                command.attempt,
+                JobState::Cancelled,
+                result.artifacts.transcript_dir.clone(),
+                &result,
+            )?;
+            let reporting = recovery_context.begin_terminal_reporting()?;
+            let report_operation = recovery_context.begin_external_operation(
+                "terminal_report",
+                &format!("job:{}:cancelled", command.job_id),
+            )?;
+            let update = client
+                .update_job(
+                    &cli.worker_id,
+                    command.job_id,
+                    JobState::Cancelled,
+                    result.artifacts.transcript_dir.clone(),
+                    Some(result),
+                )
+                .await;
+            if let Err(error) = update {
+                report_operation.ambiguous("terminal_report_failed")?;
+                eprintln!(
+                    "recovery cancellation {} for job {} was not acknowledged: {error}",
+                    command.cancellation_id, command.job_id
+                );
+            } else {
+                report_operation.completed()?;
+                if reporting {
+                    recovery_context.phase.transition(AttemptPhase::Completed)?;
+                    recovery_context.finalize_private_state()?;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(cli.poll_interval_secs)).await;
+            continue;
+        }
+        let polled_job = poll_response.job;
 
         if let Some(job) = polled_job {
             let authorization_version = job
@@ -3901,14 +7019,28 @@ async fn main() -> anyhow::Result<()> {
             let hb_job_id = job.id;
             let (hb_stop_tx, mut hb_stop_rx) = tokio::sync::watch::channel(false);
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let stop_reason = Arc::new(std::sync::Mutex::new(None));
+            let hb_stop_reason = Arc::clone(&stop_reason);
+            let hb_job = job.clone();
+            let hb_session = worker_session.clone();
+            let hb_cancel_tx = cancel_tx.clone();
             let heartbeat_task = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(JOB_HEARTBEAT_SECS));
                 loop {
                     tokio::select! {
                         _ = hb_stop_rx.changed() => break,
                         _ = interval.tick() => {
-                            if let Err(error) = hb_client.heartbeat(&hb_worker_id, WorkerState::Busy).await {
-                                eprintln!("busy heartbeat failed for job {hb_job_id}: {error}");
+                            match hb_client.heartbeat(&hb_worker_id, WorkerState::Busy).await {
+                                Ok(Some(command)) => match verify_cancellation_command(&command, &hb_job, &hb_session) {
+                                    Ok(()) => latch_stop_reason(&hb_stop_reason, WorkerStopReason::CancelRequested(command), &hb_cancel_tx),
+                                    Err(error) => eprintln!("ignored invalid cancellation command for job {hb_job_id}: {error}"),
+                                },
+                                Ok(None) => {}
+                                Err(error) => {
+                                    eprintln!("busy heartbeat failed for job {hb_job_id}: {error}");
+                                    latch_stop_reason(&hb_stop_reason, WorkerStopReason::ControlPlaneUnavailable, &hb_cancel_tx);
+                                    break;
+                                }
                             }
                             match hb_client
                                 .update_job(&hb_worker_id, hb_job_id, JobState::Running, None, None)
@@ -3917,18 +7049,70 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(JobUpdateOutcome::Applied) => {}
                                 Ok(JobUpdateOutcome::CancelledOnServer) => {
                                     eprintln!("job {hb_job_id} was cancelled on server; stopping local execution");
-                                    let _ = cancel_tx.send(true);
+                                    latch_stop_reason(&hb_stop_reason, WorkerStopReason::LeaseLost, &hb_cancel_tx);
                                     break;
                                 }
                                 Err(error) => {
                                     eprintln!("running lease renewal failed for job {hb_job_id}: {error}");
-                                    let _ = cancel_tx.send(true);
+                                    latch_stop_reason(&hb_stop_reason, WorkerStopReason::LeaseLost, &hb_cancel_tx);
                                     break;
                                 }
                             }
                         }
                     }
                 }
+            });
+            let control_task = cancellation_stream.as_ref().map(|stream| {
+                let stream = Arc::clone(stream);
+                let control_stop_reason = Arc::clone(&stop_reason);
+                let control_cancel_tx = cancel_tx.clone();
+                let control_job = job.clone();
+                let control_session = worker_session.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let message = stream.lock().await.recv().await;
+                        match message {
+                            Some(Ok(command)) => match verify_cancellation_command(
+                                &command,
+                                &control_job,
+                                &control_session,
+                            ) {
+                                Ok(()) => {
+                                    latch_stop_reason(
+                                        &control_stop_reason,
+                                        WorkerStopReason::CancelRequested(command),
+                                        &control_cancel_tx,
+                                    );
+                                    break;
+                                }
+                                Err(error) => eprintln!(
+                                    "ignored invalid streamed cancellation command for job {}: {error}",
+                                    control_job.id
+                                ),
+                            },
+                            Some(Err(error)) => {
+                                eprintln!(
+                                    "cancellation control stream unavailable for job {}: {error}",
+                                    control_job.id
+                                );
+                                latch_stop_reason(
+                                    &control_stop_reason,
+                                    WorkerStopReason::ControlPlaneUnavailable,
+                                    &control_cancel_tx,
+                                );
+                                break;
+                            }
+                            None => {
+                                latch_stop_reason(
+                                    &control_stop_reason,
+                                    WorkerStopReason::ControlPlaneUnavailable,
+                                    &control_cancel_tx,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                })
             });
 
             let transcript_rel_dir = Path::new("transcripts")
@@ -3942,8 +7126,40 @@ async fn main() -> anyhow::Result<()> {
                 .join(&transcript_rel_dir)
                 .to_string_lossy()
                 .to_string();
+            let invocation_id = protocol::authorization_request_from_job_context(&job.context)
+                .context("job has no invocation identity for attempt phase")?
+                .invocation_id;
+            let assignment_id = protocol::cancellation_assignment_id(
+                job.id,
+                invocation_id,
+                job.attempt,
+                &cli.worker_id,
+                worker_session.session_id,
+                worker_session.generation,
+            );
+            let attempt_root = private_attempt_root(&cli.data_dir, assignment_id)?;
+            let cancellation_context = Arc::new(ExecutionCancellationContext {
+                stop_reason: Arc::clone(&stop_reason),
+                stop_rx: cancel_rx,
+                phase: Arc::new(AttemptPhaseStore::initialize(
+                    &attempt_root,
+                    assignment_id,
+                    job.id,
+                    job.attempt,
+                )?),
+                operations: Arc::new(OperationJournal::initialize(
+                    &attempt_root,
+                    assignment_id,
+                    job.id,
+                    job.attempt,
+                )?),
+                assignment_id,
+                pre_cleanup_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                active_pre_cleanup_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                active_terminal_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
 
-            let result = run_job(
+            let mut result = run_job(
                 &job,
                 execution_permit,
                 &cli.worker_id,
@@ -3956,16 +7172,201 @@ async fn main() -> anyhow::Result<()> {
                 &worktrees_root,
                 &egress_manager,
                 event_publisher.as_ref(),
-                cancel_rx,
+                &cancellation_context,
             )
             .await;
 
+            if result.is_ok() {
+                match client.heartbeat(&cli.worker_id, WorkerState::Busy).await {
+                    Ok(Some(command)) => {
+                        if let Err(error) =
+                            verify_cancellation_command(&command, &job, &worker_session)
+                        {
+                            eprintln!(
+                                "ignored invalid post-exit cancellation command for job {}: {error}",
+                                job.id
+                            );
+                        } else {
+                            latch_stop_reason(
+                                &stop_reason,
+                                WorkerStopReason::CancelRequested(command),
+                                &cancel_tx,
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "post-exit cancellation check failed for job {}: {error}",
+                            job.id
+                        );
+                        latch_stop_reason(
+                            &stop_reason,
+                            WorkerStopReason::ControlPlaneUnavailable,
+                            &cancel_tx,
+                        );
+                    }
+                }
+            }
+
             let _ = hb_stop_tx.send(true);
             let _ = heartbeat_task.await;
+            if let Some(control_task) = control_task {
+                control_task.abort();
+            }
+
+            let latched_reason = stop_reason
+                .lock()
+                .expect("worker stop reason lock poisoned")
+                .clone();
+            let explicitly_interrupted =
+                matches!(latched_reason, Some(WorkerStopReason::CancelRequested(_)))
+                    && (result.is_ok()
+                        || result.as_ref().err().is_some_and(|error| {
+                            error.downcast_ref::<ExecutionInterrupted>().is_some_and(
+                                |interruption| {
+                                    matches!(interruption.0, WorkerStopReason::CancelRequested(_))
+                                },
+                            )
+                        }));
+            let execution_error = result.as_ref().err().and_then(|error| {
+                if error.downcast_ref::<ExecutionInterrupted>().is_some() {
+                    None
+                } else {
+                    Some(format!("{error:#}"))
+                }
+            });
+            let cancellation_attempt =
+                if matches!(latched_reason, Some(WorkerStopReason::CancelRequested(_))) {
+                    let reconciliation = reconcile_cancellation_resources(
+                        &cli.data_dir,
+                        &transcripts_root,
+                        &egress_manager.config().installation_id,
+                        &egress_manager.config().config_identity,
+                        &cli.worker_id,
+                        STARTUP_RECONCILIATION_MAX_ITEMS,
+                        STARTUP_RECONCILIATION_TIMEOUT,
+                    )
+                    .await;
+                    if reconciliation.is_ok() {
+                        ensure_cleanup_phase_after_reconciliation(&cancellation_context).await?;
+                    } else {
+                        cancellation_context.operations.reload_from_disk()?;
+                    }
+                    Some(if let Some(error) = execution_error.clone() {
+                        CancellationAttempt {
+                            execution_error: Some(error.clone()),
+                            stop_reason: latched_reason.clone(),
+                            cleanup_error: None,
+                            containment: VerifiedContainmentAbsence {
+                                checked_at: Utc::now(),
+                                process: protocol::ContainmentStatus::Failed {
+                                    error: error.clone(),
+                                },
+                                container: protocol::ContainmentStatus::Failed {
+                                    error: error.clone(),
+                                },
+                            },
+                            explicitly_interrupted,
+                        }
+                    } else {
+                        match reconciliation {
+                            Ok(evidence) => CancellationAttempt {
+                                execution_error: None,
+                                stop_reason: latched_reason.clone(),
+                                cleanup_error: None,
+                                containment: evidence,
+                                explicitly_interrupted,
+                            },
+                            Err(error) => CancellationAttempt {
+                                execution_error: None,
+                                stop_reason: latched_reason.clone(),
+                                cleanup_error: Some(format!("{error:#}")),
+                                containment: VerifiedContainmentAbsence {
+                                    checked_at: Utc::now(),
+                                    process: protocol::ContainmentStatus::Failed {
+                                        error: "process containment was not proven".to_string(),
+                                    },
+                                    container: protocol::ContainmentStatus::Failed {
+                                        error: format!("{error:#}"),
+                                    },
+                                },
+                                explicitly_interrupted,
+                            },
+                        }
+                    })
+                } else {
+                    None
+                };
+            if result.is_err()
+                && matches!(latched_reason, Some(WorkerStopReason::CancelRequested(_)))
+            {
+                result = Ok(cancelled_before_execution_result(&transcript_rel_dir));
+            }
+            if let Ok(job_result) = result.as_mut() {
+                match latched_reason {
+                    Some(WorkerStopReason::CancelRequested(command)) => {
+                        let attempt = cancellation_attempt
+                            .clone()
+                            .expect("cancelled execution has containment result");
+                        job_result.outcome = ExecutionOutcome::Cancelled;
+                        job_result.termination_reason = TerminationReason::Cancelled;
+                        job_result.exit_code = None;
+                        job_result.output_json = None;
+                        job_result.github_pr = None;
+                        job_result.error_message = attempt.failure();
+                        job_result.cancellation_acknowledgement =
+                            Some(protocol::CancellationAcknowledgement {
+                                command,
+                                containment: attempt.containment.into_protocol(),
+                            });
+                        if job_result.error_message.is_some() {
+                            cancellation_context
+                                .phase
+                                .containment_failed(&anyhow::anyhow!(
+                                    "{}",
+                                    job_result.error_message.as_deref().unwrap_or_default()
+                                ))?;
+                        }
+                    }
+                    Some(WorkerStopReason::LeaseLost)
+                        if job_result.outcome == ExecutionOutcome::Cancelled =>
+                    {
+                        job_result.outcome = ExecutionOutcome::Failed;
+                        job_result.termination_reason = TerminationReason::WorkerError;
+                        job_result.error_message =
+                            Some("execution stopped after lease loss".to_string());
+                    }
+                    Some(WorkerStopReason::ControlPlaneUnavailable)
+                        if job_result.outcome == ExecutionOutcome::Cancelled =>
+                    {
+                        job_result.outcome = ExecutionOutcome::Failed;
+                        job_result.termination_reason = TerminationReason::WorkerError;
+                        job_result.error_message = Some(
+                            "execution stopped because the control plane was unavailable"
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
 
             match result {
                 Ok(job_result) if matches!(job_result.outcome, ExecutionOutcome::Succeeded) => {
-                    if let Err(error) = client
+                    persist_terminal_report(
+                        &cancellation_context,
+                        job.id,
+                        job.attempt,
+                        JobState::Succeeded,
+                        job_result.artifacts.transcript_dir.clone(),
+                        &job_result,
+                    )?;
+                    let reporting = cancellation_context.begin_terminal_reporting()?;
+                    let report = cancellation_context.begin_external_operation(
+                        "terminal_report",
+                        &format!("job:{}:succeeded", job.id),
+                    )?;
+                    match client
                         .update_job(
                             &cli.worker_id,
                             job.id,
@@ -3975,11 +7376,35 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                     {
-                        eprintln!("failed to report successful job {}: {error}", job.id);
+                        Ok(_) if reporting => {
+                            report.completed()?;
+                            cancellation_context
+                                .phase
+                                .transition(AttemptPhase::Completed)?;
+                            cancellation_context.finalize_private_state()?;
+                        }
+                        Ok(_) => report.completed()?,
+                        Err(error) => {
+                            report.ambiguous("terminal_report_failed")?;
+                            eprintln!("failed to report successful job {}: {error}", job.id)
+                        }
                     }
                 }
                 Ok(job_result) if matches!(job_result.outcome, ExecutionOutcome::Cancelled) => {
-                    if let Err(error) = client
+                    persist_terminal_report(
+                        &cancellation_context,
+                        job.id,
+                        job.attempt,
+                        JobState::Cancelled,
+                        job_result.artifacts.transcript_dir.clone(),
+                        &job_result,
+                    )?;
+                    let reporting = cancellation_context.begin_terminal_reporting()?;
+                    let report = cancellation_context.begin_external_operation(
+                        "terminal_report",
+                        &format!("job:{}:cancelled", job.id),
+                    )?;
+                    match client
                         .update_job(
                             &cli.worker_id,
                             job.id,
@@ -3989,11 +7414,35 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                     {
-                        eprintln!("failed to report cancelled job {}: {error}", job.id);
+                        Ok(_) if reporting => {
+                            report.completed()?;
+                            cancellation_context
+                                .phase
+                                .transition(AttemptPhase::Completed)?;
+                            cancellation_context.finalize_private_state()?;
+                        }
+                        Ok(_) => report.completed()?,
+                        Err(error) => {
+                            report.ambiguous("terminal_report_failed")?;
+                            eprintln!("failed to report cancelled job {}: {error}", job.id)
+                        }
                     }
                 }
                 Ok(job_result) => {
-                    if let Err(error) = client
+                    persist_terminal_report(
+                        &cancellation_context,
+                        job.id,
+                        job.attempt,
+                        JobState::Failed,
+                        job_result.artifacts.transcript_dir.clone(),
+                        &job_result,
+                    )?;
+                    let reporting = cancellation_context.begin_terminal_reporting()?;
+                    let report = cancellation_context.begin_external_operation(
+                        "terminal_report",
+                        &format!("job:{}:failed", job.id),
+                    )?;
+                    match client
                         .update_job(
                             &cli.worker_id,
                             job.id,
@@ -4003,11 +7452,37 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                     {
-                        eprintln!("failed to report failed job {}: {error}", job.id);
+                        Ok(_) if reporting => {
+                            report.completed()?;
+                            cancellation_context
+                                .phase
+                                .transition(AttemptPhase::Completed)?;
+                            cancellation_context.finalize_private_state()?;
+                        }
+                        Ok(_) => report.completed()?,
+                        Err(error) => {
+                            report.ambiguous("terminal_report_failed")?;
+                            eprintln!("failed to report failed job {}: {error}", job.id)
+                        }
                     }
                 }
                 Err(error) => {
                     eprintln!("job {} execution failed: {error}", job.id);
+                    if cancellation_context.phase.current().rank()
+                        < AttemptPhase::CleanupRunning.rank()
+                    {
+                        reconcile_cancellation_resources(
+                            &cli.data_dir,
+                            &transcripts_root,
+                            &egress_manager.config().installation_id,
+                            &egress_manager.config().config_identity,
+                            &cli.worker_id,
+                            STARTUP_RECONCILIATION_MAX_ITEMS,
+                            STARTUP_RECONCILIATION_TIMEOUT,
+                        )
+                        .await?;
+                        ensure_cleanup_phase_after_reconciliation(&cancellation_context).await?;
+                    }
                     let stdout_path = PathBuf::from(&transcript_dir).join("stdout.log");
                     let stderr_path = PathBuf::from(&transcript_dir).join("stderr.log");
                     let now = Utc::now();
@@ -4040,7 +7515,21 @@ async fn main() -> anyhow::Result<()> {
                         repo: None,
                         github_pr: None,
                         error_message: Some(format!("{error:#}")),
+                        cancellation_acknowledgement: None,
                     };
+                    persist_terminal_report(
+                        &cancellation_context,
+                        job.id,
+                        job.attempt,
+                        JobState::Failed,
+                        infra_result.artifacts.transcript_dir.clone(),
+                        &infra_result,
+                    )?;
+                    let reporting = cancellation_context.begin_terminal_reporting()?;
+                    let report = cancellation_context.begin_external_operation(
+                        "terminal_report",
+                        &format!("job:{}:infrastructure_failed", job.id),
+                    )?;
                     if let Err(update_error) = client
                         .update_job(
                             &cli.worker_id,
@@ -4051,7 +7540,16 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                     {
+                        report.ambiguous("terminal_report_failed")?;
                         eprintln!("failed to report failed job {}: {update_error}", job.id);
+                    } else {
+                        report.completed()?;
+                        if reporting {
+                            cancellation_context
+                                .phase
+                                .transition(AttemptPhase::Completed)?;
+                            cancellation_context.finalize_private_state()?;
+                        }
                     }
                 }
             }
@@ -4079,8 +7577,9 @@ async fn run_job(
     worktrees_root: &Path,
     egress_manager: &EgressManager,
     event_publisher: Option<&JobEventPublisher>,
-    cancel_rx: watch::Receiver<bool>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<JobResult> {
+    cancellation.check()?;
     let local_agent_config = egress_manager.config();
     let verified = verify_authorized_job_for_session(
         job,
@@ -4101,28 +7600,8 @@ async fn run_job(
     let github_action = verified.github_action;
     let environment_bundle = verified.environment_bundle;
     let agent_output_events = verified.agent_output_events;
-
-    let opencode_job_state = if matches!(resolved_runner.kind, ResolvedRunnerKind::Opencode(_)) {
-        Some(
-            OpencodeJobState::prepare(
-                data_dir,
-                ContainerOwnership {
-                    installation_id: local_agent_config.installation_id.clone(),
-                    config_identity: local_agent_config.config_identity.clone(),
-                    worker_id: worker_id.to_string(),
-                    job_id: job.id,
-                    attempt: job.attempt,
-                },
-                environment_bundle
-                    .as_ref()
-                    .context("OpenCode job has no authorized environment bundle")?,
-                &DockerCli::production(),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let mut opencode_job_state: Option<Arc<OpencodeJobState>> = None;
+    cancellation.check()?;
 
     let transcript_dir = resolve_to_absolute(Path::new(transcript_dir))
         .with_context(|| format!("resolve transcript dir {}", transcript_dir))?
@@ -4130,7 +7609,10 @@ async fn run_job(
         .to_string();
     let transcript_dir = transcript_dir.as_str();
 
-    std::fs::create_dir_all(transcript_dir)?;
+    cancellation.create_dir_all(
+        "artifact_transcript_directory_create",
+        Path::new(transcript_dir),
+    )?;
 
     let environment_table =
         EnvironmentValidationTable::from_local_agent_config(local_agent_config)?;
@@ -4160,9 +7642,10 @@ async fn run_job(
             .map(|p| p.worker_id.clone())
             .unwrap_or_else(|| worker_id.to_string()),
         writer: Arc::new(Mutex::new(
-            JobEventTranscriptWriter::create(&job_events_path).await?,
+            JobEventTranscriptWriter::create(&job_events_path, cancellation).await?,
         )),
         publisher: event_publisher.cloned(),
+        cancellation: cancellation.clone(),
     };
 
     job_event_sink
@@ -4173,9 +7656,13 @@ async fn run_job(
         )
         .await;
 
+    cancellation.transition(AttemptPhase::WorkspacePreparing)?;
     let prepared_workspace =
-        prepare_workspace(job, &runtime_spec, repos_root, worktrees_root).await?;
+        prepare_workspace(job, &runtime_spec, repos_root, worktrees_root, cancellation).await?;
+    cancellation.transition(AttemptPhase::WorkspacePrepared)?;
     let workspace_dir = prepared_workspace.workspace_dir.clone();
+
+    cancellation.transition(AttemptPhase::CredentialsResolving)?;
 
     job_event_sink
         .emit(
@@ -4191,15 +7678,24 @@ async fn run_job(
     }
 
     let prompt_dir = PathBuf::from(transcript_dir).join("prompt");
-    std::fs::create_dir_all(&prompt_dir)?;
+    cancellation.create_dir_all("artifact_prompt_directory_create", &prompt_dir)?;
     if let Some(prompt) = &job.prompt {
         if let Some(system) = &prompt.system {
-            std::fs::write(prompt_dir.join("system.txt"), system)?;
+            cancellation.write_file(
+                "artifact_prompt_write",
+                &prompt_dir.join("system.txt"),
+                system,
+            )?;
         }
-        std::fs::write(prompt_dir.join("user.txt"), &prompt.user)?;
+        cancellation.write_file(
+            "artifact_prompt_write",
+            &prompt_dir.join("user.txt"),
+            &prompt.user,
+        )?;
     }
-    std::fs::write(
-        PathBuf::from(transcript_dir).join("context.json"),
+    cancellation.write_file(
+        "artifact_context_write",
+        &PathBuf::from(transcript_dir).join("context.json"),
         serde_json::to_vec_pretty(&job.context)?,
     )?;
 
@@ -4214,6 +7710,10 @@ async fn run_job(
     let stderr_path = PathBuf::from(transcript_dir).join("stderr.log");
     let run_json_path = PathBuf::from(transcript_dir).join("run.json");
     if let Some(action) = github_action.as_ref() {
+        cancellation.transition(AttemptPhase::CredentialsResolved)?;
+        cancellation.transition(AttemptPhase::BundleMaterializing)?;
+        cancellation.transition(AttemptPhase::BundleMaterialized)?;
+        cancellation.transition(AttemptPhase::Running)?;
         let started_at = Utc::now();
         let operation = async {
             let output_json = execute_github_action(
@@ -4222,12 +7722,17 @@ async fn run_job(
                 &workspace_dir,
                 local_agent_config,
                 &work_item_context,
+                cancellation,
             )
             .await?;
-            std::fs::write(&output_path, serde_json::to_vec_pretty(&output_json)?)?;
-            std::fs::write(&stdout_path, b"")?;
-            std::fs::write(&stderr_path, b"")?;
-            std::fs::write(&transcript_jsonl_path, b"")?;
+            cancellation.write_file(
+                "artifact_output_write",
+                &output_path,
+                serde_json::to_vec_pretty(&output_json)?,
+            )?;
+            cancellation.write_file("artifact_stdout_write", &stdout_path, b"")?;
+            cancellation.write_file("artifact_stderr_write", &stderr_path, b"")?;
+            cancellation.write_file("artifact_transcript_write", &transcript_jsonl_path, b"")?;
             let finished_at = Utc::now();
             let timing = ExecutionTiming {
                 started_at,
@@ -4241,9 +7746,15 @@ async fn run_job(
                 .repo
                 .as_ref()
                 .map(|repo| resolve_target_branch_for_repo_job(job, repo));
-            let repo =
-                capture_repo_metadata(&workspace_dir, job.repo.as_ref(), target_branch).await;
-            std::fs::write(
+            let repo = capture_repo_metadata(
+                &workspace_dir,
+                job.repo.as_ref(),
+                target_branch,
+                cancellation,
+            )
+            .await;
+            cancellation.write_file(
+                "artifact_run_metadata_write",
                 &run_json_path,
                 serde_json::to_vec_pretty(&build_run_json_payload(
                     job,
@@ -4281,15 +7792,26 @@ async fn run_job(
                 output_json: Some(output_json),
                 repo,
                 error_message: None,
+                cancellation_acknowledgement: None,
             })
         };
-        let operation =
-            run_authorized_github_operation(operation, &deadline, cancel_rx.clone()).await;
-        return finalize_required_cleanup(
+        let operation = run_authorized_github_operation(operation, &deadline, cancellation).await;
+        cancellation.phase.transition(AttemptPhase::PostExit)?;
+        cancellation.transition_cleanup().await?;
+        let result = finalize_required_cleanup(
             operation,
-            cleanup_workspace(job, &prepared_workspace, Some(&job_event_sink)),
+            cleanup_workspace(
+                job,
+                &prepared_workspace,
+                Some(&job_event_sink),
+                cancellation,
+            ),
         )
         .await;
+        if let Err(error) = &result {
+            cancellation.phase.containment_failed(error)?;
+        }
+        return result;
     }
     env.insert(
         "AGENT_WORKSPACE_DIR".to_string(),
@@ -4446,6 +7968,7 @@ async fn run_job(
                 .collect(),
             agent_output_events: agent_output_events.clone(),
         },
+        cancellation,
     ) {
         job_event_sink
             .emit(
@@ -4454,7 +7977,11 @@ async fn run_job(
                 format!("warning: failed to write .agent-context.json: {error:#}"),
             )
             .await;
-    } else if let Err(error) = std::fs::copy(&agent_context_path, &worktree_agent_context_path) {
+    } else if let Err(error) = cancellation.copy_file(
+        "workspace_agent_context_copy",
+        &agent_context_path,
+        &worktree_agent_context_path,
+    ) {
         job_event_sink
             .emit(
                 job.id,
@@ -4470,6 +7997,35 @@ async fn run_job(
         container_image: runtime_spec.environment.container_image.clone(),
         ..job.clone()
     };
+
+    cancellation.transition(AttemptPhase::CredentialsResolved)?;
+    cancellation.transition(AttemptPhase::BundleMaterializing)?;
+    cancellation.transition(AttemptPhase::BundleMaterialized)?;
+    if matches!(resolved_runner.kind, ResolvedRunnerKind::Opencode(_)) {
+        cancellation.check()?;
+        opencode_job_state = Some(
+            OpencodeJobState::prepare_cancellable(
+                data_dir,
+                ContainerOwnership {
+                    installation_id: local_agent_config.installation_id.clone(),
+                    config_identity: local_agent_config.config_identity.clone(),
+                    worker_id: worker_id.to_string(),
+                    job_id: job.id,
+                    attempt: job.attempt,
+                    assignment_id: cancellation.assignment_id,
+                    worker_session_id,
+                    worker_session_generation,
+                },
+                environment_bundle
+                    .as_ref()
+                    .context("OpenCode job has no authorized environment bundle")?,
+                &DockerCli::production(),
+                cancellation,
+            )
+            .await?,
+        );
+        cancellation.check()?;
+    }
 
     let mut execution_result = async {
         let started_at = Utc::now();
@@ -4525,7 +8081,7 @@ async fn run_job(
                         .as_ref()
                         .context("OpenCode job state was not prepared")?,
                     Some(&job_event_sink),
-                    Some(cancel_rx.clone()),
+                    cancellation,
                 )
                 .await?
             }
@@ -4533,6 +8089,7 @@ async fn run_job(
                 run_docker(
                     &resolved_job,
                     local_agent_config,
+                    data_dir,
                     &workspace_dir,
                     transcript_dir,
                     &transcript_jsonl_path,
@@ -4548,7 +8105,7 @@ async fn run_job(
                     prepared_workspace.mirror_dir.as_deref(),
                     &prepared_workspace.additional_repo_mounts,
                     Some(&job_event_sink),
-                    Some(cancel_rx.clone()),
+                    cancellation,
                 )
                 .await?
             }
@@ -4629,12 +8186,16 @@ async fn run_job(
             .repo
             .as_ref()
             .map(|repo| resolve_target_branch_for_repo_job(job, repo));
-        let repo_meta =
-            capture_repo_metadata(&workspace_dir, job.repo.as_ref(), target_branch).await;
+        let repo_meta = capture_repo_metadata(
+            &workspace_dir,
+            job.repo.as_ref(),
+            target_branch,
+            cancellation,
+        )
+        .await;
 
         let (workspace_dir_display, transcript_dir_display) =
             display_paths_for_runtime(&workspace_dir, transcript_dir, &runtime_spec);
-        let mut meta = tokio::fs::File::create(&run_json_path).await?;
         let payload = build_run_json_payload(
             job,
             &runtime_spec,
@@ -4644,8 +8205,11 @@ async fn run_job(
             &workspace_dir_display,
             &transcript_dir_display,
         );
-        meta.write_all(serde_json::to_string_pretty(&payload)?.as_bytes())
-            .await?;
+        cancellation.write_file(
+            "artifact_run_metadata_write",
+            &run_json_path,
+            serde_json::to_vec_pretty(&payload)?,
+        )?;
 
         Ok::<JobResult, anyhow::Error>(JobResult {
             outcome,
@@ -4677,20 +8241,29 @@ async fn run_job(
             repo: repo_meta,
             github_pr,
             error_message: None,
+            cancellation_acknowledgement: None,
         })
     }
     .await;
 
-    let _ = std::fs::remove_file(&worktree_agent_context_path);
+    cancellation.phase.transition(AttemptPhase::PostExit)?;
 
-    if let Err(error) = cleanup_workspace(job, &prepared_workspace, Some(&job_event_sink)).await {
-        job_event_sink
-            .emit(
-                job.id,
-                pb::JobEventKind::JobEventSystem,
-                format!("workspace cleanup warning: {error:#}"),
-            )
-            .await;
+    cancellation.remove_file(
+        "workspace_agent_context_remove",
+        &worktree_agent_context_path,
+    )?;
+
+    cancellation.transition_cleanup().await?;
+    if let Err(error) = cleanup_workspace(
+        job,
+        &prepared_workspace,
+        Some(&job_event_sink),
+        cancellation,
+    )
+    .await
+    {
+        cancellation.phase.containment_failed(&error)?;
+        execution_result = Err(error.context("required workspace cleanup failed"));
     }
 
     if let Ok(job_result) = &mut execution_result {
@@ -4717,12 +8290,44 @@ async fn run_job(
             execution_result = Err(state.redact_error(error));
         }
         if let Err(cleanup_error) = state.cleanup().await {
+            cancellation.phase.containment_failed(&cleanup_error)?;
             execution_result =
                 Err(state.redact_error(&cleanup_error.context("finalize OpenCode per-job state")));
+        } else if let Err(interruption) = cancellation.check() {
+            execution_result = Err(interruption);
         }
     }
 
     execution_result
+}
+
+fn cancelled_before_execution_result(transcript_rel_dir: &str) -> JobResult {
+    let now = Utc::now();
+    JobResult {
+        outcome: ExecutionOutcome::Cancelled,
+        termination_reason: TerminationReason::Cancelled,
+        exit_code: None,
+        timing: ExecutionTiming {
+            started_at: now,
+            finished_at: now,
+            duration_ms: 0,
+        },
+        artifacts: ArtifactSummary {
+            stdout_path: artifact_store_relative_path(transcript_rel_dir, "stdout.log"),
+            stderr_path: artifact_store_relative_path(transcript_rel_dir, "stderr.log"),
+            output_path: None,
+            transcript_dir: Some(transcript_rel_dir.to_string()),
+            stdout_bytes: None,
+            stderr_bytes: None,
+            output_bytes: None,
+            structured_transcript_artifacts: Vec::new(),
+        },
+        output_json: None,
+        repo: None,
+        github_pr: None,
+        error_message: None,
+        cancellation_acknowledgement: None,
+    }
 }
 
 struct VerifiedAuthorizedJob {
@@ -4741,6 +8346,7 @@ struct VerifiedAuthorizedJob {
 
 struct OpencodeJobState {
     root: PathBuf,
+    runtime_root: PathBuf,
     bundle: PathBuf,
     data: PathBuf,
     state: PathBuf,
@@ -4754,25 +8360,68 @@ struct OpencodeJobState {
     ambiguous_create: AtomicBool,
     clock: Arc<dyn WallClock>,
     marker_store: Arc<dyn CreateMarkerStore>,
+    cancellation: ExecutionCancellationContext,
 }
 
 impl OpencodeJobState {
+    async fn prepare_cancellable(
+        data_dir: &Path,
+        ownership: ContainerOwnership,
+        bundle: &agent_hub_config::EnvironmentBundle,
+        docker: &DockerCli,
+        cancellation: &ExecutionCancellationContext,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::prepare_with_reconciliation_timeout_cancellable(
+            data_dir,
+            ownership,
+            bundle,
+            docker,
+            Duration::from_secs(30),
+            cancellation,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn prepare(
         data_dir: &Path,
         ownership: ContainerOwnership,
         bundle: &agent_hub_config::EnvironmentBundle,
         docker: &DockerCli,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::prepare_with_reconciliation_timeout(
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let attempt_root = private_attempt_root(data_dir, ownership.assignment_id)?;
+        let cancellation = ExecutionCancellationContext::for_test_attempt(
+            &attempt_root,
+            stop_rx,
+            ownership.assignment_id,
+            ownership.job_id,
+            ownership.attempt,
+        )?;
+        Self::prepare_cancellable(data_dir, ownership, bundle, docker, &cancellation).await
+    }
+
+    async fn prepare_with_reconciliation_timeout_cancellable(
+        data_dir: &Path,
+        ownership: ContainerOwnership,
+        bundle: &agent_hub_config::EnvironmentBundle,
+        docker: &DockerCli,
+        reconciliation_timeout: Duration,
+        cancellation: &ExecutionCancellationContext,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::prepare_with_clock_cancellable(
             data_dir,
             ownership,
             bundle,
             docker,
-            Duration::from_secs(30),
+            reconciliation_timeout,
+            Arc::new(SystemWallClock),
+            cancellation,
         )
         .await
     }
 
+    #[cfg(test)]
     async fn prepare_with_reconciliation_timeout(
         data_dir: &Path,
         ownership: ContainerOwnership,
@@ -4780,17 +8429,49 @@ impl OpencodeJobState {
         docker: &DockerCli,
         reconciliation_timeout: Duration,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::prepare_with_clock(
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let attempt_root = private_attempt_root(data_dir, ownership.assignment_id)?;
+        let cancellation = ExecutionCancellationContext::for_test_attempt(
+            &attempt_root,
+            stop_rx,
+            ownership.assignment_id,
+            ownership.job_id,
+            ownership.attempt,
+        )?;
+        Self::prepare_with_reconciliation_timeout_cancellable(
             data_dir,
             ownership,
             bundle,
             docker,
             reconciliation_timeout,
-            Arc::new(SystemWallClock),
+            &cancellation,
         )
         .await
     }
 
+    async fn prepare_with_clock_cancellable(
+        data_dir: &Path,
+        ownership: ContainerOwnership,
+        bundle: &agent_hub_config::EnvironmentBundle,
+        docker: &DockerCli,
+        reconciliation_timeout: Duration,
+        clock: Arc<dyn WallClock>,
+        cancellation: &ExecutionCancellationContext,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::prepare_with_dependencies_cancellable(
+            data_dir,
+            ownership,
+            bundle,
+            docker,
+            reconciliation_timeout,
+            clock,
+            Arc::new(FsCreateMarkerStore),
+            cancellation,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn prepare_with_clock(
         data_dir: &Path,
         ownership: ContainerOwnership,
@@ -4799,19 +8480,29 @@ impl OpencodeJobState {
         reconciliation_timeout: Duration,
         clock: Arc<dyn WallClock>,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::prepare_with_dependencies(
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let attempt_root = private_attempt_root(data_dir, ownership.assignment_id)?;
+        let cancellation = ExecutionCancellationContext::for_test_attempt(
+            &attempt_root,
+            stop_rx,
+            ownership.assignment_id,
+            ownership.job_id,
+            ownership.attempt,
+        )?;
+        Self::prepare_with_clock_cancellable(
             data_dir,
             ownership,
             bundle,
             docker,
             reconciliation_timeout,
             clock,
-            Arc::new(FsCreateMarkerStore),
+            &cancellation,
         )
         .await
     }
 
-    async fn prepare_with_dependencies(
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_with_dependencies_cancellable(
         data_dir: &Path,
         ownership: ContainerOwnership,
         bundle: &agent_hub_config::EnvironmentBundle,
@@ -4819,14 +8510,14 @@ impl OpencodeJobState {
         reconciliation_timeout: Duration,
         clock: Arc<dyn WallClock>,
         marker_store: Arc<dyn CreateMarkerStore>,
+        cancellation: &ExecutionCancellationContext,
     ) -> anyhow::Result<Arc<Self>> {
         bundle
             .verify_opencode_sentinel()
             .map_err(anyhow::Error::msg)
             .context("verify authorized OpenCode environment bundle sentinel")?;
-        let root = data_dir
-            .join("opencode-jobs")
-            .join(ownership.job_id.to_string());
+        let root = cancellation.phase.root.join("opencode");
+        let runtime_root = runtime_attempt_root(data_dir, ownership.assignment_id)?;
         if root.exists() {
             let container_name = format!("agent-hub-opencode-{}", ownership.job_id.simple());
             let recorded_ownership: ContainerOwnership = serde_json::from_slice(
@@ -4911,59 +8602,127 @@ impl OpencodeJobState {
                         )
                     })?;
             }
+            let remove = cancellation
+                .begin_external_operation("bundle_state_remove", &root.to_string_lossy())?;
+            if runtime_root.exists() {
+                tokio::fs::remove_dir_all(&runtime_root)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "remove reconciled OpenCode runtime state {}",
+                            runtime_root.display()
+                        )
+                    })?;
+            }
             tokio::fs::remove_dir_all(&root).await.with_context(|| {
                 format!("remove reconciled OpenCode job state {}", root.display())
             })?;
+            remove.completed()?;
         }
         let container_name = format!("agent-hub-opencode-{}", ownership.job_id.simple());
+        cancellation
+            .create_dir_all("authority_directory_create", &root)
+            .context("create private OpenCode authority directory")?;
         let state = Arc::new(Self {
-            bundle: root.join("config"),
-            data: root.join("data"),
-            state: root.join("state"),
-            cache: root.join("cache"),
+            bundle: runtime_root.join("config"),
+            data: runtime_root.join("data"),
+            state: runtime_root.join("state"),
+            cache: runtime_root.join("cache"),
+            runtime_root,
             root,
             cleaned: AtomicBool::new(false),
             retained: AtomicBool::new(false),
             container_name: container_name.clone(),
-            docker: docker.clone(),
+            docker: docker.clone().with_execution_context(cancellation),
             redactor: RwLock::new(ExactTokenRedactor::default()),
             ownership: ownership.clone(),
             ambiguous_create: AtomicBool::new(false),
             clock,
             marker_store,
+            cancellation: cancellation.clone(),
         });
         for directory in [&state.data, &state.state, &state.cache] {
-            std::fs::create_dir_all(directory).with_context(|| {
-                format!("create OpenCode job directory {}", directory.display())
-            })?;
+            cancellation
+                .create_dir_all("bundle_state_directory_create", directory)
+                .with_context(|| {
+                    format!("create OpenCode job directory {}", directory.display())
+                })?;
         }
-        std::fs::create_dir_all(state.state.join("home"))
+        cancellation
+            .create_dir_all("bundle_home_directory_create", &state.state.join("home"))
             .context("create OpenCode job-local home directory in authorized XDG state")?;
+        let bundle_operation = cancellation.begin_external_operation(
+            "environment_bundle_materialize",
+            &state.bundle.to_string_lossy(),
+        )?;
         bundle
             .write_to(&state.bundle)
             .map_err(anyhow::Error::msg)
             .context("write authorized OpenCode environment bundle")?;
-        std::fs::write(
-            state.root.join("bundle.sha256"),
-            format!("{}\n", bundle.digest),
-        )
-        .context("write authorized OpenCode environment bundle digest")?;
-        std::fs::write(
-            state.root.join("container-name"),
-            format!("{container_name}\n"),
-        )
-        .context("write exact OpenCode container identity")?;
-        std::fs::write(
-            state.root.join("ownership.json"),
-            serde_json::to_vec_pretty(&ownership)?,
-        )
-        .context("write immutable OpenCode state ownership")?;
+        bundle_operation.completed()?;
+        cancellation
+            .write_file(
+                "environment_bundle_digest_write",
+                &state.root.join("bundle.sha256"),
+                format!("{}\n", bundle.digest),
+            )
+            .context("write authorized OpenCode environment bundle digest")?;
+        cancellation
+            .write_file(
+                "container_identity_write",
+                &state.root.join("container-name"),
+                format!("{container_name}\n"),
+            )
+            .context("write exact OpenCode container identity")?;
+        cancellation
+            .write_file(
+                "container_ownership_write",
+                &state.root.join("ownership.json"),
+                serde_json::to_vec_pretty(&ownership)?,
+            )
+            .context("write immutable OpenCode state ownership")?;
         Ok(state)
     }
 
+    #[cfg(test)]
+    async fn prepare_with_dependencies(
+        data_dir: &Path,
+        ownership: ContainerOwnership,
+        bundle: &agent_hub_config::EnvironmentBundle,
+        docker: &DockerCli,
+        reconciliation_timeout: Duration,
+        clock: Arc<dyn WallClock>,
+        marker_store: Arc<dyn CreateMarkerStore>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let attempt_root = private_attempt_root(data_dir, ownership.assignment_id)?;
+        let cancellation = ExecutionCancellationContext::for_test_attempt(
+            &attempt_root,
+            stop_rx,
+            ownership.assignment_id,
+            ownership.job_id,
+            ownership.attempt,
+        )?;
+        Self::prepare_with_dependencies_cancellable(
+            data_dir,
+            ownership,
+            bundle,
+            docker,
+            reconciliation_timeout,
+            clock,
+            marker_store,
+            &cancellation,
+        )
+        .await
+    }
+
     fn trusted_mounts(&self) -> anyhow::Result<Vec<protocol::orchestration::PlannedFileMount>> {
-        let root = std::fs::canonicalize(&self.root)
-            .with_context(|| format!("canonicalize OpenCode job root {}", self.root.display()))?;
+        let root = std::fs::canonicalize(&self.runtime_root).with_context(|| {
+            format!(
+                "canonicalize OpenCode runtime root {}",
+                self.runtime_root.display()
+            )
+        })?;
         let configured = [
             (&self.bundle, "/opencode/config/opencode", true),
             (&self.data, "/opencode/data", false),
@@ -5010,22 +8769,38 @@ impl OpencodeJobState {
                 self.root.display()
             );
         }
-        match tokio::fs::remove_dir_all(&self.root).await {
+        let operation = self.cancellation.begin_external_operation(
+            "runtime_state_remove",
+            &self.runtime_root.to_string_lossy(),
+        )?;
+        match tokio::fs::remove_dir_all(&self.runtime_root).await {
             Ok(()) => {
+                operation.completed()?;
+                self.cancellation
+                    .operations
+                    .reconcile_owned_resources_under(&self.runtime_root)?;
                 self.cleaned.store(true, Ordering::Release);
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                operation.completed()?;
                 self.cleaned.store(true, Ordering::Release);
                 Ok(())
             }
-            Err(error) => Err(error)
-                .with_context(|| format!("remove OpenCode job state {}", self.root.display())),
+            Err(error) => {
+                operation.cleanup_failed("runtime_state_remove_failed")?;
+                Err(error)
+                    .with_context(|| format!("remove OpenCode job state {}", self.root.display()))
+            }
         }
     }
 
     async fn retain_for_cleanup_failure(&self, reason: &str) -> anyhow::Result<()> {
         self.retained.store(true, Ordering::Release);
+        let operation = self.cancellation.begin_external_operation(
+            "cleanup_failure_marker_write",
+            &self.root.to_string_lossy(),
+        )?;
         tokio::fs::write(
             self.root.join("CLEANUP_REQUIRED"),
             format!("container cleanup failed: {reason}\n"),
@@ -5036,16 +8811,22 @@ impl OpencodeJobState {
                 "record retained OpenCode job state at {}",
                 self.root.display()
             )
-        })
+        })?;
+        operation.completed()
     }
 
     async fn record_resolved_image(&self, image: &ResolvedOpencodeImage) -> anyhow::Result<()> {
+        let operation = self.cancellation.begin_external_operation(
+            "resolved_image_artifact_write",
+            &self.root.to_string_lossy(),
+        )?;
         tokio::fs::write(
             self.root.join("resolved-image.json"),
             serde_json::to_vec_pretty(image)?,
         )
         .await
-        .context("write resolved OpenCode image identity")
+        .context("write resolved OpenCode image identity")?;
+        operation.completed()
     }
 
     fn create_marker(&self, phase: CreateLifecyclePhase) -> anyhow::Result<AmbiguousCreateMarker> {
@@ -5058,22 +8839,36 @@ impl OpencodeJobState {
     }
 
     fn persist_create_phase(&self, phase: CreateLifecyclePhase) -> anyhow::Result<()> {
+        let operation = self
+            .cancellation
+            .begin_external_operation("docker_create_marker_write", &self.root.to_string_lossy())?;
         self.marker_store
-            .persist_ambiguous(&self.root, &self.create_marker(phase)?)
+            .persist_ambiguous(&self.root, &self.create_marker(phase)?)?;
+        operation.completed()
     }
 
     fn transition_create_success(&self) -> anyhow::Result<()> {
+        let operation = self.cancellation.begin_external_operation(
+            "docker_create_marker_transition",
+            &self.root.to_string_lossy(),
+        )?;
         self.marker_store.transition_success(
             &self.root,
             &self.create_marker(CreateLifecyclePhase::CreateSucceeded)?,
-        )
+        )?;
+        operation.completed()
     }
 
     fn clear_definitive_local_rejection(&self) -> anyhow::Result<()> {
+        let operation = self.cancellation.begin_external_operation(
+            "docker_create_marker_remove",
+            &self.root.to_string_lossy(),
+        )?;
         self.marker_store.clear_local_rejection(
             &self.root,
             &self.create_marker(CreateLifecyclePhase::LocalRejected)?,
-        )
+        )?;
+        operation.completed()
     }
 
     fn set_redactor(&self, redactor: ExactTokenRedactor) -> anyhow::Result<()> {
@@ -5085,6 +8880,9 @@ impl OpencodeJobState {
     }
 
     fn redact_error(&self, error: &anyhow::Error) -> anyhow::Error {
+        if let Some(interruption) = error.downcast_ref::<ExecutionInterrupted>() {
+            return ExecutionInterrupted(interruption.0.clone()).into();
+        }
         match self.redactor.read() {
             Ok(redactor) => anyhow::anyhow!(redactor.redact(&format!("{error:#}"))),
             Err(_) => {
@@ -5099,24 +8897,12 @@ impl Drop for OpencodeJobState {
         if self.cleaned.load(Ordering::Acquire) || self.retained.load(Ordering::Acquire) {
             return;
         }
-        let root = self.root.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Err(error) = tokio::fs::remove_dir_all(&root).await
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    eprintln!(
-                        "error: failed fallback cleanup of OpenCode job state {}: {error}",
-                        root.display()
-                    );
-                }
-            });
-        } else {
-            eprintln!(
-                "error: OpenCode job state requires cleanup at {} (no async runtime available)",
-                self.root.display()
-            );
-        }
+        let error = anyhow::anyhow!(
+            "OpenCode job state dropped without awaited cleanup: {}",
+            self.root.display()
+        );
+        let _ = self.cancellation.phase.containment_failed(&error);
+        eprintln!("error: {error:#}");
     }
 }
 
@@ -5178,6 +8964,10 @@ impl CredentialContainerCleanupGuard {
                 .await?;
             return Err(error).context("remove credential-bearing OpenCode container");
         }
+        self.job_state
+            .cancellation
+            .operations
+            .reconcile_owned_resource(&self.container_name)?;
         Ok(())
     }
 }
@@ -5187,42 +8977,13 @@ impl Drop for CredentialContainerCleanupGuard {
         if !self.armed {
             return;
         }
-        let name = self.container_name.clone();
-        let state = Arc::clone(&self.job_state);
-        let remover = Arc::clone(&self.remover);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                match remover(name).await {
-                    Ok(()) => {
-                        if let Err(error) = state.cleanup().await {
-                            eprintln!("error: dropped OpenCode job cleanup failed: {error:#}");
-                        }
-                    }
-                    Err(error) => {
-                        if let Err(marker_error) = state
-                            .retain_for_cleanup_failure(&format!("{error:#}"))
-                            .await
-                        {
-                            eprintln!(
-                                "error: dropped OpenCode container cleanup failed and retention marker failed: {error:#}; {marker_error:#}"
-                            );
-                        } else {
-                            eprintln!(
-                                "error: dropped OpenCode container cleanup failed; state retained at {}: {error:#}",
-                                state.root.display()
-                            );
-                        }
-                    }
-                }
-            });
-        } else {
-            eprintln!(
-                "error: credential-bearing container '{}' requires cleanup; state retained at {}",
-                self.container_name,
-                self.job_state.root.display()
-            );
-            self.job_state.retained.store(true, Ordering::Release);
-        }
+        self.job_state.retained.store(true, Ordering::Release);
+        let error = anyhow::anyhow!(
+            "credential-bearing container '{}' dropped without awaited cleanup",
+            self.container_name
+        );
+        let _ = self.job_state.cancellation.phase.containment_failed(&error);
+        eprintln!("error: {error:#}");
     }
 }
 
@@ -5246,11 +9007,13 @@ mod opencode_job_state_tests {
     use super::{
         AMBIGUOUS_CREATE_MARKER, AMBIGUOUS_CREATE_QUARANTINE, ContainerOwnership, ContainerRemover,
         CreateLifecyclePhase, CreateMarkerStore, CredentialContainerCleanupGuard, DockerCli,
-        DockerRuntimeInvocation, EnvironmentValidationTable, ExactTokenRedactor, ExecutionMode,
-        FsCreateMarkerStore, Job, JobDeadline, JobState, LABEL_ATTEMPT, LABEL_CONFIG,
-        LABEL_INSTALLATION, LABEL_JOB, LABEL_WORKER, OpencodeJobState, OpencodeManagedSpec,
-        ResolvedOpencodeImage, WallClock, finish_credential_container_operation,
-        reconcile_opencode_startup, run_opencode_validation_loop, spawn_opencode_runtime_container,
+        DockerRuntimeInvocation, EnvironmentValidationTable, ExactTokenRedactor,
+        ExecutionCancellationContext, ExecutionMode, FsCreateMarkerStore, Job, JobDeadline,
+        JobState, LABEL_ASSIGNMENT, LABEL_ATTEMPT, LABEL_CONFIG, LABEL_INSTALLATION, LABEL_JOB,
+        LABEL_WORKER, LABEL_WORKER_SESSION, LABEL_WORKER_SESSION_GENERATION, OpencodeJobState,
+        OpencodeManagedSpec, ResolvedOpencodeImage, WallClock,
+        finish_credential_container_operation, reconcile_opencode_startup,
+        run_opencode_validation_loop, spawn_opencode_runtime_container,
     };
     use chrono::Utc;
     use std::sync::Arc;
@@ -5366,6 +9129,9 @@ mod opencode_job_state_tests {
             worker_id: "test-worker".to_string(),
             job_id,
             attempt: 0,
+            assignment_id: job_id,
+            worker_session_id: uuid::Uuid::nil(),
+            worker_session_generation: 0,
         }
     }
 
@@ -5433,13 +9199,16 @@ if [ "$1" = create ]; then
         {LABEL_WORKER}) worker="$value" ;;
         {LABEL_JOB}) job="$value" ;;
         {LABEL_ATTEMPT}) attempt="$value" ;;
+        {LABEL_ASSIGNMENT}) assignment="$value" ;;
+        {LABEL_WORKER_SESSION}) worker_session="$value" ;;
+        {LABEL_WORKER_SESSION_GENERATION}) worker_session_generation="$value" ;;
       esac
     fi
     shift
   done
   if [ -f "$state/require_marker_path" ]; then marker=$(cat "$state/require_marker_path"); [ -f "$marker" ] || {{ printf 'missing durable pre-submit marker\n' >&2; exit 97; }}; fi
   if [ -f "$state/create_fail" ]; then output=$(cat "$state/output_path" 2>/dev/null); printf '{{"next_event":"invalid","summary":"synthetic-edge-canary"}}' > "$output"; printf 'synthetic create failure\n' >&2; exit 1; fi
-  labels=$(printf '{{"{LABEL_INSTALLATION}":"%s","{LABEL_CONFIG}":"%s","{LABEL_WORKER}":"%s","{LABEL_JOB}":"%s","{LABEL_ATTEMPT}":"%s"}}' "$installation" "$config" "$worker" "$job" "$attempt")
+  labels=$(printf '{{"{LABEL_INSTALLATION}":"%s","{LABEL_CONFIG}":"%s","{LABEL_WORKER}":"%s","{LABEL_JOB}":"%s","{LABEL_ATTEMPT}":"%s","{LABEL_ASSIGNMENT}":"%s","{LABEL_WORKER_SESSION}":"%s","{LABEL_WORKER_SESSION_GENERATION}":"%s"}}' "$installation" "$config" "$worker" "$job" "$attempt" "$assignment" "$worker_session" "$worker_session_generation")
   if [ -f "$state/create_slow" ]; then (sleep 0.8; printf '%s' "$labels" > "$containers/$name") & sleep 2; fi
   printf '%s' "$labels" > "$containers/$name"; printf 'created\n'; exit 0
 fi
@@ -5465,7 +9234,11 @@ exit 0
         let mut permissions = std::fs::metadata(&command).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&command, permissions).unwrap();
-        DockerCli { command }
+        DockerCli {
+            command,
+            recovery_journal: None,
+            execution_phase: None,
+        }
     }
 
     fn fake_invocation(
@@ -5552,7 +9325,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn job_state_is_isolated_and_removed_after_explicit_cleanup() {
+    async fn job_state_splits_private_authority_from_disposable_runtime() {
         let root = std::env::temp_dir().join(format!(
             "agent-hub-opencode-state-test-{}",
             uuid::Uuid::new_v4()
@@ -5568,6 +9341,23 @@ exit 0
             .await
             .unwrap();
         assert_ne!(first.root, second.root);
+        assert_ne!(first.runtime_root, second.runtime_root);
+        assert!(!first.runtime_root.starts_with(first.root.parent().unwrap()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(first.root.parent().unwrap())
+                    .unwrap()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&first.runtime_root).unwrap().mode() & 0o777,
+                0o700
+            );
+        }
         assert!(first.bundle.join("opencode.json").exists());
         assert_eq!(
             std::fs::read_to_string(first.root.join("bundle.sha256")).unwrap(),
@@ -5575,6 +9365,10 @@ exit 0
         );
         assert!(second.bundle.join("opencode.json").exists());
         let mounts = first.trusted_mounts().unwrap();
+        assert!(mounts.iter().all(|mount| {
+            std::path::Path::new(&mount.host_path).starts_with(&first.runtime_root)
+                && !std::path::Path::new(&mount.host_path).starts_with(&first.root)
+        }));
         assert!(mounts.iter().any(|mount| {
             mount.container_path == "/opencode/config/opencode" && mount.read_only
         }));
@@ -5587,13 +9381,67 @@ exit 0
         }
         let first_root = first.root.clone();
         let second_root = second.root.clone();
+        let first_runtime = first.runtime_root.clone();
+        let second_runtime = second.runtime_root.clone();
         first.cleanup().await.unwrap();
+        assert!(!first_runtime.exists());
+        assert!(first_root.exists());
+        first.retained.store(true, Ordering::Release);
         drop(first);
-        assert!(!first_root.exists());
         assert!(second_root.exists());
         second.cleanup().await.unwrap();
+        assert!(!second_runtime.exists());
+        assert!(second_root.exists());
+        second.retained.store(true, Ordering::Release);
         drop(second);
-        assert!(!second_root.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn opencode_error_redaction_preserves_typed_cancellation_interruption() {
+        let root = std::env::temp_dir().join(format!("typed-redaction-{}", uuid::Uuid::new_v4()));
+        let job_id = uuid::Uuid::new_v4();
+        let state = OpencodeJobState::prepare(
+            &root,
+            ownership(job_id),
+            &bundle(),
+            &DockerCli::production(),
+        )
+        .await
+        .unwrap();
+        let session = uuid::Uuid::new_v4();
+        let invocation = uuid::Uuid::new_v4();
+        let command = protocol::CancellationCommand {
+            cancellation_id: uuid::Uuid::new_v4(),
+            generation: 1,
+            job_id,
+            invocation_id: invocation,
+            attempt: 0,
+            assignment_id: protocol::cancellation_assignment_id(
+                job_id,
+                invocation,
+                0,
+                "test-worker",
+                session,
+                1,
+            ),
+            runtime_assignment_id: state.ownership.assignment_id,
+            worker_id: "test-worker".to_string(),
+            worker_session_id: session,
+            worker_session_generation: 1,
+        };
+        let interruption = anyhow::Error::new(super::ExecutionInterrupted(
+            super::WorkerStopReason::CancelRequested(command),
+        ));
+        let redacted = state.redact_error(&interruption);
+        assert!(matches!(
+            redacted.downcast_ref::<super::ExecutionInterrupted>(),
+            Some(super::ExecutionInterrupted(
+                super::WorkerStopReason::CancelRequested(_)
+            ))
+        ));
+        state.retained.store(true, Ordering::Release);
+        drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5628,7 +9476,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn dropped_guard_runs_async_fallback_before_state_cleanup() {
+    async fn dropped_guard_never_spawns_detached_cleanup() {
         let root =
             std::env::temp_dir().join(format!("agent-hub-cleanup-drop-{}", uuid::Uuid::new_v4()));
         let state = OpencodeJobState::prepare(
@@ -5652,13 +9500,13 @@ exit 0
             CredentialContainerCleanupGuard::new("container".into(), Arc::clone(&state), remover);
         drop(guard);
         drop(state);
-        for _ in 0..50 {
-            if !state_root.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(!state_root.exists());
+        assert!(state_root.exists());
+        let phase: super::AttemptPhaseRecord = serde_json::from_slice(
+            &super::read_private_regular(state_root.parent().unwrap(), "attempt-phase.json")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(phase.phase, super::AttemptPhase::ContainmentFailed);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 
@@ -5753,6 +9601,7 @@ exit 0
         write_owned_container(&root, &state);
         std::fs::write(root.join("fake-docker-state/race_once"), "race").unwrap();
         let state_root = state.root.clone();
+        let runtime_root = state.runtime_root.clone();
         state.retained.store(true, Ordering::Release);
         drop(state);
 
@@ -5768,7 +9617,8 @@ exit 0
         )
         .await
         .unwrap();
-        assert!(!state_root.exists());
+        assert!(state_root.exists());
+        assert!(!runtime_root.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5929,10 +9779,11 @@ exit 0
             "agent-hub-startup-enumeration-{}",
             uuid::Uuid::new_v4()
         ));
-        let jobs = root.join("opencode-jobs");
+        let jobs = root.join("attempts");
         std::fs::create_dir_all(&jobs).unwrap();
-        for index in 0..100 {
-            std::fs::create_dir_all(jobs.join(format!("item-{index:03}"))).unwrap();
+        for _ in 0..100 {
+            std::fs::create_dir_all(jobs.join(uuid::Uuid::new_v4().to_string()).join("opencode"))
+                .unwrap();
         }
         let docker = fake_docker(&root);
         assert!(
@@ -6006,8 +9857,11 @@ exit 0
                 state.container_name.clone(),
                 Arc::clone(&state),
             );
+            let (_stop_tx, stop_rx) = watch::channel(false);
+            let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
             let operation =
-                spawn_opencode_runtime_container(&invocation, &state.container_name).await;
+                spawn_opencode_runtime_container(&invocation, &state.container_name, &cancellation)
+                    .await;
             if edge == "success" {
                 assert!(!state.root.join(AMBIGUOUS_CREATE_MARKER).exists());
                 assert!(state.root.join(super::CREATE_OUTCOME_MARKER).exists());
@@ -6251,8 +10105,15 @@ exit 0
                         state.container_name.clone(),
                         Arc::clone(&state),
                     );
-                    let operation =
-                        spawn_opencode_runtime_container(&invocation, &state.container_name).await;
+                    let (_stop_tx, stop_rx) = watch::channel(false);
+                    let cancellation =
+                        ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
+                    let operation = spawn_opencode_runtime_container(
+                        &invocation,
+                        &state.container_name,
+                        &cancellation,
+                    )
+                    .await;
                     assert!(operation.is_err());
                     assert!(
                         finish_credential_container_operation(operation, guard)
@@ -6432,6 +10293,7 @@ exit 0
                     cancel_tx.send(true).unwrap();
                 });
             }
+            let cancellation = ExecutionCancellationContext::for_test(&root, cancel_rx).unwrap();
             let result = run_opencode_validation_loop(
                 &job,
                 &OpencodeManagedSpec {
@@ -6444,14 +10306,19 @@ exit 0
                 &serde_json::json!({}),
                 &EnvironmentValidationTable::for_tests(),
                 None,
-                Some(cancel_rx),
+                &cancellation,
             )
             .await;
             match scenario {
                 "success" => assert!(matches!(result.unwrap(), super::ExecutionStatus::Exited(0))),
                 "timeout" => assert!(matches!(result.unwrap(), super::ExecutionStatus::TimedOut)),
                 "cancellation" => {
-                    assert!(matches!(result.unwrap(), super::ExecutionStatus::Cancelled))
+                    assert!(
+                        matches!(&result, Ok(super::ExecutionStatus::Cancelled))
+                            || result.as_ref().err().is_some_and(|error| {
+                                error.to_string().contains("ControlPlaneUnavailable")
+                            })
+                    )
                 }
                 "create_fail" | "start_fail" | "transcript_error" | "validation" => {
                     assert!(result.is_err())
@@ -6940,7 +10807,7 @@ mod real_docker_oauth_integration_tests {
         let job_id = uuid::Uuid::new_v4();
         let runtime = synthetic_oauth_runtime_spec();
         let execution_context = serde_json::json!({
-            "workflow": {"valid_next_events":["job_succeeded"]},
+            "workflow": {"inputs":{}},
             "work_item": {"workflow_id":"oauth-integration"},
             "state_invocation": {"state_id":"assert", "id":work_item_id}
         });
@@ -6979,7 +10846,7 @@ mod real_docker_oauth_integration_tests {
             workflow_snapshot: serde_json::json!({"schema":"reactive_v2"}),
             state_id: "assert".to_string(),
             state_kind: protocol::ReactiveStateKind::Agent,
-            agent_output_events: Vec::new(),
+            agent_output_events: vec![protocol::AgentOutputEvent::JobSucceeded],
             behavior: protocol::ResolvedAuthorizationBehavior {
                 execution_kind: "agent".to_string(),
                 runner_profile: serde_json::to_value(&profile)?,
@@ -7100,6 +10967,9 @@ mod real_docker_oauth_integration_tests {
                 worker_id: resource_identity.clone(),
                 job_id,
                 attempt: 0,
+                assignment_id: uuid::Uuid::nil(),
+                worker_session_id: uuid::Uuid::nil(),
+                worker_session_generation: 0,
             },
             bundle,
             &DockerCli::production(),
@@ -7108,12 +10978,18 @@ mod real_docker_oauth_integration_tests {
         write_hostile_home(&state.state.join("home"))?;
         let sentinel_before = std::fs::read(state.bundle.join(".gitignore"))?;
         let event_path = transcript.join("job-events.jsonl");
+        let (_event_stop_tx, event_stop_rx) = watch::channel(false);
+        let event_cancellation = ExecutionCancellationContext::for_test(
+            &root.join("private-event-attempts/event"),
+            event_stop_rx,
+        )?;
         let events = JobEventSink {
             worker_id: resource_identity.clone(),
             writer: Arc::new(Mutex::new(
-                JobEventTranscriptWriter::create(&event_path).await?,
+                JobEventTranscriptWriter::create(&event_path, &event_cancellation).await?,
             )),
             publisher: None,
+            cancellation: event_cancellation,
         };
         let output_path = transcript.join("output.json");
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -7141,6 +11017,10 @@ mod real_docker_oauth_integration_tests {
             ResolvedRunnerKind::Opencode(spec) => spec,
             _ => anyhow::bail!("integration profile is not OpenCode"),
         };
+        let cancellation = ExecutionCancellationContext::for_test(
+            &root.join("private-execution-attempts/execution"),
+            cancel_rx,
+        )?;
         let invocation = build_docker_runtime_invocation(
             &verified.job,
             &local_config,
@@ -7161,6 +11041,7 @@ mod real_docker_oauth_integration_tests {
             &state,
             &opencode.trusted_env,
             Some(&events),
+            &cancellation,
         )
         .await?;
         assert_production_opencode_invocation(&invocation.args, &state)?;
@@ -7174,7 +11055,7 @@ mod real_docker_oauth_integration_tests {
                 &verified.work_item_context,
                 &validation,
                 Some(&events),
-                Some(cancel_rx),
+                &cancellation,
             )
             .await
         } else {
@@ -7184,7 +11065,8 @@ mod real_docker_oauth_integration_tests {
                 Arc::clone(&invocation.job_state),
             );
             let operation = async {
-                spawn_opencode_runtime_container(&invocation, &container_name).await?;
+                spawn_opencode_runtime_container(&invocation, &container_name, &cancellation)
+                    .await?;
                 run_docker_opencode_attempt(
                     &verified.job,
                     &invocation,
@@ -7197,7 +11079,7 @@ mod real_docker_oauth_integration_tests {
                     &verified.work_item_context,
                     &validation,
                     Some(&events),
-                    None,
+                    &cancellation,
                 )
                 .await
             }
@@ -7287,7 +11169,8 @@ mod real_docker_oauth_integration_tests {
                 .is_some()
         );
         state.cleanup().await?;
-        assert!(!state.root.exists());
+        assert!(!state.runtime_root.exists());
+        assert!(state.root.exists());
         assert_eq!(docker_snapshot(&resource_identity)?, docker_before);
         assert_eq!(
             docker_image_id(agent_hub_config::DURABLE_OPENCODE_IMAGE)?,
@@ -7520,10 +11403,13 @@ printf '{{"next_event":"{next_event}","summary":"%s"}}' "$access" > /transcript/
                 anyhow::bail!("production invocation has no writable {destination} mount");
             }
         }
-        if args
-            .iter()
-            .any(|argument| argument.contains("/var/run/docker.sock"))
-        {
+        if args.windows(2).any(|window| {
+            matches!(window[0].as_str(), "-v" | "--volume")
+                && window[1]
+                    .split(':')
+                    .next()
+                    .is_some_and(|source| source == "/var/run/docker.sock")
+        }) {
             anyhow::bail!("production invocation exposes the Docker socket");
         }
         if std::fs::read(state.bundle.join(".gitignore"))?
@@ -8116,6 +12002,90 @@ fn validate_mount_target_plan<'a>(
     Ok(())
 }
 
+fn validate_final_docker_mount_plan(
+    private_attempt_root: &Path,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let attempts_root = private_attempt_root
+        .parent()
+        .context("private attempt root has no attempts parent")?;
+    let attempts_root = std::fs::canonicalize(attempts_root)?;
+    let assignment = private_attempt_root
+        .file_name()
+        .context("private attempt root has no assignment component")?;
+    let data_dir = attempts_root
+        .parent()
+        .context("attempts root has no worker data parent")?;
+    let runtime_attempts = data_dir.join("runtime-attempts");
+    let exact_runtime_root = runtime_attempts.join(assignment);
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] != "-v" && args[index] != "--volume" {
+            index += 1;
+            continue;
+        }
+        let spec = args
+            .get(index + 1)
+            .context("Docker volume flag has no value")?;
+        let source = spec
+            .split(':')
+            .next()
+            .context("Docker volume has no source")?;
+        let declared_source = PathBuf::from(source);
+        let declared_runtime_source = declared_source.starts_with(&runtime_attempts);
+        let source = std::fs::canonicalize(source)
+            .with_context(|| format!("canonicalize Docker mount source {source}"))?;
+        anyhow::ensure!(
+            !source.starts_with(&attempts_root) && !attempts_root.starts_with(&source),
+            "Docker mount source overlaps worker-private attempt authority"
+        );
+        if declared_runtime_source || source.starts_with(&runtime_attempts) {
+            let exact_runtime_root = std::fs::canonicalize(&exact_runtime_root)
+                .context("canonicalize exact assignment runtime root")?;
+            anyhow::ensure!(
+                source.starts_with(&exact_runtime_root),
+                "Docker runtime mount belongs to a different assignment"
+            );
+        }
+        #[cfg(unix)]
+        if source.is_file() {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(&source)?;
+            anyhow::ensure!(metadata.nlink() == 1, "Docker file mount has hard links");
+            for entry in walk_private_regular_files(&attempts_root)? {
+                let private = std::fs::metadata(entry)?;
+                anyhow::ensure!(
+                    metadata.dev() != private.dev() || metadata.ino() != private.ino(),
+                    "Docker file mount aliases worker-private authority"
+                );
+            }
+        }
+        index += 2;
+    }
+    Ok(())
+}
+
+fn walk_private_regular_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "private attempt inventory contains symlink"
+            );
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    Ok(files)
+}
+
 fn forbidden_host_mount(path: &Path) -> bool {
     let normalized = normalize_mount_path_for_policy(&path.to_string_lossy());
     if is_forbidden_host_path(&normalized) {
@@ -8213,40 +12183,36 @@ fn validate_github_action_capability(
 async fn run_authorized_github_operation<F, T>(
     operation: F,
     deadline: &JobDeadline,
-    cancel_rx: watch::Receiver<bool>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let cancellation = wait_for_cancellation(cancel_rx);
+    let external = cancellation
+        .begin_external_operation("managed_github_operation", "authorized_github_capability")?;
+    let cancelled = cancellation.cancelled();
     tokio::pin!(operation);
-    tokio::pin!(cancellation);
-    if let Some(remaining) = deadline.remaining() {
+    tokio::pin!(cancelled);
+    let result = if let Some(remaining) = deadline.remaining() {
         tokio::select! {
             result = &mut operation => result,
-            () = &mut cancellation => anyhow::bail!("managed GitHub action cancelled"),
+            () = &mut cancelled => Err(anyhow::anyhow!("managed GitHub action cancelled")),
             () = tokio::time::sleep(remaining) => {
-                anyhow::bail!("managed GitHub action exceeded authorized timeout")
+                Err(anyhow::anyhow!("managed GitHub action exceeded authorized timeout"))
             }
         }
     } else {
         tokio::select! {
             result = &mut operation => result,
-            () = &mut cancellation => anyhow::bail!("managed GitHub action cancelled"),
+            () = &mut cancelled => Err(anyhow::anyhow!("managed GitHub action cancelled")),
         }
+    };
+    if result.is_ok() {
+        external.completed()?;
+    } else {
+        external.ambiguous("managed_github_operation_failed")?;
     }
-}
-
-async fn wait_for_cancellation(mut cancel_rx: watch::Receiver<bool>) {
-    if *cancel_rx.borrow() {
-        return;
-    }
-    while cancel_rx.changed().await.is_ok() {
-        if *cancel_rx.borrow() {
-            return;
-        }
-    }
-    std::future::pending::<()>().await;
+    result
 }
 
 async fn finalize_required_cleanup<T, F>(
@@ -8291,16 +12257,18 @@ trait GithubHttpTransport {
 
 struct ReqwestGithubHttpTransport {
     client: reqwest::Client,
+    cancellation: ExecutionCancellationContext,
 }
 
 impl ReqwestGithubHttpTransport {
-    fn new() -> anyhow::Result<Self> {
+    fn new(cancellation: &ExecutionCancellationContext) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .user_agent("agent-hub-github-action/1")
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()?,
+            cancellation: cancellation.clone(),
         })
     }
 }
@@ -8311,6 +12279,14 @@ impl GithubHttpTransport for ReqwestGithubHttpTransport {
         request: GithubHttpRequest,
         token: &str,
     ) -> anyhow::Result<GithubHttpResponse> {
+        self.cancellation.check()?;
+        let resource = reqwest::Url::parse(&request.url)
+            .ok()
+            .and_then(|url| url.host_str().map(ToOwned::to_owned))
+            .context("GitHub request URL has no host")?;
+        let operation = self
+            .cancellation
+            .begin_external_operation("managed_github_http_request", &resource)?;
         let mut builder = self
             .client
             .request(request.method, &request.url)
@@ -8323,7 +12299,13 @@ impl GithubHttpTransport for ReqwestGithubHttpTransport {
         if let Some(body) = request.body {
             builder = builder.json(&body);
         }
-        let response = builder.send().await?;
+        let response = match builder.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                operation.ambiguous("managed_github_http_failed")?;
+                return Err(error.into());
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             anyhow::bail!("GitHub request failed with HTTP {status}");
@@ -8334,6 +12316,7 @@ impl GithubHttpTransport for ReqwestGithubHttpTransport {
         } else {
             serde_json::from_slice(&bytes).context("GitHub returned invalid JSON")?
         };
+        operation.completed()?;
         Ok(GithubHttpResponse { status, body })
     }
 }
@@ -8355,18 +12338,43 @@ trait GitCommandRunner {
     async fn run(&self, request: GitCommandRequest) -> anyhow::Result<GitCommandOutput>;
 }
 
-struct TokioGitCommandRunner;
+struct TokioGitCommandRunner {
+    cancellation: ExecutionCancellationContext,
+}
 
 impl GitCommandRunner for TokioGitCommandRunner {
     async fn run(&self, request: GitCommandRequest) -> anyhow::Result<GitCommandOutput> {
-        let output = tokio::process::Command::new("git")
+        self.cancellation.check()?;
+        let operation = self.cancellation.begin_external_operation(
+            "managed_github_git_request",
+            &request.workspace.to_string_lossy(),
+        )?;
+        let mut command = tokio::process::Command::new("git");
+        command
             .arg("-C")
             .arg(request.workspace)
             .args(request.args)
             .envs(request.env)
-            .kill_on_drop(true)
-            .output()
-            .await?;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.as_std_mut().process_group(0);
+        let child = command.spawn()?;
+        let pid = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .context("managed GitHub git helper has no valid PID")?;
+        let identity = read_process_identity(pid)?;
+        let helper = self.cancellation.begin_external_operation(
+            "managed_github_git_helper",
+            &format!(
+                "pid={};pgid={};boot={};start={}",
+                identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
+            ),
+        )?;
+        let output = child.wait_with_output().await?;
+        verify_process_group_absent(&identity).await?;
+        helper.reconciled()?;
+        operation.completed()?;
         Ok(GitCommandOutput {
             success: output.status.success(),
             stdout: output.stdout,
@@ -8376,14 +12384,29 @@ impl GitCommandRunner for TokioGitCommandRunner {
 
 struct TemporaryCredentialFile {
     path: Option<PathBuf>,
+    cancellation: ExecutionCancellationContext,
 }
 
 impl TemporaryCredentialFile {
-    fn create(contents: &[u8]) -> anyhow::Result<Self> {
+    fn create(
+        contents: &[u8],
+        cancellation: &ExecutionCancellationContext,
+    ) -> anyhow::Result<Self> {
         let path =
             std::env::temp_dir().join(format!("agent-hub-github-askpass-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&path, contents)?;
-        Ok(Self { path: Some(path) })
+        cancellation.write_file("github_askpass_create", &path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let chmod = cancellation
+                .begin_external_operation("github_askpass_chmod", &path.to_string_lossy())?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            chmod.completed()?;
+        }
+        Ok(Self {
+            path: Some(path),
+            cancellation: cancellation.clone(),
+        })
     }
 
     fn path(&self) -> &Path {
@@ -8392,15 +12415,27 @@ impl TemporaryCredentialFile {
 
     fn cleanup(mut self) -> anyhow::Result<()> {
         let path = self.path.take().expect("temporary credential path");
-        std::fs::remove_file(&path)
+        self.cancellation
+            .remove_file("github_askpass_remove", &path)
             .with_context(|| format!("remove GitHub credential helper {}", path.display()))
     }
 }
 
 impl Drop for TemporaryCredentialFile {
     fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = std::fs::remove_file(path);
+        if let Some(path) = self.path.take()
+            && let Err(error) = self
+                .cancellation
+                .remove_file("github_askpass_remove", &path)
+        {
+            let _ = self.cancellation.phase.containment_failed(&error);
+            if std::thread::panicking() {
+                std::process::abort();
+            }
+            panic!(
+                "failed required GitHub askpass cleanup {}: {error:#}",
+                path.display()
+            );
         }
     }
 }
@@ -8411,6 +12446,7 @@ async fn execute_github_action(
     workspace: &Path,
     config: &LocalAgentConfig,
     work_item_context: &serde_json::Value,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<serde_json::Value> {
     let capability = runtime
         .github_capabilities
@@ -8418,16 +12454,20 @@ async fn execute_github_action(
         .first()
         .filter(|_| runtime.github_capabilities.len() == 1)
         .context("managed GitHub action requires exactly one capability")?;
-    let token = resolve_github_action_token(config, capability).await?;
-    let transport = ReqwestGithubHttpTransport::new()?;
-    execute_github_action_with(
+    let token = resolve_github_action_token(config, capability, cancellation).await?;
+    let transport = ReqwestGithubHttpTransport::new(cancellation)?;
+    let git = TokioGitCommandRunner {
+        cancellation: cancellation.clone(),
+    };
+    execute_github_action_with_cancellation(
         action,
         runtime,
         workspace,
         work_item_context,
         &token,
         &transport,
-        &TokioGitCommandRunner,
+        &git,
+        cancellation,
     )
     .await
 }
@@ -8439,6 +12479,7 @@ fn github_read_write_provider(host: &str) -> String {
 async fn resolve_github_action_token(
     config: &LocalAgentConfig,
     capability: &protocol::GithubCapability,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<String> {
     if !config
         .github_host_allowlist()
@@ -8461,13 +12502,17 @@ async fn resolve_github_action_token(
     if configured_api_base != &authorized_api_base {
         anyhow::bail!("GitHub API base URL does not match authorized host configuration");
     }
-    let credentials = resolve_configured_credentials(config, &[expected_provider], None, None)
-        .await
-        .map_err(|_| anyhow::anyhow!("GitHub credential provider resolution failed"))?;
-    github_token_from_credentials(credentials)
+    let credentials =
+        resolve_configured_credentials(config, &[expected_provider], None, None, cancellation)
+            .await
+            .map_err(|_| anyhow::anyhow!("GitHub credential provider resolution failed"))?;
+    github_token_from_credentials_cancellable(credentials, cancellation)
 }
 
-fn github_token_from_credentials(credentials: ResolvedCredentials) -> anyhow::Result<String> {
+fn github_token_from_credentials_cancellable(
+    credentials: ResolvedCredentials,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<String> {
     let token = credentials
         .env_vars
         .get("GITHUB_TOKEN")
@@ -8475,7 +12520,7 @@ fn github_token_from_credentials(credentials: ResolvedCredentials) -> anyhow::Re
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string);
-    cleanup_credential_temp_files(&credentials.temp_files)?;
+    cleanup_credential_temp_files_required(&credentials.temp_files, cancellation)?;
     if !credentials.file_mounts.is_empty()
         || !credentials.temp_files.is_empty()
         || credentials.env_vars.len() != 1
@@ -8487,15 +12532,20 @@ fn github_token_from_credentials(credentials: ResolvedCredentials) -> anyhow::Re
     token.context("GitHub action credential provider returned no GITHUB_TOKEN")
 }
 
-fn cleanup_credential_temp_files(temp_files: &[PathBuf]) -> anyhow::Result<()> {
-    for path in temp_files {
-        std::fs::remove_file(path)
-            .with_context(|| format!("remove temporary credential file {}", path.display()))?;
-    }
-    Ok(())
+#[cfg(test)]
+fn github_token_from_credentials(credentials: ResolvedCredentials) -> anyhow::Result<String> {
+    let root = std::env::temp_dir().join(format!(
+        "github-token-shape-journal-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx)?;
+    let result = github_token_from_credentials_cancellable(credentials, &cancellation);
+    let _ = std::fs::remove_dir_all(root);
+    result
 }
 
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn execute_github_action_with<H: GithubHttpTransport, G: GitCommandRunner>(
     action: &protocol::GithubAction,
     runtime: &protocol::CanonicalRuntimeSpec,
@@ -8504,6 +12554,35 @@ async fn execute_github_action_with<H: GithubHttpTransport, G: GitCommandRunner>
     token: &str,
     transport: &H,
     git: &G,
+) -> anyhow::Result<serde_json::Value> {
+    let root = std::env::temp_dir().join(format!("github-action-journal-{}", uuid::Uuid::new_v4()));
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx)?;
+    let result = execute_github_action_with_cancellation(
+        action,
+        runtime,
+        workspace,
+        work_item_context,
+        token,
+        transport,
+        git,
+        &cancellation,
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(root);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_github_action_with_cancellation<H: GithubHttpTransport, G: GitCommandRunner>(
+    action: &protocol::GithubAction,
+    runtime: &protocol::CanonicalRuntimeSpec,
+    workspace: &Path,
+    work_item_context: &serde_json::Value,
+    token: &str,
+    transport: &H,
+    git: &G,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<serde_json::Value> {
     let capability = runtime
         .github_capabilities
@@ -8542,14 +12621,14 @@ async fn execute_github_action_with<H: GithubHttpTransport, G: GitCommandRunner>
             validate_git_sha(&head_sha)?;
             let askpass = TemporaryCredentialFile::create(
                 b"#!/bin/sh\ncase \"$1\" in *Username*) printf x-access-token;; *Password*) printf %s \"$AGENT_HUB_GITHUB_TOKEN\";; *) exit 1;; esac\n",
+                cancellation,
             )?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(askpass.path(), std::fs::Permissions::from_mode(0o700))?;
-            }
             let remote = format!("https://{}/{}.git", capability.host, capability.repository);
             let refspec = format!("HEAD:refs/heads/{branch}");
+            let use_operation = cancellation.begin_external_operation(
+                "github_askpass_use",
+                &askpass.path().to_string_lossy(),
+            )?;
             let push = git
                 .run(GitCommandRequest {
                     workspace: workspace.to_path_buf(),
@@ -8577,6 +12656,11 @@ async fn execute_github_action_with<H: GithubHttpTransport, G: GitCommandRunner>
                     ]),
                 })
                 .await;
+            if push.is_ok() {
+                use_operation.completed()?;
+            } else {
+                use_operation.ambiguous("github_askpass_use_failed")?;
+            }
             askpass.cleanup()?;
             let push = push?;
             if !push.success {
@@ -9170,6 +13254,10 @@ mod github_action_tests {
 
     #[tokio::test]
     async fn github_tokens_are_host_specific_and_fail_closed() {
+        let root =
+            std::env::temp_dir().join(format!("github-token-journal-{}", uuid::Uuid::new_v4()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
         let mut config = LocalAgentConfig::default();
         config.github_hosts = vec!["github.com".to_string(), "github.snooguts.net".to_string()];
         config.github_api_base_urls = HashMap::from([
@@ -9195,7 +13283,7 @@ mod github_action_tests {
             );
             let capability = capability(host, vec![protocol::GithubOperation::PushBranch]);
             assert_eq!(
-                resolve_github_action_token(&config, &capability)
+                resolve_github_action_token(&config, &capability, &cancellation)
                     .await
                     .expect("host token"),
                 token
@@ -9207,14 +13295,14 @@ mod github_action_tests {
             vec![protocol::GithubOperation::PushBranch],
         );
         assert!(
-            resolve_github_action_token(&config, &missing)
+            resolve_github_action_token(&config, &missing, &cancellation)
                 .await
                 .is_err()
         );
         let mut mismatch = capability("github.com", vec![protocol::GithubOperation::PushBranch]);
         mismatch.credential_provider = github_read_write_provider("github.snooguts.net");
         assert!(
-            resolve_github_action_token(&config, &mismatch)
+            resolve_github_action_token(&config, &mismatch, &cancellation)
                 .await
                 .is_err()
         );
@@ -9222,7 +13310,7 @@ mod github_action_tests {
             capability("github.com", vec![protocol::GithubOperation::PushBranch]);
         mismatched_api.api_base_url = "https://ghe-api.example.com/custom".to_string();
         assert!(
-            resolve_github_action_token(&config, &mismatched_api)
+            resolve_github_action_token(&config, &mismatched_api, &cancellation)
                 .await
                 .is_err()
         );
@@ -9237,6 +13325,7 @@ mod github_action_tests {
             resolve_github_action_token(
                 &config,
                 &capability("github.com", vec![protocol::GithubOperation::PushBranch]),
+                &cancellation,
             )
             .await
             .is_err()
@@ -9822,10 +13911,14 @@ mod github_action_tests {
 
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let deadline = JobDeadline::new(Some(0)).unwrap();
+        let timeout_root =
+            std::env::temp_dir().join(format!("github-timeout-journal-{}", uuid::Uuid::new_v4()));
+        let timeout_cancellation =
+            ExecutionCancellationContext::for_test(&timeout_root, cancel_rx.clone()).unwrap();
         let timed_out = run_authorized_github_operation(
             std::future::pending::<anyhow::Result<()>>(),
             &deadline,
-            cancel_rx,
+            &timeout_cancellation,
         )
         .await;
         let timeout_cleanup = Arc::new(AtomicUsize::new(0));
@@ -9853,7 +13946,10 @@ mod github_action_tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         cancel_tx.send(true).unwrap();
         let deadline = JobDeadline::new(Some(60)).unwrap();
-        let cancelled = run_authorized_github_operation(operation, &deadline, cancel_rx).await;
+        let cancel_root =
+            std::env::temp_dir().join(format!("github-cancel-journal-{}", uuid::Uuid::new_v4()));
+        let cancellation = ExecutionCancellationContext::for_test(&cancel_root, cancel_rx).unwrap();
+        let cancelled = run_authorized_github_operation(operation, &deadline, &cancellation).await;
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         let cancel_cleanup = Arc::new(AtomicUsize::new(0));
         assert!(
@@ -9890,12 +13986,18 @@ mod github_action_tests {
         );
         let capability = capability("github.com", vec![protocol::GithubOperation::PushBranch]);
         let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let journal_root = std::env::temp_dir().join(format!(
+            "github-credential-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cancellation =
+            ExecutionCancellationContext::for_test(&journal_root, cancel_rx).unwrap();
         let started = Instant::now();
         let deadline = JobDeadline::new(Some(1)).unwrap();
         let result = run_authorized_github_operation(
-            resolve_github_action_token(&config, &capability),
+            resolve_github_action_token(&config, &capability, &cancellation),
             &deadline,
-            cancel_rx,
+            &cancellation,
         )
         .await;
         assert!(result.is_err());
@@ -10099,6 +14201,9 @@ const LABEL_CONFIG: &str = "com.reddit.agent-hub.config";
 const LABEL_WORKER: &str = "com.reddit.agent-hub.worker";
 const LABEL_JOB: &str = "com.reddit.agent-hub.job";
 const LABEL_ATTEMPT: &str = "com.reddit.agent-hub.attempt";
+const LABEL_ASSIGNMENT: &str = "com.reddit.agent-hub.assignment";
+const LABEL_WORKER_SESSION: &str = "com.reddit.agent-hub.worker-session";
+const LABEL_WORKER_SESSION_GENERATION: &str = "com.reddit.agent-hub.worker-session-generation";
 const STARTUP_RECONCILIATION_MAX_ITEMS: usize = 100;
 const STARTUP_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(60);
 const CREATE_COMMAND_MAX_BUDGET: Duration = Duration::from_secs(30);
@@ -10116,6 +14221,9 @@ struct ContainerOwnership {
     worker_id: String,
     job_id: uuid::Uuid,
     attempt: u32,
+    assignment_id: uuid::Uuid,
+    worker_session_id: uuid::Uuid,
+    worker_session_generation: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -10191,7 +14299,8 @@ fn durable_write_json<T: serde::Serialize>(
     value: &T,
 ) -> anyhow::Result<()> {
     let target = root.join(name);
-    let temporary = root.join(format!(".{name}.tmp-{}", std::process::id()));
+    ensure_private_directory(root)?;
+    let temporary = root.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
     let _ = std::fs::remove_file(&temporary);
     let result = (|| -> anyhow::Result<()> {
         let mut options = std::fs::OpenOptions::new();
@@ -10199,7 +14308,7 @@ fn durable_write_json<T: serde::Serialize>(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o600).custom_flags(0x0002_0000);
         }
         let mut file = options
             .open(&temporary)
@@ -10238,13 +14347,22 @@ impl WallClock for SystemWallClock {
 }
 
 impl ContainerOwnership {
-    fn labels(&self) -> [(String, String); 5] {
+    fn labels(&self) -> [(String, String); 8] {
         [
             (LABEL_INSTALLATION.to_string(), self.installation_id.clone()),
             (LABEL_CONFIG.to_string(), self.config_identity.clone()),
             (LABEL_WORKER.to_string(), self.worker_id.clone()),
             (LABEL_JOB.to_string(), self.job_id.to_string()),
             (LABEL_ATTEMPT.to_string(), self.attempt.to_string()),
+            (LABEL_ASSIGNMENT.to_string(), self.assignment_id.to_string()),
+            (
+                LABEL_WORKER_SESSION.to_string(),
+                self.worker_session_id.to_string(),
+            ),
+            (
+                LABEL_WORKER_SESSION_GENERATION.to_string(),
+                self.worker_session_generation.to_string(),
+            ),
         ]
     }
 
@@ -10265,6 +14383,13 @@ impl ContainerOwnership {
             attempt: value(LABEL_ATTEMPT)?
                 .parse()
                 .context("container attempt ownership label is not a u32")?,
+            assignment_id: uuid::Uuid::parse_str(&value(LABEL_ASSIGNMENT)?)
+                .context("container assignment ownership label is not a UUID")?,
+            worker_session_id: uuid::Uuid::parse_str(&value(LABEL_WORKER_SESSION)?)
+                .context("container worker session ownership label is not a UUID")?,
+            worker_session_generation: value(LABEL_WORKER_SESSION_GENERATION)?
+                .parse()
+                .context("container worker session generation label is not a u64")?,
         })
     }
 }
@@ -10289,16 +14414,69 @@ fn ambiguous_marker_age(
     Ok(Duration::from_millis(elapsed))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct DockerCli {
     command: PathBuf,
+    recovery_journal: Option<Arc<OperationJournal>>,
+    execution_phase: Option<Arc<AttemptPhaseStore>>,
 }
 
 impl DockerCli {
     fn production() -> Self {
         Self {
             command: PathBuf::from("docker"),
+            recovery_journal: None,
+            execution_phase: None,
         }
+    }
+
+    fn with_recovery_journal(mut self, journal: Arc<OperationJournal>) -> Self {
+        self.recovery_journal = Some(journal);
+        self
+    }
+
+    fn with_execution_context(mut self, cancellation: &ExecutionCancellationContext) -> Self {
+        self.recovery_journal = Some(Arc::clone(&cancellation.operations));
+        self.execution_phase = Some(Arc::clone(&cancellation.phase));
+        self
+    }
+
+    fn begin_recovery_operation(
+        &self,
+        kind: &str,
+        resource: &str,
+    ) -> anyhow::Result<Option<(uuid::Uuid, AttemptPhase)>> {
+        let Some(journal) = &self.recovery_journal else {
+            return Ok(None);
+        };
+        let operation_id = uuid::Uuid::new_v4();
+        let phase = self
+            .execution_phase
+            .as_ref()
+            .map_or(AttemptPhase::CleanupRunning, |phase| phase.current());
+        journal.append(
+            operation_id,
+            kind,
+            phase,
+            resource,
+            ExternalOperationStatus::Started,
+            None,
+        )?;
+        Ok(Some((operation_id, phase)))
+    }
+
+    fn finish_recovery_operation(
+        &self,
+        operation: Option<(uuid::Uuid, AttemptPhase)>,
+        kind: &str,
+        resource: &str,
+        status: ExternalOperationStatus,
+        error_category: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let (Some(journal), Some((operation_id, phase))) = (&self.recovery_journal, operation) {
+            journal.append(operation_id, kind, phase, resource, status, error_category)?;
+        }
+        Ok(())
     }
 
     async fn inspect_named_container(
@@ -10306,6 +14484,8 @@ impl DockerCli {
         name: &str,
         timeout: Duration,
     ) -> anyhow::Result<Option<ContainerOwnership>> {
+        let kind = "recovery_docker_inspect_request";
+        let operation = self.begin_recovery_operation(kind, name)?;
         let mut command = tokio::process::Command::new(&self.command);
         command.args([
             "container",
@@ -10314,10 +14494,62 @@ impl DockerCli {
             "{{json .Config.Labels}}",
             name,
         ]);
-        command.kill_on_drop(true);
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .context("timed out inspecting named OpenCode container")??;
+        command
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.as_std_mut().process_group(0);
+        let child = command.spawn().context("spawn Docker inspect request")?;
+        let pid = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .context("Docker inspect helper has no valid PID")?;
+        let identity = read_process_identity(pid)?;
+        let helper_resource = format!(
+            "pid={};pgid={};boot={};start={}",
+            identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
+        );
+        let helper =
+            self.begin_recovery_operation("recovery_docker_helper_process", &helper_resource)?;
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                self.finish_recovery_operation(
+                    operation,
+                    kind,
+                    name,
+                    ExternalOperationStatus::Ambiguous,
+                    Some("recovery_docker_inspect_io_failed"),
+                )?;
+                return Err(error.into());
+            }
+            Err(_) => {
+                self.finish_recovery_operation(
+                    operation,
+                    kind,
+                    name,
+                    ExternalOperationStatus::Ambiguous,
+                    Some("recovery_docker_inspect_timeout"),
+                )?;
+                anyhow::bail!("timed out inspecting named OpenCode container");
+            }
+        };
+        verify_process_group_absent(&identity).await?;
+        self.finish_recovery_operation(
+            helper,
+            "recovery_docker_helper_process",
+            &helper_resource,
+            ExternalOperationStatus::Reconciled,
+            None,
+        )?;
+        self.finish_recovery_operation(
+            operation,
+            kind,
+            name,
+            ExternalOperationStatus::Completed,
+            None,
+        )?;
         if output.status.success() {
             let labels: serde_json::Value = serde_json::from_slice(&output.stdout)
                 .context("Docker ownership labels are not valid JSON")?;
@@ -10394,19 +14626,90 @@ impl DockerCli {
             }
 
             let mut remove = tokio::process::Command::new(&self.command);
-            remove.args(["rm", "-f", name]).kill_on_drop(true);
+            remove
+                .args(["rm", "-f", "-v", name])
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            remove.as_std_mut().process_group(0);
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(remaining.min(Duration::from_secs(10)), remove.output())
-                .await
-            {
-                Ok(Ok(output)) if output.status.success() => {}
-                Ok(Ok(output)) => errors.push(format!(
-                    "remove: {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )),
-                Ok(Err(error)) => errors.push(format!("remove: {error}")),
-                Err(_) => errors.push("remove: timed out".to_string()),
+            let remove_kind = "recovery_docker_rm_request";
+            let remove_operation = self.begin_recovery_operation(remove_kind, name)?;
+            let remove_child = remove.spawn().context("spawn Docker remove request")?;
+            let remove_pid = remove_child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .context("Docker remove helper has no valid PID")?;
+            let remove_identity = read_process_identity(remove_pid)?;
+            let helper_resource = format!(
+                "pid={};pgid={};boot={};start={}",
+                remove_identity.pid,
+                remove_identity.pgid,
+                remove_identity.linux_boot_id,
+                remove_identity.proc_start_time_ticks
+            );
+            let helper =
+                self.begin_recovery_operation("recovery_docker_helper_process", &helper_resource)?;
+            let remove_result = tokio::time::timeout(
+                remaining.min(Duration::from_secs(10)),
+                remove_child.wait_with_output(),
+            )
+            .await;
+            if remove_result.is_ok() {
+                verify_process_group_absent(&remove_identity).await?;
+                self.finish_recovery_operation(
+                    helper,
+                    "recovery_docker_helper_process",
+                    &helper_resource,
+                    ExternalOperationStatus::Reconciled,
+                    None,
+                )?;
+            }
+            match remove_result {
+                Ok(Ok(output)) if output.status.success() => {
+                    self.finish_recovery_operation(
+                        remove_operation,
+                        remove_kind,
+                        name,
+                        ExternalOperationStatus::Completed,
+                        None,
+                    )?;
+                }
+                Ok(Ok(output)) => {
+                    self.finish_recovery_operation(
+                        remove_operation,
+                        remove_kind,
+                        name,
+                        ExternalOperationStatus::Completed,
+                        None,
+                    )?;
+                    errors.push(format!(
+                        "remove: {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                Ok(Err(error)) => {
+                    self.finish_recovery_operation(
+                        remove_operation,
+                        remove_kind,
+                        name,
+                        ExternalOperationStatus::Ambiguous,
+                        Some("recovery_docker_rm_io_failed"),
+                    )?;
+                    errors.push(format!("remove: {error}"));
+                }
+                Err(_) => {
+                    self.finish_recovery_operation(
+                        remove_operation,
+                        remove_kind,
+                        name,
+                        ExternalOperationStatus::Ambiguous,
+                        Some("recovery_docker_rm_timeout"),
+                    )?;
+                    errors.push("remove: timed out".to_string());
+                }
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -10414,7 +14717,10 @@ impl DockerCli {
                 .inspect_named_container(name, remaining.min(Duration::from_secs(10)))
                 .await
             {
-                Ok(None) => return Ok(()),
+                Ok(None) => {
+                    errors.push("container absent after remove; verifying absence".to_string());
+                    continue;
+                }
                 Ok(Some(actual)) if actual == *ownership => {
                     errors.push("reinspect: owned container still exists".to_string())
                 }
@@ -10467,6 +14773,8 @@ impl DockerCli {
         max_items: usize,
         clock: &dyn WallClock,
     ) -> anyhow::Result<Vec<String>> {
+        let operation_kind = "recovery_docker_list_request";
+        let operation = self.begin_recovery_operation(operation_kind, worker_id)?;
         let mut command = tokio::process::Command::new(&self.command);
         command
             .args(["ps", "-a", "--filter"])
@@ -10480,9 +14788,22 @@ impl DockerCli {
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.as_std_mut().process_group(0);
         let mut child = command
             .spawn()
             .context("spawn bounded Docker container listing")?;
+        let pid = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .context("Docker listing helper has no valid PID")?;
+        let identity = read_process_identity(pid)?;
+        let helper_resource = format!(
+            "pid={};pgid={};boot={};start={}",
+            identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
+        );
+        let helper =
+            self.begin_recovery_operation("recovery_docker_helper_process", &helper_resource)?;
         let stdout = child
             .stdout
             .take()
@@ -10494,6 +14815,13 @@ impl DockerCli {
             if remaining.is_zero() {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                self.finish_recovery_operation(
+                    helper,
+                    "recovery_docker_helper_process",
+                    &helper_resource,
+                    ExternalOperationStatus::Reconciled,
+                    None,
+                )?;
                 anyhow::bail!(
                     "startup reconciliation deadline exceeded during container enumeration"
                 );
@@ -10511,6 +14839,13 @@ impl DockerCli {
             if containers.len() >= max_items {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                self.finish_recovery_operation(
+                    helper,
+                    "recovery_docker_helper_process",
+                    &helper_resource,
+                    ExternalOperationStatus::Reconciled,
+                    None,
+                )?;
                 anyhow::bail!("startup reconciliation container item bound exceeded");
             }
             containers.push(name.to_string());
@@ -10519,9 +14854,31 @@ impl DockerCli {
         let status = tokio::time::timeout(remaining, child.wait())
             .await
             .context("startup reconciliation deadline exceeded waiting for container listing")??;
+        verify_process_group_absent(&identity).await?;
+        self.finish_recovery_operation(
+            helper,
+            "recovery_docker_helper_process",
+            &helper_resource,
+            ExternalOperationStatus::Reconciled,
+            None,
+        )?;
         if !status.success() {
+            self.finish_recovery_operation(
+                operation,
+                operation_kind,
+                worker_id,
+                ExternalOperationStatus::Completed,
+                None,
+            )?;
             anyhow::bail!("docker ps for owned OpenCode containers failed with {status}");
         }
+        self.finish_recovery_operation(
+            operation,
+            operation_kind,
+            worker_id,
+            ExternalOperationStatus::Completed,
+            None,
+        )?;
         Ok(containers)
     }
 }
@@ -10551,7 +14908,7 @@ async fn reconcile_opencode_startup(
             clock.as_ref(),
         )
         .await?;
-    let jobs_root = data_dir.join("opencode-jobs");
+    let jobs_root = data_dir.join("attempts");
     let mut retained_names = std::collections::HashSet::new();
     let mut retained = Vec::with_capacity(max_items.saturating_sub(containers.len()));
     if jobs_root.exists() {
@@ -10584,7 +14941,10 @@ async fn reconcile_opencode_startup(
             if containers.len().saturating_add(retained.len()) >= max_items {
                 anyhow::bail!("startup reconciliation combined item bound exceeded");
             }
-            retained.push(entry.path());
+            let opencode_root = entry.path().join("opencode");
+            if opencode_root.is_dir() {
+                retained.push(opencode_root);
+            }
         }
     }
 
@@ -10608,6 +14968,77 @@ async fn reconcile_opencode_startup(
         .await
         .context("startup reconciliation deadline exceeded processing retained state")??;
         retained_names.insert(name);
+    }
+
+    let generic_jobs_root = data_dir.join("attempts");
+    if generic_jobs_root.exists() {
+        let remaining = deadline.saturating_duration_since(clock.monotonic_now());
+        let mut entries = tokio::time::timeout(remaining, tokio::fs::read_dir(&generic_jobs_root))
+            .await
+            .context("startup reconciliation deadline exceeded opening generic Docker state")??;
+        let mut count = 0_usize;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            count = count.saturating_add(1);
+            if containers.len().saturating_add(count) > max_items {
+                anyhow::bail!("startup generic Docker state item bound exceeded");
+            }
+            let root = entry.path().join("docker");
+            if !root.is_dir() {
+                continue;
+            }
+            let ownership: ContainerOwnership = serde_json::from_slice(
+                &tokio::fs::read(root.join("ownership.json"))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "read retained generic Docker ownership at {}",
+                            root.display()
+                        )
+                    })?,
+            )?;
+            anyhow::ensure!(
+                ownership.installation_id == installation_id
+                    && ownership.config_identity == config_identity
+                    && ownership.worker_id == worker_id,
+                "retained generic Docker state has mismatched installation/config/worker"
+            );
+            let recorded_name = tokio::fs::read_to_string(root.join("container-name")).await?;
+            let expected_name = format!(
+                "agent-hub-job-{}-{}",
+                ownership.job_id.simple(),
+                ownership.attempt
+            );
+            anyhow::ensure!(
+                recorded_name.trim() == expected_name,
+                "retained generic Docker container name is not deterministic"
+            );
+            let ambiguous_path = root.join(AMBIGUOUS_CREATE_MARKER);
+            if ambiguous_path.exists() {
+                let marker: AmbiguousCreateMarker =
+                    serde_json::from_slice(&tokio::fs::read(&ambiguous_path).await?)?;
+                anyhow::ensure!(
+                    marker.ownership == ownership && marker.container_name == expected_name,
+                    "generic Docker ambiguous-create marker ownership mismatch"
+                );
+                let age = ambiguous_marker_age(&marker, clock.as_ref())?;
+                anyhow::ensure!(
+                    age >= AMBIGUOUS_CREATE_QUARANTINE,
+                    "generic Docker ambiguous-create quarantine remains active"
+                );
+                docker
+                    .reconcile_quarantined_create(&expected_name, &ownership, deadline)
+                    .await?;
+            } else {
+                docker
+                    .reconcile_absent_until(&expected_name, &ownership, deadline)
+                    .await?;
+            }
+            tokio::fs::remove_dir_all(&root).await?;
+            retained_names.insert(expected_name);
+        }
     }
 
     for name in containers {
@@ -10654,18 +15085,19 @@ async fn reconcile_retained_opencode_state(
             root.display()
         );
     }
-    let job_id = root
-        .file_name()
+    let assignment_id = root
+        .parent()
+        .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .and_then(|value| uuid::Uuid::parse_str(value).ok())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "retained OpenCode state has invalid job directory {}",
+                "retained OpenCode state has invalid assignment directory {}",
                 root.display()
             )
         })?;
-    if ownership.job_id != job_id {
-        anyhow::bail!("retained OpenCode state job ownership does not match directory");
+    if ownership.assignment_id != assignment_id {
+        anyhow::bail!("retained OpenCode state assignment ownership does not match directory");
     }
     let expected = format!("agent-hub-opencode-{}", ownership.job_id.simple());
     let recorded = tokio::fs::read_to_string(root.join("container-name"))
@@ -10728,9 +15160,23 @@ async fn reconcile_retained_opencode_state(
             .await
             .with_context(|| format!("startup reconcile retained state {}", root.display()))?;
     }
-    tokio::fs::remove_dir_all(root)
-        .await
-        .with_context(|| format!("remove reconciled retained state {}", root.display()))?;
+    let assignment = root
+        .parent()
+        .and_then(Path::file_name)
+        .context("retained OpenCode authority has no assignment parent")?;
+    let data_dir = root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .context("retained OpenCode authority has no worker data parent")?;
+    let runtime_root = data_dir.join("runtime-attempts").join(assignment);
+    if runtime_root.exists() {
+        tokio::fs::remove_dir_all(&runtime_root)
+            .await
+            .with_context(|| {
+                format!("remove reconciled runtime state {}", runtime_root.display())
+            })?;
+    }
     Ok(expected)
 }
 
@@ -10738,8 +15184,10 @@ async fn resolve_opencode_image(
     docker_command: &Path,
     configured_image: &str,
     deadline: &JobDeadline,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ResolvedOpencodeImage> {
-    let image_id = inspect_local_image_id(docker_command, configured_image, deadline).await?;
+    let image_id =
+        inspect_local_image_id(docker_command, configured_image, deadline, cancellation).await?;
     let binary_path = "/usr/local/bin/opencode";
     let version_output = run_before_deadline(
         tokio::process::Command::new(docker_command).args([
@@ -10753,6 +15201,9 @@ async fn resolve_opencode_image(
         ]),
         deadline,
         "inspect pinned OpenCode binary version",
+        cancellation,
+        "docker_opencode_version_inspect",
+        configured_image,
     )
     .await?;
     if !version_output.status.success() {
@@ -10780,6 +15231,7 @@ async fn inspect_local_image_id(
     docker_command: &Path,
     configured_image: &str,
     deadline: &JobDeadline,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<String> {
     let inspect = run_before_deadline(
         tokio::process::Command::new(docker_command).args([
@@ -10791,6 +15243,9 @@ async fn inspect_local_image_id(
         ]),
         deadline,
         "resolve local OpenCode image ID",
+        cancellation,
+        "docker_image_inspect_request",
+        configured_image,
     )
     .await?;
     if !inspect.status.success() {
@@ -10830,8 +15285,20 @@ async fn run_before_deadline(
     command: &mut tokio::process::Command,
     deadline: &JobDeadline,
     operation: &str,
+    cancellation: &ExecutionCancellationContext,
+    operation_kind: &str,
+    resource_identity: &str,
 ) -> anyhow::Result<std::process::Output> {
-    run_before_deadline_with_budget(command, deadline, None, operation).await
+    run_before_deadline_with_budget(
+        command,
+        deadline,
+        None,
+        operation,
+        cancellation,
+        operation_kind,
+        resource_identity,
+    )
+    .await
 }
 
 async fn run_before_deadline_with_budget(
@@ -10839,19 +15306,56 @@ async fn run_before_deadline_with_budget(
     deadline: &JobDeadline,
     maximum_budget: Option<Duration>,
     operation: &str,
+    cancellation: &ExecutionCancellationContext,
+    operation_kind: &str,
+    resource_identity: &str,
 ) -> anyhow::Result<std::process::Output> {
+    cancellation.check()?;
     let remaining = deadline
         .remaining()
         .context("operation requires an absolute job deadline")?;
     if remaining.is_zero() {
         anyhow::bail!("absolute job deadline exceeded before {operation}");
     }
-    command.kill_on_drop(true);
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.as_std_mut().process_group(0);
     let budget = maximum_budget.map_or(remaining, |maximum| remaining.min(maximum));
-    tokio::time::timeout(budget, command.output())
+    let journal = cancellation.begin_external_operation(operation_kind, resource_identity)?;
+    let child = command
+        .spawn()
+        .with_context(|| format!("failed to execute {operation}"))?;
+    let pid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .context("external request helper has no valid PID")?;
+    let identity = read_process_identity(pid)?;
+    let helper = cancellation.begin_external_operation(
+        "external_request_helper_process",
+        &format!(
+            "pid={};pgid={};boot={};start={}",
+            identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
+        ),
+    )?;
+    let result = tokio::time::timeout(budget, child.wait_with_output())
         .await
         .with_context(|| format!("absolute job deadline exceeded during {operation}"))?
-        .with_context(|| format!("failed to execute {operation}"))
+        .with_context(|| format!("failed to execute {operation}"));
+    match result {
+        Ok(output) => {
+            verify_process_group_absent(&identity).await?;
+            helper.reconciled()?;
+            journal.completed()?;
+            Ok(output)
+        }
+        Err(error) => {
+            journal.ambiguous("external_request_failed")?;
+            Err(error)
+        }
+    }
 }
 
 impl JobDeadline {
@@ -10904,7 +15408,9 @@ impl JobDeadline {
 
 #[cfg(test)]
 mod job_deadline_tests {
-    use super::{JobDeadline, resolve_opencode_image, verify_resolved_image_id};
+    use super::{
+        ExecutionCancellationContext, JobDeadline, resolve_opencode_image, verify_resolved_image_id,
+    };
     use std::path::Path;
     use std::time::{Duration, Instant, SystemTime};
 
@@ -10951,10 +15457,13 @@ mod job_deadline_tests {
         std::fs::set_permissions(&command, permissions).unwrap();
 
         let deadline = JobDeadline::new(Some(10)).unwrap();
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
         let resolved = resolve_opencode_image(
             Path::new(&command),
             agent_hub_config::DURABLE_OPENCODE_IMAGE,
             &deadline,
+            &cancellation,
         )
         .await
         .unwrap();
@@ -11216,7 +15725,7 @@ async fn supervise_process(
     deadline: &JobDeadline,
     redactor: Option<ExactTokenRedactor>,
     events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ExecutionStatus> {
     supervise_process_with_mode(
         job,
@@ -11228,7 +15737,7 @@ async fn supervise_process(
         deadline,
         redactor,
         events,
-        cancel_rx,
+        cancellation,
         false,
     )
     .await
@@ -11243,12 +15752,1103 @@ async fn await_process_streams(
     Ok(())
 }
 
+fn process_operation_kind(job: &Job) -> &'static str {
+    if job.command == "docker" {
+        match job.args.first().map(String::as_str) {
+            Some("create") => "docker_create_request",
+            Some("start") => "docker_start_request",
+            Some("exec") => "docker_exec_request",
+            Some("inspect") => "docker_inspect_request",
+            Some("logs") => "docker_logs_request",
+            Some("rm") => "docker_rm_request",
+            _ => "docker_request",
+        }
+    } else {
+        "helper_process_spawn"
+    }
+}
+
+fn process_resource_identity(job: &Job) -> String {
+    if job.command == "docker" {
+        match job.args.first().map(String::as_str) {
+            Some("create") => job
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "--name")
+                .map(|pair| pair[1].clone()),
+            Some("exec") | Some("start") => job.args.get(1).cloned(),
+            Some("logs") | Some("inspect") | Some("rm") => job.args.last().cloned(),
+            _ => None,
+        }
+        .unwrap_or_else(|| format!("job:{}:docker_request", job.id))
+    } else {
+        format!("job:{}:process_spawn", job.id)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedProcessPhase {
+    Submitting,
+    Running,
+    VerifiedAbsent,
+    ContainmentFailed,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedProcessIdentity {
+    pid: i32,
+    pgid: i32,
+    linux_boot_id: String,
+    proc_start_time_ticks: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedProcessRecord {
+    phase: PersistedProcessPhase,
+    command: String,
+    identity: Option<PersistedProcessIdentity>,
+    cleanup_error: Option<String>,
+}
+
+fn process_record_path(authoritative_root: &Path) -> anyhow::Result<(&Path, &'static str)> {
+    ensure_private_directory(authoritative_root)?;
+    Ok((authoritative_root, "process-runtime.json"))
+}
+
+fn persist_process_record(
+    transcript_jsonl_path: &Path,
+    record: &PersistedProcessRecord,
+) -> anyhow::Result<()> {
+    let (root, name) = process_record_path(transcript_jsonl_path)?;
+    durable_write_json(root, name, record)
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_identity(pid: i32) -> anyhow::Result<PersistedProcessIdentity> {
+    let linux_boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_string();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let close = stat
+        .rfind(')')
+        .context("process stat has no command terminator")?;
+    let fields = stat[close + 1..].split_whitespace().collect::<Vec<_>>();
+    let proc_start_time_ticks = fields
+        .get(19)
+        .context("process stat has no start-time field")?
+        .parse()?;
+    let pgid = fields
+        .get(2)
+        .context("process stat has no process-group field")?
+        .parse()?;
+    Ok(PersistedProcessIdentity {
+        pid,
+        pgid,
+        linux_boot_id,
+        proc_start_time_ticks,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(pid: i32) -> anyhow::Result<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let close = stat
+        .rfind(')')
+        .context("process stat has no command terminator")?;
+    Ok(stat[close + 1..]
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| state == "Z"))
+}
+
+#[cfg(target_os = "linux")]
+struct OwnedPidFd {
+    fd: i32,
+    identity: PersistedProcessIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedPidFd {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn close(fd: i32) -> i32;
+        }
+        let _ = unsafe { close(self.fd) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_owned_pidfd(identity: PersistedProcessIdentity) -> anyhow::Result<Option<OwnedPidFd>> {
+    const SYS_PIDFD_OPEN: i64 = 434;
+    unsafe extern "C" {
+        fn syscall(number: i64, ...) -> i64;
+    }
+    let fd = unsafe { syscall(SYS_PIDFD_OPEN, identity.pid, 0_u32) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error).context("pidfd_open owned process");
+    }
+    let owned = OwnedPidFd {
+        fd: i32::try_from(fd)?,
+        identity,
+    };
+    match read_process_identity(owned.identity.pid) {
+        Ok(current)
+            if current.linux_boot_id == owned.identity.linux_boot_id
+                && current.proc_start_time_ticks == owned.identity.proc_start_time_ticks
+                && current.pgid == owned.identity.pgid =>
+        {
+            Ok(Some(owned))
+        }
+        Ok(_) => Ok(None),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn owned_process_group_members(pgid: i32, linux_boot_id: &str) -> anyhow::Result<Vec<OwnedPidFd>> {
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let identity = match read_process_identity(pid) {
+            Ok(identity) if identity.pgid == pgid && identity.linux_boot_id == linux_boot_id => {
+                identity
+            }
+            _ => continue,
+        };
+        if process_is_zombie(pid).unwrap_or(false) {
+            continue;
+        }
+        if let Some(member) = open_owned_pidfd(identity)? {
+            members.push(member);
+        }
+    }
+    #[cfg(test)]
+    run_process_group_membership_fault_hook();
+    Ok(members)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+type ProcessGroupMembershipFaultHook = Box<dyn FnMut() + Send>;
+
+#[cfg(all(test, target_os = "linux"))]
+fn process_group_membership_fault_hook()
+-> &'static std::sync::Mutex<Option<ProcessGroupMembershipFaultHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<ProcessGroupMembershipFaultHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn run_process_group_membership_fault_hook() {
+    if let Some(hook) = process_group_membership_fault_hook()
+        .lock()
+        .expect("process group fault hook lock poisoned")
+        .as_mut()
+    {
+        hook();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pidfds(members: &[OwnedPidFd], signal: i32) -> anyhow::Result<()> {
+    const SYS_PIDFD_SEND_SIGNAL: i64 = 424;
+    unsafe extern "C" {
+        fn syscall(number: i64, ...) -> i64;
+    }
+    for member in members {
+        let result = unsafe {
+            syscall(
+                SYS_PIDFD_SEND_SIGNAL,
+                member.fd,
+                signal,
+                std::ptr::null::<std::ffi::c_void>(),
+                0_u32,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error)
+                    .with_context(|| format!("pidfd_send_signal process {}", member.identity.pid));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn terminate_persisted_process(identity: &PersistedProcessIdentity) -> anyhow::Result<()> {
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+    match read_process_identity(identity.pid) {
+        Ok(current) => anyhow::ensure!(
+            current.linux_boot_id == identity.linux_boot_id
+                && current.proc_start_time_ticks == identity.proc_start_time_ticks
+                && current.pgid == identity.pgid,
+            "persisted process leader identity changed; refusing PID-reuse signal"
+        ),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let members = owned_process_group_members(identity.pgid, &identity.linux_boot_id)?;
+    signal_pidfds(&members, SIGTERM)?;
+    let grace = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < grace {
+        if owned_process_group_members(identity.pgid, &identity.linux_boot_id)?.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    for _ in 0..8 {
+        let members = owned_process_group_members(identity.pgid, &identity.linux_boot_id)?;
+        if members.is_empty() {
+            return Ok(());
+        }
+        signal_pidfds(&members, SIGKILL)?;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    anyhow::ensure!(
+        owned_process_group_members(identity.pgid, &identity.linux_boot_id)?.is_empty(),
+        "owned process group remains after pidfd SIGKILL"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn terminate_persisted_process(_identity: &PersistedProcessIdentity) -> anyhow::Result<()> {
+    anyhow::bail!("persisted process recovery requires Linux process identity")
+}
+
+async fn reconcile_persisted_process_records(attempts_root: &Path) -> anyhow::Result<()> {
+    if !attempts_root.exists() {
+        return Ok(());
+    }
+    let mut entries = tokio::fs::read_dir(attempts_root).await?;
+    let mut count = 0_usize;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        if entry.file_name() == "reconciliation" {
+            continue;
+        }
+        let assignment_id = uuid::Uuid::parse_str(&entry.file_name().to_string_lossy())
+            .context("private attempt directory is not a runtime assignment UUID")?;
+        let record_path = entry.path().join("process-runtime.json");
+        if !record_path.exists() {
+            continue;
+        }
+        count = count.saturating_add(1);
+        anyhow::ensure!(
+            count <= STARTUP_RECONCILIATION_MAX_ITEMS,
+            "persisted process reconciliation item bound exceeded"
+        );
+        let mut record: PersistedProcessRecord = serde_json::from_slice(&read_private_regular(
+            &entry.path(),
+            "process-runtime.json",
+        )?)?;
+        let phase: AttemptPhaseRecord =
+            serde_json::from_slice(&read_private_regular(&entry.path(), "attempt-phase.json")?)?;
+        anyhow::ensure!(
+            phase.assignment_id == assignment_id,
+            "private process record path binding mismatch"
+        );
+        match (&record.phase, record.identity.as_ref()) {
+            (PersistedProcessPhase::Running, Some(identity)) => {
+                if let Err(error) = terminate_persisted_process(identity).await {
+                    record.phase = PersistedProcessPhase::ContainmentFailed;
+                    record.cleanup_error = Some(format!("{error:#}"));
+                    persist_process_record(&entry.path(), &record)?;
+                    return Err(error.context("reconcile persisted process identity"));
+                }
+                record.phase = PersistedProcessPhase::VerifiedAbsent;
+                record.cleanup_error = None;
+                persist_process_record(&entry.path(), &record)?;
+            }
+            (PersistedProcessPhase::Submitting, None)
+            | (PersistedProcessPhase::VerifiedAbsent, _)
+            | (PersistedProcessPhase::ContainmentFailed, _) => {}
+            _ => anyhow::bail!("persisted process record has invalid phase/identity pairing"),
+        }
+    }
+    Ok(())
+}
+
+fn parse_journal_process_identity(resource: &str) -> anyhow::Result<PersistedProcessIdentity> {
+    let fields = resource
+        .split(';')
+        .filter_map(|field| field.split_once('='))
+        .collect::<HashMap<_, _>>();
+    Ok(PersistedProcessIdentity {
+        pid: fields
+            .get("pid")
+            .context("journal helper PID is missing")?
+            .parse()?,
+        pgid: fields
+            .get("pgid")
+            .context("journal helper process group is missing")?
+            .parse()?,
+        linux_boot_id: fields
+            .get("boot")
+            .context("journal helper boot identity is missing")?
+            .to_string(),
+        proc_start_time_ticks: fields
+            .get("start")
+            .context("journal helper start identity is missing")?
+            .parse()?,
+    })
+}
+
+async fn run_recovery_process(
+    journal: &OperationJournal,
+    phase: AttemptPhase,
+    operation_kind: &str,
+    resource_identity: &str,
+    command: &mut tokio::process::Command,
+) -> anyhow::Result<std::process::Output> {
+    let operation_id = uuid::Uuid::new_v4();
+    journal.append(
+        operation_id,
+        operation_kind,
+        phase,
+        resource_identity,
+        ExternalOperationStatus::Started,
+        None,
+    )?;
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.as_std_mut().process_group(0);
+    let child = command.spawn()?;
+    let pid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .context("recovery helper has no valid PID")?;
+    let identity = read_process_identity(pid)?;
+    let helper_resource = format!(
+        "pid={};pgid={};boot={};start={}",
+        identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
+    );
+    let helper_id = uuid::Uuid::new_v4();
+    journal.append(
+        helper_id,
+        "recovery_helper_process",
+        phase,
+        &helper_resource,
+        ExternalOperationStatus::Started,
+        None,
+    )?;
+    let output = match tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            journal.append(
+                operation_id,
+                operation_kind,
+                phase,
+                resource_identity,
+                ExternalOperationStatus::Ambiguous,
+                Some("recovery_process_io_failed"),
+            )?;
+            return Err(error.into());
+        }
+        Err(_) => {
+            journal.append(
+                operation_id,
+                operation_kind,
+                phase,
+                resource_identity,
+                ExternalOperationStatus::Ambiguous,
+                Some("recovery_process_timeout"),
+            )?;
+            anyhow::bail!("recovery process timed out");
+        }
+    };
+    verify_process_group_absent(&identity).await?;
+    journal.append(
+        helper_id,
+        "recovery_helper_process",
+        phase,
+        &helper_resource,
+        ExternalOperationStatus::Reconciled,
+        None,
+    )?;
+    journal.append(
+        operation_id,
+        operation_kind,
+        phase,
+        resource_identity,
+        ExternalOperationStatus::Completed,
+        None,
+    )?;
+    Ok(output)
+}
+
+async fn reconcile_operation_journals(
+    attempts_root: &Path,
+    data_dir: &Path,
+    docker: &DockerCli,
+) -> anyhow::Result<()> {
+    if !attempts_root.exists() {
+        return Ok(());
+    }
+    let worktrees_root = std::fs::canonicalize(data_dir.join("worktrees"))?;
+    let repos_root = std::fs::canonicalize(data_dir.join("repos"))?;
+    let data_root = std::fs::canonicalize(data_dir)?;
+    let mcp_root = std::env::temp_dir().join("agent-hub-mcp");
+    let mut entries = tokio::fs::read_dir(attempts_root).await?;
+    let mut count = 0_usize;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        if entry.file_name() == "reconciliation" {
+            continue;
+        }
+        let directory_assignment = uuid::Uuid::parse_str(&entry.file_name().to_string_lossy())
+            .context("private attempt directory is not a runtime assignment UUID")?;
+        let root = entry.path();
+        let journal_path = root.join(OPERATION_JOURNAL_FILE);
+        if !journal_path.exists() {
+            continue;
+        }
+        count = count.saturating_add(1);
+        anyhow::ensure!(
+            count <= STARTUP_RECONCILIATION_MAX_ITEMS,
+            "operation journal reconciliation item bound exceeded"
+        );
+        let bytes = read_private_regular(&root, OPERATION_JOURNAL_FILE)?;
+        anyhow::ensure!(
+            bytes.last() == Some(&b'\n'),
+            "operation journal is truncated"
+        );
+        let first: ExternalOperationRecord = serde_json::from_slice(
+            bytes
+                .split(|byte| *byte == b'\n')
+                .find(|line| !line.is_empty())
+                .context("operation journal is empty")?,
+        )?;
+        anyhow::ensure!(
+            first.assignment_id == directory_assignment,
+            "operation journal path assignment mismatch"
+        );
+        let journal =
+            OperationJournal::initialize(&root, first.assignment_id, first.job_id, first.attempt)?;
+        let phase: AttemptPhaseRecord = serde_json::from_slice(
+            &read_private_regular(&root, "attempt-phase.json")
+                .context("operation journal has no durable lifecycle phase")?,
+        )?;
+        anyhow::ensure!(
+            phase.assignment_id == first.assignment_id,
+            "operation journal and lifecycle phase assignment mismatch"
+        );
+        let scope = reconciliation_scope(phase.phase);
+        for unresolved in journal.unresolved()? {
+            anyhow::ensure!(
+                phase.phase == AttemptPhase::ContainmentFailed
+                    || unresolved.lifecycle_phase.rank() <= phase.phase.rank(),
+                "operation journal lifecycle phase exceeds durable attempt phase"
+            );
+            validate_operation_within_reconciliation_scope(scope, &unresolved.operation_kind)?;
+            match unresolved.operation_kind.as_str() {
+                kind if kind.ends_with("helper_process") => {
+                    let identity = parse_journal_process_identity(&unresolved.resource_identity)?;
+                    terminate_persisted_process(&identity).await?;
+                }
+                "docker_create_marker_write"
+                | "docker_create_marker_transition"
+                | "docker_create_marker_remove" => {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let canonical = std::fs::canonicalize(path)?;
+                        anyhow::ensure!(
+                            canonical.starts_with(&data_root),
+                            "Docker marker state is outside worker data root"
+                        );
+                    }
+                }
+                "workspace_branch_remove"
+                | "recovery_workspace_branch_remove"
+                | "recovery_workspace_branch_inspect" => {
+                    let (mirror, branch) = unresolved
+                        .resource_identity
+                        .split_once(';')
+                        .context("workspace branch journal identity is malformed")?;
+                    anyhow::ensure!(
+                        !branch.is_empty() && !branch.chars().any(char::is_control),
+                        "workspace branch journal identity is invalid"
+                    );
+                    let mirror = std::fs::canonicalize(mirror)?;
+                    anyhow::ensure!(
+                        mirror.starts_with(&repos_root),
+                        "workspace branch mirror is outside repository root"
+                    );
+                    let mut remove = tokio::process::Command::new("git");
+                    remove
+                        .arg("-C")
+                        .arg(&mirror)
+                        .arg("branch")
+                        .arg("-D")
+                        .arg(branch);
+                    let _ = run_recovery_process(
+                        &journal,
+                        phase.phase,
+                        "recovery_workspace_branch_remove",
+                        &unresolved.resource_identity,
+                        &mut remove,
+                    )
+                    .await?;
+                    let mut inspect = tokio::process::Command::new("git");
+                    inspect
+                        .arg("-C")
+                        .arg(&mirror)
+                        .arg("show-ref")
+                        .arg("--verify")
+                        .arg(format!("refs/heads/{branch}"));
+                    let inspected = run_recovery_process(
+                        &journal,
+                        phase.phase,
+                        "recovery_workspace_branch_inspect",
+                        &unresolved.resource_identity,
+                        &mut inspect,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        inspected.status.code() == Some(1),
+                        "workspace branch absence was not proven"
+                    );
+                }
+                kind if kind.starts_with("docker_") => {
+                    let inspected = docker
+                        .inspect_named_container(
+                            &unresolved.resource_identity,
+                            STARTUP_RECONCILIATION_TIMEOUT,
+                        )
+                        .await?;
+                    let ownership = if let Some(ownership) = inspected {
+                        ownership
+                    } else {
+                        let mut recorded = None;
+                        for state_root in [root.join("opencode"), root.join("docker")] {
+                            let ownership_path = state_root.join("ownership.json");
+                            if ownership_path.exists() {
+                                recorded = Some(serde_json::from_slice::<ContainerOwnership>(
+                                    &std::fs::read(ownership_path)?,
+                                )?);
+                                break;
+                            }
+                        }
+                        recorded.context(
+                            "unresolved Docker operation has no private ownership evidence; containment cannot be acknowledged",
+                        )?
+                    };
+                    anyhow::ensure!(
+                        ownership.assignment_id == unresolved.assignment_id
+                            && ownership.job_id == unresolved.job_id
+                            && ownership.attempt == unresolved.attempt,
+                        "unresolved Docker operation ownership does not match journal identity"
+                    );
+                    docker
+                        .reconcile_absent(
+                            &unresolved.resource_identity,
+                            &ownership,
+                            STARTUP_RECONCILIATION_TIMEOUT,
+                        )
+                        .await?;
+                    for state_root in [root.join("opencode"), root.join("docker")] {
+                        let marker_path = state_root.join(AMBIGUOUS_CREATE_MARKER);
+                        if marker_path.exists() {
+                            let marker: AmbiguousCreateMarker =
+                                serde_json::from_slice(&std::fs::read(&marker_path)?)?;
+                            anyhow::ensure!(
+                                marker.ownership == ownership
+                                    && marker.container_name == unresolved.resource_identity,
+                                "ambiguous Docker marker does not match journal ownership"
+                            );
+                            std::fs::remove_file(marker_path)?;
+                            sync_directory(&state_root)?;
+                        }
+                    }
+                }
+                kind if kind.starts_with("workspace_") => {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let canonical = std::fs::canonicalize(&path)?;
+                        anyhow::ensure!(
+                            canonical.starts_with(&worktrees_root),
+                            "unresolved workspace operation is outside the owned worktree root"
+                        );
+                        std::fs::remove_dir_all(&canonical)?;
+                    }
+                }
+                kind if kind.starts_with("credential_") || kind.starts_with("github_askpass_") => {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let metadata = std::fs::symlink_metadata(&path)?;
+                        anyhow::ensure!(
+                            !metadata.file_type().is_symlink(),
+                            "unresolved journal resource is a symlink"
+                        );
+                        let canonical = std::fs::canonicalize(&path)?;
+                        let owned_temp = canonical
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("agent-hub-cred-")
+                                    || name.starts_with("agent-hub-github-askpass-")
+                            });
+                        anyhow::ensure!(
+                            canonical.starts_with(&data_root) || owned_temp,
+                            "unresolved credential resource is outside owned roots"
+                        );
+                        if metadata.is_dir() {
+                            std::fs::remove_dir_all(canonical)?;
+                        } else {
+                            std::fs::remove_file(canonical)?;
+                        }
+                    }
+                }
+                kind if kind.starts_with("mcp_") => {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let canonical = std::fs::canonicalize(&path)?;
+                        anyhow::ensure!(
+                            canonical.starts_with(&mcp_root),
+                            "unresolved MCP resource is outside owned socket root"
+                        );
+                        std::fs::remove_file(canonical)?;
+                    }
+                }
+                kind if kind.starts_with("bundle_")
+                    || kind.starts_with("environment_bundle_")
+                    || kind.starts_with("container_") =>
+                {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let metadata = std::fs::symlink_metadata(&path)?;
+                        anyhow::ensure!(
+                            !metadata.file_type().is_symlink(),
+                            "owned bundle/container state is a symlink"
+                        );
+                        let canonical = std::fs::canonicalize(&path)?;
+                        anyhow::ensure!(
+                            canonical.starts_with(&data_root),
+                            "owned bundle/container state is outside the worker data root"
+                        );
+                    }
+                }
+                "output_redaction_temporary_write" => {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let canonical = std::fs::canonicalize(&path)?;
+                        let attempt_root = std::fs::canonicalize(&root)?;
+                        anyhow::ensure!(
+                            canonical.starts_with(&attempt_root),
+                            "output redaction temporary escaped attempt root"
+                        );
+                        std::fs::remove_file(canonical)?;
+                    }
+                }
+                "process_stream_persist" => {
+                    for raw_path in unresolved.resource_identity.split(';') {
+                        let path = PathBuf::from(raw_path);
+                        if path.exists() {
+                            let metadata = std::fs::symlink_metadata(path)?;
+                            anyhow::ensure!(
+                                metadata.is_file() && !metadata.file_type().is_symlink(),
+                                "process stream evidence is not a regular file"
+                            );
+                        }
+                    }
+                }
+                kind if kind.starts_with("artifact_")
+                    || kind.starts_with("event_")
+                    || kind.starts_with("output_")
+                    || kind == "process_output_open"
+                    || kind == "resolved_image_artifact_write" =>
+                {
+                    for raw_path in unresolved
+                        .resource_identity
+                        .split("->")
+                        .flat_map(|part| part.split(';'))
+                    {
+                        let path = PathBuf::from(raw_path);
+                        if path.exists() {
+                            let metadata = std::fs::symlink_metadata(&path)?;
+                            anyhow::ensure!(
+                                metadata.is_file() && !metadata.file_type().is_symlink(),
+                                "unresolved artifact evidence is not a regular file"
+                            );
+                        }
+                    }
+                }
+                kind if kind.starts_with("terminal_report") => {}
+                _ => anyhow::bail!(
+                    "unsupported unresolved external operation '{}' requires containment_failed",
+                    unresolved.operation_kind
+                ),
+            }
+            journal.append(
+                unresolved.operation_id,
+                &unresolved.operation_kind,
+                unresolved.lifecycle_phase,
+                &unresolved.resource_identity,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )?;
+        }
+        if journal.unresolved()?.is_empty()
+            && phase.phase == AttemptPhase::CleanupRunning
+            && root.join("terminal-report.json").exists()
+        {
+            AttemptPhaseStore::initialize(&root, phase.assignment_id, phase.job_id, phase.attempt)?
+                .transition(AttemptPhase::TerminalReporting)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_cancellation_resources(
+    data_dir: &Path,
+    _transcripts_root: &Path,
+    installation_id: &str,
+    config_identity: &str,
+    worker_id: &str,
+    max_items: usize,
+    timeout: Duration,
+) -> anyhow::Result<VerifiedContainmentAbsence> {
+    let attempts_root = data_dir.join("attempts");
+    ensure_private_directory(&attempts_root)?;
+    let mut had_process = false;
+    let mut had_container = false;
+    for entry in std::fs::read_dir(&attempts_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || entry.file_name() == "reconciliation" {
+            continue;
+        }
+        had_process |= entry.path().join("process-runtime.json").exists();
+        had_container |= entry.path().join("opencode/ownership.json").exists()
+            || entry.path().join("docker/ownership.json").exists();
+    }
+    let recovery_root = attempts_root.join("reconciliation");
+    let recovery_journal = Arc::new(OperationJournal::initialize(
+        &recovery_root,
+        uuid::Uuid::nil(),
+        uuid::Uuid::nil(),
+        0,
+    )?);
+    let previously_unresolved = recovery_journal.unresolved()?;
+    let docker = DockerCli::production().with_recovery_journal(Arc::clone(&recovery_journal));
+    for operation in &previously_unresolved {
+        if operation.operation_kind.ends_with("helper_process") {
+            let identity = parse_journal_process_identity(&operation.resource_identity)?;
+            terminate_persisted_process(&identity).await?;
+        }
+    }
+    reconcile_persisted_process_records(&attempts_root).await?;
+    reconcile_operation_journals(&attempts_root, data_dir, &docker).await?;
+    reconcile_opencode_startup(
+        data_dir,
+        &docker,
+        installation_id,
+        config_identity,
+        worker_id,
+        max_items,
+        timeout,
+        Arc::new(SystemWallClock),
+    )
+    .await?;
+    let runtime_attempts = data_dir.join("runtime-attempts");
+    if runtime_attempts.exists() {
+        ensure_private_directory(&runtime_attempts)?;
+        for entry in std::fs::read_dir(&runtime_attempts)? {
+            let entry = entry?;
+            anyhow::ensure!(
+                entry.file_type()?.is_dir(),
+                "runtime attempt inventory contains non-directory"
+            );
+            uuid::Uuid::parse_str(&entry.file_name().to_string_lossy())
+                .context("runtime attempt directory is not assignment-bound")?;
+            ensure_private_directory(&entry.path())?;
+            let operation_id = uuid::Uuid::new_v4();
+            let resource = entry.path().to_string_lossy().into_owned();
+            recovery_journal.append(
+                operation_id,
+                "runtime_attempt_reconcile_remove",
+                AttemptPhase::CleanupRunning,
+                &resource,
+                ExternalOperationStatus::Started,
+                None,
+            )?;
+            std::fs::remove_dir_all(entry.path())?;
+            recovery_journal.append(
+                operation_id,
+                "runtime_attempt_reconcile_remove",
+                AttemptPhase::CleanupRunning,
+                &resource,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )?;
+        }
+    }
+    for operation in previously_unresolved {
+        recovery_journal.append(
+            operation.operation_id,
+            &operation.operation_kind,
+            operation.lifecycle_phase,
+            &operation.resource_identity,
+            ExternalOperationStatus::Reconciled,
+            None,
+        )?;
+    }
+    Ok(VerifiedContainmentAbsence {
+        checked_at: Utc::now(),
+        process: if had_process {
+            protocol::ContainmentStatus::VerifiedAbsent
+        } else {
+            protocol::ContainmentStatus::NotApplicable
+        },
+        container: if had_container {
+            protocol::ContainmentStatus::VerifiedAbsent
+        } else {
+            protocol::ContainmentStatus::NotApplicable
+        },
+    })
+}
+
+async fn recover_terminal_reporting_attempts(
+    data_dir: &Path,
+    client: &Client,
+    worker_id: &str,
+    installation_id: &str,
+    config_identity: &str,
+) -> anyhow::Result<()> {
+    let attempts_root = data_dir.join("attempts");
+    if !attempts_root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&attempts_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || entry.file_name() == "reconciliation" {
+            continue;
+        }
+        let root = entry.path();
+        let phase: AttemptPhaseRecord =
+            serde_json::from_slice(&read_private_regular(&root, "attempt-phase.json")?)?;
+        if !matches!(
+            phase.phase,
+            AttemptPhase::TerminalReporting | AttemptPhase::ContainmentFailed
+        ) {
+            continue;
+        }
+        let mut report: PersistedTerminalReport =
+            serde_json::from_slice(&read_private_regular(&root, "terminal-report.json")?)?;
+        anyhow::ensure!(
+            report.assignment_id == phase.assignment_id
+                && report.runtime_assignment_id == phase.assignment_id
+                && report.job_id == phase.job_id
+                && report.attempt == phase.attempt,
+            "terminal report identity does not match durable attempt"
+        );
+        let journal = Arc::new(OperationJournal::initialize(
+            &root,
+            phase.assignment_id,
+            phase.job_id,
+            phase.attempt,
+        )?);
+        anyhow::ensure!(
+            journal.unresolved()?.is_empty(),
+            "terminal reporting recovery has unresolved cleanup operations"
+        );
+        if let Some(previous) = report.delivery_command.clone() {
+            let current = client.get_job_cancellation_command(report.job_id).await?;
+            if let Some(current) = current {
+                let changed = match rebind_terminal_report(&mut report, &current) {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        durable_write_json(
+                            &root,
+                            "TERMINAL_REPORT_QUARANTINED",
+                            &serde_json::json!({"error":"rebound cancellation command conflicts with immutable report"}),
+                        )?;
+                        return Err(error);
+                    }
+                };
+                if changed {
+                    let operation_id = uuid::Uuid::new_v4();
+                    journal.append(
+                        operation_id,
+                        "terminal_report_rebind",
+                        AttemptPhase::TerminalReporting,
+                        &current.cancellation_id.to_string(),
+                        ExternalOperationStatus::Started,
+                        None,
+                    )?;
+                    durable_write_json(&root, "terminal-report.json", &report)?;
+                    journal.append(
+                        operation_id,
+                        "terminal_report_rebind",
+                        AttemptPhase::TerminalReporting,
+                        report
+                            .cancellation_id
+                            .as_ref()
+                            .context("cancelled report has no identity")?
+                            .to_string()
+                            .as_str(),
+                        ExternalOperationStatus::Reconciled,
+                        None,
+                    )?;
+                }
+            } else if report.state == JobState::Cancelled && previous.cancellation_id.is_nil() {
+                anyhow::bail!(
+                    "cancelled terminal report has invalid immutable cancellation identity"
+                );
+            }
+        }
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let cancellation = ExecutionCancellationContext {
+            stop_reason: Arc::new(std::sync::Mutex::new(None)),
+            stop_rx,
+            phase: Arc::new(AttemptPhaseStore::initialize(
+                &root,
+                phase.assignment_id,
+                phase.job_id,
+                phase.attempt,
+            )?),
+            operations: journal,
+            assignment_id: phase.assignment_id,
+            pre_cleanup_closed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            active_pre_cleanup_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            active_terminal_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        if phase.phase == AttemptPhase::ContainmentFailed {
+            let evidence = reconcile_cancellation_resources(
+                data_dir,
+                Path::new("."),
+                installation_id,
+                config_identity,
+                worker_id,
+                STARTUP_RECONCILIATION_MAX_ITEMS,
+                STARTUP_RECONCILIATION_TIMEOUT,
+            )
+            .await?;
+            ensure_cleanup_phase_after_reconciliation(&cancellation).await?;
+            let acknowledgement = report
+                .result
+                .cancellation_acknowledgement
+                .as_mut()
+                .context("containment-failed report has no cancellation acknowledgement")?;
+            acknowledgement.containment = evidence.into_protocol();
+            report.result.error_message = None;
+            durable_write_json(&root, "terminal-report.json", &report)?;
+            cancellation.begin_terminal_reporting()?;
+        }
+        let stored = client
+            .get_job(report.job_id)
+            .await?
+            .context("terminal reporting recovery job is missing")?;
+        let committed = matches!(
+            stored.state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        );
+        let replay = if committed {
+            let stored_result = stored
+                .result
+                .as_ref()
+                .context("committed terminal job has no result")?;
+            if stored.state != report.state
+                || serde_json::to_value(stored_result)? != serde_json::to_value(&report.result)?
+            {
+                durable_write_json(
+                    &root,
+                    "TERMINAL_REPORT_QUARANTINED",
+                    &serde_json::json!({"error":"committed terminal result conflict"}),
+                )?;
+                anyhow::bail!("committed terminal result conflicts with private immutable report");
+            }
+            Ok(JobUpdateOutcome::Applied)
+        } else if stored.state == JobState::Running {
+            client
+                .update_job(
+                    worker_id,
+                    report.job_id,
+                    report.state,
+                    report.transcript_dir.clone(),
+                    Some(report.result.clone()),
+                )
+                .await
+        } else {
+            Err(anyhow::anyhow!(
+                "terminal report cannot replay from server job state {:?}",
+                stored.state
+            ))
+        };
+        if let Err(error) = replay {
+            durable_write_json(
+                &root,
+                "TERMINAL_REPORT_QUARANTINED",
+                &serde_json::json!({"error": format!("{error:#}")}),
+            )?;
+            return Err(error.context("terminal report replay conflicted or failed"));
+        }
+        cancellation.phase.transition(AttemptPhase::Completed)?;
+        cancellation.finalize_private_state()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_process_identity(pid: i32) -> anyhow::Result<PersistedProcessIdentity> {
+    Ok(PersistedProcessIdentity {
+        pid,
+        pgid: pid,
+        linux_boot_id: "not-applicable".to_string(),
+        proc_start_time_ticks: 0,
+    })
+}
+
+#[cfg(unix)]
+async fn verify_process_group_absent(identity: &PersistedProcessIdentity) -> anyhow::Result<()> {
+    terminate_persisted_process(identity).await
+}
+
+#[cfg(not(unix))]
+async fn verify_process_group_absent(_identity: &PersistedProcessIdentity) -> anyhow::Result<()> {
+    Ok(())
+}
+
 fn finish_output_boundaries(
     stream_result: anyhow::Result<()>,
     output_path: &Path,
     redactor: Option<&ExactTokenRedactor>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
-    let artifact_result = finalize_redacted_output_artifact(output_path, redactor);
+    let artifact_result = finalize_redacted_output_artifact(output_path, redactor, cancellation);
     match (stream_result, artifact_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(stream), Ok(())) => Err(stream),
@@ -11259,7 +16859,13 @@ fn finish_output_boundaries(
     }
 }
 
-fn open_process_output_file(path: &Path, append: bool) -> anyhow::Result<std::fs::File> {
+fn open_process_output_file(
+    path: &Path,
+    append: bool,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<std::fs::File> {
+    let operation =
+        cancellation.begin_external_operation("process_output_open", &path.to_string_lossy())?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true);
     if append {
@@ -11267,9 +16873,12 @@ fn open_process_output_file(path: &Path, append: bool) -> anyhow::Result<std::fs
     } else {
         options.truncate(true);
     }
-    options
+    let file = options
         .open(path)
-        .with_context(|| format!("open process output {}", path.display()))
+        .with_context(|| format!("open process output {}", path.display()))?;
+    file.sync_all()?;
+    operation.completed()?;
+    Ok(file)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11287,20 +16896,20 @@ async fn supervise_process_with_output_validation(
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
     events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancellation: &ExecutionCancellationContext,
     append: bool,
 ) -> anyhow::Result<ExecutionStatus> {
     let opened = (|| -> anyhow::Result<_> {
         Ok((
-            open_process_output_file(stdout_path, append)?,
-            open_process_output_file(stderr_path, append)?,
-            open_process_output_file(transcript_jsonl_path, append)?,
+            open_process_output_file(stdout_path, append, cancellation)?,
+            open_process_output_file(stderr_path, append, cancellation)?,
+            open_process_output_file(transcript_jsonl_path, append, cancellation)?,
         ))
     })();
     let (stdout_std, stderr_std, transcript_std) = match opened {
         Ok(opened) => opened,
         Err(error) => {
-            finish_output_boundaries(Err(error), output_path, redactor.as_ref())?;
+            finish_output_boundaries(Err(error), output_path, redactor.as_ref(), cancellation)?;
             unreachable!("transcript open failure must return an error")
         }
     };
@@ -11313,6 +16922,8 @@ async fn supervise_process_with_output_validation(
 
     let mut cmd = tokio::process::Command::new(&job.command);
     cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.as_std_mut().process_group(0);
     cmd.args(&job.args)
         .current_dir(workspace_dir)
         .stdout(Stdio::piped())
@@ -11330,16 +16941,58 @@ async fn supervise_process_with_output_validation(
                 redactor.redact(&spawn_description)
             })
     );
+    persist_process_record(
+        &cancellation.phase.root,
+        &PersistedProcessRecord {
+            phase: PersistedProcessPhase::Submitting,
+            command: job.command.clone(),
+            identity: None,
+            cleanup_error: None,
+        },
+    )?;
+    let spawn_operation = cancellation
+        .begin_external_operation(process_operation_kind(job), &process_resource_identity(job))?;
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
+            spawn_operation.completed()?;
             let operation = Err(error).with_context(|| {
                 format!("failed to spawn command: {} {:?}", job.command, job.args)
             });
-            finish_output_boundaries(operation, output_path, redactor.as_ref())?;
+            finish_output_boundaries(operation, output_path, redactor.as_ref(), cancellation)?;
             unreachable!("spawn failure must return an error")
         }
     };
+    let mut request_operation = Some(spawn_operation);
+    if job.command != "docker"
+        && let Some(operation) = request_operation.take()
+    {
+        operation.completed()?;
+    }
+    let process_group_id = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .context("spawned process has no valid process-group ID")?;
+    let process_identity = read_process_identity(process_group_id)?;
+    let helper_operation = cancellation.begin_external_operation(
+        "helper_process",
+        &format!(
+            "pid={};pgid={};boot={};start={}",
+            process_identity.pid,
+            process_identity.pgid,
+            process_identity.linux_boot_id,
+            process_identity.proc_start_time_ticks
+        ),
+    )?;
+    persist_process_record(
+        &cancellation.phase.root,
+        &PersistedProcessRecord {
+            phase: PersistedProcessPhase::Running,
+            command: job.command.clone(),
+            identity: Some(process_identity.clone()),
+            cleanup_error: None,
+        },
+    )?;
 
     let stdout = child
         .stdout
@@ -11354,6 +17007,12 @@ async fn supervise_process_with_output_validation(
     let stdout_redactor = redactor.clone();
     let stdout_job_id = job.id;
     let stdout_transcript_writer = Arc::clone(&transcript_writer);
+    let stdout_cancellation = cancellation.clone();
+    let stdout_resources = format!(
+        "{};{}",
+        stdout_path.display(),
+        transcript_jsonl_path.display()
+    );
     let stdout_task = tokio::spawn(async move {
         pump_process_stream(
             stdout,
@@ -11365,6 +17024,8 @@ async fn supervise_process_with_output_validation(
             stdout_job_id,
             pb::JobEventKind::JobEventStdout,
             stdout_redactor,
+            stdout_cancellation,
+            stdout_resources,
         )
         .await
     });
@@ -11373,6 +17034,12 @@ async fn supervise_process_with_output_validation(
     let stderr_redactor = redactor.clone();
     let stderr_job_id = job.id;
     let stderr_transcript_writer = Arc::clone(&transcript_writer);
+    let stderr_cancellation = cancellation.clone();
+    let stderr_resources = format!(
+        "{};{}",
+        stderr_path.display(),
+        transcript_jsonl_path.display()
+    );
     let stderr_task = tokio::spawn(async move {
         pump_process_stream(
             stderr,
@@ -11384,6 +17051,8 @@ async fn supervise_process_with_output_validation(
             stderr_job_id,
             pb::JobEventKind::JobEventStderr,
             stderr_redactor,
+            stderr_cancellation,
+            stderr_resources,
         )
         .await
     });
@@ -11396,7 +17065,7 @@ async fn supervise_process_with_output_validation(
                 break wait_result?;
             }
             _ = ticker.tick() => {
-                if cancel_requested(&cancel_rx) {
+                if cancellation.check().is_err() {
                     if let Some(events) = events {
                         events
                             .emit(
@@ -11406,10 +17075,23 @@ async fn supervise_process_with_output_validation(
                             )
                             .await;
                     }
-                    let _ = child.kill().await;
+                    terminate_persisted_process(&process_identity).await?;
                     let _ = child.wait().await;
+                    persist_process_record(
+                        &cancellation.phase.root,
+                        &PersistedProcessRecord {
+                            phase: PersistedProcessPhase::VerifiedAbsent,
+                            command: job.command.clone(),
+                            identity: Some(process_identity.clone()),
+                            cleanup_error: None,
+                        },
+                    )?;
+                    helper_operation.reconciled()?;
+                    if let Some(operation) = request_operation.take() {
+                        operation.completed()?;
+                    }
                     let streams = await_process_streams(stdout_task, stderr_task).await;
-                    finish_output_boundaries(streams, output_path, redactor.as_ref())?;
+                    finish_output_boundaries(streams, output_path, redactor.as_ref(), cancellation)?;
                     return Ok(ExecutionStatus::Cancelled);
                 }
 
@@ -11419,6 +17101,7 @@ async fn supervise_process_with_output_validation(
                     agent_output_events,
                     work_item_context,
                     environment_table,
+                    cancellation,
                 )
                 .is_ok()
                 {
@@ -11434,10 +17117,23 @@ async fn supervise_process_with_output_validation(
                             )
                             .await;
                     }
-                    let _ = child.kill().await;
+                    terminate_persisted_process(&process_identity).await?;
                     let _ = child.wait().await;
+                    persist_process_record(
+                        &cancellation.phase.root,
+                        &PersistedProcessRecord {
+                            phase: PersistedProcessPhase::VerifiedAbsent,
+                            command: job.command.clone(),
+                            identity: Some(process_identity.clone()),
+                            cleanup_error: None,
+                        },
+                    )?;
+                    helper_operation.reconciled()?;
+                    if let Some(operation) = request_operation.take() {
+                        operation.completed()?;
+                    }
                     let streams = await_process_streams(stdout_task, stderr_task).await;
-                    finish_output_boundaries(streams, output_path, redactor.as_ref())?;
+                    finish_output_boundaries(streams, output_path, redactor.as_ref(), cancellation)?;
                     return Ok(ExecutionStatus::Exited(0));
                 }
 
@@ -11451,18 +17147,46 @@ async fn supervise_process_with_output_validation(
                                 )
                                 .await;
                         }
-                        let _ = child.kill().await;
+                        terminate_persisted_process(&process_identity).await?;
                         let _ = child.wait().await;
+                        persist_process_record(
+                            &cancellation.phase.root,
+                            &PersistedProcessRecord {
+                                phase: PersistedProcessPhase::VerifiedAbsent,
+                                command: job.command.clone(),
+                                identity: Some(process_identity.clone()),
+                                cleanup_error: None,
+                            },
+                        )?;
+                        helper_operation.reconciled()?;
+                        if let Some(operation) = request_operation.take() {
+                            operation.completed()?;
+                        }
                         let streams = await_process_streams(stdout_task, stderr_task).await;
-                        finish_output_boundaries(streams, output_path, redactor.as_ref())?;
+                        finish_output_boundaries(streams, output_path, redactor.as_ref(), cancellation)?;
                         return Ok(ExecutionStatus::TimedOut);
                     }
             }
         }
     };
 
+    verify_process_group_absent(&process_identity).await?;
+    persist_process_record(
+        &cancellation.phase.root,
+        &PersistedProcessRecord {
+            phase: PersistedProcessPhase::VerifiedAbsent,
+            command: job.command.clone(),
+            identity: Some(process_identity),
+            cleanup_error: None,
+        },
+    )?;
+    helper_operation.reconciled()?;
+    if let Some(operation) = request_operation.take() {
+        operation.completed()?;
+    }
+
     let streams = await_process_streams(stdout_task, stderr_task).await;
-    finish_output_boundaries(streams, output_path, redactor.as_ref())?;
+    finish_output_boundaries(streams, output_path, redactor.as_ref(), cancellation)?;
 
     Ok(ExecutionStatus::Exited(status.code().unwrap_or(1)))
 }
@@ -11478,45 +17202,12 @@ async fn supervise_process_with_mode(
     deadline: &JobDeadline,
     redactor: Option<ExactTokenRedactor>,
     events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancellation: &ExecutionCancellationContext,
     append: bool,
 ) -> anyhow::Result<ExecutionStatus> {
-    let stdout_std = if append {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stdout_path)?
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(stdout_path)?
-    };
-    let stderr_std = if append {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(stderr_path)?
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(stderr_path)?
-    };
-    let transcript_std = if append {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(transcript_jsonl_path)?
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(transcript_jsonl_path)?
-    };
+    let stdout_std = open_process_output_file(stdout_path, append, cancellation)?;
+    let stderr_std = open_process_output_file(stderr_path, append, cancellation)?;
+    let transcript_std = open_process_output_file(transcript_jsonl_path, append, cancellation)?;
 
     let stdout_file = tokio::io::BufWriter::new(tokio::fs::File::from_std(stdout_std));
     let stderr_file = tokio::io::BufWriter::new(tokio::fs::File::from_std(stderr_std));
@@ -11526,6 +17217,8 @@ async fn supervise_process_with_mode(
 
     let mut cmd = tokio::process::Command::new(&job.command);
     cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.as_std_mut().process_group(0);
     cmd.args(&job.args)
         .current_dir(workspace_dir)
         .stdout(Stdio::piped())
@@ -11541,14 +17234,66 @@ async fn supervise_process_with_mode(
         workspace_dir.display(),
         workspace_dir.exists()
     );
-    let mut child = cmd.spawn().with_context(|| {
-        format!(
-            "failed to spawn '{}' (args={}) in cwd={}",
-            job.command,
-            job.args.len(),
-            workspace_dir.display()
-        )
-    })?;
+    persist_process_record(
+        &cancellation.phase.root,
+        &PersistedProcessRecord {
+            phase: PersistedProcessPhase::Submitting,
+            command: job.command.clone(),
+            identity: None,
+            cleanup_error: None,
+        },
+    )?;
+    let spawn_operation = cancellation
+        .begin_external_operation(process_operation_kind(job), &process_resource_identity(job))?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            spawn_operation.completed()?;
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to spawn '{}' (args={}) in cwd={}",
+                    job.command,
+                    job.args.len(),
+                    workspace_dir.display()
+                )
+            });
+        }
+    };
+    if process_operation_kind(job) == "docker_create_request" {
+        cancellation
+            .phase
+            .transition(AttemptPhase::DockerCreateSubmitted)?;
+    }
+    let mut request_operation = Some(spawn_operation);
+    if job.command != "docker"
+        && let Some(operation) = request_operation.take()
+    {
+        operation.completed()?;
+    }
+    let process_group_id = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .context("spawned process has no valid process-group ID")?;
+    let process_identity = read_process_identity(process_group_id)?;
+    let helper_operation = cancellation.begin_external_operation(
+        "helper_process",
+        &format!(
+            "pid={};pgid={};boot={};start={}",
+            process_identity.pid,
+            process_identity.pgid,
+            process_identity.linux_boot_id,
+            process_identity.proc_start_time_ticks
+        ),
+    )?;
+    persist_process_record(
+        &cancellation.phase.root,
+        &PersistedProcessRecord {
+            phase: PersistedProcessPhase::Running,
+            command: job.command.clone(),
+            identity: Some(process_identity.clone()),
+            cleanup_error: None,
+        },
+    )?;
 
     let stdout = child
         .stdout
@@ -11563,6 +17308,12 @@ async fn supervise_process_with_mode(
     let stdout_redactor = redactor.clone();
     let stdout_job_id = job.id;
     let stdout_transcript_writer = Arc::clone(&transcript_writer);
+    let stdout_cancellation = cancellation.clone();
+    let stdout_resources = format!(
+        "{};{}",
+        stdout_path.display(),
+        transcript_jsonl_path.display()
+    );
     let stdout_task = tokio::spawn(async move {
         pump_process_stream(
             stdout,
@@ -11574,6 +17325,8 @@ async fn supervise_process_with_mode(
             stdout_job_id,
             pb::JobEventKind::JobEventStdout,
             stdout_redactor,
+            stdout_cancellation,
+            stdout_resources,
         )
         .await
     });
@@ -11582,6 +17335,12 @@ async fn supervise_process_with_mode(
     let stderr_redactor = redactor;
     let stderr_job_id = job.id;
     let stderr_transcript_writer = Arc::clone(&transcript_writer);
+    let stderr_cancellation = cancellation.clone();
+    let stderr_resources = format!(
+        "{};{}",
+        stderr_path.display(),
+        transcript_jsonl_path.display()
+    );
     let stderr_task = tokio::spawn(async move {
         pump_process_stream(
             stderr,
@@ -11593,6 +17352,8 @@ async fn supervise_process_with_mode(
             stderr_job_id,
             pb::JobEventKind::JobEventStderr,
             stderr_redactor,
+            stderr_cancellation,
+            stderr_resources,
         )
         .await
     });
@@ -11605,7 +17366,7 @@ async fn supervise_process_with_mode(
                 break wait_result?;
             }
             _ = ticker.tick() => {
-                if cancel_requested(&cancel_rx) {
+                if cancellation.check().is_err() {
                     if let Some(events) = events {
                         events
                             .emit(
@@ -11615,8 +17376,21 @@ async fn supervise_process_with_mode(
                             )
                             .await;
                     }
-                    let _ = child.kill().await;
+                    terminate_persisted_process(&process_identity).await?;
                     let _ = child.wait().await;
+                    persist_process_record(
+                        &cancellation.phase.root,
+                        &PersistedProcessRecord {
+                            phase: PersistedProcessPhase::VerifiedAbsent,
+                            command: job.command.clone(),
+                            identity: Some(process_identity.clone()),
+                            cleanup_error: None,
+                        },
+                    )?;
+                    helper_operation.reconciled()?;
+                    if let Some(operation) = request_operation.take() {
+                        operation.completed()?;
+                    }
                     await_process_streams(stdout_task, stderr_task).await?;
                     return Ok(ExecutionStatus::Cancelled);
                 }
@@ -11631,13 +17405,42 @@ async fn supervise_process_with_mode(
                             )
                             .await;
                     }
-                    let _ = child.kill().await;
+                    terminate_persisted_process(&process_identity).await?;
                     let _ = child.wait().await;
+                    persist_process_record(
+                        &cancellation.phase.root,
+                        &PersistedProcessRecord {
+                            phase: PersistedProcessPhase::VerifiedAbsent,
+                            command: job.command.clone(),
+                            identity: Some(process_identity.clone()),
+                            cleanup_error: None,
+                        },
+                    )?;
+                    helper_operation.reconciled()?;
+                    if let Some(operation) = request_operation.take() {
+                        operation.completed()?;
+                    }
+                    await_process_streams(stdout_task, stderr_task).await?;
                     return Ok(ExecutionStatus::TimedOut);
                 }
             }
         }
     };
+
+    verify_process_group_absent(&process_identity).await?;
+    persist_process_record(
+        &cancellation.phase.root,
+        &PersistedProcessRecord {
+            phase: PersistedProcessPhase::VerifiedAbsent,
+            command: job.command.clone(),
+            identity: Some(process_identity),
+            cleanup_error: None,
+        },
+    )?;
+    helper_operation.reconciled()?;
+    if let Some(operation) = request_operation.take() {
+        operation.completed()?;
+    }
 
     await_process_streams(stdout_task, stderr_task).await?;
 
@@ -11655,18 +17458,23 @@ async fn pump_process_stream<R>(
     job_id: uuid::Uuid,
     kind: pb::JobEventKind,
     redactor: Option<ExactTokenRedactor>,
+    cancellation: ExecutionCancellationContext,
+    resource_identity: String,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
+        let operation =
+            cancellation.begin_external_operation("process_stream_persist", &resource_identity)?;
         let line = redactor
             .as_ref()
             .map_or(line.clone(), |redactor| redactor.redact(&line));
         log_file.write_all(line.as_bytes()).await?;
         log_file.write_all(b"\n").await?;
         log_file.flush().await?;
+        log_file.get_ref().sync_data().await?;
 
         parent_out.write_all(line.as_bytes()).await?;
         parent_out.write_all(b"\n").await?;
@@ -11683,6 +17491,7 @@ where
             let mut writer = transcript_writer.lock().await;
             writer.write_all(&encoded).await?;
             writer.flush().await?;
+            writer.get_ref().sync_data().await?;
         }
 
         if let Some(events) = &events {
@@ -11693,6 +17502,7 @@ where
                 .to_string();
             events.emit(job_id, kind, message).await;
         }
+        operation.completed()?;
     }
     Ok(())
 }
@@ -11701,6 +17511,7 @@ where
 async fn run_docker(
     job: &Job,
     local_agent_config: &LocalAgentConfig,
+    data_dir: &Path,
     workspace_dir: &Path,
     transcript_dir: &str,
     transcript_jsonl_path: &Path,
@@ -11716,8 +17527,69 @@ async fn run_docker(
     primary_repo_mirror_dir: Option<&Path>,
     additional_repo_mounts: &[AdditionalRepoMount],
     events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ExecutionStatus> {
+    cancellation.check()?;
+    let worker_session_id = job
+        .assigned_worker_session_id
+        .context("generic Docker job has no assigned worker session")?;
+    let worker_session_generation = job
+        .assigned_worker_session_generation
+        .context("generic Docker job has no assigned worker session generation")?;
+    let worker_id = job
+        .assigned_worker_id
+        .as_deref()
+        .context("generic Docker job has no assigned worker")?;
+    let invocation_id = protocol::authorization_request_from_job_context(&job.context)
+        .context("generic Docker job has no signed invocation")?
+        .invocation_id;
+    let ownership = ContainerOwnership {
+        installation_id: local_agent_config.installation_id.clone(),
+        config_identity: local_agent_config.config_identity.clone(),
+        worker_id: worker_id.to_string(),
+        job_id: job.id,
+        attempt: job.attempt,
+        assignment_id: protocol::cancellation_assignment_id(
+            job.id,
+            invocation_id,
+            job.attempt,
+            worker_id,
+            worker_session_id,
+            worker_session_generation,
+        ),
+        worker_session_id,
+        worker_session_generation,
+    };
+    let assignment_runtime_root = runtime_attempt_root(data_dir, ownership.assignment_id)?;
+    let container_name = format!("agent-hub-job-{}-{}", job.id.simple(), job.attempt);
+    let runtime_state = cancellation.phase.root.join("docker");
+    let docker = DockerCli::production().with_execution_context(cancellation);
+    if runtime_state.exists() {
+        let recorded: ContainerOwnership =
+            serde_json::from_slice(&std::fs::read(runtime_state.join("ownership.json"))?)?;
+        let recorded_name = std::fs::read_to_string(runtime_state.join("container-name"))?;
+        anyhow::ensure!(
+            recorded == ownership && recorded_name.trim() == container_name,
+            "retained generic Docker runtime ownership mismatch"
+        );
+        docker
+            .reconcile_absent(&container_name, &ownership, STARTUP_RECONCILIATION_TIMEOUT)
+            .await?;
+        std::fs::remove_dir_all(&runtime_state)?;
+    }
+    std::fs::create_dir_all(&runtime_state)?;
+    durable_write_json(&runtime_state, "ownership.json", &ownership)?;
+    let mut container_name_file = std::fs::File::create(runtime_state.join("container-name"))?;
+    container_name_file.write_all(format!("{container_name}\n").as_bytes())?;
+    container_name_file.sync_all()?;
+    sync_directory(&runtime_state)?;
+    let marker_store = FsCreateMarkerStore;
+    let create_marker = |phase| AmbiguousCreateMarker {
+        ownership: ownership.clone(),
+        container_name: container_name.clone(),
+        observed_at_unix_ms: wall_clock_unix_ms(&SystemWallClock).unwrap_or(0),
+        phase,
+    };
     let workspace_dir = resolve_to_absolute(workspace_dir)
         .with_context(|| format!("resolve workspace dir {}", workspace_dir.display()))?;
     let transcript_dir = resolve_to_absolute(Path::new(transcript_dir))
@@ -11808,7 +17680,15 @@ async fn run_docker(
         append_git_identity_env_defaults(&mut docker_env);
     }
 
-    let mut args = vec!["run".to_string(), "--rm".to_string()];
+    let mut args = vec![
+        "create".to_string(),
+        "--name".to_string(),
+        container_name.clone(),
+    ];
+    for (key, value) in ownership.labels() {
+        args.push("--label".to_string());
+        args.push(format!("{key}={value}"));
+    }
 
     if let Some(user) = docker_run_user_arg(&workspace_dir) {
         args.push("--user".to_string());
@@ -11965,12 +17845,13 @@ async fn run_docker(
             required_credential_providers,
             deadline.wall_clock(),
             None,
+            cancellation,
         )
         .await?
     } else {
         ResolvedCredentials::default()
     };
-    validate_general_job_credentials(&resolved_credentials)?;
+    validate_general_job_credentials_cancellable(&resolved_credentials, cancellation)?;
     append_resolved_credentials_to_docker_invocation(
         &resolved_credentials,
         &mut args,
@@ -11985,12 +17866,14 @@ async fn run_docker(
         args.push("-v".to_string());
         args.push(spec);
     }
-    let mcp_bridges = configure_mcp_bridges_for_docker(
+    let mut mcp_bridges = configure_mcp_bridges_for_docker(
         &mut args,
         &mut docker_env,
         local_agent_config,
         job,
+        &assignment_runtime_root,
         events,
+        cancellation,
     )
     .await?;
     for (k, v) in &docker_env {
@@ -12005,34 +17888,174 @@ async fn run_docker(
     args.push(container_image);
     args.extend(job.args.clone());
 
-    let docker_job = Job {
+    validate_final_docker_mount_plan(&cancellation.phase.root, &args)?;
+    let create_job = Job {
         args,
         command: "docker".to_string(),
         ..job.clone()
     };
     eprintln!(
         "info: docker invocation: {} {}",
-        docker_job.command,
-        docker_job.args.join(" ")
+        create_job.command,
+        create_job.args.join(" ")
     );
-    let run_result = supervise_process(
-        &docker_job,
-        &workspace_dir,
-        transcript_jsonl_path,
-        stdout_path,
-        stderr_path,
-        &HashMap::new(),
-        deadline,
-        None,
-        events,
-        cancel_rx,
-    )
-    .await?;
-    for bridge in &mcp_bridges {
-        bridge.stop();
+    let operation = async {
+        cancellation.transition(AttemptPhase::DockerCreateSubmitting)?;
+        let marker_operation = cancellation.begin_external_operation(
+            "docker_create_marker_write",
+            &runtime_state.to_string_lossy(),
+        )?;
+        marker_store.persist_ambiguous(
+            &runtime_state,
+            &create_marker(CreateLifecyclePhase::CreateSubmitting),
+        )?;
+        marker_operation.completed()?;
+        let create_result = supervise_process(
+            &create_job,
+            &workspace_dir,
+            transcript_jsonl_path,
+            stdout_path,
+            stderr_path,
+            &HashMap::new(),
+            deadline,
+            None,
+            events,
+            cancellation,
+        )
+        .await?;
+        match create_result {
+            ExecutionStatus::Exited(0) => {
+                let marker_operation = cancellation.begin_external_operation(
+                    "docker_create_marker_transition",
+                    &runtime_state.to_string_lossy(),
+                )?;
+                marker_store.transition_success(
+                    &runtime_state,
+                    &create_marker(CreateLifecyclePhase::CreateSucceeded),
+                )?;
+                marker_operation.completed()?;
+                cancellation.transition(AttemptPhase::DockerCreated)?;
+            }
+            ExecutionStatus::Exited(_) => {
+                let marker_operation = cancellation.begin_external_operation(
+                    "docker_create_marker_remove",
+                    &runtime_state.to_string_lossy(),
+                )?;
+                marker_store.clear_local_rejection(
+                    &runtime_state,
+                    &create_marker(CreateLifecyclePhase::LocalRejected),
+                )?;
+                marker_operation.completed()?;
+                return Ok(create_result);
+            }
+            ExecutionStatus::Cancelled | ExecutionStatus::TimedOut => {
+                anyhow::bail!(
+                    "generic Docker create outcome is ambiguous; quarantine reconciliation is required"
+                );
+            }
+        }
+        cancellation.transition(AttemptPhase::DockerStartSubmitting)?;
+        let start_job = Job {
+            command: "docker".to_string(),
+            args: vec!["start".to_string(), container_name.clone()],
+            ..job.clone()
+        };
+        let start_result = supervise_process(
+            &start_job,
+            &workspace_dir,
+            transcript_jsonl_path,
+            stdout_path,
+            stderr_path,
+            &HashMap::new(),
+            deadline,
+            None,
+            events,
+            cancellation,
+        )
+        .await?;
+        if !matches!(start_result, ExecutionStatus::Exited(0)) {
+            return Ok(start_result);
+        }
+        cancellation.transition(AttemptPhase::DockerStarted)?;
+        cancellation.transition(AttemptPhase::Running)?;
+        let logs_job = Job {
+            command: "docker".to_string(),
+            args: vec!["logs".to_string(), "-f".to_string(), container_name.clone()],
+            ..job.clone()
+        };
+        let logs_result = supervise_process(
+            &logs_job,
+            &workspace_dir,
+            transcript_jsonl_path,
+            stdout_path,
+            stderr_path,
+            &HashMap::new(),
+            deadline,
+            None,
+            events,
+            cancellation,
+        )
+        .await?;
+        if !matches!(logs_result, ExecutionStatus::Exited(_)) {
+            return Ok(logs_result);
+        }
+        cancellation.phase.transition(AttemptPhase::PostExit)?;
+        cancellation.check()?;
+        let mut inspect_command = tokio::process::Command::new("docker");
+        inspect_command.args(["inspect", "--format", "{{.State.ExitCode}}", &container_name]);
+        let inspect = run_before_deadline(
+            &mut inspect_command,
+            deadline,
+            "inspect generic Docker exit code",
+            cancellation,
+            "docker_inspect_request",
+            &container_name,
+        )
+        .await?;
+        cancellation.check()?;
+        anyhow::ensure!(inspect.status.success(), "generic Docker exit-code inspect failed");
+        Ok(ExecutionStatus::Exited(
+            String::from_utf8(inspect.stdout)?.trim().parse()?,
+        ))
     }
-    cleanup_credential_temp_files_best_effort(&resolved_credentials.temp_files);
-    Ok(run_result)
+    .await;
+    let cleanup = docker
+        .reconcile_absent(&container_name, &ownership, STARTUP_RECONCILIATION_TIMEOUT)
+        .await;
+    let run_result = match (operation, cleanup) {
+        (Ok(status), Ok(())) => {
+            cancellation
+                .operations
+                .reconcile_owned_resource(&container_name)?;
+            let remove = cancellation.begin_external_operation(
+                "generic_docker_state_remove",
+                &runtime_state.to_string_lossy(),
+            )?;
+            std::fs::remove_dir_all(&runtime_state)?;
+            remove.completed()?;
+            Ok(status)
+        }
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup.context("generic Docker containment cleanup")),
+        (Err(operation), Err(cleanup)) => Err(anyhow::anyhow!(
+            "generic Docker operation failed: {operation:#}; containment cleanup failed: {cleanup:#}"
+        )),
+    };
+    finalize_required_cleanup(run_result, async {
+        for bridge in &mut mcp_bridges {
+            bridge.stop(cancellation).await?;
+        }
+        if assignment_runtime_root.exists() {
+            let remove = cancellation.begin_external_operation(
+                "runtime_attempt_remove",
+                &assignment_runtime_root.to_string_lossy(),
+            )?;
+            tokio::fs::remove_dir_all(&assignment_runtime_root).await?;
+            remove.completed()?;
+        }
+        cleanup_credential_temp_files_required(&resolved_credentials.temp_files, cancellation)
+    })
+    .await
 }
 
 struct DockerRuntimeInvocation {
@@ -12075,9 +18098,10 @@ async fn run_docker_opencode_with_validation_retries(
     environment_table: &EnvironmentValidationTable,
     opencode_job_state: &Arc<OpencodeJobState>,
     events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ExecutionStatus> {
-    let invocation = build_docker_runtime_invocation(
+    cancellation.check()?;
+    let mut invocation = build_docker_runtime_invocation(
         job,
         local_agent_config,
         workspace_dir,
@@ -12097,10 +18121,12 @@ async fn run_docker_opencode_with_validation_retries(
         opencode_job_state,
         &opencode.trusted_env,
         events,
+        cancellation,
     )
     .await?;
+    cancellation.check()?;
 
-    run_opencode_validation_loop(
+    let result = run_opencode_validation_loop(
         job,
         opencode,
         &invocation,
@@ -12109,19 +18135,14 @@ async fn run_docker_opencode_with_validation_retries(
         &work_item_context,
         environment_table,
         events,
-        cancel_rx,
+        cancellation,
     )
-    .await
-    .inspect(|_| {
-        for bridge in &invocation.mcp_bridges {
-            bridge.stop();
-        }
-    })
-    .inspect_err(|_| {
-        for bridge in &invocation.mcp_bridges {
-            bridge.stop();
-        }
-    })
+    .await;
+    for bridge in &mut invocation.mcp_bridges {
+        bridge.stop(cancellation).await?;
+    }
+    cancellation.check()?;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12134,10 +18155,10 @@ async fn run_opencode_validation_loop(
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
     events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ExecutionStatus> {
     let max_attempts = opencode.max_validation_attempts.max(1);
-    let _ = std::fs::remove_file(output_path);
+    cancellation.remove_file("output_artifact_reset", output_path)?;
 
     let container_name = invocation.job_state.container_name.clone();
     if container_name != format!("agent-hub-opencode-{}", job.id.simple()) {
@@ -12152,7 +18173,8 @@ async fn run_opencode_validation_loop(
     );
 
     let operation = async {
-        spawn_opencode_runtime_container(invocation, &container_name).await?;
+        spawn_opencode_runtime_container(invocation, &container_name, cancellation).await?;
+        cancellation.transition(AttemptPhase::Running)?;
         loop {
         if let Some(events) = events {
             events
@@ -12173,7 +18195,10 @@ async fn run_opencode_validation_loop(
         if invocation.deadline.is_expired() {
             return Ok(ExecutionStatus::TimedOut);
         }
-        let _ = std::fs::remove_file(output_redaction_marker(output_path));
+        cancellation.remove_file(
+            "output_redaction_marker_remove",
+            &output_redaction_marker(output_path),
+        )?;
 
         let status = run_docker_opencode_attempt(
             job,
@@ -12187,7 +18212,7 @@ async fn run_opencode_validation_loop(
             work_item_context,
             environment_table,
             events,
-            cancel_rx.clone(),
+            cancellation,
         )
         .await?;
         if matches!(status, ExecutionStatus::Cancelled) {
@@ -12203,6 +18228,7 @@ async fn run_opencode_validation_loop(
             agent_output_events,
             work_item_context,
             environment_table,
+            cancellation,
         ) {
             Ok(()) => {
                 if let Some(events) = events {
@@ -12259,7 +18285,11 @@ async fn run_opencode_validation_loop(
     let operation = match operation {
         Err(operation_error) => {
             if !output_redaction_marker(output_path).exists() {
-                match finalize_redacted_output_artifact(output_path, Some(&invocation.redactor)) {
+                match finalize_redacted_output_artifact(
+                    output_path,
+                    Some(&invocation.redactor),
+                    cancellation,
+                ) {
                     Ok(()) => Err(operation_error),
                     Err(artifact_error) => Err(anyhow::anyhow!(
                         "OpenCode operation failed: {operation_error:#}; output artifact finalization also failed: {artifact_error:#}"
@@ -12287,7 +18317,7 @@ async fn run_docker_opencode_attempt(
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
     events: Option<&JobEventSink>,
-    cancel_rx: Option<watch::Receiver<bool>>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ExecutionStatus> {
     let opencode_cmd = if let Some(prompt) = continuation_prompt {
         build_opencode_continue_script(shell_prelude, prompt)
@@ -12329,7 +18359,7 @@ async fn run_docker_opencode_attempt(
             work_item_context,
             environment_table,
             events,
-            cancel_rx,
+            cancellation,
             true,
         )
         .await
@@ -12348,20 +18378,17 @@ async fn run_docker_opencode_attempt(
             work_item_context,
             environment_table,
             events,
-            cancel_rx,
+            cancellation,
             false,
         )
         .await
     }
 }
 
-fn cancel_requested(cancel_rx: &Option<watch::Receiver<bool>>) -> bool {
-    cancel_rx.as_ref().is_some_and(|rx| *rx.borrow())
-}
-
 async fn spawn_opencode_runtime_container(
     invocation: &DockerRuntimeInvocation,
     container_name: &str,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
     invocation
         .job_state
@@ -12383,6 +18410,7 @@ async fn spawn_opencode_runtime_container(
         Path::new(&invocation.command),
         &invocation.resolved_image.configured_image,
         &invocation.deadline,
+        cancellation,
     )
     .await?;
     verify_resolved_image_id(&invocation.resolved_image.image_id, &current_image_id)?;
@@ -12400,6 +18428,7 @@ async fn spawn_opencode_runtime_container(
         .job_state
         .ambiguous_create
         .store(true, Ordering::Release);
+    cancellation.transition(AttemptPhase::DockerCreateSubmitting)?;
     if let Err(marker_error) = invocation
         .job_state
         .persist_create_phase(CreateLifecyclePhase::CreateSubmitting)
@@ -12430,9 +18459,12 @@ async fn spawn_opencode_runtime_container(
         anyhow::bail!("absolute deadline expired before Docker create submission");
     }
     create.kill_on_drop(true);
+    let create_operation =
+        cancellation.begin_external_operation("docker_create_request", container_name)?;
     let child = match create.spawn() {
         Ok(child) => child,
         Err(error) => {
+            create_operation.completed()?;
             invocation
                 .job_state
                 .clear_definitive_local_rejection()
@@ -12444,6 +18476,9 @@ async fn spawn_opencode_runtime_container(
             return Err(error).context("submit Docker create process");
         }
     };
+    cancellation
+        .phase
+        .transition(AttemptPhase::DockerCreateSubmitted)?;
     invocation
         .job_state
         .persist_create_phase(CreateLifecyclePhase::CreateSubmitted)
@@ -12451,10 +18486,17 @@ async fn spawn_opencode_runtime_container(
     let create_budget = remaining.min(CREATE_COMMAND_MAX_BUDGET);
     let created = match tokio::time::timeout(create_budget, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
-        Ok(Err(error)) => return Err(error).context("wait for Docker create response"),
-        Err(_) => anyhow::bail!("Docker create response exceeded its bounded request budget"),
+        Ok(Err(error)) => {
+            create_operation.ambiguous("docker_create_wait_failed")?;
+            return Err(error).context("wait for Docker create response");
+        }
+        Err(_) => {
+            create_operation.ambiguous("docker_create_response_timeout")?;
+            anyhow::bail!("Docker create response exceeded its bounded request budget");
+        }
     };
     if !created.status.success() {
+        create_operation.ambiguous("docker_create_non_success")?;
         anyhow::bail!(
             "Docker create returned an ambiguous non-success response for {}: {}: {}",
             container_name,
@@ -12462,6 +18504,7 @@ async fn spawn_opencode_runtime_container(
             String::from_utf8_lossy(&created.stderr).trim()
         );
     }
+    create_operation.completed()?;
     invocation
         .job_state
         .transition_create_success()
@@ -12470,13 +18513,18 @@ async fn spawn_opencode_runtime_container(
         .job_state
         .ambiguous_create
         .store(false, Ordering::Release);
+    cancellation.phase.transition(AttemptPhase::DockerCreated)?;
 
     let mut start = tokio::process::Command::new(&invocation.command);
     start.args(["start", container_name]);
+    cancellation.transition(AttemptPhase::DockerStartSubmitting)?;
     let started = run_before_deadline(
         &mut start,
         &invocation.deadline,
         "start named OpenCode container",
+        cancellation,
+        "docker_start_request",
+        container_name,
     )
     .await?;
     if !started.status.success() {
@@ -12487,6 +18535,7 @@ async fn spawn_opencode_runtime_container(
             String::from_utf8_lossy(&started.stderr).trim()
         );
     }
+    cancellation.phase.transition(AttemptPhase::DockerStarted)?;
     Ok(())
 }
 
@@ -12560,6 +18609,7 @@ fn validate_opencode_output(
     agent_output_events: &[String],
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
+    _cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
     if !output_path.exists() {
         anyhow::bail!("output.json missing")
@@ -12619,6 +18669,60 @@ mod executable_output_validation_tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn missing_and_delayed_output_reads_create_no_cleanup_obligation() {
+        let root =
+            std::env::temp_dir().join(format!("output-observation-{}", uuid::Uuid::new_v4()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let context = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
+        context.phase.transition(AttemptPhase::Running).unwrap();
+        let output = root.join("output.json");
+        let events = vec!["job_succeeded".to_string()];
+        let work_item = serde_json::json!({"workflow_id":"runtime-14"});
+        let environments = EnvironmentValidationTable::for_tests();
+        for _ in 0..32 {
+            assert!(
+                validate_opencode_output_snapshot(
+                    &output,
+                    None,
+                    &events,
+                    &work_item,
+                    &environments,
+                    &context,
+                )
+                .is_err()
+            );
+            assert!(context.operations.unresolved().unwrap().is_empty());
+        }
+        std::fs::write(&output, br#"{"next_event":"job_succeeded"}"#).unwrap();
+        validate_opencode_output_snapshot(
+            &output,
+            None,
+            &events,
+            &work_item,
+            &environments,
+            &context,
+        )
+        .unwrap();
+        assert!(context.operations.unresolved().unwrap().is_empty());
+        std::fs::write(&output, b"not-json").unwrap();
+        assert!(
+            validate_opencode_output_snapshot(
+                &output,
+                None,
+                &events,
+                &work_item,
+                &environments,
+                &context,
+            )
+            .is_err()
+        );
+        assert!(context.operations.unresolved().unwrap().is_empty());
+        std::fs::write(&output, br#"{"next_event":"job_succeeded"}"#).unwrap();
+        context.transition_cleanup().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn validate_opencode_output_snapshot(
@@ -12627,6 +18731,7 @@ fn validate_opencode_output_snapshot(
     agent_output_events: &[String],
     work_item_context: &serde_json::Value,
     environment_table: &EnvironmentValidationTable,
+    _cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(output_path).context("read output.json snapshot")?;
     let redacted = redactor.map_or(bytes.clone(), |redactor| redactor.redact_bytes(&bytes));
@@ -12641,31 +18746,49 @@ fn validate_opencode_output_snapshot(
 fn finalize_redacted_output_artifact(
     output_path: &Path,
     redactor: Option<&ExactTokenRedactor>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
     let marker = output_redaction_marker(output_path);
     if !output_path.exists() {
-        std::fs::write(&marker, b"absent\n").context("write output redaction marker")?;
+        cancellation
+            .write_file("output_redaction_marker_write", &marker, b"absent\n")
+            .context("write output redaction marker")?;
         return Ok(());
     }
     let bytes = std::fs::read(output_path).context("read output.json for final redaction")?;
     let redacted = redactor.map_or(bytes.clone(), |redactor| redactor.redact_bytes(&bytes));
     if let Err(error) = serde_json::from_slice::<serde_json::Value>(&redacted) {
-        std::fs::remove_file(output_path)
+        cancellation
+            .remove_file("output_invalid_remove", output_path)
             .context("remove unsafe invalid output.json after redaction failure")?;
-        std::fs::write(&marker, b"removed-invalid\n")
+        cancellation
+            .write_file(
+                "output_redaction_marker_write",
+                &marker,
+                b"removed-invalid\n",
+            )
             .context("write invalid output redaction marker")?;
         return Err(error).context("redacted output.json is invalid and was removed");
     }
     let temporary = output_path.with_extension("json.redacting");
-    if let Err(error) = std::fs::write(&temporary, &redacted)
-        .and_then(|()| std::fs::rename(&temporary, output_path))
+    if let Err(error) = cancellation
+        .write_file("output_redaction_temporary_write", &temporary, &redacted)
+        .and_then(|()| {
+            cancellation.rename_file("output_redaction_replace", &temporary, output_path)
+        })
     {
-        let _ = std::fs::remove_file(&temporary);
-        let _ = std::fs::remove_file(output_path);
+        let temporary_cleanup = cancellation.remove_file("output_redaction_cleanup", &temporary);
+        let output_cleanup = cancellation.remove_file("output_redaction_cleanup", output_path);
+        if let Err(cleanup) = temporary_cleanup.and(output_cleanup) {
+            return Err(error).context(format!(
+                "persist redacted output.json failed and unsafe artifact cleanup failed: {cleanup:#}"
+            ));
+        }
         return Err(error).context("persist redacted output.json; unsafe artifact was removed");
     }
-    std::fs::write(marker, b"redacted\n").context("write output redaction marker")?;
-    Ok(())
+    cancellation
+        .write_file("output_redaction_marker_write", &marker, b"redacted\n")
+        .context("write output redaction marker")
 }
 
 fn output_redaction_marker(output_path: &Path) -> PathBuf {
@@ -12876,6 +18999,7 @@ async fn build_docker_runtime_invocation(
     opencode_job_state: &Arc<OpencodeJobState>,
     trusted_opencode_env: &BTreeMap<String, String>,
     events: Option<&JobEventSink>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<DockerRuntimeInvocation> {
     let workspace_dir = resolve_to_absolute(workspace_dir)
         .with_context(|| format!("resolve workspace dir {}", workspace_dir.display()))?;
@@ -12884,17 +19008,23 @@ async fn build_docker_runtime_invocation(
     let configured_image = runtime_container_image.as_deref().ok_or_else(|| {
         anyhow::anyhow!("runtime container_image must be set via CONFIG_ROOT configuration")
     })?;
-    let resolved_image =
-        resolve_opencode_image(Path::new("docker"), configured_image, deadline).await?;
+    let resolved_image = resolve_opencode_image(
+        Path::new("docker"),
+        configured_image,
+        deadline,
+        cancellation,
+    )
+    .await?;
     opencode_job_state
         .record_resolved_image(&resolved_image)
         .await?;
-    tokio::fs::write(
-        transcript_dir.join("resolved-image.json"),
-        serde_json::to_vec_pretty(&resolved_image)?,
-    )
-    .await
-    .context("write transcript OpenCode image identity")?;
+    cancellation
+        .write_file(
+            "artifact_resolved_image_write",
+            &transcript_dir.join("resolved-image.json"),
+            serde_json::to_vec_pretty(&resolved_image)?,
+        )
+        .context("write transcript OpenCode image identity")?;
     let trusted_mounts = opencode_job_state.trusted_mounts()?;
     let mut mount_targets = vec!["/workspace".to_string(), "/transcript".to_string()];
     mount_targets.extend(
@@ -12937,12 +19067,13 @@ async fn build_docker_runtime_invocation(
             required_credential_providers,
             deadline.wall_clock(),
             Some(&opencode_job_state.data),
+            cancellation,
         )
         .await?
     } else {
         ResolvedCredentials::default()
     };
-    validate_general_job_credentials(&resolved_credentials)?;
+    validate_general_job_credentials_cancellable(&resolved_credentials, cancellation)?;
     let redactor = ExactTokenRedactor::new(resolved_credentials.redaction_values.clone());
     opencode_job_state.set_redactor(redactor.clone())?;
 
@@ -13164,7 +19295,9 @@ async fn build_docker_runtime_invocation(
         &mut docker_env,
         local_agent_config,
         job,
+        &opencode_job_state.runtime_root,
         events,
+        cancellation,
     )
     .await?;
     apply_trusted_opencode_environment(&mut docker_env, trusted_opencode_env)?;
@@ -13174,6 +19307,7 @@ async fn build_docker_runtime_invocation(
     args.push(resolved_image.image_id.clone());
     args.extend(job.args.clone());
 
+    validate_final_docker_mount_plan(&cancellation.phase.root, &args)?;
     Ok(DockerRuntimeInvocation {
         command: "docker".to_string(),
         args,
@@ -13217,7 +19351,9 @@ async fn configure_mcp_bridges_for_docker(
     docker_env: &mut HashMap<String, String>,
     local_agent_config: &LocalAgentConfig,
     job: &Job,
+    runtime_root: &Path,
     events: Option<&JobEventSink>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<Vec<McpBridgeInstance>> {
     let work_item_context = work_item_contract_from_job_context(&job.context);
     if is_triage_job(&work_item_context) {
@@ -13226,7 +19362,7 @@ async fn configure_mcp_bridges_for_docker(
     let mut bridges = Vec::new();
 
     for bridge_config in &local_agent_config.mcp_bridges {
-        match McpBridgeInstance::start(bridge_config).await {
+        match McpBridgeInstance::start(bridge_config, runtime_root, cancellation).await {
             Ok(bridge) => {
                 args.push("-v".to_string());
                 args.push(bridge.docker_mount_arg());
@@ -13251,6 +19387,19 @@ async fn configure_mcp_bridges_for_docker(
             }
             Err(error) => {
                 let _ = events;
+                let mut cleanup_errors = Vec::new();
+                for bridge in &mut bridges {
+                    if let Err(cleanup_error) = bridge.stop(cancellation).await {
+                        cleanup_errors.push(format!("{cleanup_error:#}"));
+                    }
+                }
+                if !cleanup_errors.is_empty() {
+                    anyhow::bail!(
+                        "failed to start required MCP bridge '{}': {error:#}; prior bridge cleanup failed: {}",
+                        bridge_config.name,
+                        cleanup_errors.join("; ")
+                    );
+                }
                 return Err(error).with_context(|| {
                     format!(
                         "failed to start required MCP bridge '{}'",
@@ -13269,6 +19418,7 @@ async fn resolve_configured_credentials(
     required_provider_names: &[String],
     valid_through: Option<SystemTime>,
     credential_dir: Option<&Path>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ResolvedCredentials> {
     if required_provider_names.is_empty() {
         return Ok(ResolvedCredentials::default());
@@ -13285,12 +19435,12 @@ async fn resolve_configured_credentials(
                 })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    resolve_all_for_job(&providers, valid_through, credential_dir).await
+    resolve_all_for_job(&providers, valid_through, credential_dir, cancellation).await
 }
 
 #[cfg(test)]
 mod selected_credential_provider_tests {
-    use super::{LocalAgentConfig, resolve_configured_credentials};
+    use super::{ExecutionCancellationContext, LocalAgentConfig, resolve_configured_credentials};
     use crate::credential_provider::CredentialProvider;
     use std::collections::HashMap;
 
@@ -13324,16 +19474,30 @@ mod selected_credential_provider_tests {
                 provider("undeclared", &undeclared_marker),
             ),
         ]);
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
 
-        resolve_configured_credentials(&config, &["selected".to_string()], None, None)
-            .await
-            .unwrap();
+        resolve_configured_credentials(
+            &config,
+            &["selected".to_string()],
+            None,
+            None,
+            &cancellation,
+        )
+        .await
+        .unwrap();
         assert!(selected_marker.exists());
         assert!(!undeclared_marker.exists());
         assert!(
-            resolve_configured_credentials(&config, &["missing".to_string()], None, None)
-                .await
-                .is_err()
+            resolve_configured_credentials(
+                &config,
+                &["missing".to_string()],
+                None,
+                None,
+                &cancellation,
+            )
+            .await
+            .is_err()
         );
         assert!(!undeclared_marker.exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -13662,8 +19826,9 @@ mod runner_profile_projection_tests {
 #[cfg(test)]
 mod oauth_secret_canary_tests {
     use super::{
-        ExactTokenRedactor, append_resolved_credentials_to_docker_invocation,
-        finalize_redacted_output_artifact, output_redaction_marker,
+        ExactTokenRedactor, ExecutionCancellationContext,
+        append_resolved_credentials_to_docker_invocation, finalize_redacted_output_artifact,
+        output_redaction_marker,
     };
     use crate::credential_provider::{CredentialProvider, resolve_all_for_job};
     use std::collections::HashMap;
@@ -13702,10 +19867,13 @@ mod oauth_secret_canary_tests {
             safety_margin_secs: 60,
         };
         let data = root.join("data");
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
         let resolved = resolve_all_for_job(
             &[provider],
             SystemTime::now().checked_add(Duration::from_secs(120)),
             Some(&data),
+            &cancellation,
         )
         .await
         .unwrap();
@@ -13747,7 +19915,11 @@ mod oauth_secret_canary_tests {
         bytes.extend_from_slice(&[0xff, 0xfe]);
         std::fs::write(&output, bytes).unwrap();
         let redactor = ExactTokenRedactor::new(vec![canary.to_string()]);
-        assert!(finalize_redacted_output_artifact(&output, Some(&redactor)).is_err());
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
+        assert!(
+            finalize_redacted_output_artifact(&output, Some(&redactor), &cancellation).is_err()
+        );
         assert!(!output.exists());
         assert!(output_redaction_marker(&output).exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -13800,7 +19972,10 @@ fn append_resolved_credentials_to_docker_invocation(
     }
 }
 
-fn validate_general_job_credentials(resolved: &ResolvedCredentials) -> anyhow::Result<()> {
+fn validate_general_job_credentials_cancellable(
+    resolved: &ResolvedCredentials,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
     const MANAGED_GITHUB_ENV: [&str; 6] = [
         "GITHUB_TOKEN",
         "GH_TOKEN",
@@ -13813,21 +19988,35 @@ fn validate_general_job_credentials(resolved: &ResolvedCredentials) -> anyhow::R
         .iter()
         .any(|name| resolved.env_vars.contains_key(*name))
     {
-        cleanup_credential_temp_files(&resolved.temp_files)?;
+        cleanup_credential_temp_files_required(&resolved.temp_files, cancellation)?;
         anyhow::bail!("GitHub credentials are restricted to managed GitHub actions");
     }
     Ok(())
 }
 
-fn cleanup_credential_temp_files_best_effort(temp_files: &[PathBuf]) {
+#[cfg(test)]
+fn validate_general_job_credentials(resolved: &ResolvedCredentials) -> anyhow::Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "general-credential-journal-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let (_stop_tx, stop_rx) = watch::channel(false);
+    let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx)?;
+    let result = validate_general_job_credentials_cancellable(resolved, &cancellation);
+    let _ = std::fs::remove_dir_all(root);
+    result
+}
+
+fn cleanup_credential_temp_files_required(
+    temp_files: &[PathBuf],
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
     for path in temp_files {
-        if let Err(error) = std::fs::remove_file(path) {
-            eprintln!(
-                "warning: failed to remove credential temp file {}: {error:#}",
-                path.display()
-            );
+        if path.exists() {
+            cancellation.remove_file("credential_temp_file_remove", path)?;
         }
     }
+    Ok(())
 }
 
 fn append_git_config_env(env: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -14537,6 +20726,9 @@ mod multi_repo_tests {
                 worker_id: "worker".to_string(),
                 job_id: uuid::Uuid::nil(),
                 attempt: 0,
+                assignment_id: uuid::Uuid::nil(),
+                worker_session_id: uuid::Uuid::nil(),
+                worker_session_generation: 0,
             },
         )
         .expect("args");
@@ -14564,7 +20756,7 @@ mod multi_repo_tests {
         assert!(!create_args.iter().any(|arg| arg == "-d"));
         assert_eq!(
             create_args.iter().filter(|arg| *arg == "--label").count(),
-            5
+            8
         );
     }
 }
@@ -14700,9 +20892,21 @@ mod triage_validation_tests {
         });
         let mut args = Vec::new();
         let mut env = HashMap::new();
-        let bridges = configure_mcp_bridges_for_docker(&mut args, &mut env, &config, &job, None)
-            .await
-            .expect("triage should skip MCP configuration");
+        let root =
+            std::env::temp_dir().join(format!("triage-mcp-journal-{}", uuid::Uuid::new_v4()));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root, stop_rx).unwrap();
+        let bridges = configure_mcp_bridges_for_docker(
+            &mut args,
+            &mut env,
+            &config,
+            &job,
+            &root.join("runtime"),
+            None,
+            &cancellation,
+        )
+        .await
+        .expect("triage should skip MCP configuration");
         assert!(bridges.is_empty());
         assert!(args.is_empty());
         assert!(env.is_empty());

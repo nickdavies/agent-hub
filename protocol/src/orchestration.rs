@@ -794,6 +794,7 @@ pub enum ExecutionMode {
 pub enum WorkItemState {
     Pending,
     Running,
+    Cancelling,
     Succeeded,
     Failed,
     Cancelled,
@@ -2575,6 +2576,130 @@ pub struct FireEventRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationOutcome {
+    Accepted,
+    AlreadyRequested,
+    TerminalNoop,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CancellationLifecycleState {
+    Requested,
+    RecoveryPending,
+    ContainmentFailed,
+    Completed,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Display, EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CancellationDeliveryState {
+    Pending,
+    Delivered,
+    RecoveryPending,
+    ContainmentFailed,
+    Acknowledged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CancellationStatus {
+    pub outcome: CancellationOutcome,
+    #[serde(default)]
+    pub cancellation_id: Option<Uuid>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    pub terminal_jobs: u32,
+    pub running_jobs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FireEventResponse {
+    pub work_item: WorkItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<CancellationStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CancellationCommand {
+    pub cancellation_id: Uuid,
+    pub generation: u64,
+    pub job_id: Uuid,
+    pub invocation_id: Uuid,
+    pub attempt: u32,
+    pub assignment_id: Uuid,
+    pub runtime_assignment_id: Uuid,
+    pub worker_id: String,
+    pub worker_session_id: Uuid,
+    pub worker_session_generation: u64,
+}
+
+pub fn cancellation_assignment_id(
+    job_id: Uuid,
+    invocation_id: Uuid,
+    attempt: u32,
+    worker_id: &str,
+    worker_session_id: Uuid,
+    worker_session_generation: u64,
+) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agent-hub:cancellation-assignment:v1\0");
+    hasher.update(job_id.as_bytes());
+    hasher.update(invocation_id.as_bytes());
+    hasher.update(attempt.to_be_bytes());
+    hasher.update((worker_id.len() as u64).to_be_bytes());
+    hasher.update(worker_id.as_bytes());
+    hasher.update(worker_session_id.as_bytes());
+    hasher.update(worker_session_generation.to_be_bytes());
+    let digest = hasher.finalize();
+    Uuid::from_slice(&digest[..16]).expect("SHA-256 prefix has UUID length")
+}
+
+pub fn verify_cancellation_assignment_id(command: &CancellationCommand) -> Result<(), String> {
+    let expected = cancellation_assignment_id(
+        command.job_id,
+        command.invocation_id,
+        command.attempt,
+        &command.worker_id,
+        command.worker_session_id,
+        command.worker_session_generation,
+    );
+    if command.assignment_id != expected {
+        return Err(
+            "cancellation assignment identity does not match its session fence".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ContainmentAbsenceEvidence {
+    pub checked_at: DateTime<Utc>,
+    pub process: ContainmentStatus,
+    pub container: ContainmentStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainmentStatus {
+    NotApplicable,
+    VerifiedAbsent,
+    Failed { error: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CancellationAcknowledgement {
+    pub command: CancellationCommand,
+    pub containment: ContainmentAbsenceEvidence,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RegisterWorkerRequest {
     pub id: String,
@@ -2667,6 +2792,13 @@ pub struct HeartbeatRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeartbeatResponse {
+    pub worker: WorkerInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<CancellationCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PollJobRequest {
     pub worker_id: String,
 }
@@ -2674,6 +2806,8 @@ pub struct PollJobRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PollJobResponse {
     pub job: Option<Job>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<CancellationCommand>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2701,6 +2835,8 @@ pub struct JobResult {
     pub github_pr: Option<GithubPullRequestMetadata>,
     #[serde(default)]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_acknowledgement: Option<CancellationAcknowledgement>,
 }
 
 /// Typed contract for agent output (output.json).

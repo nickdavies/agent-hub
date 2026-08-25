@@ -850,7 +850,7 @@ fn compute_allowed_actions(
             }
             actions
         }
-        WorkItemState::Succeeded | WorkItemState::Cancelled => vec![],
+        WorkItemState::Cancelling | WorkItemState::Succeeded | WorkItemState::Cancelled => vec![],
     }
 }
 
@@ -1117,6 +1117,7 @@ fn triage_status_from_item(item: &WorkItem) -> TaskTriageStatus {
                 TaskTriageStatus::InProgress
             }
         }
+        WorkItemState::Cancelling => TaskTriageStatus::InProgress,
         WorkItemState::Succeeded => TaskTriageStatus::Completed,
         WorkItemState::Failed => TaskTriageStatus::Blocked,
         WorkItemState::Cancelled => TaskTriageStatus::Cancelled,

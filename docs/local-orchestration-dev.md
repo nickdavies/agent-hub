@@ -15,10 +15,8 @@ Both directories must canonicalize to disjoint paths owned by the same user on t
 local filesystem. Production accepts Linux ext4, btrfs, and XFS. tmpfs, NFS/NFS4, FUSE, CIFS/SMB,
 overlayfs, remote filesystems, and unknown filesystem types are rejected because authoritative
 evidence must survive reboot and power loss. Tests may use tmpfs/overlay beneath their isolated temp
-roots. `AGENT_HUB_ALLOW_EPHEMERAL_FILE_ADAPTER_FS=1` is an explicit durability waiver usable
-wherever it is set and emits a startup warning; c390 and normal production deployments must leave
-it unset. SQLite is
-the sole authority for internal action/recovery receipts; private file sidecars are immutable
+roots only in `#[cfg(test)]` binaries. Production has no filesystem durability waiver. SQLite is the
+sole authority for internal action/recovery receipts; private file sidecars are immutable
 provider-facing checkpoint and terminal-delivery evidence.
 
 The Rust test binary exposes only an ignored, environment-gated subprocess helper named
@@ -48,6 +46,124 @@ This setup runs:
 - `agent-hub-server` in Docker compose
 - `vikunja` in Docker compose
 - `local-agent` as a host process
+
+The canonical public work-item event endpoint is
+`POST /api/v1/orchestration/work-items/{id}/events`. The singular `/event` form is retained as a
+compatibility alias and invokes the same handler. Cancellation responses include the work item and
+the durable cancellation identity/outcome. A running job leaves the work item in `cancelling` until
+its bound worker proves process and container absence with the matching fenced acknowledgement.
+Pending cancellation commands survive server restart. An authenticated worker replacement rebinds
+them to the replacement session with a higher recovery generation; the old session is invalidated
+and cannot acknowledge. Worker startup reconciles persisted, ownership-labelled OpenCode and
+generic Docker containers before polling, then handles recovery cancellation commands before new
+work. Failed absence checks remain durable as `containment_failed` with `cleanup_error` and never
+terminalize the job or work item.
+Cancellation assignment identities are derived and verified by the protocol crate. Recovery rebind
+creates a new session-bound delivery assignment while retaining the original runtime assignment for
+container reconciliation. Process records persist PID, process group, Linux boot ID, and `/proc`
+start time; restart cleanup refuses to signal a reused PID. Process and container evidence are
+separate typed values (`not_applicable`, `verified_absent`, or `failed`). Generic Docker uses the
+same durable create-submission markers and quarantine rules as OpenCode. Provider-action revision
+application plans durable cancellation commands in its idempotent SQLite transaction rather than
+terminalizing running jobs.
+Every orchestration SQLite connection uses WAL, foreign keys, a bounded busy timeout, and
+`synchronous=FULL`. Cancellation intent and acknowledgement commit before their HTTP/gRPC success
+response; restart tests reopen the database after both boundaries and verify the immutable command,
+receipt, outbox, and terminal result. This protects committed state across process termination and
+host power loss when the reviewed filesystem honors fsync.
+Each attempt has a fsynced monotonic phase record from `initialized` through workspace, credential,
+bundle, Docker create/start, running, post-exit, reporting, cleanup, and `completed`. Invalid phase
+regressions hard-fail; `containment_failed` advances only through explicit restart cleanup recovery.
+Repeatable external effects use a separate fsynced append-only `external-effects.jsonl` journal.
+Records have contiguous sequence numbers, stable operation IDs, immutable assignment/job/attempt and
+resource identities, lifecycle phase, and started/completed/ambiguous/cleanup-failed/reconciled
+status. Exact duplicate records are idempotent; conflicting duplicates, malformed records,
+truncation, sequence gaps, unsupported effects, and missing ownership evidence quarantine or fail
+containment. Completed resource-creation records remain unresolved until their exact cleanup is
+recorded, so lifecycle phases never regress for Docker exec, inspect, removal, or retry operations.
+Pure local observations—such as polling, validating, or reading an `output.json` snapshot for
+redaction—do not create cleanup-journal records. Artifact writes, fsyncs, atomic redaction
+replacements, markers, removals, helper processes, network calls, and containment inspections remain
+journaled.
+All of these records, process identities, ownership files, and create-quarantine markers live under
+worker-private `$WORKER_DATA/attempts/<runtime-assignment-id>/` with mode `0700`; files are mode
+`0600`, no-follow, owner/link/type checked, atomically replaced and fsynced. This directory is never
+mounted into a job. `$ARTIFACT_ROOT/transcripts/<job-id>/` contains only redacted, non-authoritative
+artifacts, so hostile writes or deletions under `/transcript` cannot affect restart recovery.
+Container-facing OpenCode config, XDG state/data/cache/home, access-only auth, and MCP sockets live
+in the assignment-bound sibling `$WORKER_DATA/runtime-attempts/<runtime-assignment-id>/`. Only this
+exact runtime subtree may be mounted. It is removed before acknowledgement; private authority stays
+until terminal report and journal closure.
+Linux process cleanup enumerates exact process-group members, opens pidfds after boot-ID/start-time
+verification, and sends TERM/KILL through pidfds while repeatedly discovering new members. The
+OpenCode plugin declares a pinned TypeScript compiler because an isolated frozen install otherwise
+cannot execute its checked-in `typecheck` script.
+
+### Durable-cancellation test API
+
+Execution fault injection is compiled only into the `local-agent` test binary. One central hook
+covers every durable lifecycle transition and operation-journal status boundary.
+
+- `AGENT_HUB_TEST_EXECUTION_FAULT=error:<boundary>` returns an injected error.
+- `AGENT_HUB_TEST_EXECUTION_FAULT=abort:<boundary>` aborts the process.
+- `AGENT_HUB_TEST_EXECUTION_FAULT=pause:<boundary>` writes the selected boundary plus a newline to
+  `AGENT_HUB_TEST_EXECUTION_FAULT_READY`, then waits for
+  `AGENT_HUB_TEST_EXECUTION_FAULT_RELEASE` to exist.
+- Lifecycle boundaries are `lifecycle:<phase>:before|after`, where `<phase>` is one of
+  `initialized`, `workspace_preparing`, `workspace_prepared`, `credentials_resolving`,
+  `credentials_resolved`, `bundle_materializing`, `bundle_materialized`,
+  `docker_create_submitting`, `docker_create_submitted`, `docker_created`,
+  `docker_start_submitting`, `docker_started`, `running`, `post_exit`, `cleanup_running`,
+  `terminal_reporting`, `containment_failed`, or `completed`.
+- Journal boundaries are `operation:<operation-kind>:<status>:before|after`, where status is
+  `started`, `completed`, `ambiguous`, `cleanup_failed`, or `reconciled`.
+
+The subprocess hook helper contract is:
+
+```bash
+AGENT_HUB_EXECUTION_FAULT_HELPER=1 \
+AGENT_HUB_EXECUTION_FAULT_BOUNDARY='lifecycle:running:before' \
+AGENT_HUB_TEST_EXECUTION_FAULT='abort:lifecycle:running:before' \
+cargo test -p local-agent --bin local-agent \
+  tests::subprocess_execution_fault_helper -- \
+  --ignored --exact --test-threads=1 --nocapture
+```
+
+For pause tests, additionally set absolute isolated ready/release paths. Remove both files before
+starting the helper, wait for the ready file, inspect or restart the server/worker, and create the
+release file. Never share these control paths between jobs.
+
+An ignored production-path E2E should start the file adapter and gRPC server with isolated absolute
+`TASK_DIR`, `TASK_STATE_DIR`, database, artifact, and worker-data paths, then launch the worker with:
+
+```bash
+TASK_ADAPTER=file TASK_DIR="$TASK_DIR" TASK_STATE_DIR="$TASK_STATE_DIR" \
+cargo run -p agent-hub-server --bin agent-hub-server
+
+cargo run -p local-agent --bin local-agent -- \
+  --transport grpc --grpc-endpoint http://127.0.0.1:50051 \
+  --worker-id "$WORKER_ID" --hostname localhost \
+  --data-dir "$WORKER_DATA" --artifact-store-root "$ARTIFACT_ROOT"
+```
+
+Restart means terminating and re-running the same command against the same isolated durable paths;
+worker replacement uses the same worker ID and a newly registered session. The harness must inspect:
+
+- `$WORKER_DATA/attempts/<runtime-assignment-id>/attempt-phase.json`
+- `$WORKER_DATA/attempts/<runtime-assignment-id>/external-effects.jsonl`
+- `$WORKER_DATA/attempts/<runtime-assignment-id>/process-runtime.json`
+- `$WORKER_DATA/attempts/<runtime-assignment-id>/opencode/`
+- `$WORKER_DATA/attempts/<runtime-assignment-id>/docker/`
+- `$WORKER_DATA/attempts/reconciliation/external-effects.jsonl`
+- `/tmp/agent-hub-mcp/*.sock`
+- ownership-labelled `agent-hub-opencode-*` and `agent-hub-job-*` containers
+- the server SQLite cancellation row and file-adapter checkpoint under `$TASK_STATE_DIR`
+
+Success requires terminal cancellation acknowledgement only after all applicable operation records
+are completed or reconciled, no process-group member, socket, credential file, XDG/bundle state, or
+owned container remains, and no work item remains in `cancelling`. Unsupported operations, missing
+ownership evidence, malformed journals, and cleanup failures must remain `containment_failed` and be
+retryable after the evidence or cleanup failure is repaired.
 
 ## 1) Prepare local env
 

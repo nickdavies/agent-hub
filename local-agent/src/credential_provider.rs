@@ -1,9 +1,13 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+
+use super::ExecutionCancellationContext;
 
 fn default_true() -> bool {
     true
@@ -95,6 +99,7 @@ impl CredentialProvider {
         &self,
         valid_through: Option<SystemTime>,
         credential_dir: Option<&Path>,
+        cancellation: &ExecutionCancellationContext,
     ) -> anyhow::Result<ResolvedCredentials> {
         match self {
             Self::File {
@@ -120,17 +125,41 @@ impl CredentialProvider {
                 capture_file,
                 ..
             } => {
-                let output = tokio::process::Command::new(command)
-                    .args(args)
-                    .kill_on_drop(true)
-                    .output()
-                    .await?;
+                let operation = cancellation.begin_external_operation(
+                    "credential_command",
+                    &format!("provider:{}", self.name()),
+                )?;
+                let mut child_command = tokio::process::Command::new(command);
+                child_command.args(args).kill_on_drop(true);
+                #[cfg(unix)]
+                child_command.as_std_mut().process_group(0);
+                let child = child_command.spawn()?;
+                let pid = child
+                    .id()
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .context("credential helper has no valid PID")?;
+                let identity = super::read_process_identity(pid)?;
+                let helper = cancellation.begin_external_operation(
+                    "credential_helper_process",
+                    &format!(
+                        "pid={};pgid={};boot={};start={}",
+                        identity.pid,
+                        identity.pgid,
+                        identity.linux_boot_id,
+                        identity.proc_start_time_ticks
+                    ),
+                )?;
+                let output = child.wait_with_output().await?;
+                super::verify_process_group_absent(&identity).await?;
+                helper.reconciled()?;
                 if !output.status.success() {
+                    operation.completed()?;
                     anyhow::bail!(
                         "credential command failed: {}",
                         String::from_utf8_lossy(&output.stderr)
                     );
                 }
+                operation.completed()?;
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let mut creds = ResolvedCredentials::default();
                 if let Some(env_var) = capture_env {
@@ -139,7 +168,12 @@ impl CredentialProvider {
                 if let Some(file_path) = capture_file {
                     let tmp = std::env::temp_dir()
                         .join(format!("agent-hub-cred-{}", uuid::Uuid::new_v4()));
+                    let materialize = cancellation.begin_external_operation(
+                        "credential_materialize",
+                        &tmp.to_string_lossy(),
+                    )?;
                     tokio::fs::write(&tmp, stdout.as_bytes()).await?;
+                    materialize.completed()?;
                     creds.file_mounts.push((
                         tmp.to_string_lossy().to_string(),
                         file_path.clone(),
@@ -179,6 +213,7 @@ impl CredentialProvider {
                 *safety_margin_secs,
                 valid_through,
                 credential_dir,
+                cancellation,
             ),
         }
     }
@@ -188,11 +223,14 @@ pub async fn resolve_all_for_job(
     providers: &[CredentialProvider],
     valid_through: Option<SystemTime>,
     credential_dir: Option<&Path>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ResolvedCredentials> {
+    cancellation.check()?;
     let mut merged = ResolvedCredentials::default();
     for provider in providers {
+        cancellation.check()?;
         let creds = provider
-            .resolve_for_job(valid_through, credential_dir)
+            .resolve_for_job(valid_through, credential_dir, cancellation)
             .await
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -205,6 +243,7 @@ pub async fn resolve_all_for_job(
         merged.temp_files.extend(creds.temp_files);
         merged.redaction_values.extend(creds.redaction_values);
     }
+    cancellation.check()?;
     Ok(merged)
 }
 
@@ -213,6 +252,7 @@ fn resolve_opencode_chatgpt_oauth(
     safety_margin_secs: u64,
     valid_through: Option<SystemTime>,
     credential_dir: Option<&Path>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ResolvedCredentials> {
     let valid_through =
         valid_through.context("authorized job deadline is required for ChatGPT OAuth")?;
@@ -257,7 +297,10 @@ fn resolve_opencode_chatgpt_oauth(
     }
 
     let auth_dir = credential_dir.join("opencode");
+    let directory = cancellation
+        .begin_external_operation("credential_directory_create", &auth_dir.to_string_lossy())?;
     std::fs::create_dir_all(&auth_dir).context("create job OpenCode data directory")?;
+    directory.completed()?;
     let auth_path = auth_dir.join("auth.json");
     let output = serde_json::to_vec(&serde_json::json!({
         "openai": {
@@ -268,7 +311,7 @@ fn resolve_opencode_chatgpt_oauth(
             "accountId": account_id,
         }
     }))?;
-    write_secret_file(&auth_path, &output)?;
+    write_secret_file(&auth_path, &output, cancellation)?;
     Ok(ResolvedCredentials {
         file_mounts: Vec::new(),
         env_vars: HashMap::new(),
@@ -333,7 +376,13 @@ fn parse_auth_entries(bytes: &[u8]) -> anyhow::Result<Vec<(String, serde_json::V
     Ok(entries)
 }
 
-fn write_secret_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+fn write_secret_file(
+    path: &Path,
+    bytes: &[u8],
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
+    let operation = cancellation
+        .begin_external_operation("credential_secret_write", &path.to_string_lossy())?;
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -346,7 +395,7 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             .context("create job OpenCode auth file")?;
         file.write_all(bytes)
             .context("write job OpenCode auth file")?;
-        Ok(())
+        operation.completed()
     }
     #[cfg(not(unix))]
     {
@@ -360,6 +409,11 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    fn cancellation(root: &Path) -> super::super::ExecutionCancellationContext {
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        super::super::ExecutionCancellationContext::for_test(root, stop_rx).unwrap()
+    }
 
     #[test]
     fn auth_parser_preserves_duplicate_provider_names() {
@@ -407,10 +461,12 @@ mod tests {
             host_auth_path: source.to_string_lossy().into_owned(),
             safety_margin_secs: 60,
         };
+        let cancellation = cancellation(&root);
         let resolved = provider
             .resolve_for_job(
                 SystemTime::now().checked_add(Duration::from_secs(120)),
                 Some(&data),
+                &cancellation,
             )
             .await
             .unwrap();
@@ -472,11 +528,13 @@ mod tests {
             host_auth_path: source.to_string_lossy().into_owned(),
             safety_margin_secs: 60,
         };
+        let cancellation = cancellation(&root);
         assert!(
             provider
                 .resolve_for_job(
                     SystemTime::now().checked_add(Duration::from_secs(120)),
                     Some(&data),
+                    &cancellation,
                 )
                 .await
                 .is_err()
@@ -503,6 +561,7 @@ mod tests {
             host_auth_path: source.to_string_lossy().into_owned(),
             safety_margin_secs: 60,
         };
+        let cancellation = cancellation(&root);
         for invalid in [
             r#"{}"#,
             r#"{"openai":{"type":"api","access":"synthetic","expires":9999999999999,"accountId":"synthetic"}}"#,
@@ -514,6 +573,7 @@ mod tests {
                     .resolve_for_job(
                         SystemTime::now().checked_add(Duration::from_secs(120)),
                         Some(&data),
+                        &cancellation,
                     )
                     .await
                     .is_err()
@@ -553,9 +613,10 @@ mod tests {
             host_auth_path: source.to_string_lossy().into_owned(),
             safety_margin_secs: 60,
         };
+        let cancellation = cancellation(&root);
         assert!(
             provider
-                .resolve_for_job(Some(valid_through), Some(&root.join("data")))
+                .resolve_for_job(Some(valid_through), Some(&root.join("data")), &cancellation,)
                 .await
                 .is_err()
         );

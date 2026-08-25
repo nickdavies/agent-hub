@@ -5,6 +5,8 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 
+use super::ExecutionCancellationContext;
+
 /// MCP bridge configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpBridgeConfig {
@@ -42,32 +44,58 @@ pub struct McpBridgeInstance {
     pub socket_path: PathBuf,
     pub container_path: String,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    bridge_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    cancellation: ExecutionCancellationContext,
 }
 
 impl McpBridgeInstance {
     /// Start a bridge that listens on a Unix socket and proxies to the host endpoint.
-    pub async fn start(config: &McpBridgeConfig) -> anyhow::Result<Self> {
+    pub async fn start(
+        config: &McpBridgeConfig,
+        runtime_root: &std::path::Path,
+        cancellation: &ExecutionCancellationContext,
+    ) -> anyhow::Result<Self> {
+        cancellation.check()?;
         let container_path = config
             .container_socket_path
             .clone()
             .unwrap_or_else(|| format!("/tmp/mcp-{}.sock", config.name));
 
-        let socket_dir = std::env::temp_dir().join("agent-hub-mcp");
+        let socket_dir = runtime_root.join("mcp");
+        let directory = cancellation.begin_external_operation(
+            "mcp_socket_directory_create",
+            &socket_dir.to_string_lossy(),
+        )?;
         tokio::fs::create_dir_all(&socket_dir).await?;
-        let socket_path = socket_dir.join(format!("{}.sock", config.name));
+        directory.completed()?;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        config.name.hash(&mut hasher);
+        let socket_path = socket_dir.join(format!("{:016x}.sock", hasher.finish()));
 
-        let _ = tokio::fs::remove_file(&socket_path).await;
+        if socket_path.exists() {
+            let remove = cancellation.begin_external_operation(
+                "mcp_stale_socket_remove",
+                &socket_path.to_string_lossy(),
+            )?;
+            tokio::fs::remove_file(&socket_path).await?;
+            remove.completed()?;
+        }
 
+        let bind = cancellation
+            .begin_external_operation("mcp_socket_bind", &socket_path.to_string_lossy())?;
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind bridge socket {}", socket_path.display()))?;
+        bind.completed()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let endpoint = config.host_endpoint.clone();
         let path = socket_path.clone();
 
-        tokio::spawn(async move {
-            if let Err(error) = run_bridge_loop(listener, &endpoint, shutdown_rx).await {
-                eprintln!("MCP bridge '{}' error: {error:#}", path.display());
-            }
+        let bridge_cancellation = cancellation.clone();
+        let bridge_task = tokio::spawn(async move {
+            run_bridge_loop(listener, &endpoint, shutdown_rx, &bridge_cancellation)
+                .await
+                .with_context(|| format!("MCP bridge '{}' loop", path.display()))
         });
 
         Ok(Self {
@@ -75,6 +103,8 @@ impl McpBridgeInstance {
             socket_path,
             container_path,
             shutdown_tx,
+            bridge_task: Some(bridge_task),
+            cancellation: cancellation.clone(),
         })
     }
 
@@ -88,15 +118,41 @@ impl McpBridgeInstance {
     }
 
     /// Stop the bridge listener loop.
-    pub fn stop(&self) {
+    pub async fn stop(
+        &mut self,
+        cancellation: &ExecutionCancellationContext,
+    ) -> anyhow::Result<()> {
         let _ = self.shutdown_tx.send(true);
+        if let Some(task) = self.bridge_task.take() {
+            task.await.context("MCP bridge task failed")??;
+        }
+        if self.socket_path.exists() {
+            let remove = cancellation.begin_external_operation(
+                "mcp_socket_remove",
+                &self.socket_path.to_string_lossy(),
+            )?;
+            tokio::fs::remove_file(&self.socket_path).await?;
+            remove.completed()?;
+            cancellation
+                .operations
+                .reconcile_owned_resource(&self.socket_path.to_string_lossy())?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for McpBridgeInstance {
     fn drop(&mut self) {
-        self.stop();
-        let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(task) = self.bridge_task.take() {
+            task.abort();
+            let error =
+                anyhow::anyhow!("MCP bridge '{}' dropped without awaited cleanup", self.name);
+            let _ = self.cancellation.phase.containment_failed(&error);
+            if std::thread::panicking() {
+                std::process::abort();
+            }
+            panic!("{error:#}");
+        }
     }
 }
 
@@ -104,16 +160,22 @@ async fn run_bridge_loop(
     listener: UnixListener,
     endpoint: &McpEndpoint,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 let (client_stream, _) = accept_result?;
                 let endpoint = endpoint.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_mcp_connection(client_stream, &endpoint).await {
+                let cancellation = cancellation.clone();
+                connections.spawn(async move {
+                    if let Err(error) =
+                        handle_mcp_connection(client_stream, &endpoint, &cancellation).await
+                    {
                         eprintln!("MCP bridge connection error: {error:#}");
                     }
+                    cancellation.check()
                 });
             }
             changed = shutdown_rx.changed() => {
@@ -123,28 +185,70 @@ async fn run_bridge_loop(
             }
         }
     }
-
+    connections.abort_all();
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            return Err(error).context("MCP bridge connection task failed");
+        }
+    }
     Ok(())
 }
 
-async fn handle_mcp_connection(client: UnixStream, endpoint: &McpEndpoint) -> anyhow::Result<()> {
+async fn handle_mcp_connection(
+    client: UnixStream,
+    endpoint: &McpEndpoint,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
     match endpoint {
         McpEndpoint::Unix { path } => {
+            let operation =
+                cancellation.begin_external_operation("mcp_upstream_connect", "unix_endpoint")?;
             let upstream = UnixStream::connect(path).await?;
+            operation.completed()?;
             bidirectional_copy(client, upstream).await
         }
         McpEndpoint::Tcp { host, port } => {
+            let operation = cancellation
+                .begin_external_operation("mcp_upstream_connect", &format!("tcp:{host}:{port}"))?;
             let upstream = tokio::net::TcpStream::connect(format!("{host}:{port}")).await?;
+            operation.completed()?;
             bidirectional_copy_tcp(client, upstream).await
         }
         McpEndpoint::Stdio { command, args, env } => {
-            let mut child = tokio::process::Command::new(command)
+            let operation =
+                cancellation.begin_external_operation("mcp_helper_spawn", "stdio_endpoint")?;
+            let mut child_command = tokio::process::Command::new(command);
+            child_command
                 .args(args)
                 .envs(env)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit())
-                .spawn()?;
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                child_command.as_std_mut().process_group(0);
+            }
+            let mut child = child_command.spawn()?;
+            operation.completed()?;
+            let pid = child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .context("MCP helper has no valid PID")?;
+            let identity = super::read_process_identity(pid)?;
+            let helper = cancellation.begin_external_operation(
+                "mcp_helper_process",
+                &format!(
+                    "pid={};pgid={};boot={};start={}",
+                    identity.pid,
+                    identity.pgid,
+                    identity.linux_boot_id,
+                    identity.proc_start_time_ticks
+                ),
+            )?;
 
             let mut child_stdin = child
                 .stdin
@@ -161,6 +265,8 @@ async fn handle_mcp_connection(client: UnixStream, endpoint: &McpEndpoint) -> an
             tokio::try_join!(client_to_child, child_to_client)?;
 
             let _ = child.wait().await;
+            super::verify_process_group_absent(&identity).await?;
+            helper.reconciled()?;
             Ok(())
         }
     }
@@ -217,4 +323,59 @@ pub fn container_socket_path(config: &McpBridgeConfig) -> String {
         .container_socket_path
         .clone()
         .unwrap_or_else(|| default_container_socket_path(&config.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::FileTypeExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn socket_bridge_setup_proxy_and_teardown_leave_no_pending_cleanup() {
+        let root = std::env::temp_dir().join(format!("mcp-lifecycle-{}", uuid::Uuid::new_v4()));
+        let upstream_path = root.join("upstream.sock");
+        std::fs::create_dir_all(&root).unwrap();
+        let upstream = UnixListener::bind(&upstream_path).unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut bytes = [0_u8; 4];
+            stream.read_exact(&mut bytes).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        });
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root.join("attempt"), stop_rx)
+            .expect("cancellation context");
+        let name = format!("test-{}", uuid::Uuid::new_v4().simple());
+        let mut bridge = McpBridgeInstance::start(
+            &McpBridgeConfig {
+                name,
+                host_endpoint: McpEndpoint::Unix {
+                    path: upstream_path.to_string_lossy().into_owned(),
+                },
+                container_socket_path: None,
+            },
+            &root.join("runtime"),
+            &cancellation,
+        )
+        .await
+        .expect("start bridge");
+        assert!(
+            std::fs::symlink_metadata(&bridge.socket_path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        let mut client = UnixStream::connect(&bridge.socket_path).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut reply = [0_u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ping");
+        drop(client);
+        upstream_task.await.unwrap();
+        bridge.stop(&cancellation).await.expect("stop bridge");
+        assert!(!bridge.socket_path.exists());
+        assert!(cancellation.operations.unresolved().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -11,6 +11,7 @@ service WorkerLifecycle {
   rpc PollJob(PollJobRequest) returns (PollJobResponse);
   rpc UpdateJob(UpdateJobRequest) returns (UpdateJobResponse);
   rpc StreamJobEvents(stream JobEventChunk) returns (StreamJobEventsResponse);
+  rpc StreamCancellationCommands(ControlStreamRequest) returns (stream CancellationCommand);
 }
 
 message RegisterWorkerRequest {
@@ -34,6 +35,7 @@ message HeartbeatWorkerRequest {
 
 message HeartbeatWorkerResponse {
   repeated WorkerProtocolCapability server_protocol_capabilities = 1;
+  optional CancellationCommand cancellation = 2;
 }
 
 message PollJobRequest {
@@ -43,6 +45,7 @@ message PollJobRequest {
 message PollJobResponse {
   optional Job job = 1;
   repeated WorkerProtocolCapability server_protocol_capabilities = 2;
+  optional CancellationCommand cancellation = 3;
 }
 
 message UpdateJobRequest {
@@ -53,7 +56,46 @@ message UpdateJobRequest {
   optional JobResult result = 5;
 }
 
-message UpdateJobResponse {}
+message UpdateJobResponse {
+  optional CancellationCommand cancellation = 1;
+}
+
+message ControlStreamRequest {
+  string worker_id = 1;
+}
+
+message CancellationCommand {
+  string cancellation_id = 1;
+  uint64 generation = 2;
+  string job_id = 3;
+  string invocation_id = 4;
+  uint32 attempt = 5;
+  string assignment_id = 6;
+  string worker_id = 7;
+  string worker_session_id = 8;
+  uint64 worker_session_generation = 9;
+  string runtime_assignment_id = 10;
+}
+
+message ContainmentAbsenceEvidence {
+  google.protobuf.Timestamp checked_at = 1;
+  ContainmentStatus process = 2;
+  ContainmentStatus container = 3;
+  optional string process_error = 4;
+  optional string container_error = 5;
+}
+
+enum ContainmentStatus {
+  CONTAINMENT_UNSPECIFIED = 0;
+  CONTAINMENT_NOT_APPLICABLE = 1;
+  CONTAINMENT_VERIFIED_ABSENT = 2;
+  CONTAINMENT_FAILED = 3;
+}
+
+message CancellationAcknowledgement {
+  CancellationCommand command = 1;
+  ContainmentAbsenceEvidence containment = 2;
+}
 
 message JobEventChunk {
   string worker_id = 1;
@@ -186,6 +228,7 @@ message JobResult {
   optional RepoExecutionMetadata repo = 7;
   optional GithubPullRequestMetadata github_pr = 8;
   optional string error_message = 9;
+  optional CancellationAcknowledgement cancellation_acknowledgement = 10;
 }
 
 message Job {

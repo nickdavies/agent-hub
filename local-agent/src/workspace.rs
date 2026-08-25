@@ -1,9 +1,12 @@
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use chrono::Utc;
 use protocol::Job;
 
+use super::ExecutionCancellationContext;
 use super::JobEventSink;
 use super::pb;
 
@@ -30,7 +33,9 @@ pub(crate) async fn prepare_workspace(
     runtime_spec: &protocol::CanonicalRuntimeSpec,
     repos_root: &Path,
     worktrees_root: &Path,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<PreparedWorkspace> {
+    cancellation.check()?;
     let Some(repo) = &job.repo else {
         let workspace_dir = worktree_dir_for_job_attempt(worktrees_root, job);
         let workspace_dir = if workspace_dir.is_relative() {
@@ -38,10 +43,10 @@ pub(crate) async fn prepare_workspace(
         } else {
             workspace_dir
         };
-        std::fs::create_dir_all(&workspace_dir)?;
-        ensure_git_workspace(&workspace_dir).await?;
+        journal_create_dir_all(cancellation, "workspace_create", &workspace_dir)?;
+        ensure_git_workspace(&workspace_dir, cancellation).await?;
         let additional_repo_mounts =
-            prepare_additional_repo_mounts(job, runtime_spec, repos_root).await?;
+            prepare_additional_repo_mounts(job, runtime_spec, repos_root, cancellation).await?;
         return Ok(PreparedWorkspace {
             workspace_dir,
             mirror_dir: None,
@@ -50,8 +55,12 @@ pub(crate) async fn prepare_workspace(
         });
     };
 
-    std::fs::create_dir_all(repos_root)?;
-    std::fs::create_dir_all(worktrees_root)?;
+    journal_create_dir_all(cancellation, "workspace_repos_root_create", repos_root)?;
+    journal_create_dir_all(
+        cancellation,
+        "workspace_worktrees_root_create",
+        worktrees_root,
+    )?;
 
     let repo_key = safe_repo_key(&repo.repo_url);
     let mirror_dir = repos_root.join(repo_key);
@@ -64,11 +73,13 @@ pub(crate) async fn prepare_workspace(
                 .arg(repo.repo_url.as_str())
                 .arg(&mirror_dir),
             "git clone failed",
+            cancellation,
+            &mirror_dir.to_string_lossy(),
         )
         .await?;
     }
 
-    refresh_mirror_if_needed(&mirror_dir).await?;
+    refresh_mirror_if_needed(&mirror_dir, cancellation).await?;
 
     run_status(
         tokio::process::Command::new("git")
@@ -77,6 +88,8 @@ pub(crate) async fn prepare_workspace(
             .arg("worktree")
             .arg("prune"),
         "git worktree prune failed",
+        cancellation,
+        &mirror_dir.to_string_lossy(),
     )
     .await?;
 
@@ -89,7 +102,7 @@ pub(crate) async fn prepare_workspace(
         worktree_dir
     };
     if worktree_dir.exists() {
-        let _ = std::fs::remove_dir_all(&worktree_dir);
+        journal_remove_dir_all(cancellation, "workspace_stale_remove", &worktree_dir)?;
     }
 
     let target_branch = resolve_target_branch_for_repo_job(job, repo);
@@ -106,11 +119,13 @@ pub(crate) async fn prepare_workspace(
             .arg(&worktree_dir)
             .arg(&checkout_ref),
         "git worktree add failed",
+        cancellation,
+        &worktree_dir.to_string_lossy(),
     )
     .await?;
 
     let additional_repo_mounts =
-        prepare_additional_repo_mounts(job, runtime_spec, repos_root).await?;
+        prepare_additional_repo_mounts(job, runtime_spec, repos_root, cancellation).await?;
 
     Ok(PreparedWorkspace {
         workspace_dir: worktree_dir,
@@ -124,6 +139,7 @@ pub(crate) async fn cleanup_workspace(
     job: &Job,
     prepared: &PreparedWorkspace,
     events: Option<&JobEventSink>,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
     if let Some(mirror_dir) = &prepared.mirror_dir {
         run_status(
@@ -135,6 +151,8 @@ pub(crate) async fn cleanup_workspace(
                 .arg("--force")
                 .arg(&prepared.workspace_dir),
             "git worktree remove failed",
+            cancellation,
+            &prepared.workspace_dir.to_string_lossy(),
         )
         .await?;
         run_status(
@@ -144,52 +162,43 @@ pub(crate) async fn cleanup_workspace(
                 .arg("worktree")
                 .arg("prune"),
             "git worktree prune failed",
+            cancellation,
+            &mirror_dir.to_string_lossy(),
         )
         .await?;
 
         if let Some(attempt_branch) = &prepared.attempt_branch {
-            match tokio::process::Command::new("git")
+            let mut command = tokio::process::Command::new("git");
+            command
                 .arg("-C")
                 .arg(mirror_dir)
                 .arg("branch")
                 .arg("-D")
-                .arg(attempt_branch)
-                .status()
-                .await
+                .arg(attempt_branch);
+            let resource = format!("{};{}", mirror_dir.display(), attempt_branch);
+            if let Err(error) = run_status(
+                &mut command,
+                "git branch delete failed",
+                cancellation,
+                &resource,
+            )
+            .await
+                && let Some(events) = events
             {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    if let Some(events) = events {
-                        events
-                            .emit(
-                                job.id,
-                                pb::JobEventKind::JobEventSystem,
-                                format!(
-                                    "cleanup warning: failed to delete attempt branch '{}' ({status})",
-                                    attempt_branch
-                                ),
-                            )
-                            .await;
-                    }
-                }
-                Err(error) => {
-                    if let Some(events) = events {
-                        events
-                            .emit(
-                                job.id,
-                                pb::JobEventKind::JobEventSystem,
-                                format!(
-                                    "cleanup warning: branch delete command failed for '{}' ({error})",
-                                    attempt_branch
-                                ),
-                            )
-                            .await;
-                    }
-                }
+                events
+                    .emit(
+                        job.id,
+                        pb::JobEventKind::JobEventSystem,
+                        format!(
+                            "cleanup warning: branch delete command failed for '{}' ({error})",
+                            attempt_branch
+                        ),
+                    )
+                    .await;
             }
         }
     } else if prepared.workspace_dir.exists() {
-        std::fs::remove_dir_all(&prepared.workspace_dir)?;
+        journal_remove_dir_all(cancellation, "workspace_remove", &prepared.workspace_dir)?;
     }
 
     if let Some(events) = events {
@@ -498,19 +507,26 @@ pub(crate) async fn capture_repo_metadata(
     workspace_dir: &Path,
     repo: Option<&protocol::RepoSource>,
     target_branch: Option<String>,
+    cancellation: &ExecutionCancellationContext,
 ) -> Option<protocol::RepoExecutionMetadata> {
     if !workspace_dir.join(".git").exists() {
         return None;
     }
 
-    let head_sha = git_output(workspace_dir, &["rev-parse", "HEAD"]).await;
-    let branch_raw = git_output(workspace_dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+    let head_sha = git_output(workspace_dir, &["rev-parse", "HEAD"], cancellation).await;
+    let branch_raw = git_output(
+        workspace_dir,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        cancellation,
+    )
+    .await;
     let branch = branch_raw
         .as_deref()
         .map(str::trim)
         .filter(|b| !b.is_empty() && *b != "HEAD")
         .map(ToOwned::to_owned);
-    let status_porcelain = git_output(workspace_dir, &["status", "--porcelain"]).await;
+    let status_porcelain =
+        git_output(workspace_dir, &["status", "--porcelain"], cancellation).await;
 
     let mut changed_files: u32 = 0;
     let mut untracked_files: u32 = 0;
@@ -540,8 +556,16 @@ pub(crate) async fn capture_repo_metadata(
     })
 }
 
-async fn ensure_repo_mirror(repo_url: &str, repos_root: &Path) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(repos_root)?;
+async fn ensure_repo_mirror(
+    repo_url: &str,
+    repos_root: &Path,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<PathBuf> {
+    journal_create_dir_all(
+        cancellation,
+        "workspace_repo_mirror_root_create",
+        repos_root,
+    )?;
 
     let repo_key = safe_repo_key(repo_url);
     let mirror_dir = repos_root.join(repo_key);
@@ -554,11 +578,13 @@ async fn ensure_repo_mirror(repo_url: &str, repos_root: &Path) -> anyhow::Result
                 .arg(repo_url)
                 .arg(&mirror_dir),
             "git clone failed",
+            cancellation,
+            &mirror_dir.to_string_lossy(),
         )
         .await?;
     }
 
-    refresh_mirror_if_needed(&mirror_dir).await?;
+    refresh_mirror_if_needed(&mirror_dir, cancellation).await?;
     Ok(mirror_dir)
 }
 
@@ -566,6 +592,7 @@ async fn prepare_additional_repo_mounts(
     job: &Job,
     runtime_spec: &protocol::CanonicalRuntimeSpec,
     repos_root: &Path,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<Vec<AdditionalRepoMount>> {
     let additional_claims = additional_repo_claims_for_mounts(job, runtime_spec);
     if additional_claims.is_empty() {
@@ -581,7 +608,7 @@ async fn prepare_additional_repo_mounts(
                 job.id, claim.repo_url
             );
         }
-        let mirror_dir = ensure_repo_mirror(&claim.repo_url, repos_root).await?;
+        let mirror_dir = ensure_repo_mirror(&claim.repo_url, repos_root, cancellation).await?;
         mounts.push(AdditionalRepoMount {
             repo_url: claim.repo_url.clone(),
             host_path: mirror_dir,
@@ -593,7 +620,10 @@ async fn prepare_additional_repo_mounts(
     Ok(mounts)
 }
 
-async fn refresh_mirror_if_needed(mirror_dir: &Path) -> anyhow::Result<()> {
+async fn refresh_mirror_if_needed(
+    mirror_dir: &Path,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
     if !should_refresh_mirror(mirror_dir)? {
         return Ok(());
     }
@@ -606,10 +636,17 @@ async fn refresh_mirror_if_needed(mirror_dir: &Path) -> anyhow::Result<()> {
             .arg("--prune")
             .arg("origin"),
         "git fetch failed",
+        cancellation,
+        &mirror_dir.to_string_lossy(),
     )
     .await?;
 
+    let operation = cancellation.begin_external_operation(
+        "workspace_mirror_refresh_stamp_write",
+        &mirror_dir.to_string_lossy(),
+    )?;
     write_mirror_refresh_timestamp(mirror_dir)?;
+    operation.completed()?;
     Ok(())
 }
 
@@ -656,23 +693,86 @@ fn safe_repo_key(repo_url: &str) -> String {
     out
 }
 
-async fn run_status(cmd: &mut tokio::process::Command, context: &str) -> anyhow::Result<()> {
-    let status = cmd.status().await?;
+async fn run_status(
+    cmd: &mut tokio::process::Command,
+    context: &str,
+    cancellation: &ExecutionCancellationContext,
+    resource_identity: &str,
+) -> anyhow::Result<()> {
+    let operation_kind = match context {
+        "git worktree add failed" => "workspace_worktree_create",
+        "git worktree remove failed" => "workspace_worktree_remove",
+        "git branch delete failed" => "workspace_branch_remove",
+        _ => "workspace_git_mutation",
+    };
+    let operation = cancellation.begin_external_operation(operation_kind, resource_identity)?;
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.as_std_mut().process_group(0);
+    let mut child = cmd.spawn()?;
+    let pid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .context("workspace git helper has no valid PID")?;
+    let identity = super::read_process_identity(pid)?;
+    let helper = cancellation.begin_external_operation(
+        "workspace_git_helper_process",
+        &format!(
+            "pid={};pgid={};boot={};start={}",
+            identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
+        ),
+    )?;
+    let status = child.wait().await?;
+    super::verify_process_group_absent(&identity).await?;
+    helper.reconciled()?;
     if status.success() {
+        operation.completed()?;
+        if operation_kind == "workspace_worktree_remove" {
+            cancellation
+                .operations
+                .reconcile_owned_resource(resource_identity)?;
+        }
         Ok(())
     } else {
+        operation.ambiguous("workspace_git_mutation_failed")?;
         anyhow::bail!("{context}: {status}")
     }
 }
 
-async fn git_output(workspace_dir: &Path, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new("git")
+async fn git_output(
+    workspace_dir: &Path,
+    args: &[&str],
+    cancellation: &ExecutionCancellationContext,
+) -> Option<String> {
+    let operation = cancellation
+        .begin_external_operation("workspace_git_inspect", &workspace_dir.to_string_lossy())
+        .ok()?;
+    let mut command = tokio::process::Command::new("git");
+    command
         .arg("-C")
         .arg(workspace_dir)
         .args(args)
-        .output()
-        .await
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    command.as_std_mut().process_group(0);
+    let child = command.spawn().ok()?;
+    let pid = child.id().and_then(|pid| i32::try_from(pid).ok())?;
+    let identity = super::read_process_identity(pid).ok()?;
+    let helper = cancellation
+        .begin_external_operation(
+            "workspace_git_helper_process",
+            &format!(
+                "pid={};pgid={};boot={};start={}",
+                identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
+            ),
+        )
         .ok()?;
+    let output = child.wait_with_output().await.ok()?;
+    super::verify_process_group_absent(&identity).await.ok()?;
+    helper.reconciled().ok()?;
+    operation.completed().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -685,18 +785,61 @@ async fn git_output(workspace_dir: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-pub(crate) async fn ensure_git_workspace(workspace_dir: &Path) -> anyhow::Result<()> {
+pub(crate) async fn ensure_git_workspace(
+    workspace_dir: &Path,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
     let git_dir = workspace_dir.join(".git");
     if git_dir.exists() {
         return Ok(());
     }
-    let status = tokio::process::Command::new("git")
-        .arg("init")
-        .arg(workspace_dir)
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("git init failed");
+    let operation = cancellation
+        .begin_external_operation("workspace_git_init", &workspace_dir.to_string_lossy())?;
+    let mut command = tokio::process::Command::new("git");
+    command.arg("init").arg(workspace_dir);
+    let status = run_status(
+        &mut command,
+        "git init failed",
+        cancellation,
+        &workspace_dir.to_string_lossy(),
+    )
+    .await;
+    if status.is_err() {
+        operation.ambiguous("workspace_git_init_failed")?;
+        return status;
     }
+    operation.completed()?;
     Ok(())
+}
+
+fn journal_create_dir_all(
+    cancellation: &ExecutionCancellationContext,
+    operation_kind: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let operation =
+        cancellation.begin_external_operation(operation_kind, &path.to_string_lossy())?;
+    std::fs::create_dir_all(path)?;
+    operation.completed()
+}
+
+fn journal_remove_dir_all(
+    cancellation: &ExecutionCancellationContext,
+    operation_kind: &str,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let operation =
+        cancellation.begin_external_operation(operation_kind, &path.to_string_lossy())?;
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {
+            operation.completed()?;
+            cancellation
+                .operations
+                .reconcile_owned_resources_under(path)
+        }
+        Err(error) => {
+            operation.cleanup_failed("workspace_remove_failed")?;
+            Err(error.into())
+        }
+    }
 }

@@ -8,6 +8,8 @@ use protocol::{
     GithubPullRequestMetadata, JOB_RUN_SCHEMA_NAME, Job, StructuredTranscriptArtifact,
 };
 
+use super::ExecutionCancellationContext;
+
 pub(crate) const TRANSCRIPT_JSONL_INLINE_TAIL_LIMIT: usize = 20;
 pub(crate) const TRANSCRIPT_JSONL_INLINE_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const JOB_EVENTS_INLINE_TAIL_LIMIT: usize = 20;
@@ -45,6 +47,7 @@ pub(crate) fn write_agent_context_file(
     agent_context_path: &Path,
     job: &Job,
     params: AgentContextWriteParams,
+    cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
     let (workspace_dir_display, transcript_dir_display) = display_paths_for_runtime(
         &params.workspace_dir,
@@ -169,8 +172,11 @@ pub(crate) fn write_agent_context_file(
         generated_at: Utc::now(),
         advisory: true,
     };
-    std::fs::write(agent_context_path, serde_json::to_vec_pretty(&payload)?)?;
-    Ok(())
+    cancellation.write_file(
+        "artifact_agent_context_write",
+        agent_context_path,
+        serde_json::to_vec_pretty(&payload)?,
+    )
 }
 
 pub(crate) fn collect_structured_transcript_artifacts(

@@ -136,6 +136,10 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
             post(orchestration::webhook::github_webhook::<N>),
         )
         .route(
+            "/orchestration/work-items/{id}/events",
+            post(orchestration::handlers::fire_work_item_event::<N>),
+        )
+        .route(
             "/orchestration/work-items/{id}/event",
             post(orchestration::handlers::fire_work_item_event::<N>),
         )
@@ -145,11 +149,16 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
         )
         .route(
             "/orchestration/jobs/{id}",
-            put(orchestration::handlers::update_job::<N>),
+            get(orchestration::handlers::get_job::<N>)
+                .put(orchestration::handlers::update_job::<N>),
         )
         .route(
             "/orchestration/jobs/{id}/events",
             get(orchestration::handlers::job_events_sse::<N>),
+        )
+        .route(
+            "/orchestration/jobs/{id}/cancellation-command",
+            get(orchestration::handlers::get_job_cancellation_command::<N>),
         )
         .route(
             "/orchestration/workers",
@@ -792,6 +801,13 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         approval_mode: ApprovalFeatureMode,
         workflows_dir: std::path::PathBuf,
     ) -> Router {
+        router(build_test_state(approval_mode, workflows_dir))
+    }
+
+    fn build_test_state(
+        approval_mode: ApprovalFeatureMode,
+        workflows_dir: std::path::PathBuf,
+    ) -> AppState<NullNotifier> {
         let task_dir =
             std::env::temp_dir().join(format!("ah-test-tasks-{}", uuid::Uuid::new_v4().simple()));
         let config_root = make_hermetic_config_root();
@@ -826,8 +842,7 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
             github_polling_enabled: false,
             github_poll_interval_secs: 30,
         };
-        let state = AppState::new(config, NullNotifier, None);
-        router(state)
+        AppState::new(config, NullNotifier, None)
     }
 
     fn test_app() -> Router {
@@ -899,6 +914,22 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         let req = Request::builder()
             .method("GET")
             .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn get_response_with_worker_session(
+        app: &Router,
+        path: &str,
+        session_id: &str,
+        session_token: &str,
+    ) -> axum::response::Response {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("x-agent-hub-worker-session-id", session_id)
+            .header("x-agent-hub-worker-session-token", session_token)
             .body(Body::empty())
             .unwrap();
         app.clone().oneshot(req).await.unwrap()
@@ -1583,6 +1614,494 @@ kind = "terminal"
             sess["status"]["status"], "waiting",
             "session should be Waiting while question is pending"
         );
+    }
+
+    #[tokio::test]
+    async fn work_item_events_plural_is_canonical_and_singular_is_compatible() {
+        let app = test_app();
+
+        for suffix in ["events", "event"] {
+            let created = post_json_response(
+                &app,
+                "/api/v1/orchestration/work-items",
+                r#"{"workflow_id":"__triage__","context":{"task":"route-test"}}"#,
+            )
+            .await;
+            assert_eq!(created.status(), AxumStatus::OK);
+            let created: Value = serde_json::from_slice(
+                &axum::body::to_bytes(created.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let id = created["id"].as_str().expect("work item id");
+
+            let response = post_json_response(
+                &app,
+                &format!("/api/v1/orchestration/work-items/{id}/{suffix}"),
+                r#"{"event":"cancel","job_id":null,"reason":"operator request"}"#,
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatus::OK, "route suffix {suffix}");
+            let body: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["work_item"]["id"], id);
+            assert_eq!(body["cancellation"]["outcome"], "accepted");
+            assert!(body["cancellation"]["cancellation_id"].is_string());
+        }
+
+        let wrong = post_json_response(
+            &app,
+            "/api/v1/orchestration/work-items/00000000-0000-0000-0000-000000000000/events/runtime-12",
+            r#"{"event":"cancel","job_id":null,"reason":null}"#,
+        )
+        .await;
+        assert_eq!(wrong.status(), AxumStatus::NOT_FOUND);
+        let helper_escape =
+            post_json_response(&app, "/api/v1/internal/durable-cancellation-e2e", r#"{}"#).await;
+        assert_eq!(helper_escape.status(), AxumStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn running_cancellation_is_fenced_until_containment_acknowledgement() {
+        let state = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        let database = state.orchestration.database_path_for_tests().to_path_buf();
+        let app = router(state);
+        let created = post_json_response(
+            &app,
+            "/api/v1/orchestration/work-items",
+            r#"{"workflow_id":"__triage__","context":{"task":"running-cancel"}}"#,
+        )
+        .await;
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let work_item_id = created["id"].as_str().unwrap();
+
+        let registration = post_json_response(
+            &app,
+            "/api/v1/orchestration/workers",
+            r#"{"id":"cancel-worker","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3"]}"#,
+        )
+        .await;
+        let registration: Value = serde_json::from_slice(
+            &axum::body::to_bytes(registration.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let session_id = registration["session_id"].as_str().unwrap();
+        let session_token = registration["session_token"].as_str().unwrap();
+
+        let assigned = post_json_response_with_worker_session(
+            &app,
+            "/api/v1/orchestration/poll",
+            r#"{"worker_id":"cancel-worker"}"#,
+            session_id,
+            session_token,
+        )
+        .await;
+        let assigned: Value = serde_json::from_slice(
+            &axum::body::to_bytes(assigned.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let job_id = assigned["job"]["id"].as_str().unwrap();
+        let running = put_json_response_with_worker_session(
+            &app,
+            &format!("/api/v1/orchestration/jobs/{job_id}"),
+            r#"{"worker_id":"cancel-worker","state":"running","transcript_dir":null,"result":null}"#,
+            session_id,
+            session_token,
+        )
+        .await;
+        assert_eq!(running.status(), AxumStatus::OK);
+
+        let mut blocker = rusqlite::Connection::open(&database).unwrap();
+        blocker
+            .busy_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
+        let blocker_tx = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        blocker_tx
+            .execute(
+                "UPDATE workers SET state = state WHERE id = ?1",
+                ["cancel-worker"],
+            )
+            .unwrap();
+
+        let cancel_app = app.clone();
+        let cancel_path = format!("/api/v1/orchestration/work-items/{work_item_id}/events");
+        let cancel_task = tokio::spawn(async move {
+            post_json_response(
+                &cancel_app,
+                &cancel_path,
+                r#"{"event":"cancel","job_id":null,"reason":"operator request"}"#,
+            )
+            .await
+        });
+        let heartbeat_app = app.clone();
+        let heartbeat_session_id = session_id.to_string();
+        let heartbeat_session_token = session_token.to_string();
+        let heartbeat_task = tokio::spawn(async move {
+            post_json_response_with_worker_session(
+                &heartbeat_app,
+                "/api/v1/orchestration/workers/cancel-worker/heartbeat",
+                r#"{"state":"busy"}"#,
+                &heartbeat_session_id,
+                &heartbeat_session_token,
+            )
+            .await
+        });
+        let poll_app = app.clone();
+        let poll_session_id = session_id.to_string();
+        let poll_session_token = session_token.to_string();
+        let poll_task = tokio::spawn(async move {
+            post_json_response_with_worker_session(
+                &poll_app,
+                "/api/v1/orchestration/poll",
+                r#"{"worker_id":"cancel-worker"}"#,
+                &poll_session_id,
+                &poll_session_token,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!cancel_task.is_finished());
+        blocker_tx.commit().unwrap();
+
+        let cancelled = cancel_task.await.unwrap();
+        let heartbeat = heartbeat_task.await.unwrap();
+        let poll = poll_task.await.unwrap();
+        assert_ne!(heartbeat.status(), AxumStatus::INTERNAL_SERVER_ERROR);
+        assert_ne!(poll.status(), AxumStatus::INTERNAL_SERVER_ERROR);
+        assert_eq!(cancelled.status(), AxumStatus::OK);
+        let cancelled: Value = serde_json::from_slice(
+            &axum::body::to_bytes(cancelled.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cancelled["work_item"]["state"], "cancelling");
+        assert_eq!(cancelled["cancellation"]["running_jobs"], 1);
+        let cancellation_id = cancelled["cancellation"]["cancellation_id"]
+            .as_str()
+            .unwrap();
+
+        let replacement = post_json_response_with_worker_session(
+            &app,
+            "/api/v1/orchestration/workers",
+            r#"{"id":"cancel-worker","hostname":"localhost-restarted","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3"]}"#,
+            session_id,
+            session_token,
+        )
+        .await;
+        assert_eq!(replacement.status(), AxumStatus::OK);
+        let replacement: Value = serde_json::from_slice(
+            &axum::body::to_bytes(replacement.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let recovery_session_id = replacement["session_id"].as_str().unwrap();
+        let recovery_session_token = replacement["session_token"].as_str().unwrap();
+        assert_ne!(recovery_session_id, session_id);
+
+        let stale_poll = post_json_response_with_worker_session(
+            &app,
+            "/api/v1/orchestration/poll",
+            r#"{"worker_id":"cancel-worker"}"#,
+            session_id,
+            session_token,
+        )
+        .await;
+        assert_eq!(stale_poll.status(), AxumStatus::UNAUTHORIZED);
+
+        let fallback = post_json_response_with_worker_session(
+            &app,
+            "/api/v1/orchestration/poll",
+            r#"{"worker_id":"cancel-worker"}"#,
+            recovery_session_id,
+            recovery_session_token,
+        )
+        .await;
+        let fallback: Value = serde_json::from_slice(
+            &axum::body::to_bytes(fallback.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(fallback["job"].is_null());
+        assert_eq!(fallback["cancellation"]["cancellation_id"], cancellation_id);
+        assert_eq!(fallback["cancellation"]["generation"], 2);
+        assert_eq!(
+            fallback["cancellation"]["worker_session_id"],
+            recovery_session_id
+        );
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let late_success = serde_json::json!({
+            "worker_id": "cancel-worker",
+            "state": "succeeded",
+            "transcript_dir": "transcripts/late-success",
+            "result": {
+                "outcome": "succeeded",
+                "termination_reason": "exit_code",
+                "exit_code": 0,
+                "timing": {"started_at": now, "finished_at": now, "duration_ms": 0},
+                "artifacts": {
+                    "stdout_path": "transcripts/late-success/stdout.log",
+                    "stderr_path": "transcripts/late-success/stderr.log",
+                    "output_path": null,
+                    "transcript_dir": "transcripts/late-success",
+                    "structured_transcript_artifacts": []
+                },
+                "output_json": {"next_event":"job_succeeded"},
+                "repo": null,
+                "github_pr": null,
+                "error_message": null
+            }
+        })
+        .to_string();
+        let late_success = put_json_response_with_worker_session(
+            &app,
+            &format!("/api/v1/orchestration/jobs/{job_id}"),
+            &late_success,
+            session_id,
+            session_token,
+        )
+        .await;
+        assert_eq!(late_success.status(), AxumStatus::UNAUTHORIZED);
+
+        let late_success = put_json_response_with_worker_session(
+            &app,
+            &format!("/api/v1/orchestration/jobs/{job_id}"),
+            &serde_json::json!({
+                "worker_id": "cancel-worker",
+                "state": "succeeded",
+                "transcript_dir": "transcripts/late-success",
+                "result": {
+                    "outcome": "succeeded",
+                    "termination_reason": "exit_code",
+                    "exit_code": 0,
+                    "timing": {"started_at": now, "finished_at": now, "duration_ms": 0},
+                    "artifacts": {
+                        "stdout_path": "transcripts/late-success/stdout.log",
+                        "stderr_path": "transcripts/late-success/stderr.log",
+                        "output_path": null,
+                        "transcript_dir": "transcripts/late-success",
+                        "structured_transcript_artifacts": []
+                    },
+                    "output_json": {"next_event":"job_succeeded"},
+                    "repo": null,
+                    "github_pr": null,
+                    "error_message": null
+                }
+            })
+            .to_string(),
+            recovery_session_id,
+            recovery_session_token,
+        )
+        .await;
+        assert_eq!(late_success.status(), AxumStatus::BAD_REQUEST);
+
+        let failed_containment = serde_json::json!({
+            "worker_id": "cancel-worker",
+            "state": "cancelled",
+            "transcript_dir": "transcripts/cancelled",
+            "result": {
+                "outcome": "cancelled",
+                "termination_reason": "cancelled",
+                "exit_code": null,
+                "timing": {"started_at": now, "finished_at": now, "duration_ms": 0},
+                "artifacts": {
+                    "stdout_path": "transcripts/cancelled/stdout.log",
+                    "stderr_path": "transcripts/cancelled/stderr.log",
+                    "output_path": null,
+                    "transcript_dir": "transcripts/cancelled",
+                    "structured_transcript_artifacts": []
+                },
+                "output_json": null,
+                "repo": null,
+                "github_pr": null,
+                "error_message": "synthetic rm failure",
+                "cancellation_acknowledgement": {
+                    "command": fallback["cancellation"].clone(),
+                    "containment": {
+                        "checked_at": now,
+                        "process": "verified_absent",
+                        "container": {"failed":{"error":"synthetic rm failure"}}
+                    }
+                }
+            }
+        })
+        .to_string();
+        let failed_containment = put_json_response_with_worker_session(
+            &app,
+            &format!("/api/v1/orchestration/jobs/{job_id}"),
+            &failed_containment,
+            recovery_session_id,
+            recovery_session_token,
+        )
+        .await;
+        assert_eq!(failed_containment.status(), AxumStatus::BAD_REQUEST);
+
+        let containment_status = post_json_response(
+            &app,
+            &format!("/api/v1/orchestration/work-items/{work_item_id}/events"),
+            r#"{"event":"cancel","job_id":null,"reason":"containment retry"}"#,
+        )
+        .await;
+        let containment_status: Value = serde_json::from_slice(
+            &axum::body::to_bytes(containment_status.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            containment_status["work_item"]["context"]["cancellation"]["state"],
+            "containment_failed"
+        );
+        assert_eq!(
+            containment_status["work_item"]["context"]["cancellation"]["cleanup_error"],
+            "synthetic rm failure"
+        );
+
+        let acknowledgement = serde_json::json!({
+            "worker_id": "cancel-worker",
+            "state": "cancelled",
+            "transcript_dir": "transcripts/cancelled",
+            "result": {
+                "outcome": "cancelled",
+                "termination_reason": "cancelled",
+                "exit_code": null,
+                "timing": {"started_at": now, "finished_at": now, "duration_ms": 0},
+                "artifacts": {
+                    "stdout_path": "transcripts/cancelled/stdout.log",
+                    "stderr_path": "transcripts/cancelled/stderr.log",
+                    "output_path": null,
+                    "transcript_dir": "transcripts/cancelled",
+                    "structured_transcript_artifacts": []
+                },
+                "output_json": null,
+                "repo": null,
+                "github_pr": null,
+                "error_message": null,
+                "cancellation_acknowledgement": {
+                    "command": fallback["cancellation"].clone(),
+                    "containment": {
+                        "checked_at": now,
+                        "process": "verified_absent",
+                        "container": "verified_absent"
+                    }
+                }
+            }
+        })
+        .to_string();
+        let acknowledged = put_json_response_with_worker_session(
+            &app,
+            &format!("/api/v1/orchestration/jobs/{job_id}"),
+            &acknowledgement,
+            recovery_session_id,
+            recovery_session_token,
+        )
+        .await;
+        assert_eq!(acknowledged.status(), AxumStatus::OK);
+        let committed = get_response_with_worker_session(
+            &app,
+            &format!("/api/v1/orchestration/jobs/{job_id}"),
+            recovery_session_id,
+            recovery_session_token,
+        )
+        .await;
+        assert_eq!(committed.status(), AxumStatus::OK);
+        let committed: Value = serde_json::from_slice(
+            &axum::body::to_bytes(committed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(committed["state"], "cancelled");
+        assert_eq!(
+            committed["result"]["cancellation_acknowledgement"]["command"],
+            fallback["cancellation"]
+        );
+
+        let duplicate = post_json_response(
+            &app,
+            &format!("/api/v1/orchestration/work-items/{work_item_id}/events"),
+            r#"{"event":"cancel","job_id":null,"reason":"duplicate"}"#,
+        )
+        .await;
+        assert_eq!(duplicate.status(), AxumStatus::OK);
+        let duplicate: Value = serde_json::from_slice(
+            &axum::body::to_bytes(duplicate.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(duplicate["work_item"]["state"], "cancelled");
+        assert_eq!(
+            duplicate["cancellation"]["cancellation_id"],
+            cancellation_id
+        );
+        assert_eq!(duplicate["cancellation"]["outcome"], "already_requested");
+
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let command: (String, String, String) = connection
+            .query_row(
+                "SELECT cancellation_id, delivery_state, acknowledgement_json
+                 FROM job_cancellation_commands WHERE job_id = ?1",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(command.0, cancellation_id);
+        assert_eq!(command.1, "acknowledged");
+        assert!(!command.2.is_empty());
+        let acknowledgement: Value = serde_json::from_str(&command.2).unwrap();
+        let result_json: String = connection
+            .query_row(
+                "SELECT result_json FROM jobs WHERE id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let result: Value = serde_json::from_str(&result_json).unwrap();
+        assert_eq!(result["cancellation_acknowledgement"], acknowledgement);
+        let work_item_cancellation: (String, String) = connection
+            .query_row(
+                "SELECT cancellation_id, state FROM work_item_cancellations
+                 WHERE work_item_id = ?1",
+                [work_item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(work_item_cancellation.0, cancellation_id);
+        assert_eq!(work_item_cancellation.1, "completed");
+        let active: u32 = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM job_cancellation_commands
+                    WHERE delivery_state != 'acknowledged') +
+                    (SELECT COUNT(*) FROM work_item_cancellations
+                    WHERE state != 'completed')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
     }
 
     /// A Waiting session whose question has been resolved must be eligible for

@@ -2000,6 +2000,7 @@ mod tests {
             repo: None,
             github_pr: None,
             error_message: None,
+            cancellation_acknowledgement: None,
         };
 
         let rows = job_detail_structured_value_preview_rows("build", Some(&result));
@@ -2054,6 +2055,7 @@ mod tests {
             repo: None,
             github_pr: None,
             error_message: None,
+            cancellation_acknowledgement: None,
         };
 
         let rows = job_detail_structured_value_preview_rows("build", Some(&result));
@@ -2185,6 +2187,7 @@ mod tests {
             repo: None,
             github_pr: None,
             error_message: None,
+            cancellation_acknowledgement: None,
         };
 
         assert_eq!(
@@ -2241,6 +2244,7 @@ mod tests {
             repo: None,
             github_pr: None,
             error_message: None,
+            cancellation_acknowledgement: None,
         };
 
         let rows = retrievable_artifact_rows_for_job(job_id, &result);

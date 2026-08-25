@@ -8,12 +8,21 @@ use protocol::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
+pub(super) fn begin_immediate_transaction(
+    connection: &mut Connection,
+) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    // The connection-wide bounded busy timeout retries lock acquisition inside SQLite.
+    // Starting IMMEDIATE here prevents read snapshots from being promoted after a competing write.
+    connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
+
 use crate::server::task_adapter::ProviderActionIdentity;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DbTable {
     WorkItems,
     Jobs,
+    JobCancellationCommands,
     OwnershipReturnOutbox,
     CheckpointOutbox,
     ProviderActionInbox,
@@ -27,6 +36,7 @@ impl DbTable {
         match self {
             Self::WorkItems => "work_items",
             Self::Jobs => "jobs",
+            Self::JobCancellationCommands => "job_cancellation_commands",
             Self::OwnershipReturnOutbox => "ownership_return_outbox",
             Self::CheckpointOutbox => "checkpoint_outbox",
             Self::ProviderActionInbox => "provider_action_inbox",
@@ -127,7 +137,7 @@ pub(super) fn commit_provider_action(
     conn: &mut Connection,
     commit: ProviderActionCommit,
 ) -> anyhow::Result<ProviderActionCommitOutcome> {
-    let tx = conn.transaction()?;
+    let tx = begin_immediate_transaction(conn)?;
     if let Some((stored_work_item_id, stored_action_json, stored_state)) = tx
         .query_row(
             "SELECT work_item_id, action_json, state FROM provider_action_inbox WHERE task_id = ?1 AND action_namespace = ?2 AND revision = ?3",
@@ -238,10 +248,7 @@ pub(super) fn commit_provider_action(
         insert_job_in_transaction(&tx, job)?;
     }
     for work_item_id in &commit.cancel_active_work_item_ids {
-        tx.execute(
-            "UPDATE jobs SET state = 'cancelled', lease_expires_at = NULL, updated_at = ?2 WHERE work_item_id = ?1 AND state IN ('pending', 'assigned', 'running')",
-            params![work_item_id.to_string(), Utc::now().to_rfc3339()],
-        )?;
+        plan_durable_cancellation_in_transaction(&tx, *work_item_id)?;
     }
     for checkpoint_owner_id in &commit.cancel_unreleased_checkpoint_owner_ids {
         tx.execute(
@@ -289,8 +296,148 @@ pub(super) fn commit_provider_action(
     Ok(ProviderActionCommitOutcome::Committed)
 }
 
+pub(super) fn plan_durable_cancellation_in_transaction(
+    tx: &Transaction<'_>,
+    work_item_id: Uuid,
+) -> anyhow::Result<Uuid> {
+    if let Some(id) = tx
+        .query_row(
+            "SELECT cancellation_id FROM work_item_cancellations WHERE work_item_id = ?1",
+            [work_item_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Uuid::parse_str(&id).map_err(Into::into);
+    }
+    let cancellation_id = Uuid::new_v4();
+    let generation = 1_u64;
+    let now = Utc::now();
+    tx.execute(
+        "UPDATE jobs SET state = 'cancelled', lease_expires_at = NULL, updated_at = ?2
+         WHERE work_item_id = ?1 AND state IN ('pending','assigned')",
+        params![work_item_id.to_string(), now.to_rfc3339()],
+    )?;
+    let running = {
+        let mut statement = tx.prepare(
+            "SELECT jobs.id, jobs.attempt, jobs.assigned_worker_id,
+                    jobs.assigned_worker_session_id, jobs.assigned_worker_session_generation,
+                    authorization_records.invocation_id
+             FROM jobs JOIN authorization_records
+               ON authorization_records.authorization_id = jobs.authorization_id
+             WHERE jobs.work_item_id = ?1 AND jobs.state = 'running'",
+        )?;
+        statement
+            .query_map([work_item_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<u64>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (job_id, attempt, worker_id, session_id, session_generation, invocation_id) in &running {
+        let worker_id = worker_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("running cancellation job has no worker"))?;
+        let session_id = session_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("running cancellation job has no session"))?;
+        let session_generation = session_generation
+            .ok_or_else(|| anyhow::anyhow!("running cancellation job has no session generation"))?;
+        let command = protocol::CancellationCommand {
+            cancellation_id,
+            generation,
+            job_id: Uuid::parse_str(job_id)?,
+            invocation_id: Uuid::parse_str(invocation_id)?,
+            attempt: *attempt,
+            assignment_id: protocol::cancellation_assignment_id(
+                Uuid::parse_str(job_id)?,
+                Uuid::parse_str(invocation_id)?,
+                *attempt,
+                worker_id,
+                Uuid::parse_str(session_id)?,
+                session_generation,
+            ),
+            runtime_assignment_id: protocol::cancellation_assignment_id(
+                Uuid::parse_str(job_id)?,
+                Uuid::parse_str(invocation_id)?,
+                *attempt,
+                worker_id,
+                Uuid::parse_str(session_id)?,
+                session_generation,
+            ),
+            worker_id: worker_id.to_string(),
+            worker_session_id: Uuid::parse_str(session_id)?,
+            worker_session_generation: session_generation,
+        };
+        protocol::verify_cancellation_assignment_id(&command).map_err(anyhow::Error::msg)?;
+        tx.execute(
+            "INSERT INTO job_cancellation_commands (job_id, work_item_id, cancellation_id,
+                generation, invocation_id, attempt, assignment_id, runtime_assignment_id,
+                worker_id, worker_session_id, worker_session_generation, delivery_state,
+                acknowledgement_json, cleanup_error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                'pending', NULL, NULL, ?12, ?12)",
+            params![
+                job_id,
+                work_item_id.to_string(),
+                cancellation_id.to_string(),
+                generation,
+                invocation_id,
+                attempt,
+                command.assignment_id.to_string(),
+                command.runtime_assignment_id.to_string(),
+                worker_id,
+                session_id,
+                session_generation,
+                now.to_rfc3339()
+            ],
+        )?;
+    }
+    let state = if running.is_empty() {
+        "completed"
+    } else {
+        "requested"
+    };
+    tx.execute(
+        "INSERT INTO work_item_cancellations (work_item_id, cancellation_id, generation,
+            state, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        params![
+            work_item_id.to_string(),
+            cancellation_id.to_string(),
+            generation,
+            state,
+            now.to_rfc3339()
+        ],
+    )?;
+    tx.execute(
+        "UPDATE work_items SET state = ?2,
+            context_json = json_set(context_json, '$.cancellation.id', ?3,
+                '$.cancellation.generation', ?4, '$.cancellation.state', ?5),
+            updated_at = ?6 WHERE id = ?1",
+        params![
+            work_item_id.to_string(),
+            if running.is_empty() {
+                "cancelled"
+            } else {
+                "cancelling"
+            },
+            cancellation_id.to_string(),
+            generation,
+            state,
+            now.to_rfc3339()
+        ],
+    )?;
+    Ok(cancellation_id)
+}
+
 pub(super) fn migrate_canonical_authorization_bytes(conn: &mut Connection) -> anyhow::Result<()> {
-    let tx = conn.transaction()?;
+    let tx = begin_immediate_transaction(conn)?;
     let already_applied = tx
         .query_row(
             "SELECT 1 FROM schema_migrations WHERE name = 'canonical_authorization_bytes_v1'",
@@ -373,7 +520,7 @@ pub(super) fn migrate_canonical_authorization_bytes(conn: &mut Connection) -> an
     let now = Utc::now().to_rfc3339();
     for root_id in affected_roots {
         tx.execute(
-            "UPDATE jobs SET state = 'cancelled', assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE checkpoint_owner_id = ?1 AND state IN ('pending', 'assigned', 'running')",
+            "UPDATE jobs SET state = 'cancelled', assigned_worker_id = NULL, lease_expires_at = NULL, updated_at = ?2 WHERE checkpoint_owner_id = ?1 AND state IN ('pending', 'assigned')",
             params![root_id, now],
         )?;
         tx.execute(
@@ -496,7 +643,7 @@ pub(super) fn stage_authorization_obligation(
     logical_item: Option<&WorkItem>,
     obligation: &AuthorizationObligationInsert,
 ) -> anyhow::Result<()> {
-    let tx = conn.transaction()?;
+    let tx = begin_immediate_transaction(conn)?;
     insert_authorization_obligation(&tx, obligation)?;
     update_work_item_in_transaction(&tx, root)?;
     if let Some(logical_item) = logical_item
@@ -513,7 +660,7 @@ pub(super) fn commit_ordinary_authorized_job(
     work_items: &[WorkItem],
     insert: &ProviderActionJobInsert,
 ) -> anyhow::Result<()> {
-    let tx = conn.transaction()?;
+    let tx = begin_immediate_transaction(conn)?;
     for item in work_items {
         update_work_item_in_transaction(&tx, item)?;
     }

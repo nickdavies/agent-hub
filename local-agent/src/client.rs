@@ -1,8 +1,8 @@
 use anyhow::Context;
 use protocol::{
-    AuthenticatedWorkerSession, HeartbeatRequest, Job, JobResult, JobState, JobUpdateRequest,
-    PollJobRequest, PollJobResponse, RegisterWorkerRequest, RegisterWorkerResponse, Secret,
-    WorkerState,
+    AuthenticatedWorkerSession, HeartbeatRequest, HeartbeatResponse, JobResult, JobState,
+    JobUpdateRequest, PollJobRequest, PollJobResponse, RegisterWorkerRequest,
+    RegisterWorkerResponse, Secret, WorkerState,
 };
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -12,7 +12,8 @@ use tonic::transport::Channel;
 
 use local_agent::pb;
 use local_agent::pb_conv::{
-    execution_mode_to_pb, job_from_pb, job_result_to_pb, job_state_to_pb, worker_state_to_pb,
+    cancellation_command_from_pb, execution_mode_to_pb, job_from_pb, job_result_to_pb,
+    job_state_to_pb, worker_state_to_pb,
 };
 
 const WORKER_NOT_FOUND_MARKER: &str = "worker not found";
@@ -112,6 +113,8 @@ pub(crate) struct HttpClient {
 #[derive(Clone)]
 pub(crate) struct GrpcClient {
     pub(crate) client: pb::worker_lifecycle_client::WorkerLifecycleClient<Channel>,
+    pub(crate) http: reqwest::Client,
+    pub(crate) base: String,
     pub(crate) token: Option<Secret>,
     pub(crate) worker_session: Arc<RwLock<Option<AuthenticatedWorkerSession>>>,
     pub(crate) server_capability_state: Arc<RwLock<Option<BoundServerCapabilities>>>,
@@ -186,6 +189,70 @@ impl HttpClient {
 }
 
 impl Client {
+    pub(crate) async fn get_job(
+        &self,
+        job_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<protocol::Job>> {
+        let (http, base, token) = match self {
+            Self::Http(client) => (&client.http, &client.base, client.token.as_ref()),
+            Self::Grpc(client) => (&client.http, &client.base, client.token.as_ref()),
+        };
+        let mut request = http.get(format!("{base}/api/v1/orchestration/jobs/{job_id}"));
+        if let Some(token) = token {
+            request = request.bearer_auth(token.expose());
+        }
+        let session = self
+            .worker_session()
+            .context("terminal reporting query has no worker session")?;
+        request = request
+            .header(
+                "x-agent-hub-worker-session-id",
+                session.session_id.to_string(),
+            )
+            .header(
+                "x-agent-hub-worker-session-token",
+                session.session_token.expose(),
+            );
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = response.error_for_status()?;
+        Ok(Some(response.json().await?))
+    }
+
+    pub(crate) async fn get_job_cancellation_command(
+        &self,
+        job_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<protocol::CancellationCommand>> {
+        let (http, base, token) = match self {
+            Self::Http(client) => (&client.http, &client.base, client.token.as_ref()),
+            Self::Grpc(client) => (&client.http, &client.base, client.token.as_ref()),
+        };
+        let mut request = http.get(format!(
+            "{base}/api/v1/orchestration/jobs/{job_id}/cancellation-command"
+        ));
+        if let Some(token) = token {
+            request = request.bearer_auth(token.expose());
+        }
+        let session = self
+            .worker_session()
+            .context("cancellation command query has no worker session")?;
+        let response = request
+            .header(
+                "x-agent-hub-worker-session-id",
+                session.session_id.to_string(),
+            )
+            .header(
+                "x-agent-hub-worker-session-token",
+                session.session_token.expose(),
+            )
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response.json().await?)
+    }
+
     pub(crate) fn server_supports_authorization_version(&self, version: u32) -> bool {
         let state = match self {
             Client::Http(client) => &client.server_capability_state,
@@ -332,7 +399,11 @@ impl Client {
         }
     }
 
-    pub(crate) async fn heartbeat(&self, id: &str, state: WorkerState) -> anyhow::Result<()> {
+    pub(crate) async fn heartbeat(
+        &self,
+        id: &str,
+        state: WorkerState,
+    ) -> anyhow::Result<Option<protocol::CancellationCommand>> {
         match self {
             Client::Http(client) => {
                 let expected_session = client
@@ -361,7 +432,8 @@ impl Client {
                     &expected_session,
                     capabilities_from_header(resp.headers()),
                 )?;
-                Ok(())
+                let response: HeartbeatResponse = resp.json().await?;
+                Ok(response.cancellation)
             }
             Client::Grpc(client) => {
                 let expected_session = client
@@ -388,28 +460,30 @@ impl Client {
                 )?;
                 match inner.heartbeat_worker(req).await {
                     Ok(response) => {
+                        let response = response.into_inner();
                         update_bound_capabilities(
                             &client.server_capability_state,
                             &expected_session,
-                            capabilities_from_pb(
-                                response.into_inner().server_protocol_capabilities,
-                            )?,
+                            capabilities_from_pb(response.server_protocol_capabilities)?,
                         )?;
+                        response
+                            .cancellation
+                            .map(cancellation_command_from_pb)
+                            .transpose()
                     }
                     Err(status)
                         if status.code() == tonic::Code::NotFound
                             && status.message().contains(WORKER_NOT_FOUND_MARKER) =>
                     {
-                        return Err(WorkerNotFoundError.into());
+                        Err(WorkerNotFoundError.into())
                     }
-                    Err(status) => return Err(status.into()),
+                    Err(status) => Err(status.into()),
                 }
-                Ok(())
             }
         }
     }
 
-    pub(crate) async fn poll(&self, worker_id: &str) -> anyhow::Result<Option<Job>> {
+    pub(crate) async fn poll(&self, worker_id: &str) -> anyhow::Result<PollJobResponse> {
         match self {
             Client::Http(client) => {
                 let expected_session = client
@@ -465,7 +539,7 @@ impl Client {
                     )
                     .map_err(anyhow::Error::msg)?;
                 }
-                Ok(parsed.job)
+                Ok(parsed)
             }
             Client::Grpc(client) => {
                 let expected_session = client
@@ -524,7 +598,13 @@ impl Client {
                     )
                     .map_err(anyhow::Error::msg)?;
                 }
-                Ok(job)
+                Ok(PollJobResponse {
+                    job,
+                    cancellation: resp
+                        .cancellation
+                        .map(cancellation_command_from_pb)
+                        .transpose()?,
+                })
             }
         }
     }
@@ -616,7 +696,7 @@ pub(crate) async fn start_grpc_event_stream(
     token: Option<Secret>,
     worker_id: &str,
     worker_session: &AuthenticatedWorkerSession,
-) -> anyhow::Result<mpsc::Sender<pb::JobEventChunk>> {
+) -> anyhow::Result<GrpcEventStreamHandle> {
     let (tx, rx) = mpsc::channel::<pb::JobEventChunk>(512);
     let mut req = apply_grpc_bearer(token.as_ref(), tonic::Request::new(ReceiverStream::new(rx)))?;
     apply_worker_session_metadata(&mut req, Some(worker_session))?;
@@ -624,12 +704,89 @@ pub(crate) async fn start_grpc_event_stream(
         "x-agent-hub-worker-id",
         MetadataValue::try_from(worker_id).context("invalid worker ID for gRPC metadata")?,
     );
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(error) = client.stream_job_events(req).await {
             eprintln!("gRPC event stream ended: {error}");
         }
     });
-    Ok(tx)
+    Ok(GrpcEventStreamHandle { sender: tx, task })
+}
+
+pub(crate) struct GrpcEventStreamHandle {
+    pub(crate) sender: mpsc::Sender<pb::JobEventChunk>,
+    pub(crate) task: tokio::task::JoinHandle<()>,
+}
+
+pub(crate) struct GrpcCancellationStreamHandle {
+    pub(crate) receiver: mpsc::Receiver<anyhow::Result<protocol::CancellationCommand>>,
+    pub(crate) task: tokio::task::JoinHandle<()>,
+}
+
+pub(crate) async fn start_grpc_cancellation_stream(
+    client: pb::worker_lifecycle_client::WorkerLifecycleClient<Channel>,
+    token: Option<Secret>,
+    worker_id: &str,
+    worker_session: &AuthenticatedWorkerSession,
+) -> anyhow::Result<GrpcCancellationStreamHandle> {
+    let (sender, receiver) = mpsc::channel(8);
+    let worker_id = worker_id.to_string();
+    let worker_session = worker_session.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let request = (|| -> anyhow::Result<_> {
+                let mut request = apply_grpc_bearer(
+                    token.as_ref(),
+                    tonic::Request::new(pb::ControlStreamRequest {
+                        worker_id: worker_id.clone(),
+                    }),
+                )?;
+                apply_worker_session_metadata(&mut request, Some(&worker_session))?;
+                Ok(request)
+            })();
+            let stream = match request {
+                Ok(request) => client.clone().stream_cancellation_commands(request).await,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    break;
+                }
+            };
+            match stream {
+                Ok(response) => {
+                    let mut stream = response.into_inner();
+                    loop {
+                        match stream.message().await {
+                            Ok(Some(command)) => {
+                                if sender
+                                    .send(cancellation_command_from_pb(command))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = sender
+                                    .send(Err(anyhow::anyhow!(
+                                        "cancellation control stream closed"
+                                    )))
+                                    .await;
+                                break;
+                            }
+                            Err(error) => {
+                                let _ = sender.send(Err(error.into())).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error.into())).await;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    Ok(GrpcCancellationStreamHandle { receiver, task })
 }
 
 fn apply_worker_session_metadata<T>(
