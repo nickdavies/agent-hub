@@ -26,6 +26,12 @@ pub struct EnvironmentConfig {
     /// agent-hub-configs/environments/<env>/environment.toml.
     #[serde(default)]
     pub runtime: Option<String>,
+    #[serde(default = "default_max_timeout_secs")]
+    pub max_timeout_secs: u64,
+}
+
+fn default_max_timeout_secs() -> u64 {
+    86_400
 }
 
 impl EnvironmentConfig {
@@ -57,7 +63,21 @@ approval_mode = "gateway"
 
     #[test]
     fn environment_toml_rejects_unknown_fields_at_every_level() {
-        assert!(EnvironmentConfig::from_toml(ENVIRONMENT, "test").is_ok());
+        assert_eq!(
+            EnvironmentConfig::from_toml(ENVIRONMENT, "test")
+                .unwrap()
+                .max_timeout_secs,
+            86_400
+        );
+        assert_eq!(
+            EnvironmentConfig::from_toml(
+                &format!("{ENVIRONMENT}\nmax_timeout_secs = 900\n"),
+                "test",
+            )
+            .unwrap()
+            .max_timeout_secs,
+            900
+        );
         assert!(
             EnvironmentConfig::from_toml(&format!("{ENVIRONMENT}\nunknown = true\n"), "test")
                 .is_err()

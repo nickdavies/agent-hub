@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use agent_hub_executor::{
     ArtifactPaths, Cancellation, CleanupStatus, Deadline, DockerCli, DockerExecutionPlan,
-    DockerMount, DockerOwnership, ExecutionRequest, ExecutionStatus, NetworkMode,
+    DockerMount, DockerOwnership, ExecutionRequest, ExecutionStatus, NetworkMode, OutputLimits,
     credential_provider::{CredentialProvider, resolve_all_for_job},
     egress::{
         PreparedRestrictedEgress, ProxyRuntimeSpec, ResolverRuntimeSpec, RestrictedEgressRequest,
@@ -55,7 +55,10 @@ pub struct AuthorizationSelectors<'a> {
     pub environment: &'a str,
     pub image_family: &'a str,
     pub network_class: &'a str,
+    pub network_resources: &'a [NetworkResourceKind],
     pub tool_approval: &'a str,
+    pub overlays: &'a [String],
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +96,8 @@ pub struct RunRecord {
     pub finished_at: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub execution_status: Option<RunStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +140,10 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         ),
         "tool approval selector exceeds the resolved environment ceiling"
     );
+    ensure!(
+        input.timeout_secs <= environment.max_timeout_secs,
+        "timeout selector exceeds the resolved environment ceiling"
+    );
     let mut overlays = input.overlays;
     overlays.sort();
     ensure!(
@@ -146,6 +155,10 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             .iter()
             .all(|overlay| environment.allowed_overlays.contains(overlay)),
         "requested overlay is not allowed by the environment"
+    );
+    ensure!(
+        overlays.is_empty(),
+        "attended execution cannot apply environment overlays; reject the proposal instead of silently ignoring them"
     );
     let approved_roots = approved_roots(&deployment.local_agent)?;
     let mounts = resolve_mounts(
@@ -262,7 +275,7 @@ pub fn render_proposal(
     let canonical_path = std::fs::canonicalize(path)
         .with_context(|| format!("canonicalize authorization path {}", path.display()))?;
     Ok(format!(
-        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {} --tool-approval {} --authorization {} --digest {}\n",
+        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\nOverlays: {}\nTimeout seconds: {}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
         request.proposal.environment,
         request.proposal.image_family,
         request.proposal.image_tag,
@@ -270,6 +283,8 @@ pub fn render_proposal(
         request.proposal.network_class,
         resource_list(&request.proposal.network_resources),
         tool_approval_name(request.proposal.tool_approval),
+        request.proposal.overlays.join(","),
+        request.proposal.timeout_secs,
         request.proposal.prompt_digest,
         request.proposal.prompt,
         artifact.digest,
@@ -277,10 +292,42 @@ pub fn render_proposal(
         shell_word(&request.proposal.environment),
         shell_word(&request.proposal.image_family),
         shell_word(&request.proposal.network_class),
+        repeated_selector_args(
+            "network-resource",
+            request
+                .proposal
+                .network_resources
+                .iter()
+                .map(ToString::to_string)
+        ),
         tool_approval_name(request.proposal.tool_approval),
+        repeated_selector_args("overlay", request.proposal.overlays.iter().cloned()),
+        request.proposal.timeout_secs,
         shell_word(&path_string(&canonical_path)?),
         artifact.digest,
     ))
+}
+
+pub async fn authorize_revalidated(
+    store: &StateStore,
+    path: &Path,
+    selectors: AuthorizationSelectors<'_>,
+) -> anyhow::Result<()> {
+    let (artifact, original_authorization_path) = read_authorization_file(path)?;
+    let request = artifact.verify().map_err(anyhow::Error::msg)?;
+    verify_authorization_selectors(&request, &artifact, &selectors)?;
+    verify_execution_inputs(&request)?;
+    let docker =
+        which::which("docker").context("Docker CLI is required to authorize attended execution")?;
+    let current_image = inspect_image_identity(
+        &docker,
+        &request.proposal.image_tag,
+        &Deadline::new(Some(30))?,
+        &Cancellation::never(),
+    )
+    .await?;
+    verify_image_identity(&request.proposal.image_id, &current_image)?;
+    persist_authorization_receipt(store, artifact, original_authorization_path, selectors)
 }
 
 pub fn authorize(
@@ -291,6 +338,15 @@ pub fn authorize(
     let (artifact, original_authorization_path) = read_authorization_file(path)?;
     let request = artifact.verify().map_err(anyhow::Error::msg)?;
     verify_authorization_selectors(&request, &artifact, &selectors)?;
+    persist_authorization_receipt(store, artifact, original_authorization_path, selectors)
+}
+
+fn persist_authorization_receipt(
+    store: &StateStore,
+    artifact: AttendedAuthorizationArtifact,
+    original_authorization_path: String,
+    selectors: AuthorizationSelectors<'_>,
+) -> anyhow::Result<()> {
     let _lock = store.lock(&lock_path(selectors.digest))?;
     let record = AuthorizationRecord {
         artifact,
@@ -324,8 +380,20 @@ fn verify_authorization_selectors(
         "network class selector mismatch"
     );
     ensure!(
+        request.proposal.network_resources == selectors.network_resources,
+        "network resource selectors mismatch"
+    );
+    ensure!(
         tool_approval_name(request.proposal.tool_approval) == selectors.tool_approval,
         "tool approval selector mismatch"
+    );
+    ensure!(
+        request.proposal.overlays == selectors.overlays,
+        "overlay selectors mismatch"
+    );
+    ensure!(
+        request.proposal.timeout_secs == selectors.timeout_secs,
+        "timeout selector mismatch"
     );
     Ok(())
 }
@@ -339,37 +407,17 @@ pub async fn run(
     let request = supplied.verify().map_err(anyhow::Error::msg)?;
     let digest = supplied.digest.clone();
     verify_authorization_selectors(&request, &supplied, &selectors)?;
-    verify_execution_inputs(&request)?;
-    let docker_path =
-        which::which("docker").context("Docker CLI is required for attended execution")?;
-    let selector_deadline = Deadline::new(Some(30))?;
-    let current_image = inspect_image_identity(
-        &docker_path,
-        &request.proposal.image_tag,
-        &selector_deadline,
-        &Cancellation::never(),
-    )
-    .await?;
-    verify_image_identity(&request.proposal.image_id, &current_image)?;
-    let _lock = store.lock(&lock_path(&digest))?;
     let authorized_path = authorization_path("records", &digest);
-    let authorized: AuthorizationRecord = match store.read_json(&authorized_path) {
-        Ok(authorized) => authorized,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            let authorized = AuthorizationRecord {
-                artifact: supplied.clone(),
-                authorization_path: supplied_path.clone(),
-                authorized_at: Utc::now(),
-            };
-            store.create_json(&authorized_path, &authorized)?;
-            authorized
-        }
-        Err(error) => return Err(error),
-    };
+    let authorized: AuthorizationRecord = store
+        .read_json(&authorized_path)
+        .context("attended authorization has not been approved")?;
+    ensure!(
+        authorized.artifact == supplied && authorized.authorization_path == supplied_path,
+        "authorized artifact does not match supplied artifact"
+    );
+    verify_execution_inputs(&request)?;
+    let _lock = store.lock(&lock_path(&digest))?;
+    let authorized: AuthorizationRecord = store.read_json(&authorized_path)?;
     ensure!(
         authorized.artifact == supplied && authorized.authorization_path == supplied_path,
         "authorized artifact does not match supplied artifact"
@@ -386,8 +434,11 @@ pub async fn run(
         "attended MCP bridge material is unavailable from the executor substrate"
     );
     verify_tool_approval(request.proposal.tool_approval)?;
+    let docker_path =
+        which::which("docker").context("Docker CLI is required for attended execution")?;
     let id = digest[..24].to_string();
     let container_name = format!("agent-hub-attended-{id}");
+    let run_dir = store.path(&PathBuf::from("runs").join(&id))?;
     let ownership = BTreeMap::from([
         (
             "agent-hub.reddit.com/attended-digest".to_string(),
@@ -418,11 +469,29 @@ pub async fn run(
                         anyhow::bail!("attended authorization is already running");
                     }
                     None => {
-                        record.status = RunStatus::Failed;
+                        let recovery = recover_owned_run_resources(
+                            &docker_path,
+                            &run_dir,
+                            &id,
+                            &container_name,
+                            &ownership,
+                        )
+                        .await;
+                        record.status = if recovery.is_ok() {
+                            RunStatus::Failed
+                        } else {
+                            RunStatus::CleanupFailed
+                        };
                         record.finished_at = Some(Utc::now());
-                        record.error = Some(
-                            "execution was interrupted after crossing the launch boundary".into(),
-                        );
+                        record.error = Some(match recovery {
+                            Ok(()) => {
+                                "execution was interrupted after crossing the launch boundary"
+                                    .into()
+                            }
+                            Err(error) => format!(
+                                "execution was interrupted after crossing the launch boundary; recovery cleanup failed: {error:#}"
+                            ),
+                        });
                         store.replace_json(&run_record_path(&id), &record)?;
                         anyhow::bail!("attended execution was interrupted after launch");
                     }
@@ -454,6 +523,7 @@ pub async fn run(
                 finished_at: None,
                 exit_code: None,
                 error: None,
+                execution_status: None,
             };
             store.create_json(&run_record_path(&id), &record)?;
             record
@@ -462,6 +532,7 @@ pub async fn run(
     };
     prepare_consumption(store, &mut record, &digest, |_| Ok(()))?;
 
+    let result = async {
     let cancel_marker = store.path(&cancel_path(&id))?;
     let cancelled_before_preflight = cancel_marker.exists();
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(cancelled_before_preflight);
@@ -521,7 +592,6 @@ pub async fn run(
         runtime_gid,
     )
     .map_err(anyhow::Error::msg)?;
-    let run_dir = store.path(&PathBuf::from("runs").join(&id))?;
     let runs_dir = run_dir.parent().context("run directory has no parent")?;
     if !runs_dir.exists() {
         std::fs::create_dir(runs_dir)?;
@@ -534,10 +604,18 @@ pub async fn run(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
             "attended run directory is not a real directory"
         );
+        recover_owned_run_resources(
+            &docker_path,
+            &run_dir,
+            &id,
+            &container_name,
+            &ownership,
+        )
+        .await
+        .context("reconcile interrupted attended run before retry")?;
         std::fs::remove_dir_all(&run_dir)?;
         File::open(runs_dir)?.sync_all()?;
     }
-    let result = async {
         std::fs::create_dir(&run_dir)?;
         set_private_directory(&run_dir)?;
         sync_directory_and_parent(&run_dir)?;
@@ -559,6 +637,7 @@ pub async fn run(
             set_private_directory(directory)?;
             sync_directory_and_parent(directory)?;
         }
+        validate_credential_runtime_conflicts(&request, &runner)?;
         let effects = agent_hub_executor::ExecutionCancellationContext::new(
             &run_dir.join("effects"),
             cancellation.clone(),
@@ -571,10 +650,26 @@ pub async fn run(
             &effects,
         )
         .await?;
-        let credential_material = credentials.material()?;
-        let redaction_values = credential_material.redaction_values.clone();
         let credential_cleanup =
-            TemporaryCredentialCleanup(credential_material.temporary_files.clone());
+            TemporaryCredentialCleanup(credentials.temp_files.clone());
+        if let Err(error) = verify_materialized_credential_identities(&request, &credentials) {
+            return merge_execution_cleanup(
+                Err(error),
+                effects.finalize(),
+                credential_cleanup.cleanup(),
+            );
+        }
+        let credential_material = match credentials.material() {
+            Ok(material) => material,
+            Err(error) => {
+                return merge_execution_cleanup(
+                    Err(error),
+                    effects.finalize(),
+                    credential_cleanup.cleanup(),
+                );
+            }
+        };
+        let redaction_values = credential_material.redaction_values.clone();
         let mut mounts = request
             .execution
             .workspaces
@@ -645,7 +740,7 @@ pub async fn run(
             "execution was cancelled before launch"
         );
         let cleanup_deadline = Deadline::new(Some(30))?;
-        let mut prepared_egress = prepare_execution_egress(
+        let mut prepared_egress = match prepare_execution_egress(
             &deployment,
             &request,
             &docker_path,
@@ -657,7 +752,16 @@ pub async fn run(
             },
             cancellation.clone(),
         )
-        .await?;
+        .await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return merge_execution_cleanup(
+                    Err(error),
+                    effects.finalize(),
+                    credential_cleanup.cleanup(),
+                );
+            }
+        };
         let operation = async {
             let (network, network_environment, dns, extra_hosts) = match &prepared_egress {
             Some(prepared) => {
@@ -744,6 +848,15 @@ pub async fn run(
                 cancellation,
                 append: false,
                 redaction_values,
+                output_limits: OutputLimits {
+                    stdout_bytes: request.output.limits.stdout_bytes,
+                    stderr_bytes: request.output.limits.stderr_bytes,
+                    transcript_bytes: request.output.limits.transcript_bytes,
+                },
+                effects: Some(effects.clone()),
+                operation_identity: Some(format!(
+                    "container={container_name};digest={digest};image={image_identity}"
+                )),
             })
             .await
         }
@@ -754,10 +867,16 @@ pub async fn run(
             None => Ok(()),
         };
         let credential_cleanup = credential_cleanup.cleanup();
-        merge_execution_cleanup(operation, egress_cleanup, credential_cleanup)
+        let effect_cleanup = effects.finalize();
+        merge_execution_cleanup(
+            operation,
+            merge_cleanup_results(egress_cleanup, effect_cleanup),
+            credential_cleanup,
+        )
     }
     .await;
     record.finished_at = Some(Utc::now());
+    let mut cleanup_complete = true;
     match result {
         Ok(result) => {
             if store.path(&cancel_path(&id))?.exists() {
@@ -771,6 +890,10 @@ pub async fn run(
                     }
                     ExecutionStatus::Cancelled => record.status = RunStatus::Cancelled,
                     ExecutionStatus::TimedOut => record.status = RunStatus::TimedOut,
+                    ExecutionStatus::OutputLimitExceeded => {
+                        record.status = RunStatus::Failed;
+                        record.error = Some("reviewed host-output limit exceeded".into());
+                    }
                 }
             }
             if let CleanupStatus::Failed(error) = result.cleanup {
@@ -779,13 +902,20 @@ pub async fn run(
             }
         }
         Err(error) => {
-            if store.path(&cancel_path(&id))?.exists() {
+            if is_cleanup_failure(&error) {
+                cleanup_complete = false;
+                record.status = RunStatus::CleanupFailed;
+                record.error = Some(format!("{error:#}"));
+            } else if store.path(&cancel_path(&id))?.exists() && is_cancellation_error(&error) {
                 record.status = RunStatus::Cancelled;
             } else {
-                record.status = RunStatus::CleanupFailed;
+                record.status = RunStatus::Failed;
                 record.error = Some(format!("{error:#}"));
             }
         }
+    }
+    if record.status != RunStatus::CleanupFailed {
+        record.execution_status = Some(record.status.clone());
     }
     let docker = DockerCli::new(docker_path);
     if let Err(error) = docker
@@ -796,6 +926,7 @@ pub async fn run(
         )
         .await
     {
+        cleanup_complete = false;
         record.status = RunStatus::CleanupFailed;
         let container_error = format!("container cleanup failed: {error:#}");
         record.error = Some(match record.error.take() {
@@ -803,56 +934,97 @@ pub async fn run(
             None => container_error,
         });
     }
-    if run_dir.is_dir() {
-        let result_path = run_dir.join(&request.output.result);
-        let artifacts_path = run_dir.join(&request.output.artifacts);
-        let repositories_path = run_dir.join(&request.output.repositories);
-        let cleanup_path = run_dir.join(&request.output.cleanup);
-        let mut repositories = Vec::new();
-        for repository in &request.execution.repositories {
-            let ending = if repository.starting.head.is_some() {
-                crate::local::repository_state(Path::new(&repository.repository_root))?
-            } else {
-                repository.starting.clone()
-            };
-            repositories.push(serde_json::json!({
-                "workspace_alias": repository.workspace_alias,
-                "repository_root": repository.repository_root,
-                "mount_path": repository.mount_path,
-                "remote": repository.remote,
-                "access": repository.access,
-                "starting": repository.starting,
-                "ending": ending,
-            }));
+    let output_result: anyhow::Result<()> = (|| {
+        if run_dir.is_dir() {
+            let result_path = run_dir.join(&request.output.result);
+            let artifacts_path = run_dir.join(&request.output.artifacts);
+            let repositories_path = run_dir.join(&request.output.repositories);
+            let cleanup_path = run_dir.join(&request.output.cleanup);
+            let mut repositories = Vec::new();
+            for repository in &request.execution.repositories {
+                let ending = if repository.starting.head.is_some() {
+                    crate::local::repository_state(Path::new(&repository.repository_root))?
+                } else {
+                    repository.starting.clone()
+                };
+                repositories.push(serde_json::json!({
+                    "workspace_alias": repository.workspace_alias,
+                    "repository_root": repository.repository_root,
+                    "mount_path": repository.mount_path,
+                    "remote": repository.remote,
+                    "access": repository.access,
+                    "starting": repository.starting,
+                    "ending": ending,
+                }));
+            }
+            repositories.sort_by_key(|repository| {
+                repository["workspace_alias"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            write_private_durable_bounded(
+                &repositories_path,
+                &serde_json::to_vec_pretty(&repositories)?,
+                request.output.limits.artifact_bytes,
+            )?;
+            write_private_durable_bounded(
+                &result_path,
+                &serde_json::to_vec_pretty(&record)?,
+                request.output.limits.artifact_bytes,
+            )?;
+            write_private_durable_bounded(
+                &artifacts_path,
+                &serde_json::to_vec_pretty(&serde_json::json!({
+                    "stdout": "stdout.log",
+                    "stderr": "stderr.log",
+                    "transcript": request.output.transcript,
+                    "result": request.output.result,
+                    "repositories": request.output.repositories,
+                }))?,
+                request.output.limits.artifact_bytes,
+            )?;
+            write_private_durable(
+                &cleanup_path,
+                &serde_json::to_vec_pretty(&serde_json::json!({
+                    "status": if cleanup_complete { "complete" } else { "cleanup_failed" },
+                    "error": &record.error,
+                    "containment": {
+                        "process": if cleanup_complete { "verified_absent_or_not_created" } else { "unresolved" },
+                        "container": if cleanup_complete { "verified_absent" } else { "unresolved" },
+                        "egress": if cleanup_complete { "verified_absent_or_not_created" } else { "unresolved" },
+                        "credentials": if cleanup_complete { "verified_absent_or_not_created" } else { "unresolved" },
+                    }
+                }))?,
+            )?;
         }
-        repositories.sort_by_key(|repository| {
-            repository["workspace_alias"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
+        Ok(())
+    })();
+    if let Err(error) = output_result {
+        if record.status != RunStatus::CleanupFailed {
+            record.status = RunStatus::Failed;
+            record.execution_status = Some(RunStatus::Failed);
+        }
+        let output_error = format!("attended output finalization failed: {error:#}");
+        record.error = Some(match record.error.take() {
+            Some(existing) => format!("{existing}; {output_error}"),
+            None => output_error,
         });
-        write_private_durable(
-            &repositories_path,
-            &serde_json::to_vec_pretty(&repositories)?,
-        )?;
-        write_private_durable(&result_path, &serde_json::to_vec_pretty(&record)?)?;
-        write_private_durable(
-            &artifacts_path,
-            &serde_json::to_vec_pretty(&serde_json::json!({
-                "stdout": "stdout.log",
-                "stderr": "stderr.log",
-                "transcript": request.output.transcript,
-                "result": request.output.result,
-                "repositories": request.output.repositories,
-            }))?,
-        )?;
-        write_private_durable(
-            &cleanup_path,
-            &serde_json::to_vec_pretty(&serde_json::json!({
-                "status": if record.status == RunStatus::CleanupFailed { "cleanup_failed" } else { "complete" },
-                "error": &record.error,
-            }))?,
-        )?;
+        if run_dir.is_dir() {
+            let _ = write_private_durable_bounded(
+                &run_dir.join(&request.output.result),
+                &serde_json::to_vec_pretty(&record)?,
+                request.output.limits.artifact_bytes,
+            );
+            let cleanup_path = run_dir.join(&request.output.cleanup);
+            let _ = write_private_durable(
+                &cleanup_path,
+                &serde_json::to_vec_pretty(&serde_json::json!({
+                    "status": "incomplete",
+                    "error": &record.error,
+                }))?,
+            );
+        }
     }
     store.replace_json(&run_record_path(&id), &record)?;
     Ok(record)
@@ -993,34 +1165,36 @@ pub async fn cleanup(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> 
     if record.status == RunStatus::Cleaned {
         return Ok(record);
     }
-    let cleanup_result = DockerCli::new(which::which("docker")?)
-        .remove_owned(
-            &record.container_name,
-            &DockerOwnership::new(record.ownership.clone())?,
-            Duration::from_secs(30),
-        )
-        .await
-        .and_then(|()| {
-            let run_dir = store.path(&PathBuf::from("runs").join(id))?;
-            let parent = run_dir.parent().context("run directory has no parent")?;
-            match std::fs::remove_dir_all(&run_dir) {
-                Ok(()) => File::open(parent)?.sync_all()?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            Ok(())
-        });
+    let docker = which::which("docker")?;
+    let run_dir = store.path(&PathBuf::from("runs").join(id))?;
+    let cleanup_result = recover_owned_run_resources(
+        &docker,
+        &run_dir,
+        id,
+        &record.container_name,
+        &record.ownership,
+    )
+    .await
+    .and_then(|()| {
+        let parent = run_dir.parent().context("run directory has no parent")?;
+        match std::fs::remove_dir_all(&run_dir) {
+            Ok(()) => File::open(parent)?.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    });
     record.finished_at = Some(Utc::now());
     match cleanup_result {
         Ok(()) => {
-            if !matches!(
-                record.status,
-                RunStatus::Failed
-                    | RunStatus::Cancelled
-                    | RunStatus::TimedOut
-                    | RunStatus::CleanupFailed
-            ) {
-                record.status = RunStatus::Cleaned;
+            record.status = match record.execution_status.clone() {
+                Some(RunStatus::Succeeded) | None if record.status == RunStatus::Succeeded => {
+                    RunStatus::Cleaned
+                }
+                Some(status) => status,
+                None => RunStatus::Failed,
+            };
+            if matches!(record.status, RunStatus::Succeeded | RunStatus::Cleaned) {
                 record.error = None;
             }
         }
@@ -1031,6 +1205,60 @@ pub async fn cleanup(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> 
     }
     store.replace_json(&run_record_path(id), &record)?;
     Ok(record)
+}
+
+async fn recover_owned_run_resources(
+    docker: &Path,
+    run_dir: &Path,
+    id: &str,
+    container_name: &str,
+    ownership: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = DockerCli::new(docker)
+        .remove_owned(
+            container_name,
+            &DockerOwnership::new(ownership.clone())?,
+            Duration::from_secs(30),
+        )
+        .await
+    {
+        failures.push(format!("primary container: {error:#}"));
+    }
+    if run_dir.exists()
+        && let Err(error) = agent_hub_executor::egress::recover_restricted_egress(
+            docker,
+            &run_dir.join("egress"),
+            id,
+            &Deadline::new(Some(30))?,
+        )
+        .await
+    {
+        failures.push(format!("egress: {error:#}"));
+    }
+    if run_dir.join("effects").exists() {
+        match agent_hub_executor::ExecutionCancellationContext::new(
+            &run_dir.join("effects"),
+            Cancellation::never(),
+        ) {
+            Ok(effects) => {
+                if let Err(error) = effects
+                    .reconcile_owned_effects(&run_dir.join("data"))
+                    .await
+                    .and_then(|()| effects.finalize())
+                {
+                    failures.push(format!("credential/process effects: {error:#}"));
+                }
+            }
+            Err(error) => failures.push(format!("effect journal: {error:#}")),
+        }
+    }
+    ensure!(
+        failures.is_empty(),
+        "owned run cleanup failed: {}",
+        failures.join("; ")
+    );
+    Ok(())
 }
 
 fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::Result<()> {
@@ -1098,6 +1326,10 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
             tool_approval_mode(&environment.approval_mode)?,
         ),
         "authorized tool approval exceeds the environment ceiling"
+    );
+    ensure!(
+        request.proposal.timeout_secs <= environment.max_timeout_secs,
+        "authorized timeout exceeds the environment ceiling"
     );
     let runner = deployment
         .runner_profiles
@@ -1230,6 +1462,101 @@ async fn resolve_attended_credentials(
     .await
 }
 
+fn validate_credential_runtime_conflicts(
+    request: &AttendedAuthorizationRequestV1,
+    runner: &config::ResolvedRunnerProfile,
+) -> anyhow::Result<()> {
+    let mut environment = request
+        .execution
+        .behavior
+        .env
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    environment.extend(runner.opencode.trusted_env.keys().cloned());
+    environment.insert("AGENT_PROMPT_USER_PATH".to_string());
+    if !request.proposal.network_resources.is_empty() {
+        environment.extend(
+            [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "NO_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "no_proxy",
+                "AGENT_RESTRICTED_EGRESS_HOSTS",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+    let mut mounts = request
+        .execution
+        .workspaces
+        .iter()
+        .map(|mount| mount.container_path.clone())
+        .chain(
+            request
+                .execution
+                .context_roots
+                .iter()
+                .map(|mount| mount.container_path.clone()),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    mounts.extend(
+        [
+            "/opencode/config",
+            "/opencode/data",
+            "/opencode/state",
+            "/opencode/cache",
+            "/agent-hub/prompt.txt",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+
+    for provider in &request.execution.credential_providers {
+        for target in &provider.targets {
+            if target.starts_with('/') {
+                ensure!(
+                    !mounts.contains(target),
+                    "credential target '{target}' conflicts with an executor mount"
+                );
+            } else {
+                ensure!(
+                    !environment.contains(target),
+                    "credential target '{target}' conflicts with an authorized environment variable"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_materialized_credential_identities(
+    request: &AttendedAuthorizationRequestV1,
+    credentials: &agent_hub_executor::credential_provider::ResolvedCredentials,
+) -> anyhow::Result<()> {
+    for (name, identity) in &credentials.source_identities {
+        let authorized = request
+            .execution
+            .credential_providers
+            .iter()
+            .find(|provider| provider.name == *name)
+            .with_context(|| {
+                format!("materialized credential provider '{name}' was not authorized")
+            })?;
+        ensure!(
+            authorized.source == identity.canonical_path
+                && authorized.constraints.get("source_sha256") == Some(&identity.sha256),
+            "credential source '{name}' changed after authorization"
+        );
+    }
+    Ok(())
+}
+
 fn configured_credential_providers(
     deployment: &config::ValidatedDeployment,
 ) -> anyhow::Result<HashMap<String, CredentialProvider>> {
@@ -1304,19 +1631,24 @@ fn authorized_credential_provider(
             container_path,
             read_only,
             ..
-        } => (
-            host_path.clone(),
-            None,
-            Vec::new(),
-            None,
-            if *read_only {
-                "read_only"
-            } else {
-                "read_write"
-            }
-            .to_string(),
-            BTreeMap::from([("container_path".to_string(), container_path.clone())]),
-        ),
+        } => {
+            ensure!(*read_only, "credential file mounts must be read-only");
+            let identity = agent_hub_executor::credential_provider::private_file_identity(
+                host_path,
+                "credential file",
+            )?;
+            (
+                identity.canonical_path,
+                None,
+                Vec::new(),
+                None,
+                "read_only".to_string(),
+                BTreeMap::from([
+                    ("container_path".to_string(), container_path.clone()),
+                    ("source_sha256".to_string(), identity.sha256),
+                ]),
+            )
+        }
         CredentialProvider::Env { .. } => (
             "configured_environment".to_string(),
             None,
@@ -1354,27 +1686,33 @@ fn authorized_credential_provider(
             allowed_contexts,
             container_path,
             ..
-        } => (
-            source_path
-                .clone()
-                .unwrap_or_else(|| "~/.kube/config".to_string()),
-            None,
-            Vec::new(),
-            None,
-            "read_only".to_string(),
-            BTreeMap::from([
-                (
-                    "allowed_contexts".to_string(),
-                    serde_json::to_string(allowed_contexts)?,
-                ),
-                (
-                    "container_path".to_string(),
-                    container_path
-                        .clone()
-                        .unwrap_or_else(|| "/home/agent/.kube/config".to_string()),
-                ),
-            ]),
-        ),
+        } => {
+            let source = source_path.as_deref().unwrap_or("~/.kube/config");
+            let identity = agent_hub_executor::credential_provider::private_file_identity(
+                source,
+                "kubeconfig credential",
+            )?;
+            (
+                identity.canonical_path,
+                None,
+                Vec::new(),
+                None,
+                "read_only".to_string(),
+                BTreeMap::from([
+                    (
+                        "allowed_contexts".to_string(),
+                        serde_json::to_string(allowed_contexts)?,
+                    ),
+                    (
+                        "container_path".to_string(),
+                        container_path
+                            .clone()
+                            .unwrap_or_else(|| "/home/agent/.kube/config".to_string()),
+                    ),
+                    ("source_sha256".to_string(), identity.sha256),
+                ]),
+            )
+        }
         CredentialProvider::OpencodeChatgptOauth {
             host_auth_path,
             safety_margin_secs,
@@ -1543,6 +1881,31 @@ fn attended_config_provenance(
 
 struct TemporaryCredentialCleanup(Vec<PathBuf>);
 
+#[derive(Debug)]
+struct FinalizationError(String);
+
+fn is_cleanup_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<FinalizationError>().is_some()
+        || error.chain().any(|cause| {
+            let message = cause.to_string().to_ascii_lowercase();
+            message.contains("cleanup failed") || message.contains("cleanup also failed")
+        })
+}
+
+fn is_cancellation_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().to_ascii_lowercase().contains("cancel"))
+}
+
+impl std::fmt::Display for FinalizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FinalizationError {}
+
 fn merge_execution_cleanup<T>(
     operation: anyhow::Result<T>,
     egress_cleanup: anyhow::Result<()>,
@@ -1562,8 +1925,19 @@ fn merge_execution_cleanup<T>(
             if let CleanupStatus::Failed(error) = credential_cleanup {
                 errors.push(format!("credential cleanup failed: {error}"));
             }
-            Err(anyhow::anyhow!(errors.join("; ")))
+            Err(anyhow::Error::new(FinalizationError(errors.join("; "))))
         }
+    }
+}
+
+fn merge_cleanup_results(
+    first: anyhow::Result<()>,
+    second: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(anyhow::anyhow!("{first:#}; {second:#}")),
     }
 }
 
@@ -2013,6 +2387,13 @@ fn resource_list(resources: &[NetworkResourceKind]) -> String {
     }
 }
 
+fn repeated_selector_args(name: &str, values: impl IntoIterator<Item = String>) -> String {
+    values
+        .into_iter()
+        .map(|value| format!(" --{name} {}", shell_word(&value)))
+        .collect()
+}
+
 fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value
@@ -2107,6 +2488,15 @@ fn write_private_durable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     file.sync_all()?;
     File::open(path.parent().context("attended output has no parent")?)?.sync_all()?;
     Ok(())
+}
+
+fn write_private_durable_bounded(path: &Path, bytes: &[u8], limit: u64) -> anyhow::Result<()> {
+    ensure!(limit > 0, "attended artifact output limit must be positive");
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "attended artifact exceeded reviewed limit of {limit} bytes"
+    );
+    write_private_durable(path, bytes)
 }
 
 fn sync_directory_and_parent(path: &Path) -> anyhow::Result<()> {
@@ -2314,6 +2704,7 @@ mod tests {
                 finished_at: None,
                 exit_code: None,
                 error: None,
+                execution_status: None,
             };
             store
                 .create_json(&super::run_record_path(&record.id), &record)

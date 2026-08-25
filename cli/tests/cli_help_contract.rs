@@ -25,16 +25,27 @@ fn executable_local_help_has_the_complete_command_contract() {
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
     for command in [
-        "propose", "run", "list", "status", "logs", "result", "cancel", "cleanup",
+        "propose",
+        "authorize",
+        "run",
+        "list",
+        "status",
+        "logs",
+        "result",
+        "cancel",
+        "cleanup",
     ] {
         assert!(stdout.contains(command), "missing command {command}");
     }
     assert!(stdout.contains("agent-hub local propose --config-root"));
+    assert!(stdout.contains("agent-hub local authorize --environment"));
     assert!(stdout.contains("agent-hub local run --environment"));
     let unwrapped = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(unwrapped.contains("--network-class build --tool-approval dippy --authorization"));
+    assert!(unwrapped.contains(
+        "--network-class build --network-resource llm --tool-approval dippy --timeout-secs 3600 --authorization"
+    ));
     assert!(
-        !stdout
+        stdout
             .lines()
             .any(|line| line.trim_start().starts_with("authorize "))
     );

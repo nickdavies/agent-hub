@@ -5058,7 +5058,7 @@ mod tests {
         effects.hash(&mut hasher);
         assert_eq!(
             hasher.finish(),
-            4_453_831_012_833_862_904,
+            16_318_665_444_239_385_555,
             "external-effect source inventory changed; audit every changed helper and update the reviewed fingerprint"
         );
     }
@@ -14201,6 +14201,7 @@ mod github_action_tests {
             )],
             temp_files: vec![temp.clone()],
             redaction_values: Vec::new(),
+            source_identities: Default::default(),
         };
         let error = github_token_from_credentials(credentials).unwrap_err();
         assert!(!format!("{error:#}").contains(TOKEN));

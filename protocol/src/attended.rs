@@ -183,6 +183,16 @@ pub struct AttendedOutputContract {
     pub artifacts: String,
     pub repositories: String,
     pub cleanup: String,
+    pub limits: AttendedOutputLimits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedOutputLimits {
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub transcript_bytes: u64,
+    pub artifact_bytes: u64,
 }
 
 impl Default for AttendedOutputContract {
@@ -193,6 +203,12 @@ impl Default for AttendedOutputContract {
             artifacts: "artifacts.json".into(),
             repositories: "repositories.json".into(),
             cleanup: "cleanup.json".into(),
+            limits: AttendedOutputLimits {
+                stdout_bytes: 16 * 1024 * 1024,
+                stderr_bytes: 16 * 1024 * 1024,
+                transcript_bytes: 32 * 1024 * 1024,
+                artifact_bytes: 4 * 1024 * 1024,
+            },
         }
     }
 }

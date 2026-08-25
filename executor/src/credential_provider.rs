@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CredentialMaterial, DockerMount, ExecutionCancellationContext};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateFileIdentity {
+    pub canonical_path: String,
+    pub sha256: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -70,6 +76,7 @@ pub struct ResolvedCredentials {
     pub file_mounts: Vec<(String, String, bool)>,
     pub temp_files: Vec<PathBuf>,
     pub redaction_values: Vec<String>,
+    pub source_identities: BTreeMap<String, PrivateFileIdentity>,
 }
 
 impl std::fmt::Debug for ResolvedCredentials {
@@ -80,6 +87,7 @@ impl std::fmt::Debug for ResolvedCredentials {
             .field("file_mount_count", &self.file_mounts.len())
             .field("temp_file_count", &self.temp_files.len())
             .field("redaction_value_count", &self.redaction_values.len())
+            .field("source_identity_count", &self.source_identities.len())
             .finish()
     }
 }
@@ -134,7 +142,9 @@ impl CredentialProvider {
                 .cloned()
                 .collect(),
             Self::KubeconfigFilter { container_path, .. } => {
-                container_path.iter().cloned().collect()
+                let mut targets = container_path.iter().cloned().collect::<Vec<_>>();
+                targets.push("KUBECONFIG".to_string());
+                targets
             }
             Self::OpencodeChatgptOauth { .. } => {
                 vec!["/opencode/data/opencode/auth.json".to_string()]
@@ -158,9 +168,25 @@ impl CredentialProvider {
                 read_only,
                 ..
             } => {
-                let resolved_path = shellexpand::tilde(host_path).to_string();
+                anyhow::ensure!(*read_only, "credential file mounts must be read-only");
+                let credential_dir = credential_dir
+                    .context("job credential directory is required for file credentials")?;
+                let (identity, bytes) = read_private_regular_file(host_path, "credential file")?;
+                let resolved_path = materialize_private_source(
+                    credential_dir,
+                    self.name(),
+                    &identity.sha256,
+                    &bytes,
+                    cancellation,
+                )?;
                 Ok(ResolvedCredentials {
-                    file_mounts: vec![(resolved_path, container_path.clone(), *read_only)],
+                    file_mounts: vec![(
+                        resolved_path.to_string_lossy().into_owned(),
+                        container_path.clone(),
+                        true,
+                    )],
+                    temp_files: vec![resolved_path],
+                    source_identities: BTreeMap::from([(self.name().to_string(), identity)]),
                     ..Default::default()
                 })
             }
@@ -199,7 +225,18 @@ impl CredentialProvider {
                         identity.proc_start_time_ticks
                     ),
                 )?;
-                let output = child.wait_with_output().await?;
+                let cancellation_signal = cancellation.cancellation();
+                let outcome = tokio::select! {
+                    output = child.wait_with_output() => Some(output),
+                    () = cancellation_signal.cancelled() => None,
+                };
+                let Some(output) = outcome else {
+                    super::verify_process_group_absent(&identity).await?;
+                    helper.reconciled()?;
+                    operation.reconciled()?;
+                    anyhow::bail!("credential command was cancelled");
+                };
+                let output = output?;
                 super::verify_process_group_absent(&identity).await?;
                 helper.reconciled()?;
                 if !output.status.success() {
@@ -216,13 +253,16 @@ impl CredentialProvider {
                     creds.env_vars.insert(env_var.clone(), stdout.clone());
                 }
                 if let Some(file_path) = capture_file {
-                    let tmp = std::env::temp_dir()
-                        .join(format!("agent-hub-cred-{}", uuid::Uuid::new_v4()));
+                    let credential_dir = credential_dir.context(
+                        "job credential directory is required for command file credentials",
+                    )?;
+                    let tmp =
+                        credential_dir.join(format!("command-{}.credential", uuid::Uuid::new_v4()));
                     let materialize = cancellation.begin_external_operation(
                         "credential_materialize",
                         &tmp.to_string_lossy(),
                     )?;
-                    tokio::fs::write(&tmp, stdout.as_bytes()).await?;
+                    write_secret_file(&tmp, stdout.as_bytes(), cancellation)?;
                     materialize.completed()?;
                     creds.file_mounts.push((
                         tmp.to_string_lossy().to_string(),
@@ -239,18 +279,31 @@ impl CredentialProvider {
                 container_path,
                 ..
             } => {
-                // For MVP: just mount the whole kubeconfig read-only.
-                // TODO: implement actual context filtering.
                 let source = source_path.as_deref().unwrap_or("~/.kube/config");
-                let resolved_source = shellexpand::tilde(source).to_string();
+                let credential_dir = credential_dir
+                    .context("job credential directory is required for kubeconfig credentials")?;
+                let (identity, bytes) = read_private_regular_file(source, "kubeconfig credential")?;
+                let resolved_source = materialize_private_source(
+                    credential_dir,
+                    self.name(),
+                    &identity.sha256,
+                    &bytes,
+                    cancellation,
+                )?;
                 let target = container_path
                     .as_deref()
                     .unwrap_or("/home/agent/.kube/config")
                     .to_string();
 
                 Ok(ResolvedCredentials {
-                    file_mounts: vec![(resolved_source, target.clone(), true)],
+                    file_mounts: vec![(
+                        resolved_source.to_string_lossy().into_owned(),
+                        target.clone(),
+                        true,
+                    )],
                     env_vars: HashMap::from([("KUBECONFIG".to_string(), target)]),
+                    temp_files: vec![resolved_source],
+                    source_identities: BTreeMap::from([(self.name().to_string(), identity)]),
                     ..Default::default()
                 })
             }
@@ -269,6 +322,95 @@ impl CredentialProvider {
     }
 }
 
+pub fn private_file_identity(
+    configured_path: &str,
+    description: &str,
+) -> anyhow::Result<PrivateFileIdentity> {
+    read_private_regular_file(configured_path, description).map(|(identity, _)| identity)
+}
+
+#[cfg(unix)]
+fn read_private_regular_file(
+    configured_path: &str,
+    description: &str,
+) -> anyhow::Result<(PrivateFileIdentity, Vec<u8>)> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let expanded = PathBuf::from(shellexpand::tilde(configured_path).as_ref());
+    anyhow::ensure!(
+        expanded.is_absolute(),
+        "configured {description} source must be absolute"
+    );
+    let canonical = std::fs::canonicalize(&expanded)
+        .with_context(|| format!("canonicalize configured {description} source"))?;
+    anyhow::ensure!(
+        canonical == expanded,
+        "configured {description} source path is not canonical"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&canonical)
+        .with_context(|| format!("open configured {description} source"))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "configured {description} source is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.uid() == std::fs::metadata("/proc/self")?.uid(),
+        "configured {description} source is not owned by the current user"
+    );
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o077 == 0,
+        "configured {description} source is accessible by another user"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok((
+        PrivateFileIdentity {
+            canonical_path: canonical.to_string_lossy().into_owned(),
+            sha256: Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        },
+        bytes,
+    ))
+}
+
+#[cfg(not(unix))]
+fn read_private_regular_file(
+    _configured_path: &str,
+    _description: &str,
+) -> anyhow::Result<(PrivateFileIdentity, Vec<u8>)> {
+    anyhow::bail!("secure credential source reads require Unix no-follow semantics")
+}
+
+fn materialize_private_source(
+    credential_dir: &Path,
+    provider_name: &str,
+    digest: &str,
+    bytes: &[u8],
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<PathBuf> {
+    let safe_name = provider_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let path = credential_dir.join(format!("{safe_name}-{}.credential", &digest[..16]));
+    write_secret_file(&path, bytes, cancellation)?;
+    Ok(path)
+}
+
 pub async fn resolve_all_for_job(
     providers: &[CredentialProvider],
     valid_through: Option<SystemTime>,
@@ -280,19 +422,30 @@ pub async fn resolve_all_for_job(
     let mut merged = ResolvedCredentials::default();
     for provider in providers {
         cancellation.check()?;
-        let creds = provider
+        let creds = match provider
             .resolve_for_job(valid_through, credential_dir, cancellation)
             .await
-            .map_err(|error| {
-                anyhow::anyhow!(
+        {
+            Ok(creds) => creds,
+            Err(error) => {
+                let cleanup = crate::cleanup_temporary_files(&merged.temp_files);
+                let provider_error = format!(
                     "credential provider '{}' failed: {error:#}",
                     provider.name()
-                )
-            })?;
+                );
+                return match cleanup {
+                    crate::CleanupStatus::Complete => Err(anyhow::anyhow!(provider_error)),
+                    crate::CleanupStatus::Failed(cleanup) => Err(anyhow::anyhow!(
+                        "{provider_error}; credential cleanup failed: {cleanup}"
+                    )),
+                };
+            }
+        };
         merged.env_vars.extend(creds.env_vars);
         merged.file_mounts.extend(creds.file_mounts);
         merged.temp_files.extend(creds.temp_files);
         merged.redaction_values.extend(creds.redaction_values);
+        merged.source_identities.extend(creds.source_identities);
     }
     cancellation.check()?;
     Ok(merged)
@@ -383,6 +536,7 @@ fn resolve_opencode_chatgpt_oauth(
         env_vars: HashMap::new(),
         temp_files: vec![auth_path],
         redaction_values: vec![access.to_string()],
+        source_identities: BTreeMap::new(),
     })
 }
 
@@ -784,5 +938,89 @@ mod tests {
         ];
         assert!(validate_provider_targets(&providers).is_err());
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn file_and_kube_sources_are_private_canonical_copies_not_host_mounts() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-private-source-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file_source = root.join("file.secret");
+        let kube_source = root.join("kubeconfig");
+        std::fs::write(&file_source, "file-secret").unwrap();
+        std::fs::write(&kube_source, "apiVersion: v1\n").unwrap();
+        make_private(&file_source);
+        make_private(&kube_source);
+        let credential_dir = root.join("materialized");
+        std::fs::create_dir(&credential_dir).unwrap();
+        let cancellation = cancellation(&root);
+        let resolved = resolve_all_for_job(
+            &[
+                CredentialProvider::File {
+                    name: "file".into(),
+                    host_path: file_source.to_string_lossy().into_owned(),
+                    container_path: "/credentials/file".into(),
+                    read_only: true,
+                },
+                CredentialProvider::KubeconfigFilter {
+                    name: "kube".into(),
+                    source_path: Some(kube_source.to_string_lossy().into_owned()),
+                    allowed_contexts: vec!["test".into()],
+                    container_path: Some("/credentials/kube".into()),
+                },
+            ],
+            None,
+            Some(&credential_dir),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.file_mounts.len(), 2);
+        for (source, _, read_only) in &resolved.file_mounts {
+            let source = Path::new(source);
+            assert!(source.starts_with(&credential_dir));
+            assert_ne!(source, file_source);
+            assert_ne!(source, kube_source);
+            assert!(*read_only);
+            assert_eq!(
+                std::fs::metadata(source).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(resolved.env_vars["KUBECONFIG"], "/credentials/kube");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn generic_sources_reject_symlink_public_and_writable_inputs() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-source-rejection-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        std::fs::write(&source, "secret").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let cancellation = cancellation(&root);
+        for (path, read_only) in [(&source, true), (&link, true), (&source, false)] {
+            let provider = CredentialProvider::File {
+                name: "file".into(),
+                host_path: path.to_string_lossy().into_owned(),
+                container_path: "/credentials/file".into(),
+                read_only,
+            };
+            assert!(
+                provider
+                    .resolve_for_job(None, Some(&root.join("data")), &cancellation)
+                    .await
+                    .is_err()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

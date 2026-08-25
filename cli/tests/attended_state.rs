@@ -28,7 +28,7 @@ fn selector_render_is_deterministic_and_authorization_replay_is_rejected() {
     let second = render_proposal(&path, &artifact).unwrap();
     assert_eq!(first, second);
     assert!(first.contains(DIPPY_SELECTOR_PREFIX));
-    assert!(first.contains("--environment development --image-family job-code --network-class none --tool-approval auto --authorization"));
+    assert!(first.contains("--environment development --image-family job-code --network-class none --tool-approval auto --timeout-secs 3600 --authorization"));
     assert!(!first.contains("gateway"));
     assert!(!first.contains(" --resource "));
 
@@ -122,7 +122,10 @@ fn selectors<'a>(digest: &'a str, environment: &'a str) -> AuthorizationSelector
         environment,
         image_family: "job-code",
         network_class: "none",
+        network_resources: &[],
         tool_approval: "auto",
+        overlays: &[],
+        timeout_secs: 3600,
     }
 }
 

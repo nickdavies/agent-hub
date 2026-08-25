@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 
 use crate::{
-    Cancellation, Deadline, ExecutionCancellationContext, RestrictedEgress, execute_output,
-    inspect_image_identity,
+    Cancellation, Deadline, ExecutionCancellationContext, RestrictedEgress,
+    execute_output_cancellable, inspect_image_identity,
 };
 
 const MANAGED_LABEL: &str = "agent-hub.reddit.com/executor-egress";
@@ -123,6 +123,7 @@ struct PartialResources {
     internal_network: String,
     external_network: String,
     config_paths: Vec<PathBuf>,
+    effects: ExecutionCancellationContext,
 }
 
 impl RestrictedEgressRequest {
@@ -140,14 +141,24 @@ impl RestrictedEgressRequest {
         )?;
         let preparation = effects.begin_external_operation("egress_prepare", &self.namespace)?;
 
+        let proxy_image_operation = effects.begin_external_operation(
+            "egress_docker_subprocess",
+            &format!("image_inspect:proxy:{}", self.proxy.image),
+        )?;
         let proxy_image =
             inspect_image_identity(docker, &self.proxy.image, deadline, &self.cancellation)
                 .await
                 .context("resolve immutable Squid image")?;
+        proxy_image_operation.completed()?;
+        let resolver_image_operation = effects.begin_external_operation(
+            "egress_docker_subprocess",
+            &format!("image_inspect:resolver:{}", self.resolver.image),
+        )?;
         let resolver_image =
             inspect_image_identity(docker, &self.resolver.image, deadline, &self.cancellation)
                 .await
                 .context("resolve immutable Unbound image")?;
+        resolver_image_operation.completed()?;
         let hosts = exact_host_union(&self.policies)?;
         let guarded_web = matches!(self.policies.as_slice(), [RestrictedPolicy::GuardedWeb]);
 
@@ -171,11 +182,25 @@ impl RestrictedEgressRequest {
             internal_network: internal_network.clone(),
             external_network: external_network.clone(),
             config_paths: vec![unbound_path.clone(), squid_path.clone()],
+            effects: effects.clone(),
         };
         let cleanup_deadline = Deadline::new(Some(30))?;
 
         let operation = async {
+            let config_write = effects.begin_external_operation(
+                "egress_config_write",
+                &format!("unbound:{}", unbound_path.display()),
+            )?;
             write_private_file(&unbound_path, unbound_config.as_bytes())?;
+            config_write.completed()?;
+            let external_create = effects.begin_external_operation(
+                "egress_network_create",
+                &format!(
+                    "name={external_network};namespace={};internal=false;subnets={}",
+                    self.namespace,
+                    self.external_subnets.join(",")
+                ),
+            )?;
             create_network(
                 docker,
                 NetworkCreation {
@@ -193,6 +218,14 @@ impl RestrictedEgressRequest {
                 deadline,
             )
             .await?;
+            external_create.completed()?;
+            let internal_create = effects.begin_external_operation(
+                "egress_network_create",
+                &format!(
+                    "name={internal_network};namespace={};internal=true;subnets=",
+                    self.namespace
+                ),
+            )?;
             create_network(
                 docker,
                 NetworkCreation {
@@ -210,6 +243,7 @@ impl RestrictedEgressRequest {
                 deadline,
             )
             .await?;
+            internal_create.completed()?;
 
             let resolver_fingerprint = fingerprint(&[
                 unbound_config.as_bytes(),
@@ -217,6 +251,13 @@ impl RestrictedEgressRequest {
                 self.resolver.upstream.as_bytes(),
                 self.resolver.readiness_host.as_bytes(),
             ]);
+            let resolver_create = effects.begin_external_operation(
+                "egress_container_create",
+                &format!(
+                    "name={resolver_name};namespace={};kind=resolver;fingerprint={resolver_fingerprint}",
+                    self.namespace
+                ),
+            )?;
             run_resolver(
                 docker,
                 &resolver_name,
@@ -230,7 +271,12 @@ impl RestrictedEgressRequest {
                 deadline,
             )
             .await?;
+            resolver_create.completed()?;
             inject_failure(self.failure_after, PreparationBoundary::ResolverCreated)?;
+            let resolver_inspect = effects.begin_external_operation(
+                "egress_docker_subprocess",
+                &format!("inspect_address:{resolver_name}:{external_network}"),
+            )?;
             let resolver_ip = inspect_network_ip(
                 docker,
                 &resolver_name,
@@ -239,6 +285,7 @@ impl RestrictedEgressRequest {
                 deadline,
             )
             .await?;
+            resolver_inspect.completed()?;
             inject_failure(
                 self.failure_after,
                 PreparationBoundary::ResolverAddressInspected,
@@ -254,13 +301,25 @@ impl RestrictedEgressRequest {
 
             let squid_config =
                 render_squid_config(self.proxy.listen_port, &resolver_ip, &hosts, guarded_web);
+            let config_write = effects.begin_external_operation(
+                "egress_config_write",
+                &format!("squid:{}", squid_path.display()),
+            )?;
             write_private_file(&squid_path, squid_config.as_bytes())?;
+            config_write.completed()?;
             let proxy_fingerprint = fingerprint(&[
                 squid_config.as_bytes(),
                 proxy_image.as_bytes(),
                 resolver_ip.as_bytes(),
                 b"net.ipv6.conf.all.disable_ipv6=1",
             ]);
+            let proxy_create = effects.begin_external_operation(
+                "egress_container_create",
+                &format!(
+                    "name={proxy_name};namespace={};kind=proxy;fingerprint={proxy_fingerprint}",
+                    self.namespace
+                ),
+            )?;
             run_proxy(
                 docker,
                 &proxy_name,
@@ -274,7 +333,12 @@ impl RestrictedEgressRequest {
                 deadline,
             )
             .await?;
+            proxy_create.completed()?;
             inject_failure(self.failure_after, PreparationBoundary::ProxyCreated)?;
+            let proxy_attach = effects.begin_external_operation(
+                "egress_network_connect",
+                &format!("network={external_network};container={proxy_name}"),
+            )?;
             connect_network(
                 docker,
                 &external_network,
@@ -283,7 +347,12 @@ impl RestrictedEgressRequest {
                 deadline,
             )
             .await?;
+            proxy_attach.completed()?;
             inject_failure(self.failure_after, PreparationBoundary::ProxyAttached)?;
+            let proxy_inspect = effects.begin_external_operation(
+                "egress_docker_subprocess",
+                &format!("inspect_address:{proxy_name}:{internal_network}"),
+            )?;
             let proxy_ip = inspect_network_ip(
                 docker,
                 &proxy_name,
@@ -292,9 +361,14 @@ impl RestrictedEgressRequest {
                 deadline,
             )
             .await?;
+            proxy_inspect.completed()?;
             inject_failure(
                 self.failure_after,
                 PreparationBoundary::ProxyAddressInspected,
+            )?;
+            let resolver_contract = effects.begin_external_operation(
+                "egress_docker_subprocess",
+                &format!("inspect_contract:{resolver_name}:{resolver_fingerprint}"),
             )?;
             verify_container_contract(
                 docker,
@@ -312,10 +386,16 @@ impl RestrictedEgressRequest {
                     cap_add: Some("NET_BIND_SERVICE"),
                     sysctl: None,
                 },
+                &self.cancellation,
                 deadline,
             )
             .await?;
+            resolver_contract.completed()?;
             inject_failure(self.failure_after, PreparationBoundary::ContractsInspected)?;
+            let proxy_contract = effects.begin_external_operation(
+                "egress_docker_subprocess",
+                &format!("inspect_contract:{proxy_name}:{proxy_fingerprint}"),
+            )?;
             verify_container_contract(
                 docker,
                 &proxy_name,
@@ -332,11 +412,17 @@ impl RestrictedEgressRequest {
                     cap_add: None,
                     sysctl: Some(("net.ipv6.conf.all.disable_ipv6", "1")),
                 },
+                &self.cancellation,
                 deadline,
             )
             .await?;
+            proxy_contract.completed()?;
             inject_failure(self.failure_after, PreparationBoundary::ProxyReady)?;
             check_cancelled(&self.cancellation, "restricted egress finalization")?;
+            let readiness = effects.begin_external_operation(
+                "egress_proxy_readiness",
+                &format!("network={internal_network};proxy={proxy_ip}:{}", self.proxy.listen_port),
+            )?;
             wait_for_proxy(
                 docker,
                 &internal_network,
@@ -347,6 +433,7 @@ impl RestrictedEgressRequest {
                 deadline,
             )
             .await?;
+            readiness.completed()?;
             Ok::<_, anyhow::Error>((proxy_ip, resolver_ip))
         }
         .await;
@@ -377,6 +464,7 @@ impl RestrictedEgressRequest {
             Err(error) => match partial.cleanup(&cleanup_deadline).await {
                 Ok(()) => {
                     preparation.reconciled()?;
+                    effects.reconcile_all()?;
                     effects.finalize()?;
                     Err(error)
                 }
@@ -434,11 +522,13 @@ impl PreparedRestrictedEgress {
             internal_network: self.internal_network.clone(),
             external_network: self.external_network.clone(),
             config_paths: self.config_paths.clone(),
+            effects: self.effects.clone(),
         };
         match partial.cleanup(deadline).await {
             Ok(()) => {
                 self.cleaned = true;
                 cleanup.reconciled()?;
+                self.effects.reconcile_all()?;
                 self.effects.finalize()
             }
             Err(error) => {
@@ -451,6 +541,21 @@ impl PreparedRestrictedEgress {
 
 impl PartialResources {
     async fn cleanup(&mut self, deadline: &Deadline) -> anyhow::Result<()> {
+        let reconciliation = self.effects.begin_external_operation(
+            "egress_resource_reconcile",
+            &format!(
+                "proxy={};resolver={};internal_network={};external_network={};configs={}",
+                self.proxy_name,
+                self.resolver_name,
+                self.internal_network,
+                self.external_network,
+                self.config_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        )?;
         let mut failures = Vec::new();
         if let Err(error) =
             remove_owned_container(&self.docker, &self.proxy_name, &self.namespace, deadline).await
@@ -477,12 +582,50 @@ impl PartialResources {
                 failures.push(format!("config {}: {error}", path.display()));
             }
         }
-        anyhow::ensure!(
-            failures.is_empty(),
-            "restricted egress cleanup failed: {}",
-            failures.join("; ")
-        );
-        Ok(())
+        if failures.is_empty() {
+            reconciliation.reconciled()
+        } else {
+            reconciliation.cleanup_failed("egress_resource_reconcile_failed")?;
+            anyhow::bail!("restricted egress cleanup failed: {}", failures.join("; "))
+        }
+    }
+}
+
+pub async fn recover_restricted_egress(
+    docker: &Path,
+    state_dir: &Path,
+    namespace: &str,
+    deadline: &Deadline,
+) -> anyhow::Result<()> {
+    validate_namespace(namespace)?;
+    let effects = ExecutionCancellationContext::new(
+        &state_dir.join("effects").join(namespace),
+        Cancellation::never(),
+    )?;
+    let recovery = effects.begin_external_operation("egress_recovery", namespace)?;
+    let mut partial = PartialResources {
+        docker: docker.to_path_buf(),
+        namespace: namespace.to_string(),
+        proxy_name: format!("agent-hub-executor-{namespace}-proxy"),
+        resolver_name: format!("agent-hub-executor-{namespace}-resolver"),
+        internal_network: format!("agent-hub-executor-{namespace}-internal"),
+        external_network: format!("agent-hub-executor-{namespace}-external"),
+        config_paths: vec![
+            state_dir.join(format!("unbound-{namespace}.conf")),
+            state_dir.join(format!("squid-{namespace}.conf")),
+        ],
+        effects: effects.clone(),
+    };
+    match partial.cleanup(deadline).await {
+        Ok(()) => {
+            recovery.reconciled()?;
+            effects.reconcile_all()?;
+            effects.finalize()
+        }
+        Err(error) => {
+            recovery.cleanup_failed("egress_recovery_failed")?;
+            Err(error)
+        }
     }
 }
 
@@ -548,7 +691,14 @@ async fn create_network(
     append_labels(&mut args, namespace, "network", &subnet_fingerprint);
     args.push(network.name.to_string());
     require_success(
-        execute_output(docker, &args, deadline, "create restricted network").await?,
+        execute_output_cancellable(
+            docker,
+            &args,
+            deadline,
+            cancellation,
+            "create restricted network",
+        )
+        .await?,
         &format!("create restricted network '{}'", network.name),
     )?;
     inject_failure(checkpoints.failure_after, checkpoints.created)?;
@@ -559,6 +709,7 @@ async fn create_network(
         &subnet_fingerprint,
         network.internal,
         network.subnets,
+        cancellation,
         deadline,
     )
     .await?;
@@ -625,7 +776,14 @@ async fn run_resolver(
         "/etc/unbound/unbound.conf".to_string(),
     ]);
     require_success(
-        execute_output(docker, &args, deadline, "start Unbound resolver").await?,
+        execute_output_cancellable(
+            docker,
+            &args,
+            deadline,
+            cancellation,
+            "start Unbound resolver",
+        )
+        .await?,
         "start Unbound resolver",
     )
 }
@@ -691,7 +849,8 @@ async fn run_proxy(
         image.to_string(),
     ]);
     require_success(
-        execute_output(docker, &args, deadline, "start Squid proxy").await?,
+        execute_output_cancellable(docker, &args, deadline, cancellation, "start Squid proxy")
+            .await?,
         "start Squid proxy",
     )
 }
@@ -711,7 +870,14 @@ async fn connect_network(
         container.to_string(),
     ];
     require_success(
-        execute_output(docker, &args, deadline, "connect Squid external network").await?,
+        execute_output_cancellable(
+            docker,
+            &args,
+            deadline,
+            cancellation,
+            "connect Squid external network",
+        )
+        .await?,
         "connect Squid external network",
     )
 }
@@ -731,7 +897,14 @@ async fn inspect_network_ip(
     ];
     for _ in 0..50 {
         check_cancelled(cancellation, "container network inspection")?;
-        let output = execute_output(docker, &args, deadline, "inspect enforcement address").await?;
+        let output = execute_output_cancellable(
+            docker,
+            &args,
+            deadline,
+            cancellation,
+            "inspect enforcement address",
+        )
+        .await?;
         if output.status.success() {
             let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if ip.parse::<IpAddr>().is_ok() {
@@ -740,7 +913,7 @@ async fn inspect_network_ip(
         }
         sleep_bounded(deadline, Duration::from_millis(100)).await?;
     }
-    let logs = execute_output(
+    let logs = execute_output_cancellable(
         docker,
         &[
             "logs".to_string(),
@@ -748,6 +921,7 @@ async fn inspect_network_ip(
             name.to_string(),
         ],
         deadline,
+        cancellation,
         "read enforcement logs",
     )
     .await?;
@@ -776,10 +950,18 @@ async fn verify_container_contract(
     docker: &Path,
     name: &str,
     contract: ContainerContract<'_>,
+    cancellation: &Cancellation,
     deadline: &Deadline,
 ) -> anyhow::Result<()> {
     let args = vec!["inspect".to_string(), name.to_string()];
-    let output = execute_output(docker, &args, deadline, "inspect enforcement container").await?;
+    let output = execute_output_cancellable(
+        docker,
+        &args,
+        deadline,
+        cancellation,
+        "inspect enforcement container",
+    )
+    .await?;
     anyhow::ensure!(
         output.status.success(),
         "inspect enforcement container failed: {}",
@@ -978,6 +1160,7 @@ fn option_set(options: &str) -> BTreeSet<String> {
     options.split(',').map(str::to_string).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn verify_network_contract(
     docker: &Path,
     name: &str,
@@ -985,6 +1168,7 @@ async fn verify_network_contract(
     fingerprint: &str,
     internal: bool,
     expected_subnets: &[String],
+    cancellation: &Cancellation,
     deadline: &Deadline,
 ) -> anyhow::Result<()> {
     let args = vec![
@@ -992,7 +1176,14 @@ async fn verify_network_contract(
         "inspect".to_string(),
         name.to_string(),
     ];
-    let output = execute_output(docker, &args, deadline, "inspect enforcement network").await?;
+    let output = execute_output_cancellable(
+        docker,
+        &args,
+        deadline,
+        cancellation,
+        "inspect enforcement network",
+    )
+    .await?;
     anyhow::ensure!(
         output.status.success(),
         "inspect enforcement network failed: {}",
@@ -1075,7 +1266,14 @@ async fn wait_for_proxy(
             "/dev/null".to_string(),
             format!("http://{proxy_ip}:{port}/"),
         ];
-        let output = execute_output(docker, &args, deadline, "probe Squid readiness").await?;
+        let output = execute_output_cancellable(
+            docker,
+            &args,
+            deadline,
+            cancellation,
+            "probe Squid readiness",
+        )
+        .await?;
         if output.status.success() {
             return Ok(());
         }
@@ -1195,7 +1393,14 @@ async fn reconcile_owned_absent(
         } else {
             vec!["network".to_string(), "rm".to_string(), name.to_string()]
         };
-        let output = execute_output(docker, &args, deadline, "remove enforcement resource").await?;
+        let output = execute_output_cancellable(
+            docker,
+            &args,
+            deadline,
+            &Cancellation::never(),
+            "remove enforcement resource",
+        )
+        .await?;
         if !output.status.success() {
             failures.push(format!(
                 "remove: {}: {}",
@@ -1220,7 +1425,14 @@ async fn ensure_owned(
     deadline: &Deadline,
 ) -> anyhow::Result<bool> {
     let args = vec![kind.to_string(), "inspect".to_string(), name.to_string()];
-    let output = execute_output(docker, &args, deadline, "inspect enforcement ownership").await?;
+    let output = execute_output_cancellable(
+        docker,
+        &args,
+        deadline,
+        &Cancellation::never(),
+        "inspect enforcement ownership",
+    )
+    .await?;
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
         if error.contains("no such") || error.contains("not found") {

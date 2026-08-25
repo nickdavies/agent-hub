@@ -116,8 +116,8 @@ struct ExternalEffectRecord {
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ExternalEffectStatus {
-    Started,
-    Completed,
+    Submitting,
+    Submitted,
     Ambiguous,
     CleanupFailed,
     Reconciled,
@@ -128,7 +128,7 @@ pub struct ExecutionCancellationContext {
     cancellation: Cancellation,
     journal_path: Arc<PathBuf>,
     journal_lock: Arc<std::sync::Mutex<()>>,
-    effect_state: Arc<std::sync::Mutex<HashMap<uuid::Uuid, ExternalEffectStatus>>>,
+    effect_state: Arc<std::sync::Mutex<HashMap<uuid::Uuid, ExternalEffectRecord>>>,
 }
 
 impl ExecutionCancellationContext {
@@ -147,7 +147,7 @@ impl ExecutionCancellationContext {
                 .filter(|line| !line.is_empty())
             {
                 let record: ExternalEffectRecord = serde_json::from_slice(line)?;
-                effect_state.insert(record.operation_id, record.status);
+                effect_state.insert(record.operation_id, record);
             }
         }
         Ok(Self {
@@ -173,27 +173,98 @@ impl ExecutionCancellationContext {
             .lock()
             .expect("effect state lock poisoned");
         anyhow::ensure!(
-            state.values().all(|status| matches!(
-                status,
-                ExternalEffectStatus::Completed | ExternalEffectStatus::Reconciled
+            state.values().all(|record| matches!(
+                record.status,
+                ExternalEffectStatus::Submitted | ExternalEffectStatus::Reconciled
             )),
             "external effects remain unresolved"
         );
         drop(state);
-        let root = self
-            .journal_path
-            .parent()
-            .context("effect journal has no parent")?;
-        let parent = root.parent().context("effect journal root has no parent")?;
-        std::fs::remove_dir_all(root)?;
-        if std::fs::read_dir(parent)?.next().is_none() {
-            let grandparent = parent
+        sync_directory(
+            self.journal_path
                 .parent()
-                .context("effect journal namespace root has no parent")?;
-            std::fs::remove_dir(parent)?;
-            return sync_directory(grandparent);
+                .context("effect journal has no parent")?,
+        )
+    }
+
+    pub fn reconcile_all(&self) -> anyhow::Result<()> {
+        let unresolved = self
+            .effect_state
+            .lock()
+            .expect("effect state lock poisoned")
+            .values()
+            .filter(|record| {
+                !matches!(
+                    record.status,
+                    ExternalEffectStatus::Submitted | ExternalEffectStatus::Reconciled
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in unresolved {
+            self.append_effect(
+                record.operation_id,
+                &record.operation_kind,
+                &record.resource_identity,
+                ExternalEffectStatus::Reconciled,
+            )?;
         }
-        sync_directory(parent)
+        Ok(())
+    }
+
+    pub async fn reconcile_owned_effects(&self, credential_root: &Path) -> anyhow::Result<()> {
+        let records = self
+            .effect_state
+            .lock()
+            .expect("effect state lock poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in records {
+            match record.operation_kind.as_str() {
+                "credential_materialize" | "credential_secret_write" => {
+                    let path = Path::new(&record.resource_identity);
+                    anyhow::ensure!(
+                        path.is_absolute() && path.starts_with(credential_root),
+                        "credential effect path escaped its owned root"
+                    );
+                    match std::fs::remove_file(path) {
+                        Ok(()) => sync_directory(
+                            path.parent()
+                                .context("credential effect path has no parent")?,
+                        )?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    anyhow::ensure!(
+                        !path.exists(),
+                        "owned credential file remains after cleanup"
+                    );
+                }
+                "credential_directory_create" => {
+                    let path = Path::new(&record.resource_identity);
+                    anyhow::ensure!(
+                        path.is_absolute() && path.starts_with(credential_root),
+                        "credential effect directory escaped its owned root"
+                    );
+                    if path.is_dir() && std::fs::read_dir(path)?.next().is_none() {
+                        std::fs::remove_dir(path)?;
+                        sync_directory(
+                            path.parent()
+                                .context("credential effect directory has no parent")?,
+                        )?;
+                    }
+                }
+                "credential_helper_process" => {
+                    verify_process_group_absent(&parse_process_effect_identity(
+                        &record.resource_identity,
+                    )?)
+                    .await?;
+                }
+                _ => {}
+            }
+        }
+        self.reconcile_all()
     }
 
     pub fn begin_external_operation<'a>(
@@ -214,7 +285,7 @@ impl ExecutionCancellationContext {
             operation_id,
             operation_kind,
             resource_identity,
-            ExternalEffectStatus::Started,
+            ExternalEffectStatus::Submitting,
         )?;
         Ok(ExternalOperation {
             context: self,
@@ -262,7 +333,7 @@ impl ExecutionCancellationContext {
         self.effect_state
             .lock()
             .expect("effect state lock poisoned")
-            .insert(operation_id, status);
+            .insert(operation_id, record);
         Ok(())
     }
 
@@ -270,6 +341,31 @@ impl ExecutionCancellationContext {
     pub(crate) fn for_test(root: &Path, receiver: watch::Receiver<bool>) -> anyhow::Result<Self> {
         Self::new(root, Cancellation::new(receiver))
     }
+}
+
+fn parse_process_effect_identity(value: &str) -> anyhow::Result<ProcessIdentity> {
+    let fields = value
+        .split(';')
+        .filter_map(|field| field.split_once('='))
+        .collect::<HashMap<_, _>>();
+    Ok(ProcessIdentity {
+        pid: fields
+            .get("pid")
+            .context("process effect has no PID")?
+            .parse()?,
+        pgid: fields
+            .get("pgid")
+            .context("process effect has no process group")?
+            .parse()?,
+        linux_boot_id: fields
+            .get("boot")
+            .context("process effect has no boot identity")?
+            .to_string(),
+        proc_start_time_ticks: fields
+            .get("start")
+            .context("process effect has no start identity")?
+            .parse()?,
+    })
 }
 
 pub struct ExternalOperation<'a> {
@@ -282,7 +378,7 @@ pub struct ExternalOperation<'a> {
 
 impl ExternalOperation<'_> {
     pub fn completed(mut self) -> anyhow::Result<()> {
-        self.finish(ExternalEffectStatus::Completed)
+        self.finish(ExternalEffectStatus::Submitted)
     }
 
     pub fn ambiguous(mut self, _error_category: &str) -> anyhow::Result<()> {
@@ -377,6 +473,16 @@ pub struct ExecutionRequest {
     pub cancellation: Cancellation,
     pub append: bool,
     pub redaction_values: Vec<String>,
+    pub output_limits: OutputLimits,
+    pub effects: Option<ExecutionCancellationContext>,
+    pub operation_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLimits {
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub transcript_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +490,7 @@ pub enum ExecutionStatus {
     Exited(i32),
     TimedOut,
     Cancelled,
+    OutputLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,9 +528,16 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
     let stdout_file = open_artifact(&request.artifacts.stdout, request.append)?;
     let stderr_file = open_artifact(&request.artifacts.stderr, request.append)?;
     let transcript_file = open_artifact(&request.artifacts.transcript, request.append)?;
-    let transcript = Arc::new(Mutex::new(tokio::io::BufWriter::new(
-        tokio::fs::File::from_std(transcript_file),
-    )));
+    let transcript = Arc::new(Mutex::new(BoundedTranscript {
+        writer: tokio::io::BufWriter::new(tokio::fs::File::from_std(transcript_file)),
+        written: if request.append {
+            std::fs::metadata(&request.artifacts.transcript)?.len()
+        } else {
+            0
+        },
+        limit: request.output_limits.transcript_bytes,
+    }));
+    let (stream_failure_tx, stream_failure_rx) = watch::channel(None::<String>);
 
     let mut command = tokio::process::Command::new(&request.command);
     command
@@ -439,6 +553,15 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
     #[cfg(unix)]
     command.as_std_mut().process_group(0);
 
+    let submission = match (&request.effects, &request.operation_identity) {
+        (Some(effects), Some(identity)) => {
+            Some(effects.begin_external_operation("primary_process_submit", identity)?)
+        }
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "execution effect context and operation identity must be provided together"
+        ),
+    };
     let mut child = command.spawn().with_context(|| {
         format!(
             "spawn resolved command '{}'",
@@ -451,6 +574,9 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
             .and_then(|pid| i32::try_from(pid).ok())
             .context("spawned process has no valid process ID")?,
     )?;
+    if let Some(submission) = submission {
+        submission.completed()?;
+    }
     let stdout = child
         .stdout
         .take()
@@ -459,20 +585,45 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
         .stderr
         .take()
         .context("capture resolved command stderr")?;
-    let stdout_task = tokio::spawn(persist_stream(
-        stdout,
-        tokio::fs::File::from_std(stdout_file),
-        Arc::clone(&transcript),
-        "stdout",
-        request.redaction_values.clone(),
-    ));
-    let stderr_task = tokio::spawn(persist_stream(
-        stderr,
-        tokio::fs::File::from_std(stderr_file),
-        Arc::clone(&transcript),
-        "stderr",
-        request.redaction_values.clone(),
-    ));
+    let stdout_redactions = request.redaction_values.clone();
+    let stderr_redactions = request.redaction_values.clone();
+    let stdout_limit = request.output_limits.stdout_bytes;
+    let stderr_limit = request.output_limits.stderr_bytes;
+    let stdout_transcript = Arc::clone(&transcript);
+    let stdout_failure = stream_failure_tx.clone();
+    let stdout_task = tokio::spawn(async move {
+        let result = persist_stream(
+            stdout,
+            tokio::fs::File::from_std(stdout_file),
+            stdout_transcript,
+            "stdout",
+            stdout_redactions,
+            stdout_limit,
+            stdout_failure.clone(),
+        )
+        .await;
+        if let Err(error) = &result {
+            let _ = stdout_failure.send(Some(format!("stdout persistence failed: {error:#}")));
+        }
+        result
+    });
+    let stderr_failure = stream_failure_tx;
+    let stderr_task = tokio::spawn(async move {
+        let result = persist_stream(
+            stderr,
+            tokio::fs::File::from_std(stderr_file),
+            transcript,
+            "stderr",
+            stderr_redactions,
+            stderr_limit,
+            stderr_failure.clone(),
+        )
+        .await;
+        if let Err(error) = &result {
+            let _ = stderr_failure.send(Some(format!("stderr persistence failed: {error:#}")));
+        }
+        result
+    });
 
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -483,6 +634,10 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
                 break ExecutionStatus::Exited(status.code().unwrap_or(1));
             }
             _ = ticker.tick() => {
+                if stream_failure_rx.borrow().is_some() {
+                    terminate_process_group(&process_identity, &mut child).await?;
+                    break ExecutionStatus::OutputLimitExceeded;
+                }
                 if request.cancellation.requested() {
                     terminate_process_group(&process_identity, &mut child).await?;
                     break ExecutionStatus::Cancelled;
@@ -500,6 +655,11 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
     stderr_task
         .await
         .context("stderr persistence task failed")??;
+    let status = if stream_failure_rx.borrow().is_some() {
+        ExecutionStatus::OutputLimitExceeded
+    } else {
+        status
+    };
     verify_process_group_absent(&process_identity).await?;
     Ok(ExecutionResult {
         status,
@@ -534,12 +694,15 @@ fn open_artifact(path: &Path, append: bool) -> anyhow::Result<std::fs::File> {
 async fn persist_stream<R: AsyncRead + Unpin>(
     reader: R,
     output: tokio::fs::File,
-    transcript: Arc<Mutex<tokio::io::BufWriter<tokio::fs::File>>>,
+    transcript: Arc<Mutex<BoundedTranscript>>,
     stream: &'static str,
     redaction_values: Vec<String>,
+    limit: u64,
+    failure: watch::Sender<Option<String>>,
 ) -> anyhow::Result<()> {
     let mut lines = BufReader::new(reader).lines();
     let mut output = tokio::io::BufWriter::new(output);
+    let mut written = output.get_ref().metadata().await?.len();
     while let Some(line) = lines.next_line().await? {
         let line = redaction_values.iter().fold(line, |line, value| {
             if value.is_empty() {
@@ -548,9 +711,16 @@ async fn persist_stream<R: AsyncRead + Unpin>(
                 line.replace(value, "[REDACTED]")
             }
         });
+        let output_bytes = line.len() as u64 + 1;
+        if written.saturating_add(output_bytes) > limit {
+            let message = format!("{stream} output exceeded reviewed limit of {limit} bytes");
+            let _ = failure.send(Some(message));
+            return Ok(());
+        }
         output.write_all(line.as_bytes()).await?;
         output.write_all(b"\n").await?;
         output.flush().await?;
+        written += output_bytes;
         let mut record = serde_json::to_vec(&serde_json::json!({
             "timestamp": Utc::now().to_rfc3339(),
             "stream": stream,
@@ -558,10 +728,25 @@ async fn persist_stream<R: AsyncRead + Unpin>(
         }))?;
         record.push(b'\n');
         let mut transcript = transcript.lock().await;
-        transcript.write_all(&record).await?;
-        transcript.flush().await?;
+        if transcript.written.saturating_add(record.len() as u64) > transcript.limit {
+            let message = format!(
+                "transcript output exceeded reviewed limit of {} bytes",
+                transcript.limit
+            );
+            let _ = failure.send(Some(message));
+            return Ok(());
+        }
+        transcript.writer.write_all(&record).await?;
+        transcript.writer.flush().await?;
+        transcript.written += record.len() as u64;
     }
     Ok(())
+}
+
+struct BoundedTranscript {
+    writer: tokio::io::BufWriter<tokio::fs::File>,
+    written: u64,
+    limit: u64,
 }
 
 async fn terminate_process_group(

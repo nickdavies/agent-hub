@@ -8,6 +8,10 @@ pub const JOB_CODE_PREFLIGHT_PATH: &str = "/usr/local/bin/agent-hub-job-code-pre
 pub const JOB_CODE_TOOL_MANIFEST_PATH: &str =
     "/usr/local/share/agent-hub/job-code-tool-manifest.json";
 
+pub fn job_code_tool_manifest_sha256(contents: &str) -> String {
+    hex::encode(Sha256::digest(contents.as_bytes()))
+}
+
 pub fn job_code_preflight_docker_args(
     image: &str,
     runtime_uid: u32,
@@ -72,7 +76,7 @@ pub fn validate_job_code_preflight_report(
         return Err("preflight returned an invalid success report".to_string());
     }
 
-    let actual_manifest_sha256 = hex::encode(Sha256::digest(report.manifest.contents.as_bytes()));
+    let actual_manifest_sha256 = job_code_tool_manifest_sha256(&report.manifest.contents);
     if report.manifest.sha256 != actual_manifest_sha256 {
         return Err("preflight tool manifest digest does not match its contents".to_string());
     }

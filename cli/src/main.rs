@@ -24,7 +24,7 @@ struct Cli {
 enum Commands {
     /// Run locally authorized agents
     #[command(
-        after_help = "Examples:\n  agent-hub local propose --config-root /config --environment code-supervised --image-family job-code --network-class build --network-resource llm --tool-approval dippy --overlay github --workspace primary=/workspace/repo:rw --primary-workspace primary --context-root code=/home/nick.davies/code:ro --timeout-secs 3600 --prompt-stdin --output /secure/authorization.json < /secure/prompt\n  agent-hub local run --environment code-supervised --image-family job-code --network-class build --tool-approval dippy --authorization /secure/authorization.json --digest DIGEST"
+        after_help = "Examples:\n  agent-hub local propose --config-root /config --environment code-supervised --image-family job-code --network-class build --network-resource llm --tool-approval dippy --workspace primary=/workspace/repo:rw --primary-workspace primary --context-root code=/home/nick.davies/code:ro --timeout-secs 3600 --prompt-stdin --output /secure/authorization.json < /secure/prompt\n  agent-hub local authorize --environment code-supervised --image-family job-code --network-class build --network-resource llm --tool-approval dippy --timeout-secs 3600 --authorization /secure/authorization.json --digest DIGEST\n  agent-hub local run --environment code-supervised --image-family job-code --network-class build --network-resource llm --tool-approval dippy --timeout-secs 3600 --authorization /secure/authorization.json --digest DIGEST"
     )]
     Local {
         #[command(subcommand)]
@@ -124,6 +124,27 @@ enum LocalCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Persist a one-use approval receipt after complete revalidation
+    Authorize {
+        #[arg(long)]
+        environment: String,
+        #[arg(long, value_parser = ["job-code"])]
+        image_family: String,
+        #[arg(long, value_parser = ["none", "llm-only", "build", "guarded-web"])]
+        network_class: String,
+        #[arg(long = "network-resource")]
+        network_resources: Vec<NetworkResourceKind>,
+        #[arg(long, value_parser = ["auto", "dippy"])]
+        tool_approval: String,
+        #[arg(long = "overlay")]
+        overlays: Vec<String>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        timeout_secs: u64,
+        #[arg(long)]
+        authorization: PathBuf,
+        #[arg(long)]
+        digest: String,
+    },
     /// Consume an authorization and execute it in the foreground
     Run {
         #[arg(long)]
@@ -132,8 +153,14 @@ enum LocalCommand {
         image_family: String,
         #[arg(long, value_parser = ["none", "llm-only", "build", "guarded-web"])]
         network_class: String,
+        #[arg(long = "network-resource")]
+        network_resources: Vec<NetworkResourceKind>,
         #[arg(long, value_parser = ["auto", "dippy"])]
         tool_approval: String,
+        #[arg(long = "overlay")]
+        overlays: Vec<String>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        timeout_secs: u64,
         #[arg(long)]
         authorization: PathBuf,
         #[arg(long)]
@@ -248,7 +275,10 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             environment,
             image_family,
             network_class,
+            network_resources,
             tool_approval,
+            overlays,
+            timeout_secs,
             authorization,
             digest,
         } => {
@@ -260,12 +290,42 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
                     environment: &environment,
                     image_family: &image_family,
                     network_class: &network_class,
+                    network_resources: &network_resources,
                     tool_approval: &tool_approval,
+                    overlays: &overlays,
+                    timeout_secs,
                 },
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&record)?);
             attended::ensure_successful_outcome(&record)?;
+        }
+        LocalCommand::Authorize {
+            environment,
+            image_family,
+            network_class,
+            network_resources,
+            tool_approval,
+            overlays,
+            timeout_secs,
+            authorization,
+            digest,
+        } => {
+            attended::authorize_revalidated(
+                &state_store()?,
+                &authorization,
+                AuthorizationSelectors {
+                    digest: &digest,
+                    environment: &environment,
+                    image_family: &image_family,
+                    network_class: &network_class,
+                    network_resources: &network_resources,
+                    tool_approval: &tool_approval,
+                    overlays: &overlays,
+                    timeout_secs,
+                },
+            )
+            .await?;
         }
         LocalCommand::List => {
             println!(
@@ -548,7 +608,7 @@ mod attended_cli_tests {
 
     #[test]
     fn run_contract_has_exact_ordered_selectors_authorization_and_digest() {
-        let valid = [
+        let valid = vec![
             "agent-hub",
             "local",
             "run",
@@ -558,17 +618,23 @@ mod attended_cli_tests {
             "job-code",
             "--network-class",
             "build",
+            "--network-resource",
+            "llm",
             "--tool-approval",
             "dippy",
+            "--overlay",
+            "github",
+            "--timeout-secs",
+            "3600",
             "--authorization",
             "/tmp/authorization.json",
             "--digest",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ];
-        assert!(Cli::try_parse_from(valid).is_ok());
+        assert!(Cli::try_parse_from(valid.clone()).is_ok());
 
-        let mut gateway = valid;
-        gateway[10] = "gateway";
+        let mut gateway = valid.clone();
+        gateway[12] = "gateway";
         assert!(Cli::try_parse_from(gateway).is_err());
 
         assert!(
@@ -584,8 +650,14 @@ mod attended_cli_tests {
                 "job-code",
                 "--network-class",
                 "build",
+                "--network-resource",
+                "llm",
                 "--tool-approval",
                 "dippy",
+                "--overlay",
+                "github",
+                "--timeout-secs",
+                "3600",
                 "--digest",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ])

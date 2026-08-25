@@ -5380,7 +5380,7 @@ pub fn default_approval_rules_for_tier(
     match tier {
         PlannedEnvironmentTier::Docker => {
             let has_network = !matches!(network, None | Some(NetworkResourceRequest::None));
-            if has_network {
+            let mut rules = if has_network {
                 ApprovalRuleSet {
                     auto_approve: vec![
                         "file_read".to_string(),
@@ -5403,7 +5403,69 @@ pub fn default_approval_rules_for_tier(
                     escalate: vec!["shell_unknown".to_string()],
                     deny: Vec::new(),
                 }
-            }
+            };
+            normalize_string_set(&mut rules.auto_approve);
+            normalize_string_set(&mut rules.escalate);
+            normalize_string_set(&mut rules.deny);
+            rules
+        }
+    }
+}
+
+#[cfg(test)]
+mod default_approval_rule_tests {
+    use super::*;
+
+    #[test]
+    fn code_auto_research_web_auto_and_supervised_defaults_are_normalized_and_self_equivalent() {
+        let scenarios = [
+            ("code-auto", NetworkResourceRequest::None),
+            (
+                "research-web-auto",
+                NetworkResourceRequest::Resources(vec![NetworkResourceKind::GuardedWeb]),
+            ),
+            ("code-supervised", NetworkResourceRequest::None),
+        ];
+        for (name, network) in scenarios {
+            let rules =
+                default_approval_rules_for_tier(&PlannedEnvironmentTier::Docker, Some(&network));
+            assert!(
+                rules.auto_approve.windows(2).all(|pair| pair[0] < pair[1]),
+                "{name}"
+            );
+            assert!(
+                rules.escalate.windows(2).all(|pair| pair[0] < pair[1]),
+                "{name}"
+            );
+            assert!(
+                rules.deny.windows(2).all(|pair| pair[0] < pair[1]),
+                "{name}"
+            );
+
+            let mut approved = crate::ApprovedExecutionSpec {
+                runtime: canonical_runtime_spec_for_execution(
+                    ExecutionMode::Docker,
+                    Some("job-code@sha256:test".into()),
+                    Some(60),
+                ),
+                behavior: ResolvedAuthorizationBehavior {
+                    execution_kind: "agent".into(),
+                    runner_profile: serde_json::json!({}),
+                    command: "true".into(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    prompt: None,
+                    primary_repo: None,
+                    primary_repo_branch: None,
+                    execution_context: serde_json::json!({}),
+                    triage: false,
+                    allow_remote_credentials: false,
+                },
+                pids_limit: crate::APPROVED_EXECUTION_PIDS_LIMIT,
+            };
+            approved.runtime.environment.network_resources = Some(network);
+            approved.runtime.approval_rules = Some(rules);
+            assert!(approved.permissions_are_subset_of(&approved), "{name}");
         }
     }
 }

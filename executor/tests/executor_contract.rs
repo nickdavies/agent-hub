@@ -5,8 +5,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_hub_executor::{
     ArtifactPaths, Cancellation, CleanupStatus, ContainmentStatus, Deadline, DockerCli,
-    DockerExecutionPlan, DockerMount, DockerOwnership, ExecutionRequest, ExecutionStatus,
-    NetworkMode, cleanup_temporary_files, execute_process, verify_image_identity,
+    DockerExecutionPlan, DockerMount, DockerOwnership, ExecutionCancellationContext,
+    ExecutionRequest, ExecutionStatus, NetworkMode, OutputLimits, cleanup_temporary_files,
+    execute_process, verify_image_identity,
 };
 
 #[test]
@@ -185,6 +186,13 @@ async fn process_execution_persists_streams_and_reports_containment() {
         cancellation: Cancellation::new(cancel_rx),
         append: false,
         redaction_values: vec!["secret".into()],
+        output_limits: OutputLimits {
+            stdout_bytes: 1024,
+            stderr_bytes: 1024,
+            transcript_bytes: 4096,
+        },
+        effects: None,
+        operation_identity: None,
     };
     drop(cancel_tx);
     let result = execute_process(request).await.unwrap();
@@ -226,6 +234,13 @@ async fn cancellation_contains_the_entire_process_group() {
         cancellation: Cancellation::new(cancel_rx),
         append: false,
         redaction_values: Vec::new(),
+        output_limits: OutputLimits {
+            stdout_bytes: 1024,
+            stderr_bytes: 1024,
+            transcript_bytes: 4096,
+        },
+        effects: None,
+        operation_identity: None,
     };
     let execution = tokio::spawn(execute_process(request));
     for _ in 0..100 {
@@ -243,6 +258,66 @@ async fn cancellation_contains_the_entire_process_group() {
     );
     let descendant = std::fs::read_to_string(&pid_path).unwrap();
     assert!(!PathBuf::from(format!("/proc/{}", descendant.trim())).exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn output_overflow_kills_execution_and_keeps_files_bounded() {
+    let root = temp_root("process-output-limit");
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let result = execute_process(ExecutionRequest {
+        command: PathBuf::from("sh"),
+        args: vec![
+            "-lc".into(),
+            "while :; do printf '1234567890\\n'; done".into(),
+        ],
+        current_dir: root.clone(),
+        environment: BTreeMap::new(),
+        artifacts: ArtifactPaths::in_directory(&root),
+        deadline: Deadline::new(Some(5)).unwrap(),
+        cancellation: Cancellation::new(cancel_rx),
+        append: false,
+        redaction_values: Vec::new(),
+        output_limits: OutputLimits {
+            stdout_bytes: 64,
+            stderr_bytes: 64,
+            transcript_bytes: 4096,
+        },
+        effects: None,
+        operation_identity: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.status, ExecutionStatus::OutputLimitExceeded);
+    assert!(std::fs::metadata(root.join("stdout.log")).unwrap().len() <= 64);
+    assert!(
+        std::fs::metadata(root.join("transcript.jsonl"))
+            .unwrap()
+            .len()
+            <= 4096
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn effect_recovery_removes_exact_credential_file_before_reconciling() {
+    let root = temp_root("effect-credential-recovery");
+    let credentials = root.join("credentials");
+    std::fs::create_dir(&credentials).unwrap();
+    let credential = credentials.join("owned.secret");
+    std::fs::write(&credential, "secret").unwrap();
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::new(cancel_rx))
+            .unwrap();
+    let unresolved = effects
+        .begin_external_operation("credential_secret_write", &credential.to_string_lossy())
+        .unwrap();
+    drop(unresolved);
+    effects.reconcile_owned_effects(&credentials).await.unwrap();
+    effects.finalize().unwrap();
+    assert!(!credential.exists());
+    assert!(root.join("effects/executor-effects.jsonl").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 
