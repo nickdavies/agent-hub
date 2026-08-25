@@ -165,6 +165,18 @@ pub fn materialize_environment_bundle_with_snapshot(
             validate_durable_opencode_config(&bytes)?;
             if environment.approval_mode == "auto" {
                 validate_automatic_opencode_plugins(&bytes)?;
+                validate_automatic_opencode_permissions(
+                    &bytes,
+                    &environment.name,
+                    &environment.network_policy,
+                )?;
+            } else if environment.approval_mode == "gateway" {
+                validate_supervised_opencode_config(&bytes)?;
+            } else {
+                return Err(format!(
+                    "environment '{}' has unsupported approval mode '{}'",
+                    environment.name, environment.approval_mode
+                ));
             }
         }
         insert_file(&mut files, name, bytes, false)?;
@@ -256,6 +268,81 @@ fn validate_automatic_opencode_plugins(bytes: &[u8]) -> Result<(), String> {
         return Err("automatic OpenCode environments must not load attended plugins".to_string());
     }
     Ok(())
+}
+
+fn validate_automatic_opencode_permissions(
+    bytes: &[u8],
+    environment: &str,
+    network_policy: &str,
+) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("failed to parse opencode.json: {error}"))?;
+    let permissions = value
+        .get("permission")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            "automatic OpenCode environments require explicit permissions".to_string()
+        })?;
+    if permissions.get("*").and_then(serde_json::Value::as_str) != Some("allow") {
+        return Err("automatic OpenCode permissions must explicitly allow by default".to_string());
+    }
+    if contains_action(&serde_json::Value::Object(permissions.clone()), "ask") {
+        return Err("automatic OpenCode environments must not contain ask permissions".to_string());
+    }
+    let webfetch = permissions
+        .get("webfetch")
+        .and_then(serde_json::Value::as_str);
+    if environment == "research-auto" && webfetch != Some("deny") {
+        return Err("research-auto must explicitly deny WebFetch".to_string());
+    }
+    if environment == "research-web-auto"
+        && (webfetch != Some("allow") || network_policy != "guarded-web")
+    {
+        return Err(
+            "research-web-auto may explicitly allow WebFetch only with guarded-web".to_string(),
+        );
+    }
+    if webfetch == Some("allow") && network_policy != "guarded-web" {
+        return Err("explicit WebFetch allow requires guarded-web".to_string());
+    }
+    Ok(())
+}
+
+fn validate_supervised_opencode_config(bytes: &[u8]) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("failed to parse opencode.json: {error}"))?;
+    if value
+        .get("plugin")
+        .is_some_and(|plugins| !plugins.as_array().is_some_and(Vec::is_empty))
+    {
+        return Err("supervised OpenCode environments must not load plugins".to_string());
+    }
+    let permissions = value
+        .get("permission")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            "supervised OpenCode environments require explicit permissions".to_string()
+        })?;
+    if permissions.get("*").and_then(serde_json::Value::as_str) != Some("ask") {
+        return Err("supervised OpenCode permissions must ask by default".to_string());
+    }
+    if permissions.get("*").and_then(serde_json::Value::as_str) == Some("allow") {
+        return Err("supervised OpenCode permissions must not allow every tool".to_string());
+    }
+    Ok(())
+}
+
+fn contains_action(value: &serde_json::Value, action: &str) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.values().any(|value| contains_action(value, action))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| contains_action(value, action))
+        }
+        serde_json::Value::String(value) => value == action,
+        _ => false,
+    }
 }
 
 fn validate_agent_model(bytes: &[u8], path: &Path) -> Result<(), String> {
@@ -553,6 +640,54 @@ mod tests {
     }
 
     #[test]
+    fn approval_modes_require_fail_closed_supervision_or_non_interactive_auto_rules() {
+        let supervised = serde_json::to_vec(&json!({
+            "permission":{"*":"ask","external_directory":{"*":"deny","/workspace/*":"allow"}}
+        }))
+        .unwrap();
+        validate_supervised_opencode_config(&supervised).unwrap();
+        for invalid in [
+            json!({"permission":{"*":"allow"}}),
+            json!({"permission":{"*":"ask"},"plugin":["unexpected"]}),
+        ] {
+            assert!(
+                validate_supervised_opencode_config(&serde_json::to_vec(&invalid).unwrap())
+                    .is_err()
+            );
+        }
+
+        validate_automatic_opencode_permissions(
+            &serde_json::to_vec(&json!({"permission":{"*":"allow","webfetch":"deny"}})).unwrap(),
+            "research-auto",
+            "none",
+        )
+        .unwrap();
+        validate_automatic_opencode_permissions(
+            &serde_json::to_vec(&json!({"permission":{"*":"allow","webfetch":"allow"}})).unwrap(),
+            "research-web-auto",
+            "guarded-web",
+        )
+        .unwrap();
+        assert!(
+            validate_automatic_opencode_permissions(
+                &serde_json::to_vec(&json!({"permission":{"*":"allow","bash":"ask"}})).unwrap(),
+                "code-auto",
+                "build",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_automatic_opencode_permissions(
+                &serde_json::to_vec(&json!({"permission":{"*":"allow","webfetch":"allow"}}))
+                    .unwrap(),
+                "research-web-auto",
+                "build",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn materialization_copies_shared_files_and_changes_digest_with_content() {
         let root = std::env::temp_dir().join(format!(
             "agent-hub-bundle-test-{}-{}",
@@ -612,7 +747,8 @@ include_agents = ["example"]
             serde_json::to_vec(&json!({
                 "model": DURABLE_OPENCODE_MODEL,
                 "small_model": DURABLE_OPENCODE_MODEL,
-                "enabled_providers": ["openai"]
+                "enabled_providers": ["openai"],
+                "permission": {"*":"allow"}
             }))
             .unwrap(),
         )

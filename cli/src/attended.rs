@@ -385,9 +385,7 @@ pub async fn run(
         runner.mcp_bridges.is_empty(),
         "attended MCP bridge material is unavailable from the executor substrate"
     );
-    if request.proposal.tool_approval == ToolApprovalMode::Dippy {
-        which::which("dippy").context("Dippy gateway is required by the attended environment")?;
-    }
+    verify_tool_approval(request.proposal.tool_approval)?;
     let id = digest[..24].to_string();
     let container_name = format!("agent-hub-attended-{id}");
     let ownership = BTreeMap::from([
@@ -524,6 +522,12 @@ pub async fn run(
     )
     .map_err(anyhow::Error::msg)?;
     let run_dir = store.path(&PathBuf::from("runs").join(&id))?;
+    let runs_dir = run_dir.parent().context("run directory has no parent")?;
+    if !runs_dir.exists() {
+        std::fs::create_dir(runs_dir)?;
+        set_private_directory(runs_dir)?;
+        sync_directory_and_parent(runs_dir)?;
+    }
     if run_dir.exists() {
         let metadata = std::fs::symlink_metadata(&run_dir)?;
         ensure!(
@@ -531,7 +535,7 @@ pub async fn run(
             "attended run directory is not a real directory"
         );
         std::fs::remove_dir_all(&run_dir)?;
-        File::open(run_dir.parent().context("run directory has no parent")?)?.sync_all()?;
+        File::open(runs_dir)?.sync_all()?;
     }
     let result = async {
         std::fs::create_dir(&run_dir)?;
@@ -2159,6 +2163,14 @@ fn runtime_identity(request: &AttendedAuthorizationRequestV1) -> anyhow::Result<
     Ok((metadata.uid(), metadata.gid()))
 }
 
+fn verify_tool_approval(mode: ToolApprovalMode) -> anyhow::Result<()> {
+    ensure!(
+        mode == ToolApprovalMode::Auto,
+        "in-sandbox Dippy approval is unavailable: no verified externally mediated OpenCode permission path is configured"
+    );
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn runtime_identity(_request: &AttendedAuthorizationRequestV1) -> anyhow::Result<(u32, u32)> {
     anyhow::bail!("attended job-code preflight requires Unix ownership metadata")
@@ -2190,13 +2202,22 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::{
         RunRecord, RunStatus, merge_execution_cleanup, network_class_within_ceiling,
-        prepare_consumption, resolve_network_resources, selector_resources,
+        resolve_network_resources, selector_resources, verify_tool_approval,
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
     use chrono::Utc;
     use protocol::NetworkResourceKind;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn supervised_tool_approval_fails_before_launch() {
+        verify_tool_approval(protocol::ToolApprovalMode::Auto).unwrap();
+        let error = verify_tool_approval(protocol::ToolApprovalMode::Dippy)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no verified externally mediated OpenCode permission path"));
+    }
 
     #[test]
     fn attended_network_selectors_have_exact_canonical_ceilings() {

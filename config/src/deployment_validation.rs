@@ -604,7 +604,8 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "model":"openai/gpt-5.6-sol",
                 "small_model":"openai/gpt-5.6-sol",
-                "enabled_providers":["openai"]
+                "enabled_providers":["openai"],
+                "permission":{"*":"allow"}
             }))
             .unwrap(),
         )
