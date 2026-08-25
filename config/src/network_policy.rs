@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -6,11 +7,13 @@ use serde::{Deserialize, Serialize};
 use crate::system::SystemConfig;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetworkPolicyTomlFile {
     policy: NetworkPolicyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkPolicyConfig {
     pub name: String,
     pub description: String,
@@ -40,11 +43,82 @@ impl NetworkPolicyConfig {
     pub fn from_toml(raw: &str, label: &str) -> Result<Self, String> {
         let wrapped: NetworkPolicyTomlFile = toml::from_str(raw)
             .map_err(|e| format!("failed to parse network policy config {label}: {e}"))?;
+        for rule in &wrapped.policy.allow {
+            canonical_policy_hosts(&rule.hosts)?;
+        }
         Ok(wrapped.policy)
     }
 }
 
+pub fn canonical_policy_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
+    let mut canonical = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        canonical.push(canonical_policy_host(host)?);
+    }
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn canonical_policy_host(host: &str) -> Result<String, String> {
+    if host.is_empty() || host.trim() != host {
+        return Err(format!(
+            "network policy host '{host}' must be non-empty without surrounding whitespace"
+        ));
+    }
+    if host.contains("//") || host.contains('/') || host.contains(':') || host.ends_with('.') {
+        return Err(format!(
+            "network policy host '{host}' is not a bare DNS host"
+        ));
+    }
+
+    let (wildcard, name) = host
+        .strip_prefix("*.")
+        .map_or((false, host), |name| (true, name));
+    if name.parse::<IpAddr>().is_ok() {
+        return Err(format!(
+            "network policy host '{host}' must not be an IP literal"
+        ));
+    }
+    if name.split('.').all(|label| {
+        label.bytes().all(|byte| byte.is_ascii_digit())
+            || label.strip_prefix("0x").is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    }) {
+        return Err(format!(
+            "network policy host '{host}' must not be a numeric IP form"
+        ));
+    }
+    if name.len() > 253 || !name.contains('.') {
+        return Err(format!(
+            "network policy host '{host}' must be a fully-qualified DNS name"
+        ));
+    }
+    for label in name.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!(
+                "network policy host '{host}' is not a valid DNS name"
+            ));
+        }
+    }
+    let canonical = name.to_ascii_lowercase();
+    Ok(if wildcard {
+        format!("*.{canonical}")
+    } else {
+        canonical
+    })
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyAllowRule {
     #[serde(default)]
     pub description: Option<String>,
@@ -55,6 +129,7 @@ pub struct PolicyAllowRule {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlattenedPolicy {
     pub name: String,
     pub description: String,
@@ -91,13 +166,13 @@ pub fn flatten_policy(
         }
 
         for allow in &policy.allow {
-            for host in &allow.hosts {
+            for host in canonical_policy_hosts(&allow.hosts)? {
                 if seen_hosts.insert(host.clone()) {
-                    hosts.push(host.clone());
+                    hosts.push(host);
                 }
             }
             if let Some(source) = &allow.hosts_from {
-                for host in resolve_hosts_from(source, system)? {
+                for host in canonical_policy_hosts(&resolve_hosts_from(source, system)?)? {
                     if seen_hosts.insert(host.clone()) {
                         hosts.push(host);
                     }
@@ -152,5 +227,56 @@ fn resolve_hosts_from(reference: &str, system: &SystemConfig) -> Result<Vec<Stri
             .flat_map(|provider| provider.hosts.clone())
             .collect()),
         _ => Err(format!("unsupported hosts_from reference '{reference}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NetworkPolicyConfig, canonical_policy_hosts};
+
+    #[test]
+    fn policy_dtos_reject_unknown_fields_at_every_level() {
+        for raw in [
+            "[policy]\nname='none'\ndescription='none'\nunknown=true\n",
+            "[policy]\nname='none'\ndescription='none'\n[[policy.allow]]\nhosts=['example.com']\nunknown=true\n",
+            "[policy]\nname='none'\ndescription='none'\n[unknown]\nvalue=true\n",
+        ] {
+            assert!(NetworkPolicyConfig::from_toml(raw, "test policy").is_err());
+        }
+    }
+
+    #[test]
+    fn policy_hosts_are_canonical_and_deterministically_ordered() {
+        assert_eq!(
+            canonical_policy_hosts(&[
+                "Z.Example.com".to_string(),
+                "a.example.com".to_string(),
+                "a.example.com".to_string(),
+            ])
+            .unwrap(),
+            ["a.example.com", "z.example.com"]
+        );
+    }
+
+    #[test]
+    fn policy_hosts_reject_urls_ip_literals_and_malformed_names_without_dropping() {
+        for host in [
+            "",
+            " example.com",
+            "https://example.com",
+            "127.0.0.1",
+            "0177.0.0.1",
+            "0x7f.0x0.0x0.0x1",
+            "::1",
+            "localhost",
+            "example.com:443",
+            "example.com.",
+            "bad_label.example.com",
+        ] {
+            assert!(
+                canonical_policy_hosts(&[host.to_string()]).is_err(),
+                "accepted {host}"
+            );
+        }
     }
 }

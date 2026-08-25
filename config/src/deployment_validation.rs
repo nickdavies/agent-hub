@@ -83,6 +83,16 @@ pub struct ValidatedImageManifest {
     pub name: String,
     pub file: CapturedAuthoritativeFile,
     pub image: toml::Value,
+    pub relative_files: BTreeMap<String, Vec<u8>>,
+    pub file_digests: BTreeMap<String, String>,
+    pub directory_digest: String,
+}
+
+struct CapturedImageContext {
+    file: CapturedAuthoritativeFile,
+    relative_files: BTreeMap<String, Vec<u8>>,
+    file_digests: BTreeMap<String, String>,
+    directory_digest: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
@@ -146,7 +156,7 @@ impl ValidatedDeployment {
             "environment_bundle_digests": self.environment_bundle_digests,
             "runner_profile_digests": self.runner_profile_digests,
             "network_policy_digests": self.network_policies.iter().map(|(name, policy)| (name, &policy.directory_digest)).collect::<BTreeMap<_, _>>(),
-            "images": self.images.iter().map(|(name, image)| (name, &image.file.digest)).collect::<BTreeMap<_, _>>(),
+            "images": self.images.iter().map(|(name, image)| (name, &image.directory_digest)).collect::<BTreeMap<_, _>>(),
             "authoritative_paths": self.authoritative_paths,
         });
         let bytes = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
@@ -169,11 +179,14 @@ impl ValidatedDeployment {
                     .map(|path| format!("network_policies/{name}/{path}")),
             );
         }
-        expected.extend(
-            self.images
-                .values()
-                .map(|image| image.file.relative_path.clone()),
-        );
+        for image in self.images.values() {
+            expected.extend(
+                image
+                    .relative_files
+                    .keys()
+                    .map(|path| format!("images/{}/{path}", image.name)),
+            );
+        }
         if let Some(registry) = &self.overlay_registry {
             expected.insert(registry.file.relative_path.clone());
         }
@@ -259,10 +272,10 @@ pub fn validate_authoritative_config_root(root: &Path) -> Result<ValidatedDeploy
     if let Some(configured) = &system.system.images {
         for name in &configured.installed {
             validate_component(name, "image")?;
-            let relative_path = format!("images/{name}/image.toml");
-            let file = capture_file(root, &relative_path)?;
+            let captured = capture_image(root, name)?;
+            let relative_path = captured.file.relative_path.clone();
             let parsed: ImageFile = toml::from_str(
-                std::str::from_utf8(&file.bytes)
+                std::str::from_utf8(&captured.file.bytes)
                     .map_err(|error| format!("image manifest '{name}' is not UTF-8: {error}"))?,
             )
             .map_err(|error| format!("failed to parse {relative_path}: {error}"))?;
@@ -271,14 +284,22 @@ pub fn validate_authoritative_config_root(root: &Path) -> Result<ValidatedDeploy
                     "image manifest '{relative_path}' must contain an image table"
                 ));
             }
-            authoritative_paths.insert(relative_path);
+            authoritative_paths.extend(
+                captured
+                    .relative_files
+                    .keys()
+                    .map(|path| format!("images/{name}/{path}")),
+            );
             if images
                 .insert(
                     name.clone(),
                     ValidatedImageManifest {
                         name: name.clone(),
-                        file,
+                        file: captured.file,
                         image: parsed.image,
+                        relative_files: captured.relative_files,
+                        file_digests: captured.file_digests,
+                        directory_digest: captured.directory_digest,
                     },
                 )
                 .is_some()
@@ -386,6 +407,43 @@ fn capture_file(root: &Path, configured_path: &str) -> Result<CapturedAuthoritat
     })
 }
 
+fn capture_image(root: &Path, name: &str) -> Result<CapturedImageContext, String> {
+    validate_component(name, "image")?;
+    let directory = root.join("images").join(name);
+    let mut relative_files = BTreeMap::new();
+    capture_directory(&directory, &directory, &mut relative_files)?;
+    let manifest_bytes = relative_files
+        .get("image.toml")
+        .ok_or_else(|| format!("image '{name}' has no image.toml"))?
+        .clone();
+    let file_digests = relative_files
+        .iter()
+        .map(|(path, bytes)| (path.clone(), hex::encode(Sha256::digest(bytes))))
+        .collect();
+    let directory_digest = digest_directory(&relative_files);
+    Ok(CapturedImageContext {
+        file: CapturedAuthoritativeFile {
+            relative_path: format!("images/{name}/image.toml"),
+            digest: hex::encode(Sha256::digest(&manifest_bytes)),
+            bytes: manifest_bytes,
+        },
+        relative_files,
+        file_digests,
+        directory_digest,
+    })
+}
+
+fn digest_directory(files: &BTreeMap<String, Vec<u8>>) -> String {
+    let mut digest = Sha256::new();
+    for (path, bytes) in files {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    hex::encode(digest.finalize())
+}
+
 fn normalize_relative_path(path: &str) -> Result<String, String> {
     if path.is_empty() {
         return Err("authoritative path must not be empty".to_string());
@@ -441,18 +499,12 @@ fn capture_network_policy(root: &Path, name: &str) -> Result<ValidatedNetworkPol
         .iter()
         .map(|(path, bytes)| (path.clone(), hex::encode(Sha256::digest(bytes))))
         .collect();
-    let mut digest = Sha256::new();
-    for (path, bytes) in &relative_files {
-        digest.update((path.len() as u64).to_be_bytes());
-        digest.update(path.as_bytes());
-        digest.update((bytes.len() as u64).to_be_bytes());
-        digest.update(bytes);
-    }
+    let directory_digest = digest_directory(&relative_files);
     Ok(ValidatedNetworkPolicy {
         name: name.to_string(),
         relative_files,
         file_digests,
-        directory_digest: hex::encode(digest.finalize()),
+        directory_digest,
         policy,
     })
 }
@@ -538,7 +590,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             root.join("environments/test/environment.toml"),
-            "[environment]\nname='test'\ndescription='test'\nimage='agent-hub/job-code:2026-08-18'\nnetwork_policy='none'\napproval_mode='auto'\n",
+            "[environment]\nname='test'\ndescription='test'\nimage='agent-hub/job-code:2026-08-24'\nnetwork_policy='none'\napproval_mode='auto'\n",
         )
         .unwrap();
         std::fs::write(
@@ -605,9 +657,13 @@ mod tests {
         )
         .unwrap();
         let image_path = root.join("images/job-code/image.toml");
+        let dockerfile_path = root.join("images/job-code/Dockerfile");
+        let preflight_path = root.join("images/job-code/preflight.sh");
         let overlay_path = root.join("overlays/registry.toml");
         let triage_path = root.join("triage.toml");
         std::fs::write(&image_path, "[image]\nname='original'\n").unwrap();
+        std::fs::write(&dockerfile_path, "FROM image@sha256:original\n").unwrap();
+        std::fs::write(&preflight_path, "original preflight\n").unwrap();
         std::fs::write(
             &overlay_path,
             "[[overlays]]\nname='original'\nprovider='command'\n[overlays.config]\ncommand='true'\n",
@@ -623,6 +679,16 @@ mod tests {
         let image = captured.images["job-code"].clone();
         let overlay = captured.overlay_registry.clone().unwrap();
         let triage = captured.triage_prompt.clone().unwrap();
+        std::fs::write(&preflight_path, "replacement preflight\n").unwrap();
+        let refreshed_context = validate_authoritative_config_root(&root).unwrap();
+        assert_eq!(
+            refreshed_context.images["job-code"].file.digest,
+            image.file.digest
+        );
+        assert_ne!(
+            refreshed_context.images["job-code"].directory_digest,
+            image.directory_digest
+        );
         std::fs::write(&image_path, "[image]\nname='replacement'\n").unwrap();
         std::fs::write(
             &overlay_path,

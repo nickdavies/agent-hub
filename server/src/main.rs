@@ -494,8 +494,8 @@ mod rollback_preflight_tests {
                     |row| row.get::<_, u32>(0),
                 )
                 .unwrap(),
-            3,
-            "new databases explicitly initialize the current v3 fence"
+            4,
+            "new databases explicitly initialize the current v4 fence"
         );
         connection.execute(
             "INSERT INTO workers (id, hostname, state, supported_modes_json, protocol_capabilities_json, session_id, session_generation, last_heartbeat_at) VALUES ('worker-v2','host','idle','[]','[\"canonical_authorization_v2\"]','session',1,'now')",

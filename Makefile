@@ -7,10 +7,10 @@ build-job-image:
 	$(MAKE) build-job-images
 
 build-job-images:
-	cargo run -p agent-hub -- build images --config-root ../agent-hub-configs
+	cargo run -p agent-hub -- build --config-root ../agent-hub-configs images
 
 build-environments:
-	cargo run -p agent-hub -- build environments --config-root ../agent-hub-configs
+	cargo run -p agent-hub -- build --config-root ../agent-hub-configs environments
 
 build-all:
 	cargo run -p agent-hub -- build --config-root ../agent-hub-configs

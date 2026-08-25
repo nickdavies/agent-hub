@@ -1313,7 +1313,7 @@ impl OrchestrationService {
                     );
                     CREATE TABLE IF NOT EXISTS authorization_protocol_mode (
                         id INTEGER PRIMARY KEY CHECK (id = 1),
-                        max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2,3)),
+                        max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2,3,4)),
                         updated_at TEXT NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS workers (
@@ -1417,6 +1417,12 @@ impl OrchestrationService {
                     CREATE TRIGGER IF NOT EXISTS authorization_protocol_workers_v3_update
                     BEFORE UPDATE ON workers WHEN (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1) < 3 AND NEW.protocol_capabilities_json LIKE '%canonical_authorization_v3%'
                     BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects v3 worker update'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_workers_v4_insert
+                    BEFORE INSERT ON workers WHEN (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1) < 4 AND NEW.protocol_capabilities_json LIKE '%canonical_authorization_v4%'
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects v4 worker'); END;
+                    CREATE TRIGGER IF NOT EXISTS authorization_protocol_workers_v4_update
+                    BEFORE UPDATE ON workers WHEN (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1) < 4 AND NEW.protocol_capabilities_json LIKE '%canonical_authorization_v4%'
+                    BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects v4 worker update'); END;
                     CREATE TRIGGER IF NOT EXISTS authorization_protocol_recovery_insert
                     BEFORE INSERT ON worker_session_recovery_inbox WHEN (SELECT canonical_authorization_version FROM jobs WHERE id = NEW.job_id) > (SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1)
                     BEGIN SELECT RAISE(ABORT, 'authorization protocol fence rejects recovery'); END;
@@ -1430,13 +1436,13 @@ impl OrchestrationService {
                         [],
                         |row| row.get(0),
                     )?;
-                    if !protocol_mode_schema.contains("1,2,3") {
+                    if !protocol_mode_schema.contains("1,2,3,4") {
                         conn.execute_batch(
                             "PRAGMA legacy_alter_table = ON;
                              ALTER TABLE authorization_protocol_mode RENAME TO authorization_protocol_mode_v2;
                              CREATE TABLE authorization_protocol_mode (
                                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                                max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2,3)),
+                                 max_authorization_version INTEGER NOT NULL CHECK (max_authorization_version IN (1,2,3,4)),
                                 updated_at TEXT NOT NULL
                              );
                              INSERT INTO authorization_protocol_mode SELECT * FROM authorization_protocol_mode_v2;
@@ -1451,7 +1457,7 @@ impl OrchestrationService {
                             |row| row.get(0),
                         )?;
                         let valid: u32 = conn.query_row(
-                            "SELECT COUNT(*) FROM authorization_protocol_mode WHERE id = 1 AND max_authorization_version IN (1,2,3)",
+                            "SELECT COUNT(*) FROM authorization_protocol_mode WHERE id = 1 AND max_authorization_version IN (1,2,3,4)",
                             [],
                             |row| row.get(0),
                         )?;
@@ -1460,7 +1466,7 @@ impl OrchestrationService {
                         }
                     } else {
                         conn.execute(
-                            "INSERT INTO authorization_protocol_mode (id, max_authorization_version, updated_at) VALUES (1, 3, ?1)",
+                            "INSERT INTO authorization_protocol_mode (id, max_authorization_version, updated_at) VALUES (1, 4, ?1)",
                             [Utc::now().to_rfc3339()],
                         )?;
                     }
@@ -2263,13 +2269,23 @@ impl OrchestrationService {
                 )
                 .into());
             }
-            if max_authorization_version < protocol::CANONICAL_AUTHORIZATION_VERSION
+            if max_authorization_version < protocol::CANONICAL_AUTHORIZATION_VERSION_V3
                 && protocol_capabilities.contains(
                     &protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
                 )
             {
                 return Err(WorkerSessionAuthFailure(
                     "authorization protocol fence rejects v3 worker registration",
+                )
+                .into());
+            }
+            if max_authorization_version < protocol::CANONICAL_AUTHORIZATION_VERSION_V4
+                && protocol_capabilities.contains(
+                    &protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
+                )
+            {
+                return Err(WorkerSessionAuthFailure(
+                    "authorization protocol fence rejects v4 worker registration",
                 )
                 .into());
             }
@@ -2695,6 +2711,9 @@ impl OrchestrationService {
         if max >= 3 {
             capabilities.push(protocol::WorkerProtocolCapability::CanonicalAuthorizationV3);
         }
+        if max >= 4 {
+            capabilities.push(protocol::WorkerProtocolCapability::CanonicalAuthorizationV4);
+        }
         Ok(capabilities)
     }
 
@@ -2752,6 +2771,7 @@ impl OrchestrationService {
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1
                     | protocol::WorkerProtocolCapability::CanonicalAuthorizationV2
                     | protocol::WorkerProtocolCapability::CanonicalAuthorizationV3
+                    | protocol::WorkerProtocolCapability::CanonicalAuthorizationV4
             )
         }) {
             worker.state = WorkerState::Idle;
@@ -7347,7 +7367,8 @@ impl OrchestrationService {
                 execution
                     .and_then(|config| config.container_image.clone())
                     .is_some(),
-            );
+            )
+            .map_err(AppError::WorkflowInvalid)?;
             project_environment_selection_into_job_context(
                 &mut job.context,
                 selection,
@@ -7463,6 +7484,16 @@ impl OrchestrationService {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("command")
             .to_string();
+        let resolver_enforcement = self
+            .runner_profiles
+            .egress
+            .get("resolver")
+            .cloned()
+            .ok_or_else(|| {
+                AppError::WorkflowInvalid(
+                    "default runner profile has no resolver enforcement contract".to_string(),
+                )
+            })?;
         let runner_profile = match execution_kind.as_str() {
             "agent" => self
                 .runner_profiles
@@ -7482,10 +7513,15 @@ impl OrchestrationService {
                 })?,
             "managed" => serde_json::json!({
                 "profile_name": "github_action",
-                "config_digest": "github_action_v1"
+                "config_digest": "github_action_v1",
+                "resolver_enforcement": resolver_enforcement
             }),
             "command" => {
-                serde_json::json!({"profile_name":"command", "config_digest":"command_v1"})
+                serde_json::json!({
+                    "profile_name":"command",
+                    "config_digest":"command_v1",
+                    "resolver_enforcement": resolver_enforcement
+                })
             }
             other => {
                 return Err(AppError::WorkflowInvalid(format!(
@@ -10672,7 +10708,8 @@ impl OrchestrationService {
                                 execution
                                     .and_then(|config| config.container_image.clone())
                                     .is_some(),
-                            );
+                            )
+                            .map_err(anyhow::Error::msg)?;
                             project_environment_selection_into_job_context(
                                 &mut job.context,
                                 selection,
@@ -12986,19 +13023,24 @@ fn apply_environment_definition_to_runtime(
     runtime: &mut CanonicalRuntimeSpec,
     environment: &EnvironmentDefinition,
     container_image_overridden: bool,
-) {
+) -> Result<(), String> {
     if !container_image_overridden {
         runtime.environment.container_image = Some(environment.image.clone());
     }
-    // The workflow author can express an explicit
-    // `network_resources` (parsed from workflow.toml into
-    // `runtime.environment.network_resources` upstream). When they have, we
-    // honour it — workflow definitions are reviewed code, so they have
-    // authority over the environment's default `network_class`. The environment
-    // policy only fills in for steps that didn't ask for anything.
-    if runtime.environment.network_resources.is_none() {
-        runtime.environment.network_resources =
-            network_request_for_environment_class(environment.network_class.as_str());
+    let ceiling = network_request_for_environment_class(environment.network_class.as_str())
+        .ok_or_else(|| {
+            format!(
+                "environment '{}' has unsupported network class '{}'",
+                environment.name, environment.network_class
+            )
+        })?;
+    match runtime.environment.network_resources.as_ref() {
+        Some(request) => validate_network_request_within_ceiling(
+            request,
+            &ceiling,
+            environment.network_class.as_str(),
+        )?,
+        None => runtime.environment.network_resources = Some(ceiling),
     }
     runtime.permissions = canonical_permissions_for_environment(&runtime.environment);
     if let Some(request) = &runtime.environment.network_resources {
@@ -13008,17 +13050,91 @@ fn apply_environment_definition_to_runtime(
         &runtime.environment.tier,
         runtime.environment.network_resources.as_ref(),
     ));
+    Ok(())
+}
+
+fn validate_network_request_within_ceiling(
+    request: &NetworkResourceRequest,
+    ceiling: &NetworkResourceRequest,
+    class: &str,
+) -> Result<(), String> {
+    match (request, ceiling) {
+        (NetworkResourceRequest::None, _) => Ok(()),
+        (NetworkResourceRequest::Full, NetworkResourceRequest::Full) => Ok(()),
+        (NetworkResourceRequest::Full, _) => Err(format!(
+            "full network access exceeds '{class}' environment ceiling"
+        )),
+        (NetworkResourceRequest::Resources(requested), NetworkResourceRequest::Full) => {
+            validate_guarded_web_resource_set(requested)
+        }
+        (
+            NetworkResourceRequest::Resources(requested),
+            NetworkResourceRequest::Resources(allowed),
+        ) => {
+            validate_guarded_web_resource_set(requested)?;
+            if requested.iter().all(|resource| allowed.contains(resource)) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "requested network resources exceed '{class}' environment ceiling"
+                ))
+            }
+        }
+        (NetworkResourceRequest::Resources(requested), NetworkResourceRequest::None) => {
+            validate_guarded_web_resource_set(requested)?;
+            if requested.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "requested network resources exceed '{class}' environment ceiling"
+                ))
+            }
+        }
+    }
+}
+
+fn validate_guarded_web_resource_set(
+    resources: &[protocol::NetworkResourceKind],
+) -> Result<(), String> {
+    if resources.contains(&protocol::NetworkResourceKind::GuardedWeb) && resources.len() != 1 {
+        Err("guarded_web cannot be combined with other network resources".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn network_request_for_environment_class(class: &str) -> Option<NetworkResourceRequest> {
     match class {
         "none" => Some(NetworkResourceRequest::None),
         "full" => Some(NetworkResourceRequest::Full),
-        "restricted" => Some(NetworkResourceRequest::Resources(vec![
+        "llm-only" => Some(NetworkResourceRequest::Resources(vec![
+            protocol::NetworkResourceKind::Llm,
+        ])),
+        "github-only" => Some(NetworkResourceRequest::Resources(vec![
+            protocol::NetworkResourceKind::Github,
+        ])),
+        "go-registry" => Some(NetworkResourceRequest::Resources(vec![
+            protocol::NetworkResourceKind::GoRegistry,
+        ])),
+        "crates-registry" => Some(NetworkResourceRequest::Resources(vec![
+            protocol::NetworkResourceKind::CratesRegistry,
+        ])),
+        "pypi-registry" => Some(NetworkResourceRequest::Resources(vec![
+            protocol::NetworkResourceKind::PypiRegistry,
+        ])),
+        "npm-registry" => Some(NetworkResourceRequest::Resources(vec![
+            protocol::NetworkResourceKind::NpmRegistry,
+        ])),
+        "guarded-web" => Some(NetworkResourceRequest::Resources(vec![
+            protocol::NetworkResourceKind::GuardedWeb,
+        ])),
+        "build" | "restricted" => Some(NetworkResourceRequest::Resources(vec![
             protocol::NetworkResourceKind::Llm,
             protocol::NetworkResourceKind::Github,
             protocol::NetworkResourceKind::GoRegistry,
             protocol::NetworkResourceKind::CratesRegistry,
+            protocol::NetworkResourceKind::PypiRegistry,
+            protocol::NetworkResourceKind::NpmRegistry,
         ])),
         _ => None,
     }
@@ -14173,7 +14289,8 @@ fn canonical_agent_output_event_names(job: &Job) -> Result<Vec<String>, String> 
         .ok_or_else(|| "job has no canonical authorization identity".to_string())?;
     let bundle = protocol::ImmutableAuthorizationBundle::verify(artifact, authorization_id)?;
     match bundle.version {
-        protocol::CANONICAL_AUTHORIZATION_VERSION => Ok(bundle
+        protocol::CANONICAL_AUTHORIZATION_VERSION_V3
+        | protocol::CANONICAL_AUTHORIZATION_VERSION_V4 => Ok(bundle
             .request
             .agent_output_events
             .iter()
@@ -15346,6 +15463,7 @@ mod tests {
                         protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                         protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                         protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                        protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
                     ],
                     None,
                 )
@@ -15413,6 +15531,7 @@ mod tests {
                                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
                             ],
                         },
                         None,
@@ -15634,7 +15753,10 @@ mod tests {
             svc.assign_next_job(
                 "worker".to_string(),
                 vec![protocol::ExecutionMode::Docker],
-                vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV3],
+                vec![
+                    protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                    protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
+                ],
                 None,
             )
             .await
@@ -15666,7 +15788,10 @@ mod tests {
             svc.assign_next_job(
                 "worker".to_string(),
                 vec![protocol::ExecutionMode::Docker],
-                vec![protocol::WorkerProtocolCapability::CanonicalAuthorizationV3],
+                vec![
+                    protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                    protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
+                ],
                 None,
             )
             .await
@@ -17469,8 +17594,8 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_protocol_mode_schema_upgrade_preserves_v2_fence() {
-        let db = std::env::temp_dir().join(format!("protocol-v3-{}.sqlite3", Uuid::new_v4()));
-        let tasks = std::env::temp_dir().join(format!("protocol-v3-tasks-{}", Uuid::new_v4()));
+        let db = std::env::temp_dir().join(format!("protocol-v4-{}.sqlite3", Uuid::new_v4()));
+        let tasks = std::env::temp_dir().join(format!("protocol-v4-tasks-{}", Uuid::new_v4()));
         let conn = Connection::open(db.as_path()).expect("create legacy database");
         conn.execute_batch(
             "CREATE TABLE authorization_protocol_mode (
@@ -17501,7 +17626,7 @@ mod tests {
             )
             .expect("read migrated protocol fence");
         assert_eq!(max_version, protocol::CANONICAL_AUTHORIZATION_VERSION_V2);
-        assert!(schema.contains("1,2,3"));
+        assert!(schema.contains("1,2,3,4"));
         drop(conn);
         drop(svc);
         Connection::open(db.as_path())
@@ -19620,7 +19745,7 @@ kind = "terminal"
     fn environments_fixture() -> Vec<EnvironmentDefinition> {
         vec![EnvironmentDefinition {
             name: "code-auto".to_string(),
-            image: "agent-hub/job-code:latest".to_string(),
+            image: agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string(),
             network_class: "restricted".to_string(),
             approval_mode: "auto".to_string(),
             allowed_overlays: vec!["github".to_string()],
@@ -20207,7 +20332,7 @@ kind = "terminal"
             environment: protocol::PlannedEnvironmentSpec {
                 tier: protocol::PlannedEnvironmentTier::Docker,
                 execution_mode: protocol::ExecutionMode::Docker,
-                container_image: Some("agent-hub/job-code:latest".into()),
+                container_image: Some(agent_hub_config::DURABLE_OPENCODE_IMAGE.into()),
                 timeout_secs: Some(900),
                 memory_limit: None,
                 cpu_limit: None,
@@ -20234,15 +20359,10 @@ kind = "terminal"
     }
 
     fn restricted_environment_definition() -> EnvironmentDefinition {
-        // `code-auto` in environment.toml says `network_policy = "build"`,
-        // which `map_policy_to_network_class` rewrites to "restricted" before
-        // the value reaches `EnvironmentDefinition`. "restricted" is the only
-        // legacy network label below "full"/"none" that
-        // `network_request_from_legacy_label` understands.
         EnvironmentDefinition {
             name: "code-auto".to_string(),
-            image: "agent-hub/job-code:latest".to_string(),
-            network_class: "restricted".to_string(),
+            image: agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string(),
+            network_class: "build".to_string(),
             approval_mode: "auto".to_string(),
             allowed_overlays: vec!["github".to_string()],
             description: None,
@@ -20251,23 +20371,35 @@ kind = "terminal"
     }
 
     #[test]
-    fn workflow_full_network_resources_overrides_environment_default() {
-        // Workflow.toml asked for full network access on a Docker step. The
-        // environment's default `network_class = restricted` must NOT clobber
-        // it — workflow definitions are reviewed code, so they have authority.
+    fn workflow_full_network_resources_cannot_exceed_environment_ceiling() {
         let mut runtime = docker_runtime_spec_with_network(Some(NetworkResourceRequest::Full));
         let env = restricted_environment_definition();
-        apply_environment_definition_to_runtime(&mut runtime, &env, true);
+        assert!(apply_environment_definition_to_runtime(&mut runtime, &env, true).is_err());
+    }
 
-        assert_eq!(
-            runtime.environment.network_resources,
-            Some(NetworkResourceRequest::Full),
-            "workflow's Full must survive env application",
-        );
-        // The legacy `network` string should reflect the workflow choice too,
-        // since downstream consumers (squid policy selection, approval rules)
-        // read it.
-        assert!(runtime.permissions.can_access_network);
+    #[test]
+    fn guarded_web_environment_rejects_full_and_combined_resources() {
+        let environment = EnvironmentDefinition {
+            name: "research-web-auto".to_string(),
+            image: agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string(),
+            network_class: "guarded-web".to_string(),
+            approval_mode: "auto".to_string(),
+            allowed_overlays: Vec::new(),
+            description: None,
+            runtime: None,
+        };
+        for request in [
+            NetworkResourceRequest::Full,
+            NetworkResourceRequest::Resources(vec![
+                protocol::NetworkResourceKind::GuardedWeb,
+                protocol::NetworkResourceKind::Llm,
+            ]),
+        ] {
+            let mut runtime = docker_runtime_spec_with_network(Some(request));
+            assert!(
+                apply_environment_definition_to_runtime(&mut runtime, &environment, true).is_err()
+            );
+        }
     }
 
     #[test]
@@ -20275,7 +20407,7 @@ kind = "terminal"
         // No workflow opinion → environment policy fills in.
         let mut runtime = docker_runtime_spec_with_network(None);
         let env = restricted_environment_definition();
-        apply_environment_definition_to_runtime(&mut runtime, &env, true);
+        apply_environment_definition_to_runtime(&mut runtime, &env, true).unwrap();
 
         let env_resources = runtime
             .environment
@@ -20286,6 +20418,29 @@ kind = "terminal"
             env_resources,
             NetworkResourceRequest::Resources(_)
         ));
+    }
+
+    #[test]
+    fn llm_only_environment_default_stays_llm_only() {
+        let mut runtime = docker_runtime_spec_with_network(None);
+        let environment = EnvironmentDefinition {
+            name: "research-auto".to_string(),
+            image: "agent-hub/job-code:latest".to_string(),
+            network_class: "llm-only".to_string(),
+            approval_mode: "auto".to_string(),
+            allowed_overlays: Vec::new(),
+            description: None,
+            runtime: None,
+        };
+
+        apply_environment_definition_to_runtime(&mut runtime, &environment, true).unwrap();
+
+        assert_eq!(
+            runtime.environment.network_resources,
+            Some(NetworkResourceRequest::Resources(vec![
+                protocol::NetworkResourceKind::Llm,
+            ]))
+        );
     }
 
     #[test]
@@ -20322,7 +20477,7 @@ kind = "terminal"
         // must honour even when the environment default is permissive.
         let mut runtime = docker_runtime_spec_with_network(Some(NetworkResourceRequest::None));
         let env = restricted_environment_definition();
-        apply_environment_definition_to_runtime(&mut runtime, &env, true);
+        apply_environment_definition_to_runtime(&mut runtime, &env, true).unwrap();
 
         assert_eq!(
             runtime.environment.network_resources,
@@ -20854,6 +21009,15 @@ kind = "terminal"
         for forbidden in ["human_approved", "cancel", "timeout"] {
             let mut legacy_request = artifact.verify_and_parse().unwrap();
             legacy_request.agent_output_events.clear();
+            if let Some(profile) = legacy_request.behavior.runner_profile.as_object_mut() {
+                profile.remove("resolver_enforcement");
+                if let Some(egress) = profile
+                    .get_mut("egress")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    egress.remove("resolver");
+                }
+            }
             legacy_request.behavior.execution_context["workflow"]["inputs"]["valid_next_events"] =
                 serde_json::json!([forbidden]);
             let legacy_artifact = legacy_request.canonical_artifact().unwrap();
@@ -21346,6 +21510,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
             ..v1_registration.clone()
         };
@@ -21466,6 +21631,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         };
         let first = harness
@@ -23385,6 +23551,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -23525,6 +23692,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -23864,6 +24032,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -25643,6 +25812,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -26223,6 +26393,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -26603,6 +26774,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -26685,6 +26857,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -26791,6 +26964,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -27187,6 +27361,7 @@ kind = "terminal"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await
@@ -28446,7 +28621,7 @@ kind = "terminal"
     }
 
     #[tokio::test]
-    async fn timeout_only_executable_issues_v3_with_empty_agent_output_set() {
+    async fn timeout_only_executable_issues_v4_with_empty_agent_output_set() {
         let tmp = std::env::temp_dir().join(format!("wf-timeout-only-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("mkdir");
         write_workflow(
@@ -28915,6 +29090,7 @@ terminal_outcome = "failed"
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ],
         })
         .await

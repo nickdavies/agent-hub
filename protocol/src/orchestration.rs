@@ -286,6 +286,21 @@ mod immutable_authorization_tests {
         };
         assert!(unknown.verify_and_parse().is_err());
 
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        invalid["resolver"]["upstream"] = serde_json::json!("https://resolver.invalid");
+        let invalid_bytes = canonical_json_bytes(invalid).unwrap();
+        let invalid = CanonicalAuthorizationArtifact {
+            version: CANONICAL_AUTHORIZATION_VERSION_V4,
+            digest: canonical_authorization_digest_for_version(
+                CANONICAL_AUTHORIZATION_VERSION_V4,
+                &invalid_bytes,
+            )
+            .unwrap(),
+            canonical_bytes: invalid_bytes,
+        };
+        assert!(invalid.verify_and_parse().is_err());
+
         let mut unknown_nested: serde_json::Value =
             serde_json::from_slice(&artifact.canonical_bytes).unwrap();
         unknown_nested["behavior"]["runner_profile"]["future_field"] = serde_json::json!(true);
@@ -367,6 +382,7 @@ mod immutable_authorization_tests {
         let v1 = [WorkerProtocolCapability::CanonicalAuthorizationV1];
         let v2 = [WorkerProtocolCapability::CanonicalAuthorizationV2];
         let v3 = [WorkerProtocolCapability::CanonicalAuthorizationV3];
+        let v4 = [WorkerProtocolCapability::CanonicalAuthorizationV4];
         let both = [
             WorkerProtocolCapability::CanonicalAuthorizationV1,
             WorkerProtocolCapability::CanonicalAuthorizationV2,
@@ -379,6 +395,9 @@ mod immutable_authorization_tests {
         assert!(worker_supports_canonical_authorization(&both, 2));
         assert!(!worker_supports_canonical_authorization(&v2, 3));
         assert!(worker_supports_canonical_authorization(&v3, 3));
+        assert!(!worker_supports_canonical_authorization(&v3, 4));
+        assert!(worker_supports_canonical_authorization(&v4, 4));
+        assert!(!worker_supports_canonical_authorization(&v4, 3));
         assert!(!worker_supports_canonical_authorization(&both, 0));
         assert!(!worker_supports_canonical_authorization(&both, 3));
     }
@@ -411,7 +430,7 @@ mod immutable_authorization_tests {
         assert!(missing.verify_and_parse().is_err());
 
         let empty = request().canonical_artifact_v3().unwrap();
-        assert_eq!(empty.version, CANONICAL_AUTHORIZATION_VERSION);
+        assert_eq!(empty.version, CANONICAL_AUTHORIZATION_VERSION_V3);
         assert!(
             empty
                 .verify_and_parse()
@@ -458,6 +477,99 @@ mod immutable_authorization_tests {
             "inputs": {"valid_next_events": ["human_approved", "cancel"]}
         });
         assert!(stale_projection.canonical_artifact().is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_v4_binds_resolver_and_rejects_tampering() {
+        let request = resolver_authorization_request();
+        let artifact = request.canonical_artifact_v4().unwrap();
+        assert_eq!(artifact.version, CANONICAL_AUTHORIZATION_VERSION_V4);
+        assert_eq!(artifact.verify_and_parse().unwrap(), request.normalize());
+
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        tampered["resolver"]["upstream"] = serde_json::json!("8.8.8.8@53");
+        let tampered_bytes = canonical_json_bytes(tampered).unwrap();
+        let stale_digest = CanonicalAuthorizationArtifact {
+            version: CANONICAL_AUTHORIZATION_VERSION_V4,
+            digest: artifact.digest.clone(),
+            canonical_bytes: tampered_bytes.clone(),
+        };
+        assert!(stale_digest.verify_and_parse().is_err());
+
+        let mut unknown: serde_json::Value = serde_json::from_slice(&tampered_bytes).unwrap();
+        unknown["resolver"]["unknown"] = serde_json::json!(true);
+        let unknown_bytes = canonical_json_bytes(unknown).unwrap();
+        let unknown = CanonicalAuthorizationArtifact {
+            version: CANONICAL_AUTHORIZATION_VERSION_V4,
+            digest: canonical_authorization_digest_for_version(
+                CANONICAL_AUTHORIZATION_VERSION_V4,
+                &unknown_bytes,
+            )
+            .unwrap(),
+            canonical_bytes: unknown_bytes,
+        };
+        assert!(unknown.verify_and_parse().is_err());
+
+        let mut missing = resolver_authorization_request();
+        missing.behavior.runner_profile["egress"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resolver");
+        assert!(missing.canonical_artifact_v4().is_err());
+    }
+
+    #[test]
+    fn canonical_authorization_cross_version_and_domain_replay_is_rejected() {
+        let v4 = resolver_authorization_request()
+            .canonical_artifact_v4()
+            .unwrap();
+        for version in [1, CANONICAL_AUTHORIZATION_VERSION_V2, 3] {
+            let replay = CanonicalAuthorizationArtifact {
+                version,
+                digest: canonical_authorization_digest_for_version(version, &v4.canonical_bytes)
+                    .unwrap(),
+                canonical_bytes: v4.canonical_bytes.clone(),
+            };
+            assert!(replay.verify_and_parse().is_err());
+        }
+
+        assert!(
+            resolver_authorization_request()
+                .canonical_artifact_v3()
+                .is_err()
+        );
+    }
+
+    fn resolver_authorization_request() -> ResolvedAuthorizationRequest {
+        let mut request = request();
+        request.agent_output_events = vec![AgentOutputEvent::JobSucceeded];
+        request.permission_envelope.environment.network_resources =
+            Some(NetworkResourceRequest::Resources(vec![
+                NetworkResourceKind::Llm,
+            ]));
+        request.behavior.runner_profile = serde_json::json!({
+            "profile_name":"agent",
+            "kind":"opencode",
+            "command":"opencode",
+            "args":["run"],
+            "container_image":"image@sha256:abc",
+            "file_mounts":[],
+            "credential_providers":[],
+            "trusted_mounts":[],
+            "mcp_bridges":[],
+            "egress":{
+                "llm":{"default_provider":null,"providers":{}},
+                "build":{"github_hosts":[],"go_registry_hosts":[],"crates_registry_hosts":[]},
+                "proxy":{"image":"proxy@sha256:abc","listen_port":3128,"runtime_uid":13,"runtime_gid":13,"writable_tmpfs_mode":"0755","declared_volumes":["/var/log/squid","/var/spool/squid"]},
+                "resolver":{"upstream":"127.0.0.11@53","readiness_host":"example.com"},
+                "preflight_image":"image@sha256:abc"
+            },
+            "github_hosts":[],
+            "opencode":{"max_validation_attempts":3,"trusted_env":{"OPENCODE_PURE":"1"}},
+            "config_digest":"fixture"
+        });
+        request
     }
 
     #[test]
@@ -626,7 +738,7 @@ mod immutable_authorization_tests {
             ],
             "egress":{
                 "llm":{"default_provider":null,"providers":{"openai":["api.openai.com","chatgpt.com"]}},
-                "build":{"github_hosts":["github.com"],"go_registry_hosts":["proxy.golang.org"],"crates_registry_hosts":["crates.io"]},
+                "build":{"github_hosts":["github.com"],"go_registry_hosts":["proxy.golang.org"],"crates_registry_hosts":["crates.io"],"pypi_registry_hosts":["pypi.org"],"npm_registry_hosts":["registry.npmjs.org"]},
                 "proxy":{"image":"proxy@sha256:abc","listen_port":3128,"runtime_uid":13,"runtime_gid":13,"writable_tmpfs_mode":"0755","declared_volumes":["/var/spool/squid","/var/log/squid"]},
                 "preflight_image":null
             },
@@ -2763,6 +2875,9 @@ pub enum WorkerProtocolCapability {
     /// The worker verifies canonical authorization v3 and derives executable
     /// agent transitions only from its signed agent_output_events set.
     CanonicalAuthorizationV3,
+    /// The worker verifies canonical authorization v4, including the exact
+    /// resolver enforcement contract used by restricted egress.
+    CanonicalAuthorizationV4,
 }
 
 pub fn worker_capability_for_canonical_authorization_version(
@@ -2773,7 +2888,12 @@ pub fn worker_capability_for_canonical_authorization_version(
         CANONICAL_AUTHORIZATION_VERSION_V2 => {
             Some(WorkerProtocolCapability::CanonicalAuthorizationV2)
         }
-        CANONICAL_AUTHORIZATION_VERSION => Some(WorkerProtocolCapability::CanonicalAuthorizationV3),
+        CANONICAL_AUTHORIZATION_VERSION_V3 => {
+            Some(WorkerProtocolCapability::CanonicalAuthorizationV3)
+        }
+        CANONICAL_AUTHORIZATION_VERSION_V4 => {
+            Some(WorkerProtocolCapability::CanonicalAuthorizationV4)
+        }
         _ => None,
     }
 }
@@ -2941,6 +3061,9 @@ pub enum NetworkResourceKind {
     Github,
     GoRegistry,
     CratesRegistry,
+    PypiRegistry,
+    NpmRegistry,
+    GuardedWeb,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -3078,10 +3201,13 @@ pub const AUTHORIZATION_REQUEST_VERSION: &str = "resolved_authorization_request_
 /// Identifies the exact DTO, canonicalization, and digest domain contract below.
 /// Any change to that contract requires a distinct version and domain separator.
 pub const CANONICAL_AUTHORIZATION_VERSION_V2: u32 = 2;
-pub const CANONICAL_AUTHORIZATION_VERSION: u32 = 3;
+pub const CANONICAL_AUTHORIZATION_VERSION_V3: u32 = 3;
+pub const CANONICAL_AUTHORIZATION_VERSION_V4: u32 = 4;
+pub const CANONICAL_AUTHORIZATION_VERSION: u32 = CANONICAL_AUTHORIZATION_VERSION_V4;
 const CANONICAL_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:resolved-authorization:v1\0";
 const CANONICAL_AUTHORIZATION_DOMAIN_V2: &[u8] = b"agent-hub:resolved-authorization:v2\0";
 const CANONICAL_AUTHORIZATION_DOMAIN_V3: &[u8] = b"agent-hub:resolved-authorization:v3\0";
+const CANONICAL_AUTHORIZATION_DOMAIN_V4: &[u8] = b"agent-hub:resolved-authorization:v4\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -3104,7 +3230,7 @@ pub struct ImmutableAuthorizationBundle {
 
 impl ImmutableAuthorizationBundle {
     pub fn create(request: &ResolvedAuthorizationRequest) -> Result<Self, serde_json::Error> {
-        let artifact = request.canonical_artifact_v3()?;
+        let artifact = request.canonical_artifact_v4()?;
         let request = artifact.verify_and_parse().map_err(|error| {
             serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
         })?;
@@ -3191,6 +3317,31 @@ struct ResolvedAuthorizationRequestV1 {
     resolved_environment: serde_json::Value,
     provider: ResolvedAuthorizationProviderV1,
     resource_constraints: ResolvedAuthorizationResourcesV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedAuthorizationRequestV4 {
+    request: ResolvedAuthorizationRequestV1,
+    agent_output_events: Vec<AgentOutputEvent>,
+    resolver: ResolverEnforcementV4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum ResolverEnforcementV4 {
+    Disabled,
+    Unbound {
+        upstream: String,
+        readiness_host: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerResolverV4 {
+    upstream: String,
+    readiness_host: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3342,6 +3493,9 @@ enum NetworkResourceKindV1 {
     Github,
     GoRegistry,
     CratesRegistry,
+    PypiRegistry,
+    NpmRegistry,
+    GuardedWeb,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3492,6 +3646,10 @@ struct RunnerEgressBuildV1 {
     github_hosts: Vec<String>,
     go_registry_hosts: Vec<String>,
     crates_registry_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pypi_registry_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    npm_registry_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3904,6 +4062,8 @@ impl ResolvedAuthorizationRequestV1 {
             normalize_lowercase_string_set(&mut profile.egress.build.github_hosts);
             normalize_lowercase_string_set(&mut profile.egress.build.go_registry_hosts);
             normalize_lowercase_string_set(&mut profile.egress.build.crates_registry_hosts);
+            normalize_lowercase_string_set(&mut profile.egress.build.pypi_registry_hosts);
+            normalize_lowercase_string_set(&mut profile.egress.build.npm_registry_hosts);
             normalize_string_set(&mut profile.egress.proxy.declared_volumes);
         }
         for capability in &mut self.permission_envelope.github_capabilities {
@@ -3955,6 +4115,151 @@ impl ResolvedAuthorizationRequestV1 {
     }
 }
 
+impl ResolvedAuthorizationRequestV4 {
+    fn from_semantic(mut request: ResolvedAuthorizationRequest) -> Result<Self, String> {
+        let resolver = take_resolver_enforcement(&mut request)?;
+        validate_resolver_enforcement(&resolver)?;
+        let agent_output_events = request.agent_output_events.clone();
+        let mut request = ResolvedAuthorizationRequestV1::from_semantic(request)
+            .map_err(|error| error.to_string())?;
+        request.normalize_sets();
+        if request_requires_resolver(&request)
+            && !matches!(resolver, ResolverEnforcementV4::Unbound { .. })
+        {
+            return Err("restricted authorization requires resolver enforcement".to_string());
+        }
+        Ok(Self {
+            request,
+            agent_output_events,
+            resolver,
+        })
+    }
+
+    fn normalize_sets(&mut self) {
+        self.request.normalize_sets();
+        self.agent_output_events.sort();
+        self.agent_output_events.dedup();
+    }
+
+    fn into_semantic(self) -> Result<ResolvedAuthorizationRequest, String> {
+        validate_resolver_enforcement(&self.resolver)?;
+        if request_requires_resolver(&self.request)
+            && !matches!(self.resolver, ResolverEnforcementV4::Unbound { .. })
+        {
+            return Err("restricted authorization requires resolver enforcement".to_string());
+        }
+        let mut request = self
+            .request
+            .into_semantic()
+            .map_err(|error| error.to_string())?;
+        request.agent_output_events = self.agent_output_events;
+        restore_resolver_enforcement(&mut request, self.resolver)?;
+        Ok(request)
+    }
+}
+
+fn validate_resolver_enforcement(resolver: &ResolverEnforcementV4) -> Result<(), String> {
+    let ResolverEnforcementV4::Unbound {
+        upstream,
+        readiness_host,
+    } = resolver
+    else {
+        return Ok(());
+    };
+    let (address, port) = upstream
+        .rsplit_once('@')
+        .ok_or_else(|| "resolver upstream must include @port".to_string())?;
+    address
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| "resolver upstream address must be an IP literal".to_string())?;
+    if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+        return Err("resolver upstream port is invalid".to_string());
+    }
+    if !readiness_host.contains('.')
+        || readiness_host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err("resolver readiness host is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn request_requires_resolver(request: &ResolvedAuthorizationRequestV1) -> bool {
+    matches!(
+        request.permission_envelope.environment.network_resources.as_ref(),
+        Some(NetworkResourceRequestV1::Resources(resources)) if !resources.is_empty()
+    )
+}
+
+fn take_resolver_enforcement(
+    request: &mut ResolvedAuthorizationRequest,
+) -> Result<ResolverEnforcementV4, String> {
+    let Some(profile) = request.behavior.runner_profile.as_object_mut() else {
+        return Err("runner profile must be an object".to_string());
+    };
+    if let Some(resolver) = profile.remove("resolver_enforcement") {
+        let resolver: RunnerResolverV4 = serde_json::from_value(resolver)
+            .map_err(|error| format!("invalid resolver enforcement: {error}"))?;
+        return Ok(ResolverEnforcementV4::Unbound {
+            upstream: resolver.upstream,
+            readiness_host: resolver.readiness_host,
+        });
+    }
+    let Some(egress) = profile.get_mut("egress") else {
+        return Ok(ResolverEnforcementV4::Disabled);
+    };
+    let egress = egress
+        .as_object_mut()
+        .ok_or_else(|| "runner egress must be an object".to_string())?;
+    let Some(resolver) = egress.remove("resolver") else {
+        return Ok(ResolverEnforcementV4::Disabled);
+    };
+    let resolver: RunnerResolverV4 =
+        serde_json::from_value(resolver).map_err(|error| format!("invalid resolver: {error}"))?;
+    Ok(ResolverEnforcementV4::Unbound {
+        upstream: resolver.upstream,
+        readiness_host: resolver.readiness_host,
+    })
+}
+
+fn restore_resolver_enforcement(
+    request: &mut ResolvedAuthorizationRequest,
+    resolver: ResolverEnforcementV4,
+) -> Result<(), String> {
+    let ResolverEnforcementV4::Unbound {
+        upstream,
+        readiness_host,
+    } = resolver
+    else {
+        return Ok(());
+    };
+    let profile = request
+        .behavior
+        .runner_profile
+        .as_object_mut()
+        .ok_or_else(|| "runner profile must be an object".to_string())?;
+    let resolver = serde_json::json!({
+        "upstream": upstream,
+        "readiness_host": readiness_host,
+    });
+    if let Some(egress) = profile
+        .get_mut("egress")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        egress.insert("resolver".to_string(), resolver);
+    } else {
+        profile.insert("resolver_enforcement".to_string(), resolver);
+    }
+    Ok(())
+}
+
 fn normalize_lowercase_string_set(values: &mut Vec<String>) {
     for value in values.iter_mut() {
         *value = value.trim().to_ascii_lowercase();
@@ -3968,6 +4273,9 @@ fn network_kind_v1_from_semantic(kind: NetworkResourceKind) -> NetworkResourceKi
         NetworkResourceKind::Github => NetworkResourceKindV1::Github,
         NetworkResourceKind::GoRegistry => NetworkResourceKindV1::GoRegistry,
         NetworkResourceKind::CratesRegistry => NetworkResourceKindV1::CratesRegistry,
+        NetworkResourceKind::PypiRegistry => NetworkResourceKindV1::PypiRegistry,
+        NetworkResourceKind::NpmRegistry => NetworkResourceKindV1::NpmRegistry,
+        NetworkResourceKind::GuardedWeb => NetworkResourceKindV1::GuardedWeb,
     }
 }
 
@@ -3977,6 +4285,9 @@ fn network_kind_v1_into_semantic(kind: NetworkResourceKindV1) -> NetworkResource
         NetworkResourceKindV1::Github => NetworkResourceKind::Github,
         NetworkResourceKindV1::GoRegistry => NetworkResourceKind::GoRegistry,
         NetworkResourceKindV1::CratesRegistry => NetworkResourceKind::CratesRegistry,
+        NetworkResourceKindV1::PypiRegistry => NetworkResourceKind::PypiRegistry,
+        NetworkResourceKindV1::NpmRegistry => NetworkResourceKind::NpmRegistry,
+        NetworkResourceKindV1::GuardedWeb => NetworkResourceKind::GuardedWeb,
     }
 }
 
@@ -4134,7 +4445,7 @@ impl ResolvedAuthorizationRequest {
     }
 
     pub fn request_digest(&self) -> Result<String, serde_json::Error> {
-        Ok(self.canonical_artifact_v3()?.digest)
+        Ok(self.canonical_artifact_v4()?.digest)
     }
 
     pub fn canonical_artifact(&self) -> Result<CanonicalAuthorizationArtifact, serde_json::Error> {
@@ -4145,6 +4456,42 @@ impl ResolvedAuthorizationRequest {
         &self,
     ) -> Result<CanonicalAuthorizationArtifact, serde_json::Error> {
         self.canonical_artifact_with_v3(true)
+    }
+
+    pub fn canonical_artifact_v4(
+        &self,
+    ) -> Result<CanonicalAuthorizationArtifact, serde_json::Error> {
+        if self.version != AUTHORIZATION_REQUEST_VERSION {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported authorization request schema {}", self.version),
+            )));
+        }
+        let normalized = self.clone().normalize();
+        let mut dto =
+            ResolvedAuthorizationRequestV4::from_semantic(normalized).map_err(|error| {
+                serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            })?;
+        if authorization_execution_context_has_legacy_events(
+            &dto.request.behavior.execution_context,
+        ) {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "canonical authorization v4 execution context must not contain valid_next_events",
+            )));
+        }
+        dto.normalize_sets();
+        let canonical_bytes = canonical_json_bytes(serde_json::to_value(dto)?)?;
+        let digest = canonical_authorization_digest_for_version(
+            CANONICAL_AUTHORIZATION_VERSION_V4,
+            &canonical_bytes,
+        )
+        .expect("canonical authorization v4 is supported");
+        Ok(CanonicalAuthorizationArtifact {
+            version: CANONICAL_AUTHORIZATION_VERSION_V4,
+            digest,
+            canonical_bytes,
+        })
     }
 
     fn canonical_artifact_with_v3(
@@ -4187,7 +4534,7 @@ impl ResolvedAuthorizationRequest {
                     "agent_output_events".to_string(),
                     serde_json::to_value(agent_output_events)?,
                 );
-            (CANONICAL_AUTHORIZATION_VERSION, value)
+            (CANONICAL_AUTHORIZATION_VERSION_V3, value)
         };
         let canonical_bytes = canonical_json_bytes(value)?;
         let digest = canonical_authorization_digest_for_version(version, &canonical_bytes)
@@ -4263,7 +4610,40 @@ impl CanonicalAuthorizationArtifact {
                 self.version
             ));
         }
-        let (mut dto, mut agent_output_events) = if self.version == CANONICAL_AUTHORIZATION_VERSION
+        if self.version == CANONICAL_AUTHORIZATION_VERSION_V4 {
+            let mut dto: ResolvedAuthorizationRequestV4 =
+                serde_json::from_slice(&self.canonical_bytes).map_err(|error| {
+                    format!("canonical authorization version 4 is invalid: {error}")
+                })?;
+            if authorization_execution_context_has_legacy_events(
+                &dto.request.behavior.execution_context,
+            ) {
+                return Err(
+                    "canonical authorization version 4 execution context contains valid_next_events"
+                        .to_string(),
+                );
+            }
+            if dto.request.version != AUTHORIZATION_REQUEST_VERSION {
+                return Err(
+                    "canonical authorization version 4 has incompatible request schema".to_string(),
+                );
+            }
+            dto.normalize_sets();
+            let canonical = canonical_json_bytes(
+                serde_json::to_value(&dto).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            if canonical != self.canonical_bytes {
+                return Err(
+                    "canonical authorization payload is not canonical for version 4".to_string(),
+                );
+            }
+            return dto.into_semantic().map_err(|error| {
+                format!("canonical authorization version 4 is semantically invalid: {error}")
+            });
+        }
+        let (mut dto, mut agent_output_events) = if self.version
+            == CANONICAL_AUTHORIZATION_VERSION_V3
         {
             let mut value: serde_json::Value = serde_json::from_slice(&self.canonical_bytes)
                 .map_err(|error| {
@@ -4330,7 +4710,7 @@ impl CanonicalAuthorizationArtifact {
         agent_output_events.sort();
         agent_output_events.dedup();
         let mut value = serde_json::to_value(&dto).map_err(|error| error.to_string())?;
-        if self.version == CANONICAL_AUTHORIZATION_VERSION {
+        if self.version == CANONICAL_AUTHORIZATION_VERSION_V3 {
             value
                 .as_object_mut()
                 .expect("request DTO is an object")
@@ -4384,7 +4764,8 @@ fn canonical_authorization_digest_for_version(
     digest.update(match version {
         1 => CANONICAL_AUTHORIZATION_DOMAIN_V1,
         CANONICAL_AUTHORIZATION_VERSION_V2 => CANONICAL_AUTHORIZATION_DOMAIN_V2,
-        CANONICAL_AUTHORIZATION_VERSION => CANONICAL_AUTHORIZATION_DOMAIN_V3,
+        CANONICAL_AUTHORIZATION_VERSION_V3 => CANONICAL_AUTHORIZATION_DOMAIN_V3,
+        CANONICAL_AUTHORIZATION_VERSION_V4 => CANONICAL_AUTHORIZATION_DOMAIN_V4,
         _ => {
             return Err(format!(
                 "unsupported canonical authorization version {version}"

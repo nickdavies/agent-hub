@@ -7,6 +7,7 @@
 //! be generated for TypeScript plugin consumption.
 
 pub mod approval;
+pub mod attended;
 pub mod config;
 pub mod gateway;
 pub mod hooks;
@@ -25,6 +26,12 @@ pub use approval::{
     ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, ExtraContext, HookEventName,
     KnownHookEvent, RequestType,
 };
+pub use attended::{
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION, ATTENDED_AUTHORIZATION_VERSION, ApprovedExecutionSpec,
+    AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1, AttendedLifecycleContract,
+    AttendedOutputContract, AttendedProposal, ContextRootSpec, RepositoryMountSpec,
+    ToolApprovalMode, WorkspaceAccess, WorkspaceSpec, sha256_hex_with_domain,
+};
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{
     ClaudeCodeHookInput, ClaudePermissionBehavior, ClaudePermissionRequestDecision,
@@ -41,7 +48,8 @@ pub use orchestration::{
     AgentContextPaths, AgentContextRepos, AgentContextWorkflow, AgentOutput, AgentOutputError,
     AgentOutputEvent, AgentOutputGitHubPr, ApprovalRuleSet, ArtifactSummary,
     AuthenticatedWorkerSession, BlockReason, CANONICAL_AUTHORIZATION_VERSION,
-    CANONICAL_AUTHORIZATION_VERSION_V2, CONTEXT_AUTHORIZATION_ID_KEY,
+    CANONICAL_AUTHORIZATION_VERSION_V2, CANONICAL_AUTHORIZATION_VERSION_V3,
+    CANONICAL_AUTHORIZATION_VERSION_V4, CONTEXT_AUTHORIZATION_ID_KEY,
     CONTEXT_AUTHORIZATION_REQUEST_KEY, CONTEXT_REQUEST_DIGEST_KEY, CancellationAcknowledgement,
     CancellationCommand, CancellationDeliveryState, CancellationLifecycleState,
     CancellationOutcome, CancellationStatus, CanonicalAuthorizationArtifact, CanonicalRuntimeSpec,

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use super::ExecutionCancellationContext;
+use crate::{CredentialMaterial, DockerMount, ExecutionCancellationContext};
 
 fn default_true() -> bool {
     true
@@ -84,6 +84,21 @@ impl std::fmt::Debug for ResolvedCredentials {
     }
 }
 
+impl ResolvedCredentials {
+    pub fn material(&self) -> anyhow::Result<CredentialMaterial> {
+        Ok(CredentialMaterial {
+            environment: self.env_vars.clone().into_iter().collect(),
+            mounts: self
+                .file_mounts
+                .iter()
+                .map(|(host, container, read_only)| DockerMount::new(host, container, *read_only))
+                .collect::<anyhow::Result<_>>()?,
+            temporary_files: self.temp_files.clone(),
+            redaction_values: self.redaction_values.clone(),
+        })
+    }
+}
+
 impl CredentialProvider {
     pub fn name(&self) -> &str {
         match self {
@@ -93,6 +108,41 @@ impl CredentialProvider {
             Self::KubeconfigFilter { name, .. } => name,
             Self::OpencodeChatgptOauth { name, .. } => name,
         }
+    }
+
+    pub fn provider_type(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "file",
+            Self::Env { .. } => "env",
+            Self::Command { .. } => "command",
+            Self::KubeconfigFilter { .. } => "kubeconfig-filter",
+            Self::OpencodeChatgptOauth { .. } => "opencode-chatgpt-oauth",
+        }
+    }
+
+    pub fn targets(&self) -> Vec<String> {
+        let mut targets = match self {
+            Self::File { container_path, .. } => vec![container_path.clone()],
+            Self::Env { vars, .. } => vars.keys().cloned().collect(),
+            Self::Command {
+                capture_env,
+                capture_file,
+                ..
+            } => capture_env
+                .iter()
+                .chain(capture_file.iter())
+                .cloned()
+                .collect(),
+            Self::KubeconfigFilter { container_path, .. } => {
+                container_path.iter().cloned().collect()
+            }
+            Self::OpencodeChatgptOauth { .. } => {
+                vec!["/opencode/data/opencode/auth.json".to_string()]
+            }
+        };
+        targets.sort();
+        targets.dedup();
+        targets
     }
 
     async fn resolve_for_job(

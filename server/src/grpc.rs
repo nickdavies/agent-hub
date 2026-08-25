@@ -172,6 +172,9 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
                     WorkerProtocolCapability::CanonicalAuthorizationV3 => {
                         pb::WorkerProtocolCapability::CanonicalAuthorizationV3 as i32
                     }
+                    WorkerProtocolCapability::CanonicalAuthorizationV4 => {
+                        pb::WorkerProtocolCapability::CanonicalAuthorizationV4 as i32
+                    }
                 })
                 .collect(),
         }))
@@ -383,6 +386,9 @@ fn server_protocol_capabilities_pb(capabilities: &[WorkerProtocolCapability]) ->
             WorkerProtocolCapability::CanonicalAuthorizationV3 => {
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV3 as i32
             }
+            WorkerProtocolCapability::CanonicalAuthorizationV4 => {
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV4 as i32
+            }
         })
         .collect()
 }
@@ -468,6 +474,9 @@ fn worker_protocol_capability_from_pb(value: i32) -> Result<WorkerProtocolCapabi
         }
         pb::WorkerProtocolCapability::CanonicalAuthorizationV3 => {
             Ok(WorkerProtocolCapability::CanonicalAuthorizationV3)
+        }
+        pb::WorkerProtocolCapability::CanonicalAuthorizationV4 => {
+            Ok(WorkerProtocolCapability::CanonicalAuthorizationV4)
         }
         pb::WorkerProtocolCapability::Unspecified => Err(Status::invalid_argument(
             "worker protocol capability unspecified",
@@ -1176,6 +1185,7 @@ mod tests {
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV1 as i32,
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV2 as i32,
                 pb::WorkerProtocolCapability::CanonicalAuthorizationV3 as i32,
+                pb::WorkerProtocolCapability::CanonicalAuthorizationV4 as i32,
             ],
         };
         let decoded = pb::RegisterWorkerRequest::decode(request.encode_to_vec().as_slice())
@@ -1191,6 +1201,10 @@ mod tests {
         assert_eq!(
             worker_protocol_capability_from_pb(decoded.protocol_capabilities[2]).unwrap(),
             WorkerProtocolCapability::CanonicalAuthorizationV3
+        );
+        assert_eq!(
+            worker_protocol_capability_from_pb(decoded.protocol_capabilities[3]).unwrap(),
+            WorkerProtocolCapability::CanonicalAuthorizationV4
         );
         assert!(
             worker_protocol_capability_from_pb(pb::WorkerProtocolCapability::Unspecified as i32)

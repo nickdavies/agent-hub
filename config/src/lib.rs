@@ -22,8 +22,13 @@ pub use environment_bundle::{
     materialize_environment_bundle_with_snapshot, materialize_environment_bundle_with_system,
     validate_durable_opencode_config,
 };
-pub use image::{ImageConfig, resolve_build_order};
-pub use network_policy::{FlattenedPolicy, NetworkPolicyConfig, PolicyAllowRule, flatten_policy};
+pub use image::{
+    ImageConfig, JOB_CODE_PREFLIGHT_PATH, JOB_CODE_TOOL_MANIFEST_PATH,
+    job_code_preflight_docker_args, resolve_build_order, validate_job_code_preflight_report,
+};
+pub use network_policy::{
+    FlattenedPolicy, NetworkPolicyConfig, PolicyAllowRule, canonical_policy_hosts, flatten_policy,
+};
 pub use rules::{
     ConfigAction, ConfigDecision, DefaultAction, RuleAction, RuleSummary, ToolConfig,
     default_to_resolved, load_tool_config, resolve_action, validate_tool_config,

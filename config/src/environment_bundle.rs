@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::{EnvironmentConfig, NetworkPolicyConfig, SystemConfig, flatten_policy};
 
 pub const DURABLE_OPENCODE_MODEL: &str = "openai/gpt-5.6-sol";
-pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-08-18";
+pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-08-24";
 pub const OPENCODE_CONFIG_SENTINEL: &[u8] =
     b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore";
 pub const OPENCODE_CONFIG_SENTINEL_SHA256: &str =
@@ -593,7 +593,7 @@ triage_environment = "test"
             r#"[environment]
 name = "test"
 description = "test"
-image = "agent-hub/job-code:2026-08-18"
+image = "agent-hub/job-code:2026-08-24"
 network_policy = "none"
 approval_mode = "auto"
 include_skills = ["example"]

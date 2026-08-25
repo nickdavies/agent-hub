@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use agent_hub_executor::{Cancellation, Deadline as JobDeadline, DockerMount};
 use anyhow::Context;
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
@@ -30,12 +31,12 @@ use tokio::sync::watch;
 
 mod artifacts;
 mod client;
-mod credential_provider;
 mod egress;
 mod egress_config;
 mod mcp_bridge;
 mod workspace;
 
+use agent_hub_executor::credential_provider::{ResolvedCredentials, resolve_all_for_job};
 use artifacts::{
     AdditionalRepoMountView, AgentContextWriteParams, collect_structured_transcript_artifacts,
     display_paths_for_runtime, file_len_u64, legacy_workflow_valid_next_events_from_job_context,
@@ -46,7 +47,6 @@ use client::{
     Client, GrpcClient, HttpClient, JobUpdateOutcome, is_worker_not_found_error,
     start_grpc_cancellation_stream, start_grpc_event_stream,
 };
-use credential_provider::{ResolvedCredentials, resolve_all_for_job};
 use egress::{EgressManager, llm_provider_from_env};
 use egress_config::{LocalAgentConfig, ManagedRunnerKind, load_local_agent_config};
 use local_agent::pb;
@@ -861,6 +861,7 @@ impl std::error::Error for ExecutionInterrupted {}
 struct ExecutionCancellationContext {
     stop_reason: Arc<std::sync::Mutex<Option<WorkerStopReason>>>,
     stop_rx: watch::Receiver<bool>,
+    effects: agent_hub_executor::ExecutionCancellationContext,
     phase: Arc<AttemptPhaseStore>,
     operations: Arc<OperationJournal>,
     assignment_id: uuid::Uuid,
@@ -871,6 +872,7 @@ struct ExecutionCancellationContext {
 
 struct ExternalOperation<'a> {
     cancellation: &'a ExecutionCancellationContext,
+    generic: Option<agent_hub_executor::ExternalOperation<'a>>,
     operation_id: uuid::Uuid,
     operation_kind: String,
     lifecycle_phase: AttemptPhase,
@@ -902,6 +904,22 @@ impl ExternalOperation<'_> {
         status: ExternalOperationStatus,
         error_category: Option<&str>,
     ) -> anyhow::Result<()> {
+        let generic = self
+            .generic
+            .take()
+            .context("generic external operation is already resolved")?;
+        match status {
+            ExternalOperationStatus::Completed => generic.completed()?,
+            ExternalOperationStatus::Ambiguous => {
+                generic.ambiguous(error_category.unwrap_or("external_operation_ambiguous"))?
+            }
+            ExternalOperationStatus::CleanupFailed => generic
+                .cleanup_failed(error_category.unwrap_or("external_operation_cleanup_failed"))?,
+            ExternalOperationStatus::Reconciled => generic.reconciled()?,
+            ExternalOperationStatus::Started => {
+                anyhow::bail!("external operation cannot finish in started state")
+            }
+        }
         let result = self.cancellation.operations.append(
             self.operation_id,
             &self.operation_kind,
@@ -1110,8 +1128,26 @@ impl ExecutionCancellationContext {
             }
             return Err(error);
         }
+        let generic = match self
+            .effects
+            .begin_external_operation(operation_kind, resource_identity)
+        {
+            Ok(generic) => generic,
+            Err(error) => {
+                if pre_cleanup_token {
+                    self.active_pre_cleanup_operations
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                if terminal_token {
+                    self.active_terminal_operations
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                return Err(error);
+            }
+        };
         Ok(ExternalOperation {
             cancellation: self,
+            generic: Some(generic),
             operation_id,
             operation_kind: operation_kind.to_string(),
             lifecycle_phase,
@@ -1292,7 +1328,11 @@ impl ExecutionCancellationContext {
         };
         Ok(Self {
             stop_reason: Arc::new(std::sync::Mutex::new(None)),
-            stop_rx,
+            stop_rx: stop_rx.clone(),
+            effects: agent_hub_executor::ExecutionCancellationContext::new(
+                root,
+                Cancellation::new(stop_rx),
+            )?,
             phase: Arc::new(AttemptPhaseStore::initialize(
                 root,
                 assignment_id,
@@ -1322,7 +1362,11 @@ impl ExecutionCancellationContext {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             stop_reason: Arc::new(std::sync::Mutex::new(None)),
-            stop_rx,
+            stop_rx: stop_rx.clone(),
+            effects: agent_hub_executor::ExecutionCancellationContext::new(
+                root,
+                Cancellation::new(stop_rx),
+            )?,
             phase: Arc::new(AttemptPhaseStore::initialize(
                 root,
                 assignment_id,
@@ -1657,6 +1701,7 @@ fn worker_protocol_capabilities() -> Vec<protocol::WorkerProtocolCapability> {
         protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
         protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
         protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+        protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
     ]
 }
 
@@ -2750,6 +2795,7 @@ mod tests {
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ]
         );
         assert_eq!(
@@ -2762,15 +2808,17 @@ mod tests {
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV1,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV2,
                 protocol::WorkerProtocolCapability::CanonicalAuthorizationV3,
+                protocol::WorkerProtocolCapability::CanonicalAuthorizationV4,
             ]),
             worker_protocol_capabilities(),
-            "a new server enables the atomic v3 session replacement"
+            "a new server enables the atomic v4 session replacement"
         );
 
         let old_server = Client::Http(HttpClient::new("http://old-server".to_string(), None));
         assert!(!old_server.server_supports_authorization_version(1));
         assert!(!old_server.server_supports_authorization_version(2));
         assert!(!old_server.server_supports_authorization_version(3));
+        assert!(!old_server.server_supports_authorization_version(4));
         if let Client::Http(client) = &old_server {
             let session_id = uuid::Uuid::new_v4();
             *client.worker_session.write().unwrap() = Some(protocol::AuthenticatedWorkerSession {
@@ -2791,6 +2839,7 @@ mod tests {
         assert!(old_server.server_supports_authorization_version(1));
         assert!(!old_server.server_supports_authorization_version(2));
         assert!(!old_server.server_supports_authorization_version(3));
+        assert!(!old_server.server_supports_authorization_version(4));
         if let Client::Http(client) = &old_server {
             client
                 .worker_session
@@ -4964,7 +5013,7 @@ mod tests {
             ("workspace.rs", include_str!("workspace.rs")),
             (
                 "credential_provider.rs",
-                include_str!("credential_provider.rs"),
+                include_str!("../../executor/src/credential_provider.rs"),
             ),
             ("mcp_bridge.rs", include_str!("mcp_bridge.rs")),
             ("artifacts.rs", include_str!("artifacts.rs")),
@@ -4988,7 +5037,7 @@ mod tests {
         effects.hash(&mut hasher);
         assert_eq!(
             hasher.finish(),
-            3_799_050_633_098_046_889,
+            2_839_038_212_704_831_756,
             "external-effect source inventory changed; audit every changed helper and update the reviewed fingerprint"
         );
     }
@@ -5502,6 +5551,27 @@ mod tests {
     }
 
     #[test]
+    fn typed_resource_subsets_map_to_exact_policy_selectors() {
+        assert_eq!(
+            policy_names_for_network_request(&NetworkResourceRequest::Resources(vec![
+                NetworkResourceKind::PypiRegistry,
+                NetworkResourceKind::Github,
+                NetworkResourceKind::NpmRegistry,
+                NetworkResourceKind::Github,
+            ]))
+            .unwrap(),
+            ["github-only", "npm-registry", "pypi-registry"]
+        );
+        assert!(
+            policy_names_for_network_request(&NetworkResourceRequest::Resources(vec![
+                NetworkResourceKind::GuardedWeb,
+                NetworkResourceKind::Llm,
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn local_agent_egress_plan_maps_build_resources_to_build_tier() {
         let runtime = protocol::CanonicalRuntimeSpec {
             runtime_version: "v2".to_string(),
@@ -5538,13 +5608,16 @@ mod tests {
 
         let mut config = LocalAgentConfig::default();
         config.set_config_tree_for_tests(crate::egress_config::ConfigTreeSnapshot {
-            network_policies: HashMap::from([(
-                "build".to_string(),
-                crate::egress_config::ConfiguredNetworkPolicy {
-                    hosts: vec!["github.com".to_string(), "api.openai.com".to_string()],
-                    ..Default::default()
-                },
-            )]),
+            network_policies: HashMap::from([
+                (
+                    "github-only".to_string(),
+                    crate::egress_config::ConfiguredNetworkPolicy::default(),
+                ),
+                (
+                    "crates-registry".to_string(),
+                    crate::egress_config::ConfiguredNetworkPolicy::default(),
+                ),
+            ]),
             ..Default::default()
         });
         let plan = resolve_local_agent_egress_plan(&runtime, &config).expect("egress plan");
@@ -5591,13 +5664,12 @@ mod tests {
 
         let mut config = LocalAgentConfig::default();
         config.set_config_tree_for_tests(crate::egress_config::ConfigTreeSnapshot {
-            network_policies: HashMap::from([(
-                "build".to_string(),
-                crate::egress_config::ConfiguredNetworkPolicy {
-                    hosts: vec!["github.com".to_string(), "api.openai.com".to_string()],
-                    ..Default::default()
-                },
-            )]),
+            network_policies: HashMap::from([
+                ("llm-only".to_string(), Default::default()),
+                ("github-only".to_string(), Default::default()),
+                ("go-registry".to_string(), Default::default()),
+                ("crates-registry".to_string(), Default::default()),
+            ]),
             ..Default::default()
         });
         let plan = resolve_local_agent_egress_plan(&runtime, &config).expect("egress plan");
@@ -6848,7 +6920,11 @@ async fn main() -> anyhow::Result<()> {
                 stop_reason: Arc::new(std::sync::Mutex::new(Some(
                     WorkerStopReason::CancelRequested(command.clone()),
                 ))),
-                stop_rx: recovery_stop_rx,
+                stop_rx: recovery_stop_rx.clone(),
+                effects: agent_hub_executor::ExecutionCancellationContext::new(
+                    &recovery_root,
+                    Cancellation::new(recovery_stop_rx),
+                )?,
                 phase: Arc::new(recovery_phase),
                 operations: recovery_journal,
                 assignment_id: command.runtime_assignment_id,
@@ -7140,7 +7216,11 @@ async fn main() -> anyhow::Result<()> {
             let attempt_root = private_attempt_root(&cli.data_dir, assignment_id)?;
             let cancellation_context = Arc::new(ExecutionCancellationContext {
                 stop_reason: Arc::clone(&stop_reason),
-                stop_rx: cancel_rx,
+                stop_rx: cancel_rx.clone(),
+                effects: agent_hub_executor::ExecutionCancellationContext::new(
+                    &attempt_root,
+                    Cancellation::new(cancel_rx),
+                )?,
                 phase: Arc::new(AttemptPhaseStore::initialize(
                     &attempt_root,
                     assignment_id,
@@ -9271,6 +9351,7 @@ exit 0
             },
             redactor: ExactTokenRedactor::new(vec!["synthetic-edge-canary".to_string()]),
             mcp_bridges: Vec::new(),
+            restricted_egress: None,
         }
     }
 
@@ -10519,11 +10600,11 @@ mod real_docker_oauth_integration_tests {
         );
         assert!(!runtime.permissions.can_access_network);
         assert_eq!(
-            policy_name_for_network_request(
+            policy_names_for_network_request(
                 runtime.environment.network_resources.as_ref().unwrap()
             )
             .unwrap(),
-            None
+            Vec::<&str>::new()
         );
     }
 
@@ -11006,7 +11087,7 @@ mod real_docker_oauth_integration_tests {
                 output_path.clone(),
                 CANARY.as_bytes(),
                 deadline
-                    .monotonic
+                    .instant()
                     .context("cancellation integration requires an absolute deadline")?,
                 cancel_tx,
             )))
@@ -11538,6 +11619,41 @@ printf '{{"next_event":"{next_event}","summary":"%s"}}' "$access" > /transcript/
     }
 }
 
+fn validate_builtin_runner_profile(
+    value: &serde_json::Value,
+    profile_name: &str,
+    config_digest: &str,
+    config: &LocalAgentConfig,
+) -> anyhow::Result<()> {
+    let mut profile = value
+        .as_object()
+        .context("runner profile must be an object")?
+        .clone();
+    let resolver = profile.remove("resolver_enforcement");
+    anyhow::ensure!(
+        profile
+            == serde_json::json!({
+                "profile_name": profile_name,
+                "config_digest": config_digest,
+            })
+            .as_object()
+            .expect("fixed runner profile is an object")
+            .clone(),
+        "fixed runner profile identity is invalid"
+    );
+    if let Some(resolver) = resolver {
+        anyhow::ensure!(
+            resolver
+                == serde_json::json!({
+                    "upstream": config.egress.resolver.upstream,
+                    "readiness_host": config.egress.resolver.readiness_host,
+                }),
+            "runner resolver enforcement does not match local configuration"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn verify_authorized_job(
     job: &Job,
@@ -11643,11 +11759,13 @@ fn verify_authorized_job_for_session(
         validate_exact_triage_mount_contract(&request.permission_envelope, config)?;
     }
     if request.behavior.execution_kind == "command" {
-        if request.behavior.runner_profile
-            != serde_json::json!({"profile_name":"command", "config_digest":"command_v1"})
-        {
-            anyhow::bail!("authorized command runner profile is invalid");
-        }
+        validate_builtin_runner_profile(
+            &request.behavior.runner_profile,
+            "command",
+            "command_v1",
+            config,
+        )
+        .context("authorized command runner profile is invalid")?;
         let mut authorized_job = job.clone();
         authorized_job.command = request.behavior.command;
         authorized_job.args = request.behavior.args;
@@ -11676,11 +11794,13 @@ fn verify_authorized_job_for_session(
         });
     }
     if request.behavior.execution_kind == "managed" {
-        if request.behavior.runner_profile
-            != serde_json::json!({"profile_name":"github_action", "config_digest":"github_action_v1"})
-        {
-            anyhow::bail!("authorized GitHub action profile is invalid");
-        }
+        validate_builtin_runner_profile(
+            &request.behavior.runner_profile,
+            "github_action",
+            "github_action_v1",
+            config,
+        )
+        .context("authorized GitHub action profile is invalid")?;
         let operation = request
             .behavior
             .execution_context
@@ -13016,7 +13136,7 @@ fn validate_github_login(value: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod github_action_tests {
     use super::*;
-    use crate::credential_provider::CredentialProvider;
+    use agent_hub_executor::credential_provider::CredentialProvider;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14052,7 +14172,10 @@ fn authorized_execution_context(
         protocol::CONTEXT_AUTHORIZATION_REQUEST_KEY.to_string(),
         serde_json::to_value(&bundle.request)?,
     );
-    if bundle.version == protocol::CANONICAL_AUTHORIZATION_VERSION {
+    if matches!(
+        bundle.version,
+        protocol::CANONICAL_AUTHORIZATION_VERSION_V3 | protocol::CANONICAL_AUTHORIZATION_VERSION_V4
+    ) {
         let workflow = object
             .entry("workflow".to_string())
             .or_insert_with(|| serde_json::json!({}));
@@ -14084,7 +14207,8 @@ fn authorized_agent_output_events(
     bundle: &protocol::ImmutableAuthorizationBundle,
 ) -> anyhow::Result<Vec<String>> {
     match bundle.version {
-        protocol::CANONICAL_AUTHORIZATION_VERSION => Ok(bundle
+        protocol::CANONICAL_AUTHORIZATION_VERSION_V3
+        | protocol::CANONICAL_AUTHORIZATION_VERSION_V4 => Ok(bundle
             .request
             .agent_output_events
             .iter()
@@ -14124,12 +14248,6 @@ enum ExecutionStatus {
     Exited(i32),
     TimedOut,
     Cancelled,
-}
-
-#[derive(Debug, Clone)]
-struct JobDeadline {
-    monotonic: Option<Instant>,
-    wall_clock: Option<SystemTime>,
 }
 
 /// Removes exact access-token byte sequences from worker-controlled output boundaries.
@@ -14391,6 +14509,10 @@ impl ContainerOwnership {
                 .parse()
                 .context("container worker session generation label is not a u64")?,
         })
+    }
+
+    fn executor_identity(&self) -> anyhow::Result<agent_hub_executor::DockerOwnership> {
+        agent_hub_executor::DockerOwnership::new(self.labels().into_iter().collect())
     }
 }
 
@@ -15272,13 +15394,8 @@ async fn inspect_local_image_id(
 }
 
 fn verify_resolved_image_id(expected: &str, current: &str) -> anyhow::Result<()> {
-    if expected == current {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "configured OpenCode image tag changed during job setup: expected {expected}, resolved {current}"
-        )
-    }
+    agent_hub_executor::verify_image_identity(expected, current)
+        .context("configured OpenCode image tag changed during job setup")
 }
 
 async fn run_before_deadline(
@@ -15355,54 +15472,6 @@ async fn run_before_deadline_with_budget(
             journal.ambiguous("external_request_failed")?;
             Err(error)
         }
-    }
-}
-
-impl JobDeadline {
-    fn new(timeout_secs: Option<u64>) -> anyhow::Result<Self> {
-        Self::from_start(Instant::now(), SystemTime::now(), timeout_secs)
-    }
-
-    fn from_start(
-        monotonic_start: Instant,
-        wall_clock_start: SystemTime,
-        timeout_secs: Option<u64>,
-    ) -> anyhow::Result<Self> {
-        let timeout = timeout_secs.map(Duration::from_secs);
-        Ok(Self {
-            monotonic: timeout
-                .map(|duration| {
-                    monotonic_start
-                        .checked_add(duration)
-                        .context("job monotonic deadline overflow")
-                })
-                .transpose()?,
-            wall_clock: timeout
-                .map(|duration| {
-                    wall_clock_start
-                        .checked_add(duration)
-                        .context("job wall-clock deadline overflow")
-                })
-                .transpose()?,
-        })
-    }
-
-    fn remaining(&self) -> Option<Duration> {
-        self.remaining_at(Instant::now())
-    }
-
-    fn remaining_at(&self, now: Instant) -> Option<Duration> {
-        self.monotonic
-            .map(|deadline| deadline.saturating_duration_since(now))
-    }
-
-    fn is_expired(&self) -> bool {
-        self.remaining()
-            .is_some_and(|remaining| remaining.is_zero())
-    }
-
-    fn wall_clock(&self) -> Option<SystemTime> {
-        self.wall_clock
     }
 }
 
@@ -15509,6 +15578,7 @@ enum LocalAgentEgressTier {
     Llm,
     Github,
     Build,
+    GuardedWeb,
     Full,
 }
 
@@ -15518,6 +15588,7 @@ impl LocalAgentEgressTier {
             Self::Llm => "llm",
             Self::Github => "github-only",
             Self::Build => "build",
+            Self::GuardedWeb => "guarded-web",
             Self::Full => "full",
         }
     }
@@ -15527,6 +15598,7 @@ impl LocalAgentEgressTier {
 struct LocalAgentEgressPlan {
     network_none: bool,
     tier: Option<LocalAgentEgressTier>,
+    resources: Vec<NetworkResourceKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -15624,92 +15696,87 @@ fn resolve_local_agent_egress_plan(
         return Ok(LocalAgentEgressPlan {
             network_none: true,
             tier: None,
+            resources: Vec::new(),
         });
     };
 
-    let requested_policy = policy_name_for_network_request(&request)?;
-    let Some(policy_name) = requested_policy else {
+    let policy_names = policy_names_for_network_request(&request)?;
+    if policy_names.is_empty() {
         return Ok(LocalAgentEgressPlan {
             network_none: true,
             tier: None,
+            resources: Vec::new(),
         });
-    };
+    }
 
     let tree = local_agent_config
         .config_tree()
         .ok_or_else(|| anyhow::anyhow!("CONFIG_ROOT is required and config tree must be loaded"))?;
-    let Some(policy) = tree.network_policies.get(policy_name) else {
-        anyhow::bail!(
-            "network policy '{}' is required by CONFIG_ROOT but was not loaded",
-            policy_name
-        );
-    };
-
-    let tier = if policy.unrestricted {
-        Some(LocalAgentEgressTier::Full)
-    } else if policy
-        .docker_network
-        .as_deref()
-        .is_some_and(|network| network.eq_ignore_ascii_case("none"))
-    {
-        None
-    } else {
-        match policy_name {
-            "llm-only" => Some(LocalAgentEgressTier::Llm),
-            "github-only" => Some(LocalAgentEgressTier::Github),
-            "build" => Some(LocalAgentEgressTier::Build),
-            "none" => None,
-            "full" => Some(LocalAgentEgressTier::Full),
-            _ => anyhow::bail!(
-                "network policy '{}' is unsupported by local-agent tier mapping",
+    for policy_name in &policy_names {
+        let Some(policy) = tree.network_policies.get(*policy_name) else {
+            anyhow::bail!(
+                "network policy '{}' is required by CONFIG_ROOT but was not loaded",
                 policy_name
-            ),
+            );
+        };
+        let expects_unrestricted = *policy_name == "full";
+        if policy.unrestricted != expects_unrestricted || policy.docker_network.is_some() {
+            anyhow::bail!(
+                "network policy '{}' does not match its typed restricted/unrestricted contract",
+                policy_name
+            );
         }
+    }
+
+    let resources = request.resources();
+    let tier = match &request {
+        NetworkResourceRequest::None => None,
+        NetworkResourceRequest::Full => Some(LocalAgentEgressTier::Full),
+        NetworkResourceRequest::Resources(_) if resources == [NetworkResourceKind::Llm] => {
+            Some(LocalAgentEgressTier::Llm)
+        }
+        NetworkResourceRequest::Resources(_) if resources == [NetworkResourceKind::Github] => {
+            Some(LocalAgentEgressTier::Github)
+        }
+        NetworkResourceRequest::Resources(_) if resources == [NetworkResourceKind::GuardedWeb] => {
+            Some(LocalAgentEgressTier::GuardedWeb)
+        }
+        NetworkResourceRequest::Resources(_) => Some(LocalAgentEgressTier::Build),
     };
 
     Ok(LocalAgentEgressPlan {
         network_none: tier.is_none(),
         tier,
+        resources,
     })
 }
 
-fn policy_name_for_network_request(
+fn policy_names_for_network_request(
     request: &NetworkResourceRequest,
-) -> anyhow::Result<Option<&'static str>> {
+) -> anyhow::Result<Vec<&'static str>> {
     match request {
-        NetworkResourceRequest::None => Ok(None),
-        NetworkResourceRequest::Full => Ok(Some("full")),
+        NetworkResourceRequest::None => Ok(Vec::new()),
+        NetworkResourceRequest::Full => Ok(vec!["full"]),
         NetworkResourceRequest::Resources(resources) => {
-            let mut deduped = resources.clone();
-            deduped.sort_by_key(|a| a.to_string());
-            deduped.dedup();
+            let deduped = NetworkResourceRequest::Resources(resources.clone()).resources();
             if deduped.is_empty() {
-                return Ok(None);
+                return Ok(Vec::new());
             }
-            if deduped
+            if deduped.contains(&NetworkResourceKind::GuardedWeb) && deduped.len() != 1 {
+                anyhow::bail!("guarded_web cannot be combined with other network resources");
+            }
+            Ok(deduped
                 .iter()
-                .all(|resource| matches!(resource, NetworkResourceKind::Llm))
-            {
-                return Ok(Some("llm-only"));
-            }
-            if deduped == [NetworkResourceKind::Github] {
-                return Ok(Some("github-only"));
-            }
-            if deduped.iter().all(|resource| {
-                matches!(
-                    resource,
-                    NetworkResourceKind::Llm
-                        | NetworkResourceKind::Github
-                        | NetworkResourceKind::GoRegistry
-                        | NetworkResourceKind::CratesRegistry
-                )
-            }) {
-                return Ok(Some("build"));
-            }
-            anyhow::bail!(
-                "requested network resources are unsupported by local-agent policies: {:?}",
-                deduped
-            );
+                .map(|resource| match resource {
+                    NetworkResourceKind::Llm => "llm-only",
+                    NetworkResourceKind::Github => "github-only",
+                    NetworkResourceKind::GoRegistry => "go-registry",
+                    NetworkResourceKind::CratesRegistry => "crates-registry",
+                    NetworkResourceKind::PypiRegistry => "pypi-registry",
+                    NetworkResourceKind::NpmRegistry => "npm-registry",
+                    NetworkResourceKind::GuardedWeb => "guarded-web",
+                })
+                .collect())
         }
     }
 }
@@ -16733,7 +16800,11 @@ async fn recover_terminal_reporting_attempts(
         let (_stop_tx, stop_rx) = watch::channel(false);
         let cancellation = ExecutionCancellationContext {
             stop_reason: Arc::new(std::sync::Mutex::new(None)),
-            stop_rx,
+            stop_rx: stop_rx.clone(),
+            effects: agent_hub_executor::ExecutionCancellationContext::new(
+                &root,
+                Cancellation::new(stop_rx),
+            )?,
             phase: Arc::new(AttemptPhaseStore::initialize(
                 &root,
                 phase.assignment_id,
@@ -17592,6 +17663,17 @@ async fn run_docker(
     };
     let workspace_dir = resolve_to_absolute(workspace_dir)
         .with_context(|| format!("resolve workspace dir {}", workspace_dir.display()))?;
+    let container_image = runtime_container_image.ok_or_else(|| {
+        anyhow::anyhow!("runtime container_image must be set via CONFIG_ROOT configuration")
+    })?;
+    preflight_job_code_runtime(
+        &container_image,
+        &container_image,
+        &workspace_dir,
+        deadline,
+        cancellation,
+    )
+    .await?;
     let transcript_dir = resolve_to_absolute(Path::new(transcript_dir))
         .with_context(|| format!("resolve transcript dir {}", transcript_dir))?;
     let mut mount_targets = vec!["/workspace".to_string(), "/transcript".to_string()];
@@ -17696,6 +17778,7 @@ async fn run_docker(
     }
 
     args.push("--security-opt=no-new-privileges".to_string());
+    args.push("--cap-drop=ALL".to_string());
 
     let memory_limit = runtime_spec
         .environment
@@ -17711,10 +17794,12 @@ async fn run_docker(
     args.push(format!("--cpus={cpu_limit}"));
 
     let mut docker_network_none = local_egress_plan.network_none;
+    let mut prepared_egress = None;
     let restricted_tier = match local_egress_plan.tier {
         Some(LocalAgentEgressTier::Llm)
         | Some(LocalAgentEgressTier::Github)
-        | Some(LocalAgentEgressTier::Build) => local_egress_plan.tier,
+        | Some(LocalAgentEgressTier::Build)
+        | Some(LocalAgentEgressTier::GuardedWeb) => local_egress_plan.tier,
         _ => None,
     };
     if !runtime_spec.permissions.can_access_network && !docker_network_none {
@@ -17745,19 +17830,6 @@ async fn run_docker(
                 );
             }
         }
-
-        let llm_provider = llm_provider_from_env(env);
-        let restricted_runtime = egress_manager
-            .prepare_restricted_tier(tier, llm_provider.as_deref())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed preparing restricted egress tier '{}' for job {}",
-                    tier.as_str(),
-                    job.id
-                )
-            })?;
-        restricted_runtime.apply_container_network_controls(&mut args, &mut docker_env);
 
         if matches!(tier, LocalAgentEgressTier::Build) {
             apply_build_egress_env_defaults(&mut docker_env, local_agent_config);
@@ -17821,11 +17893,7 @@ async fn run_docker(
             )
         })?;
         args.push("-v".to_string());
-        args.push(format!(
-            "{}:{}:ro",
-            host_path.to_string_lossy(),
-            mount.container_path
-        ));
+        args.push(DockerMount::new(host_path, &mount.container_path, true)?.argument());
     }
 
     let work_item_context = work_item_contract_from_job_context(&job.context);
@@ -17856,15 +17924,13 @@ async fn run_docker(
         &resolved_credentials,
         &mut args,
         &mut docker_env,
-    );
+    )?;
 
     for mount in &runtime_spec.environment.file_mounts {
-        let mut spec = format!("{}:{}", mount.host_path, mount.container_path);
-        if mount.read_only {
-            spec.push_str(":ro");
-        }
         args.push("-v".to_string());
-        args.push(spec);
+        args.push(
+            DockerMount::new(&mount.host_path, &mount.container_path, mount.read_only)?.argument(),
+        );
     }
     let mut mcp_bridges = configure_mcp_bridges_for_docker(
         &mut args,
@@ -17876,13 +17942,34 @@ async fn run_docker(
         cancellation,
     )
     .await?;
+    if let Some(tier) = restricted_tier
+        && !docker_network_none
+    {
+        let llm_provider = llm_provider_from_env(env);
+        let restricted_runtime = egress_manager
+            .prepare_restricted_tier(
+                tier,
+                &local_egress_plan.resources,
+                llm_provider.as_deref(),
+                &job.id.simple().to_string(),
+                Cancellation::new(cancellation.stop_rx.clone()),
+                deadline,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed preparing restricted egress tier '{}' for job {}",
+                    tier.as_str(),
+                    job.id
+                )
+            })?;
+        restricted_runtime.runtime.apply(&mut args, &mut docker_env);
+        prepared_egress = Some(restricted_runtime);
+    }
     for (k, v) in &docker_env {
         args.push("-e".to_string());
         args.push(format!("{k}={v}"));
     }
-    let container_image = runtime_container_image.ok_or_else(|| {
-        anyhow::anyhow!("runtime container_image must be set via CONFIG_ROOT configuration")
-    })?;
     args.push("--entrypoint".to_string());
     args.push(job.command.clone());
     args.push(container_image);
@@ -18042,6 +18129,12 @@ async fn run_docker(
         )),
     };
     finalize_required_cleanup(run_result, async {
+        if let Some(prepared) = &mut prepared_egress {
+            prepared
+                .cleanup(&JobDeadline::new(Some(30))?)
+                .await
+                .context("restricted egress cleanup")?;
+        }
         for bridge in &mut mcp_bridges {
             bridge.stop(cancellation).await?;
         }
@@ -18071,6 +18164,7 @@ struct DockerRuntimeInvocation {
     resolved_image: ResolvedOpencodeImage,
     redactor: ExactTokenRedactor,
     mcp_bridges: Vec<McpBridgeInstance>,
+    restricted_egress: Option<agent_hub_executor::egress::PreparedRestrictedEgress>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18126,7 +18220,7 @@ async fn run_docker_opencode_with_validation_retries(
     .await?;
     cancellation.check()?;
 
-    let result = run_opencode_validation_loop(
+    let operation = run_opencode_validation_loop(
         job,
         opencode,
         &invocation,
@@ -18141,8 +18235,18 @@ async fn run_docker_opencode_with_validation_retries(
     for bridge in &mut invocation.mcp_bridges {
         bridge.stop(cancellation).await?;
     }
-    cancellation.check()?;
-    result
+    let cleanup = match &mut invocation.restricted_egress {
+        Some(prepared) => prepared.cleanup(&JobDeadline::new(Some(30))?).await,
+        None => Ok(()),
+    };
+    match (operation, cleanup) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup.context("cleanup restricted egress")),
+        (Err(error), Err(cleanup)) => Err(anyhow::anyhow!(
+            "OpenCode execution failed: {error:#}; restricted egress cleanup also failed: {cleanup:#}"
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18561,10 +18665,7 @@ fn build_opencode_create_args(
     create_args.retain(|arg| arg != "--rm");
     create_args.push("--name".to_string());
     create_args.push(container_name.to_string());
-    for (key, value) in ownership.labels() {
-        create_args.push("--label".to_string());
-        create_args.push(format!("{key}={value}"));
-    }
+    create_args.extend(ownership.executor_identity()?.label_args());
     create_args.push("--entrypoint".to_string());
     create_args.push("/usr/bin/sh".to_string());
     create_args.push(invocation_args[image_idx].clone());
@@ -19025,6 +19126,14 @@ async fn build_docker_runtime_invocation(
             serde_json::to_vec_pretty(&resolved_image)?,
         )
         .context("write transcript OpenCode image identity")?;
+    preflight_job_code_runtime(
+        configured_image,
+        &resolved_image.image_id,
+        &workspace_dir,
+        deadline,
+        cancellation,
+    )
+    .await?;
     let trusted_mounts = opencode_job_state.trusted_mounts()?;
     let mut mount_targets = vec!["/workspace".to_string(), "/transcript".to_string()];
     mount_targets.extend(
@@ -19135,6 +19244,7 @@ async fn build_docker_runtime_invocation(
     }
 
     args.push("--security-opt=no-new-privileges".to_string());
+    args.push("--cap-drop=ALL".to_string());
 
     let memory_limit = runtime_spec
         .environment
@@ -19153,9 +19263,11 @@ async fn build_docker_runtime_invocation(
     let restricted_tier = match local_egress_plan.tier {
         Some(LocalAgentEgressTier::Llm)
         | Some(LocalAgentEgressTier::Github)
-        | Some(LocalAgentEgressTier::Build) => local_egress_plan.tier,
+        | Some(LocalAgentEgressTier::Build)
+        | Some(LocalAgentEgressTier::GuardedWeb) => local_egress_plan.tier,
         _ => None,
     };
+    let mut prepared_egress = None;
     if !runtime_spec.permissions.can_access_network && !docker_network_none {
         let warning =
             "WARNING: forcing --network=none because can_access_network is false in permissions";
@@ -19184,19 +19296,6 @@ async fn build_docker_runtime_invocation(
                 );
             }
         }
-
-        let llm_provider = llm_provider_from_env(env);
-        let restricted_runtime = egress_manager
-            .prepare_restricted_tier(tier, llm_provider.as_deref())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed preparing restricted egress tier '{}' for job {}",
-                    tier.as_str(),
-                    job.id
-                )
-            })?;
-        restricted_runtime.apply_container_network_controls(&mut args, &mut docker_env);
 
         if matches!(tier, LocalAgentEgressTier::Build) {
             apply_build_egress_env_defaults(&mut docker_env, local_agent_config);
@@ -19280,15 +19379,13 @@ async fn build_docker_runtime_invocation(
         &resolved_credentials,
         &mut args,
         &mut docker_env,
-    );
+    )?;
 
     for mount in &runtime_spec.environment.file_mounts {
-        let mut spec = format!("{}:{}", mount.host_path, mount.container_path);
-        if mount.read_only {
-            spec.push_str(":ro");
-        }
         args.push("-v".to_string());
-        args.push(spec);
+        args.push(
+            DockerMount::new(&mount.host_path, &mount.container_path, mount.read_only)?.argument(),
+        );
     }
     let mcp_bridges = configure_mcp_bridges_for_docker(
         &mut args,
@@ -19301,6 +19398,30 @@ async fn build_docker_runtime_invocation(
     )
     .await?;
     apply_trusted_opencode_environment(&mut docker_env, trusted_opencode_env)?;
+    if let Some(tier) = restricted_tier
+        && !docker_network_none
+    {
+        let llm_provider = llm_provider_from_env(env);
+        let restricted_runtime = egress_manager
+            .prepare_restricted_tier(
+                tier,
+                &local_egress_plan.resources,
+                llm_provider.as_deref(),
+                &job.id.simple().to_string(),
+                cancellation.effects.cancellation(),
+                deadline,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed preparing restricted egress tier '{}' for job {}",
+                    tier.as_str(),
+                    job.id
+                )
+            })?;
+        restricted_runtime.runtime.apply(&mut args, &mut docker_env);
+        prepared_egress = Some(restricted_runtime);
+    }
     append_docker_environment(&mut args, &docker_env);
     args.push("--entrypoint".to_string());
     args.push(job.command.clone());
@@ -19321,6 +19442,7 @@ async fn build_docker_runtime_invocation(
         resolved_image,
         redactor,
         mcp_bridges,
+        restricted_egress: prepared_egress,
     })
 }
 
@@ -19365,7 +19487,7 @@ async fn configure_mcp_bridges_for_docker(
         match McpBridgeInstance::start(bridge_config, runtime_root, cancellation).await {
             Ok(bridge) => {
                 args.push("-v".to_string());
-                args.push(bridge.docker_mount_arg());
+                args.push(bridge.docker_mount_arg()?);
 
                 let container_path = container_socket_path(bridge_config);
                 if let Some(env_var) = mcp_socket_env_var(&bridge.name) {
@@ -19435,13 +19557,19 @@ async fn resolve_configured_credentials(
                 })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    resolve_all_for_job(&providers, valid_through, credential_dir, cancellation).await
+    resolve_all_for_job(
+        &providers,
+        valid_through,
+        credential_dir,
+        &cancellation.effects,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod selected_credential_provider_tests {
     use super::{ExecutionCancellationContext, LocalAgentConfig, resolve_configured_credentials};
-    use crate::credential_provider::CredentialProvider;
+    use agent_hub_executor::credential_provider::CredentialProvider;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -19830,7 +19958,7 @@ mod oauth_secret_canary_tests {
         append_resolved_credentials_to_docker_invocation, finalize_redacted_output_artifact,
         output_redaction_marker,
     };
-    use crate::credential_provider::{CredentialProvider, resolve_all_for_job};
+    use agent_hub_executor::credential_provider::{CredentialProvider, resolve_all_for_job};
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19873,13 +20001,13 @@ mod oauth_secret_canary_tests {
             &[provider],
             SystemTime::now().checked_add(Duration::from_secs(120)),
             Some(&data),
-            &cancellation,
+            &cancellation.effects,
         )
         .await
         .unwrap();
         let mut args = vec!["run".to_string()];
         let mut env = HashMap::new();
-        append_resolved_credentials_to_docker_invocation(&resolved, &mut args, &mut env);
+        append_resolved_credentials_to_docker_invocation(&resolved, &mut args, &mut env).unwrap();
         let observable = format!("argv={args:?}\nenv={env:?}\n");
         assert!(!format!("{resolved:?}").contains(canary));
         for file in [
@@ -19955,21 +20083,10 @@ fn append_resolved_credentials_to_docker_invocation(
     resolved: &ResolvedCredentials,
     args: &mut Vec<String>,
     docker_env: &mut HashMap<String, String>,
-) {
-    for (host_path, container_path, read_only) in &resolved.file_mounts {
-        let mut spec = format!("{host_path}:{container_path}");
-        if *read_only {
-            spec.push_str(":ro");
-        }
-        args.push("-v".to_string());
-        args.push(spec);
-    }
-
-    for (key, value) in &resolved.env_vars {
-        docker_env
-            .entry(key.clone())
-            .or_insert_with(|| value.clone());
-    }
+) -> anyhow::Result<()> {
+    let material = resolved.material()?;
+    material.apply(args, docker_env);
+    Ok(())
 }
 
 fn validate_general_job_credentials_cancellable(
@@ -20043,6 +20160,62 @@ fn docker_run_user_arg(workspace_dir: &Path) -> Option<String> {
         let _ = workspace_dir;
         None
     }
+}
+
+async fn preflight_job_code_runtime(
+    configured_image: &str,
+    resolved_image: &str,
+    workspace_dir: &Path,
+    deadline: &JobDeadline,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
+    if configured_image != agent_hub_config::DURABLE_OPENCODE_IMAGE {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let (uid, gid) = {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(workspace_dir).with_context(|| {
+            format!(
+                "inspect job-code representative runtime identity from {}",
+                workspace_dir.display()
+            )
+        })?;
+        (metadata.uid(), metadata.gid())
+    };
+    #[cfg(not(unix))]
+    anyhow::bail!("job-code preflight requires a Unix runtime UID and GID");
+
+    let args = agent_hub_config::job_code_preflight_docker_args(resolved_image, uid, gid)
+        .map_err(anyhow::Error::msg)?;
+    let output = run_before_deadline_with_budget(
+        tokio::process::Command::new("docker").args(args),
+        deadline,
+        Some(Duration::from_secs(120)),
+        "job-code toolchain preflight",
+        cancellation,
+        "docker_job_code_preflight",
+        resolved_image,
+    )
+    .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "job-code toolchain preflight failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let report = agent_hub_config::validate_job_code_preflight_report(
+        &output.stdout,
+        resolved_image,
+        uid,
+        gid,
+    )
+    .map_err(anyhow::Error::msg)?;
+    eprintln!("info: job-code toolchain preflight {report}");
+    Ok(())
 }
 
 fn append_git_identity_env_defaults(env: &mut HashMap<String, String>) {
@@ -20712,7 +20885,7 @@ mod multi_repo_tests {
             "/host/repo:/repos/agent-hub-poc-test:ro".to_string(),
             "--entrypoint".to_string(),
             "/usr/bin/sh".to_string(),
-            "agent-hub/job-code:2026-08-18".to_string(),
+            "agent-hub/job-code:2026-08-24".to_string(),
             "-lc".to_string(),
             "/usr/local/bin/opencode run".to_string(),
         ];

@@ -186,12 +186,15 @@ The local setup uses a shared artifact store directory mounted into the server c
 make build-job-images
 ```
 
-Builds `agent-hub/job-base:latest`, `agent-hub/job-code:2026-08-18`, and
+Builds `agent-hub/job-base:latest`, `agent-hub/job-code:2026-08-24`, and
 `agent-hub/job-infra:latest` from Dockerfiles in `../agent-hub-configs/images/`.
 The supported coding runner is OpenCode. The job-code image is tagged
-`agent-hub/job-code:2026-08-18`; its base image, Debian snapshot, and every
+`agent-hub/job-code:2026-08-24`; its base image, Debian snapshot, and every
 downloaded tool version/checksum are fixed in the Dockerfile. The build accepts
-no artifact URL or digest inputs.
+no artifact URL or digest inputs. After building job-code, the CLI runs the image's
+shared toolchain preflight with no network, mounts, or credentials, a read-only root,
+non-root runtime identity, and tmpfs-backed state. Local-agent runs the same contract
+against the resolved image ID before starting each configured job-code execution.
 
 ## 3) Start services + bootstrap Vikunja
 

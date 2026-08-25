@@ -1195,7 +1195,7 @@ kind = "terminal"
         let registration = post_json_response(
             &app,
             "/api/v1/orchestration/workers",
-            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3"]}"#,
+            r#"{"id":"worker-artifacts","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3","canonical_authorization_v4"]}"#,
         )
         .await;
         assert_eq!(registration.status(), AxumStatus::OK);
@@ -1205,7 +1205,7 @@ kind = "terminal"
                 .get("x-agent-hub-server-capabilities")
                 .and_then(|value| value.to_str().ok()),
             Some(
-                "canonical_authorization_v1, canonical_authorization_v2, canonical_authorization_v3"
+                "canonical_authorization_v1, canonical_authorization_v2, canonical_authorization_v3, canonical_authorization_v4"
             )
         );
         let registration: Value = serde_json::from_slice(
@@ -1691,7 +1691,7 @@ kind = "terminal"
         let registration = post_json_response(
             &app,
             "/api/v1/orchestration/workers",
-            r#"{"id":"cancel-worker","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3"]}"#,
+            r#"{"id":"cancel-worker","hostname":"localhost","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3","canonical_authorization_v4"]}"#,
         )
         .await;
         let registration: Value = serde_json::from_slice(
@@ -1803,7 +1803,7 @@ kind = "terminal"
         let replacement = post_json_response_with_worker_session(
             &app,
             "/api/v1/orchestration/workers",
-            r#"{"id":"cancel-worker","hostname":"localhost-restarted","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3"]}"#,
+            r#"{"id":"cancel-worker","hostname":"localhost-restarted","supported_modes":["docker"],"protocol_capabilities":["canonical_authorization_v1","canonical_authorization_v2","canonical_authorization_v3","canonical_authorization_v4"]}"#,
             session_id,
             session_token,
         )

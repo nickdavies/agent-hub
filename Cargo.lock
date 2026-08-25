@@ -12,11 +12,13 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agent-hub"
 version = "0.1.0"
 dependencies = [
+ "agent-hub-executor",
  "anyhow",
  "chrono",
  "clap",
  "config",
  "crossterm",
+ "libc",
  "protocol",
  "reqwest",
  "serde",
@@ -26,6 +28,20 @@ dependencies = [
  "url",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "agent-hub-executor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shellexpand",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1776,6 +1792,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 name = "local-agent"
 version = "0.1.0"
 dependencies = [
+ "agent-hub-executor",
  "anyhow",
  "chrono",
  "clap",

@@ -40,7 +40,7 @@ mod tests {
     fn env(name: &str, overlays: &[&str]) -> EnvironmentDefinition {
         EnvironmentDefinition {
             name: name.to_string(),
-            image: "agent-hub/job-code:latest".to_string(),
+            image: agent_hub_config::DURABLE_OPENCODE_IMAGE.to_string(),
             network_class: "restricted".to_string(),
             approval_mode: "auto".to_string(),
             allowed_overlays: overlays.iter().map(|value| (*value).to_string()).collect(),

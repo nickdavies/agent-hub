@@ -109,11 +109,10 @@ impl McpBridgeInstance {
     }
 
     /// Get the Docker mount argument for this bridge socket.
-    pub fn docker_mount_arg(&self) -> String {
-        format!(
-            "{}:{}:rw",
-            self.socket_path.to_string_lossy(),
-            self.container_path
+    pub fn docker_mount_arg(&self) -> anyhow::Result<String> {
+        Ok(
+            agent_hub_executor::DockerMount::new(&self.socket_path, &self.container_path, false)?
+                .argument(),
         )
     }
 
@@ -333,7 +332,8 @@ mod tests {
 
     #[tokio::test]
     async fn socket_bridge_setup_proxy_and_teardown_leave_no_pending_cleanup() {
-        let root = std::env::temp_dir().join(format!("mcp-lifecycle-{}", uuid::Uuid::new_v4()));
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let root = std::env::temp_dir().join(format!("m-{}", &id[..8]));
         let upstream_path = root.join("upstream.sock");
         std::fs::create_dir_all(&root).unwrap();
         let upstream = UnixListener::bind(&upstream_path).unwrap();

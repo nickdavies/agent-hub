@@ -127,6 +127,12 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
 
         match status {
             Ok(status) if status.success() => {
+                if image_name == "job-code"
+                    && let Err(error) = run_job_code_preflight(tag, config_root)
+                {
+                    eprintln!("[FAIL] job-code preflight failed for {tag}: {error}");
+                    return (false, built);
+                }
                 println!("[OK]   built {}", tag);
                 built.push(tag.clone());
             }
@@ -142,6 +148,54 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
     }
 
     (ok, built)
+}
+
+fn run_job_code_preflight(image: &str, representative_path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    let (uid, gid) = {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(representative_path).map_err(|error| {
+            format!(
+                "failed to inspect representative runtime identity from {}: {error}",
+                representative_path.display()
+            )
+        })?;
+        (metadata.uid(), metadata.gid())
+    };
+    #[cfg(not(unix))]
+    return Err("job-code preflight requires a Unix runtime UID and GID".to_string());
+
+    let inspect = Command::new("docker")
+        .args(["image", "inspect", "--format={{.Id}}", image])
+        .output()
+        .map_err(|error| format!("failed to inspect built image identity: {error}"))?;
+    if !inspect.status.success() {
+        return Err(format!(
+            "failed to inspect built image identity: {}",
+            String::from_utf8_lossy(&inspect.stderr).trim()
+        ));
+    }
+    let image_identity = String::from_utf8(inspect.stdout)
+        .map_err(|error| format!("built image identity is not UTF-8: {error}"))?;
+    let image_identity = image_identity.trim();
+    let args = config::job_code_preflight_docker_args(image_identity, uid, gid)?;
+    let output = Command::new("docker")
+        .args(&args)
+        .output()
+        .map_err(|error| format!("failed to launch Docker: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let report =
+        config::validate_job_code_preflight_report(&output.stdout, image_identity, uid, gid)?;
+    println!("[OK]   job-code preflight {}", report);
+    Ok(())
 }
 
 fn validate_reproducible_job_code_context(dockerfile: &Path) -> Result<(), String> {
@@ -169,6 +223,13 @@ fn validate_reproducible_job_code_context(dockerfile: &Path) -> Result<(), Strin
         })
     {
         return Err("job-code Dockerfile contains a non-reproducible input".to_string());
+    }
+    for instruction in &instructions {
+        match instruction.keyword.as_str() {
+            "add" => return Err("job-code Dockerfile must not use ADD".to_string()),
+            "copy" => validate_copy_instruction(&instruction.value)?,
+            _ => {}
+        }
     }
 
     let snapshot = instructions
@@ -209,8 +270,25 @@ fn validate_reproducible_job_code_context(dockerfile: &Path) -> Result<(), Strin
     for (index, instruction) in instructions.iter().enumerate() {
         if instruction.keyword == "run" {
             let commands = run_command_kinds(&instruction.value);
+            let normalized = instruction.value.to_ascii_lowercase();
             if run_uses_insecure_curl(&instruction.value) {
                 return Err("job-code Dockerfile must not disable curl TLS verification".into());
+            }
+            if normalized.contains("corepack prepare") || normalized.contains("rustup-init") {
+                return Err(
+                    "job-code Dockerfile must use directly checksum-verified package inputs".into(),
+                );
+            }
+            let download_count = commands
+                .iter()
+                .filter(|command| **command == CommandKind::Curl)
+                .count();
+            let checksum_count = normalized.matches("sha256sum -c -").count()
+                + normalized.matches("sha512sum -c -").count();
+            if download_count != checksum_count || commands.contains(&CommandKind::Wget) {
+                return Err(
+                    "job-code Dockerfile downloads must have one committed checksum each".into(),
+                );
             }
             if commands.iter().any(|command| {
                 matches!(
@@ -221,6 +299,9 @@ fn validate_reproducible_job_code_context(dockerfile: &Path) -> Result<(), Strin
                 return Err(
                     "job-code Dockerfile contains an unsupported package transaction".into(),
                 );
+            }
+            if !commands.contains(&CommandKind::AptGet) {
+                validate_run_network_inputs(&instruction.value)?;
             }
         }
         if matches!(instruction.keyword.as_str(), "run" | "add")
@@ -243,6 +324,155 @@ fn validate_reproducible_job_code_context(dockerfile: &Path) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+fn validate_copy_instruction(value: &str) -> Result<(), String> {
+    if value != "preflight.sh /usr/local/libexec/agent-hub-job-code-preflight" {
+        return Err("job-code COPY input is not an approved local context file".to_string());
+    }
+    Ok(())
+}
+
+fn validate_run_network_inputs(run: &str) -> Result<(), String> {
+    let fragments = shell_command_fragments(run);
+    let mut download_targets = Vec::new();
+    let mut checksum_fragments = 0usize;
+
+    for (index, fragment) in fragments.iter().enumerate() {
+        let tokens = fragment.split_whitespace().collect::<Vec<_>>();
+        let first = tokens.first().copied().unwrap_or_default();
+        let command = classify_command_token(first);
+        let normalized = fragment.to_ascii_lowercase();
+
+        if command == Some(CommandKind::Wget) {
+            return Err("job-code Dockerfile must not use wget".to_string());
+        }
+        if is_remote_package_manager_fragment(&tokens) {
+            return Err(
+                "job-code Dockerfile contains a remote package-manager install".to_string(),
+            );
+        }
+        if command == Some(CommandKind::Curl) {
+            if fragment.contains("$(") || fragment.contains('`') {
+                return Err("job-code curl download uses shell indirection".to_string());
+            }
+            let urls = tokens
+                .iter()
+                .filter(|token| {
+                    contains_url_scheme(token, "http") || contains_url_scheme(token, "https")
+                })
+                .count();
+            if urls != 1 {
+                return Err("job-code curl must contain exactly one direct URL".to_string());
+            }
+            let output = tokens
+                .windows(2)
+                .find_map(|pair| (pair[0] == "-o").then_some(pair[1]))
+                .ok_or_else(|| "job-code curl must use a literal -o target".to_string())?
+                .trim_matches(['\'', '"']);
+            if !output.starts_with("/tmp/")
+                || output.contains('$')
+                || output.contains('*')
+                || download_targets.iter().any(|existing| existing == output)
+            {
+                return Err("job-code curl output target is not unique and literal".to_string());
+            }
+            download_targets.push(output.to_string());
+            continue;
+        }
+
+        let checksum = matches!(first.trim_matches(['\'', '"']), "sha256sum" | "sha512sum")
+            && tokens.get(1) == Some(&"-c")
+            && tokens.get(2) == Some(&"-")
+            && tokens.len() == 3;
+        if checksum {
+            checksum_fragments += 1;
+            continue;
+        }
+
+        if contains_url_scheme(fragment, "http") || contains_url_scheme(fragment, "https") {
+            let approved_provenance = (command == Some(CommandKind::Printf)
+                && normalized.contains("snapshot.debian.org"))
+                || (first.rsplit('/').next() == Some("grep")
+                    && normalized.contains("xz_url =")
+                    && normalized.ends_with("/tmp/rust-channel.toml"))
+                || (first.rsplit('/').next() == Some("jq")
+                    && normalized.starts_with("jq -n")
+                    && run.ends_with("> /usr/local/share/agent-hub/job-code-tool-manifest.json"));
+            if !approved_provenance {
+                return Err("job-code RUN contains an unrecognized network input".to_string());
+            }
+        }
+
+        let manifest_generation = first.rsplit('/').next() == Some("jq")
+            && normalized.starts_with("jq -n")
+            && run.ends_with("> /usr/local/share/agent-hub/job-code-tool-manifest.json");
+        if (normalized.contains("curl") || normalized.contains("wget")) && !manifest_generation {
+            return Err("job-code RUN hides a network fetch behind a wrapper".to_string());
+        }
+
+        if checksum && index == 0 {
+            return Err("job-code checksum has no download".to_string());
+        }
+    }
+
+    if download_targets.len() != checksum_fragments {
+        return Err("job-code downloads and checksums are not one-to-one".to_string());
+    }
+    for target in &download_targets {
+        let matches = fragments
+            .windows(2)
+            .filter(|pair| {
+                pair[0]
+                    .split_whitespace()
+                    .next()
+                    .and_then(classify_command_token)
+                    == Some(CommandKind::Printf)
+                    && pair[0]
+                        .split_whitespace()
+                        .any(|token| token.trim_matches(['\'', '"']) == target)
+                    && matches!(
+                        pair[1].split_whitespace().next(),
+                        Some("sha256sum" | "sha512sum")
+                    )
+            })
+            .count();
+        if matches != 1 {
+            return Err(format!(
+                "job-code download target '{target}' has no exact committed checksum"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_remote_package_manager_fragment(tokens: &[&str]) -> bool {
+    let command = tokens
+        .first()
+        .and_then(|token| token.rsplit('/').next())
+        .unwrap_or_default();
+    match command {
+        "npm" => matches!(
+            tokens.get(1),
+            Some(&("install" | "i" | "ci" | "update" | "add"))
+        ),
+        "yarn" | "pnpm" => matches!(
+            tokens.get(1),
+            Some(&("add" | "install" | "i" | "upgrade" | "update"))
+        ),
+        "pip" | "pip3" => matches!(tokens.get(1), Some(&("install" | "download" | "wheel"))),
+        "cargo" => matches!(
+            tokens.get(1),
+            Some(&("install" | "fetch" | "search" | "update"))
+        ),
+        "go" => matches!(tokens.get(1), Some(&("install" | "get" | "mod"))),
+        "uv" => matches!(
+            (tokens.get(1), tokens.get(2)),
+            (Some(&("pip" | "tool")), Some(&"install"))
+        ),
+        "corepack" => matches!(tokens.get(1), Some(&("prepare" | "install" | "use"))),
+        _ => false,
+    }
 }
 
 fn instruction_has_network_activity(instruction: &DockerInstruction) -> bool {
@@ -658,7 +888,10 @@ fn parse_apt_command(command: &str, expected_action: &str) -> Result<Vec<String>
     if packages.iter().any(|package| {
         !package
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "+.-".contains(character))
+            .all(|character| character.is_ascii_alphanumeric() || "+.-=".contains(character))
+            || package.split_once('=').is_some_and(|(name, version)| {
+                name.is_empty() || version.is_empty() || version.contains('=')
+            })
     }) {
         return Err("apt-get install contains an unsupported package expression".to_string());
     }
@@ -984,6 +1217,87 @@ RUN curl -fsSL "https://example.com/tool-${TOOL_VERSION}" -o /tmp/tool \
             ),
         ] {
             assert!(validate(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_unverified_installers_and_package_manager_resolution() {
+        for invalid in [
+            format!("{LOCKED_DOCKERFILE}RUN corepack prepare yarn@1.22.22 --activate\n"),
+            format!("{LOCKED_DOCKERFILE}RUN /tmp/rustup-init -y --default-toolchain 1.89.0\n"),
+            format!(
+                "{LOCKED_DOCKERFILE}RUN curl -fsSL https://example.com/unverified-1.0.tgz -o /tmp/unverified.tgz\n"
+            ),
+        ] {
+            assert!(validate(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn apt_parser_accepts_only_literal_exact_package_versions() {
+        let command = "apt-get -o Acquire::AllowInsecureRepositories=false -o Acquire::AllowDowngradeToInsecureRepositories=false -o APT::Get::AllowUnauthenticated=false install -y --no-install-recommends unbound=1.17.1-2+deb12u4";
+        assert_eq!(
+            parse_apt_command(command, "install").unwrap(),
+            ["unbound=1.17.1-2+deb12u4"]
+        );
+        for package in ["unbound=$VERSION", "unbound==1.0", "=1.0", "unbound="] {
+            assert!(
+                parse_apt_command(
+                    &command.replace("unbound=1.17.1-2+deb12u4", package),
+                    "install"
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_remote_or_unapproved_add_and_copy_inputs() {
+        for instruction in [
+            "ADD local.tar /tmp/local.tar",
+            "ADD https://example.com/archive.tar /tmp/archive.tar",
+            "COPY https://example.com/tool /usr/local/bin/tool",
+            "COPY other-file /usr/local/share/other-file",
+            "COPY --from=evil.example/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa /tool /usr/local/bin/tool",
+            "COPY --from=unknown-stage /tool /usr/local/bin/tool",
+        ] {
+            let invalid = format!("{LOCKED_DOCKERFILE}{instruction}\n");
+            assert!(validate(&invalid).is_err(), "accepted {instruction}");
+        }
+    }
+
+    #[test]
+    fn rejects_indirect_or_unrecognized_network_run_fragments() {
+        for instruction in [
+            r#"RUN env MODE=strict curl -fsSL https://example.com/tool -o /tmp/tool && printf '%s  %s\n' "$TOOL_SHA256" /tmp/tool | sha256sum -c -"#,
+            r#"RUN sh -c 'curl -fsSL https://example.com/tool -o /tmp/tool' && printf '%s  %s\n' "$TOOL_SHA256" /tmp/tool | sha256sum -c -"#,
+            r#"RUN downloader=https://example.com/tool; curl -fsSL "$downloader" -o /tmp/tool && printf '%s  %s\n' "$TOOL_SHA256" /tmp/tool | sha256sum -c -"#,
+            r#"RUN python3 -c 'import urllib.request; urllib.request.urlopen("https://example.com/tool")'"#,
+            "RUN npm install https://example.com/package.tgz",
+            "RUN npm ci",
+            "RUN pnpm i",
+            "RUN pip install https://example.com/package.whl",
+            "RUN pip download package",
+            "RUN cargo install --git https://example.com/repository",
+            "RUN cargo fetch",
+            "RUN go mod download",
+            "RUN corepack use pnpm@latest",
+            r#"RUN wget https://example.com/tool -O /tmp/tool && printf '%s  %s\n' "$TOOL_SHA256" /tmp/tool | sha256sum -c -"#,
+        ] {
+            let invalid = format!("{LOCKED_DOCKERFILE}{instruction}\n");
+            assert!(validate(&invalid).is_err(), "accepted {instruction}");
+        }
+    }
+
+    #[test]
+    fn rejects_download_checksum_count_or_target_mismatches() {
+        for instruction in [
+            r#"RUN curl -fsSL https://example.com/one -o /tmp/one && curl -fsSL https://example.com/two -o /tmp/two && printf '%s  %s\n' "$ONE_SHA256" /tmp/one | sha256sum -c -"#,
+            r#"RUN curl -fsSL https://example.com/one -o /tmp/one && printf '%s  %s\n' "$ONE_SHA256" /tmp/other | sha256sum -c -"#,
+            r#"RUN curl -fsSL https://example.com/one -o /tmp/one && printf '%s  %s\n' "$ONE_SHA256" /tmp/one | sha256sum -c - && printf '%s  %s\n' "$TWO_SHA256" /tmp/two | sha256sum -c -"#,
+        ] {
+            let invalid = format!("{LOCKED_DOCKERFILE}{instruction}\n");
+            assert!(validate(&invalid).is_err(), "accepted {instruction}");
         }
     }
 }

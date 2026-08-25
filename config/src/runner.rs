@@ -10,7 +10,8 @@ pub const OPENCODE_PROJECT_CONFIG_ALIASES: &[&str] = &[
     ".opencode/opencode.json",
     ".opencode/opencode.jsonc",
 ];
-pub const DURABLE_OPENCODE_PATH: &str = "/usr/local/go/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub const DURABLE_OPENCODE_PATH: &str =
+    "/usr/local/go/bin:/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerProfilesConfig {
@@ -605,18 +606,26 @@ fn default_egress_value() -> serde_json::Value {
             "github_hosts": [
                 "github.com",
                 "api.github.com",
+                "codeload.github.com",
                 "raw.githubusercontent.com",
                 "objects.githubusercontent.com"
             ],
             "go_registry_hosts": [
                 "proxy.golang.org",
                 "sum.golang.org",
-                "storage.googleapis.com"
+                "go.dev"
             ],
             "crates_registry_hosts": [
                 "crates.io",
                 "index.crates.io",
                 "static.crates.io"
+            ],
+            "pypi_registry_hosts": [
+                "files.pythonhosted.org",
+                "pypi.org"
+            ],
+            "npm_registry_hosts": [
+                "registry.npmjs.org"
             ]
         },
         "proxy": {
@@ -627,6 +636,7 @@ fn default_egress_value() -> serde_json::Value {
             "writable_tmpfs_mode": "0755",
             "declared_volumes": ["/var/log/squid", "/var/spool/squid"]
         },
+        "resolver": {"upstream": "127.0.0.11@53", "readiness_host": "example.com"},
         "preflight_image": null
     })
 }
@@ -1123,7 +1133,7 @@ fn canonicalize_egress(value: serde_json::Value) -> Result<serde_json::Value, St
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     return Ok(serde_json::Value::Array(
-                        canonical_unique_strings(&strings, "egress hosts", true)?
+                        crate::network_policy::canonical_policy_hosts(&strings)?
                             .into_iter()
                             .map(serde_json::Value::String)
                             .collect(),
@@ -1196,6 +1206,32 @@ fn canonicalize_egress(value: serde_json::Value) -> Result<serde_json::Value, St
                         .to_string(),
                 );
             }
+        }
+    }
+    if let Some(resolver) = canonical.get("resolver") {
+        let upstream = resolver
+            .get("upstream")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "egress.resolver.upstream must be a string".to_string())?;
+        let (address, port) = upstream
+            .rsplit_once('@')
+            .ok_or_else(|| "egress.resolver.upstream must include @port".to_string())?;
+        address
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "egress.resolver.upstream address must be an IP literal".to_string())?;
+        if port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+            return Err("egress.resolver.upstream port is invalid".to_string());
+        }
+        let readiness_host = resolver
+            .get("readiness_host")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "egress.resolver.readiness_host must be a string".to_string())?;
+        if !readiness_host.contains('.')
+            || readiness_host
+                .split('.')
+                .any(|label| label.is_empty() || label.len() > 63)
+        {
+            return Err("egress.resolver.readiness_host is invalid".to_string());
         }
     }
     Ok(canonical)

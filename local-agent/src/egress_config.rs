@@ -7,8 +7,8 @@ pub(crate) use agent_hub_config::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::credential_provider::CredentialProvider;
 use crate::mcp_bridge::McpBridgeConfig;
+use agent_hub_executor::credential_provider::CredentialProvider;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -214,7 +214,26 @@ pub struct EgressConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
     #[serde(default)]
+    pub resolver: ResolverConfig,
+    #[serde(default)]
     pub preflight_image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolverConfig {
+    #[serde(default = "default_resolver_upstream")]
+    pub upstream: String,
+    #[serde(default = "default_resolver_readiness_host")]
+    pub readiness_host: String,
+}
+
+impl Default for ResolverConfig {
+    fn default() -> Self {
+        Self {
+            upstream: default_resolver_upstream(),
+            readiness_host: default_resolver_readiness_host(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -247,7 +266,7 @@ impl LlmHostConfig {
             .providers
             .get(&provider_key)
             .ok_or_else(|| anyhow::anyhow!("unknown LLM provider '{provider_key}'"))?;
-        let hosts = canonical_hosts(hosts);
+        let hosts = canonical_hosts(hosts)?;
         if hosts.is_empty() {
             anyhow::bail!("LLM provider '{provider_key}' must configure at least one host");
         }
@@ -263,6 +282,10 @@ pub struct BuildHostConfig {
     pub go_registry_hosts: Vec<String>,
     #[serde(default = "default_crates_registry_hosts")]
     pub crates_registry_hosts: Vec<String>,
+    #[serde(default = "default_pypi_registry_hosts")]
+    pub pypi_registry_hosts: Vec<String>,
+    #[serde(default = "default_npm_registry_hosts")]
+    pub npm_registry_hosts: Vec<String>,
 }
 
 impl Default for BuildHostConfig {
@@ -271,6 +294,8 @@ impl Default for BuildHostConfig {
             github_hosts: default_github_hosts(),
             go_registry_hosts: default_go_registry_hosts(),
             crates_registry_hosts: default_crates_registry_hosts(),
+            pypi_registry_hosts: default_pypi_registry_hosts(),
+            npm_registry_hosts: default_npm_registry_hosts(),
         }
     }
 }
@@ -347,6 +372,7 @@ pub(crate) fn local_agent_config_from_validated_deployment(
             &deployment.network_policies,
             &deployment.triage_mounts,
             &parsed.egress.llm,
+            &parsed.egress.build,
         )
         .with_context(|| format!("load config tree from {}", config_root.display()))?,
     );
@@ -443,6 +469,7 @@ fn load_config_tree_snapshot(
     policy_snapshots: &std::collections::BTreeMap<String, agent_hub_config::ValidatedNetworkPolicy>,
     triage_mounts: &[agent_hub_config::TriageRepositoryMount],
     local_llm: &LlmHostConfig,
+    local_build: &BuildHostConfig,
 ) -> anyhow::Result<ConfigTreeSnapshot> {
     let system_file: SystemManifestFile =
         toml::from_str(system_toml).context("parse captured validated system manifest")?;
@@ -522,6 +549,7 @@ fn load_config_tree_snapshot(
         )?;
         network_policies.insert(policy_name.to_string(), policy);
     }
+    validate_typed_resource_policies(&network_policies, local_llm, local_build)?;
 
     Ok(ConfigTreeSnapshot {
         environments,
@@ -529,6 +557,74 @@ fn load_config_tree_snapshot(
         llm_provider_hosts,
         triage_mounts: triage_mounts.to_vec(),
     })
+}
+
+fn validate_typed_resource_policies(
+    policies: &HashMap<String, ConfiguredNetworkPolicy>,
+    llm: &LlmHostConfig,
+    build: &BuildHostConfig,
+) -> anyhow::Result<()> {
+    if !policies.contains_key("guarded-web") {
+        return Ok(());
+    }
+    let expected = [
+        ("llm-only", Vec::new(), true),
+        ("github-only", canonical_hosts(&build.github_hosts)?, false),
+        (
+            "go-registry",
+            canonical_hosts(&build.go_registry_hosts)?,
+            false,
+        ),
+        (
+            "crates-registry",
+            canonical_hosts(&build.crates_registry_hosts)?,
+            false,
+        ),
+        (
+            "pypi-registry",
+            canonical_hosts(&build.pypi_registry_hosts)?,
+            false,
+        ),
+        (
+            "npm-registry",
+            canonical_hosts(&build.npm_registry_hosts)?,
+            false,
+        ),
+        ("guarded-web", Vec::new(), false),
+    ];
+    for (name, hosts, dynamic_llm) in expected {
+        let policy = policies
+            .get(name)
+            .with_context(|| format!("typed network policy '{name}' is required"))?;
+        if policy.hosts != hosts || policy.uses_llm_provider_hosts != dynamic_llm {
+            anyhow::bail!("typed network policy '{name}' does not match its resource contract");
+        }
+        if policy.unrestricted || policy.docker_network.is_some() {
+            anyhow::bail!("typed network policy '{name}' must remain restricted");
+        }
+    }
+    llm.resolve_provider_hosts(None)?;
+    let build_policy = policies
+        .get("build")
+        .context("typed network policy 'build' is required")?;
+    let mut build_hosts = Vec::new();
+    for name in [
+        "github-only",
+        "go-registry",
+        "crates-registry",
+        "pypi-registry",
+        "npm-registry",
+    ] {
+        build_hosts.extend(policies[name].hosts.clone());
+    }
+    if build_policy.hosts != canonical_hosts(&build_hosts)?
+        || !build_policy.uses_llm_provider_hosts
+        || build_policy.unrestricted
+        || build_policy.docker_network.is_some()
+    {
+        anyhow::bail!("typed network policy 'build' must exactly union build resource policies");
+    }
+    Ok(())
 }
 
 fn system_llm_provider_hosts(
@@ -540,7 +636,7 @@ fn system_llm_provider_hosts(
         if name.is_empty() {
             anyhow::bail!("system.llm_providers name must not be empty");
         }
-        let hosts = canonical_hosts(&provider.hosts);
+        let hosts = canonical_hosts(&provider.hosts)?;
         if hosts.is_empty() {
             anyhow::bail!("system LLM provider '{name}' must configure at least one host");
         }
@@ -559,8 +655,13 @@ fn validate_llm_provider_host_maps(
     let local_hosts = local
         .providers
         .iter()
-        .map(|(provider, hosts)| (provider.trim().to_ascii_lowercase(), canonical_hosts(hosts)))
-        .collect::<HashMap<_, _>>();
+        .map(|(provider, hosts)| {
+            Ok((
+                provider.trim().to_ascii_lowercase(),
+                canonical_hosts(hosts)?,
+            ))
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()?;
     if system != local_hosts {
         anyhow::bail!(
             "system and local-agent LLM provider host maps must exactly match: system={system:?} local={local_hosts:?}"
@@ -610,7 +711,7 @@ fn resolve_network_policy(
             None => {}
         }
     }
-    resolved.hosts = canonical_hosts(&resolved.hosts);
+    resolved.hosts = canonical_hosts(&resolved.hosts)?;
 
     for (key, value) in &policy.env {
         resolved.env.insert(key.clone(), value.clone());
@@ -684,17 +785,22 @@ fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
             anyhow::bail!("egress.llm.providers name must not be empty");
         }
         if providers
-            .insert(provider.clone(), canonical_hosts(hosts))
+            .insert(provider.clone(), canonical_hosts(hosts)?)
             .is_some()
         {
             anyhow::bail!("egress.llm.providers contains duplicate provider '{provider}'");
         }
     }
     config.egress.llm.providers = providers;
-    config.egress.build.github_hosts = normalize_hosts(&config.egress.build.github_hosts);
-    config.egress.build.go_registry_hosts = normalize_hosts(&config.egress.build.go_registry_hosts);
+    config.egress.build.github_hosts = canonical_hosts(&config.egress.build.github_hosts)?;
+    config.egress.build.go_registry_hosts =
+        canonical_hosts(&config.egress.build.go_registry_hosts)?;
     config.egress.build.crates_registry_hosts =
-        normalize_hosts(&config.egress.build.crates_registry_hosts);
+        canonical_hosts(&config.egress.build.crates_registry_hosts)?;
+    config.egress.build.pypi_registry_hosts =
+        canonical_hosts(&config.egress.build.pypi_registry_hosts)?;
+    config.egress.build.npm_registry_hosts =
+        canonical_hosts(&config.egress.build.npm_registry_hosts)?;
     if config.egress.proxy.image.trim() != config.egress.proxy.image
         || config.egress.proxy.image.is_empty()
     {
@@ -703,6 +809,24 @@ fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
     if config.egress.proxy.listen_port == 0 {
         anyhow::bail!("egress.proxy.listen_port must be non-zero");
     }
+    let (resolver_address, resolver_port) = config
+        .egress
+        .resolver
+        .upstream
+        .rsplit_once('@')
+        .context("egress.resolver.upstream must be an IP literal with @port")?;
+    resolver_address
+        .parse::<std::net::IpAddr>()
+        .context("egress.resolver.upstream address is invalid")?;
+    if resolver_port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .is_none()
+    {
+        anyhow::bail!("egress.resolver.upstream port is invalid");
+    }
+    canonical_hosts(std::slice::from_ref(&config.egress.resolver.readiness_host))?;
     if config.egress.proxy.writable_tmpfs_mode.len() != 4
         || !config.egress.proxy.writable_tmpfs_mode.starts_with('0')
         || !config
@@ -755,47 +879,22 @@ fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn normalize_hosts(hosts: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
-    for host in hosts {
-        let host = host.trim().to_ascii_lowercase();
-        if host.is_empty() {
-            continue;
-        }
-
-        if host.contains("://") || host.contains('/') || host.contains(char::is_whitespace) {
-            continue;
-        }
-
-        let normalized = if let Some(suffix) = host.strip_prefix("*.") {
-            format!("*.{}", suffix.trim_start_matches('.'))
-        } else {
-            host.trim_start_matches('.').to_string()
-        };
-        if normalized.is_empty() {
-            continue;
-        }
-        if seen.insert(normalized.clone()) {
-            out.push(normalized);
-        }
-    }
-
-    out
-}
-
-pub fn canonical_hosts(hosts: &[String]) -> Vec<String> {
-    let mut hosts = normalize_hosts(hosts);
-    hosts.sort();
-    hosts.dedup();
-    hosts
+pub fn canonical_hosts(hosts: &[String]) -> anyhow::Result<Vec<String>> {
+    agent_hub_config::canonical_policy_hosts(hosts).map_err(anyhow::Error::msg)
 }
 
 fn default_proxy_image() -> String {
     // Use pinned stable image digest to avoid beta/default-latest drift.
     "ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029"
         .to_string()
+}
+
+fn default_resolver_upstream() -> String {
+    "127.0.0.11@53".to_string()
+}
+
+fn default_resolver_readiness_host() -> String {
+    "example.com".to_string()
 }
 
 fn default_managed_agent_runner() -> ManagedRunnerSpec {
@@ -857,6 +956,14 @@ fn default_crates_registry_hosts() -> Vec<String> {
         "static.crates.io".to_string(),
         "crates.io".to_string(),
     ]
+}
+
+fn default_pypi_registry_hosts() -> Vec<String> {
+    vec!["files.pythonhosted.org".to_string(), "pypi.org".to_string()]
+}
+
+fn default_npm_registry_hosts() -> Vec<String> {
+    vec!["registry.npmjs.org".to_string()]
 }
 
 #[cfg(test)]
@@ -1104,23 +1211,13 @@ mod tests {
     }
 
     #[test]
-    fn normalize_hosts_skips_invalid_values() {
-        let hosts = normalize_hosts(&[
-            "api.openai.com".to_string(),
-            "https://api.openai.com".to_string(),
-            " api.openai.com ".to_string(),
-            "*.github.com".to_string(),
-            ".objects.githubusercontent.com".to_string(),
-            "/tmp/sock".to_string(),
-        ]);
-
+    fn canonical_hosts_rejects_invalid_values_instead_of_dropping_them() {
+        assert!(canonical_hosts(&["https://api.openai.com".to_string()]).is_err());
+        assert!(canonical_hosts(&["  api.openai.com".to_string()]).is_err());
+        assert!(canonical_hosts(&["127.0.0.1".to_string()]).is_err());
         assert_eq!(
-            hosts,
-            vec![
-                "api.openai.com",
-                "*.github.com",
-                "objects.githubusercontent.com"
-            ]
+            canonical_hosts(&["Z.example.com".to_string(), "a.example.com".to_string(),]).unwrap(),
+            ["a.example.com", "z.example.com"]
         );
     }
 

@@ -355,7 +355,7 @@ impl LoadedEnvironment {
         EnvironmentDefinition {
             name: self.toml.name.clone(),
             image: self.toml.image.clone(),
-            network_class: map_policy_to_network_class(&self.toml.network_policy),
+            network_class: self.toml.network_policy.clone(),
             approval_mode: self.toml.approval_mode.clone(),
             allowed_overlays: self.toml.allowed_overlays.clone(),
             description: self.toml.description.clone(),
@@ -366,14 +366,6 @@ impl LoadedEnvironment {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
         }
-    }
-}
-
-fn map_policy_to_network_class(policy: &str) -> String {
-    match policy {
-        "none" => "none".to_string(),
-        "full" => "full".to_string(),
-        _ => "restricted".to_string(),
     }
 }
 
