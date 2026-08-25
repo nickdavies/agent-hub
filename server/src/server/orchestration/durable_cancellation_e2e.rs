@@ -725,6 +725,7 @@ initial_state = "run"
 id = "run"
 kind = "command"
 executor = "docker"
+timeout_secs = 120
 repo_access = "read_write"
 container_image = {image:?}
 command = "/bin/sh"

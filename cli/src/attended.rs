@@ -2202,7 +2202,7 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::{
         RunRecord, RunStatus, merge_execution_cleanup, network_class_within_ceiling,
-        resolve_network_resources, selector_resources, verify_tool_approval,
+        prepare_consumption, resolve_network_resources, selector_resources, verify_tool_approval,
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
