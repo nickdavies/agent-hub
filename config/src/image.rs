@@ -12,12 +12,16 @@ pub fn job_code_preflight_docker_args(
     image: &str,
     runtime_uid: u32,
     runtime_gid: u32,
+    pids_limit: u32,
 ) -> Result<Vec<String>, String> {
     if image.trim().is_empty() {
         return Err("job-code preflight image must not be empty".to_string());
     }
     if runtime_uid == 0 || runtime_gid == 0 {
         return Err("job-code preflight requires a non-root runtime UID and GID".to_string());
+    }
+    if pids_limit == 0 {
+        return Err("job-code preflight PID limit must be positive".to_string());
     }
     let owner = format!("uid={runtime_uid},gid={runtime_gid}");
     Ok(vec![
@@ -28,6 +32,7 @@ pub fn job_code_preflight_docker_args(
         format!("--user={runtime_uid}:{runtime_gid}"),
         "--security-opt=no-new-privileges".to_string(),
         "--cap-drop=ALL".to_string(),
+        format!("--pids-limit={pids_limit}"),
         format!("--tmpfs=/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777,{owner}"),
         format!("--tmpfs=/home/agent:rw,nosuid,nodev,size=64m,mode=0700,{owner}"),
         format!("--tmpfs=/cache:rw,nosuid,nodev,size=256m,mode=0700,{owner}"),
@@ -436,7 +441,13 @@ mod tests {
 
     #[test]
     fn job_code_preflight_is_non_root_isolated_and_mount_free() {
-        let args = job_code_preflight_docker_args("image@sha256:abc", 1000, 1001).unwrap();
+        let args = job_code_preflight_docker_args(
+            "image@sha256:abc",
+            1000,
+            1001,
+            protocol::APPROVED_EXECUTION_PIDS_LIMIT,
+        )
+        .unwrap();
         assert_eq!(args.first().map(String::as_str), Some("run"));
         assert!(args.contains(&"--network=none".to_string()));
         assert!(args.contains(&"--read-only".to_string()));
@@ -465,9 +476,10 @@ mod tests {
 
     #[test]
     fn job_code_preflight_rejects_root_and_empty_images() {
-        assert!(job_code_preflight_docker_args("image", 0, 1000).is_err());
-        assert!(job_code_preflight_docker_args("image", 1000, 0).is_err());
-        assert!(job_code_preflight_docker_args(" ", 1000, 1000).is_err());
+        assert!(job_code_preflight_docker_args("image", 0, 1000, 512).is_err());
+        assert!(job_code_preflight_docker_args("image", 1000, 0, 512).is_err());
+        assert!(job_code_preflight_docker_args(" ", 1000, 1000, 512).is_err());
+        assert!(job_code_preflight_docker_args("image", 1000, 1000, 0).is_err());
     }
 
     #[test]

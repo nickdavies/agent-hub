@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 
 use agent_hub::attended::{
-    AuthorizationSelectors, DIPPY_SELECTOR_PREFIX, authorize, render_proposal,
+    AuthorizationSelectors, DIPPY_SELECTOR_PREFIX, authorize, read_artifact_bounded,
+    render_proposal,
 };
 use agent_hub::state::StateStore;
 use protocol::{
-    ApprovedExecutionSpec, AttendedAuthorizationRequestV1, AttendedLifecycleContract,
-    AttendedOutputContract, AttendedProposal, CanonicalRuntimeSpec, ExecutionMode,
-    PlannedEnvironmentSpec, PlannedEnvironmentTier, PlannedPermissionSet, PlannedPermissionTier,
-    ResolvedAuthorizationBehavior, ToolApprovalMode,
+    ApprovedExecutionSpec, AttendedAuthorizationRequestV1, AttendedExecutionSpec,
+    AttendedLifecycleContract, AttendedOutputContract, AttendedProposal, CanonicalRuntimeSpec,
+    ExecutionMode, PlannedEnvironmentSpec, PlannedEnvironmentTier, PlannedPermissionSet,
+    PlannedPermissionTier, ResolvedAuthorizationBehavior, ToolApprovalMode,
 };
 
 #[test]
@@ -89,13 +90,38 @@ fn authorization_is_no_follow_private_and_selector_failures_do_not_create_state(
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn fresh_state_creates_runs_parent_and_bounds_artifact_reads() {
+    let root = temp_root("bounded-read");
+    let state = StateStore::open(root.join("state")).unwrap();
+    let id = "a".repeat(24);
+    state
+        .ensure_directory(std::path::Path::new("runs"))
+        .unwrap();
+    state
+        .ensure_directory(&std::path::PathBuf::from("runs").join(&id))
+        .unwrap();
+    state
+        .create_json(
+            &std::path::PathBuf::from("runs")
+                .join(&id)
+                .join("result.json"),
+            &serde_json::json!({"result":"abcdefghijklmnopqrstuvwxyz"}),
+        )
+        .unwrap();
+    let bounded = read_artifact_bounded(&state, &id, "result.json", 8).unwrap();
+    assert_eq!(bounded.returned_bytes, 8);
+    assert!(bounded.truncated);
+    assert!(bounded.total_bytes > bounded.returned_bytes);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn selectors<'a>(digest: &'a str, environment: &'a str) -> AuthorizationSelectors<'a> {
     AuthorizationSelectors {
         digest,
         environment,
         image_family: "job-code",
         network_class: "none",
-        network_resources: &[],
         tool_approval: "auto",
     }
 }
@@ -106,63 +132,77 @@ fn request() -> AttendedAuthorizationRequestV1 {
         proposal: AttendedProposal {
             environment: "development".into(),
             image_family: "job-code".into(),
+            image_tag: "agent-hub/job-code:locked".into(),
+            image_id: format!("sha256:{}", "a".repeat(64)),
             network_class: "none".into(),
             network_resources: vec![],
             tool_approval: ToolApprovalMode::Auto,
+            overlays: vec![],
+            timeout_secs: 3600,
+            prompt_digest: protocol::sha256_hex_with_domain(
+                b"agent-hub:attended-prompt:v1\0",
+                b"Fix the test",
+            ),
             prompt: "Fix the test".into(),
         },
-        execution: ApprovedExecutionSpec {
+        execution: AttendedExecutionSpec {
             config_root: "/config".into(),
             config_digest: "config".into(),
+            config_provenance: BTreeMap::from([("system.toml".into(), "digest".into())]),
             environment_bundle_digest: "bundle".into(),
-            runtime: CanonicalRuntimeSpec {
-                runtime_version: "v2".into(),
-                environment: PlannedEnvironmentSpec {
-                    tier: PlannedEnvironmentTier::Docker,
-                    execution_mode: ExecutionMode::Docker,
-                    container_image: Some("agent-hub/job-code:locked".into()),
-                    timeout_secs: Some(3600),
-                    memory_limit: None,
-                    cpu_limit: None,
-                    network_resources: Some(protocol::NetworkResourceRequest::None),
-                    filesystem: None,
-                    file_mounts: vec![],
-                    toolchains: vec![],
+            approved: ApprovedExecutionSpec {
+                runtime: CanonicalRuntimeSpec {
+                    runtime_version: "v2".into(),
+                    environment: PlannedEnvironmentSpec {
+                        tier: PlannedEnvironmentTier::Docker,
+                        execution_mode: ExecutionMode::Docker,
+                        container_image: Some("agent-hub/job-code:locked".into()),
+                        timeout_secs: Some(3600),
+                        memory_limit: None,
+                        cpu_limit: None,
+                        network_resources: Some(protocol::NetworkResourceRequest::None),
+                        filesystem: None,
+                        file_mounts: vec![],
+                        toolchains: vec![],
+                    },
+                    permissions: PlannedPermissionSet {
+                        tier: PlannedPermissionTier::DockerDefault,
+                        can_read_workspace: true,
+                        can_write_workspace: true,
+                        can_run_shell: true,
+                        can_access_network: false,
+                        auto_approve_tools: vec![],
+                        escalate_tools: vec![],
+                        kubernetes_access: Some("none".into()),
+                        aws_access: Some("none".into()),
+                    },
+                    approval_rules: None,
+                    repos: vec![],
+                    github_capabilities: vec![],
                 },
-                permissions: PlannedPermissionSet {
-                    tier: PlannedPermissionTier::DockerDefault,
-                    can_read_workspace: true,
-                    can_write_workspace: true,
-                    can_run_shell: true,
-                    can_access_network: false,
-                    auto_approve_tools: vec![],
-                    escalate_tools: vec![],
-                    kubernetes_access: Some("none".into()),
-                    aws_access: Some("none".into()),
+                behavior: ResolvedAuthorizationBehavior {
+                    execution_kind: "agent".into(),
+                    runner_profile: serde_json::json!({
+                        "command": "/usr/local/bin/opencode",
+                        "args": ["run"]
+                    }),
+                    command: "/usr/local/bin/opencode".into(),
+                    args: vec!["run".into()],
+                    env: BTreeMap::new(),
+                    prompt: Some(protocol::PromptRef {
+                        system: None,
+                        user: "Fix the test".into(),
+                    }),
+                    primary_repo: None,
+                    primary_repo_branch: None,
+                    execution_context: serde_json::json!({}),
+                    triage: false,
+                    allow_remote_credentials: false,
                 },
-                approval_rules: None,
-                repos: vec![],
-                github_capabilities: vec![],
+                pids_limit: protocol::APPROVED_EXECUTION_PIDS_LIMIT,
             },
-            behavior: ResolvedAuthorizationBehavior {
-                execution_kind: "agent".into(),
-                runner_profile: serde_json::json!({
-                    "command": "/usr/local/bin/opencode",
-                    "args": ["run"]
-                }),
-                command: "/usr/local/bin/opencode".into(),
-                args: vec!["run".into()],
-                env: BTreeMap::new(),
-                prompt: Some(protocol::PromptRef {
-                    system: None,
-                    user: "Fix the test".into(),
-                }),
-                primary_repo: None,
-                primary_repo_branch: None,
-                execution_context: serde_json::json!({}),
-                triage: false,
-                allow_remote_credentials: false,
-            },
+            credential_providers: vec![],
+            overlays: vec![],
             workspaces: vec![protocol::WorkspaceSpec {
                 alias: "primary".into(),
                 host_path: "/work/repo".into(),
@@ -175,7 +215,14 @@ fn request() -> AttendedAuthorizationRequestV1 {
                 repository_root: "/work/repo".into(),
                 mount_path: "/workspace/primary".into(),
                 remote: None,
-                head: String::new(),
+                access: protocol::WorkspaceAccess::ReadWrite,
+                starting: protocol::RepositoryState {
+                    head: None,
+                    reference: None,
+                    branch: None,
+                    detached: false,
+                    dirty_paths: vec![],
+                },
             }],
             primary_workspace: "primary".into(),
         },

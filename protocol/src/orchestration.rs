@@ -124,6 +124,22 @@ mod immutable_authorization_tests {
     }
 
     #[test]
+    fn unattended_v4_exposes_the_shared_approved_execution_projection() {
+        let request = request().normalize();
+        let projection = request.approved_execution_spec();
+        assert_eq!(projection.runtime, request.permission_envelope);
+        assert_eq!(projection.behavior, request.behavior);
+        assert!(projection.behavior_matches(&projection));
+        assert!(projection.permissions_are_subset_of(&projection));
+        let artifact = request.canonical_artifact_v4().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+        assert_eq!(
+            json["approved_execution"]["pids_limit"],
+            crate::APPROVED_EXECUTION_PIDS_LIMIT
+        );
+    }
+
+    #[test]
     fn digest_normalizes_set_like_permission_lists() {
         let first = request();
         let mut second = request();
@@ -3323,8 +3339,17 @@ struct ResolvedAuthorizationRequestV1 {
 #[serde(deny_unknown_fields)]
 struct ResolvedAuthorizationRequestV4 {
     request: ResolvedAuthorizationRequestV1,
+    approved_execution: ApprovedExecutionSpecV4,
     agent_output_events: Vec<AgentOutputEvent>,
     resolver: ResolverEnforcementV4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovedExecutionSpecV4 {
+    runtime: CanonicalRuntimeSpecV1,
+    behavior: ResolvedAuthorizationBehaviorV1,
+    pids_limit: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4128,8 +4153,14 @@ impl ResolvedAuthorizationRequestV4 {
         {
             return Err("restricted authorization requires resolver enforcement".to_string());
         }
+        let approved_execution = ApprovedExecutionSpecV4 {
+            runtime: request.permission_envelope.clone(),
+            behavior: request.behavior.clone(),
+            pids_limit: crate::APPROVED_EXECUTION_PIDS_LIMIT,
+        };
         Ok(Self {
             request,
+            approved_execution,
             agent_output_events,
             resolver,
         })
@@ -4147,6 +4178,18 @@ impl ResolvedAuthorizationRequestV4 {
             && !matches!(self.resolver, ResolverEnforcementV4::Unbound { .. })
         {
             return Err("restricted authorization requires resolver enforcement".to_string());
+        }
+        if self.approved_execution.pids_limit == 0
+            || serde_json::to_value(&self.approved_execution.runtime).map_err(|e| e.to_string())?
+                != serde_json::to_value(&self.request.permission_envelope)
+                    .map_err(|e| e.to_string())?
+            || serde_json::to_value(&self.approved_execution.behavior).map_err(|e| e.to_string())?
+                != serde_json::to_value(&self.request.behavior).map_err(|e| e.to_string())?
+        {
+            return Err(
+                "canonical authorization V4 approved execution projection differs from its request"
+                    .to_string(),
+            );
         }
         let mut request = self
             .request
@@ -4438,10 +4481,26 @@ pub struct ResolvedAuthorizationResources {
 
 impl ResolvedAuthorizationRequest {
     pub fn normalize(mut self) -> Self {
-        normalize_runtime_for_authorization(&mut self.permission_envelope);
+        let approved = crate::ApprovedExecutionSpec {
+            runtime: self.permission_envelope,
+            behavior: self.behavior,
+            pids_limit: crate::APPROVED_EXECUTION_PIDS_LIMIT,
+        }
+        .normalize();
+        self.permission_envelope = approved.runtime;
+        self.behavior = approved.behavior;
         self.agent_output_events.sort();
         self.agent_output_events.dedup();
         self
+    }
+
+    pub fn approved_execution_spec(&self) -> crate::ApprovedExecutionSpec {
+        let normalized = self.clone().normalize();
+        crate::ApprovedExecutionSpec {
+            runtime: normalized.permission_envelope,
+            behavior: normalized.behavior,
+            pids_limit: crate::APPROVED_EXECUTION_PIDS_LIMIT,
+        }
     }
 
     pub fn request_digest(&self) -> Result<String, serde_json::Error> {
@@ -4597,6 +4656,26 @@ impl ResolvedAuthorizationRequest {
                 .and_then(serde_json::Value::as_str)
                 .and_then(|value| Uuid::parse_str(value).ok())
                 == Some(self.invocation_id)
+    }
+}
+
+impl crate::ApprovedExecutionSpec {
+    pub fn normalize(mut self) -> Self {
+        normalize_runtime_for_authorization(&mut self.runtime);
+        self
+    }
+
+    pub fn behavior_matches(&self, baseline: &Self) -> bool {
+        self.clone().normalize().behavior == baseline.clone().normalize().behavior
+    }
+
+    pub fn permissions_are_subset_of(&self, baseline: &Self) -> bool {
+        self.pids_limit > 0
+            && self.pids_limit <= baseline.pids_limit
+            && runtime_is_subset(
+                &self.clone().normalize().runtime,
+                &baseline.clone().normalize().runtime,
+            )
     }
 }
 

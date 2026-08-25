@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anyhow::{Context, ensure};
 pub use protocol::WorkspaceAccess;
-use protocol::{ContextRootSpec, RepositoryMountSpec, WorkspaceSpec};
+use protocol::{ContextRootSpec, RepositoryMountSpec, RepositoryState, WorkspaceSpec};
 
 const RESERVED_ALIASES: &[&str] = &["artifacts", "config", "context", "opencode", "output"];
 
@@ -118,7 +118,12 @@ pub fn resolve_mounts(
             container_path: container_path.clone(),
             access: requested.access,
         });
-        repositories.push(repository_spec(&requested.alias, &host, &container_path)?);
+        repositories.push(repository_spec(
+            &requested.alias,
+            &host,
+            &container_path,
+            requested.access,
+        )?);
     }
     ensure!(
         workspaces
@@ -140,6 +145,11 @@ pub fn resolve_mounts(
             requested.alias
         );
         let host = roots.resolve(&requested.path)?;
+        ensure!(
+            host.to_str()
+                .is_some_and(protocol::is_canonical_context_root_path),
+            "context roots must be /home/nick.davies/code, /home/nick.davies/oss, or descendants"
+        );
         reject_host_overlap(&hosts, &host)?;
         hosts.push(host.clone());
         context_roots.push(ContextRootSpec {
@@ -200,8 +210,9 @@ fn ensure_canonical_input_path(path: &Path) -> anyhow::Result<()> {
 }
 
 fn is_read_only_context_namespace(path: &Path) -> bool {
-    ["/home/nick.davies/code", "/home/nick.davies/oss"]
+    ["code", "oss"]
         .iter()
+        .filter_map(|alias| protocol::canonical_context_root_path(alias))
         .any(|root| path.starts_with(root))
 }
 
@@ -221,6 +232,7 @@ fn repository_spec(
     alias: &str,
     root: &Path,
     mount_path: &str,
+    access: WorkspaceAccess,
 ) -> anyhow::Result<RepositoryMountSpec> {
     let git = |args: &[&str]| -> Option<String> {
         let output = Command::new("git")
@@ -235,13 +247,156 @@ fn repository_spec(
             None
         }
     };
+    let git_root = git(&["rev-parse", "--show-toplevel"]);
+    ensure!(
+        git_root
+            .as_deref()
+            .is_none_or(|git_root| Some(git_root) == root.to_str()),
+        "workspace '{}' must be the exact Git repository root",
+        root.display()
+    );
+    let is_git_root = git_root.as_deref() == root.to_str();
+    let starting = if is_git_root {
+        repository_state(root)?
+    } else {
+        RepositoryState {
+            head: None,
+            reference: None,
+            branch: None,
+            detached: false,
+            dirty_paths: Vec::new(),
+        }
+    };
     Ok(RepositoryMountSpec {
         workspace_alias: alias.to_string(),
         repository_root: path_string(root)?,
         mount_path: mount_path.to_string(),
-        remote: git(&["remote", "get-url", "origin"]),
-        head: git(&["rev-parse", "HEAD"]).unwrap_or_default(),
+        remote: is_git_root
+            .then(|| git(&["remote", "get-url", "origin"]))
+            .flatten()
+            .map(|remote| canonical_remote_identity(&remote))
+            .transpose()?,
+        access,
+        starting,
     })
+}
+
+fn canonical_remote_identity(remote: &str) -> anyhow::Result<String> {
+    ensure!(
+        !remote.is_empty() && !remote.chars().any(char::is_control),
+        "repository remote identity is empty or contains control characters"
+    );
+    if let Ok(url) = url::Url::parse(remote) {
+        ensure!(
+            url.password().is_none() && url.query().is_none() && url.fragment().is_none(),
+            "repository remote identity contains credentials, query, or fragment"
+        );
+        let host = url
+            .host_str()
+            .context("repository remote URL has no host")?;
+        ensure!(
+            matches!(url.scheme(), "git" | "http" | "https" | "ssh"),
+            "repository remote URL uses an unsupported scheme"
+        );
+        let port = url
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        return Ok(format!(
+            "{}://{}{}{}",
+            url.scheme(),
+            host.to_ascii_lowercase(),
+            port,
+            url.path()
+        ));
+    }
+    if let Some((authority, path)) = remote.split_once(':')
+        && authority.contains('@')
+    {
+        let host = authority.rsplit('@').next().unwrap_or_default();
+        ensure!(
+            !host.is_empty() && !path.is_empty(),
+            "repository SSH remote is incomplete"
+        );
+        return Ok(format!("ssh://{}/{}", host.to_ascii_lowercase(), path));
+    }
+    let path = Path::new(remote);
+    ensure!(
+        path.is_absolute(),
+        "repository remote identity is not canonical"
+    );
+    path_string(path)
+}
+
+pub fn repository_state(root: &Path) -> anyhow::Result<RepositoryState> {
+    let output = |args: &[&str]| -> anyhow::Result<std::process::Output> {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .with_context(|| format!("inspect repository {}", root.display()))
+    };
+    let head = output(&["rev-parse", "HEAD"])?;
+    ensure!(head.status.success(), "repository has no resolvable HEAD");
+    let head = String::from_utf8(head.stdout)?.trim().to_string();
+    let reference = output(&["symbolic-ref", "-q", "HEAD"])?;
+    let reference = reference
+        .status
+        .success()
+        .then(|| String::from_utf8(reference.stdout))
+        .transpose()?
+        .map(|value| value.trim().to_string());
+    let branch = reference
+        .as_deref()
+        .and_then(|value| value.strip_prefix("refs/heads/"))
+        .map(str::to_string);
+    let status = output(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
+    ensure!(status.status.success(), "inspect repository dirty state");
+    let mut dirty_paths = BTreeSet::new();
+    let fields = status
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    while index < fields.len() {
+        let field = fields[index];
+        ensure!(field.len() >= 4, "git status emitted a malformed entry");
+        dirty_paths.insert(
+            String::from_utf8(field[3..].to_vec()).context("repository path is not UTF-8")?,
+        );
+        if matches!(field[0], b'R' | b'C') || matches!(field[1], b'R' | b'C') {
+            index += 1;
+            ensure!(index < fields.len(), "git status omitted a rename source");
+            dirty_paths.insert(
+                String::from_utf8(fields[index].to_vec())
+                    .context("repository rename source is not UTF-8")?,
+            );
+        }
+        index += 1;
+    }
+    Ok(RepositoryState {
+        head: Some(head),
+        reference,
+        branch: branch.clone(),
+        detached: branch.is_none(),
+        dirty_paths: dirty_paths.into_iter().collect(),
+    })
+}
+
+pub fn repository_remote(root: &Path) -> anyhow::Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .with_context(|| format!("inspect repository remote {}", root.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let remote = String::from_utf8(output.stdout)?;
+    canonical_remote_identity(remote.trim()).map(Some)
 }
 
 fn path_string(path: &Path) -> anyhow::Result<String> {

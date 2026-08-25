@@ -57,6 +57,12 @@ fn context_roots_must_be_read_only_and_approved() {
             .container_path
             .starts_with("/context/")
     );
+    let contexts = vec![RequestedContextRoot {
+        alias: "code-child".into(),
+        path: "/home/nick.davies/code/achilles".into(),
+        access: WorkspaceAccess::ReadOnly,
+    }];
+    assert!(resolve_mounts(&roots, &workspaces, &contexts, "primary").is_ok());
     std::fs::remove_dir_all(root).unwrap();
 }
 

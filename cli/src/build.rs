@@ -179,7 +179,12 @@ fn run_job_code_preflight(image: &str, representative_path: &Path) -> Result<(),
     let image_identity = String::from_utf8(inspect.stdout)
         .map_err(|error| format!("built image identity is not UTF-8: {error}"))?;
     let image_identity = image_identity.trim();
-    let args = config::job_code_preflight_docker_args(image_identity, uid, gid)?;
+    let args = config::job_code_preflight_docker_args(
+        image_identity,
+        uid,
+        gid,
+        protocol::APPROVED_EXECUTION_PIDS_LIMIT,
+    )?;
     let output = Command::new("docker")
         .args(&args)
         .output()

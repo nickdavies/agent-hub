@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -276,6 +276,7 @@ pub async fn resolve_all_for_job(
     cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<ResolvedCredentials> {
     cancellation.check()?;
+    validate_provider_targets(providers)?;
     let mut merged = ResolvedCredentials::default();
     for provider in providers {
         cancellation.check()?;
@@ -297,6 +298,21 @@ pub async fn resolve_all_for_job(
     Ok(merged)
 }
 
+fn validate_provider_targets(providers: &[CredentialProvider]) -> anyhow::Result<()> {
+    let mut owners = BTreeMap::new();
+    for provider in providers {
+        for target in provider.targets() {
+            if let Some(existing) = owners.insert(target.clone(), provider.name().to_string()) {
+                anyhow::bail!(
+                    "credential target '{target}' conflicts between providers '{existing}' and '{}'",
+                    provider.name()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_opencode_chatgpt_oauth(
     host_auth_path: &str,
     safety_margin_secs: u64,
@@ -312,7 +328,7 @@ fn resolve_opencode_chatgpt_oauth(
     let credential_dir =
         credential_dir.context("job credential directory is required for ChatGPT OAuth")?;
     let source = shellexpand::tilde(host_auth_path).to_string();
-    let bytes = std::fs::read(&source).context("read configured ChatGPT OAuth source")?;
+    let bytes = read_private_oauth_source(Path::new(&source))?;
     let entries = parse_auth_entries(&bytes)?;
     let mut openai = entries
         .into_iter()
@@ -368,6 +384,49 @@ fn resolve_opencode_chatgpt_oauth(
         temp_files: vec![auth_path],
         redaction_values: vec![access.to_string()],
     })
+}
+
+#[cfg(unix)]
+fn read_private_oauth_source(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    anyhow::ensure!(
+        path.is_absolute(),
+        "configured ChatGPT OAuth source must be absolute"
+    );
+    anyhow::ensure!(
+        std::fs::canonicalize(path).context("canonicalize configured ChatGPT OAuth source")?
+            == path,
+        "configured ChatGPT OAuth source path is not canonical"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .context("open configured ChatGPT OAuth source")?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "configured ChatGPT OAuth source is not a regular file"
+    );
+    anyhow::ensure!(
+        metadata.uid() == std::fs::metadata("/proc/self")?.uid(),
+        "configured ChatGPT OAuth source is not owned by the current user"
+    );
+    anyhow::ensure!(
+        metadata.permissions().mode() & 0o077 == 0,
+        "configured ChatGPT OAuth source is accessible by another user"
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .context("read configured ChatGPT OAuth source")?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_private_oauth_source(_path: &Path) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("secure ChatGPT OAuth reads require Unix no-follow semantics")
 }
 
 fn oauth_required_expiry_millis(
@@ -465,6 +524,11 @@ mod tests {
         super::super::ExecutionCancellationContext::for_test(root, stop_rx).unwrap()
     }
 
+    #[cfg(unix)]
+    fn make_private(path: &Path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     #[test]
     fn auth_parser_preserves_duplicate_provider_names() {
         let entries = parse_auth_entries(br#"{"openai":{},"openai":{}}"#).unwrap();
@@ -505,6 +569,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        make_private(&source);
         let data = root.join("job-data");
         let provider = CredentialProvider::OpencodeChatgptOauth {
             name: "openai:chatgpt-oauth".into(),
@@ -618,6 +683,8 @@ mod tests {
             r#"{"openai":{"type":"oauth","access":"synthetic","expires":9999999999999,"accountId":"synthetic"},"openai":{"type":"oauth","access":"synthetic","expires":9999999999999,"accountId":"synthetic"}}"#,
         ] {
             std::fs::write(&source, invalid).unwrap();
+            #[cfg(unix)]
+            make_private(&source);
             assert!(
                 provider
                     .resolve_for_job(
@@ -658,6 +725,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        #[cfg(unix)]
+        make_private(&source);
         let provider = CredentialProvider::OpencodeChatgptOauth {
             name: "openai:chatgpt-oauth".into(),
             host_auth_path: source.to_string_lossy().into_owned(),
@@ -672,5 +741,48 @@ mod tests {
         );
         assert!(!root.join("data/opencode/auth.json").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn oauth_source_rejects_symlinks_and_non_private_files() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-oauth-source-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.json");
+        std::fs::write(&source, "{}").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_oauth_source(&source).is_err());
+        make_private(&source);
+        let link = root.join("link.json");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(read_private_oauth_source(&link).is_err());
+        assert_eq!(read_private_oauth_source(&source).unwrap(), b"{}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn credential_target_conflicts_fail_before_provider_execution() {
+        let marker = std::env::temp_dir().join(format!(
+            "agent-hub-provider-conflict-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let providers = vec![
+            CredentialProvider::Command {
+                name: "command".into(),
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), format!("touch {}", marker.display())],
+                capture_env: Some("TOKEN".into()),
+                capture_file: None,
+            },
+            CredentialProvider::Env {
+                name: "environment".into(),
+                vars: HashMap::from([("TOKEN".into(), "secret".into())]),
+            },
+        ];
+        assert!(validate_provider_targets(&providers).is_err());
+        assert!(!marker.exists());
     }
 }

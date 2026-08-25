@@ -3,11 +3,13 @@ use std::path::Path;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EnvironmentTomlFile {
     environment: EnvironmentConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     pub name: String,
     pub description: String,
@@ -37,5 +39,32 @@ impl EnvironmentConfig {
         let wrapped: EnvironmentTomlFile = toml::from_str(raw)
             .map_err(|e| format!("failed to parse environment config {label}: {e}"))?;
         Ok(wrapped.environment)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EnvironmentConfig;
+
+    const ENVIRONMENT: &str = r#"
+[environment]
+name = "development"
+description = "Development"
+image = "agent-hub/job-code:locked"
+network_policy = "build"
+approval_mode = "gateway"
+"#;
+
+    #[test]
+    fn environment_toml_rejects_unknown_fields_at_every_level() {
+        assert!(EnvironmentConfig::from_toml(ENVIRONMENT, "test").is_ok());
+        assert!(
+            EnvironmentConfig::from_toml(&format!("{ENVIRONMENT}\nunknown = true\n"), "test")
+                .is_err()
+        );
+        assert!(
+            EnvironmentConfig::from_toml(&format!("unknown = true\n{ENVIRONMENT}"), "test")
+                .is_err()
+        );
     }
 }

@@ -5,25 +5,25 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_hub_executor::{
-    ArtifactPaths, Cancellation, CleanupStatus, ContainmentStatus, Deadline, DockerCli,
-    DockerExecutionPlan, DockerMount, DockerOwnership, ExecutionRequest, ExecutionStatus,
-    NetworkMode,
+    ArtifactPaths, Cancellation, CleanupStatus, Deadline, DockerCli, DockerExecutionPlan,
+    DockerMount, DockerOwnership, ExecutionRequest, ExecutionStatus, NetworkMode,
     credential_provider::{CredentialProvider, resolve_all_for_job},
     egress::{
         PreparedRestrictedEgress, ProxyRuntimeSpec, ResolverRuntimeSpec, RestrictedEgressRequest,
         RestrictedPolicy,
     },
-    execute_output, execute_process, inspect_image_identity, verify_image_identity,
+    execute_output_cancellable, execute_process, inspect_image_identity, verify_image_identity,
 };
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use protocol::{
     ATTENDED_AUTHORIZATION_REQUEST_VERSION, ApprovedExecutionSpec, AttendedAuthorizationArtifact,
-    AttendedAuthorizationRequestV1, AttendedLifecycleContract, AttendedOutputContract,
-    AttendedProposal, CanonicalRuntimeSpec, ExecutionMode, NetworkResourceKind,
-    NetworkResourceRequest, PlannedEnvironmentTier, PromptRef, ResolvedAuthorizationBehavior,
-    ToolApprovalMode, WorkspaceAccess, canonical_environment_for_execution,
-    canonical_permissions_for_environment, default_approval_rules_for_tier,
+    AttendedAuthorizationRequestV1, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedOutputContract, AttendedProposal, AuthorizedCredentialProvider, AuthorizedOverlay,
+    CanonicalRuntimeSpec, ExecutionMode, NetworkResourceKind, NetworkResourceRequest,
+    PlannedEnvironmentTier, PromptRef, ResolvedAuthorizationBehavior, ToolApprovalMode,
+    WorkspaceAccess, canonical_environment_for_execution, canonical_permissions_for_environment,
+    default_approval_rules_for_tier,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,13 +32,18 @@ use crate::local::{
 };
 use crate::state::StateStore;
 
-pub const DIPPY_SELECTOR_PREFIX: &str = "agent-hub attended authorize";
+pub const DIPPY_SELECTOR_PREFIX: &str = "agent-hub local authorize";
 
 #[derive(Debug, Clone)]
 pub struct ProposalInput {
     pub config_root: PathBuf,
     pub environment: String,
+    pub image_family: String,
+    pub network_class: String,
     pub network_resources: Vec<NetworkResourceKind>,
+    pub tool_approval: String,
+    pub overlays: Vec<String>,
+    pub timeout_secs: u64,
     pub prompt: String,
     pub workspaces: Vec<RequestedWorkspace>,
     pub context_roots: Vec<RequestedContextRoot>,
@@ -50,7 +55,6 @@ pub struct AuthorizationSelectors<'a> {
     pub environment: &'a str,
     pub image_family: &'a str,
     pub network_class: &'a str,
-    pub network_resources: &'a [NetworkResourceKind],
     pub tool_approval: &'a str,
 }
 
@@ -96,7 +100,7 @@ struct BundleNetworkPolicy {
     name: String,
 }
 
-pub fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuthorizationArtifact> {
+pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuthorizationArtifact> {
     ensure!(
         !input.prompt.is_empty(),
         "attended prompt must not be empty"
@@ -115,7 +119,34 @@ pub fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuthorizat
         environment.name == input.environment,
         "environment selector does not match the resolved environment"
     );
-    let tool_approval = tool_approval_mode(&environment.approval_mode)?;
+    ensure!(
+        resolve_image_family(&deployment, &environment.image)? == input.image_family,
+        "image family selector does not match the resolved environment"
+    );
+    ensure!(
+        network_class_within_ceiling(&input.network_class, &environment.network_policy)?,
+        "network class selector exceeds the resolved environment ceiling"
+    );
+    let tool_approval = requested_tool_approval_mode(&input.tool_approval)?;
+    ensure!(
+        tool_approval_within_ceiling(
+            tool_approval,
+            tool_approval_mode(&environment.approval_mode)?
+        ),
+        "tool approval selector exceeds the resolved environment ceiling"
+    );
+    let mut overlays = input.overlays;
+    overlays.sort();
+    ensure!(
+        !overlays.windows(2).any(|items| items[0] == items[1]),
+        "duplicate overlay selector"
+    );
+    ensure!(
+        overlays
+            .iter()
+            .all(|overlay| environment.allowed_overlays.contains(overlay)),
+        "requested overlay is not allowed by the environment"
+    );
     let approved_roots = approved_roots(&deployment.local_agent)?;
     let mounts = resolve_mounts(
         &approved_roots,
@@ -129,8 +160,13 @@ pub fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuthorizat
         "materialized network policy does not match the environment"
     );
     let network_resources =
-        resolve_network_resources(&environment.network_policy, input.network_resources)?;
-    let runtime = canonical_runtime(&environment, &mounts, &network_resources);
+        resolve_network_resources(&input.network_class, input.network_resources)?;
+    let runtime = canonical_runtime(
+        &environment,
+        &mounts,
+        &network_resources,
+        input.timeout_secs,
+    );
     let runner = deployment
         .runner_profiles
         .resolve_agent_profile(None)
@@ -147,12 +183,28 @@ pub fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuthorizat
         "attended execution does not support runner host mounts or MCP bridges"
     );
     validate_credential_descriptors(&deployment, &runner)?;
+    let credential_providers = authorized_credential_providers(&deployment, &runner)?;
+    let overlay_descriptors = authorized_overlays(&deployment, &overlays)?;
+    let docker =
+        which::which("docker").context("Docker CLI is required to resolve the reviewed image")?;
+    let image_id = inspect_image_identity(
+        &docker,
+        &environment.image,
+        &Deadline::new(Some(30))?,
+        &Cancellation::never(),
+    )
+    .await?;
+    let prompt_digest = protocol::sha256_hex_with_domain(
+        b"agent-hub:attended-prompt:v1\0",
+        input.prompt.as_bytes(),
+    );
+    let policy_environment = network_policy_environment(&deployment, &input.network_class)?;
     let behavior = ResolvedAuthorizationBehavior {
         execution_kind: "agent".to_string(),
         runner_profile: serde_json::to_value(&runner)?,
         command: runner.command,
         args: runner.args,
-        env: BTreeMap::new(),
+        env: policy_environment,
         prompt: Some(PromptRef {
             system: None,
             user: input.prompt.clone(),
@@ -167,18 +219,29 @@ pub fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuthorizat
         version: ATTENDED_AUTHORIZATION_REQUEST_VERSION.to_string(),
         proposal: AttendedProposal {
             environment: input.environment,
-            image_family: resolve_image_family(&deployment, &environment.image)?,
-            network_class: environment.network_policy,
+            image_family: input.image_family,
+            image_tag: environment.image.clone(),
+            image_id,
+            network_class: input.network_class,
             network_resources,
             tool_approval,
+            overlays,
+            timeout_secs: input.timeout_secs,
+            prompt_digest,
             prompt: input.prompt,
         },
-        execution: ApprovedExecutionSpec {
+        execution: AttendedExecutionSpec {
             config_root: path_string(&config_root)?,
             config_digest: attended_config_digest(&deployment)?,
+            config_provenance: attended_config_provenance(&deployment)?,
             environment_bundle_digest: bundle.digest.clone(),
-            runtime,
-            behavior,
+            approved: ApprovedExecutionSpec {
+                runtime,
+                behavior,
+                pids_limit: protocol::APPROVED_EXECUTION_PIDS_LIMIT,
+            },
+            credential_providers,
+            overlays: overlay_descriptors,
             workspaces: mounts.workspaces,
             context_roots: mounts.context_roots,
             repositories: mounts.repositories,
@@ -199,19 +262,21 @@ pub fn render_proposal(
     let canonical_path = std::fs::canonicalize(path)
         .with_context(|| format!("canonicalize authorization path {}", path.display()))?;
     Ok(format!(
-        "Environment: {}\nImage family: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {} --authorization {} --digest {}\n",
+        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {} --tool-approval {} --authorization {} --digest {}\n",
         request.proposal.environment,
         request.proposal.image_family,
+        request.proposal.image_tag,
+        request.proposal.image_id,
         request.proposal.network_class,
         resource_list(&request.proposal.network_resources),
         tool_approval_name(request.proposal.tool_approval),
+        request.proposal.prompt_digest,
         request.proposal.prompt,
         artifact.digest,
         DIPPY_SELECTOR_PREFIX,
         shell_word(&request.proposal.environment),
         shell_word(&request.proposal.image_family),
         shell_word(&request.proposal.network_class),
-        resource_selector_args(&request.proposal.network_resources),
         tool_approval_name(request.proposal.tool_approval),
         shell_word(&path_string(&canonical_path)?),
         artifact.digest,
@@ -225,6 +290,23 @@ pub fn authorize(
 ) -> anyhow::Result<()> {
     let (artifact, original_authorization_path) = read_authorization_file(path)?;
     let request = artifact.verify().map_err(anyhow::Error::msg)?;
+    verify_authorization_selectors(&request, &artifact, &selectors)?;
+    let _lock = store.lock(&lock_path(selectors.digest))?;
+    let record = AuthorizationRecord {
+        artifact,
+        authorization_path: original_authorization_path,
+        authorized_at: Utc::now(),
+    };
+    store
+        .create_json(&authorization_path("records", selectors.digest), &record)
+        .context("authorization already exists or was replayed")
+}
+
+fn verify_authorization_selectors(
+    request: &AttendedAuthorizationRequestV1,
+    artifact: &AttendedAuthorizationArtifact,
+    selectors: &AuthorizationSelectors<'_>,
+) -> anyhow::Result<()> {
     ensure!(
         artifact.digest == selectors.digest,
         "authorization digest selector mismatch"
@@ -242,38 +324,56 @@ pub fn authorize(
         "network class selector mismatch"
     );
     ensure!(
-        request.proposal.network_resources
-            == canonical_resources(selectors.network_resources.to_vec()),
-        "network resource selector mismatch"
-    );
-    ensure!(
         tool_approval_name(request.proposal.tool_approval) == selectors.tool_approval,
         "tool approval selector mismatch"
     );
-    ensure_unique_resources(selectors.network_resources)?;
-    let _lock = store.lock(&lock_path(selectors.digest))?;
-    let record = AuthorizationRecord {
-        artifact,
-        authorization_path: original_authorization_path,
-        authorized_at: Utc::now(),
-    };
-    store
-        .create_json(&authorization_path("records", selectors.digest), &record)
-        .context("authorization already exists or was replayed")
+    Ok(())
 }
 
-pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<RunRecord> {
+pub async fn run(
+    store: &StateStore,
+    artifact_path: &Path,
+    selectors: AuthorizationSelectors<'_>,
+) -> anyhow::Result<RunRecord> {
     let (supplied, supplied_path) = read_authorization_file(artifact_path)?;
     let request = supplied.verify().map_err(anyhow::Error::msg)?;
     let digest = supplied.digest.clone();
+    verify_authorization_selectors(&request, &supplied, &selectors)?;
+    verify_execution_inputs(&request)?;
+    let docker_path =
+        which::which("docker").context("Docker CLI is required for attended execution")?;
+    let selector_deadline = Deadline::new(Some(30))?;
+    let current_image = inspect_image_identity(
+        &docker_path,
+        &request.proposal.image_tag,
+        &selector_deadline,
+        &Cancellation::never(),
+    )
+    .await?;
+    verify_image_identity(&request.proposal.image_id, &current_image)?;
     let _lock = store.lock(&lock_path(&digest))?;
-    let authorized: AuthorizationRecord =
-        store.read_json(&authorization_path("records", &digest))?;
+    let authorized_path = authorization_path("records", &digest);
+    let authorized: AuthorizationRecord = match store.read_json(&authorized_path) {
+        Ok(authorized) => authorized,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let authorized = AuthorizationRecord {
+                artifact: supplied.clone(),
+                authorization_path: supplied_path.clone(),
+                authorized_at: Utc::now(),
+            };
+            store.create_json(&authorized_path, &authorized)?;
+            authorized
+        }
+        Err(error) => return Err(error),
+    };
     ensure!(
         authorized.artifact == supplied && authorized.authorization_path == supplied_path,
         "authorized artifact does not match supplied artifact"
     );
-    verify_execution_inputs(&request)?;
     let runner: config::ResolvedRunnerProfile =
         serde_json::from_value(request.execution.behavior.runner_profile.clone())?;
     ensure!(
@@ -364,8 +464,25 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
     };
     prepare_consumption(store, &mut record, &digest, |_| Ok(()))?;
 
-    let docker_path =
-        which::which("docker").context("Docker CLI is required for attended execution")?;
+    let cancel_marker = store.path(&cancel_path(&id))?;
+    let cancelled_before_preflight = cancel_marker.exists();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(cancelled_before_preflight);
+    let cancellation = Cancellation::new(cancel_rx);
+    ensure!(
+        !cancelled_before_preflight,
+        "execution was cancelled before preflight"
+    );
+    let poll = AbortTask(tokio::spawn(async move {
+        loop {
+            if cancel_marker.exists() {
+                let _ = cancel_tx.send(true);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }));
+    store.ensure_directory(Path::new("runs"))?;
+
     let deadline = Deadline::new(request.execution.runtime.environment.timeout_secs)?;
     let configured_image = request
         .execution
@@ -374,15 +491,23 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
         .container_image
         .as_deref()
         .context("authorized runtime has no container image")?;
-    let image_identity = inspect_image_identity(&docker_path, configured_image, &deadline).await?;
+    let image_identity = request.proposal.image_id.clone();
+    let current_identity =
+        inspect_image_identity(&docker_path, configured_image, &deadline, &cancellation).await?;
+    verify_image_identity(&image_identity, &current_identity)?;
     let (runtime_uid, runtime_gid) = runtime_identity(&request)?;
-    let preflight_args =
-        config::job_code_preflight_docker_args(&image_identity, runtime_uid, runtime_gid)
-            .map_err(anyhow::Error::msg)?;
-    let preflight = execute_output(
+    let preflight_args = config::job_code_preflight_docker_args(
+        &image_identity,
+        runtime_uid,
+        runtime_gid,
+        request.execution.approved.pids_limit,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let preflight = execute_output_cancellable(
         &docker_path,
         &preflight_args,
         &deadline,
+        &cancellation,
         "job-code preflight",
     )
     .await?;
@@ -430,23 +555,6 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
             set_private_directory(directory)?;
             sync_directory_and_parent(directory)?;
         }
-        let cancel_marker = store.path(&cancel_path(&id))?;
-        let cancelled_before_launch = cancel_marker.exists();
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(cancelled_before_launch);
-        ensure!(
-            !cancelled_before_launch,
-            "execution was cancelled before launch"
-        );
-        let poll = AbortTask(tokio::spawn(async move {
-            loop {
-                if cancel_marker.exists() {
-                    let _ = cancel_tx.send(true);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }));
-        let cancellation = Cancellation::new(cancel_rx);
         let effects = agent_hub_executor::ExecutionCancellationContext::new(
             &run_dir.join("effects"),
             cancellation.clone(),
@@ -528,18 +636,21 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
                 );
             }
         }
-        let current_identity =
-            inspect_image_identity(&docker_path, configured_image, &deadline).await?;
-        verify_image_identity(&image_identity, &current_identity)?;
+        ensure!(
+            !cancellation.requested(),
+            "execution was cancelled before launch"
+        );
         let cleanup_deadline = Deadline::new(Some(30))?;
         let mut prepared_egress = prepare_execution_egress(
             &deployment,
             &request,
             &docker_path,
             &deadline,
-            &run_dir.join("egress"),
-            &id,
-            configured_image,
+            AttendedEgressPreparation {
+                state_dir: &run_dir.join("egress"),
+                namespace: &id,
+                resolver_image: &image_identity,
+            },
             cancellation.clone(),
         )
         .await?;
@@ -607,6 +718,7 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
                 .cpu_limit
                 .clone()
                 .unwrap_or_else(|| "4".to_string()),
+            pids_limit: request.execution.approved.pids_limit,
             read_only: true,
             tmpfs: vec!["/tmp:rw,size=1g".to_string()],
             };
@@ -638,34 +750,14 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
             None => Ok(()),
         };
         let credential_cleanup = credential_cleanup.cleanup();
-        let operation = operation.map(|mut result| {
-            if egress_cleanup.is_ok() {
-                result.containment.egress = ContainmentStatus::VerifiedAbsent;
-            }
-            result
-        });
         merge_execution_cleanup(operation, egress_cleanup, credential_cleanup)
     }
     .await;
     record.finished_at = Some(Utc::now());
-    let cancellation_requested = store.path(&cancel_path(&id))?.exists();
-    let mut cancellation_has_generic_absence = false;
     match result {
         Ok(result) => {
-            if cancellation_requested {
-                cancellation_has_generic_absence = result.cleanup == CleanupStatus::Complete
-                    && result.containment.process == ContainmentStatus::VerifiedAbsent
-                    && matches!(
-                        result.containment.egress,
-                        ContainmentStatus::VerifiedAbsent | ContainmentStatus::NotApplicable
-                    );
-                record.status = RunStatus::CleanupFailed;
-                if !cancellation_has_generic_absence {
-                    record.error = Some(
-                        "cancellation lacks positive process/egress absence or cleanup proof"
-                            .to_string(),
-                    );
-                }
+            if store.path(&cancel_path(&id))?.exists() {
+                record.status = RunStatus::Cancelled;
             } else {
                 match result.status {
                     ExecutionStatus::Exited(0) => record.status = RunStatus::Succeeded,
@@ -683,8 +775,12 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
             }
         }
         Err(error) => {
-            record.status = RunStatus::CleanupFailed;
-            record.error = Some(format!("{error:#}"));
+            if store.path(&cancel_path(&id))?.exists() {
+                record.status = RunStatus::Cancelled;
+            } else {
+                record.status = RunStatus::CleanupFailed;
+                record.error = Some(format!("{error:#}"));
+            }
         }
     }
     let docker = DockerCli::new(docker_path);
@@ -702,15 +798,39 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
             Some(existing) => format!("{existing}; {container_error}"),
             None => container_error,
         });
-    } else if cancellation_requested && cancellation_has_generic_absence {
-        record.status = RunStatus::Cancelled;
-        record.error = None;
     }
     if run_dir.is_dir() {
         let result_path = run_dir.join(&request.output.result);
         let artifacts_path = run_dir.join(&request.output.artifacts);
         let repositories_path = run_dir.join(&request.output.repositories);
         let cleanup_path = run_dir.join(&request.output.cleanup);
+        let mut repositories = Vec::new();
+        for repository in &request.execution.repositories {
+            let ending = if repository.starting.head.is_some() {
+                crate::local::repository_state(Path::new(&repository.repository_root))?
+            } else {
+                repository.starting.clone()
+            };
+            repositories.push(serde_json::json!({
+                "workspace_alias": repository.workspace_alias,
+                "repository_root": repository.repository_root,
+                "mount_path": repository.mount_path,
+                "remote": repository.remote,
+                "access": repository.access,
+                "starting": repository.starting,
+                "ending": ending,
+            }));
+        }
+        repositories.sort_by_key(|repository| {
+            repository["workspace_alias"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        });
+        write_private_durable(
+            &repositories_path,
+            &serde_json::to_vec_pretty(&repositories)?,
+        )?;
         write_private_durable(&result_path, &serde_json::to_vec_pretty(&record)?)?;
         write_private_durable(
             &artifacts_path,
@@ -719,11 +839,8 @@ pub async fn run(store: &StateStore, artifact_path: &Path) -> anyhow::Result<Run
                 "stderr": "stderr.log",
                 "transcript": request.output.transcript,
                 "result": request.output.result,
+                "repositories": request.output.repositories,
             }))?,
-        )?;
-        write_private_durable(
-            &repositories_path,
-            &serde_json::to_vec_pretty(&request.execution.repositories)?,
         )?;
         write_private_durable(
             &cleanup_path,
@@ -747,6 +864,13 @@ pub fn status(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> {
 }
 
 pub fn artifact_path(store: &StateStore, id: &str, name: &str) -> anyhow::Result<PathBuf> {
+    let relative = artifact_relative(id, name)?;
+    let path = store.path(&relative)?;
+    ensure!(path.is_file(), "attended artifact is unavailable");
+    Ok(path)
+}
+
+fn artifact_relative(id: &str, name: &str) -> anyhow::Result<PathBuf> {
     validate_id(id)?;
     ensure!(
         [
@@ -758,9 +882,53 @@ pub fn artifact_path(store: &StateStore, id: &str, name: &str) -> anyhow::Result
         .contains(&name),
         "unknown attended artifact"
     );
-    let path = store.path(&PathBuf::from("runs").join(id).join(name))?;
-    ensure!(path.is_file(), "attended artifact is unavailable");
-    Ok(path)
+    Ok(PathBuf::from("runs").join(id).join(name))
+}
+
+#[derive(Debug, Serialize)]
+pub struct BoundedArtifact {
+    pub content: String,
+    pub limit_bytes: u64,
+    pub returned_bytes: u64,
+    pub total_bytes: u64,
+    pub truncated: bool,
+}
+
+pub fn read_artifact_bounded(
+    store: &StateStore,
+    id: &str,
+    name: &str,
+    limit_bytes: u64,
+) -> anyhow::Result<BoundedArtifact> {
+    ensure!(
+        (1..=16_777_216).contains(&limit_bytes),
+        "artifact read limit is out of bounds"
+    );
+    let (bytes, total_bytes) = store.read_limited(&artifact_relative(id, name)?, limit_bytes)?;
+    let returned_bytes = bytes.len() as u64;
+    Ok(BoundedArtifact {
+        content: String::from_utf8_lossy(&bytes).into_owned(),
+        limit_bytes,
+        returned_bytes,
+        total_bytes,
+        truncated: returned_bytes < total_bytes,
+    })
+}
+
+pub fn ensure_successful_outcome(record: &RunRecord) -> anyhow::Result<()> {
+    ensure!(
+        !matches!(
+            record.status,
+            RunStatus::Failed
+                | RunStatus::Cancelled
+                | RunStatus::TimedOut
+                | RunStatus::CleanupFailed
+        ),
+        "local run {} has non-success outcome {:?}",
+        record.id,
+        record.status
+    );
+    Ok(())
 }
 
 pub async fn cancel(store: &StateStore, id: &str) -> anyhow::Result<()> {
@@ -809,9 +977,18 @@ pub async fn cancel(store: &StateStore, id: &str) -> anyhow::Result<()> {
 pub async fn cleanup(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> {
     let mut record = status(store, id)?;
     ensure!(
-        record.status != RunStatus::Running && record.status != RunStatus::Cleaned,
+        !matches!(
+            record.status,
+            RunStatus::Preparing
+                | RunStatus::ConsumingAuthorization
+                | RunStatus::ReadyToLaunch
+                | RunStatus::Running
+        ),
         "execution cannot be cleaned in its current state"
     );
+    if record.status == RunStatus::Cleaned {
+        return Ok(record);
+    }
     let cleanup_result = DockerCli::new(which::which("docker")?)
         .remove_owned(
             &record.container_name,
@@ -822,15 +999,26 @@ pub async fn cleanup(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> 
         .and_then(|()| {
             let run_dir = store.path(&PathBuf::from("runs").join(id))?;
             let parent = run_dir.parent().context("run directory has no parent")?;
-            std::fs::remove_dir_all(&run_dir)?;
-            File::open(parent)?.sync_all()?;
+            match std::fs::remove_dir_all(&run_dir) {
+                Ok(()) => File::open(parent)?.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             Ok(())
         });
     record.finished_at = Some(Utc::now());
     match cleanup_result {
         Ok(()) => {
-            record.status = RunStatus::Cleaned;
-            record.error = None;
+            if !matches!(
+                record.status,
+                RunStatus::Failed
+                    | RunStatus::Cancelled
+                    | RunStatus::TimedOut
+                    | RunStatus::CleanupFailed
+            ) {
+                record.status = RunStatus::Cleaned;
+                record.error = None;
+            }
         }
         Err(error) => {
             record.status = RunStatus::CleanupFailed;
@@ -853,6 +1041,10 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
         attended_config_digest(&deployment)? == request.execution.config_digest,
         "configuration changed after authorization"
     );
+    ensure!(
+        attended_config_provenance(&deployment)? == request.execution.config_provenance,
+        "configuration provenance changed after authorization"
+    );
     let bundle = deployment
         .environment_bundles
         .get(&request.proposal.environment)
@@ -867,6 +1059,7 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
     );
     ensure!(
         resolve_image_family(&deployment, &environment.image)? == request.proposal.image_family
+            && request.proposal.image_tag == environment.image
             && request
                 .execution
                 .runtime
@@ -877,10 +1070,18 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
         "authorized image family or exact image changed"
     );
     ensure!(
-        environment.network_policy == request.proposal.network_class
+        request
+            .proposal
+            .overlays
+            .iter()
+            .all(|overlay| environment.allowed_overlays.contains(overlay)),
+        "authorized overlay is no longer allowed by the environment"
+    );
+    ensure!(
+        network_class_within_ceiling(&request.proposal.network_class, &environment.network_policy,)?
             && request.proposal.network_resources
                 == resolve_network_resources(
-                    &environment.network_policy,
+                    &request.proposal.network_class,
                     request.proposal.network_resources.clone(),
                 )?
             && request.execution.runtime.environment.network_resources
@@ -888,8 +1089,11 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
         "authorized network selector, resources, or ceiling changed"
     );
     ensure!(
-        tool_approval_mode(&environment.approval_mode)? == request.proposal.tool_approval,
-        "authorized tool approval no longer matches the environment"
+        tool_approval_within_ceiling(
+            request.proposal.tool_approval,
+            tool_approval_mode(&environment.approval_mode)?,
+        ),
+        "authorized tool approval exceeds the environment ceiling"
     );
     let runner = deployment
         .runner_profiles
@@ -898,7 +1102,9 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
     ensure!(
         serde_json::to_value(&runner)? == request.execution.behavior.runner_profile
             && runner.command == request.execution.behavior.command
-            && runner.args == request.execution.behavior.args,
+            && runner.args == request.execution.behavior.args
+            && network_policy_environment(&deployment, &request.proposal.network_class)?
+                == request.execution.behavior.env,
         "authorized runner profile changed"
     );
     let expected_runtime = canonical_runtime(
@@ -910,10 +1116,20 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
             primary_workspace: request.execution.primary_workspace.clone(),
         },
         &request.proposal.network_resources,
+        request.proposal.timeout_secs,
     );
     ensure!(
         expected_runtime == request.execution.runtime,
         "authorized canonical runtime changed"
+    );
+    ensure!(
+        authorized_credential_providers(&deployment, &runner)?
+            == request.execution.credential_providers,
+        "authorized credential provider descriptors changed"
+    );
+    ensure!(
+        authorized_overlays(&deployment, &request.proposal.overlays)? == request.execution.overlays,
+        "authorized overlay descriptors changed"
     );
     let approved = approved_roots(&deployment.local_agent)?;
     let workspaces = request
@@ -978,7 +1194,7 @@ async fn resolve_attended_credentials(
     runner: &config::ResolvedRunnerProfile,
     valid_through: Option<std::time::SystemTime>,
     credential_dir: &Path,
-    effects: &agent_hub_executor::ExecutionCancellationContext,
+    cancellation: &agent_hub_executor::ExecutionCancellationContext,
 ) -> anyhow::Result<agent_hub_executor::credential_provider::ResolvedCredentials> {
     let configured = configured_credential_providers(deployment)?;
     let providers = runner
@@ -1001,7 +1217,13 @@ async fn resolve_attended_credentials(
             Ok(provider)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    resolve_all_for_job(&providers, valid_through, Some(credential_dir), effects).await
+    resolve_all_for_job(
+        &providers,
+        valid_through,
+        Some(credential_dir),
+        cancellation,
+    )
+    .await
 }
 
 fn configured_credential_providers(
@@ -1015,6 +1237,167 @@ fn configured_credential_providers(
             .unwrap_or_else(|| serde_json::json!({})),
     )
     .context("parse configured credential providers")
+}
+
+fn authorized_overlays(
+    deployment: &config::ValidatedDeployment,
+    selected: &[String],
+) -> anyhow::Result<Vec<AuthorizedOverlay>> {
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let registry = deployment
+        .overlay_registry
+        .as_ref()
+        .context("selected overlays require an installed overlay registry")?;
+    let mut overlays = selected
+        .iter()
+        .map(|name| {
+            let overlay = registry
+                .overlays
+                .iter()
+                .find(|overlay| overlay.name == *name)
+                .with_context(|| format!("selected overlay '{name}' is not installed"))?;
+            Ok(AuthorizedOverlay {
+                name: overlay.name.clone(),
+                provider: overlay.provider.clone(),
+                config: serde_json::to_string(&overlay.config)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    overlays.sort();
+    Ok(overlays)
+}
+
+fn authorized_credential_providers(
+    deployment: &config::ValidatedDeployment,
+    runner: &config::ResolvedRunnerProfile,
+) -> anyhow::Result<Vec<AuthorizedCredentialProvider>> {
+    let configured = configured_credential_providers(deployment)?;
+    let mut descriptors = runner
+        .credential_providers
+        .iter()
+        .map(|required| {
+            let provider = configured.get(&required.name).with_context(|| {
+                format!(
+                    "required credential provider '{}' is unavailable",
+                    required.name
+                )
+            })?;
+            authorized_credential_provider(provider)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    descriptors.sort();
+    Ok(descriptors)
+}
+
+fn authorized_credential_provider(
+    provider: &CredentialProvider,
+) -> anyhow::Result<AuthorizedCredentialProvider> {
+    let (source, command, args, validity, access, constraints) = match provider {
+        CredentialProvider::File {
+            host_path,
+            container_path,
+            read_only,
+            ..
+        } => (
+            host_path.clone(),
+            None,
+            Vec::new(),
+            None,
+            if *read_only {
+                "read_only"
+            } else {
+                "read_write"
+            }
+            .to_string(),
+            BTreeMap::from([("container_path".to_string(), container_path.clone())]),
+        ),
+        CredentialProvider::Env { .. } => (
+            "configured_environment".to_string(),
+            None,
+            Vec::new(),
+            None,
+            "inject_environment".to_string(),
+            BTreeMap::new(),
+        ),
+        CredentialProvider::Command {
+            command,
+            args,
+            capture_env,
+            capture_file,
+            ..
+        } => (
+            command.clone(),
+            Some(command.clone()),
+            args.clone(),
+            None,
+            "execute_host_command".to_string(),
+            [
+                capture_env
+                    .as_ref()
+                    .map(|value| ("capture_env".to_string(), value.clone())),
+                capture_file
+                    .as_ref()
+                    .map(|value| ("capture_file".to_string(), value.clone())),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        ),
+        CredentialProvider::KubeconfigFilter {
+            source_path,
+            allowed_contexts,
+            container_path,
+            ..
+        } => (
+            source_path
+                .clone()
+                .unwrap_or_else(|| "~/.kube/config".to_string()),
+            None,
+            Vec::new(),
+            None,
+            "read_only".to_string(),
+            BTreeMap::from([
+                (
+                    "allowed_contexts".to_string(),
+                    serde_json::to_string(allowed_contexts)?,
+                ),
+                (
+                    "container_path".to_string(),
+                    container_path
+                        .clone()
+                        .unwrap_or_else(|| "/home/agent/.kube/config".to_string()),
+                ),
+            ]),
+        ),
+        CredentialProvider::OpencodeChatgptOauth {
+            host_auth_path,
+            safety_margin_secs,
+            ..
+        } => (
+            host_auth_path.clone(),
+            None,
+            Vec::new(),
+            Some("must exceed authorized deadline".to_string()),
+            "read_only".to_string(),
+            BTreeMap::from([(
+                "safety_margin_secs".to_string(),
+                safety_margin_secs.to_string(),
+            )]),
+        ),
+    };
+    Ok(AuthorizedCredentialProvider {
+        name: provider.name().to_string(),
+        provider_type: provider.provider_type().to_string(),
+        source,
+        command,
+        args,
+        validity,
+        targets: provider.targets(),
+        access,
+        constraints,
+    })
 }
 
 fn validate_credential_descriptors(
@@ -1043,19 +1426,13 @@ fn validate_credential_descriptors(
 fn attended_config_digest(deployment: &config::ValidatedDeployment) -> anyhow::Result<String> {
     let mut local_agent = deployment.local_agent.clone();
     if let Some(object) = local_agent.as_object_mut() {
-        let providers = configured_credential_providers(deployment)?
-            .into_iter()
-            .map(|(configured_name, provider)| {
-                (
-                    configured_name,
-                    serde_json::json!({
-                        "name": provider.name(),
-                        "type": provider.provider_type(),
-                        "targets": provider.targets(),
-                    }),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
+        let mut providers = serde_json::Map::new();
+        for (configured_name, provider) in configured_credential_providers(deployment)? {
+            providers.insert(
+                configured_name,
+                serde_json::to_value(authorized_credential_provider(&provider)?)?,
+            );
+        }
         object.insert("credential_providers".to_string(), providers.into());
     }
     let snapshot = serde_json::json!({
@@ -1069,12 +1446,95 @@ fn attended_config_digest(deployment: &config::ValidatedDeployment) -> anyhow::R
         "images": deployment.images.iter()
             .map(|(name, image)| (name, &image.directory_digest))
             .collect::<BTreeMap<_, _>>(),
+        "overlay_registry": deployment.overlay_registry.as_ref().map(|registry| {
+            registry.overlays.iter().map(|overlay| serde_json::json!({
+                "name": overlay.name,
+                "provider": overlay.provider,
+                "config": overlay.config,
+                "description": overlay.description,
+            })).collect::<Vec<_>>()
+        }),
         "authoritative_paths": deployment.authoritative_paths,
     });
     Ok(protocol::sha256_hex_with_domain(
         b"agent-hub:attended-config:v1\0",
         &serde_json::to_vec(&snapshot)?,
     ))
+}
+
+fn attended_config_provenance(
+    deployment: &config::ValidatedDeployment,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut provenance = BTreeMap::new();
+    provenance.insert(
+        "system.toml".to_string(),
+        protocol::sha256_hex_with_domain(
+            b"agent-hub:attended-config-file:v1\0",
+            deployment.system_toml.as_bytes(),
+        ),
+    );
+    let mut local_agent = deployment.local_agent.clone();
+    if let Some(object) = local_agent.as_object_mut() {
+        let mut providers = serde_json::Map::new();
+        for (name, provider) in configured_credential_providers(deployment)? {
+            providers.insert(
+                name,
+                serde_json::to_value(authorized_credential_provider(&provider)?)?,
+            );
+        }
+        object.insert("credential_providers".to_string(), providers.into());
+    }
+    provenance.insert(
+        "local-agent.json".to_string(),
+        protocol::sha256_hex_with_domain(
+            b"agent-hub:attended-config-file:v1\0",
+            &serde_json::to_vec(&local_agent)?,
+        ),
+    );
+    provenance.extend(
+        deployment
+            .environment_bundle_digests
+            .iter()
+            .map(|(name, digest)| (format!("environment_bundle:{name}"), digest.clone())),
+    );
+    provenance.extend(
+        deployment
+            .runner_profile_digests
+            .iter()
+            .map(|(name, digest)| (format!("runner_profile:{name}"), digest.clone())),
+    );
+    provenance.extend(deployment.network_policies.iter().map(|(name, policy)| {
+        (
+            format!("network_policy:{name}"),
+            policy.directory_digest.clone(),
+        )
+    }));
+    provenance.extend(
+        deployment
+            .images
+            .iter()
+            .map(|(name, image)| (format!("image:{name}"), image.directory_digest.clone())),
+    );
+    if let Some(registry) = &deployment.overlay_registry {
+        provenance.insert(
+            registry.file.relative_path.clone(),
+            registry.file.digest.clone(),
+        );
+    }
+    if let Some(triage) = &deployment.triage_prompt {
+        provenance.insert(
+            triage.file.relative_path.clone(),
+            triage.file.digest.clone(),
+        );
+    }
+    provenance.insert(
+        "authoritative_inventory".to_string(),
+        protocol::sha256_hex_with_domain(
+            b"agent-hub:attended-config-inventory:v1\0",
+            &serde_json::to_vec(&deployment.authoritative_paths)?,
+        ),
+    );
+    Ok(provenance)
 }
 
 struct TemporaryCredentialCleanup(Vec<PathBuf>);
@@ -1131,6 +1591,7 @@ fn canonical_runtime(
     environment: &config::EnvironmentConfig,
     mounts: &ResolvedMounts,
     network_resources: &[NetworkResourceKind],
+    timeout_secs: u64,
 ) -> CanonicalRuntimeSpec {
     let mut planned = canonical_environment_for_execution(
         ExecutionMode::Docker,
@@ -1142,7 +1603,7 @@ fn canonical_runtime(
     } else {
         NetworkResourceRequest::Resources(network_resources.to_vec())
     });
-    planned.timeout_secs = Some(3600);
+    planned.timeout_secs = Some(timeout_secs);
     let mut permissions = canonical_permissions_for_environment(&planned);
     permissions.can_write_workspace = mounts
         .workspaces
@@ -1193,6 +1654,22 @@ fn bundle_network_policy(
     Ok(serde_json::from_slice(&file.bytes)?)
 }
 
+fn network_policy_environment(
+    deployment: &config::ValidatedDeployment,
+    policy_name: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let system = config::SystemConfig::from_toml(&deployment.system_toml, "captured system.toml")
+        .map_err(anyhow::Error::msg)?;
+    let policies = deployment
+        .network_policies
+        .iter()
+        .map(|(name, policy)| (name.clone(), policy.policy.clone()))
+        .collect::<HashMap<_, _>>();
+    let flattened =
+        config::flatten_policy(policy_name, &policies, &system).map_err(anyhow::Error::msg)?;
+    Ok(flattened.env.into_iter().collect())
+}
+
 #[derive(Debug, Deserialize)]
 struct AttendedEgressConfig {
     proxy: AttendedProxyConfig,
@@ -1225,15 +1702,18 @@ struct AttendedProxyConfig {
     declared_volumes: Vec<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
+struct AttendedEgressPreparation<'a> {
+    state_dir: &'a Path,
+    namespace: &'a str,
+    resolver_image: &'a str,
+}
+
 async fn prepare_execution_egress(
     deployment: &config::ValidatedDeployment,
     request: &AttendedAuthorizationRequestV1,
     docker: &Path,
     deadline: &Deadline,
-    state_dir: &Path,
-    namespace: &str,
-    resolver_image: &str,
+    preparation: AttendedEgressPreparation<'_>,
     cancellation: Cancellation,
 ) -> anyhow::Result<Option<PreparedRestrictedEgress>> {
     if request.proposal.network_resources.is_empty() {
@@ -1321,8 +1801,8 @@ async fn prepare_execution_egress(
         "attended proxy runtime contract is not canonical"
     );
     RestrictedEgressRequest {
-        namespace: namespace.to_string(),
-        state_dir: state_dir.to_path_buf(),
+        namespace: preparation.namespace.to_string(),
+        state_dir: preparation.state_dir.to_path_buf(),
         proxy: ProxyRuntimeSpec {
             image: egress.proxy.image,
             listen_port: egress.proxy.listen_port,
@@ -1330,7 +1810,7 @@ async fn prepare_execution_egress(
             gid: egress.proxy.runtime_gid,
         },
         resolver: ResolverRuntimeSpec {
-            image: resolver_image.to_string(),
+            image: preparation.resolver_image.to_string(),
             uid: 100,
             gid: 101,
             upstream: egress.resolver.upstream,
@@ -1396,6 +1876,18 @@ fn tool_approval_mode(value: &str) -> anyhow::Result<ToolApprovalMode> {
         "gateway" => Ok(ToolApprovalMode::Dippy),
         other => anyhow::bail!("unsupported attended tool approval mode '{other}'"),
     }
+}
+
+fn requested_tool_approval_mode(value: &str) -> anyhow::Result<ToolApprovalMode> {
+    match value {
+        "auto" => Ok(ToolApprovalMode::Auto),
+        "dippy" => Ok(ToolApprovalMode::Dippy),
+        other => anyhow::bail!("unsupported attended tool approval selector '{other}'"),
+    }
+}
+
+fn tool_approval_within_ceiling(selected: ToolApprovalMode, ceiling: ToolApprovalMode) -> bool {
+    selected == ToolApprovalMode::Dippy || ceiling == ToolApprovalMode::Auto
 }
 
 fn tool_approval_name(value: ToolApprovalMode) -> &'static str {
@@ -1473,17 +1965,19 @@ fn selector_resources(selector: &str) -> anyhow::Result<Vec<NetworkResourceKind>
     Ok(canonical_resources(resources))
 }
 
+fn network_class_within_ceiling(selected: &str, ceiling: &str) -> anyhow::Result<bool> {
+    let selected = selector_resources(selected)?;
+    let ceiling = selector_resources(ceiling)?;
+    Ok(selected.iter().all(|resource| ceiling.contains(resource)))
+}
+
 fn resolve_network_resources(
     selector: &str,
     requested: Vec<NetworkResourceKind>,
 ) -> anyhow::Result<Vec<NetworkResourceKind>> {
     let ceiling = selector_resources(selector)?;
     ensure_unique_resources(&requested)?;
-    let requested = if requested.is_empty() {
-        ceiling.clone()
-    } else {
-        canonical_resources(requested)
-    };
+    let requested = canonical_resources(requested);
     ensure!(
         !requested.contains(&NetworkResourceKind::GuardedWeb) || requested.len() == 1,
         "guarded_web cannot be combined with other network resources"
@@ -1513,13 +2007,6 @@ fn resource_list(resources: &[NetworkResourceKind]) -> String {
             .collect::<Vec<_>>()
             .join(",")
     }
-}
-
-fn resource_selector_args(resources: &[NetworkResourceKind]) -> String {
-    resources
-        .iter()
-        .map(|resource| format!(" --network-resource {}", resource))
-        .collect()
 }
 
 fn shell_word(value: &str) -> String {
@@ -1702,8 +2189,8 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RunRecord, RunStatus, merge_execution_cleanup, prepare_consumption,
-        resolve_network_resources, selector_resources,
+        RunRecord, RunStatus, merge_execution_cleanup, network_class_within_ceiling,
+        prepare_consumption, resolve_network_resources, selector_resources,
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
@@ -1737,6 +2224,7 @@ mod tests {
 
     #[test]
     fn attended_network_resources_are_repeatable_typed_stable_and_ceiling_bounded() {
+        assert_eq!(resolve_network_resources("build", vec![]).unwrap(), []);
         assert_eq!(
             resolve_network_resources(
                 "build",
@@ -1771,6 +2259,15 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn attended_environment_network_class_is_only_a_ceiling() {
+        assert!(network_class_within_ceiling("none", "build").unwrap());
+        assert!(network_class_within_ceiling("llm-only", "build").unwrap());
+        assert!(network_class_within_ceiling("build", "build").unwrap());
+        assert!(!network_class_within_ceiling("build", "llm-only").unwrap());
+        assert!(!network_class_within_ceiling("guarded-web", "build").unwrap());
     }
 
     #[test]

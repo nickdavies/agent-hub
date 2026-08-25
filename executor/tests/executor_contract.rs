@@ -57,6 +57,7 @@ fn docker_plan_materializes_mandatory_containment_controls() {
         workdir: Some("/workspace".to_string()),
         memory_limit: "8g".to_string(),
         cpu_limit: "4".to_string(),
+        pids_limit: 512,
         read_only: true,
         tmpfs: vec!["/tmp:rw,size=1g".to_string()],
     };
@@ -67,6 +68,7 @@ fn docker_plan_materializes_mandatory_containment_controls() {
         "--cap-drop=ALL",
         "--memory=8g",
         "--cpus=4",
+        "--pids-limit=512",
         "--read-only",
     ] {
         assert!(args.iter().any(|argument| argument == required));

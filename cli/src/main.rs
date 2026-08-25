@@ -22,10 +22,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run locally authorized attended agents
-    Attended {
+    /// Run locally authorized agents
+    #[command(
+        after_help = "Examples:\n  agent-hub local propose --config-root /config --environment code-supervised --image-family job-code --network-class build --network-resource llm --tool-approval dippy --overlay github --workspace primary=/workspace/repo:rw --primary-workspace primary --context-root code=/home/nick.davies/code:ro --timeout-secs 3600 --prompt-stdin --output /secure/authorization.json < /secure/prompt\n  agent-hub local run --environment code-supervised --image-family job-code --network-class build --tool-approval dippy --authorization /secure/authorization.json --digest DIGEST"
+    )]
+    Local {
         #[command(subcommand)]
-        command: AttendedCommand,
+        command: Box<LocalCommand>,
     },
     /// Launch the interactive approval review TUI
     Review {
@@ -90,29 +93,11 @@ enum BuildTarget {
 }
 
 #[derive(Subcommand)]
-enum AttendedCommand {
+enum LocalCommand {
     /// Create a deterministic attended authorization proposal
     Propose {
         #[arg(long, env = "CONFIG_ROOT")]
         config_root: PathBuf,
-        #[arg(long)]
-        environment: String,
-        #[arg(long = "network-resource")]
-        network_resources: Vec<NetworkResourceKind>,
-        #[arg(long = "workspace", value_parser = parse_workspace, required = true)]
-        workspaces: Vec<RequestedWorkspace>,
-        #[arg(long = "context-root", value_parser = parse_context_root)]
-        context_roots: Vec<RequestedContextRoot>,
-        #[arg(long, value_parser = validate_cli_alias)]
-        primary_workspace: String,
-        /// Read the complete prompt from stdin
-        #[arg(long, action = clap::ArgAction::SetTrue, required = true)]
-        prompt_stdin: bool,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// Record a selector-bound Dippy authorization
-    Authorize {
         #[arg(long)]
         environment: String,
         #[arg(long, value_parser = ["job-code"])]
@@ -123,39 +108,77 @@ enum AttendedCommand {
         network_resources: Vec<NetworkResourceKind>,
         #[arg(long, value_parser = ["auto", "dippy"])]
         tool_approval: String,
+        #[arg(long = "overlay")]
+        overlays: Vec<String>,
+        #[arg(long = "workspace", value_parser = parse_workspace, required = true)]
+        workspaces: Vec<RequestedWorkspace>,
+        #[arg(long = "context-root", value_parser = parse_context_root)]
+        context_roots: Vec<RequestedContextRoot>,
+        #[arg(long, value_parser = validate_cli_alias)]
+        primary_workspace: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        timeout_secs: u64,
+        /// Read proposal transport from stdin; the prompt is persisted in the private authorization
+        #[arg(long, action = clap::ArgAction::SetTrue, required = true)]
+        prompt_stdin: bool,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Consume an authorization and execute it in the foreground
+    Run {
+        #[arg(long)]
+        environment: String,
+        #[arg(long, value_parser = ["job-code"])]
+        image_family: String,
+        #[arg(long, value_parser = ["none", "llm-only", "build", "guarded-web"])]
+        network_class: String,
+        #[arg(long, value_parser = ["auto", "dippy"])]
+        tool_approval: String,
         #[arg(long)]
         authorization: PathBuf,
         #[arg(long)]
         digest: String,
     },
-    /// Consume an authorization and execute it in the foreground
-    Run {
-        #[arg(long)]
-        authorization: PathBuf,
-    },
     /// List local attended executions
     List,
     /// Show one execution record
-    Status { id: String },
+    Status {
+        #[arg(long)]
+        run_id: String,
+    },
     /// Print an execution log
     Logs {
-        id: String,
+        #[arg(long)]
+        run_id: String,
         #[arg(long, value_parser = ["stdout", "stderr", "transcript"], default_value = "transcript")]
         stream: String,
+        #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
+        limit_bytes: u64,
     },
     /// Print an execution result
-    Result { id: String },
+    Result {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
+        limit_bytes: u64,
+    },
     /// Cancel an owned running execution
-    Cancel { id: String },
+    Cancel {
+        #[arg(long)]
+        run_id: String,
+    },
     /// Explicitly remove owned execution resources and artifacts
-    Cleanup { id: String },
+    Cleanup {
+        #[arg(long)]
+        run_id: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new()?;
     match cli.command {
-        Commands::Attended { command } => rt.block_on(run_attended(command)),
+        Commands::Local { command } => rt.block_on(run_local(*command)),
         Commands::Review {
             server,
             token,
@@ -184,15 +207,20 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_attended(command: AttendedCommand) -> anyhow::Result<()> {
+async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
     match command {
-        AttendedCommand::Propose {
+        LocalCommand::Propose {
             config_root,
             environment,
+            image_family,
+            network_class,
             network_resources,
+            tool_approval,
+            overlays,
             workspaces,
             context_roots,
             primary_workspace,
+            timeout_secs,
             prompt_stdin: _,
             output,
         } => {
@@ -201,25 +229,30 @@ async fn run_attended(command: AttendedCommand) -> anyhow::Result<()> {
             let artifact = attended::build_proposal(ProposalInput {
                 config_root,
                 environment,
+                image_family,
+                network_class,
                 network_resources,
+                tool_approval,
+                overlays,
+                timeout_secs,
                 prompt,
                 workspaces,
                 context_roots,
                 primary_workspace,
-            })?;
+            })
+            .await?;
             write_new_private_json(&output, &artifact)?;
             print!("{}", attended::render_proposal(&output, &artifact)?);
         }
-        AttendedCommand::Authorize {
+        LocalCommand::Run {
             environment,
             image_family,
             network_class,
-            network_resources,
             tool_approval,
             authorization,
             digest,
         } => {
-            attended::authorize(
+            let record = attended::run(
                 &state_store()?,
                 &authorization,
                 AuthorizationSelectors {
@@ -227,59 +260,71 @@ async fn run_attended(command: AttendedCommand) -> anyhow::Result<()> {
                     environment: &environment,
                     image_family: &image_family,
                     network_class: &network_class,
-                    network_resources: &network_resources,
                     tool_approval: &tool_approval,
                 },
-            )?;
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            attended::ensure_successful_outcome(&record)?;
         }
-        AttendedCommand::Run { authorization } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &attended::run(&state_store()?, &authorization).await?
-                )?
-            );
-        }
-        AttendedCommand::List => {
+        LocalCommand::List => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&attended::list(&state_store()?)?)?
             );
         }
-        AttendedCommand::Status { id } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&attended::status(&state_store()?, &id)?)?
-            );
+        LocalCommand::Status { run_id } => {
+            let record = attended::status(&state_store()?, &run_id)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            attended::ensure_successful_outcome(&record)?;
         }
-        AttendedCommand::Logs { id, stream } => {
+        LocalCommand::Logs {
+            run_id,
+            stream,
+            limit_bytes,
+        } => {
             let name = match stream.as_str() {
                 "stdout" => "stdout.log",
                 "stderr" => "stderr.log",
                 "transcript" => "transcript.jsonl",
                 _ => unreachable!("clap validates log stream"),
             };
-            print!(
+            println!(
                 "{}",
-                std::fs::read_to_string(attended::artifact_path(&state_store()?, &id, name)?)?
-            );
-        }
-        AttendedCommand::Result { id } => {
-            print!(
-                "{}",
-                std::fs::read_to_string(attended::artifact_path(
+                serde_json::to_string_pretty(&attended::read_artifact_bounded(
                     &state_store()?,
-                    &id,
-                    "result.json"
+                    &run_id,
+                    name,
+                    limit_bytes
                 )?)?
             );
         }
-        AttendedCommand::Cancel { id } => attended::cancel(&state_store()?, &id).await?,
-        AttendedCommand::Cleanup { id } => {
+        LocalCommand::Result {
+            run_id,
+            limit_bytes,
+        } => {
+            let record = attended::status(&state_store()?, &run_id)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&attended::cleanup(&state_store()?, &id).await?)?
+                serde_json::to_string_pretty(&attended::read_artifact_bounded(
+                    &state_store()?,
+                    &run_id,
+                    "result.json",
+                    limit_bytes
+                )?)?
             );
+            attended::ensure_successful_outcome(&record)?;
+        }
+        LocalCommand::Cancel { run_id } => {
+            attended::cancel(&state_store()?, &run_id).await?;
+            let record = attended::status(&state_store()?, &run_id)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            attended::ensure_successful_outcome(&record)?;
+        }
+        LocalCommand::Cleanup { run_id } => {
+            let record = attended::cleanup(&state_store()?, &run_id).await?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            attended::ensure_successful_outcome(&record)?;
         }
     }
     Ok(())
@@ -414,29 +459,55 @@ mod attended_cli_tests {
 
     #[test]
     fn proposal_prompt_contract_has_only_explicit_stdin() {
+        let valid = vec![
+            "agent-hub",
+            "local",
+            "propose",
+            "--config-root",
+            "/config",
+            "--environment",
+            "development",
+            "--image-family",
+            "job-code",
+            "--network-class",
+            "none",
+            "--tool-approval",
+            "auto",
+            "--primary-workspace",
+            "primary",
+            "--workspace",
+            "primary=/tmp/repo:rw",
+            "--prompt-stdin",
+            "--timeout-secs",
+            "3600",
+            "--output",
+            "authorization.json",
+        ];
+        assert!(Cli::try_parse_from(valid.clone()).is_ok());
+        for required in [
+            "--environment",
+            "--image-family",
+            "--network-class",
+            "--tool-approval",
+            "--primary-workspace",
+            "--workspace",
+            "--timeout-secs",
+        ] {
+            let mut omitted = valid.clone();
+            let index = omitted.iter().position(|value| *value == required).unwrap();
+            omitted.drain(index..=index + 1);
+            assert!(
+                Cli::try_parse_from(omitted).is_err(),
+                "accepted proposal without {required}"
+            );
+        }
+        let mut omitted_stdin = valid;
+        omitted_stdin.retain(|value| *value != "--prompt-stdin");
+        assert!(Cli::try_parse_from(omitted_stdin).is_err());
         assert!(
             Cli::try_parse_from([
                 "agent-hub",
-                "attended",
-                "propose",
-                "--config-root",
-                "/config",
-                "--environment",
-                "development",
-                "--primary-workspace",
-                "primary",
-                "--workspace",
-                "primary=/tmp/repo:rw",
-                "--prompt-stdin",
-                "--output",
-                "authorization.json"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "agent-hub",
-                "attended",
+                "local",
                 "propose",
                 "--config-root",
                 "/config",
@@ -456,7 +527,7 @@ mod attended_cli_tests {
         assert!(
             Cli::try_parse_from([
                 "agent-hub",
-                "attended",
+                "local",
                 "propose",
                 "--config-root",
                 "/config",
@@ -476,19 +547,17 @@ mod attended_cli_tests {
     }
 
     #[test]
-    fn authorization_contract_rejects_internal_names_and_alternate_options() {
+    fn run_contract_has_exact_ordered_selectors_authorization_and_digest() {
         let valid = [
             "agent-hub",
-            "attended",
-            "authorize",
+            "local",
+            "run",
             "--environment",
             "development",
             "--image-family",
             "job-code",
             "--network-class",
             "build",
-            "--network-resource",
-            "llm",
             "--tool-approval",
             "dippy",
             "--authorization",
@@ -499,24 +568,29 @@ mod attended_cli_tests {
         assert!(Cli::try_parse_from(valid).is_ok());
 
         let mut gateway = valid;
-        gateway[12] = "gateway";
+        gateway[10] = "gateway";
         assert!(Cli::try_parse_from(gateway).is_err());
-
-        let mut resource = valid;
-        resource[9] = "--resource";
-        assert!(Cli::try_parse_from(resource).is_err());
 
         assert!(
             Cli::try_parse_from([
                 "agent-hub",
-                "attended",
+                "local",
                 "run",
                 "--authorization",
                 "/tmp/auth.json",
                 "--environment",
-                "development"
+                "development",
+                "--image-family",
+                "job-code",
+                "--network-class",
+                "build",
+                "--tool-approval",
+                "dippy",
+                "--digest",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ])
-            .is_err()
+            .is_ok()
         );
+        assert!(Cli::try_parse_from(["agent-hub", "local", "authorize", "--help"]).is_err());
     }
 }

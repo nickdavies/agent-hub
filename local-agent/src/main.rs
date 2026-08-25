@@ -15355,42 +15355,14 @@ async fn inspect_local_image_id(
     deadline: &JobDeadline,
     cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<String> {
-    let inspect = run_before_deadline(
-        tokio::process::Command::new(docker_command).args([
-            "image",
-            "inspect",
-            "--format",
-            "{{.Id}}",
-            configured_image,
-        ]),
-        deadline,
-        "resolve local OpenCode image ID",
-        cancellation,
-        "docker_image_inspect_request",
+    let executor_cancellation = agent_hub_executor::Cancellation::new(cancellation.stop_rx.clone());
+    agent_hub_executor::inspect_image_identity(
+        docker_command,
         configured_image,
+        deadline,
+        &executor_cancellation,
     )
-    .await?;
-    if !inspect.status.success() {
-        anyhow::bail!(
-            "failed to resolve local OpenCode image '{}': {}",
-            configured_image,
-            String::from_utf8_lossy(&inspect.stderr).trim()
-        );
-    }
-    let image_id = String::from_utf8(inspect.stdout)
-        .context("resolved OpenCode image ID is not UTF-8")?
-        .trim()
-        .to_string();
-    if image_id.len() != 71
-        || !image_id.starts_with("sha256:")
-        || !image_id[7..]
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
-        anyhow::bail!("resolved OpenCode image ID has invalid shape");
-    }
-
-    Ok(image_id)
+    .await
 }
 
 fn verify_resolved_image_id(expected: &str, current: &str) -> anyhow::Result<()> {
@@ -17792,6 +17764,10 @@ async fn run_docker(
         .unwrap_or(DEFAULT_DOCKER_CPU_LIMIT);
     args.push(format!("--memory={memory_limit}"));
     args.push(format!("--cpus={cpu_limit}"));
+    args.push(format!(
+        "--pids-limit={}",
+        protocol::APPROVED_EXECUTION_PIDS_LIMIT
+    ));
 
     let mut docker_network_none = local_egress_plan.network_none;
     let mut prepared_egress = None;
@@ -19258,6 +19234,10 @@ async fn build_docker_runtime_invocation(
         .unwrap_or(DEFAULT_DOCKER_CPU_LIMIT);
     args.push(format!("--memory={memory_limit}"));
     args.push(format!("--cpus={cpu_limit}"));
+    args.push(format!(
+        "--pids-limit={}",
+        protocol::APPROVED_EXECUTION_PIDS_LIMIT
+    ));
 
     let mut docker_network_none = local_egress_plan.network_none;
     let restricted_tier = match local_egress_plan.tier {
@@ -19989,6 +19969,11 @@ mod oauth_secret_canary_tests {
             .unwrap(),
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let provider = CredentialProvider::OpencodeChatgptOauth {
             name: "openai:chatgpt-oauth".to_string(),
             host_auth_path: source.to_string_lossy().into_owned(),
@@ -20187,8 +20172,13 @@ async fn preflight_job_code_runtime(
     #[cfg(not(unix))]
     anyhow::bail!("job-code preflight requires a Unix runtime UID and GID");
 
-    let args = agent_hub_config::job_code_preflight_docker_args(resolved_image, uid, gid)
-        .map_err(anyhow::Error::msg)?;
+    let args = agent_hub_config::job_code_preflight_docker_args(
+        resolved_image,
+        uid,
+        gid,
+        protocol::APPROVED_EXECUTION_PIDS_LIMIT,
+    )
+    .map_err(anyhow::Error::msg)?;
     let output = run_before_deadline_with_budget(
         tokio::process::Command::new("docker").args(args),
         deadline,

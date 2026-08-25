@@ -140,12 +140,14 @@ impl RestrictedEgressRequest {
         )?;
         let preparation = effects.begin_external_operation("egress_prepare", &self.namespace)?;
 
-        let proxy_image = inspect_image_identity(docker, &self.proxy.image, deadline)
-            .await
-            .context("resolve immutable Squid image")?;
-        let resolver_image = inspect_image_identity(docker, &self.resolver.image, deadline)
-            .await
-            .context("resolve immutable Unbound image")?;
+        let proxy_image =
+            inspect_image_identity(docker, &self.proxy.image, deadline, &self.cancellation)
+                .await
+                .context("resolve immutable Squid image")?;
+        let resolver_image =
+            inspect_image_identity(docker, &self.resolver.image, deadline, &self.cancellation)
+                .await
+                .context("resolve immutable Unbound image")?;
         let hosts = exact_host_union(&self.policies)?;
         let guarded_web = matches!(self.policies.as_slice(), [RestrictedPolicy::GuardedWeb]);
 
@@ -176,27 +178,35 @@ impl RestrictedEgressRequest {
             write_private_file(&unbound_path, unbound_config.as_bytes())?;
             create_network(
                 docker,
-                &external_network,
-                false,
-                &self.external_subnets,
+                NetworkCreation {
+                    name: &external_network,
+                    internal: false,
+                    subnets: &self.external_subnets,
+                },
                 &self.namespace,
                 &self.cancellation,
-                self.failure_after,
-                PreparationBoundary::ExternalNetworkCreated,
-                PreparationBoundary::ExternalNetworkInspected,
+                PreparationCheckpoints {
+                    failure_after: self.failure_after,
+                    created: PreparationBoundary::ExternalNetworkCreated,
+                    inspected: PreparationBoundary::ExternalNetworkInspected,
+                },
                 deadline,
             )
             .await?;
             create_network(
                 docker,
-                &internal_network,
-                true,
-                &[],
+                NetworkCreation {
+                    name: &internal_network,
+                    internal: true,
+                    subnets: &[],
+                },
                 &self.namespace,
                 &self.cancellation,
-                self.failure_after,
-                PreparationBoundary::InternalNetworkCreated,
-                PreparationBoundary::InternalNetworkInspected,
+                PreparationCheckpoints {
+                    failure_after: self.failure_after,
+                    created: PreparationBoundary::InternalNetworkCreated,
+                    inspected: PreparationBoundary::InternalNetworkInspected,
+                },
                 deadline,
             )
             .await?;
@@ -502,17 +512,24 @@ fn exact_host_union(policies: &[RestrictedPolicy]) -> anyhow::Result<Vec<String>
     Ok(hosts)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct NetworkCreation<'a> {
+    name: &'a str,
+    internal: bool,
+    subnets: &'a [String],
+}
+
+struct PreparationCheckpoints {
+    failure_after: Option<PreparationBoundary>,
+    created: PreparationBoundary,
+    inspected: PreparationBoundary,
+}
+
 async fn create_network(
     docker: &Path,
-    name: &str,
-    internal: bool,
-    subnets: &[String],
+    network: NetworkCreation<'_>,
     namespace: &str,
     cancellation: &Cancellation,
-    failure_after: Option<PreparationBoundary>,
-    created_boundary: PreparationBoundary,
-    inspected_boundary: PreparationBoundary,
+    checkpoints: PreparationCheckpoints,
     deadline: &Deadline,
 ) -> anyhow::Result<()> {
     check_cancelled(cancellation, "network creation")?;
@@ -521,31 +538,31 @@ async fn create_network(
         "create".to_string(),
         "--driver=bridge".to_string(),
     ];
-    if internal {
+    if network.internal {
         args.push("--internal".to_string());
     }
-    for subnet in subnets {
+    for subnet in network.subnets {
         args.extend(["--subnet".to_string(), subnet.clone()]);
     }
-    let subnet_fingerprint = fingerprint(&[subnets.join(",").as_bytes()]);
+    let subnet_fingerprint = fingerprint(&[network.subnets.join(",").as_bytes()]);
     append_labels(&mut args, namespace, "network", &subnet_fingerprint);
-    args.push(name.to_string());
+    args.push(network.name.to_string());
     require_success(
         execute_output(docker, &args, deadline, "create restricted network").await?,
-        &format!("create restricted network '{name}'"),
+        &format!("create restricted network '{}'", network.name),
     )?;
-    inject_failure(failure_after, created_boundary)?;
+    inject_failure(checkpoints.failure_after, checkpoints.created)?;
     verify_network_contract(
         docker,
-        name,
+        network.name,
         namespace,
         &subnet_fingerprint,
-        internal,
-        subnets,
+        network.internal,
+        network.subnets,
         deadline,
     )
     .await?;
-    inject_failure(failure_after, inspected_boundary)
+    inject_failure(checkpoints.failure_after, checkpoints.inspected)
 }
 
 fn inject_failure(

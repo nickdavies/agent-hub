@@ -27,10 +27,13 @@ pub use approval::{
     KnownHookEvent, RequestType,
 };
 pub use attended::{
-    ATTENDED_AUTHORIZATION_REQUEST_VERSION, ATTENDED_AUTHORIZATION_VERSION, ApprovedExecutionSpec,
-    AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1, AttendedLifecycleContract,
-    AttendedOutputContract, AttendedProposal, ContextRootSpec, RepositoryMountSpec,
-    ToolApprovalMode, WorkspaceAccess, WorkspaceSpec, sha256_hex_with_domain,
+    APPROVED_EXECUTION_PIDS_LIMIT, ATTENDED_AUTHORIZATION_REQUEST_VERSION,
+    ATTENDED_AUTHORIZATION_VERSION, ApprovedExecutionSpec, AttendedAuthorizationArtifact,
+    AttendedAuthorizationRequestV1, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedOutputContract, AttendedProposal, AuthorizedCredentialProvider, AuthorizedOverlay,
+    ContextRootSpec, RepositoryMountSpec, RepositoryState, ToolApprovalMode, WorkspaceAccess,
+    WorkspaceSpec, canonical_context_root_path, is_canonical_context_root_path,
+    sha256_hex_with_domain,
 };
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{

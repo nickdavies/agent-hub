@@ -88,6 +88,20 @@ impl Cancellation {
     pub fn requested(&self) -> bool {
         *self.receiver.borrow()
     }
+
+    pub fn never() -> Self {
+        let (_sender, receiver) = watch::channel(false);
+        Self::new(receiver)
+    }
+
+    async fn cancelled(&self) {
+        let mut receiver = self.receiver.clone();
+        while !*receiver.borrow() {
+            if receiver.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -767,6 +781,7 @@ pub async fn inspect_image_identity(
     docker_command: &Path,
     configured_image: &str,
     deadline: &Deadline,
+    cancellation: &Cancellation,
 ) -> anyhow::Result<String> {
     let remaining = deadline
         .remaining()
@@ -777,9 +792,13 @@ pub async fn inspect_image_identity(
         .env_clear()
         .args(["image", "inspect", "--format", "{{.Id}}", configured_image]);
     command.kill_on_drop(true);
-    let output = tokio::time::timeout(remaining, command.output())
-        .await
-        .context("image resolution deadline exceeded")??;
+    anyhow::ensure!(!cancellation.requested(), "image resolution was cancelled");
+    let output = tokio::select! {
+        output = tokio::time::timeout(remaining, command.output()) => {
+            output.context("image resolution deadline exceeded")??
+        }
+        () = cancellation.cancelled() => anyhow::bail!("image resolution was cancelled"),
+    };
     anyhow::ensure!(
         output.status.success(),
         "failed to resolve local image '{}': {}",
@@ -810,6 +829,30 @@ pub async fn execute_output(
         .await
         .with_context(|| format!("{description} deadline exceeded"))?
         .with_context(|| format!("execute {description}"))
+}
+
+pub async fn execute_output_cancellable(
+    command: &Path,
+    args: &[String],
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+    description: &str,
+) -> anyhow::Result<std::process::Output> {
+    let remaining = deadline
+        .remaining()
+        .with_context(|| format!("{description} requires an absolute deadline"))?;
+    anyhow::ensure!(!remaining.is_zero(), "{description} deadline exceeded");
+    anyhow::ensure!(!cancellation.requested(), "{description} was cancelled");
+    let mut process = tokio::process::Command::new(command);
+    process.env_clear().args(args).kill_on_drop(true);
+    tokio::select! {
+        output = tokio::time::timeout(remaining, process.output()) => {
+            output
+                .with_context(|| format!("{description} deadline exceeded"))?
+                .with_context(|| format!("execute {description}"))
+        }
+        () = cancellation.cancelled() => anyhow::bail!("{description} was cancelled"),
+    }
 }
 
 fn validate_image_identity(identity: &str) -> anyhow::Result<()> {
@@ -916,6 +959,7 @@ pub struct DockerExecutionPlan {
     pub workdir: Option<String>,
     pub memory_limit: String,
     pub cpu_limit: String,
+    pub pids_limit: u32,
     pub read_only: bool,
     pub tmpfs: Vec<String>,
 }
@@ -934,6 +978,7 @@ impl DockerExecutionPlan {
             "Docker memory limit is empty"
         );
         anyhow::ensure!(!self.cpu_limit.is_empty(), "Docker CPU limit is empty");
+        anyhow::ensure!(self.pids_limit > 0, "Docker PID limit must be positive");
         if let Some(workdir) = &self.workdir {
             validate_container_path(workdir)?;
         }
@@ -960,6 +1005,7 @@ impl DockerExecutionPlan {
             "--cap-drop=ALL".to_string(),
             format!("--memory={}", self.memory_limit),
             format!("--cpus={}", self.cpu_limit),
+            format!("--pids-limit={}", self.pids_limit),
         ];
         if self.read_only {
             args.push("--read-only".to_string());

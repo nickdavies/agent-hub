@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, ensure};
@@ -119,6 +119,15 @@ impl StateStore {
             .with_context(|| format!("parse {}", path.display()))
     }
 
+    pub fn read_limited(&self, relative: &Path, limit: u64) -> anyhow::Result<(Vec<u8>, u64)> {
+        let path = self.checked_path(relative)?;
+        let file = open_owned_file(&path)?;
+        let total = file.metadata()?.len();
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes)?;
+        Ok((bytes, total))
+    }
+
     pub fn rename(&self, from: &Path, to: &Path) -> anyhow::Result<()> {
         self.ensure_root()?;
         let from = self.checked_path(from)?;
@@ -140,6 +149,15 @@ impl StateStore {
 
     pub fn path(&self, relative: &Path) -> anyhow::Result<PathBuf> {
         self.checked_path(relative)
+    }
+
+    pub fn ensure_directory(&self, relative: &Path) -> anyhow::Result<PathBuf> {
+        self.ensure_root()?;
+        let path = self.checked_path(relative)?;
+        let sentinel = path.join(".parent");
+        ensure_parent(&self.root, &sentinel)?;
+        verify_owned_directory(&path)?;
+        Ok(path)
     }
 
     pub fn list_json<T: DeserializeOwned>(&self, relative: &Path) -> anyhow::Result<Vec<T>> {
