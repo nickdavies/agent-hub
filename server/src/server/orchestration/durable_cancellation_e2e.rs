@@ -619,18 +619,6 @@ fn assert_terminal_cancellation_invariants(
             );
         }
     }
-    let mcp_root = Path::new("/tmp/agent-hub-mcp");
-    if mcp_root.exists() {
-        let job = job_id.to_string();
-        for entry in std::fs::read_dir(mcp_root)? {
-            let entry = entry?;
-            ensure!(
-                !entry.file_name().to_string_lossy().contains(&job),
-                "job-owned MCP socket/helper remains at {}",
-                entry.path().display()
-            );
-        }
-    }
     Ok(())
 }
 

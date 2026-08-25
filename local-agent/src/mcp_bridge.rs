@@ -84,7 +84,7 @@ impl McpBridgeInstance {
 
         let bind = cancellation
             .begin_external_operation("mcp_socket_bind", &socket_path.to_string_lossy())?;
-        let listener = UnixListener::bind(&socket_path)
+        let listener = bind_runtime_socket(&socket_dir, &socket_path)
             .with_context(|| format!("bind bridge socket {}", socket_path.display()))?;
         bind.completed()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -138,6 +138,75 @@ impl McpBridgeInstance {
         }
         Ok(())
     }
+}
+
+fn bind_runtime_socket(
+    socket_dir: &std::path::Path,
+    socket_path: &std::path::Path,
+) -> std::io::Result<UnixListener> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        if socket_path.as_os_str().as_bytes().len() < 108 {
+            return UnixListener::bind(socket_path);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let directory = std::fs::File::open(socket_dir)?;
+        let file_name = socket_path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path has no file name",
+            )
+        })?;
+        let bounded_path = std::path::Path::new("/proc/self/fd")
+            .join(directory.as_raw_fd().to_string())
+            .join(file_name);
+        UnixListener::bind(bounded_path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "runtime MCP socket path exceeds the platform Unix socket path limit",
+    ))
+}
+
+async fn connect_unix_socket(path: &std::path::Path) -> std::io::Result<UnixStream> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        if path.as_os_str().as_bytes().len() < 108 {
+            return UnixStream::connect(path).await;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path has no parent",
+            )
+        })?;
+        let directory = std::fs::File::open(parent)?;
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path has no file name",
+            )
+        })?;
+        let bounded_path = std::path::Path::new("/proc/self/fd")
+            .join(directory.as_raw_fd().to_string())
+            .join(file_name);
+        UnixStream::connect(bounded_path).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "Unix socket path exceeds the platform path limit",
+    ))
 }
 
 impl Drop for McpBridgeInstance {
@@ -204,7 +273,7 @@ async fn handle_mcp_connection(
         McpEndpoint::Unix { path } => {
             let operation =
                 cancellation.begin_external_operation("mcp_upstream_connect", "unix_endpoint")?;
-            let upstream = UnixStream::connect(path).await?;
+            let upstream = connect_unix_socket(std::path::Path::new(path)).await?;
             operation.completed()?;
             bidirectional_copy(client, upstream).await
         }
@@ -366,7 +435,7 @@ mod tests {
                 .file_type()
                 .is_socket()
         );
-        let mut client = UnixStream::connect(&bridge.socket_path).await.unwrap();
+        let mut client = connect_unix_socket(&bridge.socket_path).await.unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut reply = [0_u8; 4];
         client.read_exact(&mut reply).await.unwrap();
@@ -377,5 +446,41 @@ mod tests {
         assert!(!bridge.socket_path.exists());
         assert!(cancellation.operations.unresolved().unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_bridge_binds_long_explicit_runtime_path_without_temp_fallback() {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let root = std::env::temp_dir()
+            .join(format!("m-{}", &id[..8]))
+            .join("explicit-runtime-root-component-that-exceeds-the-unix-socket-address-limit")
+            .join("another-explicit-runtime-root-component");
+        std::fs::create_dir_all(&root).unwrap();
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root.join("attempt"), stop_rx)
+            .expect("cancellation context");
+        let mut bridge = McpBridgeInstance::start(
+            &McpBridgeConfig {
+                name: "long-path".to_string(),
+                host_endpoint: McpEndpoint::Tcp {
+                    host: "127.0.0.1".to_string(),
+                    port: 9,
+                },
+                container_socket_path: None,
+            },
+            &root.join("runtime"),
+            &cancellation,
+        )
+        .await
+        .expect("start bridge through bounded descriptor path");
+        assert!(bridge.socket_path.starts_with(&root));
+        assert!(bridge.socket_path.exists());
+        bridge.stop(&cancellation).await.unwrap();
+        std::fs::remove_dir_all(
+            root.ancestors()
+                .nth(2)
+                .expect("test root has expected components"),
+        )
+        .unwrap();
     }
 }

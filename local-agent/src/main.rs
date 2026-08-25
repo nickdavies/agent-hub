@@ -558,6 +558,22 @@ impl OperationJournal {
         Ok(())
     }
 
+    fn has_operation_kind(&self, operation_kind: &str) -> bool {
+        self.state
+            .lock()
+            .expect("operation journal lock poisoned")
+            .records
+            .iter()
+            .any(|record| record.operation_kind == operation_kind)
+    }
+
+    fn has_unresolved_operation_kind(&self, operation_kind: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .unresolved()?
+            .iter()
+            .any(|record| record.operation_kind == operation_kind))
+    }
+
     fn reconcile_owned_resources_under(&self, root: &Path) -> anyhow::Result<()> {
         let root = root.to_string_lossy();
         let records = {
@@ -596,8 +612,13 @@ impl OperationJournal {
             latest.insert(record.operation_id, record);
         }
         for record in latest.into_values().filter(|record| {
-            record.status == ExternalOperationStatus::Completed
-                && operation_owns_reconcilable_resource(&record.operation_kind)
+            matches!(
+                record.status,
+                ExternalOperationStatus::Started
+                    | ExternalOperationStatus::Completed
+                    | ExternalOperationStatus::Ambiguous
+                    | ExternalOperationStatus::CleanupFailed
+            ) && operation_owns_reconcilable_resource(&record.operation_kind)
                 && record.resource_identity == resource_identity
         }) {
             self.append(
@@ -5037,7 +5058,7 @@ mod tests {
         effects.hash(&mut hasher);
         assert_eq!(
             hasher.finish(),
-            6_019_647_135_097_640_314,
+            4_453_831_012_833_862_904,
             "external-effect source inventory changed; audit every changed helper and update the reviewed fingerprint"
         );
     }
@@ -9009,9 +9030,13 @@ impl CredentialContainerCleanupGuard {
                 let ownership = ownership.clone();
                 let ambiguity_state = Arc::clone(&ambiguity_state);
                 Box::pin(async move {
-                    if ambiguity_state.ambiguous_create.load(Ordering::Acquire) {
+                    if ambiguity_state
+                        .cancellation
+                        .operations
+                        .has_unresolved_operation_kind("docker_mutation_helper_process")?
+                    {
                         anyhow::bail!(
-                            "Docker create result is ambiguous; startup/retry ownership reconciliation is required"
+                            "Docker mutation helper is unresolved; startup/retry reconciliation is required"
                         );
                     }
                     docker
@@ -9268,6 +9293,7 @@ fi
 if [ "$1" = image ]; then printf 'sha256:{}\n'; exit 0; fi
 if [ "$1" = run ]; then printf '1.18.18\n'; exit 0; fi
 if [ "$1" = create ]; then
+  : > "$state/create_entered"
   while [ $# -gt 0 ]; do
     if [ "$1" = --name ]; then shift; name="$1"; fi
     if [ "$1" = --label ]; then
@@ -9318,6 +9344,7 @@ exit 0
             command,
             recovery_journal: None,
             execution_phase: None,
+            absence_quiescence: Duration::from_millis(100),
         }
     }
 
@@ -9955,14 +9982,189 @@ exit 0
                     .join(&state.container_name)
                     .exists()
             );
-            if edge == "create_fail" {
-                assert!(state.root.join(AMBIGUOUS_CREATE_MARKER).exists());
-                assert!(state.root.join("CLEANUP_REQUIRED").exists());
-            } else {
-                state.cleanup().await.unwrap();
-            }
+            state.cleanup().await.unwrap();
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_during_docker_create_waits_for_completion_before_containment() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-cancel-create-submit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = fake_docker(&root);
+        std::fs::write(root.join("fake-docker-state/create_slow"), "slow").unwrap();
+        let state =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+        let invocation = fake_invocation(&root, Arc::clone(&state), 10);
+        let guard = CredentialContainerCleanupGuard::production(
+            state.container_name.clone(),
+            Arc::clone(&state),
+        );
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let cancellation = ExecutionCancellationContext::for_test(&root, cancel_rx).unwrap();
+        let create_entered = root.join("fake-docker-state/create_entered");
+        tokio::spawn(async move {
+            while !create_entered.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cancel_tx.send(true).unwrap();
+        });
+
+        let started = Instant::now();
+        let operation =
+            spawn_opencode_runtime_container(&invocation, &state.container_name, &cancellation)
+                .await;
+        assert!(operation.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(800));
+        assert!(
+            finish_credential_container_operation(operation, guard)
+                .await
+                .is_err()
+        );
+        assert!(
+            !root
+                .join("fake-docker-state/containers")
+                .join(&state.container_name)
+                .exists()
+        );
+        assert!(
+            !state
+                .cancellation
+                .operations
+                .has_unresolved_operation_kind("docker_mutation_helper_process")
+                .unwrap()
+        );
+        state.cleanup().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_absence_resets_when_late_owned_container_appears() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-late-create-quiescence-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut docker = fake_docker(&root);
+        docker.absence_quiescence = Duration::from_millis(300);
+        let owner = ownership(uuid::Uuid::new_v4());
+        let name = format!("agent-hub-opencode-{}", owner.job_id.simple());
+        let labels = serde_json::to_vec(
+            &owner
+                .labels()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+        .unwrap();
+        let target = root.join("fake-docker-state/containers").join(&name);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            std::fs::write(target, labels).unwrap();
+        });
+
+        let started = Instant::now();
+        docker
+            .reconcile_absent(&name, &owner, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(450));
+        assert!(
+            !root
+                .join("fake-docker-state/containers")
+                .join(name)
+                .exists()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn restart_waits_for_written_create_request_then_reconciles_late_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-create-request-restart-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for directory in [root.join("worktrees"), root.join("repos")] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let docker = fake_docker(&root);
+        let owner = ownership(uuid::Uuid::new_v4());
+        let state = OpencodeJobState::prepare(&root, owner.clone(), &bundle(), &docker)
+            .await
+            .unwrap();
+        state
+            .persist_create_phase(CreateLifecyclePhase::CreateSubmitted)
+            .unwrap();
+        state
+            .cancellation
+            .phase
+            .transition(super::AttemptPhase::DockerCreateSubmitting)
+            .unwrap();
+        let create = state
+            .cancellation
+            .begin_external_operation("docker_create_request", &state.container_name)
+            .unwrap();
+        let labels = serde_json::to_string(
+            &owner
+                .labels()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+        .unwrap();
+        let target = root
+            .join("fake-docker-state/containers")
+            .join(&state.container_name);
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 0.2; printf '%s' \"$LABELS\" > \"$TARGET\"")
+            .env("LABELS", labels)
+            .env("TARGET", &target);
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+        let child = command.spawn().unwrap();
+        let identity =
+            super::read_process_identity(i32::try_from(child.id().unwrap()).unwrap()).unwrap();
+        let helper = state
+            .cancellation
+            .begin_external_operation(
+                "docker_mutation_helper_process",
+                &format!(
+                    "container={};pid={};pgid={};boot={};start={}",
+                    state.container_name,
+                    identity.pid,
+                    identity.pgid,
+                    identity.linux_boot_id,
+                    identity.proc_start_time_ticks
+                ),
+            )
+            .unwrap();
+        drop(child);
+        drop(helper);
+        drop(create);
+
+        super::reconcile_operation_journals(&root.join("attempts"), &root, &docker)
+            .await
+            .unwrap();
+        state.cancellation.operations.reload_from_disk().unwrap();
+        assert!(
+            state
+                .cancellation
+                .operations
+                .unresolved()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!target.exists());
+        state.cleanup().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -10052,7 +10254,7 @@ exit 0
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn elapsed_ambiguous_quarantine_preserves_absent_or_unverifiable_state_for_operator() {
+    async fn elapsed_ambiguous_quarantine_accepts_quiescent_absence_but_not_inspect_failure() {
         for scenario in ["absent", "unverifiable"] {
             let root = std::env::temp_dir().join(format!(
                 "agent-hub-ambiguous-{scenario}-{}",
@@ -10083,20 +10285,24 @@ exit 0
                 std::fs::write(root.join("fake-docker-state/inspect_fail"), "fail").unwrap();
             }
             clock.set(1_000_000 + AMBIGUOUS_CREATE_QUARANTINE.as_millis() as u64);
-            assert!(
-                OpencodeJobState::prepare_with_clock(
-                    &root,
-                    owner,
-                    &bundle(),
-                    &docker,
-                    Duration::from_millis(200),
-                    clock_trait,
-                )
-                .await
-                .is_err()
-            );
-            assert!(retained_root.exists());
-            assert!(retained_root.join(AMBIGUOUS_CREATE_MARKER).exists());
+            let result = OpencodeJobState::prepare_with_clock(
+                &root,
+                owner,
+                &bundle(),
+                &docker,
+                Duration::from_millis(200),
+                clock_trait,
+            )
+            .await;
+            if scenario == "absent" {
+                let reconciled = result.unwrap();
+                assert!(!reconciled.root.join(AMBIGUOUS_CREATE_MARKER).exists());
+                reconciled.cleanup().await.unwrap();
+            } else {
+                assert!(result.is_err());
+                assert!(retained_root.exists());
+                assert!(retained_root.join(AMBIGUOUS_CREATE_MARKER).exists());
+            }
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -10370,7 +10576,7 @@ exit 0
             let (cancel_tx, cancel_rx) = watch::channel(false);
             if scenario == "cancellation" {
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     cancel_tx.send(true).unwrap();
                 });
             }
@@ -10432,12 +10638,7 @@ exit 0
                     assert!(persisted.contains("[REDACTED_ACCESS_TOKEN]"), "{scenario}");
                 }
             }
-            if scenario == "create_fail" {
-                assert!(state.root.join(AMBIGUOUS_CREATE_MARKER).exists());
-                assert!(state.root.join("CLEANUP_REQUIRED").exists());
-            } else {
-                state.cleanup().await.unwrap();
-            }
+            state.cleanup().await.unwrap();
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -14325,9 +14526,10 @@ const LABEL_WORKER_SESSION_GENERATION: &str = "com.reddit.agent-hub.worker-sessi
 const STARTUP_RECONCILIATION_MAX_ITEMS: usize = 100;
 const STARTUP_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(60);
 const CREATE_COMMAND_MAX_BUDGET: Duration = Duration::from_secs(30);
-// The quarantine is twice the maximum Docker create request budget. Absence after
-// this interval still requires operator action because it cannot establish ownership.
-const AMBIGUOUS_CREATE_QUARANTINE: Duration = Duration::from_secs(60);
+const DOCKER_ABSENCE_QUIESCENCE: Duration = Duration::from_secs(2);
+// Without a persisted helper identity, the create may have been submitted in the
+// spawn-to-journal crash window. Do not trust absence until its request budget elapsed.
+const AMBIGUOUS_CREATE_QUARANTINE: Duration = CREATE_COMMAND_MAX_BUDGET;
 const AMBIGUOUS_CREATE_MARKER: &str = "AMBIGUOUS_CREATE.json";
 const CREATE_OUTCOME_MARKER: &str = "CREATE_OUTCOME.json";
 const CREATE_MARKER_FAILURE: &str = "CREATE_MARKER_FAILURE.json";
@@ -14541,6 +14743,7 @@ struct DockerCli {
     command: PathBuf,
     recovery_journal: Option<Arc<OperationJournal>>,
     execution_phase: Option<Arc<AttemptPhaseStore>>,
+    absence_quiescence: Duration,
 }
 
 impl DockerCli {
@@ -14549,6 +14752,7 @@ impl DockerCli {
             command: PathBuf::from("docker"),
             recovery_journal: None,
             execution_phase: None,
+            absence_quiescence: DOCKER_ABSENCE_QUIESCENCE,
         }
     }
 
@@ -14713,6 +14917,7 @@ impl DockerCli {
         deadline: Instant,
     ) -> anyhow::Result<()> {
         let mut errors = Vec::new();
+        let mut absent_since = None;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -14726,23 +14931,30 @@ impl DockerCli {
                 .await
             {
                 Ok(None) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    return match self.inspect_named_container(name, remaining).await? {
-                        None => Ok(()),
-                        Some(actual) if actual == *ownership => {
-                            errors.push("container appeared between absence checks".to_string());
-                            continue;
-                        }
-                        Some(actual) => anyhow::bail!(
-                            "refusing to reconcile container '{name}' with mismatched ownership: {actual:?}"
-                        ),
-                    };
+                    let observed_at = Instant::now();
+                    let first_absence = absent_since.get_or_insert(observed_at);
+                    if observed_at.duration_since(*first_absence) >= self.absence_quiescence {
+                        return Ok(());
+                    }
+                    let remaining = deadline.saturating_duration_since(observed_at);
+                    let needed = self
+                        .absence_quiescence
+                        .saturating_sub(observed_at.duration_since(*first_absence));
+                    anyhow::ensure!(
+                        remaining >= needed,
+                        "could not prove container '{name}' absent through the required quiescence interval"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50).min(needed).min(remaining)).await;
+                    continue;
                 }
-                Ok(Some(actual)) if actual == *ownership => {}
+                Ok(Some(actual)) if actual == *ownership => {
+                    absent_since = None;
+                }
                 Ok(Some(actual)) => anyhow::bail!(
                     "refusing to reconcile container '{name}' with mismatched ownership: {actual:?}"
                 ),
                 Err(error) => {
+                    absent_since = None;
                     errors.push(format!("inspect: {error:#}"));
                 }
             }
@@ -14880,9 +15092,7 @@ impl DockerCli {
             Some(actual) => anyhow::bail!(
                 "ambiguous-create container '{name}' has mismatched ownership: {actual:?}"
             ),
-            None => anyhow::bail!(
-                "ambiguous-create quarantine elapsed but container authority cannot be established from absence; operator action is required"
-            ),
+            None => self.reconcile_absent_until(name, ownership, deadline).await,
         }
     }
 
@@ -15406,8 +15616,12 @@ async fn run_before_deadline_with_budget(
     if remaining.is_zero() {
         anyhow::bail!("absolute job deadline exceeded before {operation}");
     }
+    let docker_mutation = matches!(
+        operation_kind,
+        "docker_create_request" | "docker_start_request"
+    );
     command
-        .kill_on_drop(true)
+        .kill_on_drop(!docker_mutation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -15422,8 +15636,13 @@ async fn run_before_deadline_with_budget(
         .and_then(|pid| i32::try_from(pid).ok())
         .context("external request helper has no valid PID")?;
     let identity = read_process_identity(pid)?;
+    let helper_kind = if docker_mutation {
+        "docker_mutation_helper_process"
+    } else {
+        "external_request_helper_process"
+    };
     let helper = cancellation.begin_external_operation(
-        "external_request_helper_process",
+        helper_kind,
         &format!(
             "pid={};pgid={};boot={};start={}",
             identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
@@ -16075,6 +16294,34 @@ async fn terminate_persisted_process(identity: &PersistedProcessIdentity) -> any
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+async fn wait_for_persisted_process_absence(
+    identity: &PersistedProcessIdentity,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("process settlement deadline overflow")?;
+    loop {
+        if owned_process_group_members(identity.pgid, &identity.linux_boot_id)?.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "Docker mutation helper did not settle before its bounded reconciliation deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn wait_for_persisted_process_absence(
+    _identity: &PersistedProcessIdentity,
+    _timeout: Duration,
+) -> anyhow::Result<()> {
+    anyhow::bail!("persisted Docker mutation recovery requires Linux process identity")
+}
+
 #[cfg(not(target_os = "linux"))]
 async fn terminate_persisted_process(_identity: &PersistedProcessIdentity) -> anyhow::Result<()> {
     anyhow::bail!("persisted process recovery requires Linux process identity")
@@ -16258,7 +16505,6 @@ async fn reconcile_operation_journals(
     let worktrees_root = std::fs::canonicalize(data_dir.join("worktrees"))?;
     let repos_root = std::fs::canonicalize(data_dir.join("repos"))?;
     let data_root = std::fs::canonicalize(data_dir)?;
-    let mcp_root = std::env::temp_dir().join("agent-hub-mcp");
     let mut entries = tokio::fs::read_dir(attempts_root).await?;
     let mut count = 0_usize;
     while let Some(entry) = entries.next_entry().await? {
@@ -16306,6 +16552,24 @@ async fn reconcile_operation_journals(
             "operation journal and lifecycle phase assignment mismatch"
         );
         let scope = reconciliation_scope(phase.phase);
+        let mutation_helper_kind = "docker_mutation_helper_process";
+        for helper in journal
+            .unresolved()?
+            .into_iter()
+            .filter(|record| record.operation_kind == mutation_helper_kind)
+        {
+            let identity = parse_journal_process_identity(&helper.resource_identity)?;
+            wait_for_persisted_process_absence(&identity, CREATE_COMMAND_MAX_BUDGET).await?;
+            journal.append(
+                helper.operation_id,
+                &helper.operation_kind,
+                helper.lifecycle_phase,
+                &helper.resource_identity,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )?;
+        }
+        let mutation_helper_recorded = journal.has_operation_kind(mutation_helper_kind);
         for unresolved in journal.unresolved()? {
             anyhow::ensure!(
                 phase.phase == AttemptPhase::ContainmentFailed
@@ -16382,6 +16646,20 @@ async fn reconcile_operation_journals(
                     );
                 }
                 kind if kind.starts_with("docker_") => {
+                    if kind == "docker_create_request" && !mutation_helper_recorded {
+                        for state_root in [root.join("opencode"), root.join("docker")] {
+                            let marker_path = state_root.join(AMBIGUOUS_CREATE_MARKER);
+                            if !marker_path.exists() {
+                                continue;
+                            }
+                            let marker: AmbiguousCreateMarker =
+                                serde_json::from_slice(&std::fs::read(&marker_path)?)?;
+                            let age = ambiguous_marker_age(&marker, &SystemWallClock)?;
+                            if age < AMBIGUOUS_CREATE_QUARANTINE {
+                                tokio::time::sleep(AMBIGUOUS_CREATE_QUARANTINE - age).await;
+                            }
+                        }
+                    }
                     let inspected = docker
                         .inspect_named_container(
                             &unresolved.resource_identity,
@@ -16476,8 +16754,8 @@ async fn reconcile_operation_journals(
                     if path.exists() {
                         let canonical = std::fs::canonicalize(&path)?;
                         anyhow::ensure!(
-                            canonical.starts_with(&mcp_root),
-                            "unresolved MCP resource is outside owned socket root"
+                            canonical.starts_with(&data_root),
+                            "unresolved MCP resource is outside the worker data root"
                         );
                         std::fs::remove_file(canonical)?;
                     }
@@ -17258,8 +17536,13 @@ async fn supervise_process_with_mode(
         tokio::fs::File::from_std(transcript_std),
     )));
 
+    let docker_mutation = job.command == "docker"
+        && matches!(
+            job.args.first().map(String::as_str),
+            Some("create" | "start")
+        );
     let mut cmd = tokio::process::Command::new(&job.command);
-    cmd.kill_on_drop(true);
+    cmd.kill_on_drop(!docker_mutation);
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
     cmd.args(&job.args)
@@ -17318,8 +17601,13 @@ async fn supervise_process_with_mode(
         .and_then(|pid| i32::try_from(pid).ok())
         .context("spawned process has no valid process-group ID")?;
     let process_identity = read_process_identity(process_group_id)?;
+    let helper_kind = if docker_mutation {
+        "docker_mutation_helper_process"
+    } else {
+        "helper_process"
+    };
     let helper_operation = cancellation.begin_external_operation(
-        "helper_process",
+        helper_kind,
         &format!(
             "pid={};pgid={};boot={};start={}",
             process_identity.pid,
@@ -17409,7 +17697,7 @@ async fn supervise_process_with_mode(
                 break wait_result?;
             }
             _ = ticker.tick() => {
-                if cancellation.check().is_err() {
+                if cancellation.check().is_err() && !docker_mutation {
                     if let Some(events) = events {
                         events
                             .emit(
@@ -17439,6 +17727,11 @@ async fn supervise_process_with_mode(
                 }
 
                 if deadline.is_expired() {
+                        if docker_mutation {
+                            anyhow::bail!(
+                                "Docker mutation did not settle before its absolute deadline"
+                            );
+                        }
                     if let Some(events) = events {
                         events
                             .emit(
@@ -17638,9 +17931,16 @@ async fn run_docker(
     let container_image = runtime_container_image.ok_or_else(|| {
         anyhow::anyhow!("runtime container_image must be set via CONFIG_ROOT configuration")
     })?;
+    let resolved_container_image = inspect_local_image_id(
+        Path::new("docker"),
+        &container_image,
+        deadline,
+        cancellation,
+    )
+    .await?;
     preflight_job_code_runtime(
         &container_image,
-        &container_image,
+        &resolved_container_image,
         &workspace_dir,
         deadline,
         cancellation,
@@ -17948,7 +18248,7 @@ async fn run_docker(
     }
     args.push("--entrypoint".to_string());
     args.push(job.command.clone());
-    args.push(container_image);
+    args.push(resolved_container_image);
     args.extend(job.args.clone());
 
     validate_final_docker_mount_plan(&cancellation.phase.root, &args)?;
@@ -18082,9 +18382,18 @@ async fn run_docker(
         ))
     }
     .await;
-    let cleanup = docker
-        .reconcile_absent(&container_name, &ownership, STARTUP_RECONCILIATION_TIMEOUT)
-        .await;
+    let cleanup = if cancellation
+        .operations
+        .has_unresolved_operation_kind("docker_mutation_helper_process")?
+    {
+        Err(anyhow::anyhow!(
+            "Docker mutation helper remains unresolved; restart reconciliation is required"
+        ))
+    } else {
+        docker
+            .reconcile_absent(&container_name, &ownership, STARTUP_RECONCILIATION_TIMEOUT)
+            .await
+    };
     let run_result = match (operation, cleanup) {
         (Ok(status), Ok(())) => {
             cancellation
@@ -18538,7 +18847,8 @@ async fn spawn_opencode_runtime_container(
             .store(false, Ordering::Release);
         anyhow::bail!("absolute deadline expired before Docker create submission");
     }
-    create.kill_on_drop(true);
+    #[cfg(unix)]
+    create.as_std_mut().process_group(0);
     let create_operation =
         cancellation.begin_external_operation("docker_create_request", container_name)?;
     let child = match create.spawn() {
@@ -18556,6 +18866,20 @@ async fn spawn_opencode_runtime_container(
             return Err(error).context("submit Docker create process");
         }
     };
+    let create_pid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .context("Docker create helper has no valid PID")?;
+    let create_identity = read_process_identity(create_pid)?;
+    let helper_resource = format!(
+        "container={container_name};pid={};pgid={};boot={};start={}",
+        create_identity.pid,
+        create_identity.pgid,
+        create_identity.linux_boot_id,
+        create_identity.proc_start_time_ticks
+    );
+    let create_helper = cancellation
+        .begin_external_operation("docker_mutation_helper_process", &helper_resource)?;
     cancellation
         .phase
         .transition(AttemptPhase::DockerCreateSubmitted)?;
@@ -18575,6 +18899,8 @@ async fn spawn_opencode_runtime_container(
             anyhow::bail!("Docker create response exceeded its bounded request budget");
         }
     };
+    verify_process_group_absent(&create_identity).await?;
+    create_helper.reconciled()?;
     if !created.status.success() {
         create_operation.ambiguous("docker_create_non_success")?;
         anyhow::bail!(
@@ -18828,7 +19154,14 @@ fn finalize_redacted_output_artifact(
     let marker = output_redaction_marker(output_path);
     if !output_path.exists() {
         cancellation
-            .write_file("output_redaction_marker_write", &marker, b"absent\n")
+            .write_file(
+                "output_redaction_artifact_write",
+                output_path,
+                br#"{"next_event":"job_failed","summary":"execution ended before output was produced"}"#,
+            )
+            .context("write safe final output artifact")?;
+        cancellation
+            .write_file("output_redaction_marker_write", &marker, b"redacted\n")
             .context("write output redaction marker")?;
         return Ok(());
     }
@@ -20154,7 +20487,10 @@ async fn preflight_job_code_runtime(
     deadline: &JobDeadline,
     cancellation: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
-    if configured_image != agent_hub_config::DURABLE_OPENCODE_IMAGE {
+    let configured_is_exact_image_id =
+        verify_resolved_image_id(configured_image, configured_image).is_ok();
+    if configured_image != agent_hub_config::DURABLE_OPENCODE_IMAGE && !configured_is_exact_image_id
+    {
         return Ok(());
     }
     #[cfg(unix)]
@@ -20436,8 +20772,13 @@ mod restricted_mount_tests {
 
         #[cfg(unix)]
         {
+            use std::os::fd::AsRawFd as _;
             let socket = root.join("docker.sock");
-            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let directory = std::fs::File::open(&root).unwrap();
+            let bounded_socket = std::path::Path::new("/proc/self/fd")
+                .join(directory.as_raw_fd().to_string())
+                .join("docker.sock");
+            let listener = std::os::unix::net::UnixListener::bind(bounded_socket).unwrap();
             let link = approved.join("socket-link");
             std::os::unix::fs::symlink(&socket, &link).unwrap();
             let mut symlink = canonical_runtime_spec_for_job(&job);
