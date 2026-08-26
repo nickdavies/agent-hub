@@ -23,7 +23,7 @@ pub struct QuestionArgs {
     pub token: Secret,
 
     /// Maximum time to wait for an answer in seconds
-    #[arg(long, default_value = "600")]
+    #[arg(long, default_value = "86400")]
     pub timeout: u64,
 }
 
