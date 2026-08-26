@@ -259,6 +259,7 @@ impl ExecutionCancellationContext {
     }
 
     pub async fn reconcile_owned_effects(&self, credential_root: &Path) -> anyhow::Result<()> {
+        self.reconcile_owned_credentials(credential_root, None)?;
         let records = self
             .effect_state
             .lock()
@@ -266,30 +267,6 @@ impl ExecutionCancellationContext {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let credential_records = records
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.operation_kind.as_str(),
-                    "credential_materialize"
-                        | "credential_secret_write"
-                        | "credential_directory_create"
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        reconcile_owned_credential_paths(credential_root, &credential_records)?;
-        for record in credential_records
-            .into_iter()
-            .filter(|record| !effect_is_resolved(record))
-        {
-            self.append_effect(
-                record.operation_id,
-                &record.operation_kind,
-                &record.resource_identity,
-                ExternalEffectStatus::Reconciled,
-            )?;
-        }
         for record in records {
             if effect_is_resolved(&record) {
                 continue;
@@ -315,6 +292,98 @@ impl ExecutionCancellationContext {
                     ExternalEffectStatus::Reconciled,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    pub fn reconcile_owned_credentials(
+        &self,
+        credential_root: &Path,
+        runtime_data_root: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        let credential_records = self
+            .effect_state
+            .lock()
+            .expect("effect state lock poisoned")
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.operation_kind.as_str(),
+                    "credential_materialize"
+                        | "credential_secret_write"
+                        | "credential_directory_create"
+                ) && !(record.operation_kind == "credential_directory_create"
+                    && runtime_data_root.is_some_and(|runtime_root| {
+                        Path::new(&record.resource_identity) == runtime_root
+                    }))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        reconcile_owned_credential_paths(credential_root, &credential_records)?;
+        for record in credential_records
+            .into_iter()
+            .filter(|record| !effect_is_resolved(record))
+        {
+            self.append_effect(
+                record.operation_id,
+                &record.operation_kind,
+                &record.resource_identity,
+                ExternalEffectStatus::Reconciled,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn reconcile_owned_runtime_data(
+        &self,
+        authorization_root: &Path,
+        runtime_data_root: &Path,
+    ) -> anyhow::Result<()> {
+        let records = self
+            .effect_state
+            .lock()
+            .expect("effect state lock poisoned")
+            .values()
+            .filter(|record| {
+                record.operation_kind == "opencode_runtime_data_directory_create"
+                    || (record.operation_kind == "credential_directory_create"
+                        && Path::new(&record.resource_identity) == runtime_data_root)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in &records {
+            anyhow::ensure!(
+                Path::new(&record.resource_identity) == runtime_data_root,
+                "OpenCode runtime-data effect does not match its authorized root"
+            );
+        }
+        match std::fs::symlink_metadata(runtime_data_root) {
+            Ok(_) => {
+                anyhow::ensure!(
+                    !records.is_empty(),
+                    "OpenCode runtime-data root has no run-owned effect"
+                );
+                remove_owned_runtime_data_tree(authorization_root, runtime_data_root)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        anyhow::ensure!(
+            std::fs::symlink_metadata(runtime_data_root)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "owned OpenCode runtime-data root remains after cleanup: {}",
+            runtime_data_root.display()
+        );
+        for record in records
+            .into_iter()
+            .filter(|record| !effect_is_resolved(record))
+        {
+            self.append_effect(
+                record.operation_id,
+                &record.operation_kind,
+                &record.resource_identity,
+                ExternalEffectStatus::Reconciled,
+            )?;
         }
         Ok(())
     }
@@ -521,6 +590,80 @@ fn reconcile_owned_credential_paths(
         );
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn remove_owned_runtime_data_tree(
+    authorization_root: &Path,
+    runtime_data_root: &Path,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    anyhow::ensure!(
+        authorization_root.is_absolute() && runtime_data_root.is_absolute(),
+        "OpenCode runtime-data ownership roots must be absolute"
+    );
+    let authorization_metadata = std::fs::symlink_metadata(authorization_root)?;
+    anyhow::ensure!(
+        authorization_metadata.is_dir() && !authorization_metadata.file_type().is_symlink(),
+        "OpenCode runtime-data authorization root is not a real directory"
+    );
+    let canonical_authorization = std::fs::canonicalize(authorization_root)?;
+    anyhow::ensure!(
+        canonical_authorization == authorization_root,
+        "OpenCode runtime-data authorization root is not canonical"
+    );
+    let runtime_metadata = std::fs::symlink_metadata(runtime_data_root)?;
+    anyhow::ensure!(
+        runtime_metadata.is_dir() && !runtime_metadata.file_type().is_symlink(),
+        "OpenCode runtime-data root is not a real directory"
+    );
+    let canonical_runtime = std::fs::canonicalize(runtime_data_root)?;
+    anyhow::ensure!(
+        canonical_runtime == runtime_data_root
+            && canonical_runtime.parent() == Some(canonical_authorization.as_path()),
+        "OpenCode runtime-data root is not exactly contained by its authorization root"
+    );
+    let expected_uid = unsafe { libc::geteuid() };
+    for (description, metadata) in [
+        ("authorization", &authorization_metadata),
+        ("runtime-data", &runtime_metadata),
+    ] {
+        anyhow::ensure!(
+            metadata.uid() == expected_uid,
+            "OpenCode runtime-data {description} root owner mismatch"
+        );
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "OpenCode runtime-data {description} root is not private"
+        );
+    }
+
+    remove_runtime_data_entry(runtime_data_root)?;
+    sync_directory(&canonical_authorization)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_runtime_data_entry(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        for entry in std::fs::read_dir(path)? {
+            remove_runtime_data_entry(&entry?.path())?;
+        }
+        std::fs::remove_dir(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn remove_owned_runtime_data_tree(
+    _authorization_root: &Path,
+    _runtime_data_root: &Path,
+) -> anyhow::Result<()> {
+    anyhow::bail!("secure OpenCode runtime-data cleanup requires Unix ownership metadata")
 }
 
 #[derive(Clone, Copy)]

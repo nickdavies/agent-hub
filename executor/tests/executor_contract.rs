@@ -793,6 +793,156 @@ async fn effect_recovery_hard_fails_on_unknown_credential_material_then_retries(
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn effect_recovery_removes_owned_opencode_runtime_data_without_following_symlinks() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let root = temp_root("effect-opencode-runtime-data-recovery");
+    let data = root.join("data");
+    let runtime_data = data.join("opencode");
+    let caller_target = root.join("caller-target");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&runtime_data).unwrap();
+    std::fs::create_dir(&caller_target).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&runtime_data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(caller_target.join("untouched"), "caller-owned").unwrap();
+    for relative in [
+        "opencode.db",
+        "opencode.db-wal",
+        "log/opencode.log",
+        "snapshot/state.json",
+        "repos/repository.json",
+    ] {
+        let path = runtime_data.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "runtime-state").unwrap();
+    }
+    symlink(&caller_target, runtime_data.join("repos/caller-link")).unwrap();
+    let auth = runtime_data.join("auth.json");
+    std::fs::write(&auth, "secret").unwrap();
+
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+    effects
+        .begin_external_operation(
+            "opencode_runtime_data_directory_create",
+            &runtime_data.to_string_lossy(),
+        )
+        .unwrap()
+        .completed()
+        .unwrap();
+    effects
+        .begin_external_operation("credential_secret_write", &auth.to_string_lossy())
+        .unwrap()
+        .completed()
+        .unwrap();
+
+    effects
+        .reconcile_owned_credentials(&data, Some(&runtime_data))
+        .unwrap();
+    assert!(!auth.exists());
+    assert!(runtime_data.join("opencode.db").is_file());
+    effects
+        .reconcile_owned_runtime_data(&data, &runtime_data)
+        .unwrap();
+    effects.finalize().unwrap();
+
+    assert!(!runtime_data.exists());
+    assert_eq!(
+        std::fs::read_to_string(caller_target.join("untouched")).unwrap(),
+        "caller-owned"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn effect_recovery_reclassifies_only_the_exact_legacy_opencode_runtime_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_root("effect-legacy-opencode-runtime-data-recovery");
+    let data = root.join("data");
+    let runtime_data = data.join("opencode");
+    let unrelated = data.join("other");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&runtime_data).unwrap();
+    std::fs::create_dir(&unrelated).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&runtime_data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(runtime_data.join("opencode.db"), "runtime-state").unwrap();
+    std::fs::write(unrelated.join("unknown"), "not-runtime-data").unwrap();
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+    for path in [&runtime_data, &unrelated] {
+        effects
+            .begin_external_operation("credential_directory_create", &path.to_string_lossy())
+            .unwrap()
+            .completed()
+            .unwrap();
+    }
+
+    let error = effects
+        .reconcile_owned_credentials(&data, Some(&runtime_data))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown material"));
+    assert!(runtime_data.is_dir());
+    assert!(unrelated.is_dir());
+
+    std::fs::remove_file(unrelated.join("unknown")).unwrap();
+    effects
+        .reconcile_owned_credentials(&data, Some(&runtime_data))
+        .unwrap();
+    effects
+        .reconcile_owned_runtime_data(&data, &runtime_data)
+        .unwrap();
+    effects.finalize().unwrap();
+    assert!(!runtime_data.exists());
+    assert!(!unrelated.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn effect_recovery_rejects_runtime_data_effect_outside_the_exact_authorized_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_root("effect-opencode-runtime-data-containment");
+    let data = root.join("data");
+    let runtime_data = data.join("opencode");
+    let caller_target = root.join("caller-target");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&runtime_data).unwrap();
+    std::fs::create_dir(&caller_target).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&runtime_data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(caller_target.join("untouched"), "caller-owned").unwrap();
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+    effects
+        .begin_external_operation(
+            "opencode_runtime_data_directory_create",
+            &caller_target.to_string_lossy(),
+        )
+        .unwrap()
+        .completed()
+        .unwrap();
+
+    let error = effects
+        .reconcile_owned_runtime_data(&data, &runtime_data)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not match its authorized root"));
+    assert_eq!(
+        std::fs::read_to_string(caller_target.join("untouched")).unwrap(),
+        "caller-owned"
+    );
+    assert!(runtime_data.is_dir());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn cleanup_failure_is_explicit() {
     let root = temp_root("cleanup-status");

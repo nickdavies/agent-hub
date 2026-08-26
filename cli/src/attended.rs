@@ -147,6 +147,7 @@ struct AttendedCleanupEvidence {
     container: CleanupCheck,
     egress: CleanupCheck,
     credentials: CleanupCheck,
+    runtime_data: CleanupCheck,
     effects: CleanupCheck,
 }
 
@@ -157,6 +158,7 @@ impl Default for AttendedCleanupEvidence {
             container: CleanupCheck::not_applicable(),
             egress: CleanupCheck::not_applicable(),
             credentials: CleanupCheck::not_applicable(),
+            runtime_data: CleanupCheck::not_applicable(),
             effects: CleanupCheck::not_applicable(),
         }
     }
@@ -168,6 +170,7 @@ impl AttendedCleanupEvidence {
             && self.container.complete()
             && self.egress.complete()
             && self.credentials.complete()
+            && self.runtime_data.complete()
             && self.effects.complete()
     }
 }
@@ -919,7 +922,6 @@ pub async fn run(
             }
             None => Ok(()),
         };
-        let credential_cleanup = credential_cleanup.cleanup();
         let helper_cleanup = effects.settle_process_helpers().await;
         let primary_cleanup = match &helper_cleanup {
             Ok(()) => {
@@ -936,7 +938,24 @@ pub async fn run(
                 "primary containment blocked by unsettled helper: {error:#}"
             )),
         };
-        let credential_effect_cleanup = effects.reconcile_owned_effects(&data_dir).await;
+        let credential_cleanup = credential_cleanup.cleanup();
+        let containment_absent = helper_cleanup.is_ok()
+            && primary_cleanup.is_ok()
+            && egress_cleanup.is_ok();
+        let credential_effect_cleanup = if containment_absent {
+            effects.reconcile_owned_credentials(&data_dir, Some(&data_dir.join("opencode")))
+        } else {
+            Err(anyhow::anyhow!(
+                "credential effect cleanup blocked until process, container, helper, and egress absence is proven"
+            ))
+        };
+        let runtime_data_cleanup = if containment_absent {
+            effects.reconcile_owned_runtime_data(&data_dir, &data_dir.join("opencode"))
+        } else {
+            Err(anyhow::anyhow!(
+                "OpenCode runtime-data cleanup blocked until process, container, helper, and egress absence is proven"
+            ))
+        };
         let credential_check = match (&credential_cleanup, &credential_effect_cleanup) {
             (CleanupStatus::Complete, Ok(())) => CleanupCheck {
                 status: "verified_absent",
@@ -951,13 +970,17 @@ pub async fn run(
                 error: Some(format!("{error:#}")),
             },
         };
-        let effect_cleanup = credential_effect_cleanup
-            .and_then(|()| effects.finalize());
+        let effect_cleanup = match (&credential_effect_cleanup, &runtime_data_cleanup) {
+            (Ok(()), Ok(())) => effects.finalize(),
+            (Err(error), _) => Err(anyhow::anyhow!("credential effects: {error:#}")),
+            (_, Err(error)) => Err(anyhow::anyhow!("runtime-data effects: {error:#}")),
+        };
         captured_cleanup_evidence = Some(AttendedCleanupEvidence {
             process: CleanupCheck::from_result(&helper_cleanup),
             container: CleanupCheck::from_result(&primary_cleanup),
             egress: CleanupCheck::from_result(&egress_cleanup),
             credentials: credential_check,
+            runtime_data: CleanupCheck::from_result(&runtime_data_cleanup),
             effects: CleanupCheck::from_result(&effect_cleanup),
         });
         merge_execution_cleanup(
@@ -1402,13 +1425,29 @@ async fn recover_owned_run_resources(
     {
         failures.push(format!("egress: {error:#}"));
     }
-    if let Some(effects) = &effects
-        && let Err(error) = effects
-            .reconcile_owned_effects(&run_dir.join("data"))
-            .await
-            .and_then(|()| effects.finalize())
-    {
-        failures.push(format!("credential/process effects: {error:#}"));
+    if let Some(effects) = &effects {
+        let data_dir = run_dir.join("data");
+        let runtime_data_dir = data_dir.join("opencode");
+        if failures.is_empty() {
+            if let Err(error) =
+                effects.reconcile_owned_credentials(&data_dir, Some(&runtime_data_dir))
+            {
+                failures.push(format!("credential effects: {error:#}"));
+            }
+            if let Err(error) = effects.reconcile_owned_runtime_data(&data_dir, &runtime_data_dir) {
+                failures.push(format!("runtime-data effects: {error:#}"));
+            }
+            if failures.is_empty()
+                && let Err(error) = effects.finalize()
+            {
+                failures.push(format!("effect reconciliation: {error:#}"));
+            }
+        } else {
+            failures.push(
+                "runtime-data effects: cleanup blocked until container and egress absence is proven"
+                    .to_string(),
+            );
+        }
     }
     ensure!(
         failures.is_empty(),

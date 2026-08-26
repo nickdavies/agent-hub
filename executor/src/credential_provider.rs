@@ -497,8 +497,10 @@ fn resolve_opencode_chatgpt_oauth(
     }
 
     let auth_dir = credential_dir.join("opencode");
-    let directory = cancellation
-        .begin_external_operation("credential_directory_create", &auth_dir.to_string_lossy())?;
+    let directory = cancellation.begin_external_operation(
+        "opencode_runtime_data_directory_create",
+        &auth_dir.to_string_lossy(),
+    )?;
     std::fs::create_dir_all(&auth_dir).context("create job OpenCode data directory")?;
     directory.completed()?;
     let auth_path = auth_dir.join("auth.json");
