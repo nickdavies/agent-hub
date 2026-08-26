@@ -140,6 +140,7 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
         // Web UI routes
         let mut web_routes = Router::new()
             .route("/approvals", get(web::dashboard::<N>))
+            .route("/approvals/queue", get(web::approval_queue::<N>))
             .route("/approvals/{id}", get(web::approval_detail::<N>));
 
         if state.config.auth_mode != AuthMode::None {
@@ -553,13 +554,13 @@ mod integration_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode as AxumStatus};
-    use config::{ApprovalFeatureMode, AuthMode, ServerConfig};
+    use config::{ApprovalFeatureMode, AuthMode, ServerConfig, Token};
     use notifier::NullNotifier;
     use sessions::SessionApprovalMode;
     use tower::ServiceExt; // for oneshot
 
     /// Build a test router with auth disabled (no Bearer tokens needed).
-    fn test_app() -> Router {
+    fn test_app_with_mode(approval_mode: ApprovalFeatureMode) -> Router {
         let config = ServerConfig {
             auth_mode: AuthMode::None,
             tokens: vec![],
@@ -567,12 +568,16 @@ mod integration_tests {
             presence_ttl_secs: 120,
             session_ttl_secs: 7200,
             notification_delay_secs: 0,
-            approval_mode: ApprovalFeatureMode::Readwrite,
+            approval_mode,
             base_url: Some("http://localhost:8080".into()),
             default_approval_mode: SessionApprovalMode::Remote,
         };
         let state = AppState::new(config, NullNotifier, None);
         router(state)
+    }
+
+    fn test_app() -> Router {
+        test_app_with_mode(ApprovalFeatureMode::Readwrite)
     }
 
     /// Helper: POST JSON to a path and return the status code.
@@ -599,6 +604,57 @@ mod integration_tests {
             .await
             .unwrap();
         (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn mobile_approval_queue_renders_readwrite_shell() {
+        let app = test_app();
+
+        let (status, body) = get_json(&app, "/approvals/queue").await;
+
+        assert_eq!(status, AxumStatus::OK);
+        assert!(body.contains("id=\"queue-state\""));
+        assert!(body.contains("id=\"queue-actions\""));
+        assert!(body.contains("/api/v1/approvals/pending"));
+    }
+
+    #[tokio::test]
+    async fn mobile_approval_queue_hides_readonly_actions() {
+        let app = test_app_with_mode(ApprovalFeatureMode::Readonly);
+
+        let (status, body) = get_json(&app, "/approvals/queue").await;
+
+        assert_eq!(status, AxumStatus::OK);
+        assert!(body.contains("id=\"readonly-status\""));
+        assert!(!body.contains("id=\"queue-actions\""));
+    }
+
+    #[tokio::test]
+    async fn mobile_approval_queue_requires_web_auth() {
+        let config = ServerConfig {
+            auth_mode: AuthMode::Token,
+            tokens: vec![Token {
+                label: "test".into(),
+                secret: protocol::Secret::new("secret"),
+            }],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode: ApprovalFeatureMode::Readwrite,
+            base_url: Some("http://localhost:8080".into()),
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        let app = router(AppState::new(config, NullNotifier, None));
+
+        let request = Request::builder()
+            .uri("/approvals/queue")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), AxumStatus::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()["location"], "/auth/login");
     }
 
     // ---------------------------------------------------------------

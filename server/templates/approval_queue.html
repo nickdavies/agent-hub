@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Approval Queue — Claude Notify</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        body { min-height: 100vh; }
+        nav, main { max-width: 44rem; }
+        nav { padding-top: max(0.75rem, env(safe-area-inset-top)); }
+        main { padding-bottom: calc(1rem + env(safe-area-inset-bottom)); }
+        article { margin-bottom: 1rem; }
+        #queue-summary { color: var(--pico-muted-color); font-size: 0.9rem; }
+        #error-state { border: 1px solid var(--pico-del-color); color: var(--pico-del-color); padding: 0.75rem; border-radius: var(--pico-border-radius); }
+        #meta { overflow-wrap: anywhere; }
+        #meta dt, .smart-view dt { color: var(--pico-primary); font-weight: bold; margin-top: 0.6rem; }
+        #meta dd, .smart-view dd { margin-left: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+        pre { max-height: none; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+        .view-heading { align-items: center; display: flex; justify-content: space-between; gap: 1rem; }
+        .view-heading button { margin: 0; padding: 0.25rem 0.6rem; width: auto; white-space: nowrap; }
+        #readonly-status { border-top: 1px solid var(--pico-muted-border-color); padding: 0.75rem 0; color: var(--pico-muted-color); }
+        #queue-actions { position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; background: var(--pico-card-background-color); border-top: 1px solid var(--pico-muted-border-color); box-shadow: 0 -0.25rem 1rem rgba(0, 0, 0, 0.08); }
+        #queue-actions .action-inner { max-width: 44rem; margin: 0 auto; padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom)); }
+        #primary-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+        #primary-actions button { min-height: 3.5rem; margin: 0; font-size: 1.1rem; font-weight: bold; }
+        #deny-panel { margin-bottom: 0.75rem; }
+        #deny-panel label { margin-bottom: 0.25rem; }
+        #deny-panel input { margin-bottom: 0.5rem; }
+        #deny-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+        #deny-actions button { margin: 0; }
+        [hidden] { display: none !important; }
+    </style>
+</head>
+<body>
+<nav class="container">
+    <ul><li><a href="/approvals"><strong>Claude Notify</strong></a></li></ul>
+    {% if has_auth %}
+    <ul><li><small>{{ email }}</small></li></ul>
+    {% endif %}
+</nav>
+
+<main class="container" id="queue-state">
+    <header>
+        <h2>Approval Queue</h2>
+        <p id="queue-summary" aria-live="polite">Loading pending approvals…</p>
+    </header>
+
+    <p id="loading-state" role="status">Loading approval details…</p>
+    <p id="empty-state" role="status" hidden>No pending approvals. Waiting for new work…</p>
+    <p id="error-state" role="alert" hidden></p>
+
+    <article id="request-state" aria-labelledby="tool-name" aria-live="polite" aria-atomic="true" hidden>
+        <header>
+            <h3 id="tool-name" tabindex="-1"></h3>
+            <dl id="meta">
+                <dt>Project</dt><dd id="project"></dd>
+                <dt>Session</dt><dd id="session"></dd>
+                <dt>Provider</dt><dd><code id="provider"></code></dd>
+            </dl>
+        </header>
+
+        <section id="context-section" hidden>
+            <h4 id="context-heading"></h4>
+            <pre><code id="context-content"></code></pre>
+        </section>
+
+        <section aria-labelledby="input-heading">
+            <div class="view-heading">
+                <h4 id="input-heading">Tool Input</h4>
+                <button type="button" class="outline secondary" id="view-toggle" aria-controls="smart-view raw-view" aria-expanded="false">Show raw JSON</button>
+            </div>
+            <div id="smart-view" class="smart-view"></div>
+            <pre id="raw-view" hidden><code id="raw-content"></code></pre>
+        </section>
+
+        <p>Status: <mark>Pending</mark></p>
+    </article>
+
+    {% if !readwrite %}
+    <p id="readonly-status" role="status">This approval queue is read-only.</p>
+    {% endif %}
+</main>
+
+{% if readwrite %}
+<footer id="queue-actions" hidden>
+    <div class="action-inner">
+        <div id="deny-panel" hidden>
+            <label for="deny-reason">Reason (optional)</label>
+            <input type="text" id="deny-reason" autocomplete="off">
+            <div id="deny-actions">
+                <button type="button" class="secondary" id="confirm-deny">Deny request</button>
+                <button type="button" class="outline secondary" id="cancel-deny">Cancel</button>
+            </div>
+        </div>
+        <div id="primary-actions">
+            <button type="button" id="approve-button" aria-label="Approve current request">Approve</button>
+            <button type="button" class="secondary" id="deny-button" aria-label="Deny current request">Deny</button>
+        </div>
+        <small id="action-status" role="status" aria-live="assertive"></small>
+    </div>
+</footer>
+{% endif %}
+
+<script>
+(function() {
+    const READWRITE = {{ readwrite }};
+    const POLL_MS = 2000;
+    let currentId = null;
+    let queueRequest = null;
+    let pollTimer = null;
+    let actionInFlight = false;
+    let rawMode = false;
+    let errorKind = null;
+    let focusNewRequest = false;
+    let resolvedApprovalId = null;
+
+    const loadingState = document.getElementById('loading-state');
+    const emptyState = document.getElementById('empty-state');
+    const errorState = document.getElementById('error-state');
+    const requestState = document.getElementById('request-state');
+    const queueSummary = document.getElementById('queue-summary');
+    const queueActions = document.getElementById('queue-actions');
+
+    function setText(id, value) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value == null ? '' : String(value);
+    }
+
+    function showError(message, kind) {
+        errorState.textContent = message;
+        errorState.hidden = false;
+        errorKind = kind;
+    }
+
+    function clearError() {
+        errorState.hidden = true;
+        errorState.textContent = '';
+        errorKind = null;
+    }
+
+    function updateActionSpacing() {
+        const queueState = document.getElementById('queue-state');
+        if (!queueActions || queueActions.hidden) {
+            queueState.style.paddingBottom = '';
+            return;
+        }
+        queueState.style.paddingBottom = Math.ceil(queueActions.getBoundingClientRect().height + 16) + 'px';
+    }
+
+    function requestActionSpacingUpdate() {
+        window.requestAnimationFrame(updateActionSpacing);
+    }
+
+    function renderSmartInput(input) {
+        const container = document.getElementById('smart-view');
+        container.replaceChildren();
+        if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+            const pre = document.createElement('pre');
+            const code = document.createElement('code');
+            code.textContent = JSON.stringify(input, null, 2);
+            pre.appendChild(code);
+            container.appendChild(pre);
+            return;
+        }
+
+        const list = document.createElement('dl');
+        for (const [key, value] of Object.entries(input)) {
+            const term = document.createElement('dt');
+            term.textContent = key;
+            const detail = document.createElement('dd');
+            if (typeof value === 'string') {
+                detail.textContent = value;
+            } else {
+                const pre = document.createElement('pre');
+                const code = document.createElement('code');
+                code.textContent = JSON.stringify(value, null, 2);
+                pre.appendChild(code);
+                detail.appendChild(pre);
+            }
+            list.append(term, detail);
+        }
+        container.appendChild(list);
+    }
+
+    function renderContext(approval) {
+        const section = document.getElementById('context-section');
+        const extra = approval.context && approval.context.extra;
+        if (!extra || typeof extra !== 'object') {
+            section.hidden = true;
+            return;
+        }
+        if (typeof extra.diff === 'string') {
+            setText('context-heading', 'Diff');
+            setText('context-content', extra.diff);
+            section.hidden = false;
+        } else if (typeof extra.dippy_reason === 'string') {
+            setText('context-heading', 'Dippy context');
+            setText('context-content', extra.dippy_reason);
+            section.hidden = false;
+        } else {
+            section.hidden = true;
+        }
+    }
+
+    function renderApproval(approval, count) {
+        currentId = approval.id;
+        rawMode = false;
+        setText('tool-name', approval.tool_name || 'Unknown tool');
+        setText('project', approval.project || 'Unknown project');
+        setText('session', approval.session_display_name || approval.session_id || 'Unknown session');
+        setText('provider', approval.provider || 'Unknown provider');
+        renderContext(approval);
+        renderSmartInput(approval.tool_input);
+        setText('raw-content', JSON.stringify(approval.tool_input, null, 2));
+        document.getElementById('smart-view').hidden = false;
+        document.getElementById('raw-view').hidden = true;
+        const toggle = document.getElementById('view-toggle');
+        toggle.textContent = 'Show raw JSON';
+        toggle.setAttribute('aria-expanded', 'false');
+        loadingState.hidden = true;
+        emptyState.hidden = true;
+        requestState.hidden = false;
+        queueSummary.textContent = count === 1 ? '1 pending approval' : count + ' pending approvals';
+        if (queueActions) queueActions.hidden = false;
+        setText('action-status', '');
+        hideDeny();
+        requestActionSpacingUpdate();
+        if (focusNewRequest) {
+            focusNewRequest = false;
+            window.requestAnimationFrame(() => document.getElementById('tool-name').focus());
+        }
+    }
+
+    function renderEmpty() {
+        currentId = null;
+        loadingState.hidden = true;
+        requestState.hidden = true;
+        emptyState.hidden = false;
+        queueSummary.textContent = 'No pending approvals';
+        if (queueActions) queueActions.hidden = true;
+        setText('action-status', '');
+        focusNewRequest = false;
+        requestActionSpacingUpdate();
+    }
+
+    function applyQueue(approvals) {
+        if (!Array.isArray(approvals)) throw new Error('Pending approvals response was not a list.');
+        if (errorKind === 'load') clearError();
+        let pending = approvals;
+        if (resolvedApprovalId) {
+            const stillListed = approvals.some(approval => approval.id === resolvedApprovalId);
+            pending = approvals.filter(approval => approval.id !== resolvedApprovalId);
+            if (!stillListed) resolvedApprovalId = null;
+        }
+        if (pending.length === 0) {
+            renderEmpty();
+            return;
+        }
+
+        const current = pending.find(approval => approval.id === currentId);
+        if (current) {
+            queueSummary.textContent = pending.length === 1 ? '1 pending approval' : pending.length + ' pending approvals';
+            return;
+        }
+        renderApproval(pending[0], pending.length);
+    }
+
+    function loadQueue() {
+        if (queueRequest) return queueRequest;
+        queueRequest = fetch('/api/v1/approvals/pending', { credentials: 'same-origin' })
+            .then(response => {
+                if (!response.ok) throw new Error('Could not load approvals (HTTP ' + response.status + ').');
+                return response.json();
+            })
+            .then(applyQueue)
+            .catch(error => {
+                if (!currentId) {
+                    loadingState.hidden = true;
+                    emptyState.hidden = true;
+                    requestState.hidden = true;
+                }
+                showError(error.message || 'Could not load approvals.', 'load');
+                throw error;
+            })
+            .finally(() => { queueRequest = null; });
+        return queueRequest;
+    }
+
+    function schedulePoll() {
+        window.clearTimeout(pollTimer);
+        pollTimer = window.setTimeout(async () => {
+            if (!actionInFlight) await loadQueue().catch(() => {});
+            schedulePoll();
+        }, POLL_MS);
+    }
+
+    function setActionBusy(busy, message) {
+        actionInFlight = busy;
+        for (const id of ['approve-button', 'deny-button', 'confirm-deny', 'cancel-deny']) {
+            const button = document.getElementById(id);
+            if (button) button.disabled = busy;
+        }
+        setText('action-status', message || '');
+        requestActionSpacingUpdate();
+    }
+
+    async function resolveCurrent(decision, message) {
+        if (!READWRITE || !currentId || actionInFlight) return;
+        const approvalId = currentId;
+        setActionBusy(true, decision === 'approve' ? 'Approving…' : 'Denying…');
+        clearError();
+        window.clearTimeout(pollTimer);
+        try {
+            if (queueRequest) await queueRequest.catch(() => {});
+            const response = await fetch('/api/v1/approvals/' + encodeURIComponent(approvalId) + '/resolve', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ decision, message })
+            });
+            if (!response.ok) throw new Error('Could not resolve approval (HTTP ' + response.status + ').');
+        } catch (error) {
+            showError(error.message || 'Could not resolve approval.', 'action');
+            setText('action-status', 'Request was not resolved.');
+            setActionBusy(false, document.getElementById('action-status').textContent);
+            schedulePoll();
+            return;
+        }
+
+        resolvedApprovalId = approvalId;
+        currentId = null;
+        focusNewRequest = true;
+        setText('action-status', '');
+        requestState.hidden = true;
+        loadingState.textContent = 'Request resolved. Refreshing the queue…';
+        loadingState.hidden = false;
+        if (queueActions) queueActions.hidden = true;
+        requestActionSpacingUpdate();
+
+        try {
+            await loadQueue();
+        } catch (error) {
+            showError('Request resolved, but the queue could not be refreshed.', 'load');
+        } finally {
+            setActionBusy(false, document.getElementById('action-status').textContent);
+            schedulePoll();
+        }
+    }
+
+    function showDeny() {
+        if (!READWRITE || actionInFlight) return;
+        document.getElementById('deny-panel').hidden = false;
+        document.getElementById('primary-actions').hidden = true;
+        document.getElementById('deny-reason').focus();
+        requestActionSpacingUpdate();
+    }
+
+    function hideDeny() {
+        if (!READWRITE) return;
+        document.getElementById('deny-panel').hidden = true;
+        document.getElementById('primary-actions').hidden = false;
+        document.getElementById('deny-reason').value = '';
+        requestActionSpacingUpdate();
+    }
+
+    document.getElementById('view-toggle').addEventListener('click', () => {
+        rawMode = !rawMode;
+        document.getElementById('smart-view').hidden = rawMode;
+        document.getElementById('raw-view').hidden = !rawMode;
+        document.getElementById('view-toggle').textContent = rawMode ? 'Show key/value view' : 'Show raw JSON';
+        document.getElementById('view-toggle').setAttribute('aria-expanded', String(rawMode));
+    });
+
+    if (READWRITE) {
+        document.getElementById('approve-button').addEventListener('click', () => resolveCurrent('approve', null));
+        document.getElementById('deny-button').addEventListener('click', showDeny);
+        document.getElementById('cancel-deny').addEventListener('click', hideDeny);
+        document.getElementById('confirm-deny').addEventListener('click', () => {
+            resolveCurrent('deny', document.getElementById('deny-reason').value || '');
+        });
+        document.getElementById('deny-reason').addEventListener('keydown', event => {
+            if (event.key === 'Enter') resolveCurrent('deny', event.currentTarget.value || '');
+            if (event.key === 'Escape') hideDeny();
+        });
+        window.addEventListener('resize', requestActionSpacingUpdate);
+    }
+
+    loadQueue().catch(() => {}).finally(schedulePoll);
+})();
+</script>
+</body>
+</html>
