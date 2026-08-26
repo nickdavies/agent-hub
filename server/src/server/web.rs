@@ -44,6 +44,12 @@ struct ApprovalDetailTemplate {
     has_auth: bool,
 }
 
+#[derive(Template)]
+#[template(path = "approval_queue.html")]
+struct ApprovalQueueTemplate {
+    readwrite: bool,
+}
+
 // --- Handlers ---
 
 /// GET /auth/login
@@ -108,6 +114,13 @@ pub async fn dashboard<N: Notifier>(
         pending_approvals,
         readwrite,
         has_auth,
+    })
+}
+
+/// GET /approvals/queue — mobile approval queue (auth enforced by middleware)
+pub async fn approval_queue<N: Notifier>(State(state): State<AppState<N>>) -> Response {
+    into_html_response(ApprovalQueueTemplate {
+        readwrite: state.config.approval_mode == ApprovalFeatureMode::Readwrite,
     })
 }
 
