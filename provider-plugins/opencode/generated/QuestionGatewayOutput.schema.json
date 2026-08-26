@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "QuestionGatewayOutput",
-  "description": "JSON written to stdout by `agent-hub-gateway question` on exit 0.\n\nExit codes:\n  0 = answered   — stdout contains this struct\n  1 = rejected, cancelled, timed out, or server unreachable\n  2 = fail-closed (bad input / internal error)",
+  "description": "JSON written to stdout by `agent-hub-gateway question` on exit 0.\n\nExit codes:\n  0 = answered   — stdout contains this struct\n  1 = explicitly rejected\n  2 = fail-closed malformed input or local failure\n  3 = timed out because the operator was away\n  4 = approvals-pipeline failure",
   "type": "object",
   "properties": {
     "answers": {

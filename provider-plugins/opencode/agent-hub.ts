@@ -261,11 +261,10 @@ function spawnStatusReportSync(
 // Single-pattern gateway call
 // ---------------------------------------------------------------------------
 
-/** Gateway result extends the generated OpenCodeHookOutput with plugin-only
- *  fields that are synthesized from exit codes (not part of the JSON wire format). */
-interface GatewayResult extends OpenCodeHookOutput {
-  ask?: boolean   // true when gateway spawn fails (binary not found — fall back to human)
-}
+type GatewayResult = OpenCodeHookOutput
+
+export const APPROVAL_TIMEOUT_MESSAGE = "Your approval request timed out because the operator was away. This is not a denial. Feel free to retry if you still need this."
+export const APPROVAL_PIPELINE_ERROR_MESSAGE = "There was an error in the approvals pipeline. This is a null answer: it is neither an approval nor a rejection of your intended action. Do not take this as a signal that your intended path is unwanted. Try again; if the error recurs, abort and report it to the operator."
 
 /** Validate that a parsed JSON value conforms to the OpenCodeHookOutput shape.
  *  The gateway is an external subprocess — we cannot trust its stdout blindly. */
@@ -302,30 +301,31 @@ async function callGateway(sid: string, payload: OpenCodeHookInput): Promise<Gat
     proc.on("close", (code: number | null) => {
       untrack(sid, proc)
       if (stderr) log("INFO", "gateway stderr", { output: stderr.trim() })
-      // Exit 1 = server unreachable or approval timed out — deny, do not fall back to opencode ask.
+      // Exit 1 is an approvals-pipeline failure from older gateway versions.
       if (code === 1) {
-        log("WARN", "gateway denied (server unreachable or approval timed out)", { reason: stderr.trim() })
-        return resolve({ allowed: false, reason: stderr.trim() || "gateway: server unreachable or timed out" })
+        log("WARN", "gateway approvals pipeline failure", { reason: stderr.trim() })
+        return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
       }
-      // Exit 2 = fail-closed (bad input, config error, policy denial).
-      if (code !== 0) return resolve({ allowed: false, reason: "gateway: fail-closed" })
+      // Exit 2 = fail-closed local input or config error.
+      if (code === 2) return resolve({ allowed: false, reason: "gateway: fail-closed" })
+      if (code !== 0) return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
       try {
         const parsed: unknown = JSON.parse(stdout.trim())
         if (!isValidGatewayOutput(parsed)) {
           log("ERROR", "gateway output failed validation", { stdout: stdout.trim() })
-          return resolve({ allowed: false, reason: "gateway: invalid output shape" })
+          return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
         }
         resolve(parsed)
       } catch {
         log("ERROR", "gateway invalid response", { stdout: stdout.trim() })
-        resolve({ allowed: false, reason: "gateway: invalid response" })
+        resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
       }
     })
 
     proc.on("error", (err: Error) => {
       untrack(sid, proc)
-      log("ERROR", "gateway spawn error — falling back to ask", { err: err.message, bin })
-      resolve({ allowed: false, ask: true, reason: err.message })
+      log("ERROR", "gateway spawn error", { err: err.message, bin })
+      resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
     })
 
     proc.stdin.end(JSON.stringify(payload))
@@ -337,13 +337,14 @@ async function callGateway(sid: string, payload: OpenCodeHookInput): Promise<Gat
 // ---------------------------------------------------------------------------
 
 /** Result from the gateway `question` subcommand. */
-interface QuestionGatewayResult {
-  /** Answers returned when exit code is 0. */
-  answers?: string[][]
-  /** True when the question was rejected/cancelled (exit 1). */
-  rejected?: boolean
-  /** Error details for exit 2 (fail-closed). */
-  error?: string
+type QuestionGatewayResult =
+  | { answers: string[][] }
+  | { outcome: "rejected" | "timeout" | "pipeline-error" }
+
+function isValidQuestionAnswers(value: unknown): value is string[][] {
+  return Array.isArray(value) && value.every(
+    (answer) => Array.isArray(answer) && answer.every((item) => typeof item === "string"),
+  )
 }
 
 async function callGatewayQuestion(
@@ -380,30 +381,40 @@ async function callGatewayQuestion(
       if (code === 0) {
         try {
           const parsed = JSON.parse(stdout.trim()) as QuestionGatewayOutput
+          if (!isValidQuestionAnswers(parsed.answers) || parsed.answers.length !== payload.questions.length) {
+            log("ERROR", "question gateway output failed validation", { stdout: stdout.trim() })
+            resolve({ outcome: "pipeline-error" })
+            return
+          }
           resolve({ answers: parsed.answers })
         } catch {
           log("ERROR", "question gateway invalid JSON", { stdout: stdout.trim() })
-          resolve({ error: "gateway: invalid JSON response" })
+          resolve({ outcome: "pipeline-error" })
         }
         return
       }
 
       if (code === 1) {
-        log("INFO", "question gateway rejected/cancelled", { reason: stderr.trim() })
-        resolve({ rejected: true })
+        log("INFO", "question gateway rejected", { reason: stderr.trim() })
+        resolve({ outcome: "rejected" })
         return
       }
 
-      // exit 2 or unexpected
-      log("WARN", "question gateway fail-closed", { code: String(code), stderr: stderr.trim() })
-      resolve({ error: `gateway: fail-closed (exit ${code})` })
+      if (code === 3) {
+        log("INFO", "question gateway timed out", { reason: stderr.trim() })
+        resolve({ outcome: "timeout" })
+        return
+      }
+
+      log("WARN", "question gateway pipeline failure", { code: String(code), stderr: stderr.trim() })
+      resolve({ outcome: "pipeline-error" })
     })
 
     proc.on("error", (err: Error) => {
       untrack(sid, proc)
       questionGatewayProcs.delete(requestId)
       log("ERROR", "question gateway spawn error", { err: err.message, bin })
-      resolve({ error: err.message })
+      resolve({ outcome: "pipeline-error" })
     })
 
     proc.stdin.end(JSON.stringify(payload))
@@ -464,8 +475,8 @@ function validatePluginDirectory(directory: string) {
 
 // Apply a GatewayResult to the hook output object.
 function apply(r: GatewayResult, output: PermissionOutput) {
-  output.status = r.ask ? "ask" : r.allowed ? "allow" : "deny"
-  if (r.reason && !r.allowed && !r.ask) output.message = r.reason
+  output.status = r.allowed ? "allow" : "deny"
+  if (r.reason && !r.allowed) output.message = r.reason
 }
 
 // ---------------------------------------------------------------------------
@@ -798,17 +809,17 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         // Proxy through gateway (async — the event hook is fire-and-forget from
         // opencode's perspective, but question.ask() awaits the Deferred internally
         // so the reply can arrive at any time).
-        callGatewayQuestion(sid, proxyReq).then(async (result) => {
+        const handleGatewayResult = async (result: QuestionGatewayResult) => {
           // If the question was answered locally in the TUI while the gateway
           // was in-flight, we killed the gateway (SIGTERM) which causes it to
-          // exit with code 1 (rejected).  Skip the question.reject call here —
-          // the question is already resolved and a second reject would fail.
+          // exit without an answer. Skip the gateway callback here because the
+          // question is already resolved and a second response would fail.
           if (locallyAnsweredQuestions.has(requestId)) {
             log("INFO", "question already answered locally, skipping gateway callback", { sid, requestId })
             locallyAnsweredQuestions.delete(requestId)
             return
           }
-          if (result.answers) {
+          if ("answers" in result) {
             log("INFO", "question answered via gateway, calling question.reply", { sid, requestId })
             const resp = await clientV2.question.reply({
               requestID: requestId,
@@ -818,9 +829,11 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
             if (resp.error) {
               log("WARN", "question.reply failed", { sid, requestId, err: String(resp.error) })
             }
-          } else {
-            // Rejected, cancelled, or error — reject the question
-            log("INFO", "question rejected/cancelled via gateway, calling question.reject", { sid, requestId })
+            return
+          }
+
+          if (result.outcome === "rejected") {
+            log("INFO", "question rejected via gateway, calling question.reject", { sid, requestId })
             const resp = await clientV2.question.reject({
               requestID: requestId,
               directory,
@@ -828,9 +841,25 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
             if (resp.error) {
               log("WARN", "question.reject failed", { sid, requestId, err: String(resp.error) })
             }
+            return
           }
-        }).catch((err: unknown) => {
+
+          const message = result.outcome === "timeout"
+            ? APPROVAL_TIMEOUT_MESSAGE
+            : APPROVAL_PIPELINE_ERROR_MESSAGE
+          const resp = await clientV2.question.reply({
+            requestID: requestId,
+            directory,
+            answers: questions.map(() => [message]),
+          })
+          if (resp.error) {
+            log("WARN", "synthetic question.reply failed", { sid, requestId, err: String(resp.error) })
+          }
+        }
+
+        callGatewayQuestion(sid, proxyReq).then(handleGatewayResult).catch(async (err: unknown) => {
           log("WARN", "callGatewayQuestion threw", { sid, requestId, err: String(err) })
+          await handleGatewayResult({ outcome: "pipeline-error" })
         })
 
         return

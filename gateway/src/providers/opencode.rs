@@ -1,4 +1,7 @@
-use crate::types::{DecisionStatus, HookOutput, ParseError, ToolHookEvent, build_display_name};
+use crate::types::{
+    APPROVAL_PIPELINE_ERROR_MESSAGE, APPROVAL_TIMEOUT_MESSAGE, DecisionStatus, HookOutput,
+    ParseError, ToolHookEvent, build_display_name,
+};
 use config::normalize_path;
 use protocol::{OpenCodeHookInput, OpenCodeHookOutput, Tool, ToolCall};
 
@@ -52,6 +55,8 @@ pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
     let reason = match &decision.status {
         DecisionStatus::DeniedWithReason(r) => Some(r.clone()),
         DecisionStatus::Denied => Some("denied by policy".to_string()),
+        DecisionStatus::TimedOut => Some(APPROVAL_TIMEOUT_MESSAGE.to_string()),
+        DecisionStatus::PipelineError => Some(APPROVAL_PIPELINE_ERROR_MESSAGE.to_string()),
         DecisionStatus::Approved => None,
     };
     let output = OpenCodeHookOutput { allowed, reason };
@@ -81,6 +86,45 @@ mod tests {
             "cwd": cwd
         }))
         .expect("wire input deserializes")
+    }
+
+    fn test_event() -> ToolHookEvent {
+        ToolHookEvent::try_from(parse_input("/home/user/project")).unwrap()
+    }
+
+    #[test]
+    fn opencode_timeout_and_pipeline_error_deny_with_exact_messages() {
+        for (status, message) in [
+            (
+                DecisionStatus::TimedOut,
+                crate::types::APPROVAL_TIMEOUT_MESSAGE,
+            ),
+            (
+                DecisionStatus::PipelineError,
+                crate::types::APPROVAL_PIPELINE_ERROR_MESSAGE,
+            ),
+        ] {
+            let output = HookOutput {
+                status,
+                message: None,
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&format_output(&test_event(), &output)).unwrap();
+            assert_eq!(value["allowed"], false);
+            assert_eq!(value["reason"], message);
+        }
+    }
+
+    #[test]
+    fn opencode_explicit_denial_preserves_operator_reason() {
+        let output = HookOutput {
+            status: DecisionStatus::DeniedWithReason("operator denied this action".to_string()),
+            message: None,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&format_output(&test_event(), &output)).unwrap();
+        assert_eq!(value["allowed"], false);
+        assert_eq!(value["reason"], "operator denied this action");
     }
 
     #[test]
