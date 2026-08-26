@@ -21,6 +21,8 @@
         .smart-view dt { color: var(--pico-primary); font-weight: bold; margin-top: 0.6rem; }
         .smart-view dd { margin-left: 0; overflow-wrap: anywhere; }
         .smart-view dd pre { margin: 0; }
+        .dippy-context dd { border-left: 0.2rem solid var(--pico-primary); padding-left: 0.6rem; }
+        .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
         pre { max-height: none; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
         pre code { white-space: inherit; overflow-wrap: inherit; }
         .view-heading { align-items: center; display: flex; justify-content: space-between; gap: 1rem; }
@@ -97,8 +99,8 @@
             </div>
         </div>
         <div id="primary-actions">
-            <button type="button" id="approve-button" aria-label="Approve current request">Approve</button>
-            <button type="button" class="secondary" id="deny-button" aria-label="Deny current request">Deny</button>
+            <button type="button" id="approve-button" aria-label="Approve current request" aria-keyshortcuts="a">Approve</button>
+            <button type="button" class="secondary" id="deny-button" aria-label="Deny current request" aria-keyshortcuts="d">Deny</button>
         </div>
         <small id="action-status" role="status" aria-live="assertive"></small>
     </div>
@@ -155,7 +157,38 @@
         window.requestAnimationFrame(updateActionSpacing);
     }
 
-    function renderSmartInput(input) {
+    function createSmartEntry(key, value) {
+        const group = document.createElement('div');
+        const term = document.createElement('dt');
+        term.textContent = key;
+        const detail = document.createElement('dd');
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+        pre.appendChild(code);
+        detail.appendChild(pre);
+        group.append(term, detail);
+        return group;
+    }
+
+    function createDippyContext(reason) {
+        const group = document.createElement('div');
+        group.className = 'dippy-context';
+        group.setAttribute('role', 'note');
+        const term = document.createElement('dt');
+        term.className = 'visually-hidden';
+        term.textContent = 'Dippy context';
+        const detail = document.createElement('dd');
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.textContent = reason;
+        pre.appendChild(code);
+        detail.appendChild(pre);
+        group.append(term, detail);
+        return group;
+    }
+
+    function renderSmartInput(input, dippyReason) {
         const container = document.getElementById('smart-view');
         container.replaceChildren();
         if (input === null || typeof input !== 'object' || Array.isArray(input)) {
@@ -164,20 +197,44 @@
             code.textContent = typeof input === 'string' ? input : JSON.stringify(input, null, 2);
             pre.appendChild(code);
             container.appendChild(pre);
+            if (dippyReason !== null) {
+                const list = document.createElement('dl');
+                list.appendChild(createDippyContext(dippyReason));
+                container.appendChild(list);
+            }
             return;
         }
 
         const list = document.createElement('dl');
-        for (const [key, value] of Object.entries(input)) {
-            const term = document.createElement('dt');
-            term.textContent = key;
-            const detail = document.createElement('dd');
-            const pre = document.createElement('pre');
-            const code = document.createElement('code');
-            code.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-            pre.appendChild(code);
-            detail.appendChild(pre);
-            list.append(term, detail);
+        const entries = Object.entries(input);
+        const commandIndex = entries.findIndex(([key]) => key === 'command');
+        const descriptionIndex = entries.findIndex(([key]) => key === 'description');
+
+        if (dippyReason !== null && commandIndex >= 0 && descriptionIndex >= 0) {
+            const anchorIndex = Math.min(commandIndex, descriptionIndex);
+            entries.forEach(([key, value], index) => {
+                if (index === anchorIndex) {
+                    list.appendChild(createSmartEntry('command', input.command));
+                    list.appendChild(createDippyContext(dippyReason));
+                    list.appendChild(createSmartEntry('description', input.description));
+                }
+                if (key !== 'command' && key !== 'description') {
+                    list.appendChild(createSmartEntry(key, value));
+                }
+            });
+        } else {
+            for (const [key, value] of entries) {
+                if (dippyReason !== null && commandIndex < 0 && key === 'description') {
+                    list.appendChild(createDippyContext(dippyReason));
+                }
+                list.appendChild(createSmartEntry(key, value));
+                if (dippyReason !== null && key === 'command') {
+                    list.appendChild(createDippyContext(dippyReason));
+                }
+            }
+            if (dippyReason !== null && commandIndex < 0 && descriptionIndex < 0) {
+                list.appendChild(createDippyContext(dippyReason));
+            }
         }
         container.appendChild(list);
     }
@@ -193,10 +250,6 @@
             setText('context-heading', 'Diff');
             setText('context-content', extra.diff);
             section.hidden = false;
-        } else if (typeof extra.dippy_reason === 'string') {
-            setText('context-heading', 'Dippy context');
-            setText('context-content', extra.dippy_reason);
-            section.hidden = false;
         } else {
             section.hidden = true;
         }
@@ -210,7 +263,9 @@
         setText('session', approval.session_display_name || approval.session_id || 'Unknown session');
         setText('provider', approval.provider || 'Unknown provider');
         renderContext(approval);
-        renderSmartInput(approval.tool_input);
+        const extra = approval.context && approval.context.extra;
+        const dippyReason = extra && typeof extra.dippy_reason === 'string' ? extra.dippy_reason : null;
+        renderSmartInput(approval.tool_input, dippyReason);
         setText('raw-content', JSON.stringify(approval.tool_input, null, 2));
         document.getElementById('smart-view').hidden = false;
         document.getElementById('raw-view').hidden = true;
@@ -348,7 +403,7 @@
     }
 
     function showDeny() {
-        if (!READWRITE || actionInFlight) return;
+        if (!READWRITE || !currentId || actionInFlight) return;
         document.getElementById('deny-panel').hidden = false;
         document.getElementById('primary-actions').hidden = true;
         document.getElementById('deny-reason').focus();
@@ -381,6 +436,19 @@
         document.getElementById('deny-reason').addEventListener('keydown', event => {
             if (event.key === 'Enter') resolveCurrent('deny', event.currentTarget.value || '');
             if (event.key === 'Escape') hideDeny();
+        });
+        document.addEventListener('keydown', event => {
+            const target = event.target;
+            const editable = target instanceof Element &&
+                (target.matches('input, textarea, select') || target.isContentEditable);
+            if (actionInFlight || !currentId || event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || editable) return;
+            if (event.key === 'a') {
+                event.preventDefault();
+                resolveCurrent('approve', null);
+            } else if (event.key === 'd') {
+                event.preventDefault();
+                showDeny();
+            }
         });
         window.addEventListener('resize', requestActionSpacingUpdate);
     }

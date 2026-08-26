@@ -615,6 +615,8 @@ mod integration_tests {
         assert_eq!(status, AxumStatus::OK);
         assert!(body.contains("id=\"queue-state\""));
         assert!(body.contains("id=\"queue-actions\""));
+        assert!(body.contains("aria-keyshortcuts=\"a\""));
+        assert!(body.contains("aria-keyshortcuts=\"d\""));
         assert!(body.contains("/api/v1/approvals/pending"));
     }
 
@@ -627,6 +629,7 @@ mod integration_tests {
         assert_eq!(status, AxumStatus::OK);
         assert!(body.contains("id=\"readonly-status\""));
         assert!(!body.contains("id=\"queue-actions\""));
+        assert!(!body.contains("aria-keyshortcuts"));
     }
 
     #[tokio::test]
