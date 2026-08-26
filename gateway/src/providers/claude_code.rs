@@ -1,4 +1,7 @@
-use crate::types::{DecisionStatus, HookOutput, ParseError, ToolHookEvent, build_display_name};
+use crate::types::{
+    APPROVAL_PIPELINE_ERROR_MESSAGE, APPROVAL_TIMEOUT_MESSAGE, DecisionStatus, HookOutput,
+    ParseError, ToolHookEvent, build_display_name,
+};
 use protocol::{
     ClaudeCodeHookInput, ClaudePermissionBehavior, ClaudePermissionRequestDecision,
     ClaudePermissionRequestOutput, ClaudePreToolUseDecision, ClaudePreToolUseOutput,
@@ -35,7 +38,10 @@ pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
         "permissionrequest" => {
             let (behavior, message) = match &decision.status {
                 DecisionStatus::Approved => (PermissionDecision::Allow, None),
-                DecisionStatus::Denied | DecisionStatus::DeniedWithReason(_) => {
+                DecisionStatus::Denied
+                | DecisionStatus::DeniedWithReason(_)
+                | DecisionStatus::TimedOut
+                | DecisionStatus::PipelineError => {
                     (PermissionDecision::Deny, Some(deny_message(decision)))
                 }
             };
@@ -59,6 +65,14 @@ pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
                     (PermissionDecision::Deny, "denied by policy".to_string())
                 }
                 DecisionStatus::DeniedWithReason(r) => (PermissionDecision::Deny, r.clone()),
+                DecisionStatus::TimedOut => (
+                    PermissionDecision::Deny,
+                    APPROVAL_TIMEOUT_MESSAGE.to_string(),
+                ),
+                DecisionStatus::PipelineError => (
+                    PermissionDecision::Deny,
+                    APPROVAL_PIPELINE_ERROR_MESSAGE.to_string(),
+                ),
             };
             let output = ClaudePreToolUseOutput {
                 hook_specific_output: ClaudePreToolUseDecision {
@@ -75,6 +89,8 @@ pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
 fn deny_message(decision: &HookOutput) -> String {
     match &decision.status {
         DecisionStatus::DeniedWithReason(r) => r.clone(),
+        DecisionStatus::TimedOut => APPROVAL_TIMEOUT_MESSAGE.to_string(),
+        DecisionStatus::PipelineError => APPROVAL_PIPELINE_ERROR_MESSAGE.to_string(),
         _ => decision
             .message
             .clone()
@@ -113,6 +129,13 @@ mod tests {
     fn denied() -> HookOutput {
         HookOutput {
             status: DecisionStatus::Denied,
+            message: None,
+        }
+    }
+
+    fn outcome(status: DecisionStatus) -> HookOutput {
+        HookOutput {
+            status,
             message: None,
         }
     }
@@ -162,5 +185,50 @@ mod tests {
         let out = format_output(&test_event("PostToolUse"), &approved());
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    }
+
+    #[test]
+    fn claude_timeout_and_pipeline_error_deny_with_exact_messages() {
+        for (status, message) in [
+            (
+                DecisionStatus::TimedOut,
+                crate::types::APPROVAL_TIMEOUT_MESSAGE,
+            ),
+            (
+                DecisionStatus::PipelineError,
+                crate::types::APPROVAL_PIPELINE_ERROR_MESSAGE,
+            ),
+        ] {
+            let output = outcome(status);
+            let out = format_output(&test_event("PreToolUse"), &output);
+            let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert_eq!(
+                value["hookSpecificOutput"]["permissionDecisionReason"],
+                message
+            );
+
+            let out = format_output(&test_event("PermissionRequest"), &output);
+            let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(value["hookSpecificOutput"]["decision"]["behavior"], "deny");
+            assert_eq!(value["hookSpecificOutput"]["decision"]["message"], message);
+        }
+    }
+
+    #[test]
+    fn claude_explicit_denial_preserves_operator_reason() {
+        let output = outcome(DecisionStatus::DeniedWithReason(
+            "operator denied this action".to_string(),
+        ));
+        for event_name in ["PreToolUse", "PermissionRequest"] {
+            let value: serde_json::Value =
+                serde_json::from_str(&format_output(&test_event(event_name), &output)).unwrap();
+            let reason = if event_name == "PreToolUse" {
+                &value["hookSpecificOutput"]["permissionDecisionReason"]
+            } else {
+                &value["hookSpecificOutput"]["decision"]["message"]
+            };
+            assert_eq!(reason, "operator denied this action");
+        }
     }
 }

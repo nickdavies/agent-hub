@@ -19,10 +19,11 @@ use types::{DecisionStatus, HookDecision, HookOutput, ParseError, ToolHookEvent}
 
 /// Agent Hub gateway — provider-agnostic tool approval hook.
 ///
-/// Exit codes:
-///   0 = success (approval decision written to stdout)
-///   1 = server unreachable (connection error, timeout); agent should ask the user
-///   2 = fail-closed (bad input, config error, policy denial); agent should deny
+/// Approval exit codes:
+///   0 = provider decision written to stdout
+///   2 = fail-closed local input or config error
+///
+/// Other subcommands document their own exit codes.
 #[derive(Parser)]
 #[command(name = "agent-hub-gateway", version)]
 struct Cli {
@@ -87,8 +88,27 @@ struct StatusReportArgs {
 enum RunError {
     /// Hard failure — bad input, config error, etc. Agent should deny.
     FailClosed(String),
-    /// Server unreachable — connection error, timeout, bad response. Agent should ask the user.
-    ServerUnreachable(String),
+}
+
+#[derive(Debug, PartialEq)]
+enum ApprovalFlowError {
+    Timeout,
+    Pipeline(String),
+}
+
+impl ApprovalFlowError {
+    fn into_output(self) -> HookOutput {
+        if let Self::Pipeline(reason) = &self {
+            eprintln!("[error] approvals pipeline failed: {reason}");
+        }
+        HookOutput {
+            status: match self {
+                Self::Timeout => DecisionStatus::TimedOut,
+                Self::Pipeline(_) => DecisionStatus::PipelineError,
+            },
+            message: None,
+        }
+    }
 }
 
 #[tokio::main]
@@ -172,10 +192,6 @@ where
             let output = format_output(&event, &decision);
             print!("{output}");
             ExitCode::SUCCESS
-        }
-        Err(RunError::ServerUnreachable(e)) => {
-            eprintln!("agent-hub-gateway: {e}");
-            ExitCode::from(1)
         }
         Err(RunError::FailClosed(e)) => {
             eprintln!("agent-hub-gateway: {e}");
@@ -320,7 +336,10 @@ async fn run(
                 event.tool_call.tool_name()
             );
             let extra = collect_extra(&event.tool_call, delegate_reason.as_deref());
-            escalate_to_server(args, provider_name, event, extra).await?
+            match escalate_to_server(args, provider_name, event, extra).await {
+                Ok(output) => output,
+                Err(error) => error.into_output(),
+            }
         }
     };
 
@@ -464,7 +483,7 @@ async fn escalate_to_server(
     provider_name: &str,
     event: &ToolHookEvent,
     extra: Option<ExtraContext>,
-) -> Result<HookOutput, RunError> {
+) -> Result<HookOutput, ApprovalFlowError> {
     let client = reqwest::Client::new();
     let base = args.server.trim_end_matches('/');
 
@@ -498,21 +517,21 @@ async fn escalate_to_server(
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| RunError::ServerUnreachable(format!("failed to register approval: {e}")))?;
+        .map_err(|e| ApprovalFlowError::Pipeline(format!("failed to register approval: {e}")))?;
 
     if !register_resp.status().is_success() {
         eprintln!(
             "[error] server returned {} for approval registration",
             register_resp.status()
         );
-        return Err(RunError::ServerUnreachable(format!(
+        return Err(ApprovalFlowError::Pipeline(format!(
             "server returned {} for approval registration",
             register_resp.status()
         )));
     }
 
     let approval: ApprovalResponse = register_resp.json().await.map_err(|e| {
-        RunError::ServerUnreachable(format!("failed to parse approval response: {e}"))
+        ApprovalFlowError::Pipeline(format!("failed to parse approval response: {e}"))
     })?;
 
     if matches!(approval.status, ApprovalStatus::Pending) {
@@ -548,7 +567,7 @@ async fn escalate_to_server(
                 .timeout(Duration::from_secs(5))
                 .send()
                 .await;
-            Err(RunError::ServerUnreachable("aborted by signal".to_string()))
+            Err(ApprovalFlowError::Pipeline("aborted by signal".to_string()))
         }
     }
 }
@@ -560,34 +579,40 @@ async fn poll_for_decision(
     token: &Secret,
     deadline: tokio::time::Instant,
     timeout_secs: u64,
-) -> Result<HookOutput, RunError> {
+) -> Result<HookOutput, ApprovalFlowError> {
     let mut attempt: u32 = 0;
+    let mut last_wait_was_healthy = true;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            eprintln!(
-                "[error] approval timed out after {}s with no decision — denying",
-                timeout_secs
-            );
-            return Err(RunError::ServerUnreachable(
-                "approval timed out".to_string(),
-            ));
+            eprintln!("[error] approval timed out after {timeout_secs}s with no decision");
+            return Err(deadline_error(last_wait_was_healthy));
         }
 
         attempt += 1;
 
-        let resp = client
-            .get(wait_url)
-            .bearer_auth(token.expose())
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await;
+        let resp = await_approval_deadline(
+            deadline,
+            last_wait_was_healthy,
+            client
+                .get(wait_url)
+                .bearer_auth(token.expose())
+                .timeout(Duration::from_secs(60))
+                .send(),
+        )
+        .await?;
 
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[warn] wait request failed (attempt {attempt}, retrying in 2s): {e}");
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                last_wait_was_healthy = false;
+                await_approval_deadline(
+                    deadline,
+                    last_wait_was_healthy,
+                    tokio::time::sleep(Duration::from_secs(2)),
+                )
+                .await?;
                 continue;
             }
         };
@@ -599,27 +624,39 @@ async fn poll_for_decision(
         if !http_status.is_success() {
             if http_status.is_client_error() {
                 eprintln!(
-                    "[error] server returned {http_status} for approval wait — approval may have expired, denying"
+                    "[error] server returned {http_status} for approval wait — approval may have expired"
                 );
-                return Err(RunError::ServerUnreachable(format!(
+                return Err(ApprovalFlowError::Pipeline(format!(
                     "server returned {http_status} for approval wait"
                 )));
             }
             eprintln!(
                 "[warn] server returned {http_status} for approval wait (attempt {attempt}, retrying in 2s)"
             );
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            last_wait_was_healthy = false;
+            await_approval_deadline(
+                deadline,
+                last_wait_was_healthy,
+                tokio::time::sleep(Duration::from_secs(2)),
+            )
+            .await?;
             continue;
         }
 
-        let body = resp.text().await;
+        let body = await_approval_deadline(deadline, last_wait_was_healthy, resp.text()).await?;
         let body = match body {
             Ok(b) => b,
             Err(e) => {
                 eprintln!(
                     "[warn] failed to read wait response body (attempt {attempt}, retrying in 2s): {e}"
                 );
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                last_wait_was_healthy = false;
+                await_approval_deadline(
+                    deadline,
+                    last_wait_was_healthy,
+                    tokio::time::sleep(Duration::from_secs(2)),
+                )
+                .await?;
                 continue;
             }
         };
@@ -630,12 +667,26 @@ async fn poll_for_decision(
                 eprintln!(
                     "[warn] failed to parse wait response (attempt {attempt}, retrying in 2s): {e} — body: {body}"
                 );
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                last_wait_was_healthy = false;
+                await_approval_deadline(
+                    deadline,
+                    last_wait_was_healthy,
+                    tokio::time::sleep(Duration::from_secs(2)),
+                )
+                .await?;
                 continue;
             }
         };
 
-        if http_status.as_u16() == 202 || matches!(wait.status, ApprovalStatus::Pending) {
+        ensure_approval_before_deadline(deadline, last_wait_was_healthy)?;
+
+        if http_status.as_u16() == 202 {
+            if !matches!(wait.status, ApprovalStatus::Pending) {
+                return Err(ApprovalFlowError::Pipeline(format!(
+                    "server returned {http_status} with non-pending approval status"
+                )));
+            }
+            last_wait_was_healthy = true;
             let secs_remaining = remaining.as_secs();
             eprintln!(
                 "[info] approval still pending (attempt {attempt}, {secs_remaining}s remaining)"
@@ -644,9 +695,48 @@ async fn poll_for_decision(
             continue;
         }
 
+        if matches!(wait.status, ApprovalStatus::Pending) {
+            return Err(ApprovalFlowError::Pipeline(
+                "server returned an unexpected final pending approval status".to_string(),
+            ));
+        }
+
         eprintln!("[info] approval resolved: status={:?}", wait.status);
         return Ok(status_to_output(&wait.status));
     }
+}
+
+fn deadline_error(last_wait_was_healthy: bool) -> ApprovalFlowError {
+    if last_wait_was_healthy {
+        ApprovalFlowError::Timeout
+    } else {
+        ApprovalFlowError::Pipeline("approval wait failed until the deadline".to_string())
+    }
+}
+
+fn ensure_approval_before_deadline(
+    deadline: tokio::time::Instant,
+    last_wait_was_healthy: bool,
+) -> Result<(), ApprovalFlowError> {
+    if tokio::time::Instant::now() >= deadline {
+        Err(deadline_error(last_wait_was_healthy))
+    } else {
+        Ok(())
+    }
+}
+
+async fn await_approval_deadline<F>(
+    deadline: tokio::time::Instant,
+    last_wait_was_healthy: bool,
+    future: F,
+) -> Result<F::Output, ApprovalFlowError>
+where
+    F: std::future::Future,
+{
+    ensure_approval_before_deadline(deadline, last_wait_was_healthy)?;
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| deadline_error(last_wait_was_healthy))
 }
 
 /// Wait for a shutdown signal (SIGTERM or SIGINT on Unix, Ctrl+C elsewhere).
@@ -685,13 +775,73 @@ fn status_to_output(status: &ApprovalStatus) -> HookOutput {
             message: None,
         },
         ApprovalStatus::Cancelled => HookOutput {
-            status: DecisionStatus::Denied,
+            status: DecisionStatus::PipelineError,
             message: None,
         },
         ApprovalStatus::Pending => HookOutput {
-            // Should not happen — but if we get here, deny as a safety net.
-            status: DecisionStatus::Denied,
+            status: DecisionStatus::PipelineError,
             message: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_denial_remains_denied() {
+        let output = status_to_output(&ApprovalStatus::Denied {
+            reason: "operator rejected this".to_string(),
+        });
+        assert!(matches!(
+            output.status,
+            DecisionStatus::DeniedWithReason(ref reason) if reason == "operator rejected this"
+        ));
+    }
+
+    #[test]
+    fn cancelled_and_unexpected_pending_are_pipeline_errors() {
+        for status in [ApprovalStatus::Cancelled, ApprovalStatus::Pending] {
+            assert!(matches!(
+                status_to_output(&status).status,
+                DecisionStatus::PipelineError
+            ));
+        }
+    }
+
+    #[test]
+    fn healthy_pending_deadline_is_timeout_but_failed_wait_is_pipeline_error() {
+        assert_eq!(deadline_error(true), ApprovalFlowError::Timeout);
+        assert!(matches!(
+            deadline_error(false),
+            ApprovalFlowError::Pipeline(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approval_deadline_rejects_late_response_after_healthy_pending() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let result = await_approval_deadline(deadline, true, async {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            HookOutput {
+                status: DecisionStatus::Approved,
+                message: None,
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap_err(), ApprovalFlowError::Timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approval_deadline_after_recurring_failure_is_pipeline_error() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let result = await_approval_deadline(deadline, false, async {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+        })
+        .await;
+
+        assert!(matches!(result, Err(ApprovalFlowError::Pipeline(_))));
     }
 }

@@ -99,7 +99,12 @@ pub enum DecisionStatus {
     Approved,
     Denied,
     DeniedWithReason(String),
+    TimedOut,
+    PipelineError,
 }
+
+pub const APPROVAL_TIMEOUT_MESSAGE: &str = "Your approval request timed out because the operator was away. This is not a denial. Feel free to retry if you still need this.";
+pub const APPROVAL_PIPELINE_ERROR_MESSAGE: &str = "There was an error in the approvals pipeline. This is a null answer: it is neither an approval nor a rejection of your intended action. Do not take this as a signal that your intended path is unwanted. Try again; if the error recurs, abort and report it to the operator.";
 
 /// The final decision produced by the gateway's approval flow.
 ///

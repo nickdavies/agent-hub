@@ -136,8 +136,10 @@ pub struct QuestionResolveRequest {
 ///
 /// Exit codes:
 ///   0 = answered   — stdout contains this struct
-///   1 = rejected, cancelled, timed out, or server unreachable
-///   2 = fail-closed (bad input / internal error)
+///   1 = explicitly rejected
+///   2 = fail-closed malformed input or local failure
+///   3 = timed out because the operator was away
+///   4 = approvals-pipeline failure
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QuestionGatewayOutput {
     /// One array of selected labels per question, in input order.

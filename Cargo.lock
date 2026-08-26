@@ -26,6 +26,7 @@ dependencies = [
 name = "agent-hub-gateway"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "capabilities",
  "clap",
  "config",
