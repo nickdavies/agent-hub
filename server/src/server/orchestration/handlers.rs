@@ -336,6 +336,7 @@ fn is_terminal_job_state(state: &JobState) -> bool {
 
 pub fn terminal_job_event(job: &Job) -> protocol::JobEvent {
     protocol::JobEvent {
+        event_id: uuid::Uuid::new_v4(),
         job_id: job.id,
         worker_id: job.assigned_worker_id.clone().unwrap_or_default(),
         at: chrono::Utc::now(),

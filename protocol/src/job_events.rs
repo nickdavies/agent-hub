@@ -15,6 +15,8 @@ pub enum JobEventKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct JobEvent {
+    #[serde(default)]
+    pub event_id: Uuid,
     pub job_id: Uuid,
     pub worker_id: String,
     pub at: DateTime<Utc>,

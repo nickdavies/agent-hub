@@ -121,6 +121,9 @@ impl tonic::service::Interceptor for GrpcAuthInterceptor {
 impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
     type StreamCancellationCommandsStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::CancellationCommand, Status>> + Send>>;
+    type StreamJobEventsStream = Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::StreamJobEventsResponse, Status>> + Send>,
+    >;
 
     async fn register_worker(
         &self,
@@ -321,7 +324,7 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
     async fn stream_job_events(
         &self,
         request: Request<tonic::Streaming<pb::JobEventChunk>>,
-    ) -> Result<Response<pb::StreamJobEventsResponse>, Status> {
+    ) -> Result<Response<Self::StreamJobEventsStream>, Status> {
         let credential = worker_session_from_metadata(&request, true)?.expect("required session");
         let worker_id = request
             .metadata()
@@ -335,41 +338,106 @@ impl pb::worker_lifecycle_server::WorkerLifecycle for WorkerLifecycleGrpc {
             .await
             .map_err(map_orchestration_error)?;
         let mut stream = request.into_inner();
-        let mut accepted: u32 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| Status::internal(e.to_string()))?;
-            if chunk.worker_id != worker_id {
-                return Err(Status::unauthenticated(
-                    "event worker identity does not match session",
-                ));
+        let orchestration = Arc::clone(&self.orchestration);
+        let job_events = Arc::clone(&self.job_events);
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let _ = sender.send(Err(Status::internal(error.to_string()))).await;
+                        break;
+                    }
+                };
+                if chunk.worker_id != worker_id {
+                    let _ = sender
+                        .send(Err(Status::unauthenticated(
+                            "event worker identity does not match session",
+                        )))
+                        .await;
+                    break;
+                }
+                let event_id = match Uuid::parse_str(&chunk.event_id) {
+                    Ok(event_id) if !event_id.is_nil() => event_id,
+                    Err(error) => {
+                        let _ = sender
+                            .send(Err(Status::invalid_argument(format!(
+                                "invalid event id: {error}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                    Ok(_) => {
+                        let _ = sender
+                            .send(Err(Status::invalid_argument("nil event id")))
+                            .await;
+                        break;
+                    }
+                };
+                let job_id = match Uuid::parse_str(&chunk.job_id) {
+                    Ok(job_id) => job_id,
+                    Err(error) => {
+                        let _ = sender
+                            .send(Err(Status::invalid_argument(format!(
+                                "invalid job id: {error}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                };
+
+                let kind = match job_event_kind_from_pb(chunk.kind) {
+                    Ok(kind) => kind,
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        break;
+                    }
+                };
+                let at = match chunk.at.map(ts_from_pb).transpose() {
+                    Ok(at) => at.unwrap_or_else(Utc::now),
+                    Err(error) => {
+                        let _ = sender.send(Err(error)).await;
+                        break;
+                    }
+                };
+
+                let event = JobEvent {
+                    event_id,
+                    job_id,
+                    worker_id: chunk.worker_id,
+                    at,
+                    kind,
+                    stream: chunk.stream,
+                    message: chunk.message,
+                };
+                let inserted = match orchestration
+                    .record_worker_event_authenticated(credential.clone(), &event)
+                    .await
+                {
+                    Ok(inserted) => inserted,
+                    Err(error) => {
+                        let _ = sender.send(Err(map_orchestration_error(error))).await;
+                        break;
+                    }
+                };
+                if inserted {
+                    job_events.push(event).await;
+                }
+                if sender
+                    .send(Ok(pb::StreamJobEventsResponse {
+                        accepted: 1,
+                        event_id: event_id.to_string(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
-            let job_id = Uuid::parse_str(&chunk.job_id)
-                .map_err(|e| Status::invalid_argument(format!("invalid job id: {e}")))?;
+        });
 
-            let kind = job_event_kind_from_pb(chunk.kind)?;
-            let at = chunk
-                .at
-                .map(ts_from_pb)
-                .transpose()?
-                .unwrap_or_else(Utc::now);
-
-            let event = JobEvent {
-                job_id,
-                worker_id: chunk.worker_id,
-                at,
-                kind,
-                stream: chunk.stream,
-                message: chunk.message,
-            };
-            self.orchestration
-                .record_worker_event_authenticated(credential.clone(), &event)
-                .await
-                .map_err(map_orchestration_error)?;
-            self.job_events.push(event).await;
-            accepted = accepted.saturating_add(1);
-        }
-
-        Ok(Response::new(pb::StreamJobEventsResponse { accepted }))
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 }
 

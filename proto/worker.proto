@@ -10,7 +10,7 @@ service WorkerLifecycle {
   rpc HeartbeatWorker(HeartbeatWorkerRequest) returns (HeartbeatWorkerResponse);
   rpc PollJob(PollJobRequest) returns (PollJobResponse);
   rpc UpdateJob(UpdateJobRequest) returns (UpdateJobResponse);
-  rpc StreamJobEvents(stream JobEventChunk) returns (StreamJobEventsResponse);
+  rpc StreamJobEvents(stream JobEventChunk) returns (stream StreamJobEventsResponse);
   rpc StreamCancellationCommands(ControlStreamRequest) returns (stream CancellationCommand);
 }
 
@@ -104,10 +104,12 @@ message JobEventChunk {
   JobEventKind kind = 4;
   optional string stream = 5;
   string message = 6;
+  string event_id = 7;
 }
 
 message StreamJobEventsResponse {
   uint32 accepted = 1;
+  string event_id = 2;
 }
 
 enum JobEventKind {

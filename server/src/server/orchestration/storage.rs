@@ -29,6 +29,7 @@ pub(super) enum DbTable {
     AuthorizationRecords,
     AuthorizationObligations,
     Workers,
+    WorkerEventReceipts,
 }
 
 impl DbTable {
@@ -43,6 +44,7 @@ impl DbTable {
             Self::AuthorizationRecords => "authorization_records",
             Self::AuthorizationObligations => "authorization_obligations",
             Self::Workers => "workers",
+            Self::WorkerEventReceipts => "worker_event_receipts",
         }
     }
 }

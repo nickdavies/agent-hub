@@ -1329,6 +1329,7 @@ impl OrchestrationService {
                     );
                     CREATE TABLE IF NOT EXISTS worker_event_receipts (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT UNIQUE,
                         job_id TEXT NOT NULL,
                         worker_id TEXT NOT NULL,
                         worker_session_id TEXT NOT NULL,
@@ -1521,6 +1522,16 @@ impl OrchestrationService {
                     if !column_exists(conn, DbTable::Workers, "session_generation")? {
                         conn.execute(
                             "ALTER TABLE workers ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0",
+                            [],
+                        )?;
+                    }
+                    if !column_exists(conn, DbTable::WorkerEventReceipts, "event_id")? {
+                        conn.execute(
+                            "ALTER TABLE worker_event_receipts ADD COLUMN event_id TEXT",
+                            [],
+                        )?;
+                        conn.execute(
+                            "CREATE UNIQUE INDEX worker_event_receipts_event_id_unique ON worker_event_receipts(event_id)",
                             [],
                         )?;
                     }
@@ -2592,10 +2603,10 @@ impl OrchestrationService {
         &self,
         credential: WorkerSessionCredential,
         event: &protocol::JobEvent,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let path = Arc::clone(&self.db_path);
         let event = event.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let mut conn = Connection::open(path.as_path())?;
             let tx = begin_immediate_transaction(&mut conn)?;
             let worker = verify_worker_session_in_connection(&tx, &event.worker_id, &credential)?;
@@ -2624,12 +2635,14 @@ impl OrchestrationService {
             {
                 anyhow::bail!("worker session does not own event job");
             }
-            tx.execute(
+            let inserted = tx.execute(
                 "INSERT INTO worker_event_receipts (
-                    job_id, worker_id, worker_session_id, worker_session_generation,
+                    event_id, job_id, worker_id, worker_session_id, worker_session_generation,
                     event_at, event_kind, stream, message
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(event_id) DO NOTHING",
                 params![
+                    event.event_id.to_string(),
                     event.job_id.to_string(),
                     event.worker_id,
                     worker.session_id.map(|value| value.to_string()),
@@ -2640,8 +2653,38 @@ impl OrchestrationService {
                     event.message,
                 ],
             )?;
+            if inserted == 0 {
+                let existing: (String, String, String, String, Option<String>, String) = tx
+                    .query_row(
+                        "SELECT job_id, worker_id, event_at, event_kind, stream, message
+                         FROM worker_event_receipts WHERE event_id = ?1",
+                        [event.event_id.to_string()],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )?;
+                anyhow::ensure!(
+                    existing
+                        == (
+                            event.job_id.to_string(),
+                            event.worker_id.clone(),
+                            event.at.to_rfc3339(),
+                            format!("{:?}", event.kind).to_ascii_lowercase(),
+                            event.stream.clone(),
+                            event.message.clone(),
+                        ),
+                    "event identity conflicts with persisted payload"
+                );
+            }
             tx.commit()?;
-            Ok(())
+            Ok(inserted == 1)
         })
         .await
         .map_err(|error| AppError::Config(error.to_string()))?
@@ -21840,6 +21883,7 @@ kind = "terminal"
         assert_eq!(replacement_job.id, old_session_job.id);
         assert_eq!(replacement_job.assigned_worker_session_generation, Some(2));
         let session_event = protocol::JobEvent {
+            event_id: Uuid::new_v4(),
             job_id: replacement_job.id,
             worker_id: "worker-a".to_string(),
             at: Utc::now(),
@@ -21847,11 +21891,31 @@ kind = "terminal"
             stream: None,
             message: "session-bound event".to_string(),
         };
-        harness
-            .svc
-            .record_worker_event_authenticated(replaced_credential.clone(), &session_event)
-            .await
-            .expect("record session-bound event");
+        assert!(
+            harness
+                .svc
+                .record_worker_event_authenticated(replaced_credential.clone(), &session_event)
+                .await
+                .expect("record session-bound event")
+        );
+        assert!(
+            !harness
+                .svc
+                .record_worker_event_authenticated(replaced_credential.clone(), &session_event)
+                .await
+                .expect("deduplicate session-bound event")
+        );
+        let conflicting_event = protocol::JobEvent {
+            message: "conflicting payload".to_string(),
+            ..session_event.clone()
+        };
+        assert!(
+            harness
+                .svc
+                .record_worker_event_authenticated(replaced_credential.clone(), &conflicting_event)
+                .await
+                .is_err()
+        );
         harness
             .svc
             .update_job_authenticated(
@@ -22170,6 +22234,7 @@ kind = "terminal"
 
         job_events
             .push(protocol::JobEvent {
+                event_id: Uuid::new_v4(),
                 job_id: job.id,
                 worker_id: "w1".into(),
                 at: Utc::now(),

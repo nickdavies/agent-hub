@@ -90,6 +90,7 @@ mod tests {
         let hub = JobEventHub::new();
         let job_id = Uuid::new_v4();
         let event = JobEvent {
+            event_id: Uuid::new_v4(),
             job_id,
             worker_id: "w1".into(),
             at: Utc::now(),

@@ -5,7 +5,7 @@ use protocol::{
     RegisterWorkerResponse, Secret, WorkerState,
 };
 use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -706,23 +706,68 @@ pub(crate) async fn start_grpc_event_stream(
     worker_id: &str,
     worker_session: &AuthenticatedWorkerSession,
 ) -> anyhow::Result<GrpcEventStreamHandle> {
-    let (tx, rx) = mpsc::channel::<pb::JobEventChunk>(512);
-    let mut req = apply_grpc_bearer(token.as_ref(), tonic::Request::new(ReceiverStream::new(rx)))?;
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<pb::JobEventChunk>(512);
+    let mut req = apply_grpc_bearer(
+        token.as_ref(),
+        tonic::Request::new(ReceiverStream::new(outgoing_rx)),
+    )?;
     apply_worker_session_metadata(&mut req, Some(worker_session))?;
     req.metadata_mut().insert(
         "x-agent-hub-worker-id",
         MetadataValue::try_from(worker_id).context("invalid worker ID for gRPC metadata")?,
     );
+    let mut responses = client.stream_job_events(req).await?.into_inner();
+    let (tx, mut rx) = mpsc::channel::<GrpcEventPublishRequest>(512);
     let task = tokio::spawn(async move {
-        if let Err(error) = client.stream_job_events(req).await {
-            eprintln!("gRPC event stream ended: {error}");
+        let mut pending = std::collections::HashMap::new();
+        loop {
+            tokio::select! {
+                request = rx.recv() => {
+                    let Some(request) = request else { break };
+                    let event_id = request.chunk.event_id.clone();
+                    if pending.insert(event_id.clone(), request.acknowledgement).is_some() {
+                        eprintln!("duplicate pending gRPC event identity {event_id}");
+                        break;
+                    }
+                    if outgoing_tx.send(request.chunk).await.is_err() {
+                        break;
+                    }
+                }
+                response = responses.message() => {
+                    match response {
+                        Ok(Some(response)) => {
+                            if let Some(acknowledgement) = pending.remove(&response.event_id) {
+                                let _ = acknowledgement.send(Ok(response.accepted == 1));
+                            } else {
+                                eprintln!("gRPC event stream returned unknown identity {}", response.event_id);
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            eprintln!("gRPC event stream ended: {error}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for acknowledgement in pending.into_values() {
+            let _ = acknowledgement.send(Err(anyhow::anyhow!(
+                "gRPC event stream ended before acknowledgement"
+            )));
         }
     });
     Ok(GrpcEventStreamHandle { sender: tx, task })
 }
 
+pub(crate) struct GrpcEventPublishRequest {
+    pub(crate) chunk: pb::JobEventChunk,
+    pub(crate) acknowledgement: oneshot::Sender<anyhow::Result<bool>>,
+}
+
 pub(crate) struct GrpcEventStreamHandle {
-    pub(crate) sender: mpsc::Sender<pb::JobEventChunk>,
+    pub(crate) sender: mpsc::Sender<GrpcEventPublishRequest>,
     pub(crate) task: tokio::task::JoinHandle<()>,
 }
 

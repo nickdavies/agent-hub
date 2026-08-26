@@ -44,8 +44,8 @@ use artifacts::{
     work_item_contract_from_job_context, write_agent_context_file,
 };
 use client::{
-    Client, GrpcClient, HttpClient, JobUpdateOutcome, is_worker_not_found_error,
-    start_grpc_cancellation_stream, start_grpc_event_stream,
+    Client, GrpcClient, GrpcEventPublishRequest, HttpClient, JobUpdateOutcome,
+    is_worker_not_found_error, start_grpc_cancellation_stream, start_grpc_event_stream,
 };
 use egress::{EgressManager, llm_provider_from_env};
 use egress_config::{LocalAgentConfig, ManagedRunnerKind, load_local_agent_config};
@@ -1968,7 +1968,7 @@ enum TransportKind {
 #[derive(Clone)]
 struct JobEventPublisher {
     worker_id: String,
-    tx: mpsc::Sender<pb::JobEventChunk>,
+    tx: mpsc::Sender<GrpcEventPublishRequest>,
 }
 
 #[derive(Clone)]
@@ -1984,25 +1984,41 @@ struct JobEventTranscriptWriter {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedJobEventDelivery {
+    event: JobEvent,
+    transcript_path: PathBuf,
+}
+
 impl JobEventPublisher {
-    async fn emit(
-        &self,
-        job_id: uuid::Uuid,
-        at: chrono::DateTime<Utc>,
-        kind: pb::JobEventKind,
-        message: String,
-    ) -> anyhow::Result<()> {
+    async fn emit(&self, event: &JobEvent) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            event.worker_id == self.worker_id,
+            "event worker identity mismatch"
+        );
+        let (acknowledgement, received) = tokio::sync::oneshot::channel();
         self.tx
-            .send(pb::JobEventChunk {
-                worker_id: self.worker_id.clone(),
-                job_id: job_id.to_string(),
-                at: Some(ts_to_pb(at)),
-                kind: kind as i32,
-                stream: job_event_stream_name(kind).map(ToOwned::to_owned),
-                message,
+            .send(GrpcEventPublishRequest {
+                chunk: pb::JobEventChunk {
+                    worker_id: self.worker_id.clone(),
+                    job_id: event.job_id.to_string(),
+                    at: Some(ts_to_pb(event.at)),
+                    kind: job_event_kind_to_pb(&event.kind) as i32,
+                    stream: event.stream.clone(),
+                    message: event.message.clone(),
+                    event_id: event.event_id.to_string(),
+                },
+                acknowledgement,
             })
             .await
-            .context("publish job event stream chunk")
+            .context("queue job event stream chunk")?;
+        anyhow::ensure!(
+            received
+                .await
+                .context("job event acknowledgement channel closed")??,
+            "job event stream rejected event"
+        );
+        Ok(())
     }
 }
 
@@ -2010,6 +2026,7 @@ impl JobEventSink {
     async fn emit(&self, job_id: uuid::Uuid, kind: pb::JobEventKind, message: String) {
         let at = Utc::now();
         let event = JobEvent {
+            event_id: uuid::Uuid::new_v4(),
             job_id,
             worker_id: self.worker_id.clone(),
             at,
@@ -2017,9 +2034,24 @@ impl JobEventSink {
             stream: job_event_stream_name(kind).map(ToOwned::to_owned),
             message: message.clone(),
         };
+        let delivery_name = format!("job-event-{}.json", event.event_id);
+        let delivery_path = self.cancellation.phase.root.join(&delivery_name);
+        let transcript_path = self.writer.lock().await.path.clone();
+        durable_write_json(
+            &self.cancellation.phase.root,
+            &delivery_name,
+            &PersistedJobEventDelivery {
+                event: event.clone(),
+                transcript_path,
+            },
+        )
+        .expect("persist job event delivery");
         {
             let mut writer = self.writer.lock().await;
-            if let Err(error) = writer.write_event(&event, &self.cancellation).await {
+            if let Err(error) = writer
+                .write_event(&event, &delivery_path, &self.cancellation)
+                .await
+            {
                 let _ = self.cancellation.phase.containment_failed(&error);
                 panic!(
                     "failed to append required local job event transcript for {}: {error:#}",
@@ -2037,9 +2069,9 @@ impl JobEventSink {
             );
             let operation = self
                 .cancellation
-                .begin_external_operation(operation_kind, &format!("job:{job_id}"))
+                .begin_external_operation(operation_kind, &delivery_path.to_string_lossy())
                 .expect("journal event stream publication");
-            if let Err(error) = publisher.emit(job_id, at, kind, message).await {
+            if let Err(error) = publisher.emit(&event).await {
                 operation
                     .ambiguous("event_stream_publish_failed")
                     .expect("journal ambiguous event stream publication");
@@ -2074,6 +2106,7 @@ impl JobEventTranscriptWriter {
     async fn write_event(
         &mut self,
         event: &JobEvent,
+        delivery_path: &Path,
         cancellation: &ExecutionCancellationContext,
     ) -> anyhow::Result<()> {
         let operation_kind = event_operation_kind(
@@ -2082,8 +2115,8 @@ impl JobEventTranscriptWriter {
             "cleanup_event_transcript_append",
             "terminal_event_transcript_append",
         );
-        let operation =
-            cancellation.begin_external_operation(operation_kind, &self.path.to_string_lossy())?;
+        let operation = cancellation
+            .begin_external_operation(operation_kind, &delivery_path.to_string_lossy())?;
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
         self.file.write_all(&line).await?;
@@ -2110,6 +2143,14 @@ fn event_operation_kind(
 
 fn protocol_job_event_kind(kind: pb::JobEventKind) -> JobEventKind {
     local_agent::pb_conv::protocol_job_event_kind(kind)
+}
+
+fn job_event_kind_to_pb(kind: &JobEventKind) -> pb::JobEventKind {
+    match kind {
+        JobEventKind::System => pb::JobEventKind::JobEventSystem,
+        JobEventKind::Stdout => pb::JobEventKind::JobEventStdout,
+        JobEventKind::Stderr => pb::JobEventKind::JobEventStderr,
+    }
 }
 
 fn job_event_stream_name(kind: pb::JobEventKind) -> Option<&'static str> {
@@ -4897,7 +4938,15 @@ mod tests {
         let writer = JobEventTranscriptWriter::create(&root.join("events.jsonl"), &context)
             .await
             .unwrap();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<GrpcEventPublishRequest>(4);
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&published);
+        let event_task = tokio::spawn(async move {
+            while let Some(request) = event_rx.recv().await {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = request.acknowledgement.send(Ok(true));
+            }
+        });
         let sink = JobEventSink {
             worker_id: "worker".to_string(),
             writer: Arc::new(Mutex::new(writer)),
@@ -4914,14 +4963,12 @@ mod tests {
             "workspace cleaned".to_string(),
         )
         .await;
-        assert!(event_rx.recv().await.is_some());
         sink.emit(
             uuid::Uuid::new_v4(),
             pb::JobEventKind::JobEventSystem,
             "branch-delete warning".to_string(),
         )
         .await;
-        assert!(event_rx.recv().await.is_some());
         let records = context.operations.state.lock().unwrap().records.clone();
         let cleanup_events = records
             .iter()
@@ -4944,6 +4991,305 @@ mod tests {
             cleanup_publishes
                 .iter()
                 .all(|record| record.operation_class == ExternalOperationClass::Cleanup)
+        );
+        drop(sink);
+        event_task.await.unwrap();
+        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unresolved_event_transcript_appends_replay_each_exact_operation_once() {
+        let root =
+            std::env::temp_dir().join(format!("event-transcript-replay-{}", uuid::Uuid::new_v4()));
+        let attempt_root = root.join("attempt");
+        let transcript_root = root.join("transcripts");
+        std::fs::create_dir_all(&transcript_root).unwrap();
+        let transcript = transcript_root.join("events.jsonl");
+        std::fs::write(&transcript, b"").unwrap();
+        let assignment = uuid::Uuid::new_v4();
+        let job_id = uuid::Uuid::new_v4();
+        let journal = OperationJournal::initialize(&attempt_root, assignment, job_id, 0).unwrap();
+        for (index, (phase, kind)) in [
+            (AttemptPhase::Running, "event_transcript_append"),
+            (
+                AttemptPhase::CleanupRunning,
+                "cleanup_event_transcript_append",
+            ),
+            (
+                AttemptPhase::TerminalReporting,
+                "terminal_event_transcript_append",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = JobEvent {
+                event_id: uuid::Uuid::new_v4(),
+                job_id,
+                worker_id: "worker".to_string(),
+                at: Utc::now(),
+                kind: JobEventKind::System,
+                stream: None,
+                message: format!("event-{index}"),
+            };
+            let name = format!("job-event-{}.json", event.event_id);
+            durable_write_json(
+                &attempt_root,
+                &name,
+                &PersistedJobEventDelivery {
+                    event,
+                    transcript_path: transcript.clone(),
+                },
+            )
+            .unwrap();
+            let operation_id = uuid::Uuid::new_v4();
+            journal
+                .append(
+                    operation_id,
+                    kind,
+                    phase,
+                    &attempt_root.join(name).to_string_lossy(),
+                    ExternalOperationStatus::Started,
+                    None,
+                )
+                .unwrap();
+            let record = journal
+                .unresolved()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation_id == operation_id)
+                .unwrap();
+            reconcile_event_transcript_append(&attempt_root, &root, &transcript_root, &record)
+                .unwrap();
+            reconcile_event_transcript_append(&attempt_root, &root, &transcript_root, &record)
+                .unwrap();
+        }
+        let events = std::fs::read(&transcript)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<JobEvent>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_event_publications_replay_each_exact_operation_once() {
+        let root =
+            std::env::temp_dir().join(format!("event-publication-replay-{}", uuid::Uuid::new_v4()));
+        let attempt_root = root.join("attempts").join(uuid::Uuid::new_v4().to_string());
+        let assignment =
+            uuid::Uuid::parse_str(attempt_root.file_name().unwrap().to_str().unwrap()).unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        let phase = AttemptPhaseStore::initialize(&attempt_root, assignment, job_id, 0).unwrap();
+        phase.transition(AttemptPhase::TerminalReporting).unwrap();
+        let journal = OperationJournal::initialize(&attempt_root, assignment, job_id, 0).unwrap();
+        for (index, (lifecycle, kind)) in [
+            (AttemptPhase::Running, "event_stream_publish"),
+            (AttemptPhase::CleanupRunning, "cleanup_event_stream_publish"),
+            (
+                AttemptPhase::TerminalReporting,
+                "terminal_event_stream_publish",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = JobEvent {
+                event_id: uuid::Uuid::new_v4(),
+                job_id,
+                worker_id: "worker".to_string(),
+                at: Utc::now(),
+                kind: JobEventKind::System,
+                stream: None,
+                message: format!("event-{index}"),
+            };
+            let name = format!("job-event-{}.json", event.event_id);
+            durable_write_json(
+                &attempt_root,
+                &name,
+                &PersistedJobEventDelivery {
+                    event,
+                    transcript_path: root.join("unused.jsonl"),
+                },
+            )
+            .unwrap();
+            journal
+                .append(
+                    uuid::Uuid::new_v4(),
+                    kind,
+                    lifecycle,
+                    &attempt_root.join(name).to_string_lossy(),
+                    ExternalOperationStatus::Started,
+                    None,
+                )
+                .unwrap();
+        }
+        let (tx, mut rx) = mpsc::channel::<GrpcEventPublishRequest>(8);
+        let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&deliveries);
+        let acknowledgements = tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = request.acknowledgement.send(Ok(true));
+            }
+        });
+        let publisher = JobEventPublisher {
+            worker_id: "worker".to_string(),
+            tx,
+        };
+        reconcile_event_publications(&root, Some(&publisher))
+            .await
+            .unwrap();
+        reconcile_event_publications(&root, Some(&publisher))
+            .await
+            .unwrap();
+        assert_eq!(deliveries.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            OperationJournal::initialize(&attempt_root, assignment, job_id, 0)
+                .unwrap()
+                .unresolved()
+                .unwrap()
+                .is_empty()
+        );
+        drop(publisher);
+        acknowledgements.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_publication_completion_fault_replays_after_acknowledged_delivery() {
+        let root = std::env::temp_dir().join(format!(
+            "event-publication-completion-fault-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let assignment = uuid::Uuid::new_v4();
+        let job_id = uuid::Uuid::new_v4();
+        let attempt_root = root.join("attempts").join(assignment.to_string());
+        let transcript_root = root.join("transcripts");
+        std::fs::create_dir_all(&transcript_root).unwrap();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let context = ExecutionCancellationContext::for_test_attempt(
+            &attempt_root,
+            stop_rx,
+            assignment,
+            job_id,
+            0,
+        )
+        .unwrap();
+        context.phase.transition(AttemptPhase::Running).unwrap();
+        let writer =
+            JobEventTranscriptWriter::create(&transcript_root.join("events.jsonl"), &context)
+                .await
+                .unwrap();
+        let (tx, mut rx) = mpsc::channel::<GrpcEventPublishRequest>(4);
+        let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&deliveries);
+        let acknowledgements = std::thread::spawn(move || {
+            while let Some(request) = rx.blocking_recv() {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = request.acknowledgement.send(Ok(true));
+            }
+        });
+        let sink = JobEventSink {
+            worker_id: "worker".to_string(),
+            writer: Arc::new(Mutex::new(writer)),
+            publisher: Some(JobEventPublisher {
+                worker_id: "worker".to_string(),
+                tx,
+            }),
+            cancellation: context.clone(),
+        };
+        let environment = execution_fault_environment_lock();
+        unsafe {
+            std::env::set_var(
+                "AGENT_HUB_TEST_EXECUTION_FAULT",
+                "error:operation:event_stream_publish:completed:before",
+            );
+        }
+        let crashed = std::thread::spawn({
+            let sink = sink.clone();
+            move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        sink.emit(
+                            job_id,
+                            pb::JobEventKind::JobEventSystem,
+                            "fault".to_string(),
+                        )
+                        .await;
+                    });
+            }
+        })
+        .join();
+        unsafe {
+            std::env::remove_var("AGENT_HUB_TEST_EXECUTION_FAULT");
+        }
+        drop(environment);
+        assert!(crashed.is_err());
+        assert_eq!(deliveries.load(std::sync::atomic::Ordering::SeqCst), 1);
+        reconcile_event_publications(&root, sink.publisher.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(deliveries.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            OperationJournal::initialize(&attempt_root, assignment, job_id, 0)
+                .unwrap()
+                .unresolved()
+                .unwrap()
+                .is_empty()
+        );
+        drop(sink);
+        acknowledgements.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_reporting_crash_before_resumes_without_phase_regression() {
+        let root =
+            std::env::temp_dir().join(format!("terminal-before-recovery-{}", uuid::Uuid::new_v4()));
+        let assignment = uuid::Uuid::new_v4();
+        let job_id = uuid::Uuid::new_v4();
+        let attempt_root = root.join("attempts").join(assignment.to_string());
+        let phase = AttemptPhaseStore::initialize(&attempt_root, assignment, job_id, 0).unwrap();
+        phase.transition(AttemptPhase::CleanupRunning).unwrap();
+        std::fs::write(attempt_root.join("terminal-report.json"), b"{}").unwrap();
+        reconcile_event_publications(&root, None).await.unwrap();
+        let recovered =
+            AttemptPhaseStore::initialize(&attempt_root, assignment, job_id, 0).unwrap();
+        assert_eq!(recovered.current(), AttemptPhase::TerminalReporting);
+        let journal = OperationJournal::initialize(&attempt_root, assignment, job_id, 0).unwrap();
+        let operation = uuid::Uuid::new_v4();
+        journal
+            .append(
+                operation,
+                "terminal_report",
+                recovered.current(),
+                &format!("job:{job_id}:cancelled"),
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            journal
+                .unresolved()
+                .unwrap()
+                .into_iter()
+                .find(|record| record.operation_id == operation)
+                .unwrap()
+                .lifecycle_phase,
+            AttemptPhase::TerminalReporting
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -5268,7 +5614,7 @@ mod tests {
         effects.hash(&mut hasher);
         assert_eq!(
             hasher.finish(),
-            3_994_354_612_608_089_838,
+            4_565_073_392_114_023_212,
             "external-effect source inventory changed; audit every changed helper and update the reviewed fingerprint"
         );
     }
@@ -6935,6 +7281,7 @@ async fn main() -> anyhow::Result<()> {
         cancellation_stream = Some(Arc::new(Mutex::new(control_stream.receiver)));
         cancellation_stream_task = Some(control_stream.task);
     }
+    reconcile_event_publications(&cli.data_dir, event_publisher.as_ref()).await?;
     recover_terminal_reporting_attempts(
         &cli.data_dir,
         client.as_ref(),
@@ -10393,7 +10740,7 @@ exit 0
         drop(helper);
         drop(create);
 
-        super::reconcile_operation_journals(&root.join("attempts"), &root, &docker)
+        super::reconcile_operation_journals(&root.join("attempts"), &root, &root, &docker)
             .await
             .unwrap();
         state.cancellation.operations.reload_from_disk().unwrap();
@@ -10499,7 +10846,7 @@ exit 0
             .containment_failed(&anyhow::anyhow!("injected startup recovery"))
             .unwrap();
 
-        super::reconcile_operation_journals(&root.join("attempts"), &root, &docker)
+        super::reconcile_operation_journals(&root.join("attempts"), &root, &root, &docker)
             .await
             .unwrap();
         state.cancellation.operations.reload_from_disk().unwrap();
@@ -10540,7 +10887,7 @@ exit 0
             "future",
         );
         assert!(
-            super::reconcile_operation_journals(&root.join("attempts"), &root, &docker)
+            super::reconcile_operation_journals(&root.join("attempts"), &root, &root, &docker)
                 .await
                 .is_err()
         );
@@ -10722,9 +11069,10 @@ exit 0
                 .unwrap(),
         );
         drop(spawn);
-        let error = super::reconcile_operation_journals(&root.join("attempts"), &root, &docker)
-            .await
-            .unwrap_err();
+        let error =
+            super::reconcile_operation_journals(&root.join("attempts"), &root, &root, &docker)
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("attempt helper recovery failed"));
         tokio::time::timeout(Duration::from_secs(3), child.wait())
             .await
@@ -17244,6 +17592,7 @@ fn is_known_attempt_recovery_kind(kind: &str) -> bool {
 async fn reconcile_operation_journals(
     attempts_root: &Path,
     data_dir: &Path,
+    transcripts_root: &Path,
     docker: &DockerCli,
 ) -> anyhow::Result<()> {
     if !attempts_root.exists() {
@@ -17252,6 +17601,7 @@ async fn reconcile_operation_journals(
     let worktrees_root = std::fs::canonicalize(data_dir.join("worktrees"))?;
     let repos_root = std::fs::canonicalize(data_dir.join("repos"))?;
     let data_root = std::fs::canonicalize(data_dir)?;
+    let transcripts_root = std::fs::canonicalize(transcripts_root)?;
     let mut entries = tokio::fs::read_dir(attempts_root).await?;
     let mut count = 0_usize;
     while let Some(entry) = entries.next_entry().await? {
@@ -17337,7 +17687,9 @@ async fn reconcile_operation_journals(
             helper_failures.join("; ")
         );
         let mutation_helper_recorded = journal.has_operation_kind(mutation_helper_kind);
-        for unresolved in journal.unresolved()? {
+        let mut unresolved_operations = journal.unresolved()?;
+        unresolved_operations.sort_by_key(|record| record.sequence);
+        for unresolved in unresolved_operations {
             anyhow::ensure!(
                 phase.phase == AttemptPhase::ContainmentFailed
                     || unresolved.lifecycle_phase.rank() <= phase.phase.rank(),
@@ -17647,9 +17999,15 @@ async fn reconcile_operation_journals(
                 }
                 "event_stream_publish"
                 | "cleanup_event_stream_publish"
-                | "terminal_event_stream_publish" => {
-                    anyhow::bail!("unresolved event publication requires delivery replay")
-                }
+                | "terminal_event_stream_publish" => continue,
+                "event_transcript_append"
+                | "cleanup_event_transcript_append"
+                | "terminal_event_transcript_append" => reconcile_event_transcript_append(
+                    &root,
+                    &data_root,
+                    &transcripts_root,
+                    &unresolved,
+                )?,
                 "artifact_transcript_directory_create" | "artifact_prompt_directory_create" => {
                     let path = PathBuf::from(&unresolved.resource_identity);
                     if path.exists() {
@@ -17694,6 +18052,7 @@ async fn reconcile_operation_journals(
                         root.join("terminal-report.json").is_file(),
                         "terminal reporting operation has no durable report evidence"
                     );
+                    continue;
                 }
                 _ => anyhow::bail!(
                     "unsupported unresolved external operation '{}' requires containment_failed",
@@ -17709,9 +18068,158 @@ async fn reconcile_operation_journals(
                 None,
             )?;
         }
-        if journal.unresolved()?.is_empty()
-            && phase.phase == AttemptPhase::CleanupRunning
-            && root.join("terminal-report.json").exists()
+    }
+    Ok(())
+}
+
+fn persisted_event_delivery(
+    attempt_root: &Path,
+    record: &ExternalOperationRecord,
+) -> anyhow::Result<PersistedJobEventDelivery> {
+    let path = PathBuf::from(&record.resource_identity);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "event delivery evidence is not a regular file"
+    );
+    let canonical_attempt = std::fs::canonicalize(attempt_root)?;
+    let canonical = std::fs::canonicalize(&path)?;
+    anyhow::ensure!(
+        canonical.parent() == Some(canonical_attempt.as_path()),
+        "event delivery evidence escaped attempt root"
+    );
+    let delivery: PersistedJobEventDelivery = serde_json::from_slice(&std::fs::read(canonical)?)?;
+    anyhow::ensure!(
+        delivery.event.job_id == record.job_id
+            && !delivery.event.event_id.is_nil()
+            && path.file_name().and_then(|name| name.to_str())
+                == Some(format!("job-event-{}.json", delivery.event.event_id).as_str()),
+        "event delivery identity does not match journal"
+    );
+    Ok(delivery)
+}
+
+fn reconcile_event_transcript_append(
+    attempt_root: &Path,
+    data_root: &Path,
+    transcripts_root: &Path,
+    record: &ExternalOperationRecord,
+) -> anyhow::Result<()> {
+    let delivery = persisted_event_delivery(attempt_root, record)?;
+    let expected_kind = event_operation_kind(
+        record.lifecycle_phase,
+        "event_transcript_append",
+        "cleanup_event_transcript_append",
+        "terminal_event_transcript_append",
+    );
+    anyhow::ensure!(
+        record.operation_kind == expected_kind,
+        "event transcript operation kind does not match lifecycle phase"
+    );
+    let metadata = std::fs::symlink_metadata(&delivery.transcript_path)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "event transcript is not a regular file"
+    );
+    let transcript = std::fs::canonicalize(&delivery.transcript_path)?;
+    anyhow::ensure!(
+        transcript.starts_with(data_root) || transcript.starts_with(transcripts_root),
+        "event transcript escaped owned roots"
+    );
+    let bytes = std::fs::read(&transcript)?;
+    anyhow::ensure!(
+        bytes.is_empty() || bytes.last() == Some(&b'\n'),
+        "event transcript is truncated"
+    );
+    let mut matching = 0_usize;
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let event: JobEvent = serde_json::from_slice(line)?;
+        if event.event_id == delivery.event.event_id {
+            anyhow::ensure!(
+                event == delivery.event,
+                "event transcript identity has conflicting payload"
+            );
+            matching = matching.saturating_add(1);
+        }
+    }
+    anyhow::ensure!(
+        matching <= 1,
+        "event transcript contains duplicate event identity"
+    );
+    if matching == 0 {
+        let mut file = std::fs::OpenOptions::new().append(true).open(&transcript)?;
+        let mut line = serde_json::to_vec(&delivery.event)?;
+        line.push(b'\n');
+        file.write_all(&line)?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
+async fn reconcile_event_publications(
+    data_dir: &Path,
+    publisher: Option<&JobEventPublisher>,
+) -> anyhow::Result<()> {
+    let attempts_root = data_dir.join("attempts");
+    if !attempts_root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&attempts_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || entry.file_name() == "reconciliation" {
+            continue;
+        }
+        let root = entry.path();
+        let phase: AttemptPhaseRecord =
+            serde_json::from_slice(&read_private_regular(&root, "attempt-phase.json")?)?;
+        let journal =
+            OperationJournal::initialize(&root, phase.assignment_id, phase.job_id, phase.attempt)?;
+        let mut unresolved = journal.unresolved()?;
+        unresolved.sort_by_key(|record| record.sequence);
+        for record in unresolved.into_iter().filter(|record| {
+            matches!(
+                record.operation_kind.as_str(),
+                "event_stream_publish"
+                    | "cleanup_event_stream_publish"
+                    | "terminal_event_stream_publish"
+            )
+        }) {
+            let publisher = publisher
+                .context("unresolved event publication has no authenticated event stream")?;
+            let delivery = persisted_event_delivery(&root, &record)?;
+            let expected_kind = event_operation_kind(
+                record.lifecycle_phase,
+                "event_stream_publish",
+                "cleanup_event_stream_publish",
+                "terminal_event_stream_publish",
+            );
+            anyhow::ensure!(
+                record.operation_kind == expected_kind,
+                "event publication kind does not match lifecycle phase"
+            );
+            publisher.emit(&delivery.event).await?;
+            journal.append(
+                record.operation_id,
+                &record.operation_kind,
+                record.lifecycle_phase,
+                &record.resource_identity,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )?;
+        }
+        let unresolved = journal.unresolved()?;
+        anyhow::ensure!(
+            unresolved.iter().all(|record| matches!(
+                record.operation_kind.as_str(),
+                "terminal_report" | "terminal_report_rebind"
+            )),
+            "attempt has unresolved operations after event delivery recovery"
+        );
+        if phase.phase == AttemptPhase::CleanupRunning
+            && root.join("terminal-report.json").is_file()
         {
             AttemptPhaseStore::initialize(&root, phase.assignment_id, phase.job_id, phase.attempt)?
                 .transition(AttemptPhase::TerminalReporting)?;
@@ -17748,7 +18256,7 @@ async fn startup_recovery_docker(
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_cancellation_resources(
     data_dir: &Path,
-    _transcripts_root: &Path,
+    transcripts_root: &Path,
     installation_id: &str,
     config_identity: &str,
     worker_id: &str,
@@ -17821,7 +18329,7 @@ async fn reconcile_cancellation_resources(
         }
     }
     reconcile_persisted_process_records(&attempts_root).await?;
-    reconcile_operation_journals(&attempts_root, data_dir, &docker).await?;
+    reconcile_operation_journals(&attempts_root, data_dir, transcripts_root, &docker).await?;
     reconcile_opencode_startup(
         data_dir,
         &docker,
@@ -17987,10 +18495,6 @@ async fn recover_terminal_reporting_attempts(
             phase.job_id,
             phase.attempt,
         )?);
-        anyhow::ensure!(
-            journal.unresolved()?.is_empty(),
-            "terminal reporting recovery has unresolved cleanup operations"
-        );
         if let Some(previous) = report.delivery_command.clone() {
             let current = client.get_job_cancellation_command(report.job_id).await?;
             if let Some(current) = current {
@@ -18036,6 +18540,40 @@ async fn recover_terminal_reporting_attempts(
                 );
             }
         }
+        for rebind in journal
+            .unresolved()?
+            .into_iter()
+            .filter(|record| record.operation_kind == "terminal_report_rebind")
+        {
+            anyhow::ensure!(
+                report.cancellation_id == uuid::Uuid::parse_str(&rebind.resource_identity).ok()
+                    && report.delivery_command.as_ref().is_some_and(|command| {
+                        Some(command.cancellation_id) == report.cancellation_id
+                    }),
+                "terminal report rebind evidence does not prove the journaled delivery fence"
+            );
+            journal.append(
+                rebind.operation_id,
+                &rebind.operation_kind,
+                rebind.lifecycle_phase,
+                &rebind.resource_identity,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )?;
+        }
+        let unresolved_reports = journal
+            .unresolved()?
+            .into_iter()
+            .filter(|record| record.operation_kind == "terminal_report")
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            unresolved_reports.len() <= 1
+                && journal
+                    .unresolved()?
+                    .iter()
+                    .all(|record| record.operation_kind == "terminal_report"),
+            "terminal reporting recovery has unresolved non-report operations"
+        );
         let (_stop_tx, stop_rx) = watch::channel(false);
         let cancellation = ExecutionCancellationContext {
             stop_reason: Arc::new(std::sync::Mutex::new(None)),
@@ -18050,7 +18588,7 @@ async fn recover_terminal_reporting_attempts(
                 phase.job_id,
                 phase.attempt,
             )?),
-            operations: journal,
+            operations: Arc::clone(&journal),
             assignment_id: phase.assignment_id,
             pre_cleanup_closed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             active_pre_cleanup_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -18078,6 +18616,34 @@ async fn recover_terminal_reporting_attempts(
             durable_write_json(&root, "terminal-report.json", &report)?;
             cancellation.begin_terminal_reporting()?;
         }
+        let expected_report_identity = format!(
+            "job:{}:{}",
+            report.job_id,
+            match report.state {
+                JobState::Succeeded => "succeeded",
+                JobState::Cancelled => "cancelled",
+                JobState::Failed => "failed",
+                _ => anyhow::bail!("durable terminal report has non-terminal state"),
+            }
+        );
+        if let Some(unresolved) = unresolved_reports.first() {
+            anyhow::ensure!(
+                unresolved.lifecycle_phase == AttemptPhase::TerminalReporting
+                    && (unresolved.resource_identity == expected_report_identity
+                        || (report.state == JobState::Failed
+                            && unresolved.resource_identity
+                                == format!("job:{}:infrastructure_failed", report.job_id))),
+                "terminal report operation identity does not match durable report"
+            );
+        }
+        let mut report_operation = if unresolved_reports.is_empty() {
+            Some(
+                cancellation
+                    .begin_external_operation("terminal_report", &expected_report_identity)?,
+            )
+        } else {
+            None
+        };
         let stored = client
             .get_job(report.job_id)
             .await?
@@ -18119,12 +18685,27 @@ async fn recover_terminal_reporting_attempts(
             ))
         };
         if let Err(error) = replay {
+            if let Some(operation) = report_operation.take() {
+                operation.ambiguous("terminal_report_failed")?;
+            }
             durable_write_json(
                 &root,
                 "TERMINAL_REPORT_QUARANTINED",
                 &serde_json::json!({"error": format!("{error:#}")}),
             )?;
             return Err(error.context("terminal report replay conflicted or failed"));
+        }
+        if let Some(operation) = report_operation.take() {
+            operation.completed()?;
+        } else if let Some(operation) = unresolved_reports.first() {
+            journal.append(
+                operation.operation_id,
+                &operation.operation_kind,
+                operation.lifecycle_phase,
+                &operation.resource_identity,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )?;
         }
         cancellation.phase.transition(AttemptPhase::Completed)?;
         cancellation.finalize_private_state()?;
