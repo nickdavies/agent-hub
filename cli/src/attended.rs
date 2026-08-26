@@ -699,6 +699,13 @@ pub async fn run(
             &run_dir.join("effects"),
             cancellation.clone(),
         )?;
+        let runtime_data_dir = data_dir.join("opencode");
+        effects.create_owned_runtime_data(
+            &data_dir,
+            &runtime_data_dir,
+            runtime_uid,
+            runtime_gid,
+        )?;
         let mut credential_cleanup = TemporaryCredentialCleanup(Vec::new());
         let mut prepared_egress = None;
         let operation = async {
@@ -872,6 +879,12 @@ pub async fn run(
             tmpfs: vec!["/tmp:rw,size=1g".to_string()],
             };
             verify_mount_filesystem_identity(&request)?;
+            effects.verify_owned_runtime_data(
+                &data_dir,
+                &runtime_data_dir,
+                runtime_uid,
+                runtime_gid,
+            )?;
             let args = plan.materialize_args()?;
             ensure!(
                 !cancellation.requested(),
@@ -943,14 +956,14 @@ pub async fn run(
             && primary_cleanup.is_ok()
             && egress_cleanup.is_ok();
         let credential_effect_cleanup = if containment_absent {
-            effects.reconcile_owned_credentials(&data_dir, Some(&data_dir.join("opencode")))
+            effects.reconcile_owned_credentials(&data_dir, Some(&runtime_data_dir))
         } else {
             Err(anyhow::anyhow!(
                 "credential effect cleanup blocked until process, container, helper, and egress absence is proven"
             ))
         };
         let runtime_data_cleanup = if containment_absent {
-            effects.reconcile_owned_runtime_data(&data_dir, &data_dir.join("opencode"))
+            effects.reconcile_owned_runtime_data(&data_dir, &runtime_data_dir)
         } else {
             Err(anyhow::anyhow!(
                 "OpenCode runtime-data cleanup blocked until process, container, helper, and egress absence is proven"
@@ -2980,6 +2993,7 @@ mod tests {
         }
         std::fs::create_dir(state_dir.join("home"))?;
         std::fs::create_dir(data_dir.join("opencode"))?;
+        super::set_private_directory(&data_dir.join("opencode"))?;
         std::fs::create_dir_all(workspace.join(".opencode/plugin"))?;
         std::fs::create_dir_all(workspace.join(".opencode/skills/hostile"))?;
         std::fs::write(
@@ -3038,6 +3052,7 @@ mod tests {
 test -r /opencode/config/opencode/opencode.json
 test -r /opencode/config/opencode/agents/coder.md
 test -r /opencode/config/opencode/skills/local-workspaces/SKILL.md
+test "$(stat -c %a /opencode/data/opencode)" = 700
 ! touch /opencode/config/opencode/hostile-write
 touch /opencode/data/writable /opencode/state/writable /opencode/cache/writable
 /usr/local/bin/opencode debug config > /workspace/primary/debug-config.json
@@ -3045,6 +3060,7 @@ touch /opencode/data/writable /opencode/state/writable /opencode/cache/writable
 set +e
 timeout 20 /usr/local/bin/opencode run "Reply with the word ready." > /workspace/primary/model-initialization.log 2>&1
 status=$?
+test "$(stat -c %a /opencode/data/opencode)" = 700
 printf '%s\n' "$status" > /workspace/primary/model-initialization.status
 exit 0
 "#;

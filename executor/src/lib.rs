@@ -388,6 +388,82 @@ impl ExecutionCancellationContext {
         Ok(())
     }
 
+    #[cfg(unix)]
+    pub fn create_owned_runtime_data(
+        &self,
+        authorization_root: &Path,
+        runtime_data_root: &Path,
+        expected_uid: u32,
+        expected_gid: u32,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+        verify_runtime_data_parent(
+            authorization_root,
+            runtime_data_root,
+            expected_uid,
+            expected_gid,
+        )?;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(runtime_data_root)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "OpenCode runtime-data root already exists"
+        );
+        let operation = self.begin_external_operation(
+            "opencode_runtime_data_directory_create",
+            &runtime_data_root.to_string_lossy(),
+        )?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(runtime_data_root)
+            .context("create owned OpenCode runtime-data root")?;
+        std::fs::set_permissions(runtime_data_root, std::fs::Permissions::from_mode(0o700))?;
+        verify_runtime_data_root(runtime_data_root, expected_uid, expected_gid, 0o700)?;
+        sync_directory(runtime_data_root)?;
+        sync_directory(authorization_root)?;
+        operation.completed()
+    }
+
+    #[cfg(not(unix))]
+    pub fn create_owned_runtime_data(
+        &self,
+        _authorization_root: &Path,
+        _runtime_data_root: &Path,
+        _expected_uid: u32,
+        _expected_gid: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("secure OpenCode runtime-data creation requires Unix ownership metadata")
+    }
+
+    #[cfg(unix)]
+    pub fn verify_owned_runtime_data(
+        &self,
+        authorization_root: &Path,
+        runtime_data_root: &Path,
+        expected_uid: u32,
+        expected_gid: u32,
+    ) -> anyhow::Result<()> {
+        verify_runtime_data_parent(
+            authorization_root,
+            runtime_data_root,
+            expected_uid,
+            expected_gid,
+        )?;
+        verify_runtime_data_root(runtime_data_root, expected_uid, expected_gid, 0o700)
+    }
+
+    #[cfg(not(unix))]
+    pub fn verify_owned_runtime_data(
+        &self,
+        _authorization_root: &Path,
+        _runtime_data_root: &Path,
+        _expected_uid: u32,
+        _expected_gid: u32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("secure OpenCode runtime-data validation requires Unix ownership metadata")
+    }
+
     pub async fn settle_process_helpers(&self) -> anyhow::Result<()> {
         let records = self
             .effect_state
@@ -597,6 +673,40 @@ fn remove_owned_runtime_data_tree(
     authorization_root: &Path,
     runtime_data_root: &Path,
 ) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let expected_uid = unsafe { libc::geteuid() };
+    let expected_gid = unsafe { libc::getegid() };
+    verify_runtime_data_parent(
+        authorization_root,
+        runtime_data_root,
+        expected_uid,
+        expected_gid,
+    )?;
+    let runtime_metadata = std::fs::symlink_metadata(runtime_data_root)?;
+    let runtime_mode = runtime_metadata.permissions().mode() & 0o777;
+    if runtime_mode == 0o755 {
+        verify_runtime_data_root(runtime_data_root, expected_uid, expected_gid, 0o755)?;
+        std::fs::set_permissions(runtime_data_root, std::fs::Permissions::from_mode(0o700))?;
+        verify_runtime_data_root(runtime_data_root, expected_uid, expected_gid, 0o700)?;
+        sync_directory(runtime_data_root)?;
+        sync_directory(authorization_root)?;
+    } else {
+        verify_runtime_data_root(runtime_data_root, expected_uid, expected_gid, 0o700)?;
+    }
+
+    remove_runtime_data_entry(runtime_data_root)?;
+    sync_directory(authorization_root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_runtime_data_parent(
+    authorization_root: &Path,
+    runtime_data_root: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     anyhow::ensure!(
@@ -613,34 +723,48 @@ fn remove_owned_runtime_data_tree(
         canonical_authorization == authorization_root,
         "OpenCode runtime-data authorization root is not canonical"
     );
+    anyhow::ensure!(
+        runtime_data_root == authorization_root.join("opencode"),
+        "OpenCode runtime-data root is not the exact authorized path"
+    );
+    anyhow::ensure!(
+        authorization_metadata.uid() == expected_uid
+            && authorization_metadata.gid() == expected_gid,
+        "OpenCode runtime-data authorization root owner mismatch"
+    );
+    anyhow::ensure!(
+        authorization_metadata.permissions().mode() & 0o777 == 0o700,
+        "OpenCode runtime-data authorization root is not private 0700"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_runtime_data_root(
+    runtime_data_root: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
     let runtime_metadata = std::fs::symlink_metadata(runtime_data_root)?;
     anyhow::ensure!(
         runtime_metadata.is_dir() && !runtime_metadata.file_type().is_symlink(),
         "OpenCode runtime-data root is not a real directory"
     );
-    let canonical_runtime = std::fs::canonicalize(runtime_data_root)?;
     anyhow::ensure!(
-        canonical_runtime == runtime_data_root
-            && canonical_runtime.parent() == Some(canonical_authorization.as_path()),
-        "OpenCode runtime-data root is not exactly contained by its authorization root"
+        std::fs::canonicalize(runtime_data_root)? == runtime_data_root,
+        "OpenCode runtime-data root is not canonical"
     );
-    let expected_uid = unsafe { libc::geteuid() };
-    for (description, metadata) in [
-        ("authorization", &authorization_metadata),
-        ("runtime-data", &runtime_metadata),
-    ] {
-        anyhow::ensure!(
-            metadata.uid() == expected_uid,
-            "OpenCode runtime-data {description} root owner mismatch"
-        );
-        anyhow::ensure!(
-            metadata.permissions().mode() & 0o077 == 0,
-            "OpenCode runtime-data {description} root is not private"
-        );
-    }
-
-    remove_runtime_data_entry(runtime_data_root)?;
-    sync_directory(&canonical_authorization)?;
+    anyhow::ensure!(
+        runtime_metadata.uid() == expected_uid && runtime_metadata.gid() == expected_gid,
+        "OpenCode runtime-data root owner mismatch"
+    );
+    anyhow::ensure!(
+        runtime_metadata.permissions().mode() & 0o777 == expected_mode,
+        "OpenCode runtime-data root mode is not {expected_mode:04o}"
+    );
     Ok(())
 }
 

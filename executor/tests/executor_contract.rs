@@ -858,8 +858,46 @@ async fn effect_recovery_removes_owned_opencode_runtime_data_without_following_s
 }
 
 #[cfg(unix)]
+#[test]
+fn opencode_runtime_data_is_journaled_and_precreated_private() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let root = temp_root("effect-opencode-runtime-data-create");
+    let data = root.join("data");
+    let runtime_data = data.join("opencode");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+
+    effects
+        .create_owned_runtime_data(&data, &runtime_data, uid, gid)
+        .unwrap();
+    effects
+        .verify_owned_runtime_data(&data, &runtime_data, uid, gid)
+        .unwrap();
+
+    let metadata = std::fs::symlink_metadata(&runtime_data).unwrap();
+    assert_eq!(metadata.uid(), uid);
+    assert_eq!(metadata.gid(), gid);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    let journal = std::fs::read_to_string(root.join("effects/executor-effects.jsonl")).unwrap();
+    assert!(journal.contains("opencode_runtime_data_directory_create"));
+    assert!(journal.contains(runtime_data.to_str().unwrap()));
+    assert!(journal.contains("submitted"));
+
+    effects
+        .reconcile_owned_runtime_data(&data, &runtime_data)
+        .unwrap();
+    effects.finalize().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
 #[tokio::test]
-async fn effect_recovery_reclassifies_only_the_exact_legacy_opencode_runtime_root() {
+async fn effect_recovery_normalizes_and_removes_exact_legacy_opencode_runtime_root() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = temp_root("effect-legacy-opencode-runtime-data-recovery");
@@ -870,7 +908,7 @@ async fn effect_recovery_reclassifies_only_the_exact_legacy_opencode_runtime_roo
     std::fs::create_dir(&runtime_data).unwrap();
     std::fs::create_dir(&unrelated).unwrap();
     std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(&runtime_data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&runtime_data, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(runtime_data.join("opencode.db"), "runtime-state").unwrap();
     std::fs::write(unrelated.join("unknown"), "not-runtime-data").unwrap();
     let effects =
@@ -901,6 +939,112 @@ async fn effect_recovery_reclassifies_only_the_exact_legacy_opencode_runtime_roo
     effects.finalize().unwrap();
     assert!(!runtime_data.exists());
     assert!(!unrelated.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_runtime_data_creation_rejects_wrong_owner_identity() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_root("effect-opencode-runtime-data-owner");
+    let data = root.join("data");
+    let runtime_data = data.join("opencode");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+
+    let error = effects
+        .create_owned_runtime_data(
+            &data,
+            &runtime_data,
+            unsafe { libc::geteuid() }.wrapping_add(1),
+            unsafe { libc::getegid() },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("authorization root owner mismatch"));
+    assert!(!runtime_data.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn effect_recovery_rejects_symlink_opencode_runtime_data_root() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let root = temp_root("effect-opencode-runtime-data-symlink");
+    let data = root.join("data");
+    let runtime_data = data.join("opencode");
+    let target = root.join("target");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&target, &runtime_data).unwrap();
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+    effects
+        .begin_external_operation(
+            "opencode_runtime_data_directory_create",
+            &runtime_data.to_string_lossy(),
+        )
+        .unwrap()
+        .completed()
+        .unwrap();
+
+    let error = effects
+        .reconcile_owned_runtime_data(&data, &runtime_data)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a real directory"));
+    assert!(target.is_dir());
+    assert!(
+        std::fs::symlink_metadata(&runtime_data)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn effect_recovery_rejects_nonprivate_runtime_data_parent() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_root("effect-opencode-runtime-data-parent-mode");
+    let data = root.join("data");
+    let runtime_data = data.join("opencode");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&runtime_data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&runtime_data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+    effects
+        .begin_external_operation(
+            "opencode_runtime_data_directory_create",
+            &runtime_data.to_string_lossy(),
+        )
+        .unwrap()
+        .completed()
+        .unwrap();
+
+    let error = effects
+        .reconcile_owned_runtime_data(&data, &runtime_data)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("authorization root is not private 0700"));
+    assert!(runtime_data.is_dir());
+    assert_eq!(
+        std::fs::symlink_metadata(&runtime_data)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
