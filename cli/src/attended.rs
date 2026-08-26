@@ -671,6 +671,7 @@ pub async fn run(
         let data_dir = run_dir.join("data");
         let state_dir = run_dir.join("state");
         let cache_dir = run_dir.join("cache");
+        let project_config_mask_dir = run_dir.join("project-config-mask");
         let prompt_path = run_dir.join("prompt.txt");
         write_private_durable(&prompt_path, request.proposal.prompt.as_bytes())?;
         let deployment =
@@ -680,7 +681,12 @@ pub async fn run(
             .write_to(&bundle_dir)
             .map_err(anyhow::Error::msg)?;
         sync_private_tree(&bundle_dir)?;
-        for directory in [&data_dir, &state_dir, &cache_dir] {
+        for directory in [
+            &data_dir,
+            &state_dir,
+            &cache_dir,
+            &project_config_mask_dir,
+        ] {
             std::fs::create_dir(directory)?;
             set_private_directory(directory)?;
             sync_directory_and_parent(directory)?;
@@ -725,7 +731,15 @@ pub async fn run(
                 .map(|mount| DockerMount::new(&mount.host_path, &mount.container_path, true))
                 .collect::<anyhow::Result<Vec<_>>>()?,
         );
-        mounts.push(DockerMount::new(&bundle_dir, "/opencode/config", true)?);
+        mounts.extend(project_config_mask_mounts(
+            &project_config_mask_dir,
+            &request.execution.workspaces,
+        )?);
+        mounts.push(DockerMount::new(
+            &bundle_dir,
+            "/opencode/config/opencode",
+            true,
+        )?);
         mounts.push(DockerMount::new(&data_dir, "/opencode/data", false)?);
         mounts.push(DockerMount::new(&state_dir, "/opencode/state", false)?);
         mounts.push(DockerMount::new(&cache_dir, "/opencode/cache", false)?);
@@ -923,22 +937,27 @@ pub async fn run(
             )),
         };
         let credential_effect_cleanup = effects.reconcile_owned_effects(&data_dir).await;
+        let credential_check = match (&credential_cleanup, &credential_effect_cleanup) {
+            (CleanupStatus::Complete, Ok(())) => CleanupCheck {
+                status: "verified_absent",
+                error: None,
+            },
+            (CleanupStatus::Failed(error), _) => CleanupCheck {
+                status: "failed",
+                error: Some(error.clone()),
+            },
+            (CleanupStatus::Complete, Err(error)) => CleanupCheck {
+                status: "failed",
+                error: Some(format!("{error:#}")),
+            },
+        };
         let effect_cleanup = credential_effect_cleanup
             .and_then(|()| effects.finalize());
         captured_cleanup_evidence = Some(AttendedCleanupEvidence {
             process: CleanupCheck::from_result(&helper_cleanup),
             container: CleanupCheck::from_result(&primary_cleanup),
             egress: CleanupCheck::from_result(&egress_cleanup),
-            credentials: match &credential_cleanup {
-                CleanupStatus::Complete => CleanupCheck {
-                    status: "verified_absent",
-                    error: None,
-                },
-                CleanupStatus::Failed(error) => CleanupCheck {
-                    status: "failed",
-                    error: Some(error.clone()),
-                },
-            },
+            credentials: credential_check,
             effects: CleanupCheck::from_result(&effect_cleanup),
         });
         merge_execution_cleanup(
@@ -1645,7 +1664,7 @@ fn validate_credential_runtime_conflicts(
         .collect::<std::collections::BTreeSet<_>>();
     mounts.extend(
         [
-            "/opencode/config",
+            "/opencode/config/opencode",
             "/opencode/data",
             "/opencode/state",
             "/opencode/cache",
@@ -1671,6 +1690,31 @@ fn validate_credential_runtime_conflicts(
         }
     }
     Ok(())
+}
+
+fn project_config_mask_mounts(
+    mask_dir: &Path,
+    workspaces: &[protocol::WorkspaceSpec],
+) -> anyhow::Result<Vec<DockerMount>> {
+    let mut mounts = Vec::new();
+    for workspace in workspaces {
+        let project_config = Path::new(&workspace.host_path).join(".opencode");
+        match std::fs::symlink_metadata(&project_config) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "workspace project configuration is not a real directory: {}",
+                project_config.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+        mounts.push(DockerMount::new(
+            mask_dir,
+            format!("{}/.opencode", workspace.container_path),
+            true,
+        )?);
+    }
+    Ok(mounts)
 }
 
 fn verify_materialized_credential_identities(
@@ -2822,9 +2866,12 @@ mod tests {
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
+    use anyhow::Context as _;
     use chrono::Utc;
     use protocol::NetworkResourceKind;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn supervised_tool_approval_fails_before_launch() {
@@ -2833,6 +2880,219 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("no verified externally mediated OpenCode permission path"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION=1 and tester-managed Docker cleanup"]
+    async fn real_docker_attended_opencode_reaches_model_initialization() {
+        run_real_docker_attended_opencode_startup().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn run_real_docker_attended_opencode_startup() -> anyhow::Result<()> {
+        anyhow::ensure!(
+            std::env::var("AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION").as_deref() == Ok("1"),
+            "AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION=1 is required"
+        );
+        anyhow::ensure!(
+            std::env::var("AGENT_HUB_ATTENDED_OPENCODE_ALLOW_CLEANUP").as_deref() == Ok("1"),
+            "AGENT_HUB_ATTENDED_OPENCODE_ALLOW_CLEANUP=1 is required"
+        );
+        let config_root = std::fs::canonicalize(PathBuf::from(std::env::var(
+            "AGENT_HUB_ATTENDED_OPENCODE_CONFIG_ROOT",
+        )?))?;
+        let integration_root = std::fs::canonicalize(PathBuf::from(std::env::var(
+            "AGENT_HUB_ATTENDED_OPENCODE_ROOT",
+        )?))?;
+        let expected_image_id = std::env::var("AGENT_HUB_ATTENDED_OPENCODE_IMAGE_ID")?;
+        let deployment =
+            config::validate_authoritative_config_root(&config_root).map_err(anyhow::Error::msg)?;
+        let bundle = deployment
+            .environment_bundles
+            .get("code-auto")
+            .context("code-auto environment bundle is required")?;
+        let runner = deployment
+            .runner_profiles
+            .resolve_agent_profile(None)
+            .map_err(anyhow::Error::msg)?;
+        let root = integration_root.join(format!(
+            "attended-opencode-startup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root)?;
+        super::set_private_directory(&root)?;
+        let bundle_dir = root.join("config");
+        let data_dir = root.join("data");
+        let state_dir = root.join("state");
+        let cache_dir = root.join("cache");
+        let workspace = root.join("workspace");
+        let project_config_mask = root.join("project-config-mask");
+        bundle.write_to(&bundle_dir).map_err(anyhow::Error::msg)?;
+        for directory in [
+            &data_dir,
+            &state_dir,
+            &cache_dir,
+            &workspace,
+            &project_config_mask,
+        ] {
+            std::fs::create_dir(directory)?;
+            super::set_private_directory(directory)?;
+        }
+        std::fs::create_dir(state_dir.join("home"))?;
+        std::fs::create_dir(data_dir.join("opencode"))?;
+        std::fs::create_dir_all(workspace.join(".opencode/plugin"))?;
+        std::fs::create_dir_all(workspace.join(".opencode/skills/hostile"))?;
+        std::fs::write(
+            workspace.join("opencode.json"),
+            br#"{"model":"anthropic/hostile","plugin":["./.opencode/plugin/hostile.js"]}"#,
+        )?;
+        std::fs::write(
+            workspace.join(".opencode/plugin/hostile.js"),
+            r#"import fs from "node:fs"; fs.writeFileSync("/workspace/primary/hostile-plugin", "loaded"); export default async () => ({});"#,
+        )?;
+        std::fs::write(
+            workspace.join(".opencode/skills/hostile/SKILL.md"),
+            "---\nname: hostile\ndescription: hostile\n---\nhostile\n",
+        )?;
+        let expires = std::time::SystemTime::now()
+            .checked_add(Duration::from_secs(3600))
+            .context("synthetic OAuth expiry overflow")?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let auth_path = data_dir.join("opencode/auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_vec(&serde_json::json!({
+                "openai": {
+                    "type": "oauth",
+                    "access": "synthetic-attended-startup-token",
+                    "refresh": "",
+                    "expires": expires,
+                    "accountId": "synthetic-attended-account"
+                }
+            }))?,
+        )?;
+        super::set_private_file(&auth_path)?;
+
+        let docker = which::which("docker")?;
+        let image_id = agent_hub_executor::inspect_image_identity(
+            &docker,
+            config::DURABLE_OPENCODE_IMAGE,
+            &agent_hub_executor::Deadline::new(Some(15))?,
+            &agent_hub_executor::Cancellation::never(),
+        )
+        .await?;
+        anyhow::ensure!(
+            image_id == expected_image_id,
+            "Docker image identity changed"
+        );
+        let container_name = format!(
+            "agent-hub-attended-opencode-test-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let ownership = agent_hub_executor::DockerOwnership::new(BTreeMap::from([
+            ("agent-hub.owner".to_string(), "attended-test".to_string()),
+            ("agent-hub.run".to_string(), container_name.clone()),
+        ]))?;
+        let script = r#"set -eu
+test -r /opencode/config/opencode/opencode.json
+test -r /opencode/config/opencode/agents/coder.md
+test -r /opencode/config/opencode/skills/local-workspaces/SKILL.md
+! touch /opencode/config/opencode/hostile-write
+touch /opencode/data/writable /opencode/state/writable /opencode/cache/writable
+/usr/local/bin/opencode debug config > /workspace/primary/debug-config.json
+/usr/local/bin/opencode debug skill > /workspace/primary/debug-skills.json
+set +e
+timeout 20 /usr/local/bin/opencode run "Reply with the word ready." > /workspace/primary/model-initialization.log 2>&1
+status=$?
+printf '%s\n' "$status" > /workspace/primary/model-initialization.status
+exit 0
+"#;
+        let plan = agent_hub_executor::DockerExecutionPlan {
+            image_identity: image_id,
+            container_name: container_name.clone(),
+            entrypoint: "/usr/bin/sh".to_string(),
+            command_args: vec!["-lc".to_string(), script.to_string()],
+            mounts: vec![
+                agent_hub_executor::DockerMount::new(
+                    &bundle_dir,
+                    "/opencode/config/opencode",
+                    true,
+                )?,
+                agent_hub_executor::DockerMount::new(&data_dir, "/opencode/data", false)?,
+                agent_hub_executor::DockerMount::new(&state_dir, "/opencode/state", false)?,
+                agent_hub_executor::DockerMount::new(&cache_dir, "/opencode/cache", false)?,
+                agent_hub_executor::DockerMount::new(&workspace, "/workspace/primary", false)?,
+                agent_hub_executor::DockerMount::new(
+                    &project_config_mask,
+                    "/workspace/primary/.opencode",
+                    true,
+                )?,
+            ],
+            environment: runner.opencode.trusted_env.clone(),
+            network: agent_hub_executor::NetworkMode::None,
+            dns: Vec::new(),
+            extra_hosts: Vec::new(),
+            ownership: ownership.clone(),
+            user: format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                libc::getegid()
+            }),
+            workdir: Some("/workspace/primary".to_string()),
+            memory_limit: "2g".to_string(),
+            cpu_limit: "2".to_string(),
+            pids_limit: protocol::APPROVED_EXECUTION_PIDS_LIMIT,
+            read_only: true,
+            tmpfs: vec!["/tmp:rw,size=256m".to_string()],
+        };
+        let output = tokio::process::Command::new(&docker)
+            .args(plan.materialize_args()?)
+            .output()
+            .await;
+        let cleanup = agent_hub_executor::DockerCli::new(&docker)
+            .remove_owned(&container_name, &ownership, Duration::from_secs(15))
+            .await;
+        cleanup?;
+        let output = output?;
+        let model_log =
+            std::fs::read_to_string(workspace.join("model-initialization.log")).unwrap_or_default();
+        anyhow::ensure!(
+            output.status.success(),
+            "attended OpenCode startup failed: status={:?} stdout={:?} stderr={:?} model_log={:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            model_log
+        );
+        let debug_config = std::fs::read_to_string(workspace.join("debug-config.json"))?;
+        let debug_skills = std::fs::read_to_string(workspace.join("debug-skills.json"))?;
+        let model_status = std::fs::read_to_string(workspace.join("model-initialization.status"))?;
+        anyhow::ensure!(
+            debug_config.contains("openai/gpt-5.6-sol") && !debug_config.contains("hostile"),
+            "hostile project configuration affected attended OpenCode"
+        );
+        anyhow::ensure!(
+            debug_skills.contains("local-workspaces") && !debug_skills.contains("hostile"),
+            "hostile project skill affected attended OpenCode"
+        );
+        anyhow::ensure!(
+            model_log.contains("gpt-5.6-sol") && !model_log.contains("EROFS"),
+            "OpenCode did not reach authorized model initialization: {model_log:?}"
+        );
+        anyhow::ensure!(
+            !matches!(model_status.trim(), "126" | "127"),
+            "OpenCode executable did not start"
+        );
+        anyhow::ensure!(
+            !workspace.join("hostile-plugin").exists()
+                && !bundle_dir.join("hostile-write").exists()
+                && data_dir.join("writable").is_file()
+                && state_dir.join("writable").is_file()
+                && cache_dir.join("writable").is_file(),
+            "attended immutable or writable XDG mount contract failed"
+        );
+        std::fs::remove_dir_all(&root)?;
+        Ok(())
     }
 
     #[test]

@@ -266,50 +266,38 @@ impl ExecutionCancellationContext {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let credential_records = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.operation_kind.as_str(),
+                    "credential_materialize"
+                        | "credential_secret_write"
+                        | "credential_directory_create"
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        reconcile_owned_credential_paths(credential_root, &credential_records)?;
+        for record in credential_records
+            .into_iter()
+            .filter(|record| !effect_is_resolved(record))
+        {
+            self.append_effect(
+                record.operation_id,
+                &record.operation_kind,
+                &record.resource_identity,
+                ExternalEffectStatus::Reconciled,
+            )?;
+        }
         for record in records {
             if effect_is_resolved(&record) {
                 continue;
             }
             let recovered = match record.operation_kind.as_str() {
-                "credential_materialize" | "credential_secret_write" => {
-                    let path = Path::new(&record.resource_identity);
-                    anyhow::ensure!(
-                        path.is_absolute() && path.starts_with(credential_root),
-                        "credential effect path escaped its owned root"
-                    );
-                    match std::fs::remove_file(path) {
-                        Ok(()) => sync_directory(
-                            path.parent()
-                                .context("credential effect path has no parent")?,
-                        )?,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    anyhow::ensure!(
-                        !path.exists(),
-                        "owned credential file remains after cleanup"
-                    );
-                    true
-                }
-                "credential_directory_create" => {
-                    let path = Path::new(&record.resource_identity);
-                    anyhow::ensure!(
-                        path.is_absolute() && path.starts_with(credential_root),
-                        "credential effect directory escaped its owned root"
-                    );
-                    if path.is_dir() && std::fs::read_dir(path)?.next().is_none() {
-                        std::fs::remove_dir(path)?;
-                        sync_directory(
-                            path.parent()
-                                .context("credential effect directory has no parent")?,
-                        )?;
-                    }
-                    anyhow::ensure!(
-                        !path.exists(),
-                        "owned credential directory remains after cleanup"
-                    );
-                    true
-                }
+                "credential_materialize"
+                | "credential_secret_write"
+                | "credential_directory_create" => false,
                 "credential_helper_process" => {
                     verify_process_group_absent(&parse_process_effect_identity(
                         &record.resource_identity,
@@ -445,6 +433,183 @@ impl ExecutionCancellationContext {
     pub(crate) fn for_test(root: &Path, receiver: watch::Receiver<bool>) -> anyhow::Result<Self> {
         Self::new(root, Cancellation::new(receiver))
     }
+}
+
+fn reconcile_owned_credential_paths(
+    credential_root: &Path,
+    records: &[ExternalEffectRecord],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        credential_root.is_absolute(),
+        "credential root must be absolute"
+    );
+    verify_owned_credential_path(
+        credential_root,
+        credential_root,
+        CredentialPathKind::Directory,
+    )?;
+
+    let mut files = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.operation_kind.as_str(),
+                "credential_materialize" | "credential_secret_write"
+            )
+        })
+        .map(|record| PathBuf::from(&record.resource_identity))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    for path in &files {
+        verify_owned_credential_path(credential_root, path, CredentialPathKind::File)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => sync_directory(
+                path.parent()
+                    .context("credential effect path has no parent")?,
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let mut directories = records
+        .iter()
+        .filter(|record| record.operation_kind == "credential_directory_create")
+        .map(|record| PathBuf::from(&record.resource_identity))
+        .collect::<Vec<_>>();
+    directories.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    directories.dedup();
+    for path in &directories {
+        verify_owned_credential_path(credential_root, path, CredentialPathKind::Directory)?;
+        match std::fs::remove_dir(path) {
+            Ok(()) => sync_directory(
+                path.parent()
+                    .context("credential effect directory has no parent")?,
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                anyhow::bail!(
+                    "owned credential directory contains unknown material: {}",
+                    path.display()
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    for path in files {
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "owned credential file remains after cleanup: {}",
+            path.display()
+        );
+    }
+    for path in directories {
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "owned credential directory remains after cleanup: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CredentialPathKind {
+    File,
+    Directory,
+}
+
+#[cfg(unix)]
+fn verify_owned_credential_path(
+    credential_root: &Path,
+    path: &Path,
+    kind: CredentialPathKind,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    anyhow::ensure!(path.is_absolute(), "credential effect path is not absolute");
+    if credential_root.exists() {
+        anyhow::ensure!(
+            std::fs::canonicalize(credential_root)? == credential_root,
+            "credential root is not canonical"
+        );
+    }
+    let relative = path
+        .strip_prefix(credential_root)
+        .context("credential effect path escaped its owned root")?;
+    if path != credential_root {
+        anyhow::ensure!(
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+            "credential effect path escaped its owned root"
+        );
+    }
+    let expected_uid = unsafe { libc::geteuid() };
+    let mut current = credential_root.to_path_buf();
+    let components = if path == credential_root {
+        Vec::new()
+    } else {
+        relative.components().collect::<Vec<_>>()
+    };
+    for (index, component) in std::iter::once(None)
+        .chain(components.iter().map(Some))
+        .enumerate()
+    {
+        if let Some(component) = component {
+            current.push(component.as_os_str());
+        }
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "credential effect path traverses a symlink: {}",
+            current.display()
+        );
+        anyhow::ensure!(
+            metadata.uid() == expected_uid,
+            "credential effect path owner mismatch: {}",
+            current.display()
+        );
+        let is_target = index == components.len();
+        if !is_target || matches!(kind, CredentialPathKind::Directory) {
+            anyhow::ensure!(
+                metadata.is_dir(),
+                "credential effect directory is not a real directory: {}",
+                current.display()
+            );
+        } else {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "credential effect file is not a regular file: {}",
+                current.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_owned_credential_path(
+    _credential_root: &Path,
+    _path: &Path,
+    _kind: CredentialPathKind,
+) -> anyhow::Result<()> {
+    anyhow::bail!("secure credential cleanup requires Unix ownership metadata")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

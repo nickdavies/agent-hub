@@ -719,6 +719,80 @@ async fn effect_recovery_removes_exact_credential_file_before_reconciling() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn effect_recovery_removes_owned_credential_directories_deepest_first() {
+    let root = temp_root("effect-credential-directory-recovery");
+    let credentials = root.join("data");
+    let auth_dir = credentials.join("opencode");
+    let nested_dir = auth_dir.join("nested");
+    std::fs::create_dir_all(&nested_dir).unwrap();
+    let credential = nested_dir.join("auth.json");
+    std::fs::write(&credential, "secret").unwrap();
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+    effects
+        .begin_external_operation("credential_directory_create", &auth_dir.to_string_lossy())
+        .unwrap()
+        .completed()
+        .unwrap();
+    effects
+        .begin_external_operation("credential_directory_create", &nested_dir.to_string_lossy())
+        .unwrap()
+        .completed()
+        .unwrap();
+    effects
+        .begin_external_operation("credential_secret_write", &credential.to_string_lossy())
+        .unwrap()
+        .completed()
+        .unwrap();
+
+    effects.reconcile_owned_effects(&credentials).await.unwrap();
+    effects.finalize().unwrap();
+    assert!(!auth_dir.exists());
+    assert!(credentials.is_dir());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn effect_recovery_hard_fails_on_unknown_credential_material_then_retries() {
+    let root = temp_root("effect-credential-directory-retry");
+    let credentials = root.join("data");
+    let auth_dir = credentials.join("opencode");
+    std::fs::create_dir_all(&auth_dir).unwrap();
+    let credential = auth_dir.join("auth.json");
+    let unknown = auth_dir.join("unknown");
+    std::fs::write(&credential, "secret").unwrap();
+    std::fs::write(&unknown, "not-owned").unwrap();
+    let effects =
+        ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never()).unwrap();
+    effects
+        .begin_external_operation("credential_directory_create", &auth_dir.to_string_lossy())
+        .unwrap()
+        .completed()
+        .unwrap();
+    effects
+        .begin_external_operation("credential_secret_write", &credential.to_string_lossy())
+        .unwrap()
+        .completed()
+        .unwrap();
+
+    let error = effects
+        .reconcile_owned_effects(&credentials)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown material"));
+    assert!(!credential.exists());
+    assert!(auth_dir.is_dir());
+    assert!(effects.finalize().is_err());
+
+    std::fs::remove_file(unknown).unwrap();
+    effects.reconcile_owned_effects(&credentials).await.unwrap();
+    effects.finalize().unwrap();
+    assert!(!auth_dir.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn cleanup_failure_is_explicit() {
     let root = temp_root("cleanup-status");
