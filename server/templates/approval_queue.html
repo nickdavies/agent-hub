@@ -21,8 +21,6 @@
         .smart-view dt { color: var(--pico-primary); font-weight: bold; margin-top: 0.6rem; }
         .smart-view dd { margin-left: 0; overflow-wrap: anywhere; }
         .smart-view dd pre { margin: 0; }
-        .dippy-context dd { border-left: 0.2rem solid var(--pico-primary); padding-left: 0.6rem; }
-        .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
         pre { max-height: none; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
         pre code { white-space: inherit; overflow-wrap: inherit; }
         .view-heading { align-items: center; display: flex; justify-content: space-between; gap: 1rem; }
@@ -55,11 +53,6 @@
 
     <article id="request-state" aria-labelledby="request-heading" aria-live="polite" aria-atomic="true" hidden>
         <h2 id="request-heading" class="request-heading" tabindex="-1">Pending request</h2>
-
-        <section id="context-section" hidden>
-            <h3 id="context-heading"></h3>
-            <pre><code id="context-content"></code></pre>
-        </section>
 
         <section aria-labelledby="input-heading">
             <div class="view-heading">
@@ -171,24 +164,129 @@
         return group;
     }
 
-    function createDippyContext(reason) {
-        const group = document.createElement('div');
-        group.className = 'dippy-context';
-        group.setAttribute('role', 'note');
-        const term = document.createElement('dt');
-        term.className = 'visually-hidden';
-        term.textContent = 'Dippy context';
-        const detail = document.createElement('dd');
-        const pre = document.createElement('pre');
-        const code = document.createElement('code');
-        code.textContent = reason;
-        pre.appendChild(code);
-        detail.appendChild(pre);
-        group.append(term, detail);
-        return group;
+    function entriesWithDippyContext(entries, reason) {
+        const commandIndex = entries.findIndex(([key]) => key === 'command');
+        const descriptionIndex = entries.findIndex(([key]) => key === 'description');
+        const dippyEntry = ['Dippy context', reason];
+
+        if (commandIndex >= 0 && descriptionIndex >= 0) {
+            const result = [];
+            const anchorIndex = Math.min(commandIndex, descriptionIndex);
+            entries.forEach(([key, value], index) => {
+                if (index === anchorIndex) {
+                    result.push(['command', entries[commandIndex][1]], dippyEntry, ['description', entries[descriptionIndex][1]]);
+                }
+                if (key !== 'command' && key !== 'description') result.push([key, value]);
+            });
+            return result;
+        }
+
+        const result = [];
+        for (const entry of entries) {
+            const [key] = entry;
+            if (commandIndex < 0 && key === 'description') result.push(dippyEntry);
+            result.push(entry);
+            if (key === 'command') result.push(dippyEntry);
+        }
+        if (commandIndex < 0 && descriptionIndex < 0) result.push(dippyEntry);
+        return result;
     }
 
-    function renderSmartInput(input, dippyReason) {
+    function orderedSmartEntries(input, toolName, extra) {
+        const entries = Object.entries(input);
+        const dippyReason = extra && typeof extra.dippy_reason === 'string' ? extra.dippy_reason : null;
+        const diff = extra && typeof extra.diff === 'string' ? extra.diff : null;
+
+        const ordered = [];
+        const consumed = new Set();
+        function addField(key, label) {
+            if (!Object.prototype.hasOwnProperty.call(input, key) || consumed.has(key)) return;
+            ordered.push([label || key, input[key]]);
+            consumed.add(key);
+        }
+        function addPreferredPath() {
+            if (Object.prototype.hasOwnProperty.call(input, 'path')) {
+                addField('path', 'path');
+            } else {
+                addField('file_path', 'path');
+            }
+        }
+        function addDiff() {
+            if (diff !== null) ordered.push(['diff', diff]);
+        }
+        function addDippyContext() {
+            if (dippyReason !== null) ordered.push(['Dippy context', dippyReason]);
+        }
+        function addRemaining() {
+            for (const [key, value] of entries) {
+                if (!consumed.has(key)) ordered.push([key, value]);
+            }
+        }
+
+        if (toolName === 'Bash') {
+            addField('command');
+            addDippyContext();
+            addField('description');
+            addRemaining();
+            addDiff();
+            return ordered;
+        }
+
+        if (toolName === 'Write') {
+            addPreferredPath();
+            addDiff();
+            addField('content');
+            addRemaining();
+            addDippyContext();
+            return ordered;
+        }
+        if (toolName === 'MultiEdit') {
+            addPreferredPath();
+            addDiff();
+            addField('edits');
+            addRemaining();
+            addDippyContext();
+            return ordered;
+        }
+        if (toolName === 'Edit' || toolName === 'StrReplace') {
+            addPreferredPath();
+            addDiff();
+            const mutationFields = toolName === 'Edit'
+                ? ['old_content', 'new_content', 'old_string', 'new_string']
+                : ['old_string', 'new_string', 'old_content', 'new_content'];
+            mutationFields.forEach(key => addField(key));
+            addRemaining();
+            addDippyContext();
+            return ordered;
+        }
+        if (toolName === 'WebFetch') {
+            if (Object.prototype.hasOwnProperty.call(input, 'tool')) {
+                addField('tool');
+            } else {
+                ordered.push(['tool', toolName]);
+            }
+            addField('url');
+            addField('headers');
+            const timeoutKey = ['timeout', 'timeout_seconds', 'timeout_ms']
+                .find(key => Object.prototype.hasOwnProperty.call(input, key));
+            if (timeoutKey) addField(timeoutKey, 'timeout');
+            addRemaining();
+            if (diff !== null) ordered.push(['diff', diff]);
+            addDippyContext();
+            return ordered;
+        }
+
+        if (dippyReason !== null) {
+            const generic = entriesWithDippyContext(entries, dippyReason);
+            if (diff !== null) generic.push(['diff', diff]);
+            return generic;
+        }
+        addRemaining();
+        if (diff !== null) ordered.push(['diff', diff]);
+        return ordered;
+    }
+
+    function renderSmartInput(input, toolName, extra) {
         const container = document.getElementById('smart-view');
         container.replaceChildren();
         if (input === null || typeof input !== 'object' || Array.isArray(input)) {
@@ -197,62 +295,22 @@
             code.textContent = typeof input === 'string' ? input : JSON.stringify(input, null, 2);
             pre.appendChild(code);
             container.appendChild(pre);
-            if (dippyReason !== null) {
+            const dippyReason = extra && typeof extra.dippy_reason === 'string' ? extra.dippy_reason : null;
+            const diff = extra && typeof extra.diff === 'string' ? extra.diff : null;
+            if (dippyReason !== null || diff !== null) {
                 const list = document.createElement('dl');
-                list.appendChild(createDippyContext(dippyReason));
+                if (dippyReason !== null) list.appendChild(createSmartEntry('Dippy context', dippyReason));
+                if (diff !== null) list.appendChild(createSmartEntry('diff', diff));
                 container.appendChild(list);
             }
             return;
         }
 
         const list = document.createElement('dl');
-        const entries = Object.entries(input);
-        const commandIndex = entries.findIndex(([key]) => key === 'command');
-        const descriptionIndex = entries.findIndex(([key]) => key === 'description');
-
-        if (dippyReason !== null && commandIndex >= 0 && descriptionIndex >= 0) {
-            const anchorIndex = Math.min(commandIndex, descriptionIndex);
-            entries.forEach(([key, value], index) => {
-                if (index === anchorIndex) {
-                    list.appendChild(createSmartEntry('command', input.command));
-                    list.appendChild(createDippyContext(dippyReason));
-                    list.appendChild(createSmartEntry('description', input.description));
-                }
-                if (key !== 'command' && key !== 'description') {
-                    list.appendChild(createSmartEntry(key, value));
-                }
-            });
-        } else {
-            for (const [key, value] of entries) {
-                if (dippyReason !== null && commandIndex < 0 && key === 'description') {
-                    list.appendChild(createDippyContext(dippyReason));
-                }
-                list.appendChild(createSmartEntry(key, value));
-                if (dippyReason !== null && key === 'command') {
-                    list.appendChild(createDippyContext(dippyReason));
-                }
-            }
-            if (dippyReason !== null && commandIndex < 0 && descriptionIndex < 0) {
-                list.appendChild(createDippyContext(dippyReason));
-            }
+        for (const [label, value] of orderedSmartEntries(input, toolName, extra)) {
+            list.appendChild(createSmartEntry(label, value));
         }
         container.appendChild(list);
-    }
-
-    function renderContext(approval) {
-        const section = document.getElementById('context-section');
-        const extra = approval.context && approval.context.extra;
-        if (!extra || typeof extra !== 'object') {
-            section.hidden = true;
-            return;
-        }
-        if (typeof extra.diff === 'string') {
-            setText('context-heading', 'Diff');
-            setText('context-content', extra.diff);
-            section.hidden = false;
-        } else {
-            section.hidden = true;
-        }
     }
 
     function renderApproval(approval, count) {
@@ -262,10 +320,8 @@
         setText('project', approval.project || 'Unknown project');
         setText('session', approval.session_display_name || approval.session_id || 'Unknown session');
         setText('provider', approval.provider || 'Unknown provider');
-        renderContext(approval);
         const extra = approval.context && approval.context.extra;
-        const dippyReason = extra && typeof extra.dippy_reason === 'string' ? extra.dippy_reason : null;
-        renderSmartInput(approval.tool_input, dippyReason);
+        renderSmartInput(approval.tool_input, approval.tool_name, extra);
         setText('raw-content', JSON.stringify(approval.tool_input, null, 2));
         document.getElementById('smart-view').hidden = false;
         document.getElementById('raw-view').hidden = true;
