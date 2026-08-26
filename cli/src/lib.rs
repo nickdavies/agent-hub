@@ -1,3 +1,5 @@
-pub mod attended;
-pub mod local;
-pub mod state;
+pub mod api {
+    pub use protocol::{
+        AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1, AttendedProposal,
+    };
+}

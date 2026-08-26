@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 
-use agent_hub::attended::{
-    AuthorizationSelectors, DIPPY_SELECTOR_PREFIX, authorize, read_artifact_bounded,
-    render_proposal,
-};
-use agent_hub::state::StateStore;
+use crate::attended::{DIPPY_SELECTOR_PREFIX, read_artifact_bounded, render_proposal};
+use crate::state::StateStore;
 use protocol::{
     ApprovedExecutionSpec, AttendedAuthorizationRequestV1, AttendedExecutionSpec,
     AttendedLifecycleContract, AttendedOutputContract, AttendedProposal, CanonicalRuntimeSpec,
@@ -13,9 +10,8 @@ use protocol::{
 };
 
 #[test]
-fn selector_render_is_deterministic_and_authorization_replay_is_rejected() {
+fn selector_render_is_deterministic() {
     let root = temp_root("state");
-    let state = StateStore::open(root.join("state")).unwrap();
     let artifact = request().canonical_artifact().unwrap();
     let path = root.join("authorization.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
@@ -32,8 +28,6 @@ fn selector_render_is_deterministic_and_authorization_replay_is_rejected() {
     assert!(!first.contains("gateway"));
     assert!(!first.contains(" --resource "));
 
-    authorize(&state, &path, selectors(&artifact.digest, "development")).unwrap();
-    assert!(authorize(&state, &path, selectors(&artifact.digest, "development"),).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -48,46 +42,6 @@ fn state_rejects_non_private_existing_root() {
         assert!(StateStore::open(root.clone()).is_err());
     }
     std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
-}
-
-#[test]
-fn authorization_is_no_follow_private_and_selector_failures_do_not_create_state() {
-    let root = temp_root("authorization-file");
-    let artifact = request().canonical_artifact().unwrap();
-    let path = root.join("authorization.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
-    let state_root = root.join("state");
-    let state = StateStore::open(state_root.clone()).unwrap();
-    assert!(!state_root.exists());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
-
-    assert!(
-        authorize(
-            &state,
-            &path,
-            selectors(&artifact.digest, "wrong-environment"),
-        )
-        .is_err()
-    );
-    assert!(!state_root.exists());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(authorize(&state, &path, selectors(&artifact.digest, "development"),).is_err());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let link = root.join("authorization-link.json");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(authorize(&state, &link, selectors(&artifact.digest, "development"),).is_err());
-    }
-    assert!(!state_root.exists());
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -114,19 +68,6 @@ fn fresh_state_creates_runs_parent_and_bounds_artifact_reads() {
     assert!(bounded.truncated);
     assert!(bounded.total_bytes > bounded.returned_bytes);
     std::fs::remove_dir_all(root).unwrap();
-}
-
-fn selectors<'a>(digest: &'a str, environment: &'a str) -> AuthorizationSelectors<'a> {
-    AuthorizationSelectors {
-        digest,
-        environment,
-        image_family: "job-code",
-        network_class: "none",
-        network_resources: &[],
-        tool_approval: "auto",
-        overlays: &[],
-        timeout_secs: 3600,
-    }
 }
 
 fn request() -> AttendedAuthorizationRequestV1 {

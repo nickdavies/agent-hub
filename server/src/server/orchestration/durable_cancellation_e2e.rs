@@ -251,7 +251,13 @@ async fn run_subprocess_case(fault: Option<FaultCase>) -> anyhow::Result<()> {
         tasks,
     };
 
-    let running = wait_for_running_job(&orchestration, work_item_id, &mut guard.worker).await?;
+    let running = wait_for_running_job(
+        &orchestration,
+        work_item_id,
+        &guard.root.join("worker.log"),
+        &mut guard.worker,
+    )
+    .await?;
     if fault.is_none() {
         wait_for_owned_container(&worker_id).await?;
     }
@@ -788,14 +794,18 @@ fn e2e_app_state(
 async fn wait_for_running_job(
     service: &OrchestrationService,
     work_item_id: Uuid,
+    worker_log: &Path,
     worker: &mut Child,
 ) -> anyhow::Result<Job> {
     let deadline = Instant::now() + E2E_TIMEOUT;
     loop {
-        ensure!(
-            worker.try_wait()?.is_none(),
-            "worker exited before running job"
-        );
+        if let Some(status) = worker.try_wait()? {
+            anyhow::bail!(
+                "worker exited before running job with {status}: {}",
+                std::fs::read_to_string(worker_log)
+                    .unwrap_or_else(|error| format!("<unreadable log: {error}>"))
+            );
+        }
         if let Some(job) = service
             .list_jobs_for_work_item(work_item_id)
             .await?

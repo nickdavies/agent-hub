@@ -706,6 +706,7 @@ async fn run_status(
         _ => "workspace_git_mutation",
     };
     let operation = cancellation.begin_external_operation(operation_kind, resource_identity)?;
+    let operation_id = operation.operation_id();
     cmd.kill_on_drop(true);
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
@@ -717,10 +718,13 @@ async fn run_status(
     let identity = super::read_process_identity(pid)?;
     let helper = cancellation.begin_external_operation(
         "workspace_git_helper_process",
-        &format!(
-            "pid={};pgid={};boot={};start={}",
-            identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
-        ),
+        &super::linked_helper_resource(
+            operation_id,
+            identity.pid,
+            identity.pgid,
+            &identity.linux_boot_id,
+            identity.proc_start_time_ticks,
+        )?,
     )?;
     let status = child.wait().await?;
     super::verify_process_group_absent(&identity).await?;
@@ -747,6 +751,7 @@ async fn git_output(
     let operation = cancellation
         .begin_external_operation("workspace_git_inspect", &workspace_dir.to_string_lossy())
         .ok()?;
+    let operation_id = operation.operation_id();
     let mut command = tokio::process::Command::new("git");
     command
         .arg("-C")
@@ -763,10 +768,14 @@ async fn git_output(
     let helper = cancellation
         .begin_external_operation(
             "workspace_git_helper_process",
-            &format!(
-                "pid={};pgid={};boot={};start={}",
-                identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
-            ),
+            &super::linked_helper_resource(
+                operation_id,
+                identity.pid,
+                identity.pgid,
+                &identity.linux_boot_id,
+                identity.proc_start_time_ticks,
+            )
+            .ok()?,
         )
         .ok()?;
     let output = child.wait_with_output().await.ok()?;

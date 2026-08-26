@@ -385,20 +385,6 @@ pub fn repository_state(root: &Path) -> anyhow::Result<RepositoryState> {
     })
 }
 
-pub fn repository_remote(root: &Path) -> anyhow::Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .with_context(|| format!("inspect repository remote {}", root.display()))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let remote = String::from_utf8(output.stdout)?;
-    canonical_remote_identity(remote.trim()).map(Some)
-}
-
 fn path_string(path: &Path) -> anyhow::Result<String> {
     path.to_str()
         .map(str::to_string)

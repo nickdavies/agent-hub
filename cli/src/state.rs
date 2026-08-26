@@ -6,11 +6,11 @@ use anyhow::{Context, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Clone)]
-pub struct StateStore {
+pub(crate) struct StateStore {
     root: PathBuf,
 }
 
-pub struct StateLock(File);
+pub(crate) struct StateLock(File);
 
 impl Drop for StateLock {
     fn drop(&mut self) {
@@ -25,7 +25,7 @@ impl Drop for StateLock {
 }
 
 impl StateStore {
-    pub fn open(root: PathBuf) -> anyhow::Result<Self> {
+    pub(crate) fn open(root: PathBuf) -> anyhow::Result<Self> {
         ensure!(!root.as_os_str().is_empty(), "state root path is empty");
         ensure!(root.is_absolute(), "state root path must be absolute");
         if root.exists() {
@@ -34,11 +34,11 @@ impl StateStore {
         Ok(Self { root })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn create_json<T: Serialize>(&self, relative: &Path, value: &T) -> anyhow::Result<()> {
+    pub(crate) fn create_json<T: Serialize>(
+        &self,
+        relative: &Path,
+        value: &T,
+    ) -> anyhow::Result<()> {
         self.ensure_root()?;
         let path = self.checked_path(relative)?;
         ensure_parent(&self.root, &path)?;
@@ -67,7 +67,7 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn lock(&self, relative: &Path) -> anyhow::Result<StateLock> {
+    pub(crate) fn lock(&self, relative: &Path) -> anyhow::Result<StateLock> {
         self.ensure_root()?;
         let path = self.checked_path(relative)?;
         ensure_parent(&self.root, &path)?;
@@ -95,7 +95,11 @@ impl StateStore {
         Ok(StateLock(file))
     }
 
-    pub fn replace_json<T: Serialize>(&self, relative: &Path, value: &T) -> anyhow::Result<()> {
+    pub(crate) fn replace_json<T: Serialize>(
+        &self,
+        relative: &Path,
+        value: &T,
+    ) -> anyhow::Result<()> {
         self.ensure_root()?;
         let path = self.checked_path(relative)?;
         ensure_parent(&self.root, &path)?;
@@ -113,13 +117,17 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn read_json<T: DeserializeOwned>(&self, relative: &Path) -> anyhow::Result<T> {
+    pub(crate) fn read_json<T: DeserializeOwned>(&self, relative: &Path) -> anyhow::Result<T> {
         let path = self.checked_path(relative)?;
         serde_json::from_reader(open_owned_file(&path)?)
             .with_context(|| format!("parse {}", path.display()))
     }
 
-    pub fn read_limited(&self, relative: &Path, limit: u64) -> anyhow::Result<(Vec<u8>, u64)> {
+    pub(crate) fn read_limited(
+        &self,
+        relative: &Path,
+        limit: u64,
+    ) -> anyhow::Result<(Vec<u8>, u64)> {
         let path = self.checked_path(relative)?;
         let file = open_owned_file(&path)?;
         let total = file.metadata()?.len();
@@ -128,30 +136,11 @@ impl StateStore {
         Ok((bytes, total))
     }
 
-    pub fn rename(&self, from: &Path, to: &Path) -> anyhow::Result<()> {
-        self.ensure_root()?;
-        let from = self.checked_path(from)?;
-        let to = self.checked_path(to)?;
-        verify_owned_file(&from)?;
-        ensure!(
-            !to.exists(),
-            "state destination already exists: {}",
-            to.display()
-        );
-        ensure_parent(&self.root, &to)?;
-        std::fs::rename(&from, &to)?;
-        sync_parent(&from)?;
-        if from.parent() != to.parent() {
-            sync_parent(&to)?;
-        }
-        Ok(())
-    }
-
-    pub fn path(&self, relative: &Path) -> anyhow::Result<PathBuf> {
+    pub(crate) fn path(&self, relative: &Path) -> anyhow::Result<PathBuf> {
         self.checked_path(relative)
     }
 
-    pub fn ensure_directory(&self, relative: &Path) -> anyhow::Result<PathBuf> {
+    pub(crate) fn ensure_directory(&self, relative: &Path) -> anyhow::Result<PathBuf> {
         self.ensure_root()?;
         let path = self.checked_path(relative)?;
         let sentinel = path.join(".parent");
@@ -160,7 +149,7 @@ impl StateStore {
         Ok(path)
     }
 
-    pub fn list_json<T: DeserializeOwned>(&self, relative: &Path) -> anyhow::Result<Vec<T>> {
+    pub(crate) fn list_json<T: DeserializeOwned>(&self, relative: &Path) -> anyhow::Result<Vec<T>> {
         let directory = self.checked_path(relative)?;
         if !directory.exists() {
             return Ok(Vec::new());

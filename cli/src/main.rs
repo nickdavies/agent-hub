@@ -1,17 +1,27 @@
+mod attended;
 mod build;
 mod client;
+mod local;
+mod local_authorize;
 mod review;
+mod state;
 mod validate;
 mod workflows;
+
+#[cfg(test)]
+mod attended_state_tests;
+#[cfg(test)]
+mod local_tests;
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use agent_hub::attended::{self, AuthorizationSelectors, ProposalInput};
-use agent_hub::local::{RequestedContextRoot, RequestedWorkspace, WorkspaceAccess};
-use agent_hub::state::StateStore;
 use clap::{Parser, Subcommand};
 use protocol::NetworkResourceKind;
+
+use crate::attended::{AuthorizationSelectors, ProposalInput};
+use crate::local::{RequestedContextRoot, RequestedWorkspace, WorkspaceAccess};
+use crate::state::StateStore;
 
 #[derive(Parser)]
 #[command(name = "agent-hub", version, about = "Agent Hub CLI")]
@@ -311,7 +321,7 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             authorization,
             digest,
         } => {
-            attended::authorize_revalidated(
+            local_authorize::authorize(
                 &state_store()?,
                 &authorization,
                 AuthorizationSelectors {

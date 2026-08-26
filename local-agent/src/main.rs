@@ -515,7 +515,12 @@ impl OperationJournal {
                 OPERATION_JOURNAL_QUARANTINE,
                 &serde_json::json!({"reason":"invalid_transition"}),
             )?;
-            return Err(error);
+            return Err(error).with_context(|| {
+                format!(
+                    "append operation {} {:?} at {:?}",
+                    candidate.operation_kind, candidate.status, candidate.lifecycle_phase
+                )
+            });
         }
         append_durable_json_line(&self.root, OPERATION_JOURNAL_FILE, &candidate)?;
         state.next_sequence = state
@@ -565,6 +570,37 @@ impl OperationJournal {
             .records
             .iter()
             .any(|record| record.operation_kind == operation_kind)
+    }
+
+    fn has_reconciled_linked_helper(
+        &self,
+        parent_operation_id: uuid::Uuid,
+        helper_kind: &str,
+    ) -> anyhow::Result<bool> {
+        let records = self
+            .state
+            .lock()
+            .expect("operation journal lock poisoned")
+            .records
+            .clone();
+        let mut latest = std::collections::BTreeMap::new();
+        for record in &records {
+            latest.insert(record.operation_id, record);
+        }
+        for record in records
+            .iter()
+            .filter(|record| record.operation_kind == helper_kind)
+        {
+            let linked = parse_linked_helper_identity(&record.resource_identity)?;
+            if linked.parent_operation_id == parent_operation_id
+                && latest
+                    .get(&record.operation_id)
+                    .is_some_and(|latest| latest.status == ExternalOperationStatus::Reconciled)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn has_unresolved_operation_kind(&self, operation_kind: &str) -> anyhow::Result<bool> {
@@ -635,44 +671,115 @@ impl OperationJournal {
 }
 
 fn classify_external_operation(kind: &str) -> anyhow::Result<ExternalOperationClass> {
-    if kind.starts_with("terminal_report") || kind.starts_with("terminal_event_") {
-        return Ok(ExternalOperationClass::TerminalReporting);
-    }
-    if is_cleanup_operation_kind(kind) {
-        return Ok(ExternalOperationClass::Cleanup);
-    }
-    let reviewed = [
-        "workspace_",
-        "credential_",
-        "bundle_",
-        "environment_bundle_",
-        "docker_",
-        "container_",
-        "create_",
-        "github_",
-        "managed_github_",
-        "mcp_",
-        "process_",
-        "output_",
-        "artifact_",
-        "authority_",
-        "runtime_",
-        "model_",
-        "transcript_",
-        "repo_",
-        "recovery_",
-        "resolved_image_",
-        "event_",
-        "helper_process",
-        "external_request_",
-        "producer_",
-        "late_producer",
-    ];
-    anyhow::ensure!(
-        reviewed.iter().any(|prefix| kind.starts_with(prefix)),
-        "external operation kind has no reviewed class: {kind}"
-    );
-    Ok(ExternalOperationClass::PreCleanupProducer)
+    let class = match kind {
+        "terminal_report"
+        | "terminal_report_rebind"
+        | "terminal_event_stream_publish"
+        | "terminal_event_transcript_append" => ExternalOperationClass::TerminalReporting,
+        "workspace_worktree_remove"
+        | "workspace_branch_remove"
+        | "workspace_stale_remove"
+        | "workspace_remove"
+        | "workspace_git_inspect"
+        | "workspace_agent_context_remove"
+        | "cleanup_failure_marker_write"
+        | "credential_temp_file_remove"
+        | "bundle_state_remove"
+        | "runtime_state_remove"
+        | "runtime_attempt_remove"
+        | "runtime_attempt_reconcile_remove"
+        | "docker_inspect_request"
+        | "docker_rm_request"
+        | "docker_opencode_version_inspect"
+        | "docker_create_marker_remove"
+        | "github_askpass_remove"
+        | "mcp_stale_socket_remove"
+        | "mcp_socket_remove"
+        | "output_redaction_marker_remove"
+        | "output_redaction_artifact_write"
+        | "output_redaction_marker_write"
+        | "output_redaction_temporary_write"
+        | "output_redaction_replace"
+        | "output_redaction_cleanup"
+        | "output_invalid_remove"
+        | "cleanup_event_stream_publish"
+        | "cleanup_event_transcript_append"
+        | "recovery_workspace_branch_remove"
+        | "recovery_workspace_branch_inspect"
+        | "recovery_helper_process"
+        | "recovery_docker_helper_process"
+        | "recovery_docker_inspect_request"
+        | "recovery_docker_list_request"
+        | "recovery_docker_rm_request" => ExternalOperationClass::Cleanup,
+        "workspace_create"
+        | "workspace_repos_root_create"
+        | "workspace_worktrees_root_create"
+        | "workspace_repo_mirror_root_create"
+        | "workspace_mirror_refresh_stamp_write"
+        | "workspace_worktree_create"
+        | "workspace_git_mutation"
+        | "workspace_git_init"
+        | "workspace_agent_context_copy"
+        | "credential_materialize"
+        | "credential_secret_write"
+        | "credential_directory_create"
+        | "credential_command"
+        | "bundle_state_directory_create"
+        | "bundle_home_directory_create"
+        | "environment_bundle_materialize"
+        | "environment_bundle_digest_write"
+        | "container_identity_write"
+        | "container_ownership_write"
+        | "authority_directory_create"
+        | "docker_create_request"
+        | "docker_start_request"
+        | "docker_exec_request"
+        | "docker_logs_request"
+        | "docker_request"
+        | "docker_job_code_preflight"
+        | "docker_create_marker_write"
+        | "docker_create_marker_transition"
+        | "docker_mutation_helper_process"
+        | "docker_logs_helper_process"
+        | "github_askpass_create"
+        | "github_askpass_chmod"
+        | "github_askpass_use"
+        | "managed_github_operation"
+        | "managed_github_http_request"
+        | "managed_github_git_request"
+        | "managed_github_git_helper"
+        | "mcp_socket_directory_create"
+        | "mcp_socket_bind"
+        | "mcp_upstream_connect"
+        | "mcp_helper_spawn"
+        | "mcp_helper_process"
+        | "process_output_open"
+        | "process_stream_persist"
+        | "helper_process_spawn"
+        | "helper_process"
+        | "external_request_helper_process"
+        | "workspace_git_helper_process"
+        | "artifact_transcript_directory_create"
+        | "artifact_prompt_directory_create"
+        | "artifact_prompt_write"
+        | "artifact_context_write"
+        | "artifact_agent_context_write"
+        | "artifact_output_write"
+        | "artifact_stdout_write"
+        | "artifact_stderr_write"
+        | "artifact_transcript_write"
+        | "artifact_run_metadata_write"
+        | "artifact_resolved_image_write"
+        | "resolved_image_artifact_write"
+        | "event_stream_publish"
+        | "event_transcript_create"
+        | "event_transcript_append"
+        | "output_artifact_reset"
+        | "producer_reload_test"
+        | "late_producer" => ExternalOperationClass::PreCleanupProducer,
+        _ => anyhow::bail!("external operation kind has no reviewed class: {kind}"),
+    };
+    Ok(class)
 }
 
 fn operation_owns_reconcilable_resource(operation_kind: &str) -> bool {
@@ -701,6 +808,10 @@ fn validate_operation_record(record: &ExternalOperationRecord) -> anyhow::Result
     anyhow::ensure!(
         record.operation_kind.len() <= MAX_OPERATION_ERROR_CATEGORY_BYTES,
         "operation kind exceeds journal bound"
+    );
+    anyhow::ensure!(
+        record.operation_class == classify_external_operation(&record.operation_kind)?,
+        "operation journal class does not match exact persisted kind"
     );
     anyhow::ensure!(
         record.resource_identity.len() <= MAX_OPERATION_RESOURCE_BYTES,
@@ -904,6 +1015,10 @@ struct ExternalOperation<'a> {
 }
 
 impl ExternalOperation<'_> {
+    fn operation_id(&self) -> uuid::Uuid {
+        self.operation_id
+    }
+
     fn completed(mut self) -> anyhow::Result<()> {
         self.finish(ExternalOperationStatus::Completed, None)
     }
@@ -1430,29 +1545,6 @@ async fn ensure_cleanup_phase_after_reconciliation(
     }
 }
 
-fn is_cleanup_operation_kind(kind: &str) -> bool {
-    [
-        "cleanup",
-        "remove",
-        "delete",
-        "teardown",
-        "reconcile",
-        "inspect",
-        "stop",
-        "kill",
-        "redact",
-        "_rm_",
-        "unlink",
-        "close",
-        "release",
-        "shutdown",
-        "finalize",
-        "terminal_report",
-    ]
-    .iter()
-    .any(|token| kind.contains(token))
-}
-
 #[derive(Debug, Clone)]
 struct VerifiedContainmentAbsence {
     checked_at: chrono::DateTime<Utc>,
@@ -1622,25 +1714,72 @@ fn validate_operation_within_reconciliation_scope(
     scope: AttemptReconciliationScope,
     operation_kind: &str,
 ) -> anyhow::Result<()> {
-    let allowed = if operation_kind.starts_with("workspace_") {
+    let allowed = if is_attempt_workspace_removal_kind(operation_kind)
+        || is_attempt_workspace_evidence_kind(operation_kind)
+        || matches!(
+            operation_kind,
+            "workspace_branch_remove"
+                | "recovery_workspace_branch_remove"
+                | "recovery_workspace_branch_inspect"
+        ) {
         scope.workspace
-    } else if operation_kind.starts_with("credential_") {
+    } else if matches!(
+        operation_kind,
+        "credential_materialize"
+            | "credential_secret_write"
+            | "credential_directory_create"
+            | "credential_temp_file_remove"
+            | "credential_command"
+    ) {
         scope.credentials
-    } else if operation_kind.starts_with("bundle_")
-        || operation_kind.starts_with("environment_bundle_")
-        || operation_kind.starts_with("mcp_")
+    } else if is_attempt_owned_state_kind(operation_kind)
+        || is_attempt_mcp_resource_kind(operation_kind)
+        || matches!(
+            operation_kind,
+            "mcp_socket_directory_create"
+                | "mcp_upstream_connect"
+                | "mcp_helper_spawn"
+                | "authority_directory_create"
+                | "bundle_state_remove"
+        )
     {
         scope.bundle
-    } else if operation_kind.starts_with("docker_")
-        || operation_kind.starts_with("github_")
-        || operation_kind.ends_with("helper_process")
-        || operation_kind == "managed_github_operation"
+    } else if is_attempt_docker_resource_kind(operation_kind)
+        || is_attempt_process_helper_kind(operation_kind)
+        || matches!(
+            operation_kind,
+            "docker_create_marker_write"
+                | "docker_create_marker_transition"
+                | "docker_create_marker_remove"
+                | "github_askpass_create"
+                | "github_askpass_chmod"
+                | "github_askpass_remove"
+                | "github_askpass_use"
+                | "managed_github_operation"
+                | "managed_github_http_request"
+                | "managed_github_git_request"
+                | "runtime_state_remove"
+                | "runtime_attempt_remove"
+                | "runtime_attempt_reconcile_remove"
+                | "helper_process_spawn"
+        )
     {
         scope.runtime
-    } else if operation_kind.starts_with("terminal_report") {
+    } else if matches!(operation_kind, "terminal_report" | "terminal_report_rebind") {
         scope.terminal_report
-    } else {
+    } else if is_attempt_artifact_evidence_kind(operation_kind)
+        || matches!(
+            operation_kind,
+            "output_redaction_temporary_write"
+                | "process_stream_persist"
+                | "event_stream_publish"
+                | "cleanup_event_stream_publish"
+                | "terminal_event_stream_publish"
+        )
+    {
         true
+    } else {
+        anyhow::bail!("operation journal kind has no exact reconciliation scope")
     };
     anyhow::ensure!(
         allowed,
@@ -3598,10 +3737,16 @@ mod tests {
                 .unwrap()
                 .records
                 .clone();
+            let spawn_operation_id = records
+                .iter()
+                .find(|record| record.operation_kind == "helper_process_spawn")
+                .unwrap()
+                .operation_id;
             assert!(records.iter().any(|record| {
                 record.operation_kind == "helper_process"
                     && record.status == ExternalOperationStatus::Started
-                    && record.resource_identity.contains("pid=")
+                    && parse_linked_helper_identity(&record.resource_identity)
+                        .is_ok_and(|linked| linked.parent_operation_id == spawn_operation_id)
             }));
             assert!(records.iter().any(|record| {
                 record.operation_kind == "helper_process"
@@ -4074,6 +4219,63 @@ mod tests {
     }
 
     #[test]
+    fn spawn_recovery_requires_its_exact_linked_helper() {
+        let root =
+            std::env::temp_dir().join(format!("linked-helper-journal-{}", uuid::Uuid::new_v4()));
+        let journal =
+            OperationJournal::initialize(&root, uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 0)
+                .unwrap();
+        let older_spawn = uuid::Uuid::new_v4();
+        let newer_spawn = uuid::Uuid::new_v4();
+        let helper = uuid::Uuid::new_v4();
+        for spawn in [older_spawn, newer_spawn] {
+            journal
+                .append(
+                    spawn,
+                    "helper_process_spawn",
+                    AttemptPhase::Running,
+                    "spawn",
+                    ExternalOperationStatus::Started,
+                    None,
+                )
+                .unwrap();
+        }
+        let linked = linked_helper_resource(older_spawn, 1, 1, "boot", 1).unwrap();
+        journal
+            .append(
+                helper,
+                "helper_process",
+                AttemptPhase::Running,
+                &linked,
+                ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        journal
+            .append(
+                helper,
+                "helper_process",
+                AttemptPhase::Running,
+                &linked,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )
+            .unwrap();
+        assert!(
+            journal
+                .has_reconciled_linked_helper(older_spawn, "helper_process")
+                .unwrap()
+        );
+        assert!(
+            !journal
+                .has_reconciled_linked_helper(newer_spawn, "helper_process")
+                .unwrap()
+        );
+        assert!(parse_linked_helper_identity("pid=1;pgid=1;boot=old;start=1").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn operation_journal_reload_eliminates_split_in_memory_authority() {
         let root = std::env::temp_dir().join(format!("journal-reload-{}", uuid::Uuid::new_v4()));
         let assignment = uuid::Uuid::new_v4();
@@ -4493,7 +4695,7 @@ mod tests {
                 producers.push(std::thread::spawn(move || {
                     let operation = context
                         .begin_external_operation(
-                            &format!("producer_{index}"),
+                            "producer_reload_test",
                             &format!("resource-{index}"),
                         )
                         .unwrap();
@@ -4651,6 +4853,14 @@ mod tests {
             classify_external_operation("terminal_report").unwrap(),
             ExternalOperationClass::TerminalReporting
         );
+        for unreviewed in [
+            "future_remove_operation",
+            "future_stop_operation",
+            "future_close_operation",
+            "future_finalize_operation",
+        ] {
+            assert!(classify_external_operation(unreviewed).is_err());
+        }
         context.transition_cleanup().await.unwrap();
         assert!(
             context
@@ -5058,7 +5268,7 @@ mod tests {
         effects.hash(&mut hasher);
         assert_eq!(
             hasher.finish(),
-            16_318_665_444_239_385_555,
+            3_994_354_612_608_089_838,
             "external-effect source inventory changed; audit every changed helper and update the reviewed fingerprint"
         );
     }
@@ -9126,6 +9336,37 @@ mod opencode_job_state_tests {
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::watch;
 
+    fn append_unreviewed_operation(
+        journal: &super::OperationJournal,
+        operation_kind: &str,
+        resource_identity: &str,
+    ) {
+        let sequence = journal
+            .state
+            .lock()
+            .expect("operation journal lock poisoned")
+            .next_sequence;
+        super::append_durable_json_line(
+            &journal.root,
+            super::OPERATION_JOURNAL_FILE,
+            &super::ExternalOperationRecord {
+                sequence,
+                operation_id: uuid::Uuid::new_v4(),
+                assignment_id: journal.assignment_id,
+                job_id: journal.job_id,
+                attempt: journal.attempt,
+                operation_kind: operation_kind.to_string(),
+                operation_class: super::ExternalOperationClass::PreCleanupProducer,
+                lifecycle_phase: super::AttemptPhase::CleanupRunning,
+                resource_identity: resource_identity.to_string(),
+                status: super::ExternalOperationStatus::Started,
+                error_category: None,
+                recorded_at: Utc::now(),
+            },
+        )
+        .unwrap();
+    }
+
     struct FakeWallClock {
         wall_ms: AtomicU64,
         monotonic_base: Instant,
@@ -9344,6 +9585,7 @@ exit 0
             command,
             recovery_journal: None,
             execution_phase: None,
+            executor_effects: None,
             absence_quiescence: Duration::from_millis(100),
         }
     }
@@ -10111,6 +10353,7 @@ exit 0
             .cancellation
             .begin_external_operation("docker_create_request", &state.container_name)
             .unwrap();
+        let create_operation_id = create.operation_id();
         let labels = serde_json::to_string(
             &owner
                 .labels()
@@ -10136,14 +10379,14 @@ exit 0
             .cancellation
             .begin_external_operation(
                 "docker_mutation_helper_process",
-                &format!(
-                    "container={};pid={};pgid={};boot={};start={}",
-                    state.container_name,
+                &super::linked_helper_resource(
+                    create_operation_id,
                     identity.pid,
                     identity.pgid,
-                    identity.linux_boot_id,
-                    identity.proc_start_time_ticks
-                ),
+                    &identity.linux_boot_id,
+                    identity.proc_start_time_ticks,
+                )
+                .unwrap(),
             )
             .unwrap();
         drop(child);
@@ -10164,6 +10407,451 @@ exit 0
         );
         assert!(!target.exists());
         state.cleanup().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_recovery_requires_kind_specific_evidence_for_known_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-kind-specific-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for directory in [root.join("worktrees"), root.join("repos")] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let docker = fake_docker(&root);
+        let state =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+
+        let workspace = root.join("worktrees/recovery-owned");
+        std::fs::create_dir(&workspace).unwrap();
+        state
+            .cancellation
+            .begin_external_operation("workspace_create", &workspace.to_string_lossy())
+            .unwrap()
+            .completed()
+            .unwrap();
+        let credential = root.join("agent-hub-cred-recovery");
+        std::fs::write(&credential, "secret").unwrap();
+        state
+            .cancellation
+            .begin_external_operation("credential_materialize", &credential.to_string_lossy())
+            .unwrap()
+            .completed()
+            .unwrap();
+        let socket = state.root.join("recovery.sock");
+        std::fs::write(&socket, "socket-placeholder").unwrap();
+        state
+            .cancellation
+            .begin_external_operation("mcp_socket_bind", &socket.to_string_lossy())
+            .unwrap()
+            .completed()
+            .unwrap();
+        let artifact = state.root.join("recovery-artifact.json");
+        std::fs::write(&artifact, "{}").unwrap();
+        drop(
+            state
+                .cancellation
+                .begin_external_operation("artifact_output_write", &artifact.to_string_lossy())
+                .unwrap(),
+        );
+        state
+            .cancellation
+            .phase
+            .containment_failed(&anyhow::anyhow!("injected unknown startup effect"))
+            .unwrap();
+        let mut helper_command = tokio::process::Command::new("sleep");
+        helper_command.arg("30");
+        use std::os::unix::process::CommandExt as _;
+        helper_command.as_std_mut().process_group(0);
+        let helper = helper_command.spawn().unwrap();
+        let identity =
+            super::read_process_identity(i32::try_from(helper.id().unwrap()).unwrap()).unwrap();
+        let spawn = state
+            .cancellation
+            .begin_external_operation("helper_process_spawn", "linked-test-helper")
+            .unwrap();
+        let spawn_operation_id = spawn.operation_id();
+        drop(
+            state
+                .cancellation
+                .begin_external_operation(
+                    "helper_process",
+                    &super::linked_helper_resource(
+                        spawn_operation_id,
+                        identity.pid,
+                        identity.pgid,
+                        &identity.linux_boot_id,
+                        identity.proc_start_time_ticks,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+        );
+        drop(spawn);
+        drop(helper);
+        state
+            .cancellation
+            .phase
+            .containment_failed(&anyhow::anyhow!("injected startup recovery"))
+            .unwrap();
+
+        super::reconcile_operation_journals(&root.join("attempts"), &root, &docker)
+            .await
+            .unwrap();
+        state.cancellation.operations.reload_from_disk().unwrap();
+        assert!(
+            state
+                .cancellation
+                .operations
+                .unresolved()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!workspace.exists());
+        assert!(!credential.exists());
+        assert!(!socket.exists());
+        assert!(artifact.is_file());
+        state.retained.store(true, Ordering::Release);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_recovery_rejects_unknown_prefix_kind_without_reconciling_it() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-unknown-recovery-kind-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for directory in [root.join("worktrees"), root.join("repos")] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let docker = fake_docker(&root);
+        let state =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+        append_unreviewed_operation(
+            &state.cancellation.operations,
+            "artifact_future_unreviewed",
+            "future",
+        );
+        assert!(
+            super::reconcile_operation_journals(&root.join("attempts"), &root, &docker)
+                .await
+                .is_err()
+        );
+        assert!(state.cancellation.operations.reload_from_disk().is_err());
+        assert!(
+            std::fs::read_to_string(
+                state
+                    .cancellation
+                    .operations
+                    .root
+                    .join(super::OPERATION_JOURNAL_FILE)
+            )
+            .unwrap()
+            .contains("artifact_future_unreviewed")
+        );
+        state.retained.store(true, Ordering::Release);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_recovery_journal_rejects_unknown_kind_without_blanket_reconcile() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-unknown-cancellation-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for directory in [
+            root.join("attempts/reconciliation"),
+            root.join("worktrees"),
+            root.join("repos"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let journal = super::OperationJournal::initialize(
+            &root.join("attempts/reconciliation"),
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            0,
+        )
+        .unwrap();
+        append_unreviewed_operation(&journal, "recovery_future_unreviewed", "future");
+        assert!(
+            super::reconcile_cancellation_resources(
+                &root,
+                std::path::Path::new("."),
+                "installation",
+                "config",
+                "worker",
+                10,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            super::OperationJournal::initialize(
+                &root.join("attempts/reconciliation"),
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            std::fs::read_to_string(
+                root.join("attempts/reconciliation")
+                    .join(super::OPERATION_JOURNAL_FILE)
+            )
+            .unwrap()
+            .contains("recovery_future_unreviewed")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_reopens_executor_effects_and_settles_crashed_docker_helper() {
+        let root =
+            std::env::temp_dir().join(format!("startup-executor-effects-{}", uuid::Uuid::new_v4()));
+        let recovery_root = root.join("attempts/reconciliation");
+        let journal = Arc::new(
+            super::OperationJournal::initialize(
+                &recovery_root,
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                0,
+            )
+            .unwrap(),
+        );
+        let effects_root = super::startup_recovery_executor_effects_root(&recovery_root, &journal);
+        let effects = agent_hub_executor::ExecutionCancellationContext::new(
+            &effects_root,
+            agent_hub_executor::Cancellation::never(),
+        )
+        .unwrap();
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn().unwrap();
+        let identity =
+            super::read_process_identity(i32::try_from(child.id().unwrap()).unwrap()).unwrap();
+        effects
+            .begin_external_operation(
+                "docker_mutation_helper_process",
+                &format!(
+                    "pid={};pgid={};boot={};start={}",
+                    identity.pid,
+                    identity.pgid,
+                    identity.linux_boot_id,
+                    identity.proc_start_time_ticks
+                ),
+            )
+            .unwrap()
+            .completed()
+            .unwrap();
+        drop(effects);
+
+        let (_docker, recovered) = super::startup_recovery_docker(&recovery_root, journal)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        recovered.finalize().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn attempt_helper_recovery_continues_after_malformed_first_record() {
+        let root =
+            std::env::temp_dir().join(format!("attempt-helper-aggregate-{}", uuid::Uuid::new_v4()));
+        for directory in [root.join("worktrees"), root.join("repos")] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let docker = fake_docker(&root);
+        let state =
+            OpencodeJobState::prepare(&root, ownership(uuid::Uuid::new_v4()), &bundle(), &docker)
+                .await
+                .unwrap();
+        state
+            .cancellation
+            .phase
+            .containment_failed(&anyhow::anyhow!("injected helper recovery"))
+            .unwrap();
+        drop(
+            state
+                .cancellation
+                .begin_external_operation("helper_process", "malformed-linked-helper")
+                .unwrap(),
+        );
+        let spawn = state
+            .cancellation
+            .begin_external_operation("helper_process_spawn", "valid-helper")
+            .unwrap();
+        let spawn_id = spawn.operation_id();
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn().unwrap();
+        let identity =
+            super::read_process_identity(i32::try_from(child.id().unwrap()).unwrap()).unwrap();
+        drop(
+            state
+                .cancellation
+                .begin_external_operation(
+                    "helper_process",
+                    &super::linked_helper_resource(
+                        spawn_id,
+                        identity.pid,
+                        identity.pgid,
+                        &identity.linux_boot_id,
+                        identity.proc_start_time_ticks,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+        );
+        drop(spawn);
+        let error = super::reconcile_operation_journals(&root.join("attempts"), &root, &docker)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("attempt helper recovery failed"));
+        tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        state.cancellation.operations.reload_from_disk().unwrap();
+        let unresolved = state.cancellation.operations.unresolved().unwrap();
+        assert!(
+            unresolved
+                .iter()
+                .any(|record| record.resource_identity == "malformed-linked-helper")
+        );
+        assert!(!unresolved.iter().any(|record| {
+            record.operation_kind == "helper_process"
+                && super::parse_linked_helper_identity(&record.resource_identity)
+                    .is_ok_and(|linked| linked.parent_operation_id == spawn_id)
+        }));
+        state.retained.store(true, Ordering::Release);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn recovery_journal_helpers_aggregate_before_returning_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "recovery-helper-aggregate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for directory in [
+            root.join("attempts/reconciliation"),
+            root.join("worktrees"),
+            root.join("repos"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let recovery_root = root.join("attempts/reconciliation");
+        let journal = super::OperationJournal::initialize(
+            &recovery_root,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            0,
+        )
+        .unwrap();
+        let parent = uuid::Uuid::new_v4();
+        journal
+            .append(
+                parent,
+                "recovery_docker_inspect_request",
+                super::AttemptPhase::CleanupRunning,
+                "container",
+                super::ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        journal
+            .append(
+                uuid::Uuid::new_v4(),
+                "recovery_docker_helper_process",
+                super::AttemptPhase::CleanupRunning,
+                "malformed-recovery-helper",
+                super::ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        use std::os::unix::process::CommandExt as _;
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn().unwrap();
+        let identity =
+            super::read_process_identity(i32::try_from(child.id().unwrap()).unwrap()).unwrap();
+        let valid_helper = uuid::Uuid::new_v4();
+        journal
+            .append(
+                valid_helper,
+                "recovery_docker_helper_process",
+                super::AttemptPhase::CleanupRunning,
+                &super::linked_helper_resource(
+                    parent,
+                    identity.pid,
+                    identity.pgid,
+                    &identity.linux_boot_id,
+                    identity.proc_start_time_ticks,
+                )
+                .unwrap(),
+                super::ExternalOperationStatus::Started,
+                None,
+            )
+            .unwrap();
+        let error = super::reconcile_cancellation_resources(
+            &root,
+            std::path::Path::new("."),
+            "installation",
+            "config",
+            "worker",
+            10,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("startup recovery helper settlement failed")
+        );
+        tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let journal = super::OperationJournal::initialize(
+            &recovery_root,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            0,
+        )
+        .unwrap();
+        let unresolved = journal.unresolved().unwrap();
+        assert!(
+            !unresolved
+                .iter()
+                .any(|record| record.operation_id == valid_helper)
+        );
+        assert!(
+            unresolved
+                .iter()
+                .any(|record| record.resource_identity == "malformed-recovery-helper")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -10290,7 +10978,7 @@ exit 0
                 owner,
                 &bundle(),
                 &docker,
-                Duration::from_millis(200),
+                Duration::from_millis(500),
                 clock_trait,
             )
             .await;
@@ -12670,6 +13358,7 @@ impl GitCommandRunner for TokioGitCommandRunner {
             "managed_github_git_request",
             &request.workspace.to_string_lossy(),
         )?;
+        let operation_id = operation.operation_id();
         let mut command = tokio::process::Command::new("git");
         command
             .arg("-C")
@@ -12687,10 +13376,13 @@ impl GitCommandRunner for TokioGitCommandRunner {
         let identity = read_process_identity(pid)?;
         let helper = self.cancellation.begin_external_operation(
             "managed_github_git_helper",
-            &format!(
-                "pid={};pgid={};boot={};start={}",
-                identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
-            ),
+            &linked_helper_resource(
+                operation_id,
+                identity.pid,
+                identity.pgid,
+                &identity.linux_boot_id,
+                identity.proc_start_time_ticks,
+            )?,
         )?;
         let output = child.wait_with_output().await?;
         verify_process_group_absent(&identity).await?;
@@ -14744,6 +15436,7 @@ struct DockerCli {
     command: PathBuf,
     recovery_journal: Option<Arc<OperationJournal>>,
     execution_phase: Option<Arc<AttemptPhaseStore>>,
+    executor_effects: Option<agent_hub_executor::ExecutionCancellationContext>,
     absence_quiescence: Duration,
 }
 
@@ -14753,6 +15446,7 @@ impl DockerCli {
             command: PathBuf::from("docker"),
             recovery_journal: None,
             execution_phase: None,
+            executor_effects: None,
             absence_quiescence: DOCKER_ABSENCE_QUIESCENCE,
         }
     }
@@ -14765,6 +15459,15 @@ impl DockerCli {
     fn with_execution_context(mut self, cancellation: &ExecutionCancellationContext) -> Self {
         self.recovery_journal = Some(Arc::clone(&cancellation.operations));
         self.execution_phase = Some(Arc::clone(&cancellation.phase));
+        self.executor_effects = Some(cancellation.effects.clone());
+        self
+    }
+
+    fn with_executor_effects(
+        mut self,
+        effects: agent_hub_executor::ExecutionCancellationContext,
+    ) -> Self {
+        self.executor_effects = Some(effects);
         self
     }
 
@@ -14833,10 +15536,15 @@ impl DockerCli {
             .and_then(|pid| i32::try_from(pid).ok())
             .context("Docker inspect helper has no valid PID")?;
         let identity = read_process_identity(pid)?;
-        let helper_resource = format!(
-            "pid={};pgid={};boot={};start={}",
-            identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
-        );
+        let helper_resource = linked_helper_resource(
+            operation
+                .map(|(operation_id, _)| operation_id)
+                .unwrap_or_default(),
+            identity.pid,
+            identity.pgid,
+            &identity.linux_boot_id,
+            identity.proc_start_time_ticks,
+        )?;
         let helper =
             self.begin_recovery_operation("recovery_docker_helper_process", &helper_resource)?;
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
@@ -14917,163 +15625,19 @@ impl DockerCli {
         ownership: &ContainerOwnership,
         deadline: Instant,
     ) -> anyhow::Result<()> {
-        let mut errors = Vec::new();
-        let mut absent_since = None;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!(
-                    "could not prove container '{name}' absent before reconciliation deadline: {}",
-                    errors.join("; ")
-                );
-            }
-            match self
-                .inspect_named_container(name, remaining.min(Duration::from_secs(10)))
-                .await
-            {
-                Ok(None) => {
-                    let observed_at = Instant::now();
-                    let first_absence = absent_since.get_or_insert(observed_at);
-                    if observed_at.duration_since(*first_absence) >= self.absence_quiescence {
-                        return Ok(());
-                    }
-                    let remaining = deadline.saturating_duration_since(observed_at);
-                    let needed = self
-                        .absence_quiescence
-                        .saturating_sub(observed_at.duration_since(*first_absence));
-                    anyhow::ensure!(
-                        remaining >= needed,
-                        "could not prove container '{name}' absent through the required quiescence interval"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50).min(needed).min(remaining)).await;
-                    continue;
-                }
-                Ok(Some(actual)) if actual == *ownership => {
-                    absent_since = None;
-                }
-                Ok(Some(actual)) => anyhow::bail!(
-                    "refusing to reconcile container '{name}' with mismatched ownership: {actual:?}"
-                ),
-                Err(error) => {
-                    absent_since = None;
-                    errors.push(format!("inspect: {error:#}"));
-                }
-            }
-
-            let mut remove = tokio::process::Command::new(&self.command);
-            remove
-                .args(["rm", "-f", "-v", name])
-                .kill_on_drop(true)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            #[cfg(unix)]
-            remove.as_std_mut().process_group(0);
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let remove_kind = "recovery_docker_rm_request";
-            let remove_operation = self.begin_recovery_operation(remove_kind, name)?;
-            let remove_child = remove.spawn().context("spawn Docker remove request")?;
-            let remove_pid = remove_child
-                .id()
-                .and_then(|pid| i32::try_from(pid).ok())
-                .context("Docker remove helper has no valid PID")?;
-            let remove_identity = read_process_identity(remove_pid)?;
-            let helper_resource = format!(
-                "pid={};pgid={};boot={};start={}",
-                remove_identity.pid,
-                remove_identity.pgid,
-                remove_identity.linux_boot_id,
-                remove_identity.proc_start_time_ticks
-            );
-            let helper =
-                self.begin_recovery_operation("recovery_docker_helper_process", &helper_resource)?;
-            let remove_result = tokio::time::timeout(
-                remaining.min(Duration::from_secs(10)),
-                remove_child.wait_with_output(),
-            )
-            .await;
-            if remove_result.is_ok() {
-                verify_process_group_absent(&remove_identity).await?;
-                self.finish_recovery_operation(
-                    helper,
-                    "recovery_docker_helper_process",
-                    &helper_resource,
-                    ExternalOperationStatus::Reconciled,
-                    None,
-                )?;
-            }
-            match remove_result {
-                Ok(Ok(output)) if output.status.success() => {
-                    self.finish_recovery_operation(
-                        remove_operation,
-                        remove_kind,
-                        name,
-                        ExternalOperationStatus::Completed,
-                        None,
-                    )?;
-                }
-                Ok(Ok(output)) => {
-                    self.finish_recovery_operation(
-                        remove_operation,
-                        remove_kind,
-                        name,
-                        ExternalOperationStatus::Completed,
-                        None,
-                    )?;
-                    errors.push(format!(
-                        "remove: {}: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ));
-                }
-                Ok(Err(error)) => {
-                    self.finish_recovery_operation(
-                        remove_operation,
-                        remove_kind,
-                        name,
-                        ExternalOperationStatus::Ambiguous,
-                        Some("recovery_docker_rm_io_failed"),
-                    )?;
-                    errors.push(format!("remove: {error}"));
-                }
-                Err(_) => {
-                    self.finish_recovery_operation(
-                        remove_operation,
-                        remove_kind,
-                        name,
-                        ExternalOperationStatus::Ambiguous,
-                        Some("recovery_docker_rm_timeout"),
-                    )?;
-                    errors.push("remove: timed out".to_string());
-                }
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match self
-                .inspect_named_container(name, remaining.min(Duration::from_secs(10)))
-                .await
-            {
-                Ok(None) => {
-                    errors.push("container absent after remove; verifying absence".to_string());
-                    continue;
-                }
-                Ok(Some(actual)) if actual == *ownership => {
-                    errors.push("reinspect: owned container still exists".to_string())
-                }
-                Ok(Some(actual)) => anyhow::bail!(
-                    "container '{name}' ownership changed during reconciliation: {actual:?}"
-                ),
-                Err(error) => {
-                    errors.push(format!("reinspect: {error:#}"));
-                }
-            }
-            if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "could not prove container '{name}' absent before reconciliation deadline: {}",
-                    errors.join("; ")
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "container reconciliation deadline expired"
+        );
+        let mut docker = agent_hub_executor::DockerCli::new(&self.command)
+            .with_absence_quiescence(self.absence_quiescence);
+        if let Some(effects) = &self.executor_effects {
+            docker = docker.with_effects(effects.clone());
         }
+        docker
+            .remove_owned(name, &ownership.executor_identity()?, remaining)
+            .await
     }
 
     async fn reconcile_quarantined_create(
@@ -15131,10 +15695,15 @@ impl DockerCli {
             .and_then(|pid| i32::try_from(pid).ok())
             .context("Docker listing helper has no valid PID")?;
         let identity = read_process_identity(pid)?;
-        let helper_resource = format!(
-            "pid={};pgid={};boot={};start={}",
-            identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
-        );
+        let helper_resource = linked_helper_resource(
+            operation
+                .map(|(operation_id, _)| operation_id)
+                .unwrap_or_default(),
+            identity.pid,
+            identity.pgid,
+            &identity.linux_boot_id,
+            identity.proc_start_time_ticks,
+        )?;
         let helper =
             self.begin_recovery_operation("recovery_docker_helper_process", &helper_resource)?;
         let stdout = child
@@ -15629,6 +16198,7 @@ async fn run_before_deadline_with_budget(
     command.as_std_mut().process_group(0);
     let budget = maximum_budget.map_or(remaining, |maximum| remaining.min(maximum));
     let journal = cancellation.begin_external_operation(operation_kind, resource_identity)?;
+    let journal_operation_id = journal.operation_id();
     let child = command
         .spawn()
         .with_context(|| format!("failed to execute {operation}"))?;
@@ -15644,10 +16214,13 @@ async fn run_before_deadline_with_budget(
     };
     let helper = cancellation.begin_external_operation(
         helper_kind,
-        &format!(
-            "pid={};pgid={};boot={};start={}",
-            identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
-        ),
+        &linked_helper_resource(
+            journal_operation_id,
+            identity.pid,
+            identity.pgid,
+            &identity.linux_boot_id,
+            identity.proc_start_time_ticks,
+        )?,
     )?;
     let result = tokio::time::timeout(budget, child.wait_with_output())
         .await
@@ -16063,6 +16636,31 @@ struct PersistedProcessIdentity {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkedHelperProcessIdentity {
+    parent_operation_id: uuid::Uuid,
+    process: PersistedProcessIdentity,
+}
+
+fn linked_helper_resource(
+    parent_operation_id: uuid::Uuid,
+    pid: i32,
+    pgid: i32,
+    linux_boot_id: &str,
+    proc_start_time_ticks: u64,
+) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&LinkedHelperProcessIdentity {
+        parent_operation_id,
+        process: PersistedProcessIdentity {
+            pid,
+            pgid,
+            linux_boot_id: linux_boot_id.to_string(),
+            proc_start_time_ticks,
+        },
+    })?)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedProcessRecord {
     phase: PersistedProcessPhase,
     command: String,
@@ -16383,29 +16981,13 @@ async fn reconcile_persisted_process_records(attempts_root: &Path) -> anyhow::Re
     Ok(())
 }
 
+fn parse_linked_helper_identity(resource: &str) -> anyhow::Result<LinkedHelperProcessIdentity> {
+    serde_json::from_str(resource)
+        .context("journal helper identity lacks exact parent operation linkage")
+}
+
 fn parse_journal_process_identity(resource: &str) -> anyhow::Result<PersistedProcessIdentity> {
-    let fields = resource
-        .split(';')
-        .filter_map(|field| field.split_once('='))
-        .collect::<HashMap<_, _>>();
-    Ok(PersistedProcessIdentity {
-        pid: fields
-            .get("pid")
-            .context("journal helper PID is missing")?
-            .parse()?,
-        pgid: fields
-            .get("pgid")
-            .context("journal helper process group is missing")?
-            .parse()?,
-        linux_boot_id: fields
-            .get("boot")
-            .context("journal helper boot identity is missing")?
-            .to_string(),
-        proc_start_time_ticks: fields
-            .get("start")
-            .context("journal helper start identity is missing")?
-            .parse()?,
-    })
+    Ok(parse_linked_helper_identity(resource)?.process)
 }
 
 async fn run_recovery_process(
@@ -16436,10 +17018,13 @@ async fn run_recovery_process(
         .and_then(|pid| i32::try_from(pid).ok())
         .context("recovery helper has no valid PID")?;
     let identity = read_process_identity(pid)?;
-    let helper_resource = format!(
-        "pid={};pgid={};boot={};start={}",
-        identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
-    );
+    let helper_resource = linked_helper_resource(
+        operation_id,
+        identity.pid,
+        identity.pgid,
+        &identity.linux_boot_id,
+        identity.proc_start_time_ticks,
+    )?;
     let helper_id = uuid::Uuid::new_v4();
     journal.append(
         helper_id,
@@ -16493,6 +17078,167 @@ async fn run_recovery_process(
         None,
     )?;
     Ok(output)
+}
+
+fn is_attempt_process_helper_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "helper_process"
+            | "docker_mutation_helper_process"
+            | "external_request_helper_process"
+            | "docker_logs_helper_process"
+            | "workspace_git_helper_process"
+            | "mcp_helper_process"
+            | "recovery_helper_process"
+            | "managed_github_git_helper"
+    )
+}
+
+fn is_attempt_docker_resource_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "docker_create_request"
+            | "docker_start_request"
+            | "docker_exec_request"
+            | "docker_inspect_request"
+            | "docker_logs_request"
+            | "docker_rm_request"
+            | "docker_request"
+            | "docker_opencode_version_inspect"
+            | "docker_job_code_preflight"
+    )
+}
+
+fn is_attempt_workspace_removal_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "workspace_create"
+            | "workspace_worktree_create"
+            | "workspace_worktree_remove"
+            | "workspace_stale_remove"
+            | "workspace_remove"
+    )
+}
+
+fn is_attempt_workspace_evidence_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "workspace_repos_root_create"
+            | "workspace_worktrees_root_create"
+            | "workspace_repo_mirror_root_create"
+            | "workspace_mirror_refresh_stamp_write"
+            | "workspace_git_mutation"
+            | "workspace_git_inspect"
+            | "workspace_git_init"
+            | "workspace_agent_context_copy"
+            | "workspace_agent_context_remove"
+    )
+}
+
+fn is_attempt_credential_resource_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "credential_materialize"
+            | "credential_secret_write"
+            | "credential_directory_create"
+            | "credential_temp_file_remove"
+            | "github_askpass_create"
+            | "github_askpass_chmod"
+            | "github_askpass_remove"
+            | "github_askpass_use"
+    )
+}
+
+fn is_attempt_mcp_resource_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "mcp_stale_socket_remove" | "mcp_socket_bind" | "mcp_socket_remove"
+    )
+}
+
+fn is_attempt_owned_state_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "authority_directory_create"
+            | "bundle_state_directory_create"
+            | "bundle_home_directory_create"
+            | "environment_bundle_materialize"
+            | "environment_bundle_digest_write"
+            | "container_identity_write"
+            | "container_ownership_write"
+    )
+}
+
+fn is_attempt_artifact_evidence_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "artifact_transcript_directory_create"
+            | "artifact_prompt_directory_create"
+            | "artifact_prompt_write"
+            | "artifact_context_write"
+            | "artifact_agent_context_write"
+            | "artifact_output_write"
+            | "artifact_stdout_write"
+            | "artifact_stderr_write"
+            | "artifact_transcript_write"
+            | "artifact_run_metadata_write"
+            | "artifact_resolved_image_write"
+            | "event_stream_publish"
+            | "cleanup_event_stream_publish"
+            | "terminal_event_stream_publish"
+            | "event_transcript_create"
+            | "event_transcript_append"
+            | "cleanup_event_transcript_append"
+            | "terminal_event_transcript_append"
+            | "output_artifact_reset"
+            | "cleanup_failure_marker_write"
+            | "output_redaction_marker_remove"
+            | "output_redaction_artifact_write"
+            | "output_redaction_marker_write"
+            | "output_invalid_remove"
+            | "output_redaction_replace"
+            | "output_redaction_cleanup"
+            | "process_output_open"
+            | "resolved_image_artifact_write"
+    )
+}
+
+fn is_known_attempt_recovery_kind(kind: &str) -> bool {
+    is_attempt_process_helper_kind(kind)
+        || is_attempt_docker_resource_kind(kind)
+        || is_attempt_workspace_removal_kind(kind)
+        || is_attempt_workspace_evidence_kind(kind)
+        || is_attempt_credential_resource_kind(kind)
+        || is_attempt_mcp_resource_kind(kind)
+        || is_attempt_owned_state_kind(kind)
+        || is_attempt_artifact_evidence_kind(kind)
+        || matches!(
+            kind,
+            "docker_create_marker_write"
+                | "docker_create_marker_transition"
+                | "docker_create_marker_remove"
+                | "workspace_branch_remove"
+                | "recovery_workspace_branch_remove"
+                | "recovery_workspace_branch_inspect"
+                | "mcp_socket_directory_create"
+                | "mcp_upstream_connect"
+                | "mcp_helper_spawn"
+                | "helper_process_spawn"
+                | "output_redaction_temporary_write"
+                | "process_stream_persist"
+                | "event_stream_publish"
+                | "cleanup_event_stream_publish"
+                | "terminal_event_stream_publish"
+                | "managed_github_operation"
+                | "managed_github_http_request"
+                | "managed_github_git_request"
+                | "bundle_state_remove"
+                | "runtime_state_remove"
+                | "runtime_attempt_remove"
+                | "runtime_attempt_reconcile_remove"
+                | "terminal_report"
+                | "terminal_report_rebind"
+        )
 }
 
 async fn reconcile_operation_journals(
@@ -16554,22 +17300,42 @@ async fn reconcile_operation_journals(
         );
         let scope = reconciliation_scope(phase.phase);
         let mutation_helper_kind = "docker_mutation_helper_process";
+        let mut helper_failures = Vec::new();
         for helper in journal
             .unresolved()?
             .into_iter()
-            .filter(|record| record.operation_kind == mutation_helper_kind)
+            .filter(|record| is_attempt_process_helper_kind(&record.operation_kind))
         {
-            let identity = parse_journal_process_identity(&helper.resource_identity)?;
-            wait_for_persisted_process_absence(&identity, CREATE_COMMAND_MAX_BUDGET).await?;
-            journal.append(
-                helper.operation_id,
-                &helper.operation_kind,
-                helper.lifecycle_phase,
-                &helper.resource_identity,
-                ExternalOperationStatus::Reconciled,
-                None,
-            )?;
+            let result = async {
+                let identity = parse_journal_process_identity(&helper.resource_identity)?;
+                if helper.operation_kind == mutation_helper_kind {
+                    wait_for_persisted_process_absence(&identity, CREATE_COMMAND_MAX_BUDGET)
+                        .await?;
+                } else {
+                    terminate_persisted_process(&identity).await?;
+                }
+                journal.append(
+                    helper.operation_id,
+                    &helper.operation_kind,
+                    helper.lifecycle_phase,
+                    &helper.resource_identity,
+                    ExternalOperationStatus::Reconciled,
+                    None,
+                )
+            }
+            .await;
+            if let Err(error) = result {
+                helper_failures.push(format!(
+                    "{} {}: {error:#}",
+                    helper.operation_kind, helper.operation_id
+                ));
+            }
         }
+        anyhow::ensure!(
+            helper_failures.is_empty(),
+            "attempt helper recovery failed: {}",
+            helper_failures.join("; ")
+        );
         let mutation_helper_recorded = journal.has_operation_kind(mutation_helper_kind);
         for unresolved in journal.unresolved()? {
             anyhow::ensure!(
@@ -16577,9 +17343,14 @@ async fn reconcile_operation_journals(
                     || unresolved.lifecycle_phase.rank() <= phase.phase.rank(),
                 "operation journal lifecycle phase exceeds durable attempt phase"
             );
+            anyhow::ensure!(
+                is_known_attempt_recovery_kind(&unresolved.operation_kind),
+                "unsupported unresolved external operation '{}' requires containment_failed",
+                unresolved.operation_kind
+            );
             validate_operation_within_reconciliation_scope(scope, &unresolved.operation_kind)?;
             match unresolved.operation_kind.as_str() {
-                kind if kind.ends_with("helper_process") => {
+                kind if is_attempt_process_helper_kind(kind) => {
                     let identity = parse_journal_process_identity(&unresolved.resource_identity)?;
                     terminate_persisted_process(&identity).await?;
                 }
@@ -16646,7 +17417,7 @@ async fn reconcile_operation_journals(
                         "workspace branch absence was not proven"
                     );
                 }
-                kind if kind.starts_with("docker_") => {
+                kind if is_attempt_docker_resource_kind(kind) => {
                     if kind == "docker_create_request" && !mutation_helper_recorded {
                         for state_root in [root.join("opencode"), root.join("docker")] {
                             let marker_path = state_root.join(AMBIGUOUS_CREATE_MARKER);
@@ -16712,7 +17483,7 @@ async fn reconcile_operation_journals(
                         }
                     }
                 }
-                kind if kind.starts_with("workspace_") => {
+                kind if is_attempt_workspace_removal_kind(kind) => {
                     let path = PathBuf::from(&unresolved.resource_identity);
                     if path.exists() {
                         let canonical = std::fs::canonicalize(&path)?;
@@ -16723,7 +17494,25 @@ async fn reconcile_operation_journals(
                         std::fs::remove_dir_all(&canonical)?;
                     }
                 }
-                kind if kind.starts_with("credential_") || kind.starts_with("github_askpass_") => {
+                kind if is_attempt_workspace_evidence_kind(kind) => {
+                    for raw_path in unresolved
+                        .resource_identity
+                        .split("->")
+                        .flat_map(|part| part.split(';'))
+                    {
+                        let path = PathBuf::from(raw_path);
+                        if path.exists() {
+                            let canonical = std::fs::canonicalize(path)?;
+                            anyhow::ensure!(
+                                canonical.starts_with(&worktrees_root)
+                                    || canonical.starts_with(&repos_root)
+                                    || canonical.starts_with(&data_root),
+                                "workspace recovery evidence is outside owned roots"
+                            );
+                        }
+                    }
+                }
+                kind if is_attempt_credential_resource_kind(kind) => {
                     let path = PathBuf::from(&unresolved.resource_identity);
                     if path.exists() {
                         let metadata = std::fs::symlink_metadata(&path)?;
@@ -16750,7 +17539,7 @@ async fn reconcile_operation_journals(
                         }
                     }
                 }
-                kind if kind.starts_with("mcp_") => {
+                kind if is_attempt_mcp_resource_kind(kind) => {
                     let path = PathBuf::from(&unresolved.resource_identity);
                     if path.exists() {
                         let canonical = std::fs::canonicalize(&path)?;
@@ -16761,10 +17550,37 @@ async fn reconcile_operation_journals(
                         std::fs::remove_file(canonical)?;
                     }
                 }
-                kind if kind.starts_with("bundle_")
-                    || kind.starts_with("environment_bundle_")
-                    || kind.starts_with("container_") =>
-                {
+                "mcp_socket_directory_create" => {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let canonical = std::fs::canonicalize(&path)?;
+                        anyhow::ensure!(
+                            canonical.starts_with(&data_root),
+                            "unresolved MCP directory is outside the worker data root"
+                        );
+                        std::fs::remove_dir_all(canonical)?;
+                    }
+                }
+                "mcp_upstream_connect" => {}
+                "mcp_helper_spawn" => {
+                    anyhow::ensure!(
+                        journal.has_reconciled_linked_helper(
+                            unresolved.operation_id,
+                            "mcp_helper_process",
+                        )?,
+                        "MCP helper spawn has no matching reconciled process identity"
+                    );
+                }
+                "helper_process_spawn" => {
+                    anyhow::ensure!(
+                        journal.has_reconciled_linked_helper(
+                            unresolved.operation_id,
+                            "helper_process",
+                        )?,
+                        "helper spawn has no matching reconciled process identity"
+                    );
+                }
+                kind if is_attempt_owned_state_kind(kind) => {
                     let path = PathBuf::from(&unresolved.resource_identity);
                     if path.exists() {
                         let metadata = std::fs::symlink_metadata(&path)?;
@@ -16778,6 +17594,27 @@ async fn reconcile_operation_journals(
                             "owned bundle/container state is outside the worker data root"
                         );
                     }
+                }
+                "bundle_state_remove" | "runtime_state_remove" | "runtime_attempt_remove" => {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let canonical = std::fs::canonicalize(&path)?;
+                        anyhow::ensure!(
+                            canonical.starts_with(&data_root),
+                            "owned runtime removal escaped worker data root"
+                        );
+                        let metadata = std::fs::symlink_metadata(&canonical)?;
+                        anyhow::ensure!(
+                            !metadata.file_type().is_symlink(),
+                            "owned runtime removal target is a symlink"
+                        );
+                        if metadata.is_dir() {
+                            std::fs::remove_dir_all(canonical)?;
+                        } else {
+                            std::fs::remove_file(canonical)?;
+                        }
+                    }
+                    anyhow::ensure!(!path.exists(), "owned runtime removal target remains");
                 }
                 "output_redaction_temporary_write" => {
                     let path = PathBuf::from(&unresolved.resource_identity);
@@ -16795,20 +17632,36 @@ async fn reconcile_operation_journals(
                     for raw_path in unresolved.resource_identity.split(';') {
                         let path = PathBuf::from(raw_path);
                         if path.exists() {
-                            let metadata = std::fs::symlink_metadata(path)?;
+                            let metadata = std::fs::symlink_metadata(&path)?;
                             anyhow::ensure!(
                                 metadata.is_file() && !metadata.file_type().is_symlink(),
                                 "process stream evidence is not a regular file"
                             );
+                            let canonical = std::fs::canonicalize(&path)?;
+                            anyhow::ensure!(
+                                canonical.starts_with(&data_root),
+                                "process stream evidence escaped worker data root"
+                            );
                         }
                     }
                 }
-                kind if kind.starts_with("artifact_")
-                    || kind.starts_with("event_")
-                    || kind.starts_with("output_")
-                    || kind == "process_output_open"
-                    || kind == "resolved_image_artifact_write" =>
-                {
+                "event_stream_publish"
+                | "cleanup_event_stream_publish"
+                | "terminal_event_stream_publish" => {
+                    anyhow::bail!("unresolved event publication requires delivery replay")
+                }
+                "artifact_transcript_directory_create" | "artifact_prompt_directory_create" => {
+                    let path = PathBuf::from(&unresolved.resource_identity);
+                    if path.exists() {
+                        let canonical = std::fs::canonicalize(path)?;
+                        let attempt_root = std::fs::canonicalize(&root)?;
+                        anyhow::ensure!(
+                            canonical.is_dir() && canonical.starts_with(attempt_root),
+                            "artifact directory evidence escaped attempt root"
+                        );
+                    }
+                }
+                kind if is_attempt_artifact_evidence_kind(kind) => {
                     for raw_path in unresolved
                         .resource_identity
                         .split("->")
@@ -16821,10 +17674,27 @@ async fn reconcile_operation_journals(
                                 metadata.is_file() && !metadata.file_type().is_symlink(),
                                 "unresolved artifact evidence is not a regular file"
                             );
+                            let canonical = std::fs::canonicalize(&path)?;
+                            let attempt_root = std::fs::canonicalize(&root)?;
+                            anyhow::ensure!(
+                                canonical.starts_with(&attempt_root)
+                                    || canonical.starts_with(&data_root),
+                                "artifact evidence escaped owned roots"
+                            );
                         }
                     }
                 }
-                kind if kind.starts_with("terminal_report") => {}
+                "managed_github_operation"
+                | "managed_github_http_request"
+                | "managed_github_git_request" => anyhow::bail!(
+                    "unresolved managed GitHub operation requires idempotent action replay"
+                ),
+                "terminal_report" | "terminal_report_rebind" => {
+                    anyhow::ensure!(
+                        root.join("terminal-report.json").is_file(),
+                        "terminal reporting operation has no durable report evidence"
+                    );
+                }
                 _ => anyhow::bail!(
                     "unsupported unresolved external operation '{}' requires containment_failed",
                     unresolved.operation_kind
@@ -16848,6 +17718,31 @@ async fn reconcile_operation_journals(
         }
     }
     Ok(())
+}
+
+fn startup_recovery_executor_effects_root(
+    recovery_root: &Path,
+    journal: &OperationJournal,
+) -> PathBuf {
+    recovery_root.join("executor-effects").join(format!(
+        "assignment-{}-job-{}-attempt-{}",
+        journal.assignment_id, journal.job_id, journal.attempt
+    ))
+}
+
+async fn startup_recovery_docker(
+    recovery_root: &Path,
+    recovery_journal: Arc<OperationJournal>,
+) -> anyhow::Result<(DockerCli, agent_hub_executor::ExecutionCancellationContext)> {
+    let recovery_effects = agent_hub_executor::ExecutionCancellationContext::new(
+        &startup_recovery_executor_effects_root(recovery_root, &recovery_journal),
+        agent_hub_executor::Cancellation::never(),
+    )?;
+    recovery_effects.settle_process_helpers().await?;
+    let docker = DockerCli::production()
+        .with_recovery_journal(recovery_journal)
+        .with_executor_effects(recovery_effects.clone());
+    Ok((docker, recovery_effects))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16880,12 +17775,49 @@ async fn reconcile_cancellation_resources(
         uuid::Uuid::nil(),
         0,
     )?);
+    let (docker, recovery_effects) =
+        startup_recovery_docker(&recovery_root, Arc::clone(&recovery_journal)).await?;
     let previously_unresolved = recovery_journal.unresolved()?;
-    let docker = DockerCli::production().with_recovery_journal(Arc::clone(&recovery_journal));
-    for operation in &previously_unresolved {
-        if operation.operation_kind.ends_with("helper_process") {
+    let mut helper_failures = Vec::new();
+    for operation in previously_unresolved
+        .iter()
+        .filter(|operation| operation.operation_kind == "recovery_docker_helper_process")
+    {
+        let result = async {
             let identity = parse_journal_process_identity(&operation.resource_identity)?;
             terminate_persisted_process(&identity).await?;
+            recovery_journal.append(
+                operation.operation_id,
+                &operation.operation_kind,
+                operation.lifecycle_phase,
+                &operation.resource_identity,
+                ExternalOperationStatus::Reconciled,
+                None,
+            )
+        }
+        .await;
+        if let Err(error) = result {
+            helper_failures.push(format!(
+                "{} {}: {error:#}",
+                operation.operation_kind, operation.operation_id
+            ));
+        }
+    }
+    anyhow::ensure!(
+        helper_failures.is_empty(),
+        "startup recovery helper settlement failed: {}",
+        helper_failures.join("; ")
+    );
+    for operation in previously_unresolved
+        .iter()
+        .filter(|operation| operation.operation_kind != "recovery_docker_helper_process")
+    {
+        match operation.operation_kind.as_str() {
+            "recovery_docker_inspect_request"
+            | "recovery_docker_list_request"
+            | "recovery_docker_rm_request"
+            | "runtime_attempt_reconcile_remove" => {}
+            kind => anyhow::bail!("unsupported unresolved startup recovery operation '{kind}'"),
         }
     }
     reconcile_persisted_process_records(&attempts_root).await?;
@@ -16934,7 +17866,63 @@ async fn reconcile_cancellation_resources(
             )?;
         }
     }
+    let needs_list_proof = previously_unresolved
+        .iter()
+        .any(|operation| operation.operation_kind == "recovery_docker_list_request");
+    if needs_list_proof {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("startup recovery list-proof deadline overflow")?;
+        let remaining = docker
+            .list_owned_opencode_containers(
+                installation_id,
+                config_identity,
+                worker_id,
+                deadline,
+                max_items,
+                &SystemWallClock,
+            )
+            .await?;
+        anyhow::ensure!(
+            remaining.is_empty(),
+            "startup recovery list proof found owned containers"
+        );
+    }
+    recovery_effects.settle_process_helpers().await?;
+    recovery_effects.finalize()?;
     for operation in previously_unresolved {
+        match operation.operation_kind.as_str() {
+            "recovery_docker_helper_process" => continue,
+            "recovery_docker_inspect_request" | "recovery_docker_rm_request" => {
+                anyhow::ensure!(
+                    docker
+                        .inspect_named_container(
+                            &operation.resource_identity,
+                            STARTUP_RECONCILIATION_TIMEOUT,
+                        )
+                        .await?
+                        .is_none(),
+                    "startup recovery Docker resource remains"
+                );
+            }
+            "recovery_docker_list_request" => {}
+            "runtime_attempt_reconcile_remove" => {
+                let path = PathBuf::from(&operation.resource_identity);
+                anyhow::ensure!(
+                    path.parent() == Some(runtime_attempts.as_path())
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| uuid::Uuid::parse_str(name).is_ok()),
+                    "startup recovery runtime-attempt identity is invalid"
+                );
+                anyhow::ensure!(
+                    !path.exists(),
+                    "startup recovery runtime-attempt resource remains"
+                );
+            }
+            kind => anyhow::bail!("unsupported unresolved startup recovery operation '{kind}'"),
+        }
         recovery_journal.append(
             operation.operation_id,
             &operation.operation_kind,
@@ -17274,6 +18262,7 @@ async fn supervise_process_with_output_validation(
     )?;
     let spawn_operation = cancellation
         .begin_external_operation(process_operation_kind(job), &process_resource_identity(job))?;
+    let spawn_operation_id = spawn_operation.operation_id();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -17286,11 +18275,6 @@ async fn supervise_process_with_output_validation(
         }
     };
     let mut request_operation = Some(spawn_operation);
-    if job.command != "docker"
-        && let Some(operation) = request_operation.take()
-    {
-        operation.completed()?;
-    }
     let process_group_id = child
         .id()
         .and_then(|pid| i32::try_from(pid).ok())
@@ -17298,14 +18282,19 @@ async fn supervise_process_with_output_validation(
     let process_identity = read_process_identity(process_group_id)?;
     let helper_operation = cancellation.begin_external_operation(
         "helper_process",
-        &format!(
-            "pid={};pgid={};boot={};start={}",
+        &linked_helper_resource(
+            spawn_operation_id,
             process_identity.pid,
             process_identity.pgid,
-            process_identity.linux_boot_id,
-            process_identity.proc_start_time_ticks
-        ),
+            &process_identity.linux_boot_id,
+            process_identity.proc_start_time_ticks,
+        )?,
     )?;
+    if job.command != "docker"
+        && let Some(operation) = request_operation.take()
+    {
+        operation.completed()?;
+    }
     persist_process_record(
         &cancellation.phase.root,
         &PersistedProcessRecord {
@@ -17572,6 +18561,7 @@ async fn supervise_process_with_mode(
     )?;
     let spawn_operation = cancellation
         .begin_external_operation(process_operation_kind(job), &process_resource_identity(job))?;
+    let spawn_operation_id = spawn_operation.operation_id();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -17592,11 +18582,6 @@ async fn supervise_process_with_mode(
             .transition(AttemptPhase::DockerCreateSubmitted)?;
     }
     let mut request_operation = Some(spawn_operation);
-    if job.command != "docker"
-        && let Some(operation) = request_operation.take()
-    {
-        operation.completed()?;
-    }
     let process_group_id = child
         .id()
         .and_then(|pid| i32::try_from(pid).ok())
@@ -17609,14 +18594,19 @@ async fn supervise_process_with_mode(
     };
     let helper_operation = cancellation.begin_external_operation(
         helper_kind,
-        &format!(
-            "pid={};pgid={};boot={};start={}",
+        &linked_helper_resource(
+            spawn_operation_id,
             process_identity.pid,
             process_identity.pgid,
-            process_identity.linux_boot_id,
-            process_identity.proc_start_time_ticks
-        ),
+            &process_identity.linux_boot_id,
+            process_identity.proc_start_time_ticks,
+        )?,
     )?;
+    if job.command != "docker"
+        && let Some(operation) = request_operation.take()
+    {
+        operation.completed()?;
+    }
     persist_process_record(
         &cancellation.phase.root,
         &PersistedProcessRecord {
@@ -18852,6 +19842,7 @@ async fn spawn_opencode_runtime_container(
     create.as_std_mut().process_group(0);
     let create_operation =
         cancellation.begin_external_operation("docker_create_request", container_name)?;
+    let create_operation_id = create_operation.operation_id();
     let child = match create.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -18872,13 +19863,13 @@ async fn spawn_opencode_runtime_container(
         .and_then(|pid| i32::try_from(pid).ok())
         .context("Docker create helper has no valid PID")?;
     let create_identity = read_process_identity(create_pid)?;
-    let helper_resource = format!(
-        "container={container_name};pid={};pgid={};boot={};start={}",
+    let helper_resource = linked_helper_resource(
+        create_operation_id,
         create_identity.pid,
         create_identity.pgid,
-        create_identity.linux_boot_id,
-        create_identity.proc_start_time_ticks
-    );
+        &create_identity.linux_boot_id,
+        create_identity.proc_start_time_ticks,
+    )?;
     let create_helper = cancellation
         .begin_external_operation("docker_mutation_helper_process", &helper_resource)?;
     cancellation

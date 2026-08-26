@@ -469,7 +469,28 @@ async fn partial_prepare_boundaries_cleanup_exact_resources() {
                 "boundary {boundary:?} leaked {kind} {name}"
             );
         }
-        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        let effects = root.join("effects");
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("effects")]
+        );
+        assert_eq!(
+            std::fs::read_dir(&effects)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from(&namespace)]
+        );
+        assert_eq!(
+            std::fs::read_dir(effects.join(&namespace))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("executor-effects.jsonl")]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

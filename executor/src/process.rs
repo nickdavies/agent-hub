@@ -168,7 +168,7 @@ fn signal_pidfds(members: &[OwnedPidFd], signal: i32) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub async fn verify_process_group_absent(identity: &ProcessIdentity) -> anyhow::Result<()> {
+pub async fn terminate_owned_process_group(identity: &ProcessIdentity) -> anyhow::Result<()> {
     const SIGTERM: i32 = 15;
     const SIGKILL: i32 = 9;
     match read_process_identity(identity.pid) {
@@ -208,7 +208,17 @@ pub async fn verify_process_group_absent(identity: &ProcessIdentity) -> anyhow::
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub async fn verify_process_group_absent(identity: &ProcessIdentity) -> anyhow::Result<()> {
+    terminate_owned_process_group(identity).await
+}
+
 #[cfg(not(target_os = "linux"))]
 pub async fn verify_process_group_absent(_identity: &ProcessIdentity) -> anyhow::Result<()> {
+    anyhow::bail!("persisted process recovery requires Linux process identity")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn terminate_owned_process_group(_identity: &ProcessIdentity) -> anyhow::Result<()> {
     anyhow::bail!("persisted process recovery requires Linux process identity")
 }

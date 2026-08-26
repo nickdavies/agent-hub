@@ -287,6 +287,7 @@ async fn handle_mcp_connection(
         McpEndpoint::Stdio { command, args, env } => {
             let operation =
                 cancellation.begin_external_operation("mcp_helper_spawn", "stdio_endpoint")?;
+            let spawn_operation_id = operation.operation_id();
             let mut child_command = tokio::process::Command::new(command);
             child_command
                 .args(args)
@@ -301,7 +302,6 @@ async fn handle_mcp_connection(
                 child_command.as_std_mut().process_group(0);
             }
             let mut child = child_command.spawn()?;
-            operation.completed()?;
             let pid = child
                 .id()
                 .and_then(|pid| i32::try_from(pid).ok())
@@ -309,14 +309,15 @@ async fn handle_mcp_connection(
             let identity = super::read_process_identity(pid)?;
             let helper = cancellation.begin_external_operation(
                 "mcp_helper_process",
-                &format!(
-                    "pid={};pgid={};boot={};start={}",
+                &super::linked_helper_resource(
+                    spawn_operation_id,
                     identity.pid,
                     identity.pgid,
-                    identity.linux_boot_id,
-                    identity.proc_start_time_ticks
-                ),
+                    &identity.linux_boot_id,
+                    identity.proc_start_time_ticks,
+                )?,
             )?;
+            operation.completed()?;
 
             let mut child_stdin = child
                 .stdin

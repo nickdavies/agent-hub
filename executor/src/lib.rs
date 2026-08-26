@@ -8,14 +8,17 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use chrono::Utc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
 
 pub mod credential_provider;
 pub mod egress;
 mod process;
 
-pub use process::{ProcessIdentity, read_process_identity, verify_process_group_absent};
+pub use process::{
+    ProcessIdentity, read_process_identity, terminate_owned_process_group,
+    verify_process_group_absent,
+};
 
 #[derive(Debug, Clone)]
 pub struct Deadline {
@@ -158,6 +161,15 @@ impl ExecutionCancellationContext {
         })
     }
 
+    pub fn non_cancellable_recovery(&self) -> Self {
+        Self {
+            cancellation: Cancellation::never(),
+            journal_path: Arc::clone(&self.journal_path),
+            journal_lock: Arc::clone(&self.journal_lock),
+            effect_state: Arc::clone(&self.effect_state),
+        }
+    }
+
     pub fn check(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.cancellation.requested(), "execution was cancelled");
         Ok(())
@@ -173,10 +185,7 @@ impl ExecutionCancellationContext {
             .lock()
             .expect("effect state lock poisoned");
         anyhow::ensure!(
-            state.values().all(|record| matches!(
-                record.status,
-                ExternalEffectStatus::Submitted | ExternalEffectStatus::Reconciled
-            )),
+            state.values().all(effect_is_resolved),
             "external effects remain unresolved"
         );
         drop(state);
@@ -187,17 +196,24 @@ impl ExecutionCancellationContext {
         )
     }
 
-    pub fn reconcile_all(&self) -> anyhow::Result<()> {
+    pub fn reconcile_operation_kind_resource(
+        &self,
+        operation_kind: &str,
+        resource_identity: &str,
+    ) -> anyhow::Result<()> {
         let unresolved = self
             .effect_state
             .lock()
             .expect("effect state lock poisoned")
             .values()
             .filter(|record| {
-                !matches!(
-                    record.status,
-                    ExternalEffectStatus::Submitted | ExternalEffectStatus::Reconciled
-                )
+                record.operation_kind == operation_kind
+                    && (record.resource_identity == resource_identity
+                        || record
+                            .resource_identity
+                            .split(';')
+                            .any(|field| field == format!("container={resource_identity}")))
+                    && !effect_is_resolved(record)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -212,6 +228,36 @@ impl ExecutionCancellationContext {
         Ok(())
     }
 
+    pub fn required_resource_quiescence(
+        &self,
+        resource_identity: &str,
+        normal: Duration,
+        ambiguous: Duration,
+    ) -> Duration {
+        let ambiguous_submission = self
+            .effect_state
+            .lock()
+            .expect("effect state lock poisoned")
+            .values()
+            .any(|record| {
+                operation_requires_recovery(&record.operation_kind)
+                    && matches!(
+                        record.status,
+                        ExternalEffectStatus::Submitting | ExternalEffectStatus::Ambiguous
+                    )
+                    && (record.resource_identity == resource_identity
+                        || record
+                            .resource_identity
+                            .split(';')
+                            .any(|field| field.ends_with(&format!("={resource_identity}"))))
+            });
+        if ambiguous_submission {
+            normal.max(ambiguous)
+        } else {
+            normal
+        }
+    }
+
     pub async fn reconcile_owned_effects(&self, credential_root: &Path) -> anyhow::Result<()> {
         let records = self
             .effect_state
@@ -221,7 +267,10 @@ impl ExecutionCancellationContext {
             .cloned()
             .collect::<Vec<_>>();
         for record in records {
-            match record.operation_kind.as_str() {
+            if effect_is_resolved(&record) {
+                continue;
+            }
+            let recovered = match record.operation_kind.as_str() {
                 "credential_materialize" | "credential_secret_write" => {
                     let path = Path::new(&record.resource_identity);
                     anyhow::ensure!(
@@ -240,6 +289,7 @@ impl ExecutionCancellationContext {
                         !path.exists(),
                         "owned credential file remains after cleanup"
                     );
+                    true
                 }
                 "credential_directory_create" => {
                     let path = Path::new(&record.resource_identity);
@@ -254,17 +304,71 @@ impl ExecutionCancellationContext {
                                 .context("credential effect directory has no parent")?,
                         )?;
                     }
+                    anyhow::ensure!(
+                        !path.exists(),
+                        "owned credential directory remains after cleanup"
+                    );
+                    true
                 }
                 "credential_helper_process" => {
                     verify_process_group_absent(&parse_process_effect_identity(
                         &record.resource_identity,
                     )?)
                     .await?;
+                    true
                 }
-                _ => {}
+                _ => false,
+            };
+            if recovered {
+                self.append_effect(
+                    record.operation_id,
+                    &record.operation_kind,
+                    &record.resource_identity,
+                    ExternalEffectStatus::Reconciled,
+                )?;
             }
         }
-        self.reconcile_all()
+        Ok(())
+    }
+
+    pub async fn settle_process_helpers(&self) -> anyhow::Result<()> {
+        let records = self
+            .effect_state
+            .lock()
+            .expect("effect state lock poisoned")
+            .values()
+            .filter(|record| {
+                ExecutorHelperOperationKind::try_from(record.operation_kind.as_str()).is_ok()
+                    && !effect_is_resolved(record)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for record in records {
+            let result = async {
+                let identity = parse_process_effect_identity(&record.resource_identity)?;
+                terminate_owned_process_group(&identity).await?;
+                self.append_effect(
+                    record.operation_id,
+                    &record.operation_kind,
+                    &record.resource_identity,
+                    ExternalEffectStatus::Reconciled,
+                )
+            }
+            .await;
+            if let Err(error) = result {
+                failures.push(format!(
+                    "{} {}: {error:#}",
+                    record.operation_kind, record.operation_id
+                ));
+            }
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "helper settlement failed: {}",
+            failures.join("; ")
+        );
+        Ok(())
     }
 
     pub fn begin_external_operation<'a>(
@@ -343,7 +447,37 @@ impl ExecutionCancellationContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutorHelperOperationKind {
+    DockerMutation,
+    JournalledSubprocess,
+    CredentialLegacy,
+}
+
+impl TryFrom<&str> for ExecutorHelperOperationKind {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "docker_mutation_helper_process" => Ok(Self::DockerMutation),
+            "journalled_subprocess_helper_process" => Ok(Self::JournalledSubprocess),
+            "credential_helper_process" => Ok(Self::CredentialLegacy),
+            _ => Err(()),
+        }
+    }
+}
+
 fn parse_process_effect_identity(value: &str) -> anyhow::Result<ProcessIdentity> {
+    if value.trim_start().starts_with('{') {
+        #[derive(serde::Deserialize)]
+        struct LinkedProcess {
+            parent_operation_id: uuid::Uuid,
+            process: ProcessIdentity,
+        }
+        let linked: LinkedProcess = serde_json::from_str(value)?;
+        let _ = linked.parent_operation_id;
+        return Ok(linked.process);
+    }
     let fields = value
         .split(';')
         .filter_map(|field| field.split_once('='))
@@ -366,6 +500,28 @@ fn parse_process_effect_identity(value: &str) -> anyhow::Result<ProcessIdentity>
             .context("process effect has no start identity")?
             .parse()?,
     })
+}
+
+fn format_process_effect_identity(identity: &ProcessIdentity) -> String {
+    format!(
+        "pid={};pgid={};boot={};start={}",
+        identity.pid, identity.pgid, identity.linux_boot_id, identity.proc_start_time_ticks
+    )
+}
+
+fn effect_is_resolved(record: &ExternalEffectRecord) -> bool {
+    record.status == ExternalEffectStatus::Reconciled
+}
+
+fn operation_requires_recovery(operation_kind: &str) -> bool {
+    matches!(
+        operation_kind,
+        "primary_docker_mutation"
+            | "egress_network_create_request"
+            | "egress_resolver_create_request"
+            | "egress_proxy_create_request"
+            | "egress_network_connect_request"
+    )
 }
 
 pub struct ExternalOperation<'a> {
@@ -555,7 +711,7 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
 
     let submission = match (&request.effects, &request.operation_identity) {
         (Some(effects), Some(identity)) => {
-            Some(effects.begin_external_operation("primary_process_submit", identity)?)
+            Some(effects.begin_external_operation("primary_docker_mutation", identity)?)
         }
         (None, None) => None,
         _ => anyhow::bail!(
@@ -574,9 +730,16 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
             .and_then(|pid| i32::try_from(pid).ok())
             .context("spawned process has no valid process ID")?,
     )?;
-    if let Some(submission) = submission {
-        submission.completed()?;
-    }
+    let helper = request
+        .effects
+        .as_ref()
+        .map(|effects| {
+            effects.begin_external_operation(
+                "docker_mutation_helper_process",
+                &format_process_effect_identity(&process_identity),
+            )
+        })
+        .transpose()?;
     let stdout = child
         .stdout
         .take()
@@ -649,6 +812,20 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
             }
         }
     };
+    verify_process_group_absent(&process_identity).await?;
+    if let Some(helper) = helper {
+        helper.reconciled()?;
+    }
+    if let Some(submission) = submission {
+        match status {
+            ExecutionStatus::Exited(_) => submission.completed()?,
+            ExecutionStatus::Cancelled
+            | ExecutionStatus::TimedOut
+            | ExecutionStatus::OutputLimitExceeded => {
+                submission.ambiguous("primary_docker_mutation_outcome_unknown")?
+            }
+        }
+    }
     stdout_task
         .await
         .context("stdout persistence task failed")??;
@@ -660,7 +837,6 @@ pub async fn execute_process(request: ExecutionRequest) -> anyhow::Result<Execut
     } else {
         status
     };
-    verify_process_group_absent(&process_identity).await?;
     Ok(ExecutionResult {
         status,
         containment: ContainmentProof {
@@ -692,7 +868,7 @@ fn open_artifact(path: &Path, append: bool) -> anyhow::Result<std::fs::File> {
 }
 
 async fn persist_stream<R: AsyncRead + Unpin>(
-    reader: R,
+    mut reader: R,
     output: tokio::fs::File,
     transcript: Arc<Mutex<BoundedTranscript>>,
     stream: &'static str,
@@ -700,47 +876,235 @@ async fn persist_stream<R: AsyncRead + Unpin>(
     limit: u64,
     failure: watch::Sender<Option<String>>,
 ) -> anyhow::Result<()> {
-    let mut lines = BufReader::new(reader).lines();
+    const CHUNK_BYTES: usize = 8 * 1024;
     let mut output = tokio::io::BufWriter::new(output);
     let mut written = output.get_ref().metadata().await?.len();
-    while let Some(line) = lines.next_line().await? {
-        let line = redaction_values.iter().fold(line, |line, value| {
-            if value.is_empty() {
-                line
-            } else {
-                line.replace(value, "[REDACTED]")
-            }
-        });
-        let output_bytes = line.len() as u64 + 1;
-        if written.saturating_add(output_bytes) > limit {
+    anyhow::ensure!(
+        written <= limit,
+        "existing {stream} output exceeds reviewed limit"
+    );
+    let redactions = redaction_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.as_bytes())
+        .collect::<Vec<_>>();
+    let retained = redactions
+        .iter()
+        .map(|value| value.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
+    let mut pending = Vec::new();
+    let mut utf8_pending = Vec::new();
+    let mut buffer = [0_u8; CHUNK_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        let eof = read == 0;
+        if read != 0 {
+            anyhow::ensure!(
+                pending.len() <= retained,
+                "stream redaction carry exceeded its bound"
+            );
+            pending.extend_from_slice(&buffer[..read]);
+        }
+        let emit_len = if eof {
+            pending.len()
+        } else {
+            safe_redaction_prefix(
+                &pending,
+                pending.len().saturating_sub(retained),
+                &redactions,
+            )
+        };
+        if emit_len == 0 && !eof {
+            continue;
+        }
+        let Some(redacted) =
+            redact_bounded_bytes(&pending[..emit_len], &redactions, limit - written)?
+        else {
+            let message = format!("{stream} output exceeded reviewed limit of {limit} bytes");
+            let _ = failure.send(Some(message));
+            return Ok(());
+        };
+        if written.saturating_add(redacted.len() as u64) > limit {
             let message = format!("{stream} output exceeded reviewed limit of {limit} bytes");
             let _ = failure.send(Some(message));
             return Ok(());
         }
-        output.write_all(line.as_bytes()).await?;
-        output.write_all(b"\n").await?;
-        output.flush().await?;
-        written += output_bytes;
-        let mut record = serde_json::to_vec(&serde_json::json!({
-            "timestamp": Utc::now().to_rfc3339(),
-            "stream": stream,
-            "line": line,
-        }))?;
-        record.push(b'\n');
-        let mut transcript = transcript.lock().await;
-        if transcript.written.saturating_add(record.len() as u64) > transcript.limit {
-            let message = format!(
-                "transcript output exceeded reviewed limit of {} bytes",
-                transcript.limit
-            );
-            let _ = failure.send(Some(message));
-            return Ok(());
+        if !redacted.is_empty() {
+            output.write_all(&redacted).await?;
+            output.flush().await?;
+            written += redacted.len() as u64;
+            persist_transcript_chunks(
+                &redacted,
+                &mut utf8_pending,
+                Arc::clone(&transcript),
+                stream,
+                &failure,
+            )
+            .await?;
         }
-        transcript.writer.write_all(&record).await?;
-        transcript.writer.flush().await?;
-        transcript.written += record.len() as u64;
+        pending.drain(..emit_len);
+        if eof {
+            anyhow::ensure!(
+                utf8_pending.is_empty(),
+                "{stream} ended with incomplete UTF-8"
+            );
+            break;
+        }
     }
     Ok(())
+}
+
+fn safe_redaction_prefix(input: &[u8], nominal: usize, redactions: &[&[u8]]) -> usize {
+    let earliest = nominal.saturating_sub(
+        redactions
+            .iter()
+            .map(|value| value.len().saturating_sub(1))
+            .max()
+            .unwrap_or(0),
+    );
+    (earliest..nominal)
+        .find(|offset| {
+            redactions.iter().any(|value| {
+                input[*offset..].starts_with(value) && offset.saturating_add(value.len()) > nominal
+            })
+        })
+        .unwrap_or(nominal)
+}
+
+fn redact_bounded_bytes(
+    input: &[u8],
+    redactions: &[&[u8]],
+    remaining: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    const REPLACEMENT: &[u8] = b"[REDACTED]";
+    let mut required = 0_u64;
+    let mut offset = 0;
+    while offset < input.len() {
+        if let Some(value) = redactions
+            .iter()
+            .find(|value| input[offset..].starts_with(value))
+        {
+            required = required.saturating_add(REPLACEMENT.len() as u64);
+            offset += value.len();
+        } else {
+            required = required.saturating_add(1);
+            offset += 1;
+        }
+        if required > remaining {
+            return Ok(None);
+        }
+    }
+    let mut output = Vec::with_capacity(usize::try_from(required)?);
+    let mut offset = 0;
+    while offset < input.len() {
+        if let Some(value) = redactions
+            .iter()
+            .find(|value| input[offset..].starts_with(value))
+        {
+            output.extend_from_slice(REPLACEMENT);
+            offset += value.len();
+        } else {
+            output.push(input[offset]);
+            offset += 1;
+        }
+    }
+    Ok(Some(output))
+}
+
+async fn persist_transcript_chunks(
+    bytes: &[u8],
+    utf8_pending: &mut Vec<u8>,
+    transcript: Arc<Mutex<BoundedTranscript>>,
+    stream: &'static str,
+    failure: &watch::Sender<Option<String>>,
+) -> anyhow::Result<()> {
+    utf8_pending.extend_from_slice(bytes);
+    let (valid_len, incomplete) = match std::str::from_utf8(utf8_pending) {
+        Ok(_) => (utf8_pending.len(), false),
+        Err(error) if error.error_len().is_none() => (error.valid_up_to(), true),
+        Err(error) => anyhow::bail!(
+            "{stream} output is not UTF-8 at byte {}",
+            error.valid_up_to()
+        ),
+    };
+    if valid_len == 0 {
+        anyhow::ensure!(incomplete && utf8_pending.len() <= 3, "invalid UTF-8 carry");
+        return Ok(());
+    }
+    let valid = std::str::from_utf8(&utf8_pending[..valid_len])?;
+    let mut consumed = 0;
+    for segment in valid.split_inclusive('\n') {
+        let complete = segment.ends_with('\n');
+        let text = segment.strip_suffix('\n').unwrap_or(segment);
+        write_transcript_record(Arc::clone(&transcript), stream, text, !complete, failure).await?;
+        consumed += segment.len();
+    }
+    utf8_pending.drain(..consumed);
+    if incomplete {
+        anyhow::ensure!(utf8_pending.len() <= 3, "UTF-8 carry exceeded three bytes");
+    }
+    Ok(())
+}
+
+async fn write_transcript_record(
+    transcript: Arc<Mutex<BoundedTranscript>>,
+    stream: &'static str,
+    text: &str,
+    partial: bool,
+    failure: &watch::Sender<Option<String>>,
+) -> anyhow::Result<()> {
+    let mut transcript = transcript.lock().await;
+    let remaining = transcript.limit.saturating_sub(transcript.written);
+    let timestamp = Utc::now().to_rfc3339();
+    let record = TranscriptRecord {
+        timestamp: &timestamp,
+        stream,
+        line: text,
+        partial,
+    };
+    let mut counter = CountingWriter::default();
+    serde_json::to_writer(&mut counter, &record)?;
+    let required = counter.written.saturating_add(1);
+    if required > remaining {
+        let message = format!(
+            "transcript output exceeded reviewed limit of {} bytes",
+            transcript.limit
+        );
+        let _ = failure.send(Some(message));
+        return Ok(());
+    }
+    let mut encoded = Vec::with_capacity(usize::try_from(required)?);
+    serde_json::to_writer(&mut encoded, &record)?;
+    encoded.push(b'\n');
+    transcript.writer.write_all(&encoded).await?;
+    transcript.writer.flush().await?;
+    transcript.written += required;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct TranscriptRecord<'a> {
+    timestamp: &'a str,
+    stream: &'a str,
+    line: &'a str,
+    partial: bool,
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    written: u64,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.written = self.written.saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 struct BoundedTranscript {
@@ -753,7 +1117,7 @@ async fn terminate_process_group(
     identity: &ProcessIdentity,
     child: &mut tokio::process::Child,
 ) -> anyhow::Result<()> {
-    verify_process_group_absent(identity).await?;
+    terminate_owned_process_group(identity).await?;
     let _ = child.wait().await;
     Ok(())
 }
@@ -865,13 +1229,34 @@ impl DockerOwnership {
 #[derive(Debug, Clone)]
 pub struct DockerCli {
     command: PathBuf,
+    effects: Option<ExecutionCancellationContext>,
+    absence_quiescence: Duration,
+    ambiguous_quiescence: Duration,
 }
 
 impl DockerCli {
     pub fn new(command: impl Into<PathBuf>) -> Self {
         Self {
             command: command.into(),
+            effects: None,
+            absence_quiescence: Duration::from_secs(2),
+            ambiguous_quiescence: Duration::from_secs(30),
         }
+    }
+
+    pub fn with_effects(mut self, effects: ExecutionCancellationContext) -> Self {
+        self.effects = Some(effects);
+        self
+    }
+
+    pub fn with_absence_quiescence(mut self, duration: Duration) -> Self {
+        self.absence_quiescence = duration;
+        self
+    }
+
+    pub fn with_ambiguous_quiescence(mut self, duration: Duration) -> Self {
+        self.ambiguous_quiescence = duration;
+        self
     }
 
     pub async fn inspect_ownership(
@@ -879,18 +1264,20 @@ impl DockerCli {
         name: &str,
         timeout: Duration,
     ) -> anyhow::Result<Option<BTreeMap<String, String>>> {
-        let mut command = tokio::process::Command::new(&self.command);
-        command.env_clear().args([
-            "container",
-            "inspect",
-            "--format",
-            "{{json .Config.Labels}}",
-            name,
-        ]);
-        command.kill_on_drop(true);
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .context("timed out inspecting named container")??;
+        let output = self
+            .run_journalled(
+                &[
+                    "container".to_string(),
+                    "inspect".to_string(),
+                    "--format".to_string(),
+                    "{{json .Config.Labels}}".to_string(),
+                    name.to_string(),
+                ],
+                timeout,
+                "docker_container_inspect",
+                name,
+            )
+            .await?;
         if output.status.success() {
             return serde_json::from_slice(&output.stdout)
                 .context("Docker ownership labels are not valid JSON")
@@ -914,33 +1301,121 @@ impl DockerCli {
         expected: &DockerOwnership,
         timeout: Duration,
     ) -> anyhow::Result<()> {
+        let required_quiescence =
+            self.effects
+                .as_ref()
+                .map_or(self.absence_quiescence, |effects| {
+                    effects.required_resource_quiescence(
+                        name,
+                        self.absence_quiescence,
+                        self.ambiguous_quiescence,
+                    )
+                });
         let deadline = Instant::now()
             .checked_add(timeout)
             .context("container cleanup deadline overflow")?;
-        let actual = self.inspect_ownership(name, remaining(deadline)?).await?;
-        let Some(actual) = actual else { return Ok(()) };
-        ensure_expected_labels(name, expected, &actual)?;
-        let mut remove = tokio::process::Command::new(&self.command);
-        remove
-            .env_clear()
-            .args(["rm", "-f", name])
-            .kill_on_drop(true);
-        let output = tokio::time::timeout(remaining(deadline)?, remove.output())
-            .await
-            .context("timed out removing owned container")??;
-        anyhow::ensure!(
-            output.status.success(),
-            "docker rm -f {name} failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        match self.inspect_ownership(name, remaining(deadline)?).await? {
-            None => Ok(()),
-            Some(actual) => {
-                ensure_expected_labels(name, expected, &actual)?;
-                anyhow::bail!("owned container '{name}' remains after removal")
+        let mut absent_since = None;
+        loop {
+            let now = Instant::now();
+            let actual = self
+                .inspect_ownership(name, remaining(deadline)?.min(Duration::from_secs(10)))
+                .await?;
+            match actual {
+                None => {
+                    let first = absent_since.get_or_insert(now);
+                    if now.duration_since(*first) >= required_quiescence {
+                        if let Some(effects) = &self.effects {
+                            effects.reconcile_operation_kind_resource(
+                                "primary_docker_mutation",
+                                name,
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    let needed = required_quiescence.saturating_sub(now.duration_since(*first));
+                    anyhow::ensure!(
+                        remaining(deadline)? >= needed,
+                        "could not prove container '{name}' absent through continuous quiescence"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50).min(needed)).await;
+                }
+                Some(actual) => {
+                    absent_since = None;
+                    ensure_expected_labels(name, expected, &actual)?;
+                    let output = self
+                        .run_journalled(
+                            &["rm".to_string(), "-f".to_string(), name.to_string()],
+                            remaining(deadline)?.min(Duration::from_secs(10)),
+                            "docker_container_remove",
+                            name,
+                        )
+                        .await?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "docker rm -f {name} failed with {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
             }
         }
+    }
+
+    async fn run_journalled(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        operation_kind: &str,
+        resource_identity: &str,
+    ) -> anyhow::Result<std::process::Output> {
+        anyhow::ensure!(!timeout.is_zero(), "Docker operation deadline exceeded");
+        let operation = self
+            .effects
+            .as_ref()
+            .map(|effects| effects.begin_external_operation(operation_kind, resource_identity))
+            .transpose()?;
+        let spawned = spawn_bounded_output(&self.command, args, "journalled Docker helper", true)?;
+        let helper_identity = format_process_effect_identity(&spawned.identity);
+        let helper = self
+            .effects
+            .as_ref()
+            .map(|effects| {
+                effects.begin_external_operation("docker_mutation_helper_process", &helper_identity)
+            })
+            .transpose()?;
+        let output = match settle_bounded_output(
+            spawned,
+            timeout,
+            &Cancellation::never(),
+            "journalled Docker helper",
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(failure) => {
+                if let Some(helper) = helper {
+                    if failure.helper_settled {
+                        helper.reconciled()?;
+                    } else {
+                        helper.ambiguous("docker_helper_settlement_uncertain")?;
+                    }
+                }
+                if let Some(operation) = operation {
+                    operation.ambiguous("docker_operation_outcome_unknown")?;
+                }
+                return Err(failure.error);
+            }
+        };
+        if let Some(helper) = helper {
+            helper.reconciled()?;
+        }
+        if let Some(operation) = operation {
+            operation.reconciled()?;
+        }
+        if let Some(effects) = &self.effects {
+            effects.reconcile_operation_kind_resource(operation_kind, resource_identity)?;
+        }
+        Ok(output)
     }
 }
 
@@ -972,18 +1447,58 @@ pub async fn inspect_image_identity(
         .remaining()
         .context("image resolution requires an absolute deadline")?;
     anyhow::ensure!(!remaining.is_zero(), "image resolution deadline exceeded");
-    let mut command = tokio::process::Command::new(docker_command);
-    command
-        .env_clear()
-        .args(["image", "inspect", "--format", "{{.Id}}", configured_image]);
-    command.kill_on_drop(true);
-    anyhow::ensure!(!cancellation.requested(), "image resolution was cancelled");
-    let output = tokio::select! {
-        output = tokio::time::timeout(remaining, command.output()) => {
-            output.context("image resolution deadline exceeded")??
-        }
-        () = cancellation.cancelled() => anyhow::bail!("image resolution was cancelled"),
-    };
+    let output = execute_output_cancellable(
+        docker_command,
+        &[
+            "image".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{.Id}}".to_string(),
+            configured_image.to_string(),
+        ],
+        deadline,
+        cancellation,
+        "image resolution",
+    )
+    .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to resolve local image '{}': {}",
+        configured_image,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let identity = String::from_utf8(output.stdout)
+        .context("resolved image identity is not UTF-8")?
+        .trim()
+        .to_string();
+    validate_image_identity(&identity)?;
+    Ok(identity)
+}
+
+pub async fn inspect_image_identity_journalled(
+    docker_command: &Path,
+    configured_image: &str,
+    deadline: &Deadline,
+    effects: &ExecutionCancellationContext,
+    resource_identity: &str,
+) -> anyhow::Result<String> {
+    let output = execute_output_journalled(
+        docker_command,
+        &[
+            "image".to_string(),
+            "inspect".to_string(),
+            "--format".to_string(),
+            "{{.Id}}".to_string(),
+            configured_image.to_string(),
+        ],
+        deadline,
+        effects,
+        "egress_docker_read",
+        resource_identity,
+        JournalledEffect::ReadOnly,
+        "resolve local image",
+    )
+    .await?;
     anyhow::ensure!(
         output.status.success(),
         "failed to resolve local image '{}': {}",
@@ -1004,16 +1519,7 @@ pub async fn execute_output(
     deadline: &Deadline,
     description: &str,
 ) -> anyhow::Result<std::process::Output> {
-    let remaining = deadline
-        .remaining()
-        .with_context(|| format!("{description} requires an absolute deadline"))?;
-    anyhow::ensure!(!remaining.is_zero(), "{description} deadline exceeded");
-    let mut process = tokio::process::Command::new(command);
-    process.env_clear().args(args).kill_on_drop(true);
-    tokio::time::timeout(remaining, process.output())
-        .await
-        .with_context(|| format!("{description} deadline exceeded"))?
-        .with_context(|| format!("execute {description}"))
+    execute_output_cancellable(command, args, deadline, &Cancellation::never(), description).await
 }
 
 pub async fn execute_output_cancellable(
@@ -1028,15 +1534,339 @@ pub async fn execute_output_cancellable(
         .with_context(|| format!("{description} requires an absolute deadline"))?;
     anyhow::ensure!(!remaining.is_zero(), "{description} deadline exceeded");
     anyhow::ensure!(!cancellation.requested(), "{description} was cancelled");
+    let spawned = spawn_bounded_output(command, args, description, true)?;
+    settle_bounded_output(spawned, remaining, cancellation, description)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+const SUBPROCESS_STREAM_LIMIT: u64 = 1024 * 1024;
+const SUBPROCESS_AGGREGATE_LIMIT: u64 = 2 * SUBPROCESS_STREAM_LIMIT;
+
+struct SpawnedBoundedOutput {
+    child: tokio::process::Child,
+    identity: ProcessIdentity,
+    stdout: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
+    stderr: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
+    failure: watch::Receiver<Option<String>>,
+}
+
+fn spawn_bounded_output(
+    command: &Path,
+    args: &[String],
+    description: &str,
+    clear_environment: bool,
+) -> anyhow::Result<SpawnedBoundedOutput> {
     let mut process = tokio::process::Command::new(command);
-    process.env_clear().args(args).kill_on_drop(true);
-    tokio::select! {
-        output = tokio::time::timeout(remaining, process.output()) => {
-            output
-                .with_context(|| format!("{description} deadline exceeded"))?
-                .with_context(|| format!("execute {description}"))
+    if clear_environment {
+        process.env_clear();
+    }
+    process
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    process.as_std_mut().process_group(0);
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("spawn {description}"))?;
+    let identity = read_process_identity(
+        child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .context("bounded subprocess has no valid PID")?,
+    )?;
+    let stdout = child.stdout.take().context("capture bounded stdout")?;
+    let stderr = child.stderr.take().context("capture bounded stderr")?;
+    let aggregate = Arc::new(Mutex::new(0_u64));
+    let (failure_tx, failure) = watch::channel(None::<String>);
+    let stdout_aggregate = Arc::clone(&aggregate);
+    let stdout_failure = failure_tx.clone();
+    let stdout = tokio::spawn(async move {
+        read_bounded_output_stream(stdout, stdout_aggregate, "stdout", stdout_failure).await
+    });
+    let stderr = tokio::spawn(async move {
+        read_bounded_output_stream(stderr, aggregate, "stderr", failure_tx).await
+    });
+    Ok(SpawnedBoundedOutput {
+        child,
+        identity,
+        stdout,
+        stderr,
+        failure,
+    })
+}
+
+async fn read_bounded_output_stream<R: AsyncRead + Unpin>(
+    mut reader: R,
+    aggregate: Arc<Mutex<u64>>,
+    stream: &'static str,
+    failure: watch::Sender<Option<String>>,
+) -> anyhow::Result<Vec<u8>> {
+    const CHUNK_BYTES: usize = 8 * 1024;
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; CHUNK_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(output);
         }
-        () = cancellation.cancelled() => anyhow::bail!("{description} was cancelled"),
+        let next_stream = (output.len() as u64).saturating_add(read as u64);
+        let mut aggregate = aggregate.lock().await;
+        let next_aggregate = aggregate.saturating_add(read as u64);
+        if next_stream > SUBPROCESS_STREAM_LIMIT || next_aggregate > SUBPROCESS_AGGREGATE_LIMIT {
+            let _ = failure.send(Some(format!(
+                "{stream} exceeded bounded subprocess output limit"
+            )));
+            return Ok(output);
+        }
+        output.reserve(read);
+        output.extend_from_slice(&buffer[..read]);
+        *aggregate = next_aggregate;
+    }
+}
+
+async fn settle_bounded_output(
+    spawned: SpawnedBoundedOutput,
+    timeout: Duration,
+    cancellation: &Cancellation,
+    description: &str,
+) -> Result<std::process::Output, BoundedOutputFailure> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| BoundedOutputFailure::unsettled(anyhow::anyhow!("deadline overflow")))?;
+    let SpawnedBoundedOutput {
+        mut child,
+        identity,
+        stdout,
+        stderr,
+        failure,
+    } = spawned;
+    let stdout_abort = stdout.abort_handle();
+    let stderr_abort = stderr.abort_handle();
+    let mut failure_signal = failure.clone();
+    let result = match tokio::select! {
+        status = child.wait() => status.context("wait for bounded subprocess").map(Some),
+        _ = wait_for_stream_failure(&mut failure_signal) => Ok(None),
+        () = cancellation.cancelled() => Ok(None),
+        () = tokio::time::sleep(timeout) => Ok(None),
+    } {
+        Ok(result) => result,
+        Err(error) => {
+            let containment = terminate_process_group(&identity, &mut child).await;
+            stdout_abort.abort();
+            stderr_abort.abort();
+            return Err(BoundedOutputFailure::unsettled(
+                containment.err().unwrap_or(error),
+            ));
+        }
+    };
+    let containment = if result.is_none() {
+        terminate_process_group(&identity, &mut child).await
+    } else {
+        terminate_owned_process_group(&identity).await
+    };
+    if let Err(error) = containment {
+        stdout_abort.abort();
+        stderr_abort.abort();
+        return Err(BoundedOutputFailure::unsettled(error));
+    }
+    let readers = async move {
+        let (stdout, stderr) = tokio::try_join!(
+            async { stdout.await.context("bounded stdout task failed")? },
+            async { stderr.await.context("bounded stderr task failed")? },
+        )?;
+        Ok::<_, anyhow::Error>((stdout, stderr))
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let cancellation_already_latched = cancellation.requested();
+    let joined = tokio::select! {
+        result = tokio::time::timeout(remaining, readers) => result,
+        () = cancellation.cancelled(), if !cancellation_already_latched => {
+            stdout_abort.abort();
+            stderr_abort.abort();
+            return Err(BoundedOutputFailure::unsettled(anyhow::anyhow!(
+                "{description} was cancelled while settling output"
+            )));
+        }
+    };
+    let (stdout, stderr) = match joined {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            stdout_abort.abort();
+            stderr_abort.abort();
+            return Err(BoundedOutputFailure::settled(error));
+        }
+        Err(_) => {
+            let containment = terminate_owned_process_group(&identity).await;
+            stdout_abort.abort();
+            stderr_abort.abort();
+            return Err(match containment {
+                Ok(()) => BoundedOutputFailure::unsettled(anyhow::anyhow!(
+                    "{description} output readers exceeded operation deadline"
+                )),
+                Err(error) => BoundedOutputFailure::unsettled(error),
+            });
+        }
+    };
+    if let Some(error) = failure.borrow().clone() {
+        return Err(BoundedOutputFailure::settled(anyhow::anyhow!(
+            "{description} failed: {error}"
+        )));
+    }
+    if cancellation.requested() {
+        return Err(BoundedOutputFailure::settled(anyhow::anyhow!(
+            "{description} was cancelled"
+        )));
+    }
+    let status = result
+        .with_context(|| format!("{description} deadline exceeded"))
+        .map_err(BoundedOutputFailure::settled)?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[derive(Debug)]
+struct BoundedOutputFailure {
+    error: anyhow::Error,
+    helper_settled: bool,
+}
+
+impl BoundedOutputFailure {
+    fn settled(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            helper_settled: true,
+        }
+    }
+
+    fn unsettled(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            helper_settled: false,
+        }
+    }
+}
+
+async fn wait_for_stream_failure(failure: &mut watch::Receiver<Option<String>>) {
+    while failure.borrow().is_none() {
+        if failure.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalledEffect {
+    ReadOnly,
+    Mutation,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_output_journalled(
+    command: &Path,
+    args: &[String],
+    deadline: &Deadline,
+    effects: &ExecutionCancellationContext,
+    operation_kind: &str,
+    resource_identity: &str,
+    effect: JournalledEffect,
+    description: &str,
+) -> anyhow::Result<std::process::Output> {
+    execute_output_journalled_with_environment(
+        command,
+        args,
+        deadline,
+        effects,
+        operation_kind,
+        resource_identity,
+        effect,
+        description,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_output_journalled_inherited_environment(
+    command: &Path,
+    args: &[String],
+    deadline: &Deadline,
+    effects: &ExecutionCancellationContext,
+    operation_kind: &str,
+    resource_identity: &str,
+    effect: JournalledEffect,
+    description: &str,
+) -> anyhow::Result<std::process::Output> {
+    execute_output_journalled_with_environment(
+        command,
+        args,
+        deadline,
+        effects,
+        operation_kind,
+        resource_identity,
+        effect,
+        description,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_output_journalled_with_environment(
+    command: &Path,
+    args: &[String],
+    deadline: &Deadline,
+    effects: &ExecutionCancellationContext,
+    operation_kind: &str,
+    resource_identity: &str,
+    effect: JournalledEffect,
+    description: &str,
+    clear_environment: bool,
+) -> anyhow::Result<std::process::Output> {
+    let remaining = deadline
+        .remaining()
+        .with_context(|| format!("{description} requires an absolute deadline"))?;
+    anyhow::ensure!(!remaining.is_zero(), "{description} deadline exceeded");
+    effects.check()?;
+    let operation = effects.begin_external_operation(operation_kind, resource_identity)?;
+    let spawned = spawn_bounded_output(command, args, description, clear_environment)?;
+    let helper = effects.begin_external_operation(
+        "journalled_subprocess_helper_process",
+        &format_process_effect_identity(&spawned.identity),
+    )?;
+    let settled =
+        settle_bounded_output(spawned, remaining, &effects.cancellation, description).await;
+    match settled {
+        Ok(output) => {
+            helper.reconciled()?;
+            match effect {
+                JournalledEffect::ReadOnly => operation.reconciled()?,
+                JournalledEffect::Mutation => operation.completed()?,
+            }
+            Ok(output)
+        }
+        Err(failure) => {
+            if failure.helper_settled {
+                helper.reconciled()?;
+            } else {
+                helper.ambiguous("journalled_helper_settlement_uncertain")?;
+            }
+            match effect {
+                JournalledEffect::Mutation => {
+                    operation.ambiguous("journalled_mutation_outcome_unknown")?
+                }
+                JournalledEffect::ReadOnly if failure.helper_settled => operation.reconciled()?,
+                JournalledEffect::ReadOnly => {
+                    operation.ambiguous("journalled_read_settlement_uncertain")?
+                }
+            }
+            Err(failure.error)
+        }
     }
 }
 

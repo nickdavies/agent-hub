@@ -1,4 +1,4 @@
-use agent_hub::local::{
+use crate::local::{
     ApprovedRoots, RequestedContextRoot, RequestedWorkspace, WorkspaceAccess, resolve_mounts,
 };
 

@@ -33,6 +33,9 @@ use crate::local::{
 use crate::state::StateStore;
 
 pub const DIPPY_SELECTOR_PREFIX: &str = "agent-hub local authorize";
+const PRIMARY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(70);
+const ATTENDED_CLEANUP_TIMEOUT_SECS: u64 = 150;
+const CANCELLATION_TERMINAL_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone)]
 pub struct ProposalInput {
@@ -78,10 +81,16 @@ pub enum RunStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AuthorizationRecord {
+pub(crate) struct AuthorizationRecord {
     pub artifact: AttendedAuthorizationArtifact,
     pub authorization_path: String,
     pub authorized_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RevalidatedAuthorization {
+    pub artifact: AttendedAuthorizationArtifact,
+    pub authorization_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +107,69 @@ pub struct RunRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub execution_status: Option<RunStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CleanupCheck {
+    status: &'static str,
+    error: Option<String>,
+}
+
+impl CleanupCheck {
+    fn not_applicable() -> Self {
+        Self {
+            status: "not_applicable",
+            error: None,
+        }
+    }
+
+    fn from_result(result: &anyhow::Result<()>) -> Self {
+        match result {
+            Ok(()) => Self {
+                status: "verified_absent",
+                error: None,
+            },
+            Err(error) => Self {
+                status: "failed",
+                error: Some(format!("{error:#}")),
+            },
+        }
+    }
+
+    fn complete(&self) -> bool {
+        matches!(self.status, "verified_absent" | "not_applicable")
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AttendedCleanupEvidence {
+    process: CleanupCheck,
+    container: CleanupCheck,
+    egress: CleanupCheck,
+    credentials: CleanupCheck,
+    effects: CleanupCheck,
+}
+
+impl Default for AttendedCleanupEvidence {
+    fn default() -> Self {
+        Self {
+            process: CleanupCheck::not_applicable(),
+            container: CleanupCheck::not_applicable(),
+            egress: CleanupCheck::not_applicable(),
+            credentials: CleanupCheck::not_applicable(),
+            effects: CleanupCheck::not_applicable(),
+        }
+    }
+}
+
+impl AttendedCleanupEvidence {
+    fn complete(&self) -> bool {
+        self.process.complete()
+            && self.container.complete()
+            && self.egress.complete()
+            && self.credentials.complete()
+            && self.effects.complete()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,11 +380,10 @@ pub fn render_proposal(
     ))
 }
 
-pub async fn authorize_revalidated(
-    store: &StateStore,
+pub(crate) async fn revalidate_authorization(
     path: &Path,
     selectors: AuthorizationSelectors<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RevalidatedAuthorization> {
     let (artifact, original_authorization_path) = read_authorization_file(path)?;
     let request = artifact.verify().map_err(anyhow::Error::msg)?;
     verify_authorization_selectors(&request, &artifact, &selectors)?;
@@ -327,35 +398,10 @@ pub async fn authorize_revalidated(
     )
     .await?;
     verify_image_identity(&request.proposal.image_id, &current_image)?;
-    persist_authorization_receipt(store, artifact, original_authorization_path, selectors)
-}
-
-pub fn authorize(
-    store: &StateStore,
-    path: &Path,
-    selectors: AuthorizationSelectors<'_>,
-) -> anyhow::Result<()> {
-    let (artifact, original_authorization_path) = read_authorization_file(path)?;
-    let request = artifact.verify().map_err(anyhow::Error::msg)?;
-    verify_authorization_selectors(&request, &artifact, &selectors)?;
-    persist_authorization_receipt(store, artifact, original_authorization_path, selectors)
-}
-
-fn persist_authorization_receipt(
-    store: &StateStore,
-    artifact: AttendedAuthorizationArtifact,
-    original_authorization_path: String,
-    selectors: AuthorizationSelectors<'_>,
-) -> anyhow::Result<()> {
-    let _lock = store.lock(&lock_path(selectors.digest))?;
-    let record = AuthorizationRecord {
+    Ok(RevalidatedAuthorization {
         artifact,
         authorization_path: original_authorization_path,
-        authorized_at: Utc::now(),
-    };
-    store
-        .create_json(&authorization_path("records", selectors.digest), &record)
-        .context("authorization already exists or was replayed")
+    })
 }
 
 fn verify_authorization_selectors(
@@ -532,6 +578,8 @@ pub async fn run(
     };
     prepare_consumption(store, &mut record, &digest, |_| Ok(()))?;
 
+    let mut captured_execution_outcome = None;
+    let mut captured_cleanup_evidence = None;
     let result = async {
     let cancel_marker = store.path(&cancel_path(&id))?;
     let cancelled_before_preflight = cancel_marker.exists();
@@ -642,6 +690,9 @@ pub async fn run(
             &run_dir.join("effects"),
             cancellation.clone(),
         )?;
+        let mut credential_cleanup = TemporaryCredentialCleanup(Vec::new());
+        let mut prepared_egress = None;
+        let operation = async {
         let credentials = resolve_attended_credentials(
             &deployment,
             &runner,
@@ -650,25 +701,9 @@ pub async fn run(
             &effects,
         )
         .await?;
-        let credential_cleanup =
-            TemporaryCredentialCleanup(credentials.temp_files.clone());
-        if let Err(error) = verify_materialized_credential_identities(&request, &credentials) {
-            return merge_execution_cleanup(
-                Err(error),
-                effects.finalize(),
-                credential_cleanup.cleanup(),
-            );
-        }
-        let credential_material = match credentials.material() {
-            Ok(material) => material,
-            Err(error) => {
-                return merge_execution_cleanup(
-                    Err(error),
-                    effects.finalize(),
-                    credential_cleanup.cleanup(),
-                );
-            }
-        };
+        credential_cleanup.0 = credentials.temp_files.clone();
+        verify_materialized_credential_identities(&request, &credentials)?;
+        let credential_material = credentials.material()?;
         let redaction_values = credential_material.redaction_values.clone();
         let mut mounts = request
             .execution
@@ -739,8 +774,7 @@ pub async fn run(
             !cancellation.requested(),
             "execution was cancelled before launch"
         );
-        let cleanup_deadline = Deadline::new(Some(30))?;
-        let mut prepared_egress = match prepare_execution_egress(
+            prepared_egress = prepare_execution_egress(
             &deployment,
             &request,
             &docker_path,
@@ -752,17 +786,7 @@ pub async fn run(
             },
             cancellation.clone(),
         )
-        .await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return merge_execution_cleanup(
-                    Err(error),
-                    effects.finalize(),
-                    credential_cleanup.cleanup(),
-                );
-            }
-        };
-        let operation = async {
+        .await?;
             let (network, network_environment, dns, extra_hosts) = match &prepared_egress {
             Some(prepared) => {
                 let mut network_environment = HashMap::new();
@@ -845,7 +869,7 @@ pub async fn run(
                 environment: BTreeMap::new(),
                 artifacts: ArtifactPaths::in_directory(&run_dir),
                 deadline: deadline.clone(),
-                cancellation,
+                cancellation: cancellation.clone(),
                 append: false,
                 redaction_values,
                 output_limits: OutputLimits {
@@ -861,22 +885,77 @@ pub async fn run(
             .await
         }
         .await;
+        let execution_outcome = attended_execution_outcome(
+            &operation,
+            cancellation.requested(),
+        );
+        captured_execution_outcome = Some(execution_outcome.clone());
         drop(poll);
+        let cleanup_deadline = Deadline::new(Some(ATTENDED_CLEANUP_TIMEOUT_SECS))?;
         let egress_cleanup = match &mut prepared_egress {
             Some(prepared) => prepared.cleanup(&cleanup_deadline).await,
+            None if run_dir.join("egress/effects").join(&id).exists() => {
+                agent_hub_executor::egress::recover_restricted_egress(
+                    &docker_path,
+                    &run_dir.join("egress"),
+                    &id,
+                    &cleanup_deadline,
+                )
+                .await
+            }
             None => Ok(()),
         };
         let credential_cleanup = credential_cleanup.cleanup();
-        let effect_cleanup = effects.finalize();
+        let helper_cleanup = effects.settle_process_helpers().await;
+        let primary_cleanup = match &helper_cleanup {
+            Ok(()) => {
+                DockerCli::new(docker_path.clone())
+                    .with_effects(effects.clone())
+                    .remove_owned(
+                        &container_name,
+                        &DockerOwnership::new(ownership.clone())?,
+                        PRIMARY_CLEANUP_TIMEOUT,
+                    )
+                    .await
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "primary containment blocked by unsettled helper: {error:#}"
+            )),
+        };
+        let credential_effect_cleanup = effects.reconcile_owned_effects(&data_dir).await;
+        let effect_cleanup = credential_effect_cleanup
+            .and_then(|()| effects.finalize());
+        captured_cleanup_evidence = Some(AttendedCleanupEvidence {
+            process: CleanupCheck::from_result(&helper_cleanup),
+            container: CleanupCheck::from_result(&primary_cleanup),
+            egress: CleanupCheck::from_result(&egress_cleanup),
+            credentials: match &credential_cleanup {
+                CleanupStatus::Complete => CleanupCheck {
+                    status: "verified_absent",
+                    error: None,
+                },
+                CleanupStatus::Failed(error) => CleanupCheck {
+                    status: "failed",
+                    error: Some(error.clone()),
+                },
+            },
+            effects: CleanupCheck::from_result(&effect_cleanup),
+        });
         merge_execution_cleanup(
             operation,
-            merge_cleanup_results(egress_cleanup, effect_cleanup),
+            merge_cleanup_results(
+                merge_cleanup_results(
+                    merge_cleanup_results(egress_cleanup, helper_cleanup),
+                    primary_cleanup,
+                ),
+                effect_cleanup,
+            ),
             credential_cleanup,
         )
     }
     .await;
     record.finished_at = Some(Utc::now());
-    let mut cleanup_complete = true;
+    let mut cleanup_evidence = captured_cleanup_evidence.unwrap_or_default();
     match result {
         Ok(result) => {
             if store.path(&cancel_path(&id))?.exists() {
@@ -900,33 +979,61 @@ pub async fn run(
                 record.status = RunStatus::CleanupFailed;
                 record.error = Some(error);
             }
+            record.execution_status = captured_execution_outcome
+                .as_ref()
+                .map(AttendedExecutionOutcome::run_status);
         }
         Err(error) => {
-            if is_cleanup_failure(&error) {
-                cleanup_complete = false;
+            if error.downcast_ref::<FinalizationError>().is_some() {
+                if cleanup_evidence.complete() {
+                    cleanup_evidence.effects = CleanupCheck {
+                        status: "failed",
+                        error: Some(format!("{error:#}")),
+                    };
+                }
                 record.status = RunStatus::CleanupFailed;
                 record.error = Some(format!("{error:#}"));
-            } else if store.path(&cancel_path(&id))?.exists() && is_cancellation_error(&error) {
+            } else if store.path(&cancel_path(&id))?.exists() {
                 record.status = RunStatus::Cancelled;
             } else {
                 record.status = RunStatus::Failed;
                 record.error = Some(format!("{error:#}"));
             }
+            if let Some(execution_outcome) = captured_execution_outcome.clone() {
+                record.execution_status = Some(execution_outcome.run_status());
+            }
         }
     }
-    if record.status != RunStatus::CleanupFailed {
+    if record.execution_status.is_none() && record.status != RunStatus::CleanupFailed {
         record.execution_status = Some(record.status.clone());
     }
-    let docker = DockerCli::new(docker_path);
-    if let Err(error) = docker
-        .remove_owned(
-            &container_name,
-            &DockerOwnership::new(ownership)?,
-            Duration::from_secs(30),
-        )
-        .await
-    {
-        cleanup_complete = false;
+    let outer_container_cleanup = async {
+        let effects = if run_dir.join("effects").exists() {
+            Some(agent_hub_executor::ExecutionCancellationContext::new(
+                &run_dir.join("effects"),
+                Cancellation::never(),
+            )?)
+        } else {
+            None
+        };
+        if let Some(effects) = &effects {
+            effects.settle_process_helpers().await?;
+        }
+        let mut docker = DockerCli::new(docker_path);
+        if let Some(effects) = effects {
+            docker = docker.with_effects(effects);
+        }
+        docker
+            .remove_owned(
+                &container_name,
+                &DockerOwnership::new(ownership)?,
+                PRIMARY_CLEANUP_TIMEOUT,
+            )
+            .await
+    }
+    .await;
+    cleanup_evidence.container = CleanupCheck::from_result(&outer_container_cleanup);
+    if let Err(error) = outer_container_cleanup {
         record.status = RunStatus::CleanupFailed;
         let container_error = format!("container cleanup failed: {error:#}");
         record.error = Some(match record.error.take() {
@@ -934,6 +1041,7 @@ pub async fn run(
             None => container_error,
         });
     }
+    let cleanup_complete = cleanup_evidence.complete();
     let output_result: anyhow::Result<()> = (|| {
         if run_dir.is_dir() {
             let result_path = run_dir.join(&request.output.result);
@@ -965,37 +1073,38 @@ pub async fn run(
             });
             write_private_durable_bounded(
                 &repositories_path,
-                &serde_json::to_vec_pretty(&repositories)?,
+                &serialize_pretty_bounded(&repositories, request.output.limits.artifact_bytes)?,
                 request.output.limits.artifact_bytes,
             )?;
             write_private_durable_bounded(
                 &result_path,
-                &serde_json::to_vec_pretty(&record)?,
+                &serialize_pretty_bounded(&record, request.output.limits.artifact_bytes)?,
                 request.output.limits.artifact_bytes,
             )?;
+            let artifact_manifest = serde_json::json!({
+                "stdout": "stdout.log",
+                "stderr": "stderr.log",
+                "transcript": request.output.transcript,
+                "result": request.output.result,
+                "repositories": request.output.repositories,
+            });
             write_private_durable_bounded(
                 &artifacts_path,
-                &serde_json::to_vec_pretty(&serde_json::json!({
-                    "stdout": "stdout.log",
-                    "stderr": "stderr.log",
-                    "transcript": request.output.transcript,
-                    "result": request.output.result,
-                    "repositories": request.output.repositories,
-                }))?,
+                &serialize_pretty_bounded(
+                    &artifact_manifest,
+                    request.output.limits.artifact_bytes,
+                )?,
                 request.output.limits.artifact_bytes,
             )?;
-            write_private_durable(
+            let cleanup_document = serde_json::json!({
+                "status": if cleanup_complete { "complete" } else { "cleanup_failed" },
+                "error": &record.error,
+                "containment": &cleanup_evidence,
+            });
+            write_private_durable_bounded(
                 &cleanup_path,
-                &serde_json::to_vec_pretty(&serde_json::json!({
-                    "status": if cleanup_complete { "complete" } else { "cleanup_failed" },
-                    "error": &record.error,
-                    "containment": {
-                        "process": if cleanup_complete { "verified_absent_or_not_created" } else { "unresolved" },
-                        "container": if cleanup_complete { "verified_absent" } else { "unresolved" },
-                        "egress": if cleanup_complete { "verified_absent_or_not_created" } else { "unresolved" },
-                        "credentials": if cleanup_complete { "verified_absent_or_not_created" } else { "unresolved" },
-                    }
-                }))?,
+                &serialize_pretty_bounded(&cleanup_document, request.output.limits.artifact_bytes)?,
+                request.output.limits.artifact_bytes,
             )?;
         }
         Ok(())
@@ -1003,7 +1112,9 @@ pub async fn run(
     if let Err(error) = output_result {
         if record.status != RunStatus::CleanupFailed {
             record.status = RunStatus::Failed;
-            record.execution_status = Some(RunStatus::Failed);
+            if record.execution_status.is_none() {
+                record.execution_status = Some(RunStatus::Failed);
+            }
         }
         let output_error = format!("attended output finalization failed: {error:#}");
         record.error = Some(match record.error.take() {
@@ -1011,19 +1122,29 @@ pub async fn run(
             None => output_error,
         });
         if run_dir.is_dir() {
-            let _ = write_private_durable_bounded(
-                &run_dir.join(&request.output.result),
-                &serde_json::to_vec_pretty(&record)?,
-                request.output.limits.artifact_bytes,
-            );
+            if let Ok(bytes) =
+                serialize_pretty_bounded(&record, request.output.limits.artifact_bytes)
+            {
+                let _ = write_private_durable_bounded(
+                    &run_dir.join(&request.output.result),
+                    &bytes,
+                    request.output.limits.artifact_bytes,
+                );
+            }
             let cleanup_path = run_dir.join(&request.output.cleanup);
-            let _ = write_private_durable(
-                &cleanup_path,
-                &serde_json::to_vec_pretty(&serde_json::json!({
-                    "status": "incomplete",
-                    "error": &record.error,
-                }))?,
-            );
+            let incomplete = serde_json::json!({
+                "status": "incomplete",
+                "error": &record.error,
+            });
+            if let Ok(bytes) =
+                serialize_pretty_bounded(&incomplete, request.output.limits.artifact_bytes)
+            {
+                let _ = write_private_durable_bounded(
+                    &cleanup_path,
+                    &bytes,
+                    request.output.limits.artifact_bytes,
+                );
+            }
         }
     }
     store.replace_json(&run_record_path(&id), &record)?;
@@ -1037,13 +1158,6 @@ pub fn list(store: &StateStore) -> anyhow::Result<Vec<RunRecord>> {
 pub fn status(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> {
     validate_id(id)?;
     store.read_json(&run_record_path(id))
-}
-
-pub fn artifact_path(store: &StateStore, id: &str, name: &str) -> anyhow::Result<PathBuf> {
-    let relative = artifact_relative(id, name)?;
-    let path = store.path(&relative)?;
-    ensure!(path.is_file(), "attended artifact is unavailable");
-    Ok(path)
 }
 
 fn artifact_relative(id: &str, name: &str) -> anyhow::Result<PathBuf> {
@@ -1123,15 +1237,30 @@ pub async fn cancel(store: &StateStore, id: &str) -> anyhow::Result<()> {
         &cancel_path(id),
         &serde_json::json!({"requested_at": Utc::now()}),
     )?;
-    let docker = DockerCli::new(which::which("docker")?);
+    let run_dir = store.path(&PathBuf::from("runs").join(id))?;
+    let effects = if run_dir.join("effects").exists() {
+        Some(agent_hub_executor::ExecutionCancellationContext::new(
+            &run_dir.join("effects"),
+            Cancellation::never(),
+        )?)
+    } else {
+        None
+    };
+    if let Some(effects) = &effects {
+        effects.settle_process_helpers().await?;
+    }
+    let mut docker = DockerCli::new(which::which("docker")?);
+    if let Some(effects) = effects {
+        docker = docker.with_effects(effects);
+    }
     let ownership = DockerOwnership::new(record.ownership)?;
     let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_secs(30))
+        .checked_add(CANCELLATION_TERMINAL_TIMEOUT)
         .context("cancellation deadline overflow")?;
+    docker
+        .remove_owned(&record.container_name, &ownership, PRIMARY_CLEANUP_TIMEOUT)
+        .await?;
     loop {
-        docker
-            .remove_owned(&record.container_name, &ownership, Duration::from_secs(2))
-            .await?;
         let current = status(store, id)?;
         if !matches!(
             current.status,
@@ -1215,11 +1344,29 @@ async fn recover_owned_run_resources(
     ownership: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     let mut failures = Vec::new();
-    if let Err(error) = DockerCli::new(docker)
+    let effects = if run_dir.join("effects").exists() {
+        Some(agent_hub_executor::ExecutionCancellationContext::new(
+            &run_dir.join("effects"),
+            Cancellation::never(),
+        )?)
+    } else {
+        None
+    };
+    if let Some(effects) = &effects {
+        effects
+            .settle_process_helpers()
+            .await
+            .context("settle mutation helpers before containment")?;
+    }
+    let mut docker_cli = DockerCli::new(docker);
+    if let Some(effects) = &effects {
+        docker_cli = docker_cli.with_effects(effects.clone());
+    }
+    if let Err(error) = docker_cli
         .remove_owned(
             container_name,
             &DockerOwnership::new(ownership.clone())?,
-            Duration::from_secs(30),
+            PRIMARY_CLEANUP_TIMEOUT,
         )
         .await
     {
@@ -1230,28 +1377,19 @@ async fn recover_owned_run_resources(
             docker,
             &run_dir.join("egress"),
             id,
-            &Deadline::new(Some(30))?,
+            &Deadline::new(Some(ATTENDED_CLEANUP_TIMEOUT_SECS))?,
         )
         .await
     {
         failures.push(format!("egress: {error:#}"));
     }
-    if run_dir.join("effects").exists() {
-        match agent_hub_executor::ExecutionCancellationContext::new(
-            &run_dir.join("effects"),
-            Cancellation::never(),
-        ) {
-            Ok(effects) => {
-                if let Err(error) = effects
-                    .reconcile_owned_effects(&run_dir.join("data"))
-                    .await
-                    .and_then(|()| effects.finalize())
-                {
-                    failures.push(format!("credential/process effects: {error:#}"));
-                }
-            }
-            Err(error) => failures.push(format!("effect journal: {error:#}")),
-        }
+    if let Some(effects) = &effects
+        && let Err(error) = effects
+            .reconcile_owned_effects(&run_dir.join("data"))
+            .await
+            .and_then(|()| effects.finalize())
+    {
+        failures.push(format!("credential/process effects: {error:#}"));
     }
     ensure!(
         failures.is_empty(),
@@ -1881,26 +2019,76 @@ fn attended_config_provenance(
 
 struct TemporaryCredentialCleanup(Vec<PathBuf>);
 
-#[derive(Debug)]
-struct FinalizationError(String);
-
-fn is_cleanup_failure(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<FinalizationError>().is_some()
-        || error.chain().any(|cause| {
-            let message = cause.to_string().to_ascii_lowercase();
-            message.contains("cleanup failed") || message.contains("cleanup also failed")
-        })
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttendedExecutionOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
 }
 
-fn is_cancellation_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().to_ascii_lowercase().contains("cancel"))
+impl AttendedExecutionOutcome {
+    fn run_status(&self) -> RunStatus {
+        match self {
+            Self::Succeeded => RunStatus::Succeeded,
+            Self::Failed => RunStatus::Failed,
+            Self::Cancelled => RunStatus::Cancelled,
+            Self::TimedOut => RunStatus::TimedOut,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CleanupFailureKind {
+    RequiredResources,
+    Credentials,
+}
+
+#[derive(Debug)]
+struct CleanupFailureDetail {
+    kind: CleanupFailureKind,
+    error: String,
+}
+
+#[derive(Debug)]
+struct FinalizationError {
+    execution_error: Option<String>,
+    cleanup_failures: Vec<CleanupFailureDetail>,
+}
+
+fn attended_execution_outcome(
+    operation: &anyhow::Result<agent_hub_executor::ExecutionResult>,
+    cancellation_requested: bool,
+) -> AttendedExecutionOutcome {
+    match operation {
+        Ok(_) if cancellation_requested => AttendedExecutionOutcome::Cancelled,
+        Ok(result) => match result.status {
+            ExecutionStatus::Exited(0) => AttendedExecutionOutcome::Succeeded,
+            ExecutionStatus::Exited(_) | ExecutionStatus::OutputLimitExceeded => {
+                AttendedExecutionOutcome::Failed
+            }
+            ExecutionStatus::Cancelled => AttendedExecutionOutcome::Cancelled,
+            ExecutionStatus::TimedOut => AttendedExecutionOutcome::TimedOut,
+        },
+        Err(_) if cancellation_requested => AttendedExecutionOutcome::Cancelled,
+        Err(_) => AttendedExecutionOutcome::Failed,
+    }
 }
 
 impl std::fmt::Display for FinalizationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        let mut details = Vec::new();
+        if let Some(error) = &self.execution_error {
+            details.push(format!("execution failed: {error}"));
+        }
+        details.extend(self.cleanup_failures.iter().map(|failure| {
+            let kind = match failure.kind {
+                CleanupFailureKind::RequiredResources => "required resource cleanup",
+                CleanupFailureKind::Credentials => "credential cleanup",
+            };
+            format!("{kind} failed: {}", failure.error)
+        }));
+        formatter.write_str(&details.join("; "))
     }
 }
 
@@ -1914,18 +2102,25 @@ fn merge_execution_cleanup<T>(
     match (operation, egress_cleanup, credential_cleanup) {
         (Ok(result), Ok(()), CleanupStatus::Complete) => Ok(result),
         (Err(error), Ok(()), CleanupStatus::Complete) => Err(error),
-        (operation, egress_cleanup, credential_cleanup) => {
-            let mut errors = Vec::new();
-            if let Err(error) = operation {
-                errors.push(format!("execution failed: {error:#}"));
-            }
-            if let Err(error) = egress_cleanup {
-                errors.push(format!("egress cleanup failed: {error:#}"));
+        (operation, required_cleanup, credential_cleanup) => {
+            let execution_error = operation.err().map(|error| format!("{error:#}"));
+            let mut cleanup_failures = Vec::new();
+            if let Err(error) = required_cleanup {
+                cleanup_failures.push(CleanupFailureDetail {
+                    kind: CleanupFailureKind::RequiredResources,
+                    error: format!("{error:#}"),
+                });
             }
             if let CleanupStatus::Failed(error) = credential_cleanup {
-                errors.push(format!("credential cleanup failed: {error}"));
+                cleanup_failures.push(CleanupFailureDetail {
+                    kind: CleanupFailureKind::Credentials,
+                    error,
+                });
             }
-            Err(anyhow::Error::new(FinalizationError(errors.join("; "))))
+            Err(anyhow::Error::new(FinalizationError {
+                execution_error,
+                cleanup_failures,
+            }))
         }
     }
 }
@@ -2499,6 +2694,35 @@ fn write_private_durable_bounded(path: &Path, bytes: &[u8], limit: u64) -> anyho
     write_private_durable(path, bytes)
 }
 
+fn serialize_pretty_bounded<T: Serialize>(value: &T, limit: u64) -> anyhow::Result<Vec<u8>> {
+    ensure!(limit > 0, "attended artifact output limit must be positive");
+    let mut counter = JsonCountingWriter::default();
+    serde_json::to_writer_pretty(&mut counter, value)?;
+    ensure!(
+        counter.written <= limit,
+        "attended artifact exceeded reviewed limit of {limit} bytes"
+    );
+    let mut bytes = Vec::with_capacity(usize::try_from(counter.written)?);
+    serde_json::to_writer_pretty(&mut bytes, value)?;
+    Ok(bytes)
+}
+
+#[derive(Default)]
+struct JsonCountingWriter {
+    written: u64,
+}
+
+impl std::io::Write for JsonCountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.written = self.written.saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn sync_directory_and_parent(path: &Path) -> anyhow::Result<()> {
     File::open(path)?.sync_all()?;
     File::open(path.parent().context("directory has no parent")?)?.sync_all()?;
@@ -2591,8 +2815,10 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RunRecord, RunStatus, merge_execution_cleanup, network_class_within_ceiling,
-        prepare_consumption, resolve_network_resources, selector_resources, verify_tool_approval,
+        AttendedExecutionOutcome, FinalizationError, RunRecord, RunStatus,
+        attended_execution_outcome, merge_execution_cleanup, network_class_within_ceiling,
+        prepare_consumption, resolve_network_resources, selector_resources,
+        serialize_pretty_bounded, verify_tool_approval,
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
@@ -2758,5 +2984,67 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[test]
+    fn attended_output_serialization_rejects_huge_values_before_allocation() {
+        let value = "x".repeat(2 * 1024 * 1024);
+        assert!(serialize_pretty_bounded(&value, 1024).is_err());
+        assert_eq!(
+            serialize_pretty_bounded(&"bounded", 64).unwrap(),
+            br#""bounded""#
+        );
+    }
+
+    #[test]
+    fn attended_execution_outcome_survives_later_cleanup_failure() {
+        for (status, expected) in [
+            (
+                agent_hub_executor::ExecutionStatus::Cancelled,
+                AttendedExecutionOutcome::Cancelled,
+            ),
+            (
+                agent_hub_executor::ExecutionStatus::TimedOut,
+                AttendedExecutionOutcome::TimedOut,
+            ),
+        ] {
+            let operation = Ok(agent_hub_executor::ExecutionResult {
+                status,
+                containment: agent_hub_executor::ContainmentProof {
+                    process: agent_hub_executor::ContainmentStatus::VerifiedAbsent,
+                    container: agent_hub_executor::ContainmentStatus::NotApplicable,
+                    egress: agent_hub_executor::ContainmentStatus::NotApplicable,
+                },
+                cleanup: CleanupStatus::Complete,
+            });
+            assert_eq!(attended_execution_outcome(&operation, false), expected);
+            assert!(
+                merge_execution_cleanup(
+                    operation,
+                    Err(anyhow::anyhow!("injected cleanup failure")),
+                    CleanupStatus::Complete,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_classification_is_typed_not_message_based() {
+        let ordinary = merge_execution_cleanup::<()>(
+            Err(anyhow::anyhow!("ordinary execution said cleanup failed")),
+            Ok(()),
+            CleanupStatus::Complete,
+        )
+        .unwrap_err();
+        assert!(ordinary.downcast_ref::<FinalizationError>().is_none());
+
+        let cleanup = merge_execution_cleanup(
+            Ok(()),
+            Err(anyhow::anyhow!("resource remains")),
+            CleanupStatus::Complete,
+        )
+        .unwrap_err();
+        assert!(cleanup.downcast_ref::<FinalizationError>().is_some());
     }
 }

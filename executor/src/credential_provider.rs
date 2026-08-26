@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -201,52 +199,35 @@ impl CredentialProvider {
                 capture_file,
                 ..
             } => {
-                let operation = cancellation.begin_external_operation(
+                let timeout_secs = match valid_through {
+                    Some(valid_through) => {
+                        let remaining = valid_through
+                            .duration_since(SystemTime::now())
+                            .context("credential command authorized deadline expired")?;
+                        remaining
+                            .as_secs()
+                            .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+                            .clamp(1, 300)
+                    }
+                    None => 300,
+                };
+                let output = super::execute_output_journalled_inherited_environment(
+                    Path::new(command),
+                    args,
+                    &super::Deadline::new(Some(timeout_secs))?,
+                    cancellation,
                     "credential_command",
                     &format!("provider:{}", self.name()),
-                )?;
-                let mut child_command = tokio::process::Command::new(command);
-                child_command.args(args).kill_on_drop(true);
-                #[cfg(unix)]
-                child_command.as_std_mut().process_group(0);
-                let child = child_command.spawn()?;
-                let pid = child
-                    .id()
-                    .and_then(|pid| i32::try_from(pid).ok())
-                    .context("credential helper has no valid PID")?;
-                let identity = super::read_process_identity(pid)?;
-                let helper = cancellation.begin_external_operation(
-                    "credential_helper_process",
-                    &format!(
-                        "pid={};pgid={};boot={};start={}",
-                        identity.pid,
-                        identity.pgid,
-                        identity.linux_boot_id,
-                        identity.proc_start_time_ticks
-                    ),
-                )?;
-                let cancellation_signal = cancellation.cancellation();
-                let outcome = tokio::select! {
-                    output = child.wait_with_output() => Some(output),
-                    () = cancellation_signal.cancelled() => None,
-                };
-                let Some(output) = outcome else {
-                    super::verify_process_group_absent(&identity).await?;
-                    helper.reconciled()?;
-                    operation.reconciled()?;
-                    anyhow::bail!("credential command was cancelled");
-                };
-                let output = output?;
-                super::verify_process_group_absent(&identity).await?;
-                helper.reconciled()?;
+                    super::JournalledEffect::ReadOnly,
+                    "credential command",
+                )
+                .await?;
                 if !output.status.success() {
-                    operation.completed()?;
                     anyhow::bail!(
                         "credential command failed: {}",
                         String::from_utf8_lossy(&output.stderr)
                     );
                 }
-                operation.completed()?;
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let mut creds = ResolvedCredentials::default();
                 if let Some(env_var) = capture_env {
