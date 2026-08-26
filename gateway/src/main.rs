@@ -64,7 +64,7 @@ struct ApprovalArgs {
     token: Secret,
 
     /// Maximum time to wait for approval in seconds
-    #[arg(long, default_value = "600")]
+    #[arg(long, default_value = "86400")]
     timeout: u64,
 
     /// Path to tool routing config file (JSON)
@@ -788,6 +788,42 @@ fn status_to_output(status: &ApprovalStatus) -> HookOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_default_timeout_is_24_hours() {
+        let cli = Cli::try_parse_from([
+            "agent-hub-gateway",
+            "approval",
+            "--server",
+            "http://localhost",
+            "--token",
+            "test-token",
+        ])
+        .unwrap();
+
+        let Command::Approval(args) = cli.command else {
+            panic!("expected approval command");
+        };
+        assert_eq!(args.timeout, 86_400);
+    }
+
+    #[test]
+    fn question_default_timeout_is_24_hours() {
+        let cli = Cli::try_parse_from([
+            "agent-hub-gateway",
+            "question",
+            "--server",
+            "http://localhost",
+            "--token",
+            "test-token",
+        ])
+        .unwrap();
+
+        let Command::Question(args) = cli.command else {
+            panic!("expected question command");
+        };
+        assert_eq!(args.timeout, 86_400);
+    }
 
     #[test]
     fn explicit_denial_remains_denied() {
