@@ -47,9 +47,7 @@ struct ApprovalDetailTemplate {
 #[derive(Template)]
 #[template(path = "approval_queue.html")]
 struct ApprovalQueueTemplate {
-    email: String,
     readwrite: bool,
-    has_auth: bool,
 }
 
 // --- Handlers ---
@@ -120,14 +118,9 @@ pub async fn dashboard<N: Notifier>(
 }
 
 /// GET /approvals/queue — mobile approval queue (auth enforced by middleware)
-pub async fn approval_queue<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-) -> Response {
+pub async fn approval_queue<N: Notifier>(State(state): State<AppState<N>>) -> Response {
     into_html_response(ApprovalQueueTemplate {
-        email: session_email(&session).await,
         readwrite: state.config.approval_mode == ApprovalFeatureMode::Readwrite,
-        has_auth: state.config.auth_mode != crate::server::config::AuthMode::None,
     })
 }
 

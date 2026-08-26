@@ -7,17 +7,24 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
     <style>
         body { min-height: 100vh; }
-        nav, main { max-width: 44rem; }
-        nav { padding-top: max(0.75rem, env(safe-area-inset-top)); }
-        main { padding-bottom: calc(1rem + env(safe-area-inset-bottom)); }
+        main { max-width: 44rem; padding-top: max(0.5rem, env(safe-area-inset-top)); padding-bottom: calc(1rem + env(safe-area-inset-bottom)); }
         article { margin-bottom: 1rem; }
-        #queue-summary { color: var(--pico-muted-color); font-size: 0.9rem; }
+        .queue-header { display: grid; grid-template-columns: auto 1fr auto; align-items: baseline; gap: 0.6rem; margin-bottom: 0.5rem; }
+        .queue-header h1 { font-size: 1.25rem; margin: 0; }
+        .queue-header a { text-decoration: none; }
+        #queue-summary { color: var(--pico-muted-color); font-size: 0.85rem; margin: 0; white-space: nowrap; }
         #error-state { border: 1px solid var(--pico-del-color); color: var(--pico-del-color); padding: 0.75rem; border-radius: var(--pico-border-radius); }
-        #meta { overflow-wrap: anywhere; }
-        #meta dt, .smart-view dt { color: var(--pico-primary); font-weight: bold; margin-top: 0.6rem; }
-        #meta dd, .smart-view dd { margin-left: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+        .request-heading { font-size: 1rem; margin-bottom: 0.5rem; }
+        #request-details dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 0.75rem; margin-bottom: 0; overflow-wrap: anywhere; }
+        #request-details dt { color: var(--pico-primary); font-weight: bold; }
+        #request-details dd { margin: 0; min-width: 0; }
+        .smart-view dt { color: var(--pico-primary); font-weight: bold; margin-top: 0.6rem; }
+        .smart-view dd { margin-left: 0; overflow-wrap: anywhere; }
+        .smart-view dd pre { margin: 0; }
         pre { max-height: none; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+        pre code { white-space: inherit; overflow-wrap: inherit; }
         .view-heading { align-items: center; display: flex; justify-content: space-between; gap: 1rem; }
+        .view-heading h3 { margin-bottom: 0.5rem; }
         .view-heading button { margin: 0; padding: 0.25rem 0.6rem; width: auto; white-space: nowrap; }
         #readonly-status { border-top: 1px solid var(--pico-muted-border-color); padding: 0.75rem 0; color: var(--pico-muted-color); }
         #queue-actions { position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; background: var(--pico-card-background-color); border-top: 1px solid var(--pico-muted-border-color); box-shadow: 0 -0.25rem 1rem rgba(0, 0, 0, 0.08); }
@@ -33,48 +40,44 @@
     </style>
 </head>
 <body>
-<nav class="container">
-    <ul><li><a href="/approvals"><strong>Claude Notify</strong></a></li></ul>
-    {% if has_auth %}
-    <ul><li><small>{{ email }}</small></li></ul>
-    {% endif %}
-</nav>
-
 <main class="container" id="queue-state">
-    <header>
-        <h2>Approval Queue</h2>
-        <p id="queue-summary" aria-live="polite">Loading pending approvals…</p>
+    <header class="queue-header">
+        <a href="/approvals" aria-label="Back to dashboard">←</a>
+        <h1>Approval Queue</h1>
+        <p id="queue-summary" aria-live="polite">Loading…</p>
     </header>
 
     <p id="loading-state" role="status">Loading approval details…</p>
     <p id="empty-state" role="status" hidden>No pending approvals. Waiting for new work…</p>
     <p id="error-state" role="alert" hidden></p>
 
-    <article id="request-state" aria-labelledby="tool-name" aria-live="polite" aria-atomic="true" hidden>
-        <header>
-            <h3 id="tool-name" tabindex="-1"></h3>
-            <dl id="meta">
-                <dt>Project</dt><dd id="project"></dd>
-                <dt>Session</dt><dd id="session"></dd>
-                <dt>Provider</dt><dd><code id="provider"></code></dd>
-            </dl>
-        </header>
+    <article id="request-state" aria-labelledby="request-heading" aria-live="polite" aria-atomic="true" hidden>
+        <h2 id="request-heading" class="request-heading" tabindex="-1">Pending request</h2>
 
         <section id="context-section" hidden>
-            <h4 id="context-heading"></h4>
+            <h3 id="context-heading"></h3>
             <pre><code id="context-content"></code></pre>
         </section>
 
         <section aria-labelledby="input-heading">
             <div class="view-heading">
-                <h4 id="input-heading">Tool Input</h4>
+                <h3 id="input-heading">Tool Input</h3>
                 <button type="button" class="outline secondary" id="view-toggle" aria-controls="smart-view raw-view" aria-expanded="false">Show raw JSON</button>
             </div>
             <div id="smart-view" class="smart-view"></div>
             <pre id="raw-view" hidden><code id="raw-content"></code></pre>
         </section>
 
-        <p>Status: <mark>Pending</mark></p>
+        <section id="request-details" aria-labelledby="details-heading">
+            <h3 id="details-heading">Request Details</h3>
+            <dl>
+                <dt>Tool</dt><dd id="tool-name"></dd>
+                <dt>Project</dt><dd id="project"></dd>
+                <dt>Session</dt><dd id="session"></dd>
+                <dt>Provider</dt><dd><code id="provider"></code></dd>
+                <dt>Status</dt><dd><mark>Pending</mark></dd>
+            </dl>
+        </section>
     </article>
 
     {% if !readwrite %}
@@ -158,7 +161,7 @@
         if (input === null || typeof input !== 'object' || Array.isArray(input)) {
             const pre = document.createElement('pre');
             const code = document.createElement('code');
-            code.textContent = JSON.stringify(input, null, 2);
+            code.textContent = typeof input === 'string' ? input : JSON.stringify(input, null, 2);
             pre.appendChild(code);
             container.appendChild(pre);
             return;
@@ -169,15 +172,11 @@
             const term = document.createElement('dt');
             term.textContent = key;
             const detail = document.createElement('dd');
-            if (typeof value === 'string') {
-                detail.textContent = value;
-            } else {
-                const pre = document.createElement('pre');
-                const code = document.createElement('code');
-                code.textContent = JSON.stringify(value, null, 2);
-                pre.appendChild(code);
-                detail.appendChild(pre);
-            }
+            const pre = document.createElement('pre');
+            const code = document.createElement('code');
+            code.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+            pre.appendChild(code);
+            detail.appendChild(pre);
             list.append(term, detail);
         }
         container.appendChild(list);
@@ -221,14 +220,14 @@
         loadingState.hidden = true;
         emptyState.hidden = true;
         requestState.hidden = false;
-        queueSummary.textContent = count === 1 ? '1 pending approval' : count + ' pending approvals';
+        queueSummary.textContent = count + ' pending';
         if (queueActions) queueActions.hidden = false;
         setText('action-status', '');
         hideDeny();
         requestActionSpacingUpdate();
         if (focusNewRequest) {
             focusNewRequest = false;
-            window.requestAnimationFrame(() => document.getElementById('tool-name').focus());
+            window.requestAnimationFrame(() => document.getElementById('request-heading').focus());
         }
     }
 
@@ -237,7 +236,7 @@
         loadingState.hidden = true;
         requestState.hidden = true;
         emptyState.hidden = false;
-        queueSummary.textContent = 'No pending approvals';
+        queueSummary.textContent = 'None pending';
         if (queueActions) queueActions.hidden = true;
         setText('action-status', '');
         focusNewRequest = false;
@@ -260,7 +259,7 @@
 
         const current = pending.find(approval => approval.id === currentId);
         if (current) {
-            queueSummary.textContent = pending.length === 1 ? '1 pending approval' : pending.length + ' pending approvals';
+            queueSummary.textContent = pending.length + ' pending';
             return;
         }
         renderApproval(pending[0], pending.length);
