@@ -47,6 +47,8 @@ jobs:
         run: git diff --exit-code -- generated/
       - name: Typecheck
         run: bun run typecheck
+      - name: Test
+        run: bun run test
 
   docker-check:
     needs: check

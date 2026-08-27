@@ -42,9 +42,51 @@ export AGENT_HUB_TOKEN="your-bearer-token"          # server auth token
 # export AGENT_HUB_GATEWAY="/absolute/path/to/agent-hub-gateway"
 ```
 
-Server and token are required by the gateway CLI even when all decisions
-resolve locally (fast path never contacts the network). They can be set to
-placeholder values if you are not using the server escalation path.
+For a sandboxed attended run, the trusted launcher sets the complete transport:
+
+```sh
+export AGENT_HUB_APPROVAL_MODE="attended_socket"
+export AGENT_HUB_ATTENDED_APPROVAL_SOCKET="/agent-hub/approval.sock"
+export AGENT_HUB_ATTENDED_APPROVAL_BINDING='{"run_epoch":"...","authorization_digest":"...","environment_bundle_digest":"...","image_digest":"sha256:...","network_digest":"...","approval_bundle_digest":"..."}'
+export AGENT_HUB_ATTENDED_RUN_DEADLINE="2099-01-02T03:04:05Z"
+```
+
+Sandbox mode is explicit and fail closed. All four values are required, and
+`AGENT_HUB_SERVER`, `AGENT_HUB_TOKEN`, `AGENT_HUB_APPROVALS_SERVER`, and
+`AGENT_HUB_APPROVALS_TOKEN` are forbidden. Without `AGENT_HUB_APPROVAL_MODE`,
+the plugin retains the existing host HTTP behavior and rejects stray attended
+transport values.
+
+The plugin captures this absolute path once at initialization, removes
+all approval transport values from the subprocess environment, and passes the
+captured binding as CLI arguments. Missing gateway binaries, malformed OpenCode
+permissions, unavailable sockets, invalid decisions, and relay loss deny the
+tool request. HTTP status and question subprocesses are disabled in attended
+socket mode; no host-network route or proxy exception is required.
+
+### Host relay protocol v1
+
+The socket is a one-request-per-connection Unix stream using the shared
+`AttendedGatewayRequestV1` and `AttendedGatewayDecisionV1` protocol types. Each
+frame is a four-byte unsigned big-endian length followed by canonical compact
+UTF-8 JSON, with a maximum length of 1 MiB. Object keys are sorted recursively;
+arrays retain order. The relay must close after its single decision frame.
+Extra bytes or another frame are rejected as a replay. The request binds the
+run digests, monotonic sequence, single-use request ID, exact normalized tool
+input digest, and deadline. Every binding is echoed by the decision.
+
+The launcher must create and own the socket parent, mount that parent read-only,
+and preserve UID compatibility with the container runtime. The client requires
+a canonical non-writable parent owned by its effective UID and a socket with
+exact type, owner, and mode `0600`; it rechecks device/inode after connecting.
+It also requires the relay's `SO_PEERCRED` UID to equal the runtime UID.
+`SO_PEERCRED` authenticates kernel credentials at connection time, but does not
+attest the relay executable or host identity, and PID values may be translated
+by namespaces. The immutable host-created mount and run binding remain the
+authority boundary.
+
+In host mode, server and token arguments are still supplied to the gateway even
+when decisions resolve locally. Socket mode supplies neither.
 
 ### 3. Create a rule config
 

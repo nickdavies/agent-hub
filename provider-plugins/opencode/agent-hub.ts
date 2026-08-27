@@ -7,6 +7,10 @@
  *
  * Environment variables (set in the shell that launches opencode):
  *   AGENT_HUB_GATEWAY   path to the gateway binary (default: "agent-hub-gateway")
+ *   AGENT_HUB_APPROVAL_MODE  attended_socket for explicit sandbox mode
+ *   AGENT_HUB_ATTENDED_APPROVAL_SOCKET  immutable per-run relay socket
+ *   AGENT_HUB_ATTENDED_APPROVAL_BINDING  immutable attended run binding JSON
+ *   AGENT_HUB_ATTENDED_RUN_DEADLINE  attended run RFC 3339 deadline
  *   AGENT_HUB_SERVER    server URL (default: "http://localhost:8080")
  *   AGENT_HUB_TOKEN     bearer token for server auth (default: none)
  *   AGENT_HUB_CONFIG    path to agent-hub-permissions.json rule config (optional)
@@ -30,6 +34,12 @@ import type {
   SessionStatus,
   StatusReport,
 } from "./generated/gateway-types"
+import { approvalTransport, gatewayApprovalInvocation } from "./approval-transport"
+import { normalizePermission } from "./permission-normalization"
+
+const APPROVAL_TRANSPORT = approvalTransport(process.env)
+let attendedSequence = 0
+let attendedQueue: Promise<void> = Promise.resolve()
 
 // ---------------------------------------------------------------------------
 // Hook output type — extracted from Hooks["permission.ask"] so `apply()`
@@ -69,19 +79,6 @@ function log(level: LogLevel, msg: string, extra?: Record<string, string>) {
     .join(" ")
   const pad = level === "INFO" || level === "WARN" ? " " : ""
   fs.appendFileSync(logfile, `${level}${pad} ${ts} +${diff}ms ${kv} ${msg}\n`)
-}
-
-// ---------------------------------------------------------------------------
-// Permission name → gateway tool name (OpenCodeTool wire format).
-// The gateway's OpenCodeTool enum accepts both lowercase and PascalCase.
-// Values here use PascalCase to match the opencode tool.execute.before format.
-// ---------------------------------------------------------------------------
-
-const PERM_TO_TOOL: Record<string, OpenCodeTool> = {
-  bash: "Bash",
-  edit: "Write",
-  read: "Read",
-  webfetch: "WebFetch",
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +189,7 @@ function spawnStatusReport(
   status: SessionStatus,
   opts?: { waitingReason?: string; displayName?: string },
 ) {
+  if (APPROVAL_TRANSPORT.kind === "attended_socket") return
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const server = process.env.AGENT_HUB_SERVER ?? "http://localhost:8080"
   const token = process.env.AGENT_HUB_TOKEN ?? ""
@@ -230,6 +228,7 @@ function spawnStatusReportSync(
   status: SessionStatus,
   opts?: { waitingReason?: string; displayName?: string },
 ) {
+  if (APPROVAL_TRANSPORT.kind === "attended_socket") return
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const server = process.env.AGENT_HUB_SERVER ?? "http://localhost:8080"
   const token = process.env.AGENT_HUB_TOKEN ?? ""
@@ -277,20 +276,25 @@ function isValidGatewayOutput(v: unknown): v is OpenCodeHookOutput {
 }
 
 async function callGateway(sid: string, payload: OpenCodeHookInput): Promise<GatewayResult> {
+  if (APPROVAL_TRANSPORT.kind === "http") return callGatewayOnce(sid, payload)
+  const result = attendedQueue.then(() => callGatewayOnce(sid, payload))
+  attendedQueue = result.then(() => undefined, () => undefined)
+  return result
+}
+
+async function callGatewayOnce(sid: string, payload: OpenCodeHookInput): Promise<GatewayResult> {
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
-  const server = process.env.AGENT_HUB_SERVER
-  const token = process.env.AGENT_HUB_TOKEN
   const config = process.env.AGENT_HUB_CONFIG
 
-  const args: string[] = ["approval", "--opencode"]
-  args.push("--server", server ?? "http://localhost:8080")
-  args.push("--token", token ?? "")
+  const sequence = APPROVAL_TRANSPORT.kind === "attended_socket" ? ++attendedSequence : undefined
+  const invocation = gatewayApprovalInvocation(APPROVAL_TRANSPORT, process.env, sequence)
+  const args = invocation.args
   if (config) args.push("--config", config)
 
-  log("INFO", "callGateway", { bin, config: config ?? "(none)" })
+  log("INFO", "callGateway", { bin, config: config ?? "(none)", transport: APPROVAL_TRANSPORT.kind })
 
   return new Promise((resolve) => {
-    const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] })
+    const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: invocation.env })
     track(sid, proc)
 
     let stdout = ""
@@ -351,6 +355,9 @@ async function callGatewayQuestion(
   sid: string,
   payload: QuestionProxyRequest,
 ): Promise<QuestionGatewayResult> {
+  if (APPROVAL_TRANSPORT.kind === "attended_socket") {
+    return { error: "question relay is unavailable in approval-socket mode" }
+  }
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const server = process.env.AGENT_HUB_SERVER
   const token = process.env.AGENT_HUB_TOKEN
@@ -568,12 +575,11 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // is already handled by the gateway's in_workspace flag on file rules.
       // Auto-approve it here; the subsequent read/write permission will be
       // sent to the gateway with the correct path for rule evaluation.
-      if (info.permission === "external_directory") {
+      if (info.permission === "external_directory" && APPROVAL_TRANSPORT.kind === "http") {
         output.status = "allow"
         return
       }
 
-      const tool = PERM_TO_TOOL[info.permission] ?? info.permission
       const sid = info.sessionID
 
       // First tool call for this session — immediately register it on the
@@ -584,158 +590,29 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         spawnStatusReport(sid, "active")
       }
 
-      log("INFO", "about to call fetchTitle", { sid, tool })
+      log("INFO", "about to call fetchTitle", { sid, permission: info.permission })
       const title = await fetchTitle(client, sid, directory)
       log("INFO", "fetchTitle returned", { sid, title: title ?? "(none)" })
-
-      // -----------------------------------------------------------------
-      // bash: use the raw unparsed command from metadata rather than the
-      // per-subcommand tree-sitter fragments in patterns.
-      // -----------------------------------------------------------------
-      if (info.permission === "bash" && typeof info.metadata.command === "string") {
-        const result = await callGateway(
-          sid, makePayload(sid, tool, { command: info.metadata.command }, directory, worktree, title),
-        )
-        apply(result, output)
+      let requests
+      try {
+        requests = normalizePermission(info, directory, worktree)
+      } catch (error) {
+        log("ERROR", "permission normalization failed closed", { err: String(error) })
+        output.status = "deny"
+        Object.assign(output, { message: String(error) })
         return
       }
-
-      // -----------------------------------------------------------------
-      // edit (write.ts / edit.ts / apply_patch.ts):
-      //   metadata.filepath is the absolute path (scalar, for write/edit).
-      //   metadata.files is an array of per-file objects (for apply_patch).
-      //   patterns contains worktree-relative paths as fallback.
-      // -----------------------------------------------------------------
-      if (info.permission === "edit") {
-        // apply_patch: rich per-file metadata
-        if (Array.isArray(info.metadata.files)) {
-          for (const entry of info.metadata.files) {
-            const filePath = typeof entry === "object" && entry !== null &&
-              "filePath" in entry && typeof (entry as Record<string, unknown>).filePath === "string"
-              ? (entry as Record<string, unknown>).filePath as string
-              : undefined
-            if (!filePath) continue
-            const result = await callGateway(
-              sid, makePayload(sid, tool, { path: filePath }, directory, worktree, title),
-            )
-            if (!result.allowed) {
-              apply(result, output)
-              return
-            }
-          }
-          output.status = "allow"
-          return
-        }
-
-        // write/edit: scalar filepath in metadata (already absolute)
-        if (typeof info.metadata.filepath === "string") {
-          const result = await callGateway(
-            sid, makePayload(sid, tool, { path: info.metadata.filepath }, directory, worktree, title),
-          )
+      for (const request of requests) {
+        const result = await callGateway(
+          sid,
+          makePayload(sid, request.tool, request.toolInput, directory, worktree, title),
+        )
+        if (!result.allowed) {
           apply(result, output)
           return
         }
-
-        // Fallback: patterns entries are worktree-relative — resolve against worktree
-        for (const pat of info.patterns) {
-          const result = await callGateway(
-            sid, makePayload(sid, tool, { path: resolvePath(pat, worktree) }, directory, worktree, title),
-          )
-          if (!result.allowed) {
-            apply(result, output)
-            return
-          }
-        }
-        output.status = "allow"
-        return
       }
-
-      // -----------------------------------------------------------------
-      // read: patterns[0] is worktree-relative.
-      // -----------------------------------------------------------------
-      if (info.permission === "read") {
-        const result = await callGateway(
-          sid, makePayload(
-            sid,
-            tool,
-            makeReadToolInput(info.patterns[0] ?? "", worktree),
-            directory,
-            worktree,
-            title,
-          ),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // webfetch: metadata.url is the canonical arg the gateway expects.
-      // -----------------------------------------------------------------
-      if (info.permission === "webfetch" && typeof info.metadata.url === "string") {
-        const result = await callGateway(
-          sid, makePayload(sid, tool, { url: info.metadata.url }, directory, worktree, title),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // grep: patterns[0] is the regex; metadata may carry path/directory.
-      // The gateway requires `pattern`; `path` is optional.
-      // -----------------------------------------------------------------
-      if (info.permission === "grep") {
-        log("INFO", "grep permission info", {
-          patterns: JSON.stringify(info.patterns),
-          metadata: JSON.stringify(info.metadata),
-        })
-        const toolInput: Record<string, string> = {}
-        if (info.patterns[0]) toolInput.pattern = info.patterns[0]
-        // Forward path/directory from metadata if present
-        if (typeof info.metadata.path === "string") {
-          toolInput.path = resolvePath(info.metadata.path, directory)
-        } else if (typeof info.metadata.directory === "string") {
-          toolInput.path = resolvePath(info.metadata.directory, directory)
-        }
-        const result = await callGateway(
-          sid, makePayload(sid, tool, toolInput, directory, worktree, title),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // glob: preserve metadata.pattern as raw selector context while policy
-      // matching uses only the target path from metadata.path/directory or cwd.
-      // -----------------------------------------------------------------
-      if (info.permission === "glob") {
-        log("INFO", "glob permission info", {
-          patterns: JSON.stringify(info.patterns),
-          metadata: JSON.stringify(info.metadata),
-        })
-        const toolInput = makeGlobToolInput(info.metadata, directory)
-        const result = await callGateway(
-          sid, makePayload(sid, tool, toolInput, directory, worktree, title),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // All other tools (websearch, codesearch, list, task, todowrite,
-      // lsp, skill, ...):
-      // Single call with empty tool_input. get_matchable_args returns []
-      // for tools not in TOOL_DEFS and the rule engine falls to the
-      // configured default (typically "ask", escalating to the server).
-      // -----------------------------------------------------------------
-      log("INFO", "fallback permission info", {
-        permission: info.permission,
-        patterns: JSON.stringify(info.patterns),
-        metadata: JSON.stringify(info.metadata),
-      })
-      const result = await callGateway(
-        sid, makePayload(sid, tool, {}, directory, worktree, title),
-      )
-      apply(result, output)
+      output.status = "allow"
     },
 
     event: async ({ event: _event }) => {

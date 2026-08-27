@@ -1,9 +1,11 @@
 mod approval;
+mod approval_socket;
 mod providers;
 mod question;
 mod types;
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -16,6 +18,7 @@ use protocol::{
 use uuid::Uuid;
 
 use approval::{collect_extra, status_to_output};
+use approval_socket::request_approval;
 use types::{DecisionStatus, HookDecision, HookOutput, ParseError, ToolHookEvent};
 
 /// Agent Hub gateway — provider-agnostic tool approval hook.
@@ -58,11 +61,31 @@ struct ApprovalArgs {
 
     /// Server URL (e.g. https://hub.example.com)
     #[arg(long, env = "AGENT_HUB_SERVER")]
-    server: String,
+    server: Option<String>,
 
     /// Bearer token for server auth
     #[arg(long, env = "AGENT_HUB_TOKEN")]
-    token: Secret,
+    token: Option<Secret>,
+
+    /// Explicit approval transport mode. Sandbox runs require attended_socket.
+    #[arg(long, env = "AGENT_HUB_APPROVAL_MODE")]
+    approval_mode: Option<String>,
+
+    /// Per-run Unix-domain socket mounted into an attended sandbox
+    #[arg(long, env = "AGENT_HUB_ATTENDED_APPROVAL_SOCKET")]
+    approval_socket: Option<PathBuf>,
+
+    /// Immutable attended run binding JSON
+    #[arg(long, env = "AGENT_HUB_ATTENDED_APPROVAL_BINDING")]
+    approval_binding: Option<String>,
+
+    /// Monotonic attended request sequence supplied by the long-lived plugin
+    #[arg(long)]
+    approval_sequence: Option<u64>,
+
+    /// Upper bound for this attended request
+    #[arg(long, env = "AGENT_HUB_ATTENDED_RUN_DEADLINE")]
+    approval_deadline: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Maximum time to wait for approval in seconds
     #[arg(long, default_value = "86400")]
@@ -124,6 +147,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run_approval(args: ApprovalArgs) -> ExitCode {
+    if let Err(error) = validate_approval_transport(&args) {
+        eprintln!("agent-hub-gateway: {error}");
+        return ExitCode::from(2);
+    }
     if args.claude {
         run_hook::<protocol::ClaudeCodeHookInput>(
             args,
@@ -144,6 +171,59 @@ async fn run_approval(args: ApprovalArgs) -> ExitCode {
     } else {
         eprintln!("agent-hub-gateway: one of --claude, --cursor, or --opencode is required");
         ExitCode::from(2)
+    }
+}
+
+fn validate_approval_transport(args: &ApprovalArgs) -> Result<(), String> {
+    let attended_values = [
+        args.approval_socket.is_some(),
+        args.approval_binding.is_some(),
+        args.approval_sequence.is_some(),
+        args.approval_deadline.is_some(),
+    ];
+    match args.approval_mode.as_deref() {
+        Some("attended_socket") => {
+            if args.server.is_some() || args.token.is_some() {
+                return Err("attended_socket mode forbids an approval server and token".to_string());
+            }
+            if attended_values.iter().any(|present| !present) {
+                return Err(
+                    "attended_socket mode requires socket, binding, sequence, and deadline"
+                        .to_string(),
+                );
+            }
+            if !args
+                .approval_socket
+                .as_ref()
+                .is_some_and(|path| path.is_absolute())
+            {
+                return Err("attended approval socket path must be absolute".to_string());
+            }
+            if args.approval_sequence == Some(0) {
+                return Err("attended approval sequence must be positive".to_string());
+            }
+            serde_json::from_str::<protocol::AttendedGatewayBindingV1>(
+                args.approval_binding.as_deref().expect("checked above"),
+            )
+            .map_err(|error| format!("attended approval binding is invalid: {error}"))?;
+            if args.approval_deadline.expect("checked above") <= chrono::Utc::now() {
+                return Err("attended approval deadline has expired".to_string());
+            }
+            Ok(())
+        }
+        None => {
+            if attended_values.iter().any(|present| *present) {
+                return Err(
+                    "attended approval values require AGENT_HUB_APPROVAL_MODE=attended_socket"
+                        .to_string(),
+                );
+            }
+            if args.server.is_none() || args.token.is_none() {
+                return Err("host HTTP mode requires an approval server and token".to_string());
+            }
+            Ok(())
+        }
+        Some(mode) => Err(format!("unsupported approval mode '{mode}'")),
     }
 }
 
@@ -403,9 +483,6 @@ async fn escalate_to_server(
     event: &ToolHookEvent,
     extra: Option<ExtraContext>,
 ) -> Result<HookOutput, ApprovalFlowError> {
-    let client = reqwest::Client::new();
-    let base = args.server.trim_end_matches('/');
-
     let context = ApprovalContext {
         workspace_roots: event.workspace_roots.clone(),
         hook_event_name: event.hook_event_name.clone().into(),
@@ -413,6 +490,81 @@ async fn escalate_to_server(
     };
 
     let request_id = Uuid::new_v4().to_string();
+    let request = ApprovalRequest {
+        id: request_id,
+        session_id: event.session_id.clone(),
+        session_display_name: event.session_display_name.clone(),
+        cwd: event.cwd.clone(),
+        tool: event.tool_call.tool(),
+        tool_input: event.tool_call.raw_input().clone(),
+        provider: provider_name.to_string(),
+        request_type: RequestType::ToolUse,
+        context,
+    };
+
+    if let Some(socket) = &args.approval_socket {
+        eprintln!(
+            "[info] sending approval request to per-run relay: tool={} session={}",
+            event.tool_call.tool_name(),
+            event.session_id
+        );
+        let binding = serde_json::from_str::<protocol::AttendedGatewayBindingV1>(
+            args.approval_binding
+                .as_deref()
+                .expect("transport validated"),
+        )
+        .map_err(|error| {
+            ApprovalFlowError::Pipeline(format!("attended approval binding is invalid: {error}"))
+        })?;
+        let run_deadline = args.approval_deadline.expect("transport validated");
+        let timeout_deadline = chrono::Utc::now()
+            + chrono::Duration::from_std(Duration::from_secs(args.timeout)).map_err(|error| {
+                ApprovalFlowError::Pipeline(format!("attended approval timeout is invalid: {error}"))
+            })?;
+        let deadline = run_deadline.min(timeout_deadline);
+        let tool_input = event.tool_call.raw_input().clone();
+        let attended_request = protocol::AttendedGatewayRequestV1 {
+            version: protocol::ATTENDED_GATEWAY_REQUEST_VERSION.into(),
+            binding,
+            sequence: args.approval_sequence.expect("transport validated"),
+            request_id: request.id.clone(),
+            tool: event.tool_call.tool(),
+            tool_input_digest: protocol::tool_input_digest(&tool_input)
+                .map_err(ApprovalFlowError::Pipeline)?,
+            tool_input,
+            deadline,
+        };
+        let decision = request_approval(
+            socket,
+            &attended_request,
+            Duration::from_secs(args.timeout),
+            shutdown_signal(),
+        )
+        .await
+        .map_err(ApprovalFlowError::Pipeline)?;
+        return Ok(match decision.decision {
+            protocol::AttendedGatewayDecisionKind::Allow => HookOutput {
+                status: DecisionStatus::Approved,
+                message: decision.reason,
+            },
+            protocol::AttendedGatewayDecisionKind::Deny => HookOutput {
+                status: decision
+                    .reason
+                    .map(DecisionStatus::DeniedWithReason)
+                    .unwrap_or(DecisionStatus::Denied),
+                message: None,
+            },
+        });
+    }
+
+    let server = args.server.as_deref().ok_or_else(|| {
+        ApprovalFlowError::Pipeline("approval server is required outside sandbox mode".to_string())
+    })?;
+    let token = args.token.as_ref().ok_or_else(|| {
+        ApprovalFlowError::Pipeline("approval token is required outside sandbox mode".to_string())
+    })?;
+    let client = reqwest::Client::new();
+    let base = server.trim_end_matches('/');
     let register_url = format!("{base}/api/v1/hooks/approval");
     eprintln!(
         "[info] registering approval request: tool={} session={}",
@@ -421,18 +573,8 @@ async fn escalate_to_server(
     );
     let register_resp = client
         .post(&register_url)
-        .bearer_auth(args.token.expose())
-        .json(&ApprovalRequest {
-            id: request_id,
-            session_id: event.session_id.clone(),
-            session_display_name: event.session_display_name.clone(),
-            cwd: event.cwd.clone(),
-            tool: event.tool_call.tool(),
-            tool_input: event.tool_call.raw_input().clone(),
-            provider: provider_name.to_string(),
-            request_type: RequestType::ToolUse,
-            context,
-        })
+        .bearer_auth(token.expose())
+        .json(&request)
         .timeout(Duration::from_secs(10))
         .send()
         .await
@@ -475,13 +617,13 @@ async fn escalate_to_server(
     let cancel_url = format!("{base}/api/v1/approvals/{}/resolve", approval.id);
 
     tokio::select! {
-        result = poll_for_decision(&client, &wait_url, &args.token, deadline, args.timeout) => result,
+        result = poll_for_decision(&client, &wait_url, token, deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal, cancelling approval {}", approval.id);
             // Best-effort cancel — don't let this block shutdown for long.
             let _ = client
                 .post(&cancel_url)
-                .bearer_auth(args.token.expose())
+                .bearer_auth(token.expose())
                 .json(&serde_json::json!({"decision": "cancel"}))
                 .timeout(Duration::from_secs(5))
                 .send()

@@ -10,7 +10,8 @@
     "generate:schemas": "cd ../.. && cargo run -p protocol --bin generate_schemas -- provider-plugins/opencode/generated",
     "generate:types": "bun run generate-types.ts",
     "generate": "bun run generate:schemas && bun run generate:types",
-    "check": "bun run generate && bun run typecheck"
+    "test": "bun test",
+    "check": "bun run generate && bun run typecheck && bun run test"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.3.17"

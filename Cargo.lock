@@ -51,13 +51,16 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "capabilities",
+ "chrono",
  "clap",
  "config",
+ "libc",
  "protocol",
  "reqwest",
  "serde",
  "serde_json",
  "similar",
+ "tempfile",
  "tokio",
  "uuid",
 ]
