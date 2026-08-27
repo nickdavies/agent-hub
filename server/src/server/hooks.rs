@@ -193,9 +193,9 @@ pub async fn approval<N: Notifier>(
             .await;
     }
 
-    let approval = state
+    let outcome = state
         .approvals
-        .register(approvals::RegisterApproval {
+        .register_with_outcome(approvals::RegisterApproval {
             request_id: req.id,
             session_id: req.session_id,
             session_display_name: req.session_display_name,
@@ -207,18 +207,21 @@ pub async fn approval<N: Notifier>(
             context: req.context,
         })
         .await;
+    let approval = outcome.approval;
 
     // Send push notification with link if pending and base_url configured
-    if !approval.status.is_resolved()
+    if outcome.is_new
+        && !approval.status.is_resolved()
         && let Some(base_url) = &state.config.base_url
     {
         let url = format!("{}/approvals/{}", base_url, approval.id);
         let notifier = Arc::clone(&state.notifier);
         let title = "Agent Hub (approval)".to_string();
         let message = format!(
-            "[{project}] {} — {}",
-            req.tool,
-            truncate_input(&req.tool_input)
+            "[{}] {} — {}",
+            approval.project,
+            approval.tool,
+            truncate_input(&approval.tool_input)
         );
         tokio::spawn(async move {
             fire_and_forget(&*notifier, &title, &message, Some(&url)).await;

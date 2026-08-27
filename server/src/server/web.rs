@@ -3,7 +3,7 @@ use axum::Form;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_sessions::Session;
 use uuid::Uuid;
 
@@ -139,7 +139,13 @@ pub async fn approval_detail<N: Notifier>(
 
     let tool_input_pretty =
         serde_json::to_string_pretty(&approval.tool_input).unwrap_or_else(|_| "{}".to_string());
-    let approval_json = serde_json::to_string(&approval).unwrap_or_else(|_| "{}".to_string());
+    let approval_json = match json_for_script(&approval) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize approval detail data");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Serialization error").into_response();
+        }
+    };
     let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
 
@@ -150,6 +156,16 @@ pub async fn approval_detail<N: Notifier>(
         approval_json,
         readwrite,
         has_auth,
+    })
+}
+
+fn json_for_script<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    serde_json::to_string(value).map(|json| {
+        json.replace('<', "\\u003c")
+            .replace('>', "\\u003e")
+            .replace('&', "\\u0026")
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029")
     })
 }
 

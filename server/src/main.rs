@@ -121,11 +121,6 @@ async fn serve_with_storage(
 }
 
 async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result<()> {
-    let persisted = storage
-        .load()
-        .await
-        .context("failed to load persisted state")?;
-
     let config =
         server::config::ServerConfig::from_env().context("failed to load server config")?;
     let listen_addr = config.listen_addr.clone();
@@ -155,22 +150,24 @@ async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result
 
     let state = server::AppState::new(config, notifier, oauth);
 
-    if let Some(persisted) = persisted {
-        info!(
-            sessions = persisted.sessions.len(),
-            "restoring persisted state"
-        );
-        state.restore(persisted).await;
-    }
+    state
+        .restore_from_storage(&storage)
+        .await
+        .context("failed to restore persisted state")?;
 
     // Spawn session eviction background task
     let sessions = Arc::clone(&state.sessions);
     let approvals = Arc::clone(&state.approvals);
     let questions = Arc::clone(&state.questions);
-    tokio::spawn(async move {
+    let (maintenance_shutdown, mut maintenance_shutdown_rx) = tokio::sync::oneshot::channel();
+    let maintenance_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                biased;
+                _ = &mut maintenance_shutdown_rx => break,
+                _ = interval.tick() => {}
+            }
             let evicted = sessions.evict_stale(Duration::from_secs(1800)).await;
             for session_id in &evicted {
                 approvals.evict_session(session_id).await;
@@ -181,6 +178,10 @@ async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result
             let orphaned = approvals.evict_orphaned(Duration::from_secs(120)).await;
             if orphaned > 0 {
                 info!(count = orphaned, "cancelled orphaned approvals");
+            }
+            let expired_grants = approvals.purge_expired_grants().await;
+            if expired_grants > 0 {
+                info!(count = expired_grants, "purged expired approval grants");
             }
             let orphaned_q = questions.evict_orphaned(Duration::from_secs(120)).await;
             if orphaned_q > 0 {
@@ -229,6 +230,12 @@ async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
+
+    let shutdown_requested = maintenance_shutdown.send(()).is_ok();
+    maintenance_task.await.context("maintenance task failed")?;
+    if !shutdown_requested {
+        anyhow::bail!("maintenance task exited unexpectedly");
+    }
 
     // Save state after graceful shutdown
     let snapshot = state.snapshot().await;

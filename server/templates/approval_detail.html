@@ -17,6 +17,10 @@
         #deny-inline.visible { display: flex; gap: 0.5rem; align-items: center; }
         #deny-inline input { margin: 0; }
         #deny-inline button { margin: 0; white-space: nowrap; }
+        #timed-approval { display: none; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
+        #timed-approval.visible { display: flex; }
+        #timed-approval button { margin: 0; width: auto; }
+        #action-error { border: 1px solid var(--pico-del-color); color: var(--pico-del-color); padding: 0.75rem; border-radius: var(--pico-border-radius); }
         .view-toggle { font-size: 0.85rem; float: right; }
     </style>
 </head>
@@ -31,6 +35,7 @@
     </ul>
 </nav>
 <main class="container">
+    <p id="action-error" role="alert" hidden></p>
     <article>
         <header>
             <h3 id="tool-name">{{ approval.tool }}</h3>
@@ -69,8 +74,20 @@
         <hr>
         <div class="grid">
             <button onclick="doApprove()">Approve</button>
+            {% if approval.tool == protocol::Tool::Bash %}
+            <button class="outline" onclick="showTimedApproval()">Timed approve</button>
+            {% endif %}
             <button class="secondary" onclick="showDeny()">Deny</button>
         </div>
+        {% if approval.tool == protocol::Tool::Bash %}
+        <div id="timed-approval">
+            <button onclick="doApprove('30m')">1 · 30m</button>
+            <button onclick="doApprove('1h')">2 · 1h</button>
+            <button onclick="doApprove('2h')">3 · 2h</button>
+            <button onclick="doApprove('6h')">4 · 6h</button>
+            <button onclick="doApprove('24h')">5 · 24h</button>
+        </div>
+        {% endif %}
         <div id="deny-inline">
             <input type="text" id="deny-reason" placeholder="Reason..." onkeydown="if(event.key==='Enter'){doDeny();} if(event.key==='Escape'){hideDeny();}">
             <button class="secondary" onclick="doDeny()">Send</button>
@@ -84,12 +101,15 @@
 
 <div id="help-bar">
     <span>
-    {% if readwrite %}<kbd>a</kbd> approve &nbsp; <kbd>d</kbd> deny &nbsp;{% endif %}
+    {% if readwrite %}<kbd>a</kbd> approve &nbsp; {% if approval.tool == protocol::Tool::Bash %}<kbd>A</kbd> timed approve &nbsp; {% endif %}<kbd>d</kbd> deny &nbsp;{% endif %}
     <kbd>r</kbd> toggle raw &nbsp; <kbd>Esc</kbd> back &nbsp; <kbd>?</kbd> help</span>
     <div id="help-detail">
         <strong>Keyboard Shortcuts</strong><br>
         {% if readwrite %}
         <kbd>a</kbd> / <kbd>1</kbd> — Approve<br>
+        {% if approval.tool == protocol::Tool::Bash %}
+        <kbd>A</kbd> — Choose a temporary Bash approval duration<br>
+        {% endif %}
         <kbd>d</kbd> / <kbd>2</kbd> — Deny (prompts for reason)<br>
         {% endif %}
         <kbd>r</kbd> — Toggle raw JSON / smart view<br>
@@ -102,10 +122,12 @@
 <script>
 (function() {
     const READWRITE = {{ readwrite }};
+    const IS_BASH = {{ approval.tool == protocol::Tool::Bash }};
     const POLL_MS = 2000;
     const approvalId = '{{ approval.id }}';
     let rawMode = false;
     let resolved = {{ approval.status.is_resolved() }};
+    let timedApprovalVisible = false;
 
     // --- Smart formatting ---
     function formatSmartView(input) {
@@ -184,17 +206,51 @@
     }
 
     // --- Actions ---
-    window.doApprove = async function() {
-        await fetch('/api/v1/approvals/' + approvalId + '/resolve', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ decision: 'approve', message: null })
-        });
-        poll();
+    function showError(message) {
+        const error = document.getElementById('action-error');
+        error.textContent = message;
+        error.hidden = false;
+    }
+
+    function clearError() {
+        const error = document.getElementById('action-error');
+        error.textContent = '';
+        error.hidden = true;
+    }
+
+    window.doApprove = async function(approveFor = null) {
+        const body = { decision: 'approve', message: null };
+        if (approveFor) body.approve_for = approveFor;
+        try {
+            const response = await fetch('/api/v1/approvals/' + approvalId + '/resolve', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            if (!response.ok) throw new Error(`Could not approve request (HTTP ${response.status}).`);
+            clearError();
+            hideTimedApproval();
+            poll();
+        } catch (error) {
+            showError((error.message || 'Could not approve request.') + ' Check your connection and try again.');
+        }
+    };
+
+    window.showTimedApproval = function() {
+        if (!IS_BASH) return;
+        hideDeny();
+        timedApprovalVisible = true;
+        document.getElementById('timed-approval').classList.add('visible');
+    };
+
+    window.hideTimedApproval = function() {
+        timedApprovalVisible = false;
+        document.getElementById('timed-approval')?.classList.remove('visible');
     };
 
     window.showDeny = function() {
+        hideTimedApproval();
         const el = document.getElementById('deny-inline');
         if (el) {
             el.classList.add('visible');
@@ -209,14 +265,20 @@
 
     window.doDeny = async function() {
         const reason = document.getElementById('deny-reason').value || '';
-        await fetch('/api/v1/approvals/' + approvalId + '/resolve', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ decision: 'deny', message: reason })
-        });
-        hideDeny();
-        poll();
+        try {
+            const response = await fetch('/api/v1/approvals/' + approvalId + '/resolve', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ decision: 'deny', message: reason })
+            });
+            if (!response.ok) throw new Error(`Could not deny request (HTTP ${response.status}).`);
+            clearError();
+            hideDeny();
+            poll();
+        } catch (error) {
+            showError((error.message || 'Could not deny request.') + ' Check your connection and try again.');
+        }
     };
 
     // --- Keyboard shortcuts ---
@@ -224,12 +286,19 @@
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
         const key = e.key;
+        if (timedApprovalVisible) {
+            const durations = { '1': '30m', '2': '1h', '3': '2h', '4': '6h', '5': '24h' };
+            if (key === 'Escape') { e.preventDefault(); hideTimedApproval(); }
+            else if (durations[key]) { e.preventDefault(); doApprove(durations[key]); }
+            return;
+        }
         if (key === 'Escape' || key === 'Backspace') {
             e.preventDefault();
             window.location.href = '/approvals';
         }
         else if (key === 'r') { toggleView(); }
         else if (READWRITE && !resolved && (key === 'a' || key === '1')) { e.preventDefault(); doApprove(); }
+        else if (READWRITE && IS_BASH && !resolved && key === 'A') { e.preventDefault(); showTimedApproval(); }
         else if (READWRITE && !resolved && (key === 'd' || key === '2')) { e.preventDefault(); showDeny(); }
         else if (key === '?') {
             document.getElementById('help-detail').classList.toggle('visible');

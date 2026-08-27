@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use protocol::{
@@ -17,6 +18,16 @@ pub struct PersistedState {
     pub presence: Option<PresenceState>,
     #[serde(default)]
     pub pending_approvals: Vec<Approval>,
+    #[serde(default)]
+    pub timed_approval_grants: Vec<PersistedApprovalGrant>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PersistedApprovalGrant {
+    pub session_id: SessionId,
+    pub command: String,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// A single session's persisted data (excludes last_seen which is runtime-only).
@@ -83,5 +94,27 @@ impl Storage for LocalFileStorage {
         tokio::fs::write(&tmp, &data).await?;
         tokio::fs::rename(&tmp, &self.path).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PersistedState;
+
+    #[test]
+    fn old_schema_defaults_timed_approval_grants_to_empty() {
+        let old_schema = r#"{
+            "sessions": {},
+            "notify_config": null,
+            "presence": null,
+            "pending_approvals": []
+        }"#;
+
+        let state: PersistedState =
+            serde_json::from_str(old_schema).expect("the pre-grant state schema should still load");
+
+        assert!(state.sessions.is_empty());
+        assert!(state.pending_approvals.is_empty());
+        assert!(state.timed_approval_grants.is_empty());
     }
 }

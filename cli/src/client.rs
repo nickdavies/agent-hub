@@ -84,7 +84,11 @@ impl Client {
         let url = format!("{}/api/v1/approvals/{}/resolve", self.base_url, id);
         let req = self
             .auth(self.http.post(&url))
-            .json(&ApprovalResolveRequest { decision, message });
+            .json(&ApprovalResolveRequest {
+                decision,
+                message,
+                approve_for: None,
+            });
         let resp = req
             .send()
             .await
