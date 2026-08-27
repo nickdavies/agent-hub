@@ -2,7 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const IMAGE_TAG: &str = "agent-hub/job-code:2026-08-24";
+const IMAGE_TAG: &str = "agent-hub/job-code:2026-08-27";
 
 #[test]
 fn authorization_is_cross_process_single_use_and_precedes_runtime_side_effects() {
@@ -232,6 +232,7 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
 
 fn preflight_report(uid: u32, gid: u32) -> serde_json::Value {
     let tools = [
+        "agent_hub_gateway",
         "cargo",
         "cc",
         "cmake",
@@ -262,6 +263,7 @@ fn preflight_report(uid: u32, gid: u32) -> serde_json::Value {
     .map(|name| (name.to_string(), serde_json::json!(format!("{name} 1.0"))))
     .collect::<serde_json::Map<_, _>>();
     let sources = [
+        "agent_hub",
         "gh",
         "go",
         "node",
@@ -286,7 +288,7 @@ fn preflight_report(uid: u32, gid: u32) -> serde_json::Value {
     })
     .collect::<serde_json::Map<_, _>>();
     let manifest = serde_json::json!({
-        "schema":"agent-hub.job-code-tools.v2",
+        "schema":"agent-hub.job-code-tools.v3",
         "image":IMAGE_TAG,
         "debian_snapshot":"20260824T000000Z",
         "runtime":{"rust_home":"/opt/rust","rust_bin":"/opt/rust/bin","cargo_home":"$HOME/.cargo"},
@@ -295,7 +297,7 @@ fn preflight_report(uid: u32, gid: u32) -> serde_json::Value {
     });
     let contents = serde_json::to_string(&manifest).unwrap();
     serde_json::json!({
-        "schema":"agent-hub.job-code-preflight.v2",
+        "schema":"agent-hub.job-code-preflight.v3",
         "status":"ok",
         "image":{"resolved":format!("sha256:{}", "a".repeat(64))},
         "requested":{"uid":uid,"gid":gid},

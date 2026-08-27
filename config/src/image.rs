@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -10,6 +10,10 @@ pub const JOB_CODE_TOOL_MANIFEST_PATH: &str =
 
 pub fn job_code_tool_manifest_sha256(contents: &str) -> String {
     hex::encode(Sha256::digest(contents.as_bytes()))
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub fn job_code_preflight_docker_args(
@@ -61,7 +65,7 @@ pub fn validate_job_code_preflight_report(
 ) -> Result<serde_json::Value, String> {
     let report: JobCodePreflightReport = serde_json::from_slice(bytes)
         .map_err(|error| format!("preflight returned invalid JSON: {error}"))?;
-    if report.schema != "agent-hub.job-code-preflight.v2"
+    if report.schema != "agent-hub.job-code-preflight.v3"
         || report.status != "ok"
         || !is_sha256_identity(expected_image)
         || report.image.resolved != expected_image
@@ -146,8 +150,8 @@ struct JobCodeToolManifest {
 
 impl JobCodeToolManifest {
     fn validate(&self) -> Result<(), String> {
-        if self.schema != "agent-hub.job-code-tools.v2"
-            || self.image != "agent-hub/job-code:2026-08-24"
+        if self.schema != "agent-hub.job-code-tools.v3"
+            || self.image != "agent-hub/job-code:2026-08-27"
             || !is_debian_snapshot(&self.debian_snapshot)
             || self.runtime.rust_home != "/opt/rust"
             || self.runtime.rust_bin != "/opt/rust/bin"
@@ -179,6 +183,7 @@ struct ToolRuntime {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequiredTools {
+    agent_hub_gateway: String,
     cargo: String,
     cc: String,
     cmake: String,
@@ -209,6 +214,7 @@ struct RequiredTools {
 impl RequiredTools {
     fn validate(&self) -> Result<(), String> {
         let versions = [
+            &self.agent_hub_gateway,
             &self.cargo,
             &self.cc,
             &self.cmake,
@@ -287,6 +293,7 @@ struct DebianPackage {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolSources {
+    agent_hub: DownloadSource,
     gh: DownloadSource,
     go: DownloadSource,
     node: DownloadSource,
@@ -303,6 +310,7 @@ struct ToolSources {
 impl ToolSources {
     fn validate(&self) -> Result<(), String> {
         for source in [
+            &self.agent_hub,
             &self.gh,
             &self.go,
             &self.node,
@@ -372,6 +380,31 @@ pub struct ImageConfig {
     pub description: String,
     #[serde(default)]
     pub extends: Option<String>,
+    #[serde(default)]
+    pub build_contexts: BTreeMap<String, ImageBuildContext>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageBuildContext {
+    #[serde(rename = "type")]
+    pub context_type: String,
+    pub url: String,
+    pub commit: String,
+    pub archive_sha256: String,
+}
+
+impl ImageBuildContext {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.context_type != "git"
+            || !self.url.starts_with("https://")
+            || !is_canonical_digest(&self.commit, 40)
+            || !is_canonical_digest(&self.archive_sha256, 64)
+        {
+            return Err("image source build context identity is invalid".into());
+        }
+        Ok(())
+    }
 }
 
 impl ImageConfig {
@@ -442,6 +475,29 @@ fn visit_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_source_context_requires_exact_archive_identity_and_rejects_unknown_fields() {
+        let valid = r#"
+[image]
+name = "job-code"
+tag = "agent-hub/job-code:2026-08-27"
+description = "test"
+[image.build_contexts.agent-hub-source]
+type = "git"
+url = "https://github.com/nickdavies/agent-hub.git"
+commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#;
+        let parsed: ImageTomlFile = toml::from_str(valid).unwrap();
+        parsed.image.build_contexts["agent-hub-source"]
+            .validate()
+            .unwrap();
+        assert!(toml::from_str::<ImageTomlFile>(&format!("{valid}\nunknown = true\n")).is_err());
+        let mut mismatched = parsed.image.build_contexts["agent-hub-source"].clone();
+        mismatched.archive_sha256 = "not-a-digest".into();
+        assert!(mismatched.validate().is_err());
+    }
 
     #[test]
     fn job_code_preflight_is_non_root_isolated_and_mount_free() {
@@ -607,6 +663,7 @@ mod tests {
 
     fn valid_preflight_report() -> serde_json::Value {
         let tool_names = [
+            "agent_hub_gateway",
             "cargo",
             "cc",
             "cmake",
@@ -638,6 +695,7 @@ mod tests {
             .map(|name| (name.to_string(), serde_json::json!(format!("{name} 1.0"))))
             .collect::<serde_json::Map<_, _>>();
         let source_names = [
+            "agent_hub",
             "gh",
             "go",
             "node",
@@ -663,8 +721,8 @@ mod tests {
             })
             .collect::<serde_json::Map<_, _>>();
         let manifest = serde_json::json!({
-            "schema":"agent-hub.job-code-tools.v2",
-            "image":"agent-hub/job-code:2026-08-24",
+            "schema":"agent-hub.job-code-tools.v3",
+            "image":"agent-hub/job-code:2026-08-27",
             "debian_snapshot":"20260824T000000Z",
             "runtime":{"rust_home":"/opt/rust","rust_bin":"/opt/rust/bin","cargo_home":"$HOME/.cargo"},
             "tools":tools,
@@ -673,7 +731,7 @@ mod tests {
         let contents = serde_json::to_string(&manifest).unwrap();
         let sha256 = hex::encode(Sha256::digest(contents.as_bytes()));
         serde_json::json!({
-            "schema":"agent-hub.job-code-preflight.v2",
+            "schema":"agent-hub.job-code-preflight.v3",
             "status":"ok",
             "image":{"resolved":format!("sha256:{}", "a".repeat(64))},
             "requested":{"uid":1000,"gid":1001},

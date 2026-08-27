@@ -54,8 +54,23 @@ pub struct AttendedAuthorizationRequestV2 {
     pub proposal: AttendedProposal,
     pub execution: AttendedExecutionSpec,
     pub approval_bundle_digest: String,
+    pub approval_bundle: Option<AttendedApprovalBundleIdentity>,
     pub output: AttendedOutputContract,
     pub lifecycle: AttendedLifecycleContract,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedApprovalBundleIdentity {
+    pub name: String,
+    pub digest: String,
+    pub protocol: String,
+    pub gateway_commit: String,
+    pub gateway_archive_sha256: String,
+    pub plugin_sha256: String,
+    pub dippy_commit: String,
+    pub dippy_archive_sha256: String,
+    pub dippy_wheel_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -547,6 +562,38 @@ impl AttendedAuthorizationRequestV2 {
         {
             return Err("attended approval bundle digest is not lowercase SHA-256".into());
         }
+        match (self.proposal.tool_approval, &self.approval_bundle) {
+            (ToolApprovalMode::Dippy, Some(identity)) => {
+                if identity.digest != approval_bundle_digest
+                    || identity.name.is_empty()
+                    || identity.protocol != crate::ATTENDED_GATEWAY_REQUEST_VERSION
+                    || !is_lower_hex(&identity.gateway_commit, 40)
+                    || !is_lower_hex(&identity.dippy_commit, 40)
+                    || [
+                        &identity.digest,
+                        &identity.gateway_archive_sha256,
+                        &identity.plugin_sha256,
+                        &identity.dippy_archive_sha256,
+                        &identity.dippy_wheel_sha256,
+                    ]
+                    .into_iter()
+                    .any(|value| !is_lower_hex(value, 64))
+                {
+                    return Err("attended approval bundle identity is invalid".into());
+                }
+            }
+            (ToolApprovalMode::Dippy, None) => {
+                return Err(
+                    "supervised attended authorization has no approval bundle identity".into(),
+                );
+            }
+            (ToolApprovalMode::Auto, Some(_)) => {
+                return Err(
+                    "automatic attended authorization contains approval bundle material".into(),
+                );
+            }
+            (ToolApprovalMode::Auto, None) => {}
+        }
         let normalized = AttendedAuthorizationRequestV1 {
             version: ATTENDED_AUTHORIZATION_REQUEST_VERSION.into(),
             proposal: self.proposal,
@@ -573,6 +620,13 @@ impl AttendedAuthorizationRequestV2 {
             canonical_bytes: bytes,
         })
     }
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_image_id(identity: &str) -> Result<(), String> {

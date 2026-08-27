@@ -156,6 +156,7 @@ fn request_v2() -> AttendedAuthorizationRequestV2 {
         proposal: request.proposal,
         execution: request.execution,
         approval_bundle_digest: "a".repeat(64),
+        approval_bundle: None,
         output: request.output,
         lifecycle: request.lifecycle,
     }
@@ -244,6 +245,28 @@ fn attended_v2_binds_approval_bundle_without_redefining_v1() {
         ..v2
     };
     assert!(changed.verify_v2().is_err());
+}
+
+#[test]
+fn attended_v2_requires_exact_gateway_plugin_and_dippy_identities_for_supervision() {
+    let mut request = request_v2();
+    request.proposal.tool_approval = ToolApprovalMode::Dippy;
+    request.approval_bundle = Some(protocol::AttendedApprovalBundleIdentity {
+        name: "code-supervised".into(),
+        digest: "a".repeat(64),
+        protocol: protocol::ATTENDED_GATEWAY_REQUEST_VERSION.into(),
+        gateway_commit: "b".repeat(40),
+        gateway_archive_sha256: "c".repeat(64),
+        plugin_sha256: "d".repeat(64),
+        dippy_commit: "e".repeat(40),
+        dippy_archive_sha256: "f".repeat(64),
+        dippy_wheel_sha256: "1".repeat(64),
+    });
+    request.canonical_artifact().unwrap();
+    request.approval_bundle.as_mut().unwrap().plugin_sha256 = "tampered".into();
+    assert!(request.canonical_artifact().is_err());
+    request.approval_bundle = None;
+    assert!(request.canonical_artifact().is_err());
 }
 
 #[test]

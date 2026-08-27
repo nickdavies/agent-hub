@@ -92,11 +92,20 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
             .join("images")
             .join(&cfg.name)
             .join("Dockerfile");
-        if cfg.name == "job-code"
-            && let Err(error) = validate_reproducible_job_code_context(&dockerfile)
-        {
-            eprintln!("[FAIL] {error}");
-            return (false, Vec::new());
+        if cfg.name == "job-code" {
+            if let Err(error) = validate_reproducible_job_code_context(&dockerfile) {
+                eprintln!("[FAIL] {error}");
+                return (false, Vec::new());
+            }
+            if cfg.build_contexts.len() != 1 || !cfg.build_contexts.contains_key("agent-hub-source")
+            {
+                eprintln!("[FAIL] job-code requires only the agent-hub-source build context");
+                return (false, Vec::new());
+            }
+            if let Err(error) = cfg.build_contexts["agent-hub-source"].validate() {
+                eprintln!("[FAIL] {error}");
+                return (false, Vec::new());
+            }
         }
     }
 
@@ -123,6 +132,20 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
             .arg(&dockerfile)
             .arg("-t")
             .arg(tag);
+        if image_name == "job-code" {
+            let context = &cfg.build_contexts["agent-hub-source"];
+            let materialized = match materialize_git_build_context(config_root, image_name, context)
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!("[FAIL] {error}");
+                    return (false, built);
+                }
+            };
+            command
+                .arg("--build-context")
+                .arg(format!("agent-hub-source={}", materialized.display()));
+        }
         let status = command.arg(&image_dir).status();
 
         match status {
@@ -148,6 +171,117 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
     }
 
     (ok, built)
+}
+
+fn materialize_git_build_context(
+    config_root: &Path,
+    image_name: &str,
+    context: &config::ImageBuildContext,
+) -> Result<PathBuf, String> {
+    context.validate()?;
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| "Agent Hub source repository path is unavailable".to_string())?;
+    let remote = git_output(repository, &["remote", "get-url", "origin"])?;
+    if canonical_git_url(remote.trim()) != canonical_git_url(&context.url) {
+        return Err("local Agent Hub object database does not match configured repository".into());
+    }
+    let expression = format!("{}^{{commit}}", context.commit);
+    let resolved = git_output(repository, &["rev-parse", &expression])?;
+    if resolved.trim() != context.commit {
+        return Err("configured Agent Hub source commit is unavailable locally".into());
+    }
+    let archive = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["archive", "--format=tar", &context.commit])
+        .output()
+        .map_err(|error| format!("failed to materialize Agent Hub git archive: {error}"))?;
+    if !archive.status.success() {
+        return Err(format!(
+            "failed to materialize Agent Hub git archive: {}",
+            String::from_utf8_lossy(&archive.stderr).trim()
+        ));
+    }
+    verify_source_archive(&archive.stdout, context)?;
+    let destination = config_root
+        .join("artifacts")
+        .join("build-contexts")
+        .join(format!("{image_name}-{}", context.commit));
+    if destination.exists() {
+        std::fs::remove_dir_all(&destination)
+            .map_err(|error| format!("failed to clear {}: {error}", destination.display()))?;
+    }
+    std::fs::create_dir_all(&destination)
+        .map_err(|error| format!("failed to create {}: {error}", destination.display()))?;
+    let mut child = Command::new("tar")
+        .args(["-x", "-C"])
+        .arg(&destination)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to launch tar for source archive: {error}"))?;
+    std::io::Write::write_all(
+        child.stdin.as_mut().expect("piped tar stdin"),
+        &archive.stdout,
+    )
+    .map_err(|error| format!("failed to write source archive to tar: {error}"))?;
+    drop(child.stdin.take());
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed to wait for source archive extraction: {error}"))?;
+    if !status.success() {
+        return Err(format!("source archive extraction failed with {status}"));
+    }
+    Ok(destination)
+}
+
+fn verify_source_archive(bytes: &[u8], context: &config::ImageBuildContext) -> Result<(), String> {
+    let actual = config::sha256_hex(bytes);
+    if actual != context.archive_sha256 {
+        return Err(format!(
+            "Agent Hub source archive digest mismatch: expected {}, got {actual}",
+            context.archive_sha256
+        ));
+    }
+    Ok(())
+}
+
+fn git_output(repository: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to inspect local Agent Hub repository: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to inspect local Agent Hub repository: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("local Agent Hub repository output is not UTF-8: {error}"))
+}
+
+fn canonical_git_url(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase();
+    if let Some((_, repository)) = normalized.split_once("://") {
+        return repository
+            .rsplit_once('@')
+            .map_or(repository, |(_, repository)| repository)
+            .to_string();
+    }
+    if let Some((authority, path)) = normalized.split_once(':') {
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        return format!("{host}/{path}");
+    }
+    normalized
 }
 
 fn run_job_code_preflight(image: &str, representative_path: &Path) -> Result<(), String> {
@@ -235,6 +369,31 @@ fn validate_reproducible_job_code_context(dockerfile: &Path) -> Result<(), Strin
             "copy" => validate_copy_instruction(&instruction.value)?,
             _ => {}
         }
+    }
+    let gateway_builds = instructions
+        .iter()
+        .filter(|instruction| {
+            instruction.keyword == "run"
+                && instruction
+                    .value
+                    .contains("cargo build --locked --release -p agent-hub-gateway")
+        })
+        .count();
+    let cargo_builds = instructions
+        .iter()
+        .map(|instruction| instruction.value.matches("cargo build").count())
+        .sum::<usize>();
+    let source_copies = instructions
+        .iter()
+        .filter(|instruction| {
+            instruction.keyword == "copy"
+                && instruction.value == "--from=agent-hub-source / /opt/src/agent-hub"
+        })
+        .count();
+    if gateway_builds != 1 || cargo_builds != 1 || source_copies != 1 {
+        return Err(
+            "job-code Dockerfile must copy only the named Agent Hub source context and build agent-hub-gateway exactly once with Cargo --locked".into(),
+        );
     }
 
     let snapshot = instructions
@@ -332,7 +491,11 @@ fn validate_reproducible_job_code_context(dockerfile: &Path) -> Result<(), Strin
 }
 
 fn validate_copy_instruction(value: &str) -> Result<(), String> {
-    if value != "preflight.sh /usr/local/libexec/agent-hub-job-code-preflight" {
+    if !matches!(
+        value,
+        "preflight.sh /usr/local/libexec/agent-hub-job-code-preflight"
+            | "--from=agent-hub-source / /opt/src/agent-hub"
+    ) {
         return Err("job-code COPY input is not an approved local context file".to_string());
     }
     Ok(())
@@ -1051,6 +1214,26 @@ fn write_manifest(
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_archive_digest_mismatch_fails_closed() {
+        let context = config::ImageBuildContext {
+            context_type: "git".into(),
+            url: "https://example.com/agent-hub.git".into(),
+            commit: "a".repeat(40),
+            archive_sha256: config::sha256_hex(b"expected"),
+        };
+        assert!(verify_source_archive(b"expected", &context).is_ok());
+        assert!(verify_source_archive(b"tampered", &context).is_err());
+    }
+
+    #[test]
+    fn source_repository_identity_accepts_same_https_and_ssh_repository() {
+        assert_eq!(
+            canonical_git_url("git@github.com:nickdavies/agent-hub.git"),
+            canonical_git_url("https://github.com/nickdavies/agent-hub.git")
+        );
+    }
+
     const LOCKED_DOCKERFILE: &str = r#"FROM debian:bookworm-slim@sha256:abc
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DEBIAN_SNAPSHOT=20260803T000000Z
@@ -1070,6 +1253,8 @@ ENV TOOL_VERSION=1.0
 ENV TOOL_SHA256=abc
 RUN curl -fsSL "https://example.com/tool-${TOOL_VERSION}" -o /tmp/tool \
     && printf '%s  %s\n' "$TOOL_SHA256" /tmp/tool | sha256sum -c -
+COPY --from=agent-hub-source / /opt/src/agent-hub
+RUN cd /opt/src/agent-hub && cargo build --locked --release -p agent-hub-gateway
 "#;
 
     fn validate(source: &str) -> Result<(), String> {

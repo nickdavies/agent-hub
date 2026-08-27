@@ -23,8 +23,8 @@ pub use environment_bundle::{
     validate_durable_opencode_config,
 };
 pub use image::{
-    ImageConfig, JOB_CODE_PREFLIGHT_PATH, JOB_CODE_TOOL_MANIFEST_PATH,
-    job_code_preflight_docker_args, job_code_tool_manifest_sha256, resolve_build_order,
+    ImageBuildContext, ImageConfig, JOB_CODE_PREFLIGHT_PATH, JOB_CODE_TOOL_MANIFEST_PATH,
+    job_code_preflight_docker_args, job_code_tool_manifest_sha256, resolve_build_order, sha256_hex,
     validate_job_code_preflight_report,
 };
 pub use network_policy::{
@@ -35,12 +35,12 @@ pub use rules::{
     default_to_resolved, load_tool_config, resolve_action, validate_tool_config,
 };
 pub use runner::{
-    CredentialProviderDescriptor, DURABLE_OPENCODE_PATH, ManagedRunnerFileMount, ManagedRunnerKind,
-    ManagedRunnerSpec, McpBridgeDescriptor, OPENCODE_PROJECT_CONFIG_ALIASES, OpencodeRunnerConfig,
-    ResolvedRunnerProfile, RunnerProfilesConfig, TrustedMountDescriptor,
-    canonicalize_resolved_runner_profile, digest_profile, directory_content_digests,
-    trusted_opencode_runtime_env, validate_untrusted_opencode_env,
-    validate_untrusted_opencode_env_name,
+    CredentialProviderDescriptor, DURABLE_OPENCODE_PATH, HostApprovalsConfig,
+    ManagedRunnerFileMount, ManagedRunnerKind, ManagedRunnerSpec, McpBridgeDescriptor,
+    OPENCODE_PROJECT_CONFIG_ALIASES, OpencodeRunnerConfig, ResolvedRunnerProfile,
+    RunnerProfilesConfig, TrustedMountDescriptor, canonicalize_resolved_runner_profile,
+    digest_profile, directory_content_digests, trusted_opencode_runtime_env,
+    validate_untrusted_opencode_env, validate_untrusted_opencode_env_name,
 };
 pub use system::SystemConfig;
 pub use tools::{is_in_workspace, normalize_path, resolve_path};

@@ -590,7 +590,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             root.join("environments/test/environment.toml"),
-            "[environment]\nname='test'\ndescription='test'\nimage='agent-hub/job-code:2026-08-24'\nnetwork_policy='none'\napproval_mode='auto'\n",
+            "[environment]\nname='test'\ndescription='test'\nimage='agent-hub/job-code:2026-08-27'\nnetwork_policy='none'\napproval_mode='auto'\n",
         )
         .unwrap();
         std::fs::write(

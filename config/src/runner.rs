@@ -29,6 +29,8 @@ pub struct RunnerProfilesConfig {
     pub egress: serde_json::Value,
     #[serde(default)]
     pub github_hosts: Vec<String>,
+    #[serde(default)]
+    pub host_approvals: HostApprovalsConfig,
 }
 
 impl Default for RunnerProfilesConfig {
@@ -41,8 +43,31 @@ impl Default for RunnerProfilesConfig {
             mcp_bridges: Vec::new(),
             egress: default_egress_value(),
             github_hosts: Vec::new(),
+            host_approvals: HostApprovalsConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostApprovalsConfig {
+    #[serde(default = "default_host_approvals_url")]
+    pub url: String,
+    #[serde(default)]
+    pub credential_provider: Option<String>,
+}
+
+impl Default for HostApprovalsConfig {
+    fn default() -> Self {
+        Self {
+            url: default_host_approvals_url(),
+            credential_provider: None,
+        }
+    }
+}
+
+fn default_host_approvals_url() -> String {
+    "http://localhost:8080".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -345,6 +370,24 @@ impl RunnerProfilesConfig {
         self.managed_runners = normalized_runners;
         self.github_hosts = canonical_unique_strings(&self.github_hosts, "github_hosts", true)?;
         self.egress = canonicalize_egress(self.egress)?;
+        validate_host_approvals(&self.host_approvals, &self.credential_providers)?;
+        if let Some(name) = self.host_approvals.credential_provider.as_deref()
+            && (self
+                .default_agent
+                .requires_credentials
+                .iter()
+                .any(|value| value == name)
+                || self.managed_runners.values().any(|runner| {
+                    runner
+                        .requires_credentials
+                        .iter()
+                        .any(|value| value == name)
+                }))
+        {
+            return Err(format!(
+                "host approvals credential provider '{name}' must not be authorized for a container runner"
+            ));
+        }
         for (name, definition) in &self.credential_providers {
             validate_identifier(name, "credential provider name")?;
             let object = definition
@@ -539,6 +582,51 @@ impl RunnerProfilesConfig {
         };
         canonicalize_resolved_runner_profile(&profile)
     }
+}
+
+fn validate_host_approvals(
+    approvals: &HostApprovalsConfig,
+    providers: &HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let url = approvals.url.as_str();
+    let authority = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"));
+    if !(url.starts_with("http://") || url.starts_with("https://"))
+        || authority.is_none_or(|authority| {
+            authority.is_empty()
+                || authority.contains('/')
+                || authority.chars().any(char::is_whitespace)
+        })
+        || url.ends_with('/')
+        || url.contains('@')
+        || url.contains('?')
+        || url.contains('#')
+        || url.chars().any(char::is_control)
+    {
+        return Err("host_approvals.url must be a canonical HTTP(S) origin without credentials, query, fragment, or trailing slash".into());
+    }
+    if let Some(name) = approvals.credential_provider.as_deref() {
+        validate_identifier(name, "host approvals credential provider")?;
+        let provider = providers.get(name).ok_or_else(|| {
+            format!("host approvals require unknown credential provider '{name}'")
+        })?;
+        let object = provider
+            .as_object()
+            .ok_or_else(|| format!("credential provider '{name}' must be an object"))?;
+        if object.get("type").and_then(serde_json::Value::as_str) != Some("command")
+            || object
+                .get("capture_env")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            || object
+                .get("capture_file")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err("host approvals credential provider must be a host-only command capture_env provider".into());
+        }
+    }
+    Ok(())
 }
 
 fn canonical_json(value: serde_json::Value) -> serde_json::Value {
@@ -1259,6 +1347,45 @@ fn default_managed_agent_runner() -> ManagedRunnerSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_approvals_are_strict_host_only_and_no_auth_remains_valid() {
+        let mut config = RunnerProfilesConfig::default();
+        config.validated().unwrap();
+
+        config = RunnerProfilesConfig::default();
+        config.host_approvals.url = "https://approvals.example".into();
+        config.host_approvals.credential_provider = Some("approval-token".into());
+        config.credential_providers.insert(
+            "approval-token".into(),
+            serde_json::json!({
+                "type":"command",
+                "name":"approval-token",
+                "command":"credential-helper",
+                "args":[],
+                "capture_env":"AGENT_HUB_TOKEN",
+                "capture_file":null
+            }),
+        );
+        config.clone().validated().unwrap();
+
+        for url in [
+            "file:///credential",
+            "https://user@example.com",
+            "https://example.com/",
+            "https://example.com?token=secret",
+        ] {
+            let mut invalid = config.clone();
+            invalid.host_approvals.url = url.into();
+            assert!(invalid.validated().is_err(), "accepted {url}");
+        }
+        let mut leaked = config;
+        leaked
+            .default_agent
+            .requires_credentials
+            .push("approval-token".into());
+        assert!(leaked.validated().is_err());
+    }
 
     fn canonical_test_config() -> RunnerProfilesConfig {
         RunnerProfilesConfig {

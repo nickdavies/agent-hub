@@ -21,6 +21,8 @@ pub struct LocalAgentConfig {
     pub egress: EgressConfig,
     #[serde(default)]
     pub credential_providers: HashMap<String, CredentialProvider>,
+    #[serde(default, rename = "host_approvals")]
+    _host_approvals: agent_hub_config::HostApprovalsConfig,
     #[serde(default = "default_managed_agent_runner")]
     pub default_agent: ManagedRunnerSpec,
     /// Optional name of an entry in `managed_runners` to use as the default agent
@@ -59,6 +61,7 @@ impl Default for LocalAgentConfig {
             config_identity: default_config_identity(),
             egress: EgressConfig::default(),
             credential_providers: HashMap::new(),
+            _host_approvals: agent_hub_config::HostApprovalsConfig::default(),
             default_agent: default_managed_agent_runner(),
             default_agent_id: None,
             managed_runners: HashMap::new(),

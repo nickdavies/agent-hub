@@ -172,6 +172,7 @@ fn request() -> AttendedAuthorizationRequestV2 {
             primary_workspace: "primary".into(),
         },
         approval_bundle_digest: "a".repeat(64),
+        approval_bundle: None,
         output: AttendedOutputContract::default(),
         lifecycle: AttendedLifecycleContract::default(),
     }

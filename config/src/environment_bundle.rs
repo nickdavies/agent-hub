@@ -1,13 +1,24 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{EnvironmentConfig, NetworkPolicyConfig, SystemConfig, flatten_policy};
 
 pub const DURABLE_OPENCODE_MODEL: &str = "openai/gpt-5.6-sol";
-pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-08-24";
+pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-08-27";
+pub const APPROVAL_BUNDLE_PROTOCOL: &str = "attended_gateway_v1";
+pub const APPROVAL_PLUGIN_URI: &str =
+    "file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js";
+const APPROVAL_WHEEL: &str = "dippy-0.2.7-py3-none-any.whl";
+const APPROVAL_FILES: [&str; 4] = [
+    "agent-hub-opencode-plugin.js",
+    "agent-hub-permissions.json",
+    APPROVAL_WHEEL,
+    "dippy.policy",
+];
 pub const OPENCODE_CONFIG_SENTINEL: &[u8] =
     b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore";
 pub const OPENCODE_CONFIG_SENTINEL_SHA256: &str =
@@ -23,6 +34,65 @@ pub struct EnvironmentBundleFile {
 pub struct EnvironmentBundle {
     pub files: Vec<EnvironmentBundleFile>,
     pub digest: String,
+    pub approval_bundle: Option<ApprovalBundleIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalBundleIdentity {
+    pub name: String,
+    pub digest: String,
+    pub protocol: String,
+    pub gateway_commit: String,
+    pub gateway_archive_sha256: String,
+    pub plugin_sha256: String,
+    pub dippy_commit: String,
+    pub dippy_archive_sha256: String,
+    pub dippy_wheel_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalBundleManifest {
+    schema: String,
+    version: u32,
+    protocol: String,
+    sources: ApprovalBundleSources,
+    build: ApprovalBundleBuild,
+    artifacts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalBundleSources {
+    agent_hub: AgentHubApprovalSource,
+    dippy: ApprovalSource,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalSource {
+    repository: String,
+    commit: String,
+    tree: String,
+    archive_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentHubApprovalSource {
+    repository: String,
+    commit: String,
+    tree: String,
+    archive_sha256: String,
+    plugin_entrypoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalBundleBuild {
+    dippy: String,
+    plugin: String,
 }
 
 impl EnvironmentBundle {
@@ -42,7 +112,11 @@ impl EnvironmentBundle {
             .map(|(path, bytes)| EnvironmentBundleFile { path, bytes })
             .collect::<Vec<_>>();
         let digest = digest_files(&files);
-        Ok(Self { files, digest })
+        Ok(Self {
+            files,
+            digest,
+            approval_bundle: None,
+        })
     }
 
     pub fn write_to(&self, destination: &Path) -> Result<(), String> {
@@ -152,8 +226,8 @@ pub fn materialize_environment_bundle_with_snapshot(
         false,
     )?;
     insert_file(&mut files, "environment.toml", environment_bytes, false)?;
-    for name in ["agent-hub-permissions.json", "dippy.conf", "opencode.json"] {
-        let path = source.join(name);
+    {
+        let path = source.join("opencode.json");
         reject_symlink(&path)?;
         let bytes = std::fs::read(&path).map_err(|error| {
             format!(
@@ -161,26 +235,45 @@ pub fn materialize_environment_bundle_with_snapshot(
                 path.display()
             )
         })?;
-        if name == "opencode.json" {
-            validate_durable_opencode_config(&bytes)?;
-            if environment.approval_mode == "auto" {
-                validate_automatic_opencode_plugins(&bytes)?;
-                validate_automatic_opencode_permissions(
-                    &bytes,
-                    &environment.name,
-                    &environment.network_policy,
-                )?;
-            } else if environment.approval_mode == "gateway" {
-                validate_supervised_opencode_config(&bytes)?;
-            } else {
-                return Err(format!(
-                    "environment '{}' has unsupported approval mode '{}'",
-                    environment.name, environment.approval_mode
-                ));
-            }
+        validate_durable_opencode_config(&bytes)?;
+        if environment.approval_mode == "auto" {
+            validate_automatic_opencode_plugins(&bytes)?;
+            validate_automatic_opencode_permissions(
+                &bytes,
+                &environment.name,
+                &environment.network_policy,
+            )?;
+        } else if environment.approval_mode == "gateway" {
+            validate_supervised_opencode_config(&bytes)?;
+        } else {
+            return Err(format!(
+                "environment '{}' has unsupported approval mode '{}'",
+                environment.name, environment.approval_mode
+            ));
         }
-        insert_file(&mut files, name, bytes, false)?;
+        insert_file(&mut files, "opencode.json", bytes, false)?;
     }
+    let approval_bundle = match environment.approval_mode.as_str() {
+        "auto" => {
+            if environment.approval_bundle.is_some() {
+                return Err("automatic environments must not select an approval bundle".into());
+            }
+            None
+        }
+        "gateway" => {
+            let name = environment
+                .approval_bundle
+                .as_deref()
+                .ok_or_else(|| "supervised environments require an approval_bundle".to_string())?;
+            Some(collect_approval_bundle(config_root, name, &mut files)?)
+        }
+        other => {
+            return Err(format!(
+                "environment '{}' has unsupported approval mode '{other}'",
+                environment.name
+            ));
+        }
+    };
     insert_file(&mut files, "network_policy.json", network_policy, false)?;
 
     for directory in ["prompts", "instructions"] {
@@ -227,12 +320,14 @@ pub fn materialize_environment_bundle_with_snapshot(
         validate_agent_model(bytes, Path::new(path))?;
     }
 
-    EnvironmentBundle::from_files(
+    let mut bundle = EnvironmentBundle::from_files(
         files
             .into_iter()
             .map(|(path, bytes)| EnvironmentBundleFile { path, bytes })
             .collect(),
-    )
+    )?;
+    bundle.approval_bundle = approval_bundle;
+    Ok(bundle)
 }
 
 pub fn validate_durable_opencode_config(bytes: &[u8]) -> Result<(), String> {
@@ -261,10 +356,7 @@ pub fn validate_durable_opencode_config(bytes: &[u8]) -> Result<(), String> {
 fn validate_automatic_opencode_plugins(bytes: &[u8]) -> Result<(), String> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("failed to parse opencode.json: {error}"))?;
-    if value
-        .get("plugin")
-        .is_some_and(|plugins| !plugins.as_array().is_some_and(Vec::is_empty))
-    {
+    if value.get("plugin").is_some() {
         return Err("automatic OpenCode environments must not load attended plugins".to_string());
     }
     Ok(())
@@ -311,11 +403,14 @@ fn validate_automatic_opencode_permissions(
 fn validate_supervised_opencode_config(bytes: &[u8]) -> Result<(), String> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("failed to parse opencode.json: {error}"))?;
-    if value
+    let plugins = value
         .get("plugin")
-        .is_some_and(|plugins| !plugins.as_array().is_some_and(Vec::is_empty))
-    {
-        return Err("supervised OpenCode environments must not load plugins".to_string());
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "supervised OpenCode environments require the bundled plugin".to_string())?;
+    if plugins.as_slice() != [serde_json::Value::String(APPROVAL_PLUGIN_URI.to_string())] {
+        return Err(
+            "supervised OpenCode plugin URI must select the immutable bundled plugin".into(),
+        );
     }
     let permissions = value
         .get("permission")
@@ -330,6 +425,187 @@ fn validate_supervised_opencode_config(bytes: &[u8]) -> Result<(), String> {
         return Err("supervised OpenCode permissions must not allow every tool".to_string());
     }
     Ok(())
+}
+
+fn collect_approval_bundle(
+    config_root: &Path,
+    name: &str,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<ApprovalBundleIdentity, String> {
+    validate_name(name, "approval bundle")?;
+    let source = config_root
+        .join("shared")
+        .join("approval-bundles")
+        .join(name);
+    reject_symlink(&source)?;
+    let mut entries = std::fs::read_dir(&source)
+        .map_err(|error| format!("failed to read {}: {error}", source.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to read {}: {error}", source.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let expected = BTreeMap::from_iter(
+        std::iter::once("manifest.json")
+            .chain(APPROVAL_FILES)
+            .map(|name| (name.to_string(), ())),
+    );
+    let mut captured = BTreeMap::new();
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| format!("approval bundle path in {} is not UTF-8", source.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", entry.path().display()))?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(format!(
+                "approval bundle entry {} is not a regular file",
+                entry.path().display()
+            ));
+        }
+        if captured
+            .insert(
+                name.clone(),
+                std::fs::read(entry.path()).map_err(|error| error.to_string())?,
+            )
+            .is_some()
+        {
+            return Err(format!("approval bundle contains duplicate file '{name}'"));
+        }
+    }
+    if captured
+        .keys()
+        .map(|name| (name.clone(), ()))
+        .collect::<BTreeMap<_, _>>()
+        != expected
+    {
+        return Err("approval bundle file inventory is not exact".into());
+    }
+    let manifest_bytes = captured.get("manifest.json").expect("inventory checked");
+    let manifest: ApprovalBundleManifest = serde_json::from_slice(manifest_bytes)
+        .map_err(|error| format!("failed to parse approval bundle manifest: {error}"))?;
+    validate_approval_manifest(&manifest)?;
+    for artifact in APPROVAL_FILES {
+        let expected = &manifest.artifacts[artifact];
+        let actual = hex::encode(Sha256::digest(&captured[artifact]));
+        if &actual != expected {
+            return Err(format!(
+                "approval bundle artifact '{artifact}' digest mismatch"
+            ));
+        }
+    }
+    validate_approval_permissions(&captured["agent-hub-permissions.json"])?;
+    let policy = std::str::from_utf8(&captured["dippy.policy"])
+        .map_err(|error| format!("Dippy policy is not UTF-8: {error}"))?;
+    if !policy.starts_with("dippy-policy 1\n") {
+        return Err("approval bundle Dippy policy version is unsupported".into());
+    }
+    for (path, bytes) in &captured {
+        insert_file(files, &format!("approval/{path}"), bytes.clone(), false)?;
+    }
+    let digest = digest_named_files(&captured);
+    Ok(ApprovalBundleIdentity {
+        name: name.to_string(),
+        digest,
+        protocol: manifest.protocol,
+        gateway_commit: manifest.sources.agent_hub.commit,
+        gateway_archive_sha256: manifest.sources.agent_hub.archive_sha256,
+        plugin_sha256: manifest.artifacts["agent-hub-opencode-plugin.js"].clone(),
+        dippy_commit: manifest.sources.dippy.commit,
+        dippy_archive_sha256: manifest.sources.dippy.archive_sha256,
+        dippy_wheel_sha256: manifest.artifacts[APPROVAL_WHEEL].clone(),
+    })
+}
+
+fn validate_approval_manifest(manifest: &ApprovalBundleManifest) -> Result<(), String> {
+    if manifest.schema != "agent-hub.approval-bundle"
+        || manifest.version != 1
+        || manifest.protocol != APPROVAL_BUNDLE_PROTOCOL
+        || manifest.sources.agent_hub.plugin_entrypoint != "provider-plugins/opencode/agent-hub.ts"
+        || manifest
+            .artifacts
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != APPROVAL_FILES
+    {
+        return Err(
+            "approval bundle manifest identity or artifact inventory is unsupported".into(),
+        );
+    }
+    for (repository, commit, tree, archive) in [
+        (
+            &manifest.sources.agent_hub.repository,
+            &manifest.sources.agent_hub.commit,
+            &manifest.sources.agent_hub.tree,
+            &manifest.sources.agent_hub.archive_sha256,
+        ),
+        (
+            &manifest.sources.dippy.repository,
+            &manifest.sources.dippy.commit,
+            &manifest.sources.dippy.tree,
+            &manifest.sources.dippy.archive_sha256,
+        ),
+    ] {
+        if !repository.starts_with("https://")
+            || !is_lower_hex(commit, 40)
+            || !is_lower_hex(tree, 40)
+            || !is_lower_hex(archive, 64)
+        {
+            return Err("approval bundle source identity is invalid".into());
+        }
+    }
+    if manifest.build.dippy.trim().is_empty() || manifest.build.plugin.trim().is_empty() {
+        return Err("approval bundle build identity is empty".into());
+    }
+    if manifest
+        .artifacts
+        .values()
+        .any(|digest| !is_lower_hex(digest, 64))
+    {
+        return Err("approval bundle artifact digest is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_approval_permissions(bytes: &[u8]) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("failed to parse approval permissions: {error}"))?;
+    let command = format!(
+        "/usr/bin/env PYTHONPATH=/opencode/config/opencode/approval/{APPROVAL_WHEEL} /usr/bin/python3 -m dippy --immutable-policy /opencode/config/opencode/approval/dippy.policy"
+    );
+    let expected = json!({
+        "version": 1,
+        "default": "ask",
+        "rules": [
+            {"tools": ["@file_read"], "action": "allow"},
+            {"tools": ["@shell"], "action": "delegate", "command": command}
+        ]
+    });
+    if value != expected {
+        return Err(
+            "approval bundle permissions do not use the immutable bundled Dippy policy".into(),
+        );
+    }
+    Ok(())
+}
+
+fn digest_named_files(files: &BTreeMap<String, Vec<u8>>) -> String {
+    let mut digest = Sha256::new();
+    for (path, bytes) in files {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    hex::encode(digest.finalize())
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn contains_action(value: &serde_json::Value, action: &str) -> bool {
@@ -527,6 +803,78 @@ fn digest_files(files: &[EnvironmentBundleFile]) -> String {
 mod tests {
     use super::*;
 
+    fn write_test_approval_bundle(root: &Path, manifest_extra: Option<(&str, serde_json::Value)>) {
+        let bundle = root.join("shared/approval-bundles/test");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let command = format!(
+            "/usr/bin/env PYTHONPATH=/opencode/config/opencode/approval/{APPROVAL_WHEEL} /usr/bin/python3 -m dippy --immutable-policy /opencode/config/opencode/approval/dippy.policy"
+        );
+        let artifacts = BTreeMap::from([
+            ("agent-hub-opencode-plugin.js", b"plugin".to_vec()),
+            (
+                "agent-hub-permissions.json",
+                serde_json::to_vec(&json!({
+                    "version":1,"default":"ask","rules":[
+                        {"tools":["@file_read"],"action":"allow"},
+                        {"tools":["@shell"],"action":"delegate","command":command}
+                    ]
+                }))
+                .unwrap(),
+            ),
+            (APPROVAL_WHEEL, b"wheel".to_vec()),
+            ("dippy.policy", b"dippy-policy 1\ndeny rm\n".to_vec()),
+        ]);
+        for (name, bytes) in &artifacts {
+            std::fs::write(bundle.join(name), bytes).unwrap();
+        }
+        let mut manifest = json!({
+            "schema":"agent-hub.approval-bundle",
+            "version":1,
+            "protocol":APPROVAL_BUNDLE_PROTOCOL,
+            "sources":{
+                "agent_hub":{"repository":"https://example.com/agent-hub.git","commit":"a".repeat(40),"tree":"b".repeat(40),"archive_sha256":"c".repeat(64),"plugin_entrypoint":"provider-plugins/opencode/agent-hub.ts"},
+                "dippy":{"repository":"https://example.com/dippy.git","commit":"d".repeat(40),"tree":"e".repeat(40),"archive_sha256":"f".repeat(64)}
+            },
+            "build":{"dippy":"uv build","plugin":"bun build"},
+            "artifacts":artifacts.iter().map(|(name, bytes)| ((*name).to_string(), hex::encode(Sha256::digest(bytes)))).collect::<BTreeMap<_, _>>()
+        });
+        if let Some((name, value)) = manifest_extra {
+            manifest.as_object_mut().unwrap().insert(name.into(), value);
+        }
+        std::fs::write(
+            bundle.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn approval_bundle_materialization_is_strict_and_tamper_evident() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-approval-bundle-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        write_test_approval_bundle(&root, None);
+        let mut files = BTreeMap::new();
+        let identity = collect_approval_bundle(&root, "test", &mut files).unwrap();
+        assert_eq!(identity.protocol, APPROVAL_BUNDLE_PROTOCOL);
+        assert_eq!(files.len(), 5);
+        assert!(files.contains_key("approval/agent-hub-opencode-plugin.js"));
+
+        std::fs::write(
+            root.join("shared/approval-bundles/test/agent-hub-opencode-plugin.js"),
+            "tampered",
+        )
+        .unwrap();
+        assert!(collect_approval_bundle(&root, "test", &mut BTreeMap::new()).is_err());
+
+        std::fs::remove_dir_all(root.join("shared/approval-bundles/test")).unwrap();
+        write_test_approval_bundle(&root, Some(("unknown", json!(true))));
+        assert!(collect_approval_bundle(&root, "test", &mut BTreeMap::new()).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn bundle_is_order_independent_and_binds_paths_and_bytes() {
         let first = EnvironmentBundle::from_files(vec![
@@ -642,7 +990,8 @@ mod tests {
     #[test]
     fn approval_modes_require_fail_closed_supervision_or_non_interactive_auto_rules() {
         let supervised = serde_json::to_vec(&json!({
-            "permission":{"*":"ask","external_directory":{"*":"deny","/workspace/*":"allow"}}
+            "permission":{"*":"ask","external_directory":{"*":"deny","/workspace/*":"allow"}},
+            "plugin":[APPROVAL_PLUGIN_URI]
         }))
         .unwrap();
         validate_supervised_opencode_config(&supervised).unwrap();
@@ -728,7 +1077,7 @@ triage_environment = "test"
             r#"[environment]
 name = "test"
 description = "test"
-image = "agent-hub/job-code:2026-08-24"
+image = "agent-hub/job-code:2026-08-27"
 network_policy = "none"
 approval_mode = "auto"
 include_skills = ["example"]
@@ -773,6 +1122,19 @@ include_agents = ["example"]
         .unwrap();
 
         let first = materialize_environment_bundle(&root, "test").unwrap();
+        assert!(
+            first
+                .files
+                .iter()
+                .all(|file| file.path != "agent-hub-permissions.json" && file.path != "dippy.conf")
+        );
+        assert!(first.approval_bundle.is_none());
+        assert!(
+            first
+                .files
+                .iter()
+                .all(|file| !file.path.starts_with("approval/"))
+        );
         let server_authorized_digest = first.digest.clone();
         first.verify_digest(&server_authorized_digest).unwrap();
         let sentinel = first

@@ -177,12 +177,8 @@ enum LocalCommand {
         #[arg(long)]
         digest: String,
         /// Host-only approvals endpoint; never passed to the sandbox
-        #[arg(
-            long,
-            env = "AGENT_HUB_SERVER",
-            default_value = "http://localhost:8080"
-        )]
-        approvals_server: String,
+        #[arg(long, env = "AGENT_HUB_SERVER")]
+        approvals_server: Option<String>,
         /// Host-only bearer credential; never passed to the sandbox
         #[arg(long, env = "AGENT_HUB_TOKEN")]
         approvals_token: Option<String>,
@@ -328,7 +324,7 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
                     overlays: &overlays,
                     timeout_secs,
                 },
-                attended::RelayEndpoint {
+                attended::RelayEndpointOverride {
                     server_url: approvals_server,
                     token: approvals_token.map(protocol::Secret::new),
                 },

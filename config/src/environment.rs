@@ -17,6 +17,8 @@ pub struct EnvironmentConfig {
     pub network_policy: String,
     pub approval_mode: String,
     #[serde(default)]
+    pub approval_bundle: Option<String>,
+    #[serde(default)]
     pub allowed_overlays: Vec<String>,
     #[serde(default)]
     pub include_skills: Vec<String>,

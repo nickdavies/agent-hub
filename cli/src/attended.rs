@@ -18,8 +18,8 @@ use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use protocol::{
     ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2, ApprovedExecutionSpec,
-    AttendedAuthorizationArtifact, AttendedAuthorizationRequestV2, AttendedExecutionSpec,
-    AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
+    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV2,
+    AttendedExecutionSpec, AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
     AuthorizedCredentialProvider, AuthorizedOverlay, CanonicalRuntimeSpec, ExecutionMode,
     NetworkResourceKind, NetworkResourceRequest, PlannedEnvironmentTier, PromptRef,
     ResolvedAuthorizationBehavior, ToolApprovalMode, WorkspaceAccess,
@@ -75,6 +75,12 @@ pub struct AuthorizationSelectors<'a> {
 #[derive(Clone)]
 pub struct RelayEndpoint {
     pub server_url: String,
+    pub token: Option<protocol::Secret>,
+}
+
+#[derive(Clone)]
+pub struct RelayEndpointOverride {
+    pub server_url: Option<String>,
     pub token: Option<protocol::Secret>,
 }
 
@@ -320,6 +326,17 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         triage: false,
         allow_remote_credentials: !runner.credential_providers.is_empty(),
     };
+    let approval_bundle = attended_approval_bundle_identity(bundle, tool_approval)?;
+    let approval_bundle_digest = approval_bundle
+        .as_ref()
+        .map(|identity| identity.digest.clone())
+        .unwrap_or(
+            protocol::attended_approval_bundle_digest(&serde_json::json!({
+                "environment_bundle_digest": bundle.digest,
+                "mode": "auto"
+            }))
+            .map_err(anyhow::Error::msg)?,
+        );
     AttendedAuthorizationRequestV2 {
         version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2.to_string(),
         proposal: AttendedProposal {
@@ -352,7 +369,8 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             repositories: mounts.repositories,
             primary_workspace: mounts.primary_workspace,
         },
-        approval_bundle_digest: approval_bundle_digest(&bundle.digest, tool_approval)?,
+        approval_bundle_digest,
+        approval_bundle,
         output: AttendedOutputContract::default(),
         lifecycle: AttendedLifecycleContract::default(),
     }
@@ -469,7 +487,7 @@ pub async fn run(
     store: &StateStore,
     artifact_path: &Path,
     selectors: AuthorizationSelectors<'_>,
-    relay_endpoint: RelayEndpoint,
+    relay_override: RelayEndpointOverride,
 ) -> anyhow::Result<RunRecord> {
     let (supplied, supplied_path) = read_authorization_file(artifact_path)?;
     let request = supplied.verify_v2().map_err(anyhow::Error::msg)?;
@@ -484,6 +502,10 @@ pub async fn run(
         "authorized artifact does not match supplied artifact"
     );
     verify_execution_inputs(&request)?;
+    let deployment =
+        config::validate_authoritative_config_root(Path::new(&request.execution.config_root))
+            .map_err(anyhow::Error::msg)?;
+    let relay_endpoint = resolve_host_relay_endpoint(&deployment, relay_override).await?;
     let _lock = store.lock(&lock_path(&digest))?;
     let authorized: AuthorizationRecord = store.read_json(&authorized_path)?;
     ensure!(
@@ -714,11 +736,7 @@ pub async fn run(
             .write_to(&bundle_dir)
             .map_err(anyhow::Error::msg)?;
         sync_private_tree(&bundle_dir)?;
-        let approval_material = materialize_attended_approval_material(
-            &run_dir,
-            &bundle_dir,
-            request.proposal.tool_approval,
-        )?;
+        verify_attended_approval_material(&bundle_dir, request.proposal.tool_approval)?;
         for directory in [
             &data_dir,
             &state_dir,
@@ -854,26 +872,11 @@ pub async fn run(
             );
         }
         verify_host_only_approval_environment(&environment)?;
-        if let (Some(relay), Some(material)) = (&attended_relay, &approval_material) {
+        if let Some(relay) = &attended_relay {
             relay.verify_for_mount()?;
-            mounts.push(DockerMount::new(
-                &material.plugin_path,
-                "/agent-hub/opencode-plugin",
-                true,
-            )?);
-            mounts.push(DockerMount::new(
-                &material.config_path,
-                "/opencode/config/opencode/opencode.json",
-                true,
-            )?);
             mounts.push(DockerMount::new(
                 relay.socket_path.parent().context("approval relay socket has no parent")?,
                 "/agent-hub/approval",
-                true,
-            )?);
-            mounts.push(DockerMount::new(
-                &material.permissions_path,
-                "/agent-hub/agent-hub-permissions.json",
                 true,
             )?);
             ensure!(
@@ -907,7 +910,7 @@ pub async fn run(
             ensure!(
                 environment.insert(
                     "AGENT_HUB_CONFIG".into(),
-                    "/agent-hub/agent-hub-permissions.json".into(),
+                    "/opencode/config/opencode/approval/agent-hub-permissions.json".into(),
                 ).is_none(),
                 "authorized environment conflicts with attended gateway config"
             );
@@ -1351,6 +1354,61 @@ pub async fn run(
     Ok(record)
 }
 
+async fn resolve_host_relay_endpoint(
+    deployment: &config::ValidatedDeployment,
+    overrides: RelayEndpointOverride,
+) -> anyhow::Result<RelayEndpoint> {
+    let approvals = &deployment.runner_profiles.host_approvals;
+    let server_url = overrides
+        .server_url
+        .unwrap_or_else(|| approvals.url.clone());
+    let token = match (overrides.token, approvals.credential_provider.as_deref()) {
+        (Some(token), _) => Some(token),
+        (None, None) => None,
+        (None, Some(name)) => {
+            let definition = deployment
+                .local_agent
+                .get("credential_providers")
+                .and_then(|value| value.get(name))
+                .with_context(|| {
+                    format!("host approvals credential provider '{name}' disappeared")
+                })?;
+            let provider: CredentialProvider = serde_json::from_value(definition.clone())?;
+            let CredentialProvider::Command {
+                command,
+                args,
+                capture_env,
+                capture_file,
+                ..
+            } = provider
+            else {
+                anyhow::bail!("host approvals credential provider is not a command provider")
+            };
+            ensure!(
+                capture_env.is_some() && capture_file.is_none(),
+                "host approvals credential provider must return one host-only token"
+            );
+            let mut command = tokio::process::Command::new(command);
+            command.args(args).kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+                .await
+                .context("host approvals credential provider timed out")??;
+            ensure!(
+                output.status.success(),
+                "host approvals credential provider failed"
+            );
+            let value = String::from_utf8(output.stdout)?;
+            let value = value.trim();
+            ensure!(
+                !value.is_empty() && !value.chars().any(char::is_control),
+                "host approvals credential provider returned an invalid token"
+            );
+            Some(protocol::Secret::new(value.to_string()))
+        }
+    };
+    Ok(RelayEndpoint { server_url, token })
+}
+
 pub fn list(store: &StateStore) -> anyhow::Result<Vec<RunRecord>> {
     store.list_json(Path::new("executions"))
 }
@@ -1664,9 +1722,18 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV2) -> anyhow::
         .verify_digest(&request.execution.environment_bundle_digest)
         .map_err(anyhow::Error::msg)?;
     ensure!(
-        approval_bundle_digest(&bundle.digest, request.proposal.tool_approval)?
-            == request.approval_bundle_digest,
+        attended_approval_bundle_identity(bundle, request.proposal.tool_approval)?
+            == request.approval_bundle,
         "attended approval bundle changed after authorization"
+    );
+    ensure!(
+        request
+            .approval_bundle
+            .as_ref()
+            .map(|identity| identity.digest.as_str())
+            == (request.proposal.tool_approval == ToolApprovalMode::Dippy)
+                .then_some(request.approval_bundle_digest.as_str()),
+        "attended approval bundle digest and identity differ"
     );
     let environment = bundle_environment(bundle)?;
     ensure!(
@@ -2741,25 +2808,30 @@ fn tool_approval_name(value: ToolApprovalMode) -> &'static str {
     }
 }
 
-fn approval_bundle_digest(
-    environment_bundle_digest: &str,
+fn attended_approval_bundle_identity(
+    bundle: &config::EnvironmentBundle,
     mode: ToolApprovalMode,
-) -> anyhow::Result<String> {
-    protocol::attended_approval_bundle_digest(&serde_json::json!({
-        "environment_bundle_digest": environment_bundle_digest,
-        "mode": tool_approval_name(mode),
-        "plugin_sha256": protocol::sha256_hex_with_domain(
-            b"agent-hub:attended-opencode-plugin:v3\0",
-            &[
-                include_bytes!("../../provider-plugins/opencode/agent-hub.ts").as_slice(),
-                include_bytes!("../../provider-plugins/opencode/approval-transport.ts").as_slice(),
-                include_bytes!("../../provider-plugins/opencode/permission-normalization.ts").as_slice(),
-            ].concat(),
-        ),
-        "protocol": protocol::ATTENDED_GATEWAY_REQUEST_VERSION,
-        "socket": protocol::ATTENDED_GATEWAY_SOCKET_PATH,
-    }))
-    .map_err(anyhow::Error::msg)
+) -> anyhow::Result<Option<AttendedApprovalBundleIdentity>> {
+    match (mode, bundle.approval_bundle.as_ref()) {
+        (ToolApprovalMode::Auto, None) => Ok(None),
+        (ToolApprovalMode::Auto, Some(_)) => {
+            anyhow::bail!("automatic environment contains approval bundle material")
+        }
+        (ToolApprovalMode::Dippy, None) => {
+            anyhow::bail!("supervised environment has no approval bundle")
+        }
+        (ToolApprovalMode::Dippy, Some(identity)) => Ok(Some(AttendedApprovalBundleIdentity {
+            name: identity.name.clone(),
+            digest: identity.digest.clone(),
+            protocol: identity.protocol.clone(),
+            gateway_commit: identity.gateway_commit.clone(),
+            gateway_archive_sha256: identity.gateway_archive_sha256.clone(),
+            plugin_sha256: identity.plugin_sha256.clone(),
+            dippy_commit: identity.dippy_commit.clone(),
+            dippy_archive_sha256: identity.dippy_archive_sha256.clone(),
+            dippy_wheel_sha256: identity.dippy_wheel_sha256.clone(),
+        })),
+    }
 }
 
 fn canonical_resources(mut resources: Vec<NetworkResourceKind>) -> Vec<NetworkResourceKind> {
@@ -3083,60 +3155,33 @@ fn verify_tool_approval(
     Ok(())
 }
 
-struct AttendedApprovalMaterial {
-    plugin_path: PathBuf,
-    config_path: PathBuf,
-    permissions_path: PathBuf,
-}
-
-fn materialize_attended_approval_material(
-    run_dir: &Path,
+fn verify_attended_approval_material(
     bundle_dir: &Path,
     mode: ToolApprovalMode,
-) -> anyhow::Result<Option<AttendedApprovalMaterial>> {
+) -> anyhow::Result<()> {
     if mode == ToolApprovalMode::Auto {
-        return Ok(None);
+        ensure!(
+            !bundle_dir.join("approval").exists(),
+            "automatic environment leaked approval bundle material"
+        );
+        return Ok(());
     }
-    let plugin_path = run_dir.join("opencode-plugin");
-    std::fs::create_dir(&plugin_path)?;
-    for (name, contents) in [
-        (
-            "agent-hub.ts",
-            include_bytes!("../../provider-plugins/opencode/agent-hub.ts").as_slice(),
-        ),
-        (
-            "approval-transport.ts",
-            include_bytes!("../../provider-plugins/opencode/approval-transport.ts").as_slice(),
-        ),
-        (
-            "permission-normalization.ts",
-            include_bytes!("../../provider-plugins/opencode/permission-normalization.ts")
-                .as_slice(),
-        ),
+    for name in [
+        "manifest.json",
+        "agent-hub-opencode-plugin.js",
+        "agent-hub-permissions.json",
+        "dippy-0.2.7-py3-none-any.whl",
+        "dippy.policy",
     ] {
-        write_private_durable(&plugin_path.join(name), contents)?;
+        let path = bundle_dir.join("approval").join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect bundled approval artifact {}", path.display()))?;
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "bundled approval artifact is not a regular file"
+        );
     }
-    let source_config = bundle_dir.join("opencode.json");
-    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&source_config)?)?;
-    let object = config
-        .as_object_mut()
-        .context("authorized OpenCode config is not an object")?;
-    object.insert(
-        "plugin".into(),
-        serde_json::json!(["file:///agent-hub/opencode-plugin/agent-hub.ts"]),
-    );
-    let config_path = run_dir.join("attended-opencode.json");
-    write_private_durable(&config_path, &serde_json::to_vec_pretty(&config)?)?;
-    let permissions_path = run_dir.join("agent-hub-permissions.json");
-    write_private_durable(
-        &permissions_path,
-        br#"{"version":1,"default":"ask","rules":[]}"#,
-    )?;
-    Ok(Some(AttendedApprovalMaterial {
-        plugin_path,
-        config_path,
-        permissions_path,
-    }))
+    Ok(())
 }
 
 fn verify_exact_relay_mount(mounts: &[DockerMount], socket_path: &Path) -> anyhow::Result<()> {
