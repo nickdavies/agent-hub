@@ -13,7 +13,7 @@ type AttendedBinding = Readonly<{
 
 export type ApprovalTransport = Readonly<
   | { kind: "attended_socket"; socket: string; binding: string; deadline: string }
-  | { kind: "http"; server: string; token: string }
+  | { kind: "http"; server: string; token?: string }
 >
 
 const ATTENDED_KEYS = [
@@ -101,8 +101,8 @@ export function approvalTransport(env: ApprovalEnvironment): ApprovalTransport {
   }
   return Object.freeze({
     kind: "http" as const,
-    server: env.AGENT_HUB_SERVER ?? "http://localhost:8080",
-    token: env.AGENT_HUB_TOKEN ?? "",
+    server: env.AGENT_HUB_SERVER ?? "http://127.0.0.1:8080",
+    ...(env.AGENT_HUB_TOKEN ? { token: env.AGENT_HUB_TOKEN } : {}),
   })
 }
 
@@ -112,7 +112,10 @@ export function gatewayApprovalInvocation(
 ): { args: string[]; env: ApprovalEnvironment } {
   if (transport.kind === "http") {
     return {
-      args: ["approval", "--opencode", "--server", transport.server, "--token", transport.token],
+      args: [
+        "approval", "--opencode", "--server", transport.server,
+        ...(transport.token ? ["--token", transport.token] : []),
+      ],
       env: inheritedEnv,
     }
   }

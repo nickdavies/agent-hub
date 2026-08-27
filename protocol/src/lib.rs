@@ -24,18 +24,19 @@ pub mod tool_call;
 // Re-export the most commonly used types at the crate root for convenience.
 pub use approval::{
     Approval, ApprovalContext, ApprovalDecision, ApprovalRequest, ApprovalResolveRequest,
-    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, ExtraContext, HookEventName,
-    KnownHookEvent, RequestType,
+    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, AttendedApprovalReviewContext,
+    ExtraContext, HookEventName, KnownHookEvent, RequestType,
 };
 pub use attended::{
-    APPROVED_EXECUTION_PIDS_LIMIT, ATTENDED_AUTHORIZATION_REQUEST_VERSION,
-    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2, ATTENDED_AUTHORIZATION_VERSION,
-    ATTENDED_AUTHORIZATION_VERSION_V2, ApprovedExecutionSpec, AttendedApprovalBundleIdentity,
-    AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1, AttendedAuthorizationRequestV2,
-    AttendedExecutionSpec, AttendedLifecycleContract, AttendedOutputContract, AttendedOutputLimits,
-    AttendedProposal, AuthorizedCredentialProvider, AuthorizedOverlay, ContextRootSpec,
-    RepositoryMountSpec, RepositoryState, ToolApprovalMode, WorkspaceAccess, WorkspaceSpec,
-    canonical_context_root_path, is_canonical_context_root_path, sha256_hex_with_domain,
+    APPROVAL_BUNDLE_PROTOCOL, APPROVED_EXECUTION_PIDS_LIMIT,
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION, ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2,
+    ATTENDED_AUTHORIZATION_VERSION, ATTENDED_AUTHORIZATION_VERSION_V2, ApprovedExecutionSpec,
+    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1,
+    AttendedAuthorizationRequestV2, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedOutputContract, AttendedOutputLimits, AttendedProposal, AuthorizedCredentialProvider,
+    AuthorizedOverlay, ContextRootSpec, RepositoryMountSpec, RepositoryState, ToolApprovalMode,
+    WorkspaceAccess, WorkspaceSpec, canonical_context_root_path, is_canonical_context_root_path,
+    sha256_hex_with_domain,
 };
 pub use attended_gateway::{
     ATTENDED_GATEWAY_DECISION_VERSION, ATTENDED_GATEWAY_MAX_FRAME_BYTES,

@@ -53,14 +53,22 @@ pub enum PermissionDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenCodeTool {
     Bash,
+    CodeSearch,
+    DoomLoop,
     Edit, // maps to Tool::Write
+    ExternalDirectory,
     Glob,
     Grep,
+    List,
+    Lsp,
     MultiEdit,
     Read,
+    Question,
+    Skill,
     Task,
     TodoWrite,
     WebFetch,
+    WebSearch,
     Write,
     Unknown(String),
 }
@@ -69,14 +77,22 @@ impl OpenCodeTool {
     fn as_wire_str(&self) -> &str {
         match self {
             OpenCodeTool::Bash => "bash",
+            OpenCodeTool::CodeSearch => "codesearch",
+            OpenCodeTool::DoomLoop => "doom_loop",
             OpenCodeTool::Edit => "edit",
+            OpenCodeTool::ExternalDirectory => "external_directory",
             OpenCodeTool::Glob => "glob",
             OpenCodeTool::Grep => "grep",
+            OpenCodeTool::List => "list",
+            OpenCodeTool::Lsp => "lsp",
             OpenCodeTool::MultiEdit => "multiedit",
             OpenCodeTool::Read => "read",
+            OpenCodeTool::Question => "question",
+            OpenCodeTool::Skill => "skill",
             OpenCodeTool::Task => "task",
             OpenCodeTool::TodoWrite => "todowrite",
             OpenCodeTool::WebFetch => "webfetch",
+            OpenCodeTool::WebSearch => "websearch",
             OpenCodeTool::Write => "write",
             OpenCodeTool::Unknown(s) => s.as_str(),
         }
@@ -85,26 +101,42 @@ impl OpenCodeTool {
     fn from_wire(s: &str) -> OpenCodeTool {
         match s {
             "bash" => OpenCodeTool::Bash,
+            "codesearch" => OpenCodeTool::CodeSearch,
+            "doom_loop" => OpenCodeTool::DoomLoop,
             "edit" => OpenCodeTool::Edit,
+            "external_directory" => OpenCodeTool::ExternalDirectory,
             "glob" => OpenCodeTool::Glob,
             "grep" => OpenCodeTool::Grep,
+            "list" => OpenCodeTool::List,
+            "lsp" => OpenCodeTool::Lsp,
             "multiedit" => OpenCodeTool::MultiEdit,
             "read" => OpenCodeTool::Read,
+            "question" => OpenCodeTool::Question,
+            "skill" => OpenCodeTool::Skill,
             "task" => OpenCodeTool::Task,
             "todowrite" => OpenCodeTool::TodoWrite,
             "webfetch" => OpenCodeTool::WebFetch,
+            "websearch" => OpenCodeTool::WebSearch,
             "write" => OpenCodeTool::Write,
             // OpenCode also sends PascalCase names for tool.execute.before events,
             // so fall through to canonical parsing for those.
             other => match other {
                 "Bash" => OpenCodeTool::Bash,
+                "CodeSearch" => OpenCodeTool::CodeSearch,
+                "DoomLoop" => OpenCodeTool::DoomLoop,
+                "ExternalDirectory" => OpenCodeTool::ExternalDirectory,
                 "Glob" => OpenCodeTool::Glob,
                 "Grep" => OpenCodeTool::Grep,
+                "List" => OpenCodeTool::List,
+                "Lsp" => OpenCodeTool::Lsp,
                 "MultiEdit" => OpenCodeTool::MultiEdit,
+                "Question" => OpenCodeTool::Question,
                 "Read" => OpenCodeTool::Read,
+                "Skill" => OpenCodeTool::Skill,
                 "Task" => OpenCodeTool::Task,
                 "TodoWrite" => OpenCodeTool::TodoWrite,
                 "WebFetch" => OpenCodeTool::WebFetch,
+                "WebSearch" => OpenCodeTool::WebSearch,
                 "Write" => OpenCodeTool::Write,
                 "Edit" => OpenCodeTool::Edit,
                 _ => OpenCodeTool::Unknown(other.to_owned()),
@@ -117,14 +149,22 @@ impl From<OpenCodeTool> for Tool {
     fn from(t: OpenCodeTool) -> Self {
         match t {
             OpenCodeTool::Bash => Tool::Bash,
+            OpenCodeTool::CodeSearch => Tool::CodeSearch,
+            OpenCodeTool::DoomLoop => Tool::DoomLoop,
             OpenCodeTool::Edit => Tool::Write, // opencode "edit" = canonical "Write"
+            OpenCodeTool::ExternalDirectory => Tool::ExternalDirectory,
             OpenCodeTool::Glob => Tool::Glob,
             OpenCodeTool::Grep => Tool::Grep,
+            OpenCodeTool::List => Tool::List,
+            OpenCodeTool::Lsp => Tool::Lsp,
             OpenCodeTool::MultiEdit => Tool::MultiEdit,
             OpenCodeTool::Read => Tool::Read,
+            OpenCodeTool::Question => Tool::Question,
+            OpenCodeTool::Skill => Tool::Skill,
             OpenCodeTool::Task => Tool::Task,
             OpenCodeTool::TodoWrite => Tool::TodoWrite,
             OpenCodeTool::WebFetch => Tool::WebFetch,
+            OpenCodeTool::WebSearch => Tool::WebSearch,
             OpenCodeTool::Write => Tool::Write,
             OpenCodeTool::Unknown(s) => Tool::Unknown(s),
         }
@@ -158,7 +198,7 @@ impl JsonSchema for OpenCodeTool {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "Tool name as sent by OpenCode (lowercase). Known: bash, edit, glob, grep, multiedit, read, task, todowrite, webfetch, write."
+            "description": "Tool name as sent by OpenCode (lowercase). Known: bash, codesearch, doom_loop, edit, external_directory, glob, grep, list, lsp, multiedit, question, read, skill, task, todowrite, webfetch, websearch, write."
         })
     }
 }
@@ -644,9 +684,20 @@ mod tests {
     #[test]
     fn opencode_tool_pascalcase_deserialize() {
         // OpenCode sends PascalCase for tool.execute.before events
-        let json = r#""Write""#;
-        let tool: OpenCodeTool = serde_json::from_str(json).unwrap();
-        assert_eq!(tool, OpenCodeTool::Write);
+        for (name, expected) in [
+            ("Write", OpenCodeTool::Write),
+            ("CodeSearch", OpenCodeTool::CodeSearch),
+            ("DoomLoop", OpenCodeTool::DoomLoop),
+            ("ExternalDirectory", OpenCodeTool::ExternalDirectory),
+            ("List", OpenCodeTool::List),
+            ("Lsp", OpenCodeTool::Lsp),
+            ("Question", OpenCodeTool::Question),
+            ("Skill", OpenCodeTool::Skill),
+            ("WebSearch", OpenCodeTool::WebSearch),
+        ] {
+            let tool: OpenCodeTool = serde_json::from_value(name.into()).unwrap();
+            assert_eq!(tool, expected);
+        }
     }
 
     #[test]
@@ -796,14 +847,22 @@ mod tests {
     fn all_opencode_known_map_to_known_tool() {
         let mappings = [
             (OpenCodeTool::Bash, Tool::Bash),
+            (OpenCodeTool::CodeSearch, Tool::CodeSearch),
+            (OpenCodeTool::DoomLoop, Tool::DoomLoop),
             (OpenCodeTool::Edit, Tool::Write),
+            (OpenCodeTool::ExternalDirectory, Tool::ExternalDirectory),
             (OpenCodeTool::Glob, Tool::Glob),
             (OpenCodeTool::Grep, Tool::Grep),
+            (OpenCodeTool::List, Tool::List),
+            (OpenCodeTool::Lsp, Tool::Lsp),
             (OpenCodeTool::MultiEdit, Tool::MultiEdit),
+            (OpenCodeTool::Question, Tool::Question),
             (OpenCodeTool::Read, Tool::Read),
+            (OpenCodeTool::Skill, Tool::Skill),
             (OpenCodeTool::Task, Tool::Task),
             (OpenCodeTool::TodoWrite, Tool::TodoWrite),
             (OpenCodeTool::WebFetch, Tool::WebFetch),
+            (OpenCodeTool::WebSearch, Tool::WebSearch),
             (OpenCodeTool::Write, Tool::Write),
         ];
         for (oc, expected) in mappings {

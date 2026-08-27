@@ -1,13 +1,16 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SystemTomlFile {
     system: SystemConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemConfig {
     pub operator: String,
     pub bot_identity: String,
@@ -24,6 +27,8 @@ pub struct SystemConfig {
     #[serde(default)]
     pub environments: Option<SystemEnvironmentsConfig>,
     #[serde(default)]
+    pub approval_bundle_trust: BTreeMap<String, SystemApprovalBundleTrustConfig>,
+    #[serde(default)]
     pub workflows: Option<SystemWorkflowsConfig>,
     #[serde(default)]
     pub overlays: Option<SystemOverlaysConfig>,
@@ -35,6 +40,18 @@ pub struct SystemConfig {
     pub agents: Vec<SystemAgentConfig>,
     #[serde(default)]
     pub local_agent_defaults: Option<SystemLocalAgentDefaultsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SystemApprovalBundleTrustConfig {
+    pub manifest_sha256: String,
+    pub gateway_commit: String,
+    pub gateway_archive_sha256: String,
+    pub plugin_sha256: String,
+    pub dippy_commit: String,
+    pub dippy_archive_sha256: String,
+    pub dippy_wheel_sha256: String,
 }
 
 impl SystemConfig {
@@ -55,8 +72,32 @@ impl SystemConfig {
                     .to_string(),
             );
         }
+        for (name, trust) in &wrapped.system.approval_bundle_trust {
+            if name.is_empty()
+                || name.contains('/')
+                || name.contains('\\')
+                || !is_lower_hex(&trust.manifest_sha256, 64)
+                || !is_lower_hex(&trust.gateway_commit, 40)
+                || !is_lower_hex(&trust.gateway_archive_sha256, 64)
+                || !is_lower_hex(&trust.plugin_sha256, 64)
+                || !is_lower_hex(&trust.dippy_commit, 40)
+                || !is_lower_hex(&trust.dippy_archive_sha256, 64)
+                || !is_lower_hex(&trust.dippy_wheel_sha256, 64)
+            {
+                return Err(format!(
+                    "system.approval_bundle_trust.{name} contains an invalid strict identity"
+                ));
+            }
+        }
         Ok(wrapped.system)
     }
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, Deserialize)]

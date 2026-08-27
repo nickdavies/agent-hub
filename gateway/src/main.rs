@@ -101,7 +101,7 @@ struct StatusReportArgs {
 
     /// Bearer token for server auth
     #[arg(long, env = "AGENT_HUB_TOKEN")]
-    token: Secret,
+    token: Option<Secret>,
 }
 
 // --- Entrypoint ---
@@ -210,10 +210,11 @@ fn validate_approval_transport(args: &ApprovalArgs) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            if args.server.is_none() || args.token.is_none() {
-                return Err("host HTTP mode requires an approval server and token".to_string());
-            }
-            Ok(())
+            let server = args
+                .server
+                .as_deref()
+                .ok_or_else(|| "host HTTP mode requires an approval server".to_string())?;
+            http::authenticated_client(server, args.token.is_some()).map(|_| ())
         }
         Some(mode) => Err(format!("unsupported approval mode '{mode}'")),
     }
@@ -300,7 +301,7 @@ async fn run_status_report(args: StatusReportArgs) -> ExitCode {
         }
     };
 
-    let (client, base) = match http::authenticated_client(&args.server) {
+    let (client, base) = match http::authenticated_client(&args.server, args.token.is_some()) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("agent-hub-gateway: {error}");
@@ -309,9 +310,13 @@ async fn run_status_report(args: StatusReportArgs) -> ExitCode {
     };
     let url = http::endpoint(&base, "api/v1/hooks/status").expect("validated endpoint");
 
-    match client
-        .post(url.as_str())
-        .bearer_auth(args.token.expose())
+    let request = client.post(url.as_str());
+    let request = if let Some(token) = &args.token {
+        request.bearer_auth(token.expose())
+    } else {
+        request
+    };
+    match request
         .json(&report)
         .timeout(Duration::from_secs(10))
         .send()
@@ -340,7 +345,6 @@ async fn run(
     event: &ToolHookEvent,
     config_path: &str,
 ) -> Result<HookOutput, RunError> {
-    validate_gateway_config(config_path).map_err(RunError::FailClosed)?;
     let config = load_tool_config(config_path).map_err(RunError::FailClosed)?;
 
     // Extract matchable args from the typed tool call and resolve paths.
@@ -351,6 +355,37 @@ async fn run(
         .iter()
         .map(|a| config::resolve_path(a, &tool, Some(&event.cwd)))
         .collect();
+
+    if tool == protocol::Tool::ExternalDirectory {
+        if resolved_args.len() != 1 {
+            return Err(RunError::FailClosed(
+                "external_directory requires one exact requested path".to_string(),
+            ));
+        }
+        let requested = std::fs::canonicalize(&resolved_args[0]).map_err(|error| {
+            RunError::FailClosed(format!(
+                "external_directory requested path cannot be proved: {error}"
+            ))
+        })?;
+        let roots = event
+            .workspace_roots
+            .iter()
+            .map(std::fs::canonicalize)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                RunError::FailClosed(format!(
+                    "external_directory authorized root cannot be proved: {error}"
+                ))
+            })?;
+        if !roots
+            .iter()
+            .any(|root| requested == *root || requested.starts_with(root))
+        {
+            return Err(RunError::FailClosed(
+                "external_directory path is outside the authorized workspace/context".to_string(),
+            ));
+        }
+    }
 
     let action = resolve_action(
         &config,
@@ -426,104 +461,6 @@ async fn run(
     Ok(output)
 }
 
-fn validate_gateway_config(path: &str) -> Result<(), String> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|error| format!("failed to read config {path}: {error}"))?;
-    let value: serde_json::Value = serde_json::from_str(&contents)
-        .map_err(|error| format!("failed to parse config {path}: {error}"))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| format!("failed to parse config {path}: expected an object"))?;
-    let known_top = ["version", "default", "rules"];
-    if let Some(field) = object
-        .keys()
-        .find(|field| !known_top.contains(&field.as_str()))
-    {
-        return Err(format!(
-            "failed to parse config {path}: unknown field '{field}'"
-        ));
-    }
-    if object.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
-        return Err(format!(
-            "failed to parse config {path}: unsupported version"
-        ));
-    }
-    let known_rule = [
-        "tools",
-        "action",
-        "command",
-        "message",
-        "pattern",
-        "in_workspace",
-        "in_paths",
-    ];
-    if let Some(rules) = object.get("rules").and_then(serde_json::Value::as_array) {
-        for (index, rule) in rules.iter().enumerate() {
-            let rule = rule.as_object().ok_or_else(|| {
-                format!(
-                    "failed to parse config {path}: rule {} is not an object",
-                    index + 1
-                )
-            })?;
-            if let Some(field) = rule
-                .keys()
-                .find(|field| !known_rule.contains(&field.as_str()))
-            {
-                return Err(format!(
-                    "failed to parse config {path}: rule {} has unknown field '{field}'",
-                    index + 1
-                ));
-            }
-            let action = rule.get("action").and_then(serde_json::Value::as_str);
-            let command = rule.get("command");
-            let message = rule.get("message");
-            if (action == Some("delegate"))
-                != command.is_some_and(|value| {
-                    value
-                        .as_str()
-                        .is_some_and(|command| !command.trim().is_empty())
-                })
-            {
-                return Err(format!(
-                    "failed to parse config {path}: rule {} has an invalid action/command combination",
-                    index + 1
-                ));
-            }
-            if message.is_some() && action != Some("deny") {
-                return Err(format!(
-                    "failed to parse config {path}: rule {} has a message outside a deny action",
-                    index + 1
-                ));
-            }
-            for field in ["pattern", "message"] {
-                if rule
-                    .get(field)
-                    .is_some_and(|value| !value.as_str().is_some_and(|value| !value.is_empty()))
-                {
-                    return Err(format!(
-                        "failed to parse config {path}: rule {} has invalid '{field}'",
-                        index + 1
-                    ));
-                }
-            }
-            if rule.get("in_paths").is_some_and(|value| {
-                !value.as_array().is_some_and(|paths| {
-                    !paths.is_empty()
-                        && paths
-                            .iter()
-                            .all(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
-                })
-            }) {
-                return Err(format!(
-                    "failed to parse config {path}: rule {} has invalid 'in_paths'",
-                    index + 1
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Spawn a delegate subprocess, pipe the canonical delegate payload via stdin, and parse the result.
 ///
 /// The input is always in Claude Code wire format (see DelegatePayload), so delegates
@@ -584,6 +521,7 @@ async fn escalate_to_server(
         workspace_roots: event.workspace_roots.clone(),
         hook_event_name: event.hook_event_name.clone().into(),
         extra,
+        attended: None,
     };
 
     let request_id = Uuid::new_v4().to_string();
@@ -655,20 +593,23 @@ async fn escalate_to_server(
     let server = args.server.as_deref().ok_or_else(|| {
         ApprovalFlowError::Pipeline("approval server is required outside sandbox mode".to_string())
     })?;
-    let token = args.token.as_ref().ok_or_else(|| {
-        ApprovalFlowError::Pipeline("approval token is required outside sandbox mode".to_string())
-    })?;
-    let (client, base) = http::authenticated_client(server).map_err(RunError::FailClosed)?;
+    let token = args.token.as_ref();
+    let (client, base) =
+        http::authenticated_client(server, token.is_some()).map_err(ApprovalFlowError::Pipeline)?;
     let register_url =
-        http::endpoint(&base, "api/v1/hooks/approval").map_err(RunError::FailClosed)?;
+        http::endpoint(&base, "api/v1/hooks/approval").map_err(ApprovalFlowError::Pipeline)?;
     eprintln!(
         "[info] registering approval request: tool={} session={}",
         event.tool_call.tool_name(),
         event.session_id
     );
-    let register_resp = client
-        .post(register_url.as_str())
-        .bearer_auth(token.expose())
+    let register = client.post(register_url.as_str());
+    let register = if let Some(token) = token {
+        register.bearer_auth(token.expose())
+    } else {
+        register
+    };
+    let register_resp = register
         .json(&request)
         .timeout(Duration::from_secs(10))
         .send()
@@ -703,7 +644,7 @@ async fn escalate_to_server(
     // Long-poll until resolved or global timeout
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
     let wait_url = http::endpoint(&base, &format!("api/v1/approvals/{}/wait", approval.id))
-        .map_err(RunError::FailClosed)?;
+        .map_err(ApprovalFlowError::Pipeline)?;
 
     eprintln!(
         "[info] waiting for approval (id={}, timeout={}s) — approve or deny in the web UI",
@@ -711,16 +652,20 @@ async fn escalate_to_server(
     );
 
     let cancel_url = http::endpoint(&base, &format!("api/v1/approvals/{}/resolve", approval.id))
-        .map_err(RunError::FailClosed)?;
+        .map_err(ApprovalFlowError::Pipeline)?;
 
     tokio::select! {
         result = poll_for_decision(&client, wait_url.as_str(), token, deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal, cancelling approval {}", approval.id);
             // Best-effort cancel — don't let this block shutdown for long.
-            let _ = client
-                .post(cancel_url.as_str())
-                .bearer_auth(token.expose())
+            let cancel = client.post(cancel_url.as_str());
+            let cancel = if let Some(token) = token {
+                cancel.bearer_auth(token.expose())
+            } else {
+                cancel
+            };
+            let _ = cancel
                 .json(&serde_json::json!({"decision": "cancel"}))
                 .timeout(Duration::from_secs(5))
                 .send()
@@ -734,7 +679,7 @@ async fn escalate_to_server(
 async fn poll_for_decision(
     client: &reqwest::Client,
     wait_url: &str,
-    token: &Secret,
+    token: Option<&Secret>,
     deadline: tokio::time::Instant,
     timeout_secs: u64,
 ) -> Result<HookOutput, ApprovalFlowError> {
@@ -749,14 +694,16 @@ async fn poll_for_decision(
 
         attempt += 1;
 
+        let wait = client.get(wait_url);
+        let wait = if let Some(token) = token {
+            wait.bearer_auth(token.expose())
+        } else {
+            wait
+        };
         let resp = await_approval_deadline(
             deadline,
             last_wait_was_healthy,
-            client
-                .get(wait_url)
-                .bearer_auth(token.expose())
-                .timeout(Duration::from_secs(60))
-                .send(),
+            wait.timeout(Duration::from_secs(60)).send(),
         )
         .await?;
 

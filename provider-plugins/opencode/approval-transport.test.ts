@@ -53,6 +53,13 @@ describe("attended socket approval transport", () => {
 })
 
 describe("host approval transport", () => {
+  test("defaults no-auth transport to literal loopback HTTP without a token", () => {
+    const invocation = gatewayApprovalInvocation(approvalTransport({}), {})
+    expect(invocation.args).toEqual([
+      "approval", "--opencode", "--server", "http://127.0.0.1:8080",
+    ])
+  })
+
   test("preserves the existing HTTP URL and token arguments", () => {
     const transport = approvalTransport({ AGENT_HUB_SERVER: "https://hub.example", AGENT_HUB_TOKEN: "token" })
     const invocation = gatewayApprovalInvocation(transport, {})

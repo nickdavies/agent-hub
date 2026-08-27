@@ -32,6 +32,7 @@ const CANCELLATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) struct AttendedRelayConfig {
     pub socket_path: PathBuf,
     pub binding: AttendedGatewayBindingV1,
+    pub approval_bundle: protocol::AttendedApprovalBundleIdentity,
     pub run_deadline: DateTime<Utc>,
     pub server_url: String,
     pub token: Option<Secret>,
@@ -97,6 +98,11 @@ impl AttendedRelay {
         fail_closed: watch::Sender<bool>,
     ) -> anyhow::Result<Self> {
         let endpoint = validated_endpoint(&config.server_url, config.token.is_some())?;
+        ensure!(
+            config.approval_bundle.digest == config.binding.approval_bundle_digest
+                && config.approval_bundle.protocol == protocol::APPROVAL_BUNDLE_PROTOCOL,
+            "approval relay bundle identity does not match the authorized binding"
+        );
         ensure!(
             config.socket_path.is_absolute(),
             "approval relay socket path is not absolute"
@@ -521,12 +527,21 @@ impl RelayFailure {
 
 async fn relay_request(
     runtime: RelayRuntime,
-    request: AttendedGatewayRequestV1,
+    mut request: AttendedGatewayRequestV1,
     mut disconnected: watch::Receiver<bool>,
 ) -> Result<protocol::AttendedGatewayDecisionV1, RelayFailure> {
     verify_realized_socket_mount(&runtime)
         .await
         .map_err(|_| RelayFailure::SocketIntegrity)?;
+    request.approval.context.attended = Some(Box::new(protocol::AttendedApprovalReviewContext {
+        run_epoch: request.binding.run_epoch.clone(),
+        authorization_digest: request.binding.authorization_digest.clone(),
+        environment_bundle_digest: request.binding.environment_bundle_digest.clone(),
+        image_digest: request.binding.image_digest.clone(),
+        network_digest: request.binding.network_digest.clone(),
+        approval_bundle_digest: request.binding.approval_bundle_digest.clone(),
+        approval_bundle: runtime.config.approval_bundle.clone(),
+    }));
     let registration_resource = serde_json::to_string(&RegistrationEffect {
         request_id: request.request_id.clone(),
         request: request.clone(),
@@ -980,14 +995,19 @@ pub(crate) fn validated_endpoint(value: &str, has_token: bool) -> anyhow::Result
         url.query().is_none() && url.fragment().is_none(),
         "approval server URL must not contain query or fragment"
     );
-    if has_token && url.scheme() == "http" {
-        let host = url.host_str().context("approval server URL has no host")?;
-        let loopback = host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
+    let host = url.host_str().context("approval server URL has no host")?;
+    let loopback = host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback());
+    if url.scheme() == "http" {
         ensure!(
             loopback,
-            "bearer authentication requires HTTPS or a literal loopback HTTP address"
+            "HTTP approval endpoints require a literal loopback address"
+        );
+    } else if !loopback {
+        ensure!(
+            has_token,
+            "non-loopback approval endpoints require HTTPS plus a bearer token"
         );
     }
     Ok(url)
@@ -1099,8 +1119,11 @@ mod tests {
         assert!(validated_endpoint("https://token@example.test", false).is_err());
         assert!(validated_endpoint("file:///server", false).is_err());
         assert!(validated_endpoint("http://example.test", true).is_err());
+        assert!(validated_endpoint("http://example.test", false).is_err());
+        assert!(validated_endpoint("https://example.test", false).is_err());
         validated_endpoint("https://example.test/approvals", true).unwrap();
         validated_endpoint("http://127.0.0.1:8080", true).unwrap();
+        validated_endpoint("http://127.0.0.1:8080", false).unwrap();
     }
 
     #[tokio::test]
@@ -1223,6 +1246,7 @@ mod tests {
                     workspace_roots: vec!["/workspace/main".into()],
                     hook_event_name: HookEventName::from("permission.ask".to_string()),
                     extra: None,
+                    attended: None,
                 },
             },
             tool_input_digest: tool_input_digest(&tool_input).unwrap(),
@@ -1290,6 +1314,7 @@ mod tests {
                             workspace_roots: vec!["/workspace/main".into()],
                             hook_event_name: HookEventName::from("permission.ask".to_string()),
                             extra: None,
+                            attended: None,
                         },
                         created_at: Utc::now(),
                         status: ApprovalStatus::Cancelled,

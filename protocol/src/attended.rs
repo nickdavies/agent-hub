@@ -14,6 +14,7 @@ pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION: &str = "attended_authorization
 pub const ATTENDED_AUTHORIZATION_VERSION: u32 = 1;
 pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2: &str = "attended_authorization_request_v2";
 pub const ATTENDED_AUTHORIZATION_VERSION_V2: u32 = 2;
+pub const APPROVAL_BUNDLE_PROTOCOL: &str = "attended_approval_bundle_v1";
 pub const APPROVED_EXECUTION_PIDS_LIMIT: u32 = 512;
 const ATTENDED_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:attended-authorization:v1\0";
 const ATTENDED_AUTHORIZATION_DOMAIN_V2: &[u8] = b"agent-hub:attended-authorization:v2\0";
@@ -65,6 +66,7 @@ pub struct AttendedApprovalBundleIdentity {
     pub name: String,
     pub digest: String,
     pub protocol: String,
+    pub manifest_sha256: String,
     pub gateway_commit: String,
     pub gateway_archive_sha256: String,
     pub plugin_sha256: String,
@@ -566,11 +568,12 @@ impl AttendedAuthorizationRequestV2 {
             (ToolApprovalMode::Dippy, Some(identity)) => {
                 if identity.digest != approval_bundle_digest
                     || identity.name.is_empty()
-                    || identity.protocol != crate::ATTENDED_GATEWAY_REQUEST_VERSION
+                    || identity.protocol != APPROVAL_BUNDLE_PROTOCOL
                     || !is_lower_hex(&identity.gateway_commit, 40)
                     || !is_lower_hex(&identity.dippy_commit, 40)
                     || [
                         &identity.digest,
+                        &identity.manifest_sha256,
                         &identity.gateway_archive_sha256,
                         &identity.plugin_sha256,
                         &identity.dippy_archive_sha256,

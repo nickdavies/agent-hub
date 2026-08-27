@@ -279,6 +279,7 @@ mod tests {
                     workspace_roots: vec!["/workspace".into()],
                     hook_event_name: HookEventName::from("permission.ask".to_string()),
                     extra: None,
+                    attended: None,
                 },
             },
             tool_input_digest: tool_input_digest(&tool_input).unwrap(),

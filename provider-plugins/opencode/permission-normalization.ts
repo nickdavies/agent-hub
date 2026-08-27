@@ -17,10 +17,10 @@ const TOOL_NAMES: Record<string, OpenCodeTool> = {
   codesearch: "CodeSearch",
   doom_loop: "DoomLoop",
   edit: "Write",
-  external_directory: "Read",
+  external_directory: "ExternalDirectory",
   glob: "Glob",
   grep: "Grep",
-  list: "Read",
+  list: "List",
   lsp: "Lsp",
   question: "Question",
   read: "Read",
@@ -43,6 +43,11 @@ function stringMetadata(info: PermissionInfo, key: string): string | undefined {
 function requireValue(value: string | undefined, description: string): string {
   if (!value) throw new Error(`OpenCode ${description} is missing`)
   return value
+}
+
+function within(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate)
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
 }
 
 export function normalizePermission(
@@ -84,6 +89,15 @@ export function normalizePermission(
     if (info.patterns.length === 0) throw new Error(`OpenCode ${info.permission} path is missing`)
     return info.patterns.map((pattern) => ({ tool, toolInput: { path: absolute(pattern, directory) } }))
   }
+  if (info.permission === "external_directory") {
+    if (info.patterns.length !== 1) throw new Error("OpenCode external_directory requires one exact requested path")
+    const requested = absolute(info.patterns[0], directory)
+    const authorizedRoots = [absolute(directory, directory), absolute(worktree, directory)]
+    if (!authorizedRoots.some((root) => within(requested, root))) {
+      throw new Error("OpenCode external_directory path is outside the authorized workspace/context")
+    }
+    return [{ tool, toolInput: { path: requested } }]
+  }
   if (info.permission === "webfetch") {
     return [{ tool, toolInput: { url: requireValue(stringMetadata(info, "url"), "webfetch URL") } }]
   }
@@ -102,7 +116,7 @@ export function normalizePermission(
     const query = stringMetadata(info, "query") ?? info.patterns[0]
     return [{ tool, toolInput: { query: requireValue(query, `${info.permission} query`) } }]
   }
-  if (["task", "todowrite", "question", "doom_loop", "lsp", "skill"].includes(info.permission)) {
+  if (["task", "todowrite"].includes(info.permission)) {
     return [{
       tool,
       toolInput: {
@@ -111,5 +125,12 @@ export function normalizePermission(
       },
     }]
   }
-  throw new Error(`unsupported OpenCode permission '${info.permission}'`)
+  if (["question", "doom_loop"].includes(info.permission)) {
+    return [{ tool, toolInput: { patterns: [...info.patterns], metadata: structuredClone(info.metadata) } }]
+  }
+  if (["lsp", "skill"].includes(info.permission)) {
+    const name = requireValue(info.patterns[0], `${info.permission} name`)
+    return [{ tool, toolInput: { name, metadata: structuredClone(info.metadata) } }]
+  }
+  return [{ tool, toolInput: {} }]
 }

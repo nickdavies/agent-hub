@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 use uuid::Uuid;
 
+use crate::attended::AttendedApprovalBundleIdentity;
 use crate::sessions::SessionId;
 use crate::tool::Tool;
 
@@ -142,6 +143,20 @@ pub struct ApprovalContext {
     pub hook_event_name: HookEventName,
     /// Computed review artifacts: diffs for file-write tools, delegate reasoning, etc.
     pub extra: Option<ExtraContext>,
+    #[serde(default)]
+    pub attended: Option<Box<AttendedApprovalReviewContext>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedApprovalReviewContext {
+    pub run_epoch: String,
+    pub authorization_digest: String,
+    pub environment_bundle_digest: String,
+    pub image_digest: String,
+    pub network_digest: String,
+    pub approval_bundle_digest: String,
+    pub approval_bundle: AttendedApprovalBundleIdentity,
 }
 
 /// A full approval record as stored by the server.

@@ -96,6 +96,12 @@ const questionGatewayProcs: Map<string, ChildProcess> = new Map()
 // SIGTERM from our kill) with code 1, the callGatewayQuestion callback checks
 // this set and skips the question.reject call to avoid a double-resolve error.
 const locallyAnsweredQuestions: Set<string> = new Set()
+const GATEWAY_OUTPUT_LIMIT_BYTES = 1024 * 1024
+
+function appendBounded(current: string, chunk: Buffer): string | undefined {
+  if (Buffer.byteLength(current) + chunk.byteLength > GATEWAY_OUTPUT_LIMIT_BYTES) return undefined
+  return current + chunk.toString()
+}
 
 function track(sid: string, proc: ChildProcess) {
   let set = procs.get(sid)
@@ -189,8 +195,8 @@ function spawnStatusReport(
 ) {
   if (APPROVAL_TRANSPORT.kind === "attended_socket") return
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
-  const server = process.env.AGENT_HUB_SERVER ?? "http://localhost:8080"
-  const token = process.env.AGENT_HUB_TOKEN ?? ""
+  const server = process.env.AGENT_HUB_SERVER ?? "http://127.0.0.1:8080"
+  const token = process.env.AGENT_HUB_TOKEN
 
   const report: StatusReport = {
     session_id: sid,
@@ -206,13 +212,22 @@ function spawnStatusReport(
 
   const proc = spawn(
     bin,
-    ["status-report", "--server", server, "--token", token],
+    ["status-report", "--server", server, ...(token ? ["--token", token] : [])],
     { stdio: ["pipe", "ignore", "pipe"] },
   )
 
   proc.stdin.end(payload)
+  let stderr = ""
   proc.stderr?.on("data", (chunk: Buffer) => {
-    log("INFO", "status-report stderr", { output: chunk.toString().trim() })
+    const next = appendBounded(stderr, chunk)
+    if (next === undefined) {
+      proc.kill("SIGKILL")
+    } else {
+      stderr = next
+    }
+  })
+  proc.on("close", () => {
+    if (stderr) log("INFO", "status-report stderr", { output: stderr.trim() })
   })
   proc.on("error", (err: Error) => {
     log("WARN", "status report spawn failed", { err: err.message })
@@ -228,8 +243,8 @@ function spawnStatusReportSync(
 ) {
   if (APPROVAL_TRANSPORT.kind === "attended_socket") return
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
-  const server = process.env.AGENT_HUB_SERVER ?? "http://localhost:8080"
-  const token = process.env.AGENT_HUB_TOKEN ?? ""
+  const server = process.env.AGENT_HUB_SERVER ?? "http://127.0.0.1:8080"
+  const token = process.env.AGENT_HUB_TOKEN
 
   const report: StatusReport = {
     session_id: sid,
@@ -246,8 +261,13 @@ function spawnStatusReportSync(
   try {
     spawnSync(
       bin,
-      ["status-report", "--server", server, "--token", token],
-      { input: payload, stdio: ["pipe", "ignore", "pipe"], timeout: 5000 },
+      ["status-report", "--server", server, ...(token ? ["--token", token] : [])],
+      {
+        input: payload,
+        stdio: ["pipe", "ignore", "pipe"],
+        timeout: 5000,
+        maxBuffer: GATEWAY_OUTPUT_LIMIT_BYTES,
+      },
     )
   } catch (err: unknown) {
     log("WARN", "sync status report failed", { err: String(err) })
@@ -293,11 +313,22 @@ async function callGatewayOnce(sid: string, payload: OpenCodeHookInput): Promise
 
     let stdout = ""
     let stderr = ""
-    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString() })
-    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString() })
+    let outputExceeded = false
+    const capture = (current: string, chunk: Buffer): string => {
+      const next = appendBounded(current, chunk)
+      if (next === undefined) {
+        outputExceeded = true
+        proc.kill("SIGKILL")
+        return current
+      }
+      return next
+    }
+    proc.stdout.on("data", (chunk: Buffer) => { stdout = capture(stdout, chunk) })
+    proc.stderr.on("data", (chunk: Buffer) => { stderr = capture(stderr, chunk) })
 
     proc.on("close", (code: number | null) => {
       untrack(sid, proc)
+      if (outputExceeded) return resolve({ allowed: false, reason: "gateway: output exceeded limit" })
       if (stderr) log("INFO", "gateway stderr", { output: stderr.trim() })
       // Exit 1 is an approvals-pipeline failure from older gateway versions.
       if (code === 1) {
@@ -357,8 +388,8 @@ async function callGatewayQuestion(
   const token = process.env.AGENT_HUB_TOKEN
 
   const args: string[] = ["question", "--opencode"]
-  args.push("--server", server ?? "http://localhost:8080")
-  args.push("--token", token ?? "")
+  args.push("--server", server ?? "http://127.0.0.1:8080")
+  if (token) args.push("--token", token)
 
   log("INFO", "callGatewayQuestion", { bin, requestId: payload.question_request_id })
 
@@ -371,12 +402,23 @@ async function callGatewayQuestion(
 
     let stdout = ""
     let stderr = ""
-    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString() })
-    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString() })
+    let outputExceeded = false
+    const capture = (current: string, chunk: Buffer): string => {
+      const next = appendBounded(current, chunk)
+      if (next === undefined) {
+        outputExceeded = true
+        proc.kill("SIGKILL")
+        return current
+      }
+      return next
+    }
+    proc.stdout.on("data", (chunk: Buffer) => { stdout = capture(stdout, chunk) })
+    proc.stderr.on("data", (chunk: Buffer) => { stderr = capture(stderr, chunk) })
 
     proc.on("close", (code: number | null) => {
       untrack(sid, proc)
       questionGatewayProcs.delete(requestId)
+      if (outputExceeded) return resolve({ error: "gateway: output exceeded limit" })
       if (stderr) log("INFO", "question gateway stderr", { output: stderr.trim() })
 
       if (code === 0) {

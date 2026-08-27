@@ -14,7 +14,7 @@
  */
 export type SessionId = string
 /**
- * Tool name as sent by OpenCode (lowercase). Known: bash, edit, glob, grep, multiedit, read, task, todowrite, webfetch, write.
+ * Tool name as sent by OpenCode (lowercase). Known: bash, codesearch, doom_loop, edit, external_directory, glob, grep, list, lsp, multiedit, question, read, skill, task, todowrite, webfetch, websearch, write.
  */
 export type OpenCodeTool = string
 
@@ -160,6 +160,6 @@ export interface StatusReport {
  * Known OpenCodeTool values. The gateway accepts any string (for unknown/MCP
  * tools), but these are the recognized tool names.
  */
-export const OPENCODE_TOOL_NAMES = ["bash", "edit", "glob", "grep", "multiedit", "read", "task", "todowrite", "webfetch", "write"] as const
+export const OPENCODE_TOOL_NAMES = ["bash", "codesearch", "doom_loop", "edit", "external_directory", "glob", "grep", "list", "lsp", "multiedit", "read", "question", "skill", "task", "todowrite", "webfetch", "websearch", "write"] as const
 
 export type KnownOpenCodeTool = (typeof OPENCODE_TOOL_NAMES)[number]

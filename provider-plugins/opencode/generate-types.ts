@@ -24,14 +24,22 @@ const OUTPUT_FILE = path.join(SCHEMA_DIR, "gateway-types.ts")
 // We define the known values here as a string literal union for better TS DX.
 const KNOWN_OPENCODE_TOOLS = [
   "bash",
+  "codesearch",
+  "doom_loop",
   "edit",
+  "external_directory",
   "glob",
   "grep",
+  "list",
+  "lsp",
   "multiedit",
   "read",
+  "question",
+  "skill",
   "task",
   "todowrite",
   "webfetch",
+  "websearch",
   "write",
 ] as const
 

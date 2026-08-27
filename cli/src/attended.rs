@@ -400,8 +400,26 @@ pub fn render_proposal(
     let request = artifact.verify_v2().map_err(anyhow::Error::msg)?;
     let canonical_path = std::fs::canonicalize(path)
         .with_context(|| format!("canonicalize authorization path {}", path.display()))?;
+    let approval_bundle = request.approval_bundle.as_ref().map_or_else(
+        || "Approval bundle: none (automatic)\n".to_string(),
+        |bundle| {
+            format!(
+                "Approval bundle name: {}\nApproval bundle protocol: {}\nApproval bundle digest: {}\nApproval manifest SHA-256: {}\nGateway commit: {}\nGateway archive SHA-256: {}\nPlugin SHA-256: {}\nDippy commit: {}\nDippy archive SHA-256: {}\nDippy wheel SHA-256: {}\n",
+                bundle.name,
+                bundle.protocol,
+                bundle.digest,
+                bundle.manifest_sha256,
+                bundle.gateway_commit,
+                bundle.gateway_archive_sha256,
+                bundle.plugin_sha256,
+                bundle.dippy_commit,
+                bundle.dippy_archive_sha256,
+                bundle.dippy_wheel_sha256,
+            )
+        },
+    );
     Ok(format!(
-        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\nOverlays: {}\nTimeout seconds: {}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
+        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nTimeout seconds: {}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
         request.proposal.environment,
         request.proposal.image_family,
         request.proposal.image_tag,
@@ -409,6 +427,7 @@ pub fn render_proposal(
         request.proposal.network_class,
         resource_list(&request.proposal.network_resources),
         tool_approval_name(request.proposal.tool_approval),
+        approval_bundle,
         request.proposal.overlays.join(","),
         request.proposal.timeout_secs,
         request.proposal.prompt_digest,
@@ -811,6 +830,10 @@ pub async fn run(
                 AttendedRelayConfig {
                     socket_path: approval_relay_dir.join("approval.sock"),
                     binding: binding.clone(),
+                    approval_bundle: request
+                        .approval_bundle
+                        .clone()
+                        .context("supervised authorization has no approval bundle identity")?,
                     run_deadline,
                     server_url: relay_endpoint.server_url.clone(),
                     token: relay_endpoint.token.clone(),
@@ -2862,6 +2885,7 @@ fn attended_approval_bundle_identity(
             name: identity.name.clone(),
             digest: identity.digest.clone(),
             protocol: identity.protocol.clone(),
+            manifest_sha256: identity.manifest_sha256.clone(),
             gateway_commit: identity.gateway_commit.clone(),
             gateway_archive_sha256: identity.gateway_archive_sha256.clone(),
             plugin_sha256: identity.plugin_sha256.clone(),

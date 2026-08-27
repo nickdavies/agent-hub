@@ -40,6 +40,12 @@ pub enum ToolCallKind {
     SemanticSearch {
         target_directories: Vec<String>,
     },
+    ExternalDirectory {
+        path: String,
+    },
+    List {
+        path: String,
+    },
 
     // File write
     Write {
@@ -74,10 +80,32 @@ pub enum ToolCallKind {
     // Agent / meta
     Task {},
     TodoWrite {},
+    CodeSearch {
+        query: String,
+    },
+    DoomLoop {
+        patterns: Vec<String>,
+        metadata: Value,
+    },
+    Lsp {
+        operation: String,
+        metadata: Value,
+    },
+    Question {
+        patterns: Vec<String>,
+        metadata: Value,
+    },
+    Skill {
+        name: String,
+        metadata: Value,
+    },
 
     // Other
     WebFetch {
         url: String,
+    },
+    WebSearch {
+        query: String,
     },
 
     // Extensibility — typed args unavailable; raw blob in ToolCall.raw only
@@ -117,6 +145,8 @@ impl ToolCall {
             ToolCallKind::Grep { .. } => Tool::Grep,
             ToolCallKind::Glob { .. } => Tool::Glob,
             ToolCallKind::SemanticSearch { .. } => Tool::SemanticSearch,
+            ToolCallKind::ExternalDirectory { .. } => Tool::ExternalDirectory,
+            ToolCallKind::List { .. } => Tool::List,
             ToolCallKind::Write { .. } => Tool::Write,
             ToolCallKind::StrReplace { .. } => Tool::StrReplace,
             ToolCallKind::Delete { .. } => Tool::Delete,
@@ -127,7 +157,13 @@ impl ToolCall {
             ToolCallKind::Bash { .. } => Tool::Bash,
             ToolCallKind::Task {} => Tool::Task,
             ToolCallKind::TodoWrite {} => Tool::TodoWrite,
+            ToolCallKind::CodeSearch { .. } => Tool::CodeSearch,
+            ToolCallKind::DoomLoop { .. } => Tool::DoomLoop,
+            ToolCallKind::Lsp { .. } => Tool::Lsp,
+            ToolCallKind::Question { .. } => Tool::Question,
+            ToolCallKind::Skill { .. } => Tool::Skill,
             ToolCallKind::WebFetch { .. } => Tool::WebFetch,
+            ToolCallKind::WebSearch { .. } => Tool::WebSearch,
             ToolCallKind::Unknown { name } => Tool::Unknown(name.clone()),
         }
     }
@@ -142,6 +178,8 @@ impl ToolCall {
             ToolCallKind::Grep { .. } => "Grep",
             ToolCallKind::Glob { .. } => "Glob",
             ToolCallKind::SemanticSearch { .. } => "SemanticSearch",
+            ToolCallKind::ExternalDirectory { .. } => "ExternalDirectory",
+            ToolCallKind::List { .. } => "List",
             ToolCallKind::Write { .. } => "Write",
             ToolCallKind::StrReplace { .. } => "StrReplace",
             ToolCallKind::Delete { .. } => "Delete",
@@ -152,7 +190,13 @@ impl ToolCall {
             ToolCallKind::Bash { .. } => "Bash",
             ToolCallKind::Task {} => "Task",
             ToolCallKind::TodoWrite {} => "TodoWrite",
+            ToolCallKind::CodeSearch { .. } => "CodeSearch",
+            ToolCallKind::DoomLoop { .. } => "DoomLoop",
+            ToolCallKind::Lsp { .. } => "Lsp",
+            ToolCallKind::Question { .. } => "Question",
+            ToolCallKind::Skill { .. } => "Skill",
             ToolCallKind::WebFetch { .. } => "WebFetch",
+            ToolCallKind::WebSearch { .. } => "WebSearch",
             ToolCallKind::Unknown { name } => name.as_str(),
         }
     }
@@ -187,6 +231,9 @@ impl ToolCall {
             ToolCallKind::SemanticSearch { target_directories } => {
                 target_directories.iter().map(String::as_str).collect()
             }
+            ToolCallKind::ExternalDirectory { path } | ToolCallKind::List { path } => {
+                vec![path.as_str()]
+            }
 
             // File write — single path arg (some are optional)
             ToolCallKind::Write { path, .. } => vec![path.as_str()],
@@ -200,12 +247,23 @@ impl ToolCall {
 
             // Other
             ToolCallKind::WebFetch { url } => vec![url.as_str()],
+            ToolCallKind::WebSearch { query } | ToolCallKind::CodeSearch { query } => {
+                vec![query.as_str()]
+            }
+            ToolCallKind::Lsp { operation, .. }
+            | ToolCallKind::Skill {
+                name: operation, ..
+            } => {
+                vec![operation.as_str()]
+            }
 
             // No matchable args
             ToolCallKind::EditNotebook {}
             | ToolCallKind::NotebookEdit {}
             | ToolCallKind::Task {}
             | ToolCallKind::TodoWrite {}
+            | ToolCallKind::DoomLoop { .. }
+            | ToolCallKind::Question { .. }
             | ToolCallKind::Unknown { .. } => vec![],
         }
     }
@@ -288,6 +346,16 @@ fn parse_kind(tool: &Tool, raw: &Value) -> Result<ToolCallKind, ToolCallParseErr
                 target_directories: input.target_directories,
             })
         }
+        Tool::ExternalDirectory => {
+            let input: PathInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::ExternalDirectory { path: input.path })
+        }
+        Tool::List => {
+            let input: PathInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::List { path: input.path })
+        }
         Tool::Write => {
             let input: WriteInput =
                 serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
@@ -345,10 +413,52 @@ fn parse_kind(tool: &Tool, raw: &Value) -> Result<ToolCallKind, ToolCallParseErr
         }
         Tool::Task => Ok(ToolCallKind::Task {}),
         Tool::TodoWrite => Ok(ToolCallKind::TodoWrite {}),
+        Tool::CodeSearch => {
+            let input: QueryInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::CodeSearch { query: input.query })
+        }
+        Tool::DoomLoop => {
+            let input: PermissionMetadataInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::DoomLoop {
+                patterns: input.patterns,
+                metadata: input.metadata,
+            })
+        }
+        Tool::Lsp => {
+            let input: NamedPermissionInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::Lsp {
+                operation: input.name,
+                metadata: input.metadata,
+            })
+        }
+        Tool::Question => {
+            let input: PermissionMetadataInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::Question {
+                patterns: input.patterns,
+                metadata: input.metadata,
+            })
+        }
+        Tool::Skill => {
+            let input: NamedPermissionInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::Skill {
+                name: input.name,
+                metadata: input.metadata,
+            })
+        }
         Tool::WebFetch => {
             let input: WebFetchInput =
                 serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
             Ok(ToolCallKind::WebFetch { url: input.url })
+        }
+        Tool::WebSearch => {
+            let input: QueryInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::WebSearch { query: input.query })
         }
         Tool::Unknown(name) => Ok(ToolCallKind::Unknown { name: name.clone() }),
     }
@@ -366,6 +476,32 @@ fn parse_kind(tool: &Tool, raw: &Value) -> Result<ToolCallKind, ToolCallParseErr
 struct ReadInput {
     #[serde(alias = "file_path")]
     path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathInput {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryInput {
+    query: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionMetadataInput {
+    patterns: Vec<String>,
+    metadata: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedPermissionInput {
+    name: String,
+    metadata: Value,
 }
 
 #[derive(Deserialize)]

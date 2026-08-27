@@ -991,6 +991,68 @@ fn build_expanded_lines(
         });
     }
 
+    if let Some(attended) = &approval.context.attended {
+        lines.push(ExpandedLine {
+            text: String::new(),
+            kind: LineKind::Separator,
+        });
+        for (label, value) in [
+            ("Run epoch", attended.run_epoch.as_str()),
+            ("Authorization", attended.authorization_digest.as_str()),
+            (
+                "Environment bundle",
+                attended.environment_bundle_digest.as_str(),
+            ),
+            ("Image", attended.image_digest.as_str()),
+            ("Network", attended.network_digest.as_str()),
+            (
+                "Approval bundle digest",
+                attended.approval_bundle_digest.as_str(),
+            ),
+            (
+                "Approval bundle name",
+                attended.approval_bundle.name.as_str(),
+            ),
+            (
+                "Approval protocol",
+                attended.approval_bundle.protocol.as_str(),
+            ),
+            (
+                "Approval manifest",
+                attended.approval_bundle.manifest_sha256.as_str(),
+            ),
+            (
+                "Gateway commit",
+                attended.approval_bundle.gateway_commit.as_str(),
+            ),
+            (
+                "Gateway archive",
+                attended.approval_bundle.gateway_archive_sha256.as_str(),
+            ),
+            (
+                "Plugin artifact",
+                attended.approval_bundle.plugin_sha256.as_str(),
+            ),
+            (
+                "Dippy commit",
+                attended.approval_bundle.dippy_commit.as_str(),
+            ),
+            (
+                "Dippy archive",
+                attended.approval_bundle.dippy_archive_sha256.as_str(),
+            ),
+            (
+                "Dippy wheel",
+                attended.approval_bundle.dippy_wheel_sha256.as_str(),
+            ),
+        ] {
+            lines.push(ExpandedLine {
+                text: truncate_str(&format!("{label}: {value}"), max_line_width),
+                kind: LineKind::Info,
+            });
+        }
+    }
+
     lines
 }
 

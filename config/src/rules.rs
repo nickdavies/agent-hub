@@ -9,14 +9,15 @@ use crate::{expand_tilde, normalize_path};
 // --- JSON deserialization types ---
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolConfigJson {
-    #[allow(dead_code)]
     version: u32,
     default: DefaultAction,
     rules: Vec<RuleJson>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuleJson {
     tools: Vec<String>,
     action: RuleAction,
@@ -241,6 +242,8 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
         std::fs::read_to_string(path).map_err(|e| format!("failed to read config {path}: {e}"))?;
     let raw: ToolConfigJson = serde_json::from_str(&contents)
         .map_err(|e| format!("failed to parse config {path}: {e}"))?;
+    validate_tool_config_dto(&raw)
+        .map_err(|error| format!("failed to parse config {path}: {error}"))?;
 
     let mut rules = Vec::with_capacity(raw.rules.len());
     for raw_rule in raw.rules {
@@ -306,6 +309,46 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
         default: raw.default,
         rules,
     })
+}
+
+fn validate_tool_config_dto(config: &ToolConfigJson) -> Result<(), String> {
+    if config.version != 1 {
+        return Err("unsupported version".to_string());
+    }
+    for (index, rule) in config.rules.iter().enumerate() {
+        let number = index + 1;
+        if rule.tools.is_empty() || rule.tools.iter().any(|tool| tool.trim().is_empty()) {
+            return Err(format!("rule {number} has no tools"));
+        }
+        match (&rule.action, rule.command.as_deref()) {
+            (RuleAction::Delegate, Some(command)) if !command.trim().is_empty() => {}
+            (RuleAction::Delegate, _) => {
+                return Err(format!(
+                    "rule {number} has an invalid action/command combination"
+                ));
+            }
+            (_, None) => {}
+            _ => {
+                return Err(format!(
+                    "rule {number} has an invalid action/command combination"
+                ));
+            }
+        }
+        if rule.message.is_some() && rule.action != RuleAction::Deny {
+            return Err(format!("rule {number} has a message outside a deny action"));
+        }
+        for (name, value) in [("pattern", &rule.pattern), ("message", &rule.message)] {
+            if value.as_ref().is_some_and(|value| value.is_empty()) {
+                return Err(format!("rule {number} has invalid '{name}'"));
+            }
+        }
+        if rule.in_paths.as_ref().is_some_and(|paths| {
+            paths.is_empty() || paths.iter().any(|path| path.trim().is_empty())
+        }) {
+            return Err(format!("rule {number} has invalid 'in_paths'"));
+        }
+    }
+    Ok(())
 }
 
 pub fn resolve_action(
@@ -447,56 +490,7 @@ impl ToolConfig {
 /// - Non-delegate rules that have a `"command"` field (likely a mistake)
 pub fn validate_tool_config(path: &str) -> Result<(ToolConfig, Vec<String>), String> {
     let config = load_tool_config(path)?;
-    let mut warnings = Vec::new();
-
-    // Re-read and parse as raw JSON to detect unknown fields
-    let contents =
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read config {path}: {e}"))?;
-    let raw: serde_json::Value = serde_json::from_str(&contents)
-        .map_err(|e| format!("failed to parse config {path}: {e}"))?;
-
-    // Check top-level fields
-    let known_top = ["version", "default", "rules"];
-    if let Some(obj) = raw.as_object() {
-        for key in obj.keys() {
-            if !known_top.contains(&key.as_str()) {
-                warnings.push(format!("unknown top-level field \"{key}\""));
-            }
-        }
-    }
-
-    // Check per-rule fields
-    let known_rule = [
-        "tools",
-        "action",
-        "command",
-        "message",
-        "pattern",
-        "in_workspace",
-        "in_paths",
-        "in_cwds",
-    ];
-    if let Some(rules) = raw.get("rules").and_then(|r| r.as_array()) {
-        for (i, rule) in rules.iter().enumerate() {
-            if let Some(obj) = rule.as_object() {
-                for key in obj.keys() {
-                    if !known_rule.contains(&key.as_str()) {
-                        warnings.push(format!("rule {}: unknown field \"{key}\"", i + 1));
-                    }
-                }
-                // Warn on non-delegate rule with command field
-                let is_delegate = obj.get("action").and_then(|a| a.as_str()) == Some("delegate");
-                if !is_delegate && obj.contains_key("command") {
-                    warnings.push(format!(
-                        "rule {}: has \"command\" but action is not \"delegate\"",
-                        i + 1
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok((config, warnings))
+    Ok((config, Vec::new()))
 }
 
 #[cfg(test)]

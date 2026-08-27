@@ -27,6 +27,7 @@ use strum::{Display, EnumString};
 pub enum ToolCategory {
     FileRead,
     FileWrite,
+    ExternalDirectory,
     Shell,
     Other,
 }
@@ -87,6 +88,8 @@ pub enum Tool {
     Grep,
     Glob,
     SemanticSearch,
+    ExternalDirectory,
+    List,
 
     // File write
     Write,
@@ -103,9 +106,15 @@ pub enum Tool {
     // Agent / meta
     Task,
     TodoWrite,
+    CodeSearch,
+    DoomLoop,
+    Lsp,
+    Question,
+    Skill,
 
     // Other
     WebFetch,
+    WebSearch,
 
     // Extensibility — MCP tools, future tools, etc.
     Unknown(String),
@@ -119,6 +128,8 @@ impl Tool {
             Tool::Grep => "Grep",
             Tool::Glob => "Glob",
             Tool::SemanticSearch => "SemanticSearch",
+            Tool::ExternalDirectory => "ExternalDirectory",
+            Tool::List => "List",
             Tool::Write => "Write",
             Tool::StrReplace => "StrReplace",
             Tool::Delete => "Delete",
@@ -129,7 +140,13 @@ impl Tool {
             Tool::Bash => "Bash",
             Tool::Task => "Task",
             Tool::TodoWrite => "TodoWrite",
+            Tool::CodeSearch => "CodeSearch",
+            Tool::DoomLoop => "DoomLoop",
+            Tool::Lsp => "Lsp",
+            Tool::Question => "Question",
+            Tool::Skill => "Skill",
             Tool::WebFetch => "WebFetch",
+            Tool::WebSearch => "WebSearch",
             Tool::Unknown(s) => s.as_str(),
         }
     }
@@ -140,9 +157,10 @@ impl Tool {
     /// which is the key advantage over the old `TOOL_DEFS` table.
     pub fn category(&self) -> Option<ToolCategory> {
         match self {
-            Tool::Read | Tool::Grep | Tool::Glob | Tool::SemanticSearch => {
+            Tool::Read | Tool::Grep | Tool::Glob | Tool::SemanticSearch | Tool::List => {
                 Some(ToolCategory::FileRead)
             }
+            Tool::ExternalDirectory => Some(ToolCategory::ExternalDirectory),
             Tool::Write
             | Tool::StrReplace
             | Tool::Delete
@@ -151,7 +169,13 @@ impl Tool {
             | Tool::EditNotebook
             | Tool::NotebookEdit => Some(ToolCategory::FileWrite),
             Tool::Bash => Some(ToolCategory::Shell),
-            Tool::WebFetch => Some(ToolCategory::Other),
+            Tool::WebFetch
+            | Tool::WebSearch
+            | Tool::CodeSearch
+            | Tool::DoomLoop
+            | Tool::Lsp
+            | Tool::Question
+            | Tool::Skill => Some(ToolCategory::Other),
             // Agent/meta tools and unknown tools have no category.
             Tool::Task | Tool::TodoWrite | Tool::Unknown(_) => None,
         }
@@ -162,7 +186,9 @@ impl Tool {
     pub fn is_path_tool(&self) -> bool {
         matches!(
             self.category(),
-            Some(ToolCategory::FileRead | ToolCategory::FileWrite)
+            Some(
+                ToolCategory::FileRead | ToolCategory::FileWrite | ToolCategory::ExternalDirectory
+            )
         )
     }
 
@@ -173,7 +199,7 @@ impl Tool {
     /// and that no known tool is missing from its category's list.
     pub fn tools_in_category(cat: ToolCategory) -> &'static [&'static str] {
         match cat {
-            ToolCategory::FileRead => &["Read", "Grep", "Glob", "SemanticSearch"],
+            ToolCategory::FileRead => &["Read", "Grep", "Glob", "SemanticSearch", "List"],
             ToolCategory::FileWrite => &[
                 "Write",
                 "StrReplace",
@@ -184,7 +210,16 @@ impl Tool {
                 "NotebookEdit",
             ],
             ToolCategory::Shell => &["Bash"],
-            ToolCategory::Other => &["WebFetch"],
+            ToolCategory::ExternalDirectory => &["ExternalDirectory"],
+            ToolCategory::Other => &[
+                "WebFetch",
+                "WebSearch",
+                "CodeSearch",
+                "DoomLoop",
+                "Lsp",
+                "Question",
+                "Skill",
+            ],
         }
     }
 
@@ -195,6 +230,8 @@ impl Tool {
             "Grep" => Tool::Grep,
             "Glob" => Tool::Glob,
             "SemanticSearch" => Tool::SemanticSearch,
+            "ExternalDirectory" => Tool::ExternalDirectory,
+            "List" => Tool::List,
             "Write" => Tool::Write,
             "StrReplace" => Tool::StrReplace,
             "Delete" => Tool::Delete,
@@ -205,7 +242,13 @@ impl Tool {
             "Bash" => Tool::Bash,
             "Task" => Tool::Task,
             "TodoWrite" => Tool::TodoWrite,
+            "CodeSearch" => Tool::CodeSearch,
+            "DoomLoop" => Tool::DoomLoop,
+            "Lsp" => Tool::Lsp,
+            "Question" => Tool::Question,
+            "Skill" => Tool::Skill,
             "WebFetch" => Tool::WebFetch,
+            "WebSearch" => Tool::WebSearch,
             other => Tool::Unknown(other.to_owned()),
         }
     }
@@ -251,7 +294,7 @@ impl JsonSchema for Tool {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "Canonical tool name. Known values: Read, Grep, Glob, SemanticSearch, Write, StrReplace, Delete, Edit, MultiEdit, EditNotebook, NotebookEdit, Bash, Task, TodoWrite, WebFetch. Arbitrary strings are accepted for unknown/MCP tools."
+            "description": "Canonical tool name. Known values include Read, List, ExternalDirectory, Grep, Glob, SemanticSearch, Write, StrReplace, Delete, Edit, MultiEdit, EditNotebook, NotebookEdit, Bash, Task, TodoWrite, CodeSearch, DoomLoop, Lsp, Question, Skill, WebFetch, and WebSearch. Arbitrary strings are accepted for unknown/MCP tools."
         })
     }
 }

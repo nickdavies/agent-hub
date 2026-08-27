@@ -45,7 +45,7 @@
   ],
   "$defs": {
     "OpenCodeTool": {
-      "description": "Tool name as sent by OpenCode (lowercase). Known: bash, edit, glob, grep, multiedit, read, task, todowrite, webfetch, write.",
+      "description": "Tool name as sent by OpenCode (lowercase). Known: bash, codesearch, doom_loop, edit, external_directory, glob, grep, list, lsp, multiedit, question, read, skill, task, todowrite, webfetch, websearch, write.",
       "type": "string"
     },
     "SessionId": {

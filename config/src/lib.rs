@@ -42,7 +42,7 @@ pub use runner::{
     digest_profile, directory_content_digests, trusted_opencode_runtime_env,
     validate_untrusted_opencode_env, validate_untrusted_opencode_env_name,
 };
-pub use system::SystemConfig;
+pub use system::{SystemApprovalBundleTrustConfig, SystemConfig};
 pub use tools::{is_in_workspace, normalize_path, resolve_path};
 pub use triage::TriagePromptDefinition;
 pub use triage_mounts::{
