@@ -14,7 +14,7 @@ describe("attended socket approval transport", () => {
   test("passes only one complete immutable transport to the gateway", () => {
     const transport = approvalTransport({
       AGENT_HUB_APPROVAL_MODE: "attended_socket",
-      AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/approval.sock",
+      AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/approval/approval.sock",
       AGENT_HUB_ATTENDED_APPROVAL_BINDING: binding,
       AGENT_HUB_ATTENDED_RUN_DEADLINE: "2099-01-02T03:04:05Z",
     })
@@ -26,15 +26,15 @@ describe("attended socket approval transport", () => {
       AGENT_HUB_ATTENDED_RUN_DEADLINE: "replaced",
       AGENT_HUB_SERVER: "secret",
       AGENT_HUB_TOKEN: "secret",
-    }, 7)
+    })
     expect(Object.isFrozen(transport)).toBe(true)
-    expect(invocation.args).toContain("/agent-hub/approval.sock")
-    expect(invocation.args).toContain("7")
+    expect(invocation.args).toContain("/agent-hub/approval/approval.sock")
+    expect(invocation.args).not.toContain("--approval-sequence")
     expect(invocation.env).toEqual({ PATH: "/bin" })
   })
 
   test("rejects implicit, incomplete, mixed, and malformed socket transports", () => {
-    expect(() => approvalTransport({ AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/approval.sock" })).toThrow()
+    expect(() => approvalTransport({ AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/approval/approval.sock" })).toThrow()
     expect(() => approvalTransport({ AGENT_HUB_APPROVAL_MODE: "attended_socket" })).toThrow()
     expect(() => approvalTransport({
       AGENT_HUB_APPROVAL_MODE: "attended_socket",
@@ -44,7 +44,7 @@ describe("attended socket approval transport", () => {
     })).toThrow()
     expect(() => approvalTransport({
       AGENT_HUB_APPROVAL_MODE: "attended_socket",
-      AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/approval.sock",
+      AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/approval/approval.sock",
       AGENT_HUB_ATTENDED_APPROVAL_BINDING: binding,
       AGENT_HUB_ATTENDED_RUN_DEADLINE: "2099-01-02T03:04:05Z",
       AGENT_HUB_TOKEN: "must-not-enter-sandbox",

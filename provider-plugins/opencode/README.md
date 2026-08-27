@@ -46,9 +46,10 @@ For a sandboxed attended run, the trusted launcher sets the complete transport:
 
 ```sh
 export AGENT_HUB_APPROVAL_MODE="attended_socket"
-export AGENT_HUB_ATTENDED_APPROVAL_SOCKET="/agent-hub/approval.sock"
+export AGENT_HUB_ATTENDED_APPROVAL_SOCKET="/agent-hub/approval/approval.sock"
 export AGENT_HUB_ATTENDED_APPROVAL_BINDING='{"run_epoch":"...","authorization_digest":"...","environment_bundle_digest":"...","image_digest":"sha256:...","network_digest":"...","approval_bundle_digest":"..."}'
 export AGENT_HUB_ATTENDED_RUN_DEADLINE="2099-01-02T03:04:05Z"
+export AGENT_HUB_CONFIG="/agent-hub/agent-hub-permissions.json"
 ```
 
 Sandbox mode is explicit and fail closed. All four values are required, and
@@ -72,7 +73,7 @@ frame is a four-byte unsigned big-endian length followed by canonical compact
 UTF-8 JSON, with a maximum length of 1 MiB. Object keys are sorted recursively;
 arrays retain order. The relay must close after its single decision frame.
 Extra bytes or another frame are rejected as a replay. The request binds the
-run digests, monotonic sequence, single-use request ID, exact normalized tool
+run digests, single-use request ID, exact normalized tool
 input digest, and deadline. Every binding is echoed by the decision.
 
 The launcher must create and own the socket parent, mount that parent read-only,

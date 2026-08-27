@@ -858,7 +858,7 @@ pub async fn run(
             relay.verify_for_mount()?;
             mounts.push(DockerMount::new(
                 &material.plugin_path,
-                "/agent-hub/attended-approval-plugin.js",
+                "/agent-hub/opencode-plugin",
                 true,
             )?);
             mounts.push(DockerMount::new(
@@ -871,6 +871,18 @@ pub async fn run(
                 "/agent-hub/approval",
                 true,
             )?);
+            mounts.push(DockerMount::new(
+                &material.permissions_path,
+                "/agent-hub/agent-hub-permissions.json",
+                true,
+            )?);
+            ensure!(
+                environment.insert(
+                    "AGENT_HUB_APPROVAL_MODE".into(),
+                    "attended_socket".into(),
+                ).is_none(),
+                "authorized environment conflicts with attended approval mode"
+            );
             ensure!(
                 environment.insert(
                     "AGENT_HUB_ATTENDED_APPROVAL_SOCKET".into(),
@@ -891,6 +903,13 @@ pub async fn run(
                     relay.deadline().to_rfc3339(),
                 ).is_none(),
                 "authorized environment conflicts with attended relay deadline"
+            );
+            ensure!(
+                environment.insert(
+                    "AGENT_HUB_CONFIG".into(),
+                    "/agent-hub/agent-hub-permissions.json".into(),
+                ).is_none(),
+                "authorized environment conflicts with attended gateway config"
             );
             verify_exact_relay_mount(&mounts, &relay.socket_path)?;
         }
@@ -2730,8 +2749,12 @@ fn approval_bundle_digest(
         "environment_bundle_digest": environment_bundle_digest,
         "mode": tool_approval_name(mode),
         "plugin_sha256": protocol::sha256_hex_with_domain(
-            b"agent-hub:attended-approval-plugin:v2\0",
-            include_bytes!("attended-approval-plugin.js"),
+            b"agent-hub:attended-opencode-plugin:v3\0",
+            &[
+                include_bytes!("../../provider-plugins/opencode/agent-hub.ts").as_slice(),
+                include_bytes!("../../provider-plugins/opencode/approval-transport.ts").as_slice(),
+                include_bytes!("../../provider-plugins/opencode/permission-normalization.ts").as_slice(),
+            ].concat(),
         ),
         "protocol": protocol::ATTENDED_GATEWAY_REQUEST_VERSION,
         "socket": protocol::ATTENDED_GATEWAY_SOCKET_PATH,
@@ -3063,6 +3086,7 @@ fn verify_tool_approval(
 struct AttendedApprovalMaterial {
     plugin_path: PathBuf,
     config_path: PathBuf,
+    permissions_path: PathBuf,
 }
 
 fn materialize_attended_approval_material(
@@ -3073,8 +3097,25 @@ fn materialize_attended_approval_material(
     if mode == ToolApprovalMode::Auto {
         return Ok(None);
     }
-    let plugin_path = run_dir.join("attended-approval-plugin.js");
-    write_private_durable(&plugin_path, include_bytes!("attended-approval-plugin.js"))?;
+    let plugin_path = run_dir.join("opencode-plugin");
+    std::fs::create_dir(&plugin_path)?;
+    for (name, contents) in [
+        (
+            "agent-hub.ts",
+            include_bytes!("../../provider-plugins/opencode/agent-hub.ts").as_slice(),
+        ),
+        (
+            "approval-transport.ts",
+            include_bytes!("../../provider-plugins/opencode/approval-transport.ts").as_slice(),
+        ),
+        (
+            "permission-normalization.ts",
+            include_bytes!("../../provider-plugins/opencode/permission-normalization.ts")
+                .as_slice(),
+        ),
+    ] {
+        write_private_durable(&plugin_path.join(name), contents)?;
+    }
     let source_config = bundle_dir.join("opencode.json");
     let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&source_config)?)?;
     let object = config
@@ -3082,13 +3123,19 @@ fn materialize_attended_approval_material(
         .context("authorized OpenCode config is not an object")?;
     object.insert(
         "plugin".into(),
-        serde_json::json!(["file:///agent-hub/attended-approval-plugin.js"]),
+        serde_json::json!(["file:///agent-hub/opencode-plugin/agent-hub.ts"]),
     );
     let config_path = run_dir.join("attended-opencode.json");
     write_private_durable(&config_path, &serde_json::to_vec_pretty(&config)?)?;
+    let permissions_path = run_dir.join("agent-hub-permissions.json");
+    write_private_durable(
+        &permissions_path,
+        br#"{"version":1,"default":"ask","rules":[]}"#,
+    )?;
     Ok(Some(AttendedApprovalMaterial {
         plugin_path,
         config_path,
+        permissions_path,
     }))
 }
 

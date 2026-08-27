@@ -38,8 +38,6 @@ import { approvalTransport, gatewayApprovalInvocation } from "./approval-transpo
 import { normalizePermission } from "./permission-normalization"
 
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
-let attendedSequence = 0
-let attendedQueue: Promise<void> = Promise.resolve()
 
 // ---------------------------------------------------------------------------
 // Hook output type — extracted from Hooks["permission.ask"] so `apply()`
@@ -276,18 +274,14 @@ function isValidGatewayOutput(v: unknown): v is OpenCodeHookOutput {
 }
 
 async function callGateway(sid: string, payload: OpenCodeHookInput): Promise<GatewayResult> {
-  if (APPROVAL_TRANSPORT.kind === "http") return callGatewayOnce(sid, payload)
-  const result = attendedQueue.then(() => callGatewayOnce(sid, payload))
-  attendedQueue = result.then(() => undefined, () => undefined)
-  return result
+  return callGatewayOnce(sid, payload)
 }
 
 async function callGatewayOnce(sid: string, payload: OpenCodeHookInput): Promise<GatewayResult> {
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const config = process.env.AGENT_HUB_CONFIG
 
-  const sequence = APPROVAL_TRANSPORT.kind === "attended_socket" ? ++attendedSequence : undefined
-  const invocation = gatewayApprovalInvocation(APPROVAL_TRANSPORT, process.env, sequence)
+  const invocation = gatewayApprovalInvocation(APPROVAL_TRANSPORT, process.env)
   const args = invocation.args
   if (config) args.push("--config", config)
 

@@ -7,24 +7,7 @@ use std::process::{Command, Stdio};
 
 use protocol::{AttendedGatewayDecisionKind, AttendedGatewayRequestV1};
 use serde_json::Value;
-
-fn canonical_json(value: Value) -> Vec<u8> {
-    fn canonical(value: Value) -> Value {
-        match value {
-            Value::Object(values) => Value::Object(
-                values
-                    .into_iter()
-                    .map(|(key, value)| (key, canonical(value)))
-                    .collect::<std::collections::BTreeMap<_, _>>()
-                    .into_iter()
-                    .collect(),
-            ),
-            Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
-            value => value,
-        }
-    }
-    serde_json::to_vec(&canonical(value)).unwrap()
-}
+use uuid::Uuid;
 
 #[test]
 fn real_gateway_cli_exchanges_one_framed_relay_decision() {
@@ -47,11 +30,8 @@ fn real_gateway_cli_exchanges_one_framed_relay_decision() {
             .validate(&request.binding, chrono::Utc::now())
             .unwrap();
         let decision = request.decision(AttendedGatewayDecisionKind::Allow, None);
-        let body = canonical_json(serde_json::to_value(decision).unwrap());
-        stream
-            .write_all(&(body.len() as u32).to_be_bytes())
-            .unwrap();
-        stream.write_all(&body).unwrap();
+        let frame = protocol::encode_attended_gateway_frame(&decision).unwrap();
+        stream.write_all(&frame).unwrap();
     });
 
     let binding = serde_json::json!({
@@ -73,8 +53,6 @@ fn real_gateway_cli_exchanges_one_framed_relay_decision() {
             socket.to_str().unwrap(),
             "--approval-binding",
             &serde_json::to_string(&binding).unwrap(),
-            "--approval-sequence",
-            "1",
             "--approval-deadline",
             "2099-01-02T03:04:05Z",
             "--config",
@@ -106,4 +84,56 @@ fn real_gateway_cli_exchanges_one_framed_relay_decision() {
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
         serde_json::json!({"allowed": true})
     );
+}
+
+#[test]
+fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let binding = serde_json::json!({
+        "run_epoch": "018f0f21-76c0-7b37-a446-31f82a5e7601",
+        "authorization_digest": "a".repeat(64),
+        "environment_bundle_digest": "b".repeat(64),
+        "image_digest": format!("sha256:{}", "c".repeat(64)),
+        "network_digest": "d".repeat(64),
+        "approval_bundle_digest": "e".repeat(64),
+    });
+    for contents in [
+        r#"{"version":1,"default":"ask","rules":[],"unexpected":true}"#,
+        r#"{"version":2,"default":"ask","rules":[]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"ask","unexpected":true}]}"#,
+    ] {
+        let config = dir.path().join(Uuid::new_v4().to_string());
+        std::fs::write(&config, contents).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hub-gateway"))
+            .env_clear()
+            .args([
+                "approval",
+                "--opencode",
+                "--approval-mode",
+                "attended_socket",
+                "--approval-socket",
+                "/missing/approval.sock",
+                "--approval-binding",
+                &serde_json::to_string(&binding).unwrap(),
+                "--approval-deadline",
+                "2099-01-02T03:04:05Z",
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"strict","tool_name":"custom","tool_input":{},"cwd":"/workspace"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unknown field") || stderr.contains("unsupported version"));
+    }
 }

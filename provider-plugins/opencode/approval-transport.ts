@@ -109,16 +109,12 @@ export function approvalTransport(env: ApprovalEnvironment): ApprovalTransport {
 export function gatewayApprovalInvocation(
   transport: ApprovalTransport,
   inheritedEnv: ApprovalEnvironment,
-  sequence?: number,
 ): { args: string[]; env: ApprovalEnvironment } {
   if (transport.kind === "http") {
     return {
       args: ["approval", "--opencode", "--server", transport.server, "--token", transport.token],
       env: inheritedEnv,
     }
-  }
-  if (!Number.isSafeInteger(sequence) || sequence! <= 0) {
-    throw new Error("attended approval sequence must be a positive safe integer")
   }
   const env = { ...inheritedEnv }
   delete env.AGENT_HUB_APPROVAL_MODE
@@ -129,7 +125,6 @@ export function gatewayApprovalInvocation(
       "--approval-mode", "attended_socket",
       "--approval-socket", transport.socket,
       "--approval-binding", transport.binding,
-      "--approval-sequence", String(sequence),
       "--approval-deadline", transport.deadline,
     ],
     env,

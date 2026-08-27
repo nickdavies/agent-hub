@@ -4,11 +4,9 @@ use std::time::Duration;
 
 use protocol::{
     ATTENDED_GATEWAY_DECISION_VERSION, ATTENDED_GATEWAY_MAX_FRAME_BYTES, AttendedGatewayDecisionV1,
-    AttendedGatewayRequestV1,
+    AttendedGatewayRequestV1, decode_attended_gateway_payload, encode_attended_gateway_frame,
 };
 
-#[cfg(unix)]
-use serde_json::Value;
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
@@ -46,15 +44,9 @@ where
 {
     request.validate(&request.binding, chrono::Utc::now())?;
     let socket_identity = validate_socket(socket)?;
-    let request_bytes =
-        canonical_json_bytes(serde_json::to_value(request).map_err(|error| {
-            format!("attended approval request serialization failed: {error}")
-        })?)?;
-    if request_bytes.len() > ATTENDED_GATEWAY_MAX_FRAME_BYTES {
-        return Err("attended approval request frame is too large".to_string());
-    }
+    let request_frame = encode_attended_gateway_frame(request)?;
 
-    let exchange = exchange(socket, socket_identity, &request_bytes);
+    let exchange = exchange(socket, socket_identity, &request_frame);
     tokio::pin!(exchange);
     tokio::pin!(cancellation);
     let response = tokio::select! {
@@ -65,14 +57,10 @@ where
         _ = &mut cancellation => return Err("attended approval socket cancellation".to_string()),
     };
 
-    let value: Value = serde_json::from_slice(&response)
-        .map_err(|error| format!("attended approval socket returned malformed JSON: {error}"))?;
-    if canonical_json_bytes(value.clone())? != response {
-        return Err("attended approval decision is not canonical JSON".to_string());
-    }
-    let decision: AttendedGatewayDecisionV1 = serde_json::from_value(value).map_err(|error| {
-        format!("attended approval socket returned malformed decision: {error}")
-    })?;
+    let decision: AttendedGatewayDecisionV1 =
+        decode_attended_gateway_payload(&response).map_err(|error| {
+            format!("attended approval socket returned malformed decision: {error}")
+        })?;
     validate_decision(request, &decision)?;
     Ok(decision)
 }
@@ -85,7 +73,6 @@ fn validate_decision(
         return Err("attended approval decision version mismatch".to_string());
     }
     if decision.binding != request.binding
-        || decision.sequence != request.sequence
         || decision.request_id != request.request_id
         || decision.tool_input_digest != request.tool_input_digest
         || decision.deadline != request.deadline
@@ -110,7 +97,7 @@ struct SocketIdentity {
 async fn exchange(
     socket: &Path,
     expected_identity: SocketIdentity,
-    request: &[u8],
+    request_frame: &[u8],
 ) -> Result<Vec<u8>, String> {
     let mut stream = UnixStream::connect(socket)
         .await
@@ -124,13 +111,7 @@ async fn exchange(
         return Err("attended approval relay peer UID does not match the runtime UID".to_string());
     }
 
-    stream
-        .write_u32(request.len() as u32)
-        .await
-        .map_err(|error| {
-            format!("attended approval socket disconnected writing length: {error}")
-        })?;
-    stream.write_all(request).await.map_err(|error| {
+    stream.write_all(request_frame).await.map_err(|error| {
         format!("attended approval socket disconnected writing request: {error}")
     })?;
     stream
@@ -228,42 +209,26 @@ fn verify_socket_identity(socket: &Path, expected: SocketIdentity) -> Result<(),
 }
 
 #[cfg(unix)]
-fn canonical_json_bytes(value: Value) -> Result<Vec<u8>, String> {
-    fn canonical(value: Value) -> Value {
-        match value {
-            Value::Object(values) => {
-                let sorted = values
-                    .into_iter()
-                    .map(|(key, value)| (key, canonical(value)))
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                Value::Object(sorted.into_iter().collect())
-            }
-            Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
-            value => value,
-        }
-    }
-
-    serde_json::to_vec(&canonical(value))
-        .map_err(|error| format!("attended approval canonical JSON failed: {error}"))
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use chrono::{TimeZone as _, Utc};
     use protocol::{
-        ATTENDED_GATEWAY_REQUEST_VERSION, AttendedGatewayBindingV1, AttendedGatewayDecisionKind,
-        AttendedGatewayRequestV1, Tool, tool_input_digest,
+        ATTENDED_GATEWAY_REQUEST_VERSION, ApprovalContext, ApprovalRequest,
+        AttendedGatewayBindingV1, AttendedGatewayDecisionKind, AttendedGatewayRequestV1,
+        HookEventName, RequestType, SessionId, Tool, encode_attended_gateway_frame,
+        tool_input_digest,
     };
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
     use super::{
-        ATTENDED_GATEWAY_MAX_FRAME_BYTES, canonical_json_bytes, round_trip, socket_identity,
-        verify_socket_identity,
+        ATTENDED_GATEWAY_MAX_FRAME_BYTES, round_trip, socket_identity, verify_socket_identity,
     };
 
     fn request() -> AttendedGatewayRequestV1 {
@@ -278,11 +243,23 @@ mod tests {
                 network_digest: "d".repeat(64),
                 approval_bundle_digest: "e".repeat(64),
             },
-            sequence: 1,
             request_id: "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
-            tool: Tool::Bash,
+            approval: ApprovalRequest {
+                id: "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
+                session_id: SessionId::new("golden"),
+                session_display_name: "Golden".into(),
+                cwd: "/workspace".into(),
+                tool: Tool::Bash,
+                tool_input: tool_input.clone(),
+                provider: "opencode".into(),
+                request_type: RequestType::ToolUse,
+                context: ApprovalContext {
+                    workspace_roots: vec!["/workspace".into()],
+                    hook_event_name: HookEventName::from("permission.ask".to_string()),
+                    extra: None,
+                },
+            },
             tool_input_digest: tool_input_digest(&tool_input).unwrap(),
-            tool_input,
             deadline: Utc.with_ymd_and_hms(2099, 1, 2, 3, 4, 5).unwrap(),
         }
     }
@@ -307,13 +284,11 @@ mod tests {
         mut stream: tokio::net::UnixStream,
         request: &AttendedGatewayRequestV1,
     ) {
-        let body = canonical_json_bytes(
-            serde_json::to_value(request.decision(AttendedGatewayDecisionKind::Allow, None))
-                .unwrap(),
+        let frame = encode_attended_gateway_frame(
+            &request.decision(AttendedGatewayDecisionKind::Allow, None),
         )
         .unwrap();
-        stream.write_u32(body.len() as u32).await.unwrap();
-        stream.write_all(&body).await.unwrap();
+        stream.write_all(&frame).await.unwrap();
     }
 
     #[tokio::test]
@@ -342,12 +317,16 @@ mod tests {
             "../../protocol/tests/fixtures/attended_gateway_v1.json"
         ))
         .unwrap();
+        serde_json::from_value::<AttendedGatewayRequestV1>(fixture["request"].clone()).unwrap();
+        serde_json::from_value::<protocol::AttendedGatewayDecisionV1>(fixture["decision"].clone())
+            .unwrap();
         assert_eq!(
             protocol::tool_input_digest(&fixture["tool_input"]).unwrap(),
             fixture["tool_input_digest"]
         );
         for name in ["request", "decision"] {
-            let bytes = canonical_json_bytes(fixture[name].clone()).unwrap();
+            let frame = encode_attended_gateway_frame(&fixture[name]).unwrap();
+            let bytes = frame[4..].to_vec();
             assert_eq!(
                 String::from_utf8(bytes.clone()).unwrap(),
                 fixture[format!("{name}_canonical")]
@@ -385,9 +364,8 @@ mod tests {
                 if mode == "digest" {
                     decision["tool_input_digest"] = Value::String("f".repeat(64));
                 }
-                let body = canonical_json_bytes(decision).unwrap();
-                stream.write_u32(body.len() as u32).await.unwrap();
-                stream.write_all(&body).await.unwrap();
+                let frame = encode_attended_gateway_frame(&decision).unwrap();
+                stream.write_all(&frame).await.unwrap();
                 if mode == "replay" {
                     stream.write_all(b"x").await.unwrap();
                 }
@@ -452,5 +430,88 @@ mod tests {
         let error = verify_socket_identity(&socket, original).unwrap_err();
         assert!(error.contains("identity changed"), "{error}");
         drop((listener, replacement));
+    }
+
+    #[tokio::test]
+    async fn in_process_relay_proves_approve_deny_cancel_and_concurrency() {
+        let (_dir, socket, listener) = listener();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let relay_active = Arc::clone(&active);
+        let relay_maximum = Arc::clone(&maximum);
+        let relay = tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let active = Arc::clone(&relay_active);
+                let maximum = Arc::clone(&relay_maximum);
+                handlers.push(tokio::spawn(async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    let request = read_request(&mut stream).await;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    let kind = if request.approval.tool_input["decision"] == "deny" {
+                        AttendedGatewayDecisionKind::Deny
+                    } else {
+                        AttendedGatewayDecisionKind::Allow
+                    };
+                    let frame =
+                        encode_attended_gateway_frame(&request.decision(kind, None)).unwrap();
+                    let _ = stream.write_all(&frame).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for handler in handlers {
+                handler.await.unwrap();
+            }
+        });
+
+        let request_for = |suffix: &str, decision: &str| {
+            let mut request = request();
+            request.request_id = format!("018f0f21-76c0-7b37-a446-31f82a5e76{suffix}");
+            request.approval.id = request.request_id.clone();
+            request.approval.tool_input = json!({"decision": decision});
+            request.tool_input_digest = tool_input_digest(&request.approval.tool_input).unwrap();
+            request
+        };
+        let approve = request_for("10", "allow");
+        let deny = request_for("11", "deny");
+        let also_approve = request_for("12", "allow");
+        let cancel = request_for("13", "allow");
+        let (approved, denied, second_approved, cancelled) = tokio::join!(
+            round_trip(
+                &socket,
+                &approve,
+                Duration::from_secs(1),
+                std::future::pending()
+            ),
+            round_trip(
+                &socket,
+                &deny,
+                Duration::from_secs(1),
+                std::future::pending()
+            ),
+            round_trip(
+                &socket,
+                &also_approve,
+                Duration::from_secs(1),
+                std::future::pending()
+            ),
+            round_trip(&socket, &cancel, Duration::from_secs(1), async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }),
+        );
+        assert_eq!(
+            approved.unwrap().decision,
+            AttendedGatewayDecisionKind::Allow
+        );
+        assert_eq!(denied.unwrap().decision, AttendedGatewayDecisionKind::Deny);
+        assert_eq!(
+            second_approved.unwrap().decision,
+            AttendedGatewayDecisionKind::Allow
+        );
+        assert!(cancelled.unwrap_err().contains("cancellation"));
+        relay.await.unwrap();
+        assert!(maximum.load(Ordering::SeqCst) >= 2);
     }
 }

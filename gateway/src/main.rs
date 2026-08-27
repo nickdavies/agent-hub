@@ -79,10 +79,6 @@ struct ApprovalArgs {
     #[arg(long, env = "AGENT_HUB_ATTENDED_APPROVAL_BINDING")]
     approval_binding: Option<String>,
 
-    /// Monotonic attended request sequence supplied by the long-lived plugin
-    #[arg(long)]
-    approval_sequence: Option<u64>,
-
     /// Upper bound for this attended request
     #[arg(long, env = "AGENT_HUB_ATTENDED_RUN_DEADLINE")]
     approval_deadline: Option<chrono::DateTime<chrono::Utc>>,
@@ -178,7 +174,6 @@ fn validate_approval_transport(args: &ApprovalArgs) -> Result<(), String> {
     let attended_values = [
         args.approval_socket.is_some(),
         args.approval_binding.is_some(),
-        args.approval_sequence.is_some(),
         args.approval_deadline.is_some(),
     ];
     match args.approval_mode.as_deref() {
@@ -188,8 +183,7 @@ fn validate_approval_transport(args: &ApprovalArgs) -> Result<(), String> {
             }
             if attended_values.iter().any(|present| !present) {
                 return Err(
-                    "attended_socket mode requires socket, binding, sequence, and deadline"
-                        .to_string(),
+                    "attended_socket mode requires socket, binding, and deadline".to_string(),
                 );
             }
             if !args
@@ -198,9 +192,6 @@ fn validate_approval_transport(args: &ApprovalArgs) -> Result<(), String> {
                 .is_some_and(|path| path.is_absolute())
             {
                 return Err("attended approval socket path must be absolute".to_string());
-            }
-            if args.approval_sequence == Some(0) {
-                return Err("attended approval sequence must be positive".to_string());
             }
             serde_json::from_str::<protocol::AttendedGatewayBindingV1>(
                 args.approval_binding.as_deref().expect("checked above"),
@@ -342,6 +333,7 @@ async fn run(
     event: &ToolHookEvent,
     config_path: &str,
 ) -> Result<HookOutput, RunError> {
+    validate_gateway_config(config_path).map_err(RunError::FailClosed)?;
     let config = load_tool_config(config_path).map_err(RunError::FailClosed)?;
 
     // Extract matchable args from the typed tool call and resolve paths.
@@ -425,6 +417,53 @@ async fn run(
     };
 
     Ok(output)
+}
+
+fn validate_gateway_config(path: &str) -> Result<(), String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read config {path}: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|error| format!("failed to parse config {path}: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("failed to parse config {path}: expected an object"))?;
+    let known_top = ["version", "default", "rules"];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !known_top.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "failed to parse config {path}: unknown field '{field}'"
+        ));
+    }
+    if object.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(format!(
+            "failed to parse config {path}: unsupported version"
+        ));
+    }
+    let known_rule = [
+        "tools",
+        "action",
+        "command",
+        "message",
+        "pattern",
+        "in_workspace",
+        "in_paths",
+    ];
+    if let Some(rules) = object.get("rules").and_then(serde_json::Value::as_array) {
+        for (index, rule) in rules.iter().enumerate() {
+            if let Some(field) = rule.as_object().and_then(|rule| {
+                rule.keys()
+                    .find(|field| !known_rule.contains(&field.as_str()))
+            }) {
+                return Err(format!(
+                    "failed to parse config {path}: rule {} has unknown field '{field}'",
+                    index + 1
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Spawn a delegate subprocess, pipe the canonical delegate payload via stdin, and parse the result.
@@ -522,16 +561,14 @@ async fn escalate_to_server(
                 ApprovalFlowError::Pipeline(format!("attended approval timeout is invalid: {error}"))
             })?;
         let deadline = run_deadline.min(timeout_deadline);
-        let tool_input = event.tool_call.raw_input().clone();
+        let tool_input_digest =
+            protocol::tool_input_digest(&request.tool_input).map_err(ApprovalFlowError::Pipeline)?;
         let attended_request = protocol::AttendedGatewayRequestV1 {
             version: protocol::ATTENDED_GATEWAY_REQUEST_VERSION.into(),
             binding,
-            sequence: args.approval_sequence.expect("transport validated"),
             request_id: request.id.clone(),
-            tool: event.tool_call.tool(),
-            tool_input_digest: protocol::tool_input_digest(&tool_input)
-                .map_err(ApprovalFlowError::Pipeline)?,
-            tool_input,
+            approval: request,
+            tool_input_digest,
             deadline,
         };
         let decision = request_approval(
