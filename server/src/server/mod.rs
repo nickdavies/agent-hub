@@ -15,11 +15,14 @@ pub mod webhook;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::extract::rejection::JsonRejection;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
+use tokio::time::Instant;
 use tower_sessions::{MemoryStore, SessionManagerLayer};
 use uuid::Uuid;
 
@@ -543,26 +546,84 @@ impl<N: Notifier> AppState<N> {
 
     /// Capture current state for persistence.
     pub async fn snapshot(&self) -> storage::PersistedState {
+        self.snapshot_at(Utc::now(), Instant::now()).await
+    }
+
+    async fn snapshot_at(
+        &self,
+        wall_now: DateTime<Utc>,
+        monotonic_now: Instant,
+    ) -> storage::PersistedState {
+        let (pending_approvals, timed_approval_grants) =
+            self.approvals.snapshot_at(wall_now, monotonic_now).await;
         storage::PersistedState {
             sessions: self.sessions.snapshot().await,
             notify_config: Some(self.notify_config.read().await.clone()),
             presence: Some(self.presence.raw_state().await),
-            pending_approvals: self.approvals.snapshot().await,
+            pending_approvals,
+            timed_approval_grants,
         }
     }
 
-    /// Restore state from a persisted snapshot.
-    pub async fn restore(&self, state: storage::PersistedState) {
-        self.sessions.restore(state.sessions).await;
-        if let Some(cfg) = state.notify_config {
+    pub async fn restore_from_storage(
+        &self,
+        storage: &impl storage::Storage,
+    ) -> anyhow::Result<()> {
+        self.restore_from_storage_at(storage, Utc::now(), Instant::now())
+            .await
+    }
+
+    async fn restore_from_storage_at(
+        &self,
+        storage: &impl storage::Storage,
+        wall_now: DateTime<Utc>,
+        monotonic_now: Instant,
+    ) -> anyhow::Result<()> {
+        let Some(mut state) = storage
+            .load()
+            .await
+            .context("failed to load persisted state")?
+        else {
+            return Ok(());
+        };
+        tracing::info!(sessions = state.sessions.len(), "restoring persisted state");
+
+        let timed_approval_grants = std::mem::take(&mut state.timed_approval_grants);
+        if !timed_approval_grants.is_empty() {
+            storage.save(&state).await?;
+            state.timed_approval_grants = timed_approval_grants;
+        }
+
+        self.restore_at(state, wall_now, monotonic_now).await;
+        Ok(())
+    }
+
+    async fn restore_at(
+        &self,
+        state: storage::PersistedState,
+        wall_now: DateTime<Utc>,
+        monotonic_now: Instant,
+    ) {
+        let storage::PersistedState {
+            sessions,
+            notify_config,
+            presence,
+            pending_approvals,
+            timed_approval_grants,
+        } = state;
+        self.sessions.restore(sessions).await;
+        if let Some(cfg) = notify_config {
             *self.notify_config.write().await = cfg;
         }
-        if let Some(presence) = state.presence {
+        if let Some(presence) = presence {
             self.presence.set(presence).await;
         }
-        if !state.pending_approvals.is_empty() {
-            self.approvals.restore(state.pending_approvals).await;
+        if !pending_approvals.is_empty() {
+            self.approvals.restore(pending_approvals).await;
         }
+        self.approvals
+            .restore_grants_at(timed_approval_grants, wall_now, monotonic_now)
+            .await;
     }
 }
 
@@ -577,15 +638,70 @@ mod integration_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode as AxumStatus};
-    use chrono::Utc;
+    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use config::{ApprovalFeatureMode, AuthMode, ServerConfig, Token};
     use notifier::{Notifier, NotifyError, NullNotifier};
     use protocol::{
         ApprovalContext, ApprovalGrantDuration, ApprovalRequest, HookEventName, RequestType, Tool,
     };
     use sessions::SessionApprovalMode;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt; // for oneshot
+
+    struct MemoryStorage {
+        state: Mutex<Option<Vec<u8>>>,
+        fail_saves: AtomicBool,
+    }
+
+    impl MemoryStorage {
+        fn new(state: storage::PersistedState) -> Self {
+            Self {
+                state: Mutex::new(Some(
+                    serde_json::to_vec(&state).expect("persisted state should serialize"),
+                )),
+                fail_saves: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_saves(&self) {
+            self.fail_saves.store(true, Ordering::SeqCst);
+        }
+
+        fn persisted_state(&self) -> storage::PersistedState {
+            let bytes = self
+                .state
+                .lock()
+                .expect("memory storage lock should not be poisoned")
+                .clone()
+                .expect("memory storage should contain state");
+            serde_json::from_slice(&bytes).expect("persisted state should deserialize")
+        }
+    }
+
+    impl storage::Storage for MemoryStorage {
+        async fn load(&self) -> anyhow::Result<Option<storage::PersistedState>> {
+            self.state
+                .lock()
+                .expect("memory storage lock should not be poisoned")
+                .as_deref()
+                .map(serde_json::from_slice)
+                .transpose()
+                .map_err(Into::into)
+        }
+
+        async fn save(&self, state: &storage::PersistedState) -> anyhow::Result<()> {
+            if self.fail_saves.load(Ordering::SeqCst) {
+                anyhow::bail!("injected save failure");
+            }
+            *self
+                .state
+                .lock()
+                .expect("memory storage lock should not be poisoned") =
+                Some(serde_json::to_vec(state)?);
+            Ok(())
+        }
+    }
 
     struct CountingNotifier {
         sends: Arc<AtomicUsize>,
@@ -703,6 +819,564 @@ mod integration_tests {
                 },
             })
             .await
+    }
+
+    async fn register_bash_approval_at(
+        state: &AppState<NullNotifier>,
+        request_id: &str,
+        session_id: &str,
+        command: &str,
+        wall_now: chrono::DateTime<Utc>,
+        monotonic_now: tokio::time::Instant,
+    ) -> approvals::Approval {
+        state
+            .approvals
+            .register_at(
+                approvals::RegisterApproval {
+                    request_id: request_id.to_string(),
+                    session_id: SessionId::new(session_id),
+                    session_display_name: "test session".to_string(),
+                    project: "/workspace".to_string(),
+                    tool: Tool::Bash,
+                    tool_input: serde_json::json!({"command": command}),
+                    provider: "opencode".to_string(),
+                    request_type: RequestType::ToolUse,
+                    context: ApprovalContext {
+                        workspace_roots: vec!["/workspace".to_string()],
+                        hook_event_name: HookEventName::Other("test".to_string()),
+                        extra: None,
+                    },
+                },
+                wall_now,
+                monotonic_now,
+            )
+            .await
+    }
+
+    fn fixed_wall_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 27, 12, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn restored_grant_is_consumed_before_activation_and_cannot_replay_after_crash() {
+        let source = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let issued_at = fixed_wall_now();
+        let source_monotonic = tokio::time::Instant::now();
+        let long_grant = register_bash_approval_at(
+            &source,
+            "long-grant",
+            "session-1",
+            "cargo test",
+            issued_at,
+            source_monotonic,
+        )
+        .await;
+        let replacement = register_bash_approval_at(
+            &source,
+            "short-replacement",
+            "session-1",
+            "cargo test",
+            issued_at,
+            source_monotonic,
+        )
+        .await;
+        source
+            .approvals
+            .resolve_with_grant_at(
+                long_grant.id,
+                ApprovalStatus::Approved { message: None },
+                ApprovalGrantDuration::TwentyFourHours,
+                source_monotonic,
+            )
+            .await
+            .unwrap();
+        let storage = MemoryStorage::new(source.snapshot_at(issued_at, source_monotonic).await);
+
+        let first_start = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let first_start_monotonic = tokio::time::Instant::now();
+        first_start
+            .restore_from_storage_at(&storage, issued_at, first_start_monotonic)
+            .await
+            .expect("startup should consume and restore the persisted state");
+        assert!(
+            storage.persisted_state().timed_approval_grants.is_empty(),
+            "persisted authority must be consumed before startup succeeds"
+        );
+
+        first_start
+            .approvals
+            .resolve_with_grant_at(
+                replacement.id,
+                ApprovalStatus::Approved { message: None },
+                ApprovalGrantDuration::ThirtyMinutes,
+                first_start_monotonic,
+            )
+            .await
+            .expect("the restored pending approval should create a shorter replacement");
+        let before_short_expiry = register_bash_approval_at(
+            &first_start,
+            "first-runtime-match",
+            "session-1",
+            "cargo test",
+            issued_at,
+            first_start_monotonic + Duration::from_secs(29 * 60),
+        )
+        .await;
+        assert_eq!(
+            before_short_expiry.status,
+            ApprovalStatus::Approved { message: None }
+        );
+
+        // Simulate a crash by starting from the storage copy without saving the
+        // first runtime's shorter replacement.
+        let crash_restart = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let crash_restart_monotonic = tokio::time::Instant::now();
+        crash_restart
+            .restore_from_storage_at(
+                &storage,
+                issued_at + ChronoDuration::hours(1),
+                crash_restart_monotonic,
+            )
+            .await
+            .expect("consumed state should remain restartable");
+        let after_crash = register_bash_approval_at(
+            &crash_restart,
+            "after-crash",
+            "session-1",
+            "cargo test",
+            issued_at + ChronoDuration::hours(1),
+            crash_restart_monotonic,
+        )
+        .await;
+
+        assert_eq!(
+            after_crash.status,
+            ApprovalStatus::Pending,
+            "the original 24-hour grant must not replay after a crash"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_grant_consumption_failure_fails_closed_before_restore() {
+        let source = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let issued_at = fixed_wall_now();
+        let source_monotonic = tokio::time::Instant::now();
+        register_bash_approval_at(
+            &source,
+            "persisted-pending",
+            "session-2",
+            "cargo check",
+            issued_at,
+            source_monotonic,
+        )
+        .await;
+        let grant = register_bash_approval_at(
+            &source,
+            "grant-source",
+            "session-1",
+            "cargo test",
+            issued_at,
+            source_monotonic,
+        )
+        .await;
+        source
+            .approvals
+            .resolve_with_grant_at(
+                grant.id,
+                ApprovalStatus::Approved { message: None },
+                ApprovalGrantDuration::TwentyFourHours,
+                source_monotonic,
+            )
+            .await
+            .unwrap();
+        let storage = MemoryStorage::new(source.snapshot_at(issued_at, source_monotonic).await);
+        storage.fail_saves();
+        let restored = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let startup_monotonic = tokio::time::Instant::now();
+
+        let error = restored
+            .restore_from_storage_at(&storage, issued_at, startup_monotonic)
+            .await
+            .expect_err("startup must fail when persisted authority cannot be consumed");
+
+        assert!(error.to_string().contains("injected save failure"));
+        assert_eq!(restored.approvals.grant_count().await, 0);
+        assert!(restored.approvals.list_pending().await.is_empty());
+        let matching = register_bash_approval_at(
+            &restored,
+            "after-failed-restore",
+            "session-1",
+            "cargo test",
+            issued_at,
+            startup_monotonic,
+        )
+        .await;
+        assert_eq!(matching.status, ApprovalStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn clean_snapshot_restores_unexpired_grant_with_remaining_monotonic_lifetime() {
+        let source = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let issued_at = fixed_wall_now();
+        let monotonic_issued_at = tokio::time::Instant::now();
+        let granted = register_bash_approval_at(
+            &source,
+            "grant-source",
+            "session-1",
+            "cargo test",
+            issued_at,
+            monotonic_issued_at,
+        )
+        .await;
+        source
+            .approvals
+            .resolve_with_grant_at(
+                granted.id,
+                ApprovalStatus::Approved { message: None },
+                ApprovalGrantDuration::ThirtyMinutes,
+                monotonic_issued_at,
+            )
+            .await
+            .unwrap();
+
+        let shutdown_wall = issued_at + ChronoDuration::minutes(10);
+        let shutdown_monotonic = monotonic_issued_at + Duration::from_secs(10 * 60);
+        let persisted = source.snapshot_at(shutdown_wall, shutdown_monotonic).await;
+        assert_eq!(persisted.timed_approval_grants.len(), 1);
+        let persisted_grant = &persisted.timed_approval_grants[0];
+        assert_eq!(persisted_grant.session_id, SessionId::new("session-1"));
+        assert_eq!(persisted_grant.command, "cargo test");
+        assert_eq!(persisted_grant.issued_at, shutdown_wall);
+        assert_eq!(
+            persisted_grant.expires_at,
+            issued_at + ChronoDuration::minutes(30)
+        );
+
+        let startup_wall = issued_at + ChronoDuration::minutes(15);
+        let startup_monotonic = tokio::time::Instant::now();
+        let restored = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        restored
+            .restore_at(persisted, startup_wall, startup_monotonic)
+            .await;
+        let restored_expiry = startup_monotonic + Duration::from_secs(15 * 60);
+
+        let before_expiry = register_bash_approval_at(
+            &restored,
+            "before-expiry",
+            "session-1",
+            "cargo test",
+            startup_wall + ChronoDuration::days(365),
+            restored_expiry - Duration::from_nanos(1),
+        )
+        .await;
+        let at_expiry = register_bash_approval_at(
+            &restored,
+            "at-expiry",
+            "session-1",
+            "cargo test",
+            startup_wall - ChronoDuration::days(365),
+            restored_expiry,
+        )
+        .await;
+        let after_expiry = register_bash_approval_at(
+            &restored,
+            "after-expiry",
+            "session-1",
+            "cargo test",
+            startup_wall,
+            restored_expiry + Duration::from_nanos(1),
+        )
+        .await;
+
+        assert_eq!(
+            before_expiry.status,
+            ApprovalStatus::Approved { message: None }
+        );
+        assert_eq!(at_expiry.status, ApprovalStatus::Pending);
+        assert_eq!(after_expiry.status, ApprovalStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn clean_snapshot_purges_expired_timed_grants_and_retains_valid_grants() {
+        let state = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let issued_at = fixed_wall_now();
+        let monotonic_issued_at = tokio::time::Instant::now();
+        let expired = register_bash_approval_at(
+            &state,
+            "expired-source",
+            "expired-session",
+            "cargo test --expired",
+            issued_at,
+            monotonic_issued_at,
+        )
+        .await;
+        let valid = register_bash_approval_at(
+            &state,
+            "valid-source",
+            "valid-session",
+            "cargo test --valid",
+            issued_at,
+            monotonic_issued_at,
+        )
+        .await;
+        state
+            .approvals
+            .resolve_with_grant_at(
+                expired.id,
+                ApprovalStatus::Approved { message: None },
+                ApprovalGrantDuration::ThirtyMinutes,
+                monotonic_issued_at,
+            )
+            .await
+            .unwrap();
+        state
+            .approvals
+            .resolve_with_grant_at(
+                valid.id,
+                ApprovalStatus::Approved { message: None },
+                ApprovalGrantDuration::OneHour,
+                monotonic_issued_at,
+            )
+            .await
+            .unwrap();
+
+        let snapshot_wall = issued_at + ChronoDuration::minutes(30);
+        let snapshot_monotonic = monotonic_issued_at + Duration::from_secs(30 * 60);
+        let snapshot = state.snapshot_at(snapshot_wall, snapshot_monotonic).await;
+
+        assert_eq!(snapshot.timed_approval_grants.len(), 1);
+        let persisted = &snapshot.timed_approval_grants[0];
+        assert_eq!(persisted.session_id, SessionId::new("valid-session"));
+        assert_eq!(persisted.command, "cargo test --valid");
+        assert_eq!(persisted.issued_at, snapshot_wall);
+        assert_eq!(persisted.expires_at, issued_at + ChronoDuration::hours(1));
+        assert_eq!(state.approvals.grant_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn restore_discards_timed_grant_that_expired_during_downtime() {
+        let source = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let issued_at = fixed_wall_now();
+        let monotonic_issued_at = tokio::time::Instant::now();
+        let approval = register_bash_approval_at(
+            &source,
+            "grant-source",
+            "session-1",
+            "cargo test",
+            issued_at,
+            monotonic_issued_at,
+        )
+        .await;
+        source
+            .approvals
+            .resolve_with_grant_at(
+                approval.id,
+                ApprovalStatus::Approved { message: None },
+                ApprovalGrantDuration::ThirtyMinutes,
+                monotonic_issued_at,
+            )
+            .await
+            .unwrap();
+        let persisted = source
+            .snapshot_at(
+                issued_at + ChronoDuration::minutes(5),
+                monotonic_issued_at + Duration::from_secs(5 * 60),
+            )
+            .await;
+
+        let restored = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let startup_wall = issued_at + ChronoDuration::minutes(31);
+        let startup_monotonic = tokio::time::Instant::now();
+        restored
+            .restore_at(persisted, startup_wall, startup_monotonic)
+            .await;
+        let matching = register_bash_approval_at(
+            &restored,
+            "after-restore",
+            "session-1",
+            "cargo test",
+            startup_wall,
+            startup_monotonic,
+        )
+        .await;
+
+        assert_eq!(matching.status, ApprovalStatus::Pending);
+        assert_eq!(restored.approvals.grant_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn restore_discards_semantically_impossible_timed_grants() {
+        let issued_at = fixed_wall_now();
+        let cases = [
+            (
+                "expiry equal to issuance",
+                issued_at,
+                issued_at,
+                issued_at + ChronoDuration::minutes(1),
+            ),
+            (
+                "expiry before issuance",
+                issued_at,
+                issued_at - ChronoDuration::nanoseconds(1),
+                issued_at + ChronoDuration::minutes(1),
+            ),
+            (
+                "original lifetime above 24 hours",
+                issued_at,
+                issued_at + ChronoDuration::hours(24) + ChronoDuration::nanoseconds(1),
+                issued_at + ChronoDuration::minutes(1),
+            ),
+            (
+                "remaining lifetime above 24 hours",
+                issued_at,
+                issued_at + ChronoDuration::hours(24) + ChronoDuration::nanoseconds(1),
+                issued_at,
+            ),
+            (
+                "startup clock before issuance",
+                issued_at,
+                issued_at + ChronoDuration::minutes(30),
+                issued_at - ChronoDuration::nanoseconds(1),
+            ),
+        ];
+
+        for (name, persisted_issued_at, persisted_expires_at, startup_wall) in cases {
+            let restored = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+            let mut persisted = restored
+                .snapshot_at(startup_wall, tokio::time::Instant::now())
+                .await;
+            persisted.timed_approval_grants = vec![storage::PersistedApprovalGrant {
+                session_id: SessionId::new("session-1"),
+                command: "cargo test".to_string(),
+                issued_at: persisted_issued_at,
+                expires_at: persisted_expires_at,
+            }];
+            let startup_monotonic = tokio::time::Instant::now();
+
+            restored
+                .restore_at(persisted, startup_wall, startup_monotonic)
+                .await;
+            let matching = register_bash_approval_at(
+                &restored,
+                &format!("matching-{name}"),
+                "session-1",
+                "cargo test",
+                startup_wall,
+                startup_monotonic,
+            )
+            .await;
+
+            assert_eq!(
+                matching.status,
+                ApprovalStatus::Pending,
+                "{name} must not restore authority"
+            );
+            assert_eq!(
+                restored.approvals.grant_count().await,
+                0,
+                "{name} must be discarded"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_does_not_extend_a_grant_from_duplicate_persisted_entries() {
+        let issued_at = fixed_wall_now();
+        let startup_wall = issued_at + ChronoDuration::minutes(1);
+        let startup_monotonic = tokio::time::Instant::now();
+        let restored = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let mut persisted = restored.snapshot_at(startup_wall, startup_monotonic).await;
+        persisted.timed_approval_grants = vec![
+            storage::PersistedApprovalGrant {
+                session_id: SessionId::new("session-1"),
+                command: "cargo test".to_string(),
+                issued_at,
+                expires_at: issued_at + ChronoDuration::minutes(10),
+            },
+            storage::PersistedApprovalGrant {
+                session_id: SessionId::new("session-1"),
+                command: "cargo test".to_string(),
+                issued_at,
+                expires_at: issued_at + ChronoDuration::minutes(20),
+            },
+        ];
+
+        restored
+            .restore_at(persisted, startup_wall, startup_monotonic)
+            .await;
+
+        let before_shorter_expiry = register_bash_approval_at(
+            &restored,
+            "before-shorter-expiry",
+            "session-1",
+            "cargo test",
+            startup_wall,
+            startup_monotonic + Duration::from_secs(9 * 60) - Duration::from_nanos(1),
+        )
+        .await;
+        let at_shorter_expiry = register_bash_approval_at(
+            &restored,
+            "at-shorter-expiry",
+            "session-1",
+            "cargo test",
+            startup_wall,
+            startup_monotonic + Duration::from_secs(9 * 60),
+        )
+        .await;
+
+        assert_eq!(
+            before_shorter_expiry.status,
+            ApprovalStatus::Approved { message: None }
+        );
+        assert_eq!(at_shorter_expiry.status, ApprovalStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn timed_grant_persistence_preserves_existing_session_and_pending_approval_snapshot() {
+        let source = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let session_id = SessionId::new("persisted-session");
+        source
+            .sessions
+            .get_or_register(&session_id, "/workspace/persisted-project", None)
+            .await;
+        source
+            .sessions
+            .set_status(
+                &session_id,
+                SessionStatus::Idle,
+                None,
+                Some("Persisted display name".to_string()),
+            )
+            .await;
+        let pending = register_bash_approval_at(
+            &source,
+            "persisted-pending",
+            "persisted-session",
+            "cargo test",
+            fixed_wall_now(),
+            tokio::time::Instant::now(),
+        )
+        .await;
+        let wall_now = fixed_wall_now() + ChronoDuration::minutes(1);
+        let monotonic_now = tokio::time::Instant::now();
+
+        let snapshot = source.snapshot_at(wall_now, monotonic_now).await;
+        let restored = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        restored.restore_at(snapshot, wall_now, monotonic_now).await;
+
+        let sessions = restored.sessions.list().await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, session_id);
+        assert_eq!(sessions[0].project, "persisted-project");
+        assert_eq!(sessions[0].stored_status, SessionStatus::Idle);
+        assert_eq!(
+            sessions[0].display_name.as_deref(),
+            Some("Persisted display name")
+        );
+        let pending_after_restore = restored.approvals.list_pending().await;
+        assert_eq!(pending_after_restore.len(), 1);
+        assert_eq!(pending_after_restore[0].id, pending.id);
+        assert_eq!(pending_after_restore[0].request_id, "persisted-pending");
     }
 
     /// Helper: POST JSON to a path and return the status code.

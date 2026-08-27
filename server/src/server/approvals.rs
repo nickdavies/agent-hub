@@ -12,6 +12,10 @@ pub use protocol::{Approval, ApprovalContext, ApprovalStatus};
 
 use protocol::{ApprovalGrantDuration, SessionId, Tool};
 
+use super::storage::PersistedApprovalGrant;
+
+const MAX_GRANT_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ApprovalGrantKey {
     session_id: SessionId,
@@ -287,6 +291,97 @@ impl ApprovalRegistry {
         previous_len - grants.len()
     }
 
+    pub(crate) async fn snapshot_at(
+        &self,
+        wall_now: DateTime<Utc>,
+        monotonic_now: Instant,
+    ) -> (Vec<Approval>, Vec<PersistedApprovalGrant>) {
+        let _registration = self.registration.lock().await;
+        let entries = self.entries.read().await;
+        let mut grants = self.grants.write().await;
+
+        let mut pending: Vec<Approval> = entries
+            .values()
+            .filter(|entry| !entry.approval.status.is_resolved())
+            .map(|entry| entry.approval.clone())
+            .collect();
+        pending.sort_by_key(|approval| approval.created_at);
+
+        grants.retain(|_, expires_at| *expires_at > monotonic_now);
+        let grants = grants
+            .iter()
+            .filter_map(|(key, expires_at)| {
+                let remaining = expires_at.duration_since(monotonic_now);
+                let remaining = chrono::Duration::from_std(remaining).ok()?;
+                let expires_at = wall_now.checked_add_signed(remaining)?;
+                Some(PersistedApprovalGrant {
+                    session_id: key.session_id.clone(),
+                    command: key.command.clone(),
+                    issued_at: wall_now,
+                    expires_at,
+                })
+            })
+            .collect();
+
+        (pending, grants)
+    }
+
+    pub(crate) async fn restore_grants_at(
+        &self,
+        persisted: Vec<PersistedApprovalGrant>,
+        wall_now: DateTime<Utc>,
+        monotonic_now: Instant,
+    ) {
+        let mut restored = HashMap::new();
+        for grant in persisted {
+            if grant.expires_at <= wall_now
+                || grant.expires_at <= grant.issued_at
+                || wall_now < grant.issued_at
+            {
+                continue;
+            }
+
+            let Ok(total_lifetime) = grant
+                .expires_at
+                .signed_duration_since(grant.issued_at)
+                .to_std()
+            else {
+                continue;
+            };
+            let Ok(remaining) = grant.expires_at.signed_duration_since(wall_now).to_std() else {
+                continue;
+            };
+            if total_lifetime > MAX_GRANT_LIFETIME || remaining > MAX_GRANT_LIFETIME {
+                continue;
+            }
+            let Some(expires_at) = monotonic_now.checked_add(remaining) else {
+                continue;
+            };
+
+            let key = ApprovalGrantKey {
+                session_id: grant.session_id,
+                command: grant.command,
+            };
+            restored
+                .entry(key)
+                .and_modify(|existing: &mut Instant| *existing = (*existing).min(expires_at))
+                .or_insert(expires_at);
+        }
+
+        let mut grants = self.grants.write().await;
+        for (key, expires_at) in restored {
+            grants
+                .entry(key)
+                .and_modify(|existing| *existing = (*existing).min(expires_at))
+                .or_insert(expires_at);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn grant_count(&self) -> usize {
+        self.grants.read().await.len()
+    }
+
     /// List only pending approvals, sorted by creation time (oldest first).
     pub async fn list_pending(&self) -> Vec<Approval> {
         let entries = self.entries.read().await;
@@ -372,18 +467,6 @@ impl ApprovalRegistry {
             info!(approval_id = %id, "approval cancelled (orphaned — gateway stopped polling)");
         }
         count
-    }
-
-    /// Export pending approvals for persistence, sorted by creation time.
-    pub async fn snapshot(&self) -> Vec<Approval> {
-        let entries = self.entries.read().await;
-        let mut pending: Vec<Approval> = entries
-            .values()
-            .filter(|e| !e.approval.status.is_resolved())
-            .map(|e| e.approval.clone())
-            .collect();
-        pending.sort_by_key(|a| a.created_at);
-        pending
     }
 
     /// Restore approvals from persisted state.
@@ -647,6 +730,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_racing_grant_resolution_cannot_persist_pending_and_matching_grant() {
+        let registry = ApprovalRegistry::new();
+        let monotonic_now = Instant::now();
+        let approval = registry
+            .register_at(
+                request("grant-source", "session-1", Tool::Bash, "cargo test"),
+                now(),
+                monotonic_now,
+            )
+            .await;
+        let entries_barrier = registry.entries.write().await;
+        let mut resolve = Box::pin(registry.resolve_with_grant_at(
+            approval.id,
+            ApprovalStatus::Approved { message: None },
+            ApprovalGrantDuration::ThirtyMinutes,
+            monotonic_now,
+        ));
+
+        // Resolution owns registration and waits for entries. An atomic snapshot
+        // must wait for registration rather than reading stale pending entries.
+        poll_until_blocked(resolve.as_mut()).await;
+        let mut snapshot = Box::pin(registry.snapshot_at(now(), monotonic_now));
+        poll_until_blocked(snapshot.as_mut()).await;
+        drop(entries_barrier);
+
+        let (resolved, (pending, grants)) = tokio::join!(resolve, snapshot);
+        resolved.expect("pending Bash approval should create a grant");
+
+        let contains_stale_pending = pending.iter().any(|item| item.id == approval.id);
+        let contains_matching_grant = grants.iter().any(|grant| {
+            grant.session_id == protocol::SessionId::new("session-1")
+                && grant.command == "cargo test"
+        });
+        assert!(
+            !(contains_stale_pending && contains_matching_grant),
+            "one registry snapshot must not contain both sides of one resolution"
+        );
+    }
+
+    #[tokio::test]
     async fn temporary_grant_uses_monotonic_expiry_before_at_and_after_boundary() {
         let registry = ApprovalRegistry::new();
         let wall_created_at = now();
@@ -701,49 +824,6 @@ mod tests {
         );
         assert_eq!(at.status, ApprovalStatus::Pending);
         assert_eq!(after.status, ApprovalStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn temporary_grants_are_not_restored_from_a_snapshot() {
-        let source = ApprovalRegistry::new();
-        let wall_created_at = now();
-        let monotonic_start = Instant::now();
-        let granted = source
-            .register_at(
-                request("grant-source", "session-1", Tool::Bash, "cargo test"),
-                wall_created_at,
-                monotonic_start,
-            )
-            .await;
-        source
-            .resolve_with_grant_at(
-                granted.id,
-                ApprovalStatus::Approved { message: None },
-                ApprovalGrantDuration::TwentyFourHours,
-                monotonic_start,
-            )
-            .await
-            .unwrap();
-        source
-            .register_at(
-                request("persisted-pending", "session-2", Tool::Write, "ignored"),
-                wall_created_at,
-                monotonic_start,
-            )
-            .await;
-
-        let restored = ApprovalRegistry::new();
-        restored.restore(source.snapshot().await).await;
-        let matching = restored
-            .register_at(
-                request("after-restore", "session-1", Tool::Bash, "cargo test"),
-                wall_created_at + ChronoDuration::seconds(1),
-                monotonic_start + std::time::Duration::from_secs(1),
-            )
-            .await;
-
-        assert_eq!(matching.status, ApprovalStatus::Pending);
-        assert_eq!(restored.list_pending().await.len(), 2);
     }
 
     #[tokio::test]
