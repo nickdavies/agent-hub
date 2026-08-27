@@ -14,11 +14,21 @@ export interface NormalizedPermission {
 
 const TOOL_NAMES: Record<string, OpenCodeTool> = {
   bash: "Bash",
+  codesearch: "CodeSearch",
+  doom_loop: "DoomLoop",
   edit: "Write",
+  external_directory: "Read",
   glob: "Glob",
   grep: "Grep",
+  list: "Read",
+  lsp: "Lsp",
+  question: "Question",
   read: "Read",
+  skill: "Skill",
+  task: "Task",
+  todowrite: "TodoWrite",
   webfetch: "WebFetch",
+  websearch: "WebSearch",
 }
 
 function absolute(value: string, base: string): string {
@@ -40,7 +50,8 @@ export function normalizePermission(
   directory: string,
   worktree: string,
 ): NormalizedPermission[] {
-  const tool = TOOL_NAMES[info.permission] ?? info.permission
+  const tool = TOOL_NAMES[info.permission]
+  if (!tool) throw new Error(`unsupported OpenCode permission '${info.permission}'`)
   if (info.permission === "bash") {
     return [{ tool, toolInput: { command: requireValue(stringMetadata(info, "command"), "bash command") } }]
   }
@@ -69,18 +80,36 @@ export function normalizePermission(
     if (info.patterns.length === 0) throw new Error("OpenCode read path is missing")
     return info.patterns.map((pattern) => ({ tool, toolInput: { path: absolute(pattern, worktree) } }))
   }
+  if (["list", "external_directory"].includes(info.permission)) {
+    if (info.patterns.length === 0) throw new Error(`OpenCode ${info.permission} path is missing`)
+    return info.patterns.map((pattern) => ({ tool, toolInput: { path: absolute(pattern, directory) } }))
+  }
   if (info.permission === "webfetch") {
     return [{ tool, toolInput: { url: requireValue(stringMetadata(info, "url"), "webfetch URL") } }]
   }
   if (info.permission === "grep") {
     const pattern = requireValue(info.patterns[0], "grep pattern")
-    const target = stringMetadata(info, "path") ?? stringMetadata(info, "directory")
-    return [{ tool, toolInput: { pattern, ...(target ? { path: absolute(target, directory) } : {}) } }]
+    const target = stringMetadata(info, "path") ?? stringMetadata(info, "directory") ?? directory
+    return [{ tool, toolInput: { pattern, path: absolute(target, directory) } }]
   }
   if (info.permission === "glob") {
+    if (info.patterns.length === 0) throw new Error("OpenCode glob pattern is missing")
     const target = stringMetadata(info, "path") ?? stringMetadata(info, "directory") ?? directory
     const pattern = stringMetadata(info, "pattern")
     return [{ tool, toolInput: { path: absolute(target, directory), ...(pattern ? { pattern } : {}) } }]
   }
-  return [{ tool, toolInput: {} }]
+  if (["websearch", "codesearch"].includes(info.permission)) {
+    const query = stringMetadata(info, "query") ?? info.patterns[0]
+    return [{ tool, toolInput: { query: requireValue(query, `${info.permission} query`) } }]
+  }
+  if (["task", "todowrite", "question", "doom_loop", "lsp", "skill"].includes(info.permission)) {
+    return [{
+      tool,
+      toolInput: {
+        patterns: [...info.patterns],
+        metadata: structuredClone(info.metadata),
+      },
+    }]
+  }
+  throw new Error(`unsupported OpenCode permission '${info.permission}'`)
 }

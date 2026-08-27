@@ -10,6 +10,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 #[test]
+#[ignore = "requires a real read-only bind; covered by the Docker interoperability fixture"]
 fn real_gateway_cli_exchanges_one_framed_relay_decision() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("approval.sock");
@@ -17,7 +18,7 @@ fn real_gateway_cli_exchanges_one_framed_relay_decision() {
     std::fs::write(&config, r#"{"version":1,"default":"ask","rules":[]}"#).unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let relay = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -101,6 +102,9 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
         r#"{"version":1,"default":"ask","rules":[],"unexpected":true}"#,
         r#"{"version":2,"default":"ask","rules":[]}"#,
         r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"ask","unexpected":true}]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"allow","command":"true"}]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"ask","message":"bad"}]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"delegate"}]}"#,
     ] {
         let config = dir.path().join(Uuid::new_v4().to_string());
         std::fs::write(&config, contents).unwrap();
@@ -134,6 +138,11 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
         let output = child.wait_with_output().unwrap();
         assert_eq!(output.status.code(), Some(2));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("unknown field") || stderr.contains("unsupported version"));
+        assert!(
+            stderr.contains("unknown field")
+                || stderr.contains("unsupported version")
+                || stderr.contains("invalid action/command")
+                || stderr.contains("message outside")
+        );
     }
 }

@@ -95,10 +95,11 @@ async fn proxy_question(
     args: &QuestionArgs,
     req: &QuestionProxyRequest,
 ) -> Result<Vec<Vec<String>>, QuestionFlowError> {
-    let client = reqwest::Client::new();
-    let base = args.server.trim_end_matches('/');
+    let (client, base) =
+        crate::http::authenticated_client(&args.server).map_err(QuestionFlowError::Pipeline)?;
 
-    let register_url = format!("{base}/api/v1/hooks/question");
+    let register_url =
+        crate::http::endpoint(&base, "api/v1/hooks/question").map_err(QuestionFlowError::Pipeline)?;
     eprintln!(
         "[info] registering question: session={} questions={}",
         req.session_id,
@@ -106,7 +107,7 @@ async fn proxy_question(
     );
 
     let register_resp = client
-        .post(&register_url)
+        .post(register_url.as_str())
         .bearer_auth(args.token.expose())
         .json(req)
         .timeout(Duration::from_secs(10))
@@ -131,8 +132,14 @@ async fn proxy_question(
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
-    let wait_url = format!("{base}/api/v1/questions/{}/wait", proxy_resp.id);
-    let cancel_url = format!("{base}/api/v1/questions/{}/resolve", proxy_resp.id);
+    let wait_url =
+        crate::http::endpoint(&base, &format!("api/v1/questions/{}/wait", proxy_resp.id))
+            .map_err(QuestionFlowError::Pipeline)?;
+    let cancel_url = crate::http::endpoint(
+        &base,
+        &format!("api/v1/questions/{}/resolve", proxy_resp.id),
+    )
+    .map_err(QuestionFlowError::Pipeline)?;
 
     eprintln!(
         "[info] waiting for question answer (id={}, timeout={}s)",
@@ -140,11 +147,11 @@ async fn proxy_question(
     );
 
     tokio::select! {
-        result = poll_for_answer(&client, &wait_url, &args.token, deadline, args.timeout) => result,
+        result = poll_for_answer(&client, wait_url.as_str(), &args.token, deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal, cancelling question {}", proxy_resp.id);
             let _ = client
-                .post(&cancel_url)
+                .post(cancel_url.as_str())
                 .bearer_auth(args.token.expose())
                 .json(&QuestionResolveRequest {
                     decision: QuestionDecision::Cancel,

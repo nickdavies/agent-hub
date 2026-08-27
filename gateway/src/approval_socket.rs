@@ -114,10 +114,6 @@ async fn exchange(
     stream.write_all(request_frame).await.map_err(|error| {
         format!("attended approval socket disconnected writing request: {error}")
     })?;
-    stream
-        .shutdown()
-        .await
-        .map_err(|error| format!("attended approval socket request shutdown failed: {error}"))?;
 
     let len = stream.read_u32().await.map_err(|error| {
         format!("attended approval socket disconnected before decision: {error}")
@@ -171,10 +167,36 @@ fn validate_socket(socket: &Path) -> Result<SocketIdentity, String> {
             "attended approval socket parent owner does not match the runtime UID".to_string(),
         );
     }
-    if parent_metadata.permissions().mode() & 0o222 != 0 {
-        return Err("attended approval socket parent mount is not read-only".to_string());
+    if parent_metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err("attended approval socket parent mode is not 0700".to_string());
     }
+    verify_read_only_mount(parent)?;
     socket_identity(socket)
+}
+
+#[cfg(all(unix, not(test)))]
+fn verify_read_only_mount(parent: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let parent = CString::new(parent.as_os_str().as_bytes())
+        .map_err(|_| "attended approval socket parent contains NUL".to_string())?;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(parent.as_ptr(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "cannot inspect attended approval socket parent filesystem: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { filesystem.assume_init() }.f_flag & libc::ST_RDONLY == 0 {
+        return Err("attended approval socket parent is not a read-only bind mount".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, test))]
+fn verify_read_only_mount(_parent: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -269,7 +291,7 @@ mod tests {
         let socket = dir.path().join("approval.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         (dir, socket, listener)
     }
 
@@ -407,7 +429,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.sock");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             round_trip(
                 &missing,
@@ -426,7 +448,7 @@ mod tests {
         std::fs::remove_file(&socket).unwrap();
         let replacement = UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = verify_socket_identity(&socket, original).unwrap_err();
         assert!(error.contains("identity changed"), "{error}");
         drop((listener, replacement));

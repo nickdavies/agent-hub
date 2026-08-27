@@ -565,15 +565,6 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // This cast is safe and necessary until the published types catch up.
       const info = _info as unknown as PermissionRequest
       log("INFO", "permission.ask handler entered", { permission: info.permission ?? "?" })
-      // external_directory is opencode-internal — the in_workspace distinction
-      // is already handled by the gateway's in_workspace flag on file rules.
-      // Auto-approve it here; the subsequent read/write permission will be
-      // sent to the gateway with the correct path for rule evaluation.
-      if (info.permission === "external_directory" && APPROVAL_TRANSPORT.kind === "http") {
-        output.status = "allow"
-        return
-      }
-
       const sid = info.sessionID
 
       // First tool call for this session — immediately register it on the

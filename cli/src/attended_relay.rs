@@ -96,7 +96,7 @@ impl AttendedRelay {
         effects: &ExecutionCancellationContext,
         fail_closed: watch::Sender<bool>,
     ) -> anyhow::Result<Self> {
-        let endpoint = validate_endpoint(&config.server_url, config.token.is_some())?;
+        let endpoint = validated_endpoint(&config.server_url, config.token.is_some())?;
         ensure!(
             config.socket_path.is_absolute(),
             "approval relay socket path is not absolute"
@@ -225,7 +225,7 @@ pub(crate) async fn recover_attended_relay(
     token: Option<&Secret>,
     effects: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
-    let endpoint = validate_endpoint(endpoint, token.is_some())?;
+    let endpoint = validated_endpoint(endpoint, token.is_some())?;
     let client = Client::builder()
         .redirect(Policy::none())
         .connect_timeout(HTTP_OPERATION_TIMEOUT)
@@ -278,7 +278,14 @@ async fn recover_approval_effects(
             response.status
         };
         ensure!(status.is_resolved(), "recovered approval is not terminal");
-        verify_terminal(client, endpoint, token, response.id).await?;
+        verify_terminal(
+            client,
+            endpoint,
+            token,
+            response.id,
+            &registration.request_id,
+        )
+        .await?;
         reconcile_request_effects(effects, &registration.request_id)?;
     }
     let states = effects.unresolved_operation_resources("attended_relay_approval_state");
@@ -305,7 +312,14 @@ async fn recover_approval_effects(
             )
             .await?;
         }
-        verify_terminal(client, endpoint, token, state.approval_id).await?;
+        verify_terminal(
+            client,
+            endpoint,
+            token,
+            state.approval_id,
+            &state.request_id,
+        )
+        .await?;
         reconcile_request_effects(effects, &state.request_id)?;
     }
     Ok(())
@@ -381,8 +395,16 @@ async fn relay_loop(
                 });
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(Err(error)) = result {
-                    return Err(error).context("attended relay connection panicked");
+                if let Some(result) = result {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            return Err(error).context("attended relay connection failed");
+                        }
+                        Err(error) => {
+                            return Err(error).context("attended relay connection panicked");
+                        }
+                    }
                 }
             }
             changed = shutdown.changed() => {
@@ -429,10 +451,16 @@ async fn handle_connection(mut stream: UnixStream, runtime: RelayRuntime) -> any
     tokio::pin!(relay);
     let mut byte = [0u8; 1];
     let decision = tokio::select! {
-        result = &mut relay => Some(result.unwrap_or_else(|class| request.decision(
-            AttendedGatewayDecisionKind::Deny,
-            Some(class.as_str().into()),
-        ))),
+        result = &mut relay => match result {
+            Ok(decision) => Some(decision),
+            Err(RelayFailure::RemoteUnsettled) => {
+                anyhow::bail!("remote approval could not be settled")
+            }
+            Err(class) => Some(request.decision(
+                AttendedGatewayDecisionKind::Deny,
+                Some(class.as_str().into()),
+            )),
+        },
         read = stream.read(&mut byte) => {
             let _ = disconnect_tx.send(true);
             let _ = read;
@@ -474,6 +502,7 @@ enum RelayFailure {
     Wait,
     Deadline,
     Cancelled,
+    RemoteUnsettled,
 }
 
 impl RelayFailure {
@@ -485,6 +514,7 @@ impl RelayFailure {
             Self::Wait => "approval_wait_failed",
             Self::Deadline => "approval_deadline_expired",
             Self::Cancelled => "approval_cancelled",
+            Self::RemoteUnsettled => "approval_remote_unsettled",
         }
     }
 }
@@ -519,68 +549,87 @@ async fn relay_request(
     )
     .await
     .map_err(|_| RelayFailure::Registration)?;
-    persist_approval_state(
-        &runtime.effects,
-        &request.request_id,
-        response.id,
-        &response.status,
-    )
-    .map_err(|_| RelayFailure::Persistence)?;
-    register_effect
-        .completed()
-        .map_err(|_| RelayFailure::Persistence)?;
     runtime.state.lock().await.pending.insert(
         request.request_id.clone(),
         PendingApproval {
             approval_id: response.id,
         },
     );
-
-    let mut status = response.status;
-    while status == ApprovalStatus::Pending {
-        if *disconnected.borrow() {
-            status = cancel_remote(
-                &runtime.client,
-                &runtime.endpoint,
-                runtime.config.token.as_ref(),
-                response.id,
-                &runtime.effects,
-                &request.request_id,
-            )
-            .await
-            .map_err(|_| RelayFailure::Cancelled)?;
-            break;
-        }
-        let remaining = (request.deadline - Utc::now())
-            .to_std()
-            .map_err(|_| RelayFailure::Deadline)?;
-        let wait = wait_once(&runtime, response.id, remaining.min(WAIT_SLICE));
-        tokio::select! {
-            result = wait => status = result.map_err(|_| RelayFailure::Wait)?,
-            changed = disconnected.changed() => {
-                let _ = changed;
-                continue;
+    let result = async {
+        persist_approval_state(
+            &runtime.effects,
+            &request.request_id,
+            response.id,
+            &response.status,
+        )
+        .map_err(|_| RelayFailure::Persistence)?;
+        register_effect
+            .completed()
+            .map_err(|_| RelayFailure::Persistence)?;
+        let mut status = response.status;
+        while status == ApprovalStatus::Pending {
+            if *disconnected.borrow() {
+                status = cancel_remote(
+                    &runtime.client,
+                    &runtime.endpoint,
+                    runtime.config.token.as_ref(),
+                    response.id,
+                    &runtime.effects,
+                    &request.request_id,
+                )
+                .await
+                .map_err(|_| RelayFailure::Cancelled)?;
+                break;
+            }
+            let remaining = (request.deadline - Utc::now())
+                .to_std()
+                .map_err(|_| RelayFailure::Deadline)?;
+            let wait = wait_once(&runtime, response.id, remaining.min(WAIT_SLICE));
+            tokio::select! {
+                result = wait => status = result.map_err(|_| RelayFailure::Wait)?,
+                changed = disconnected.changed() => {
+                    let _ = changed;
+                    continue;
+                }
             }
         }
+        persist_approval_state(&runtime.effects, &request.request_id, response.id, &status)
+            .map_err(|_| RelayFailure::Persistence)?;
+        verify_terminal(
+            &runtime.client,
+            &runtime.endpoint,
+            runtime.config.token.as_ref(),
+            response.id,
+            &request.request_id,
+        )
+        .await
+        .map_err(|_| RelayFailure::Wait)?;
+        reconcile_request_effects(&runtime.effects, &request.request_id)
+            .map_err(|_| RelayFailure::Persistence)?;
+        Ok::<_, RelayFailure>(status)
     }
-    persist_approval_state(&runtime.effects, &request.request_id, response.id, &status)
-        .map_err(|_| RelayFailure::Persistence)?;
+    .await;
+    let status = match result {
+        Ok(status) => status,
+        Err(failure) => {
+            settle_remote_after_failure(&runtime, response.id, &request.request_id)
+                .await
+                .map_err(|_| RelayFailure::RemoteUnsettled)?;
+            runtime
+                .state
+                .lock()
+                .await
+                .pending
+                .remove(&request.request_id);
+            return Err(failure);
+        }
+    };
     runtime
         .state
         .lock()
         .await
         .pending
         .remove(&request.request_id);
-    verify_terminal(
-        &runtime.client,
-        &runtime.endpoint,
-        runtime.config.token.as_ref(),
-        response.id,
-    )
-    .await
-    .map_err(|_| RelayFailure::Wait)?;
-    reconcile_request_effects(&runtime.effects, &request.request_id)
-        .map_err(|_| RelayFailure::Persistence)?;
     Ok(match status {
         ApprovalStatus::Approved { message } => {
             request.decision(AttendedGatewayDecisionKind::Allow, message)
@@ -593,6 +642,41 @@ async fn relay_request(
             Some(RelayFailure::Cancelled.as_str().into()),
         ),
     })
+}
+
+async fn settle_remote_after_failure(
+    runtime: &RelayRuntime,
+    approval_id: Uuid,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    let approval = get_approval(
+        &runtime.client,
+        &runtime.endpoint,
+        runtime.config.token.as_ref(),
+        approval_id,
+    )
+    .await?;
+    verify_remote_identity(&approval, approval_id, request_id)?;
+    if approval.status == ApprovalStatus::Pending {
+        cancel_remote(
+            &runtime.client,
+            &runtime.endpoint,
+            runtime.config.token.as_ref(),
+            approval_id,
+            &runtime.effects,
+            request_id,
+        )
+        .await?;
+    }
+    verify_terminal(
+        &runtime.client,
+        &runtime.endpoint,
+        runtime.config.token.as_ref(),
+        approval_id,
+        request_id,
+    )
+    .await?;
+    reconcile_request_effects(&runtime.effects, request_id)
 }
 
 async fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> anyhow::Result<T> {
@@ -661,6 +745,7 @@ async fn cancel_all_pending(runtime: &RelayRuntime) -> anyhow::Result<()> {
                 &runtime.endpoint,
                 runtime.config.token.as_ref(),
                 pending.approval_id,
+                &request_id,
             )
             .await?;
             reconcile_request_effects(&runtime.effects, &request_id)
@@ -708,6 +793,7 @@ async fn cancel_remote(
         StatusCode::OK,
     )
     .await?;
+    verify_remote_identity(&approval, approval_id, request_id)?;
     operation.completed()?;
     persist_approval_state(effects, request_id, approval_id, &approval.status)?;
     Ok(approval.status)
@@ -718,10 +804,24 @@ async fn verify_terminal(
     endpoint: &Url,
     token: Option<&Secret>,
     approval_id: Uuid,
+    request_id: &str,
 ) -> anyhow::Result<ApprovalStatus> {
     let approval = get_approval(client, endpoint, token, approval_id).await?;
+    verify_remote_identity(&approval, approval_id, request_id)?;
     ensure!(approval.status.is_resolved(), "approval remains pending");
     Ok(approval.status)
+}
+
+fn verify_remote_identity(
+    approval: &Approval,
+    approval_id: Uuid,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        approval.id == approval_id && approval.request_id == request_id,
+        "approval server returned mismatched approval identity"
+    );
+    Ok(())
 }
 
 async fn get_approval(
@@ -866,7 +966,7 @@ fn endpoint_url(endpoint: &Url, path: &str) -> anyhow::Result<Url> {
     Ok(url)
 }
 
-fn validate_endpoint(value: &str, has_token: bool) -> anyhow::Result<Url> {
+pub(crate) fn validated_endpoint(value: &str, has_token: bool) -> anyhow::Result<Url> {
     let url = Url::parse(value).context("approval server URL is invalid")?;
     ensure!(
         matches!(url.scheme(), "http" | "https"),
@@ -996,11 +1096,11 @@ mod tests {
 
     #[test]
     fn endpoint_rejects_credentials_and_insecure_bearer() {
-        assert!(validate_endpoint("https://token@example.test", false).is_err());
-        assert!(validate_endpoint("file:///server", false).is_err());
-        assert!(validate_endpoint("http://example.test", true).is_err());
-        validate_endpoint("https://example.test/approvals", true).unwrap();
-        validate_endpoint("http://127.0.0.1:8080", true).unwrap();
+        assert!(validated_endpoint("https://token@example.test", false).is_err());
+        assert!(validated_endpoint("file:///server", false).is_err());
+        assert!(validated_endpoint("http://example.test", true).is_err());
+        validated_endpoint("https://example.test/approvals", true).unwrap();
+        validated_endpoint("http://127.0.0.1:8080", true).unwrap();
     }
 
     #[tokio::test]
@@ -1021,6 +1121,7 @@ mod tests {
         )
         .unwrap();
         let request = gateway_request();
+        let request_id = request.request_id.clone();
         let resource = serde_json::to_string(&RegistrationEffect {
             request_id: request.request_id.clone(),
             request,
@@ -1040,6 +1141,7 @@ mod tests {
             listener,
             Arc::clone(&registration_attempts),
             Arc::clone(&cancellation_attempts),
+            request_id,
         ));
         let socket = root.join("approval.sock");
 
@@ -1132,12 +1234,14 @@ mod tests {
         listener: tokio::net::TcpListener,
         registration_attempts: Arc<AtomicUsize>,
         cancellation_attempts: Arc<AtomicUsize>,
+        request_id: String,
     ) {
         let approval_id = Uuid::new_v4();
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let registration_attempts = Arc::clone(&registration_attempts);
             let cancellation_attempts = Arc::clone(&cancellation_attempts);
+            let request_id = request_id.clone();
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut byte = [0u8; 1];
@@ -1174,7 +1278,7 @@ mod tests {
                 } else {
                     serde_json::to_vec(&Approval {
                         id: approval_id,
-                        request_id: "request".into(),
+                        request_id,
                         session_id: SessionId::new("attended-test"),
                         session_display_name: "Attended test".into(),
                         project: "main".into(),

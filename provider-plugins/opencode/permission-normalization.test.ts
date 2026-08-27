@@ -31,17 +31,30 @@ describe("OpenCode permission normalization", () => {
       .toEqual([{ tool: "WebFetch", toolInput: { url: "https://example.test" } }])
   })
 
-  test("preserves unknown tool metadata and patterns", () => {
-    expect(normalizePermission({
-      permission: "mcp_database_query",
-      patterns: ["production", "read-only"],
-      metadata: { query: "select 1", limit: 10 },
-    }, "/w", "/w")).toEqual([{
-      tool: "mcp_database_query",
-      toolInput: {
-        patterns: ["production", "read-only"],
-        metadata: { query: "select 1", limit: 10 },
-      },
-    }])
+  test("maps every supported permission and fails closed on omissions", () => {
+    for (const permission of ["read", "list", "external_directory"]) {
+      expect(normalizePermission({ permission, patterns: ["src"], metadata: {} }, "/w", "/w"))
+        .toEqual([{ tool: "Read", toolInput: { path: "/w/src" } }])
+    }
+    expect(normalizePermission({ permission: "task", patterns: ["agent"], metadata: { prompt: "work" } }, "/w", "/w")[0].tool)
+      .toBe("Task")
+    expect(normalizePermission({ permission: "todowrite", patterns: [], metadata: {} }, "/w", "/w")[0].tool)
+      .toBe("TodoWrite")
+    expect(normalizePermission({ permission: "question", patterns: [], metadata: {} }, "/w", "/w")[0].tool)
+      .toBe("Question")
+    expect(normalizePermission({ permission: "doom_loop", patterns: [], metadata: {} }, "/w", "/w")[0].tool)
+      .toBe("DoomLoop")
+    expect(normalizePermission({ permission: "lsp", patterns: ["hover"], metadata: {} }, "/w", "/w")[0].tool)
+      .toBe("Lsp")
+    expect(normalizePermission({ permission: "skill", patterns: ["local-workspaces"], metadata: {} }, "/w", "/w")[0].tool)
+      .toBe("Skill")
+    expect(normalizePermission({ permission: "websearch", patterns: ["query"], metadata: {} }, "/w", "/w"))
+      .toEqual([{ tool: "WebSearch", toolInput: { query: "query" } }])
+    expect(normalizePermission({ permission: "codesearch", patterns: [], metadata: { query: "symbol" } }, "/w", "/w"))
+      .toEqual([{ tool: "CodeSearch", toolInput: { query: "symbol" } }])
+    expect(() => normalizePermission({ permission: "mcp_database_query", patterns: [], metadata: {} }, "/w", "/w"))
+      .toThrow("unsupported")
+    expect(() => normalizePermission({ permission: "external_directory", patterns: [], metadata: {} }, "/w", "/w"))
+      .toThrow("path is missing")
   })
 })

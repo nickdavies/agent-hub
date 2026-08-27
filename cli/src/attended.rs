@@ -85,6 +85,21 @@ pub struct RelayEndpointOverride {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RelayEndpointIdentity {
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayEpochState {
+    run_epoch: uuid::Uuid,
+    binding: protocol::AttendedGatewayBindingV1,
+    deadline: DateTime<Utc>,
+    endpoint: RelayEndpointIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Preparing,
@@ -782,13 +797,15 @@ pub async fn run(
             let run_deadline = DateTime::<Utc>::from(
                 deadline.wall_clock().context("attended relay requires a wall-clock deadline")?
             );
+            let endpoint = relay_endpoint_identity(&relay_endpoint.server_url, relay_endpoint.token.is_some())?;
             write_private_durable(
                 &run_dir.join("approval-relay-epoch.json"),
-                &serde_json::to_vec(&serde_json::json!({
-                    "run_epoch": run_epoch,
-                    "binding": &binding,
-                    "deadline": run_deadline,
-                }))?,
+                &serde_json::to_vec(&RelayEpochState {
+                    run_epoch,
+                    binding: binding.clone(),
+                    deadline: run_deadline,
+                    endpoint,
+                })?,
             )?;
             attended_relay = Some(AttendedRelay::start(
                 AttendedRelayConfig {
@@ -1409,6 +1426,13 @@ async fn resolve_host_relay_endpoint(
     Ok(RelayEndpoint { server_url, token })
 }
 
+fn relay_endpoint_identity(value: &str, has_token: bool) -> anyhow::Result<RelayEndpointIdentity> {
+    let url = crate::attended_relay::validated_endpoint(value, has_token)?;
+    Ok(RelayEndpointIdentity {
+        url: url.to_string(),
+    })
+}
+
 pub fn list(store: &StateStore) -> anyhow::Result<Vec<RunRecord>> {
     store.list_json(Path::new("executions"))
 }
@@ -1650,6 +1674,7 @@ async fn recover_owned_run_resources(
     if let Some(effects) = &effects {
         let result = match relay_endpoint {
             Some(endpoint) => {
+                verify_recovery_relay_endpoint(run_dir, endpoint)?;
                 recover_attended_relay(
                     &run_dir.join("approval-relay/approval.sock"),
                     &endpoint.server_url,
@@ -1694,6 +1719,19 @@ async fn recover_owned_run_resources(
         failures.is_empty(),
         "owned run cleanup failed: {}",
         failures.join("; ")
+    );
+    Ok(())
+}
+
+fn verify_recovery_relay_endpoint(run_dir: &Path, supplied: &RelayEndpoint) -> anyhow::Result<()> {
+    let state: RelayEpochState = serde_json::from_slice(
+        &std::fs::read(run_dir.join("approval-relay-epoch.json"))
+            .context("attended relay endpoint state is missing")?,
+    )
+    .context("attended relay endpoint state is invalid")?;
+    ensure!(
+        state.endpoint == relay_endpoint_identity(&supplied.server_url, supplied.token.is_some())?,
+        "supplied approval endpoint does not match the attended run"
     );
     Ok(())
 }
@@ -3258,10 +3296,11 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttendedExecutionOutcome, FinalizationError, RelayEndpoint, RunRecord, RunStatus,
-        attended_execution_outcome, merge_execution_cleanup, network_class_within_ceiling,
-        prepare_consumption, resolve_network_resources, selector_resources,
-        serialize_pretty_bounded, verify_exact_relay_mount, verify_host_only_approval_environment,
+        AttendedExecutionOutcome, FinalizationError, RelayEndpoint, RelayEpochState, RunRecord,
+        RunStatus, attended_execution_outcome, merge_execution_cleanup,
+        network_class_within_ceiling, prepare_consumption, resolve_network_resources,
+        selector_resources, serialize_pretty_bounded, verify_exact_relay_mount,
+        verify_host_only_approval_environment, verify_recovery_relay_endpoint,
         verify_tool_approval,
     };
     use crate::state::StateStore;
@@ -3319,6 +3358,51 @@ mod tests {
         verify_host_only_approval_environment(&environment).unwrap();
         environment.insert("AGENT_HUB_TOKEN".into(), "secret".into());
         assert!(verify_host_only_approval_environment(&environment).is_err());
+    }
+
+    #[test]
+    fn recovery_requires_exact_normalized_nonsecret_relay_endpoint() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target")
+            .join(format!("relay-endpoint-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let endpoint = RelayEndpoint {
+            server_url: "https://approvals.example/base".into(),
+            token: Some(protocol::Secret::new("host-only-secret")),
+        };
+        let binding = protocol::AttendedGatewayBindingV1 {
+            run_epoch: uuid::Uuid::new_v4().to_string(),
+            authorization_digest: "a".repeat(64),
+            environment_bundle_digest: "b".repeat(64),
+            image_digest: format!("sha256:{}", "c".repeat(64)),
+            network_digest: "d".repeat(64),
+            approval_bundle_digest: "e".repeat(64),
+        };
+        let state = RelayEpochState {
+            run_epoch: uuid::Uuid::parse_str(&binding.run_epoch).unwrap(),
+            binding,
+            deadline: Utc::now() + chrono::Duration::minutes(1),
+            endpoint: super::relay_endpoint_identity("https://approvals.example/base", true)
+                .unwrap(),
+        };
+        let bytes = serde_json::to_vec(&state).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("host-only-secret"));
+        std::fs::write(root.join("approval-relay-epoch.json"), bytes).unwrap();
+        verify_recovery_relay_endpoint(&root, &endpoint).unwrap();
+        assert!(
+            verify_recovery_relay_endpoint(
+                &root,
+                &RelayEndpoint {
+                    server_url: "https://other.example/base".into(),
+                    token: endpoint.token,
+                },
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

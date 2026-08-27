@@ -1,5 +1,6 @@
 mod approval;
 mod approval_socket;
+mod http;
 mod providers;
 mod question;
 mod types;
@@ -299,11 +300,17 @@ async fn run_status_report(args: StatusReportArgs) -> ExitCode {
         }
     };
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/v1/hooks/status", args.server.trim_end_matches('/'));
+    let (client, base) = match http::authenticated_client(&args.server) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("agent-hub-gateway: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let url = http::endpoint(&base, "api/v1/hooks/status").expect("validated endpoint");
 
     match client
-        .post(&url)
+        .post(url.as_str())
         .bearer_auth(args.token.expose())
         .json(&report)
         .timeout(Duration::from_secs(10))
@@ -452,12 +459,63 @@ fn validate_gateway_config(path: &str) -> Result<(), String> {
     ];
     if let Some(rules) = object.get("rules").and_then(serde_json::Value::as_array) {
         for (index, rule) in rules.iter().enumerate() {
-            if let Some(field) = rule.as_object().and_then(|rule| {
-                rule.keys()
-                    .find(|field| !known_rule.contains(&field.as_str()))
-            }) {
+            let rule = rule.as_object().ok_or_else(|| {
+                format!(
+                    "failed to parse config {path}: rule {} is not an object",
+                    index + 1
+                )
+            })?;
+            if let Some(field) = rule
+                .keys()
+                .find(|field| !known_rule.contains(&field.as_str()))
+            {
                 return Err(format!(
                     "failed to parse config {path}: rule {} has unknown field '{field}'",
+                    index + 1
+                ));
+            }
+            let action = rule.get("action").and_then(serde_json::Value::as_str);
+            let command = rule.get("command");
+            let message = rule.get("message");
+            if (action == Some("delegate"))
+                != command.is_some_and(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|command| !command.trim().is_empty())
+                })
+            {
+                return Err(format!(
+                    "failed to parse config {path}: rule {} has an invalid action/command combination",
+                    index + 1
+                ));
+            }
+            if message.is_some() && action != Some("deny") {
+                return Err(format!(
+                    "failed to parse config {path}: rule {} has a message outside a deny action",
+                    index + 1
+                ));
+            }
+            for field in ["pattern", "message"] {
+                if rule
+                    .get(field)
+                    .is_some_and(|value| !value.as_str().is_some_and(|value| !value.is_empty()))
+                {
+                    return Err(format!(
+                        "failed to parse config {path}: rule {} has invalid '{field}'",
+                        index + 1
+                    ));
+                }
+            }
+            if rule.get("in_paths").is_some_and(|value| {
+                !value.as_array().is_some_and(|paths| {
+                    !paths.is_empty()
+                        && paths
+                            .iter()
+                            .all(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
+                })
+            }) {
+                return Err(format!(
+                    "failed to parse config {path}: rule {} has invalid 'in_paths'",
                     index + 1
                 ));
             }
@@ -600,16 +658,16 @@ async fn escalate_to_server(
     let token = args.token.as_ref().ok_or_else(|| {
         ApprovalFlowError::Pipeline("approval token is required outside sandbox mode".to_string())
     })?;
-    let client = reqwest::Client::new();
-    let base = server.trim_end_matches('/');
-    let register_url = format!("{base}/api/v1/hooks/approval");
+    let (client, base) = http::authenticated_client(server).map_err(RunError::FailClosed)?;
+    let register_url =
+        http::endpoint(&base, "api/v1/hooks/approval").map_err(RunError::FailClosed)?;
     eprintln!(
         "[info] registering approval request: tool={} session={}",
         event.tool_call.tool_name(),
         event.session_id
     );
     let register_resp = client
-        .post(&register_url)
+        .post(register_url.as_str())
         .bearer_auth(token.expose())
         .json(&request)
         .timeout(Duration::from_secs(10))
@@ -644,22 +702,24 @@ async fn escalate_to_server(
 
     // Long-poll until resolved or global timeout
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
-    let wait_url = format!("{base}/api/v1/approvals/{}/wait", approval.id);
+    let wait_url = http::endpoint(&base, &format!("api/v1/approvals/{}/wait", approval.id))
+        .map_err(RunError::FailClosed)?;
 
     eprintln!(
         "[info] waiting for approval (id={}, timeout={}s) — approve or deny in the web UI",
         approval.id, args.timeout
     );
 
-    let cancel_url = format!("{base}/api/v1/approvals/{}/resolve", approval.id);
+    let cancel_url = http::endpoint(&base, &format!("api/v1/approvals/{}/resolve", approval.id))
+        .map_err(RunError::FailClosed)?;
 
     tokio::select! {
-        result = poll_for_decision(&client, &wait_url, token, deadline, args.timeout) => result,
+        result = poll_for_decision(&client, wait_url.as_str(), token, deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal, cancelling approval {}", approval.id);
             // Best-effort cancel — don't let this block shutdown for long.
             let _ = client
-                .post(&cancel_url)
+                .post(cancel_url.as_str())
                 .bearer_auth(token.expose())
                 .json(&serde_json::json!({"decision": "cancel"}))
                 .timeout(Duration::from_secs(5))
