@@ -3,10 +3,11 @@ use std::collections::BTreeMap;
 use crate::attended::{DIPPY_SELECTOR_PREFIX, read_artifact_bounded, render_proposal};
 use crate::state::StateStore;
 use protocol::{
-    ApprovedExecutionSpec, AttendedAuthorizationRequestV1, AttendedExecutionSpec,
-    AttendedLifecycleContract, AttendedOutputContract, AttendedProposal, CanonicalRuntimeSpec,
-    ExecutionMode, PlannedEnvironmentSpec, PlannedEnvironmentTier, PlannedPermissionSet,
-    PlannedPermissionTier, ResolvedAuthorizationBehavior, ToolApprovalMode,
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2, ApprovedExecutionSpec,
+    AttendedAuthorizationRequestV2, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedOutputContract, AttendedProposal, CanonicalRuntimeSpec, ExecutionMode,
+    PlannedEnvironmentSpec, PlannedEnvironmentTier, PlannedPermissionSet, PlannedPermissionTier,
+    ResolvedAuthorizationBehavior, ToolApprovalMode,
 };
 
 #[test]
@@ -70,9 +71,9 @@ fn fresh_state_creates_runs_parent_and_bounds_artifact_reads() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-fn request() -> AttendedAuthorizationRequestV1 {
-    AttendedAuthorizationRequestV1 {
-        version: "attended_authorization_request_v1".into(),
+fn request() -> AttendedAuthorizationRequestV2 {
+    AttendedAuthorizationRequestV2 {
+        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2.into(),
         proposal: AttendedProposal {
             environment: "development".into(),
             image_family: "job-code".into(),
@@ -170,6 +171,7 @@ fn request() -> AttendedAuthorizationRequestV1 {
             }],
             primary_workspace: "primary".into(),
         },
+        approval_bundle_digest: "a".repeat(64),
         output: AttendedOutputContract::default(),
         lifecycle: AttendedLifecycleContract::default(),
     }

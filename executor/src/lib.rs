@@ -208,11 +208,7 @@ impl ExecutionCancellationContext {
             .values()
             .filter(|record| {
                 record.operation_kind == operation_kind
-                    && (record.resource_identity == resource_identity
-                        || record
-                            .resource_identity
-                            .split(';')
-                            .any(|field| field == format!("container={resource_identity}")))
+                    && external_effect_matches_resource(record, resource_identity)
                     && !effect_is_resolved(record)
             })
             .cloned()
@@ -226,6 +222,16 @@ impl ExecutionCancellationContext {
             )?;
         }
         Ok(())
+    }
+
+    pub fn unresolved_operation_resources(&self, operation_kind: &str) -> Vec<String> {
+        self.effect_state
+            .lock()
+            .expect("effect state lock poisoned")
+            .values()
+            .filter(|record| record.operation_kind == operation_kind && !effect_is_resolved(record))
+            .map(|record| record.resource_identity.clone())
+            .collect()
     }
 
     pub fn required_resource_quiescence(
@@ -578,6 +584,30 @@ impl ExecutionCancellationContext {
     pub(crate) fn for_test(root: &Path, receiver: watch::Receiver<bool>) -> anyhow::Result<Self> {
         Self::new(root, Cancellation::new(receiver))
     }
+}
+
+fn external_effect_matches_resource(
+    record: &ExternalEffectRecord,
+    resource_identity: &str,
+) -> bool {
+    if record.resource_identity == resource_identity
+        || record
+            .resource_identity
+            .split(';')
+            .any(|field| field == format!("container={resource_identity}"))
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(&record.resource_identity)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some(resource_identity)
 }
 
 fn reconcile_owned_credential_paths(
@@ -953,6 +983,9 @@ fn operation_requires_recovery(operation_kind: &str) -> bool {
             | "egress_resolver_create_request"
             | "egress_proxy_create_request"
             | "egress_network_connect_request"
+            | "attended_relay_approval_register"
+            | "attended_relay_approval_state"
+            | "attended_relay_approval_cancel"
     )
 }
 

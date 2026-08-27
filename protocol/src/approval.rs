@@ -20,7 +20,7 @@ use crate::tool::Tool;
 ///
 /// Serialized with `#[serde(untagged)]` so the wire format stays flat:
 /// `{"diff": "..."}` or `{"dippy_reason": "..."}`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ExtraContext {
     Diff { diff: String },
@@ -133,7 +133,8 @@ impl From<String> for HookEventName {
 ///
 /// Shared between the gateway (which constructs it), the server (which stores it),
 /// and the CLI (which displays it).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalContext {
     /// Workspace roots known to the provider at hook time.
     pub workspace_roots: Vec<String>,
@@ -186,7 +187,8 @@ impl ApprovalStatus {
 // ---------------------------------------------------------------------------
 
 /// POST /api/v1/hooks/approval — request body sent by the gateway.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalRequest {
     pub id: String,
     pub session_id: SessionId,

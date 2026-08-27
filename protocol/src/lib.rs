@@ -8,6 +8,7 @@
 
 pub mod approval;
 pub mod attended;
+pub mod attended_gateway;
 pub mod config;
 pub mod gateway;
 pub mod hooks;
@@ -28,12 +29,20 @@ pub use approval::{
 };
 pub use attended::{
     APPROVED_EXECUTION_PIDS_LIMIT, ATTENDED_AUTHORIZATION_REQUEST_VERSION,
-    ATTENDED_AUTHORIZATION_VERSION, ApprovedExecutionSpec, AttendedAuthorizationArtifact,
-    AttendedAuthorizationRequestV1, AttendedExecutionSpec, AttendedLifecycleContract,
-    AttendedOutputContract, AttendedOutputLimits, AttendedProposal, AuthorizedCredentialProvider,
-    AuthorizedOverlay, ContextRootSpec, RepositoryMountSpec, RepositoryState, ToolApprovalMode,
-    WorkspaceAccess, WorkspaceSpec, canonical_context_root_path, is_canonical_context_root_path,
-    sha256_hex_with_domain,
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2, ATTENDED_AUTHORIZATION_VERSION,
+    ATTENDED_AUTHORIZATION_VERSION_V2, ApprovedExecutionSpec, AttendedAuthorizationArtifact,
+    AttendedAuthorizationRequestV1, AttendedAuthorizationRequestV2, AttendedExecutionSpec,
+    AttendedLifecycleContract, AttendedOutputContract, AttendedOutputLimits, AttendedProposal,
+    AuthorizedCredentialProvider, AuthorizedOverlay, ContextRootSpec, RepositoryMountSpec,
+    RepositoryState, ToolApprovalMode, WorkspaceAccess, WorkspaceSpec, canonical_context_root_path,
+    is_canonical_context_root_path, sha256_hex_with_domain,
+};
+pub use attended_gateway::{
+    ATTENDED_GATEWAY_DECISION_VERSION, ATTENDED_GATEWAY_MAX_FRAME_BYTES,
+    ATTENDED_GATEWAY_REQUEST_VERSION, ATTENDED_GATEWAY_SOCKET_PATH, AttendedGatewayBindingV1,
+    AttendedGatewayDecisionKind, AttendedGatewayDecisionV1, AttendedGatewayRequestV1,
+    attended_approval_bundle_digest, attended_network_digest, decode_attended_gateway_payload,
+    encode_attended_gateway_frame, tool_input_digest,
 };
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{

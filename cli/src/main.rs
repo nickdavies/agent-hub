@@ -1,4 +1,5 @@
 mod attended;
+mod attended_relay;
 mod build;
 mod client;
 mod local;
@@ -175,6 +176,16 @@ enum LocalCommand {
         authorization: PathBuf,
         #[arg(long)]
         digest: String,
+        /// Host-only approvals endpoint; never passed to the sandbox
+        #[arg(
+            long,
+            env = "AGENT_HUB_SERVER",
+            default_value = "http://localhost:8080"
+        )]
+        approvals_server: String,
+        /// Host-only bearer credential; never passed to the sandbox
+        #[arg(long, env = "AGENT_HUB_TOKEN")]
+        approvals_token: Option<String>,
     },
     /// List local attended executions
     List,
@@ -208,6 +219,16 @@ enum LocalCommand {
     Cleanup {
         #[arg(long)]
         run_id: String,
+        /// Host-only approvals endpoint; never passed to the sandbox
+        #[arg(
+            long,
+            env = "AGENT_HUB_SERVER",
+            default_value = "http://localhost:8080"
+        )]
+        approvals_server: String,
+        /// Host-only bearer credential; never passed to the sandbox
+        #[arg(long, env = "AGENT_HUB_TOKEN")]
+        approvals_token: Option<String>,
     },
 }
 
@@ -291,6 +312,8 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             timeout_secs,
             authorization,
             digest,
+            approvals_server,
+            approvals_token,
         } => {
             let record = attended::run(
                 &state_store()?,
@@ -304,6 +327,10 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
                     tool_approval: &tool_approval,
                     overlays: &overlays,
                     timeout_secs,
+                },
+                attended::RelayEndpoint {
+                    server_url: approvals_server,
+                    token: approvals_token.map(protocol::Secret::new),
                 },
             )
             .await?;
@@ -391,8 +418,20 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&record)?);
             attended::ensure_successful_outcome(&record)?;
         }
-        LocalCommand::Cleanup { run_id } => {
-            let record = attended::cleanup(&state_store()?, &run_id).await?;
+        LocalCommand::Cleanup {
+            run_id,
+            approvals_server,
+            approvals_token,
+        } => {
+            let record = attended::cleanup(
+                &state_store()?,
+                &run_id,
+                attended::RelayEndpoint {
+                    server_url: approvals_server,
+                    token: approvals_token.map(protocol::Secret::new),
+                },
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&record)?);
             attended::ensure_successful_outcome(&record)?;
         }

@@ -12,8 +12,11 @@ use crate::{
 
 pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION: &str = "attended_authorization_request_v1";
 pub const ATTENDED_AUTHORIZATION_VERSION: u32 = 1;
+pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2: &str = "attended_authorization_request_v2";
+pub const ATTENDED_AUTHORIZATION_VERSION_V2: u32 = 2;
 pub const APPROVED_EXECUTION_PIDS_LIMIT: u32 = 512;
 const ATTENDED_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:attended-authorization:v1\0";
+const ATTENDED_AUTHORIZATION_DOMAIN_V2: &[u8] = b"agent-hub:attended-authorization:v2\0";
 
 pub fn canonical_context_root_path(alias: &str) -> Option<&'static str> {
     match alias {
@@ -40,6 +43,17 @@ pub struct AttendedAuthorizationRequestV1 {
     pub version: String,
     pub proposal: AttendedProposal,
     pub execution: AttendedExecutionSpec,
+    pub output: AttendedOutputContract,
+    pub lifecycle: AttendedLifecycleContract,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedAuthorizationRequestV2 {
+    pub version: String,
+    pub proposal: AttendedProposal,
+    pub execution: AttendedExecutionSpec,
+    pub approval_bundle_digest: String,
     pub output: AttendedOutputContract,
     pub lifecycle: AttendedLifecycleContract,
 }
@@ -517,6 +531,50 @@ impl AttendedAuthorizationRequestV1 {
     }
 }
 
+impl AttendedAuthorizationRequestV2 {
+    pub fn normalize(mut self) -> Result<Self, String> {
+        if self.version != ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2 {
+            return Err(format!(
+                "unsupported attended authorization schema {}",
+                self.version
+            ));
+        }
+        let approval_bundle_digest = self.approval_bundle_digest.clone();
+        if approval_bundle_digest.len() != 64
+            || !approval_bundle_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("attended approval bundle digest is not lowercase SHA-256".into());
+        }
+        let normalized = AttendedAuthorizationRequestV1 {
+            version: ATTENDED_AUTHORIZATION_REQUEST_VERSION.into(),
+            proposal: self.proposal,
+            execution: self.execution,
+            output: self.output,
+            lifecycle: self.lifecycle,
+        }
+        .normalize()?;
+        self.proposal = normalized.proposal;
+        self.execution = normalized.execution;
+        self.approval_bundle_digest = approval_bundle_digest;
+        self.output = normalized.output;
+        self.lifecycle = normalized.lifecycle;
+        Ok(self)
+    }
+
+    pub fn canonical_artifact(&self) -> Result<AttendedAuthorizationArtifact, String> {
+        let normalized = self.clone().normalize()?;
+        let bytes =
+            canonical_json_bytes(serde_json::to_value(normalized).map_err(|e| e.to_string())?)?;
+        Ok(AttendedAuthorizationArtifact {
+            version: ATTENDED_AUTHORIZATION_VERSION_V2,
+            digest: sha256_hex_with_domain(ATTENDED_AUTHORIZATION_DOMAIN_V2, &bytes),
+            canonical_bytes: bytes,
+        })
+    }
+}
+
 fn validate_image_id(identity: &str) -> Result<(), String> {
     if identity.len() != 71
         || !identity.starts_with("sha256:")
@@ -541,6 +599,29 @@ impl AttendedAuthorizationArtifact {
             return Err("attended authorization digest mismatch".into());
         }
         let parsed: AttendedAuthorizationRequestV1 = serde_json::from_slice(&self.canonical_bytes)
+            .map_err(|e| format!("invalid attended authorization: {e}"))?;
+        let normalized = parsed.normalize()?;
+        let canonical =
+            canonical_json_bytes(serde_json::to_value(&normalized).map_err(|e| e.to_string())?)?;
+        if canonical != self.canonical_bytes {
+            return Err("attended authorization payload is not canonical".into());
+        }
+        Ok(normalized)
+    }
+
+    pub fn verify_v2(&self) -> Result<AttendedAuthorizationRequestV2, String> {
+        if self.version != ATTENDED_AUTHORIZATION_VERSION_V2 {
+            return Err(format!(
+                "unsupported attended authorization version {}",
+                self.version
+            ));
+        }
+        let expected =
+            sha256_hex_with_domain(ATTENDED_AUTHORIZATION_DOMAIN_V2, &self.canonical_bytes);
+        if self.digest != expected {
+            return Err("attended authorization digest mismatch".into());
+        }
+        let parsed: AttendedAuthorizationRequestV2 = serde_json::from_slice(&self.canonical_bytes)
             .map_err(|e| format!("invalid attended authorization: {e}"))?;
         let normalized = parsed.normalize()?;
         let canonical =

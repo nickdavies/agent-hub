@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 
 use protocol::{
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2, ATTENDED_AUTHORIZATION_VERSION_V2,
     ApprovedExecutionSpec, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1,
-    AttendedExecutionSpec, AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
-    CanonicalRuntimeSpec, ContextRootSpec, ExecutionMode, PlannedEnvironmentSpec,
-    PlannedEnvironmentTier, PlannedPermissionSet, PlannedPermissionTier, RepositoryMountSpec,
-    ResolvedAuthorizationBehavior, ToolApprovalMode, WorkspaceAccess, WorkspaceSpec,
+    AttendedAuthorizationRequestV2, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedOutputContract, AttendedProposal, CanonicalRuntimeSpec, ContextRootSpec, ExecutionMode,
+    PlannedEnvironmentSpec, PlannedEnvironmentTier, PlannedPermissionSet, PlannedPermissionTier,
+    RepositoryMountSpec, ResolvedAuthorizationBehavior, ToolApprovalMode, WorkspaceAccess,
+    WorkspaceSpec,
 };
 
 fn request() -> AttendedAuthorizationRequestV1 {
@@ -147,6 +149,18 @@ fn request() -> AttendedAuthorizationRequestV1 {
     }
 }
 
+fn request_v2() -> AttendedAuthorizationRequestV2 {
+    let request = request();
+    AttendedAuthorizationRequestV2 {
+        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2.into(),
+        proposal: request.proposal,
+        execution: request.execution,
+        approval_bundle_digest: "a".repeat(64),
+        output: request.output,
+        lifecycle: request.lifecycle,
+    }
+}
+
 #[test]
 fn attended_authorization_requires_a_positive_bounded_deadline() {
     for timeout in [None, Some(0), Some(86_401)] {
@@ -210,6 +224,26 @@ fn attended_v1_binds_config_and_environment_bundle_digests() {
         canonical_bytes: serde_json::to_vec(&bytes).unwrap(),
     };
     assert!(tampered.verify().is_err());
+}
+
+#[test]
+fn attended_v2_binds_approval_bundle_without_redefining_v1() {
+    let v1 = request().canonical_artifact().unwrap();
+    assert_eq!(v1.version, 1);
+    assert!(v1.verify().is_ok());
+    assert!(v1.verify_v2().is_err());
+
+    let v2 = request_v2().canonical_artifact().unwrap();
+    assert_eq!(v2.version, ATTENDED_AUTHORIZATION_VERSION_V2);
+    assert!(v2.verify().is_err());
+    assert!(v2.verify_v2().is_ok());
+    let mut bytes: serde_json::Value = serde_json::from_slice(&v2.canonical_bytes).unwrap();
+    bytes["approval_bundle_digest"] = serde_json::json!("b".repeat(64));
+    let changed = AttendedAuthorizationArtifact {
+        canonical_bytes: serde_json::to_vec(&bytes).unwrap(),
+        ..v2
+    };
+    assert!(changed.verify_v2().is_err());
 }
 
 #[test]

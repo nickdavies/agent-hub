@@ -17,16 +17,18 @@ use agent_hub_executor::{
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use protocol::{
-    ATTENDED_AUTHORIZATION_REQUEST_VERSION, ApprovedExecutionSpec, AttendedAuthorizationArtifact,
-    AttendedAuthorizationRequestV1, AttendedExecutionSpec, AttendedLifecycleContract,
-    AttendedOutputContract, AttendedProposal, AuthorizedCredentialProvider, AuthorizedOverlay,
-    CanonicalRuntimeSpec, ExecutionMode, NetworkResourceKind, NetworkResourceRequest,
-    PlannedEnvironmentTier, PromptRef, ResolvedAuthorizationBehavior, ToolApprovalMode,
-    WorkspaceAccess, canonical_environment_for_execution, canonical_permissions_for_environment,
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2, ApprovedExecutionSpec,
+    AttendedAuthorizationArtifact, AttendedAuthorizationRequestV2, AttendedExecutionSpec,
+    AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
+    AuthorizedCredentialProvider, AuthorizedOverlay, CanonicalRuntimeSpec, ExecutionMode,
+    NetworkResourceKind, NetworkResourceRequest, PlannedEnvironmentTier, PromptRef,
+    ResolvedAuthorizationBehavior, ToolApprovalMode, WorkspaceAccess,
+    canonical_environment_for_execution, canonical_permissions_for_environment,
     default_approval_rules_for_tier,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::attended_relay::{AttendedRelay, AttendedRelayConfig, recover_attended_relay};
 use crate::local::{
     ApprovedRoots, RequestedContextRoot, RequestedWorkspace, ResolvedMounts, resolve_mounts,
 };
@@ -36,6 +38,12 @@ pub const DIPPY_SELECTOR_PREFIX: &str = "agent-hub local authorize";
 const PRIMARY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(70);
 const ATTENDED_CLEANUP_TIMEOUT_SECS: u64 = 150;
 const CANCELLATION_TERMINAL_TIMEOUT: Duration = Duration::from_secs(180);
+const HOST_ONLY_APPROVAL_ENVIRONMENT: [&str; 4] = [
+    "AGENT_HUB_SERVER",
+    "AGENT_HUB_TOKEN",
+    "AGENT_HUB_APPROVALS_SERVER",
+    "AGENT_HUB_APPROVALS_TOKEN",
+];
 
 #[derive(Debug, Clone)]
 pub struct ProposalInput {
@@ -62,6 +70,12 @@ pub struct AuthorizationSelectors<'a> {
     pub tool_approval: &'a str,
     pub overlays: &'a [String],
     pub timeout_secs: u64,
+}
+
+#[derive(Clone)]
+pub struct RelayEndpoint {
+    pub server_url: String,
+    pub token: Option<protocol::Secret>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +159,7 @@ impl CleanupCheck {
 struct AttendedCleanupEvidence {
     process: CleanupCheck,
     container: CleanupCheck,
+    relay: CleanupCheck,
     egress: CleanupCheck,
     credentials: CleanupCheck,
     runtime_data: CleanupCheck,
@@ -156,6 +171,7 @@ impl Default for AttendedCleanupEvidence {
         Self {
             process: CleanupCheck::not_applicable(),
             container: CleanupCheck::not_applicable(),
+            relay: CleanupCheck::not_applicable(),
             egress: CleanupCheck::not_applicable(),
             credentials: CleanupCheck::not_applicable(),
             runtime_data: CleanupCheck::not_applicable(),
@@ -168,6 +184,7 @@ impl AttendedCleanupEvidence {
     fn complete(&self) -> bool {
         self.process.complete()
             && self.container.complete()
+            && self.relay.complete()
             && self.egress.complete()
             && self.credentials.complete()
             && self.runtime_data.complete()
@@ -303,8 +320,8 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         triage: false,
         allow_remote_credentials: !runner.credential_providers.is_empty(),
     };
-    AttendedAuthorizationRequestV1 {
-        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION.to_string(),
+    AttendedAuthorizationRequestV2 {
+        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2.to_string(),
         proposal: AttendedProposal {
             environment: input.environment,
             image_family: input.image_family,
@@ -335,6 +352,7 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             repositories: mounts.repositories,
             primary_workspace: mounts.primary_workspace,
         },
+        approval_bundle_digest: approval_bundle_digest(&bundle.digest, tool_approval)?,
         output: AttendedOutputContract::default(),
         lifecycle: AttendedLifecycleContract::default(),
     }
@@ -346,7 +364,7 @@ pub fn render_proposal(
     path: &Path,
     artifact: &AttendedAuthorizationArtifact,
 ) -> anyhow::Result<String> {
-    let request = artifact.verify().map_err(anyhow::Error::msg)?;
+    let request = artifact.verify_v2().map_err(anyhow::Error::msg)?;
     let canonical_path = std::fs::canonicalize(path)
         .with_context(|| format!("canonicalize authorization path {}", path.display()))?;
     Ok(format!(
@@ -388,7 +406,7 @@ pub(crate) async fn revalidate_authorization(
     selectors: AuthorizationSelectors<'_>,
 ) -> anyhow::Result<RevalidatedAuthorization> {
     let (artifact, original_authorization_path) = read_authorization_file(path)?;
-    let request = artifact.verify().map_err(anyhow::Error::msg)?;
+    let request = artifact.verify_v2().map_err(anyhow::Error::msg)?;
     verify_authorization_selectors(&request, &artifact, &selectors)?;
     verify_execution_inputs(&request)?;
     let docker =
@@ -408,7 +426,7 @@ pub(crate) async fn revalidate_authorization(
 }
 
 fn verify_authorization_selectors(
-    request: &AttendedAuthorizationRequestV1,
+    request: &AttendedAuthorizationRequestV2,
     artifact: &AttendedAuthorizationArtifact,
     selectors: &AuthorizationSelectors<'_>,
 ) -> anyhow::Result<()> {
@@ -451,9 +469,10 @@ pub async fn run(
     store: &StateStore,
     artifact_path: &Path,
     selectors: AuthorizationSelectors<'_>,
+    relay_endpoint: RelayEndpoint,
 ) -> anyhow::Result<RunRecord> {
     let (supplied, supplied_path) = read_authorization_file(artifact_path)?;
-    let request = supplied.verify().map_err(anyhow::Error::msg)?;
+    let request = supplied.verify_v2().map_err(anyhow::Error::msg)?;
     let digest = supplied.digest.clone();
     verify_authorization_selectors(&request, &supplied, &selectors)?;
     let authorized_path = authorization_path("records", &digest);
@@ -482,7 +501,7 @@ pub async fn run(
         runner.mcp_bridges.is_empty(),
         "attended MCP bridge material is unavailable from the executor substrate"
     );
-    verify_tool_approval(request.proposal.tool_approval)?;
+    verify_tool_approval(request.proposal.tool_approval, Some(&relay_endpoint))?;
     let docker_path =
         which::which("docker").context("Docker CLI is required for attended execution")?;
     let id = digest[..24].to_string();
@@ -524,6 +543,7 @@ pub async fn run(
                             &id,
                             &container_name,
                             &ownership,
+                            Some(&relay_endpoint),
                         )
                         .await;
                         record.status = if recovery.is_ok() {
@@ -592,10 +612,11 @@ pub async fn run(
         !cancelled_before_preflight,
         "execution was cancelled before preflight"
     );
+    let poll_cancel_tx = cancel_tx.clone();
     let poll = AbortTask(tokio::spawn(async move {
         loop {
             if cancel_marker.exists() {
-                let _ = cancel_tx.send(true);
+                let _ = poll_cancel_tx.send(true);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -616,6 +637,13 @@ pub async fn run(
         inspect_image_identity(&docker_path, configured_image, &deadline, &cancellation).await?;
     verify_image_identity(&image_identity, &current_identity)?;
     let (runtime_uid, runtime_gid) = runtime_identity(&request)?;
+    #[cfg(unix)]
+    if request.proposal.tool_approval == ToolApprovalMode::Dippy {
+        ensure!(
+            runtime_uid == unsafe { libc::geteuid() },
+            "attended relay socket UID is incompatible with the sandbox runtime UID"
+        );
+    }
     let preflight_args = config::job_code_preflight_docker_args(
         &image_identity,
         runtime_uid,
@@ -661,6 +689,7 @@ pub async fn run(
             &id,
             &container_name,
             &ownership,
+            Some(&relay_endpoint),
         )
         .await
         .context("reconcile interrupted attended run before retry")?;
@@ -675,6 +704,7 @@ pub async fn run(
         let state_dir = run_dir.join("state");
         let cache_dir = run_dir.join("cache");
         let project_config_mask_dir = run_dir.join("project-config-mask");
+        let approval_relay_dir = run_dir.join("approval-relay");
         let prompt_path = run_dir.join("prompt.txt");
         write_private_durable(&prompt_path, request.proposal.prompt.as_bytes())?;
         let deployment =
@@ -684,11 +714,17 @@ pub async fn run(
             .write_to(&bundle_dir)
             .map_err(anyhow::Error::msg)?;
         sync_private_tree(&bundle_dir)?;
+        let approval_material = materialize_attended_approval_material(
+            &run_dir,
+            &bundle_dir,
+            request.proposal.tool_approval,
+        )?;
         for directory in [
             &data_dir,
             &state_dir,
             &cache_dir,
             &project_config_mask_dir,
+            &approval_relay_dir,
         ] {
             std::fs::create_dir(directory)?;
             set_private_directory(directory)?;
@@ -708,7 +744,48 @@ pub async fn run(
         )?;
         let mut credential_cleanup = TemporaryCredentialCleanup(Vec::new());
         let mut prepared_egress = None;
+        let mut attended_relay = None;
         let operation = async {
+        if request.proposal.tool_approval == ToolApprovalMode::Dippy {
+            let run_epoch = uuid::Uuid::new_v4();
+            let network_digest = protocol::attended_network_digest(&serde_json::json!({
+                "class": request.proposal.network_class,
+                "resources": request.proposal.network_resources,
+                "runtime": request.execution.runtime.environment.network_resources,
+            })).map_err(anyhow::Error::msg)?;
+            let binding = protocol::AttendedGatewayBindingV1 {
+                run_epoch: run_epoch.to_string(),
+                authorization_digest: digest.clone(),
+                environment_bundle_digest: request.execution.environment_bundle_digest.clone(),
+                image_digest: image_identity.clone(),
+                network_digest,
+                approval_bundle_digest: request.approval_bundle_digest.clone(),
+            };
+            let run_deadline = DateTime::<Utc>::from(
+                deadline.wall_clock().context("attended relay requires a wall-clock deadline")?
+            );
+            write_private_durable(
+                &run_dir.join("approval-relay-epoch.json"),
+                &serde_json::to_vec(&serde_json::json!({
+                    "run_epoch": run_epoch,
+                    "binding": &binding,
+                    "deadline": run_deadline,
+                }))?,
+            )?;
+            attended_relay = Some(AttendedRelay::start(
+                AttendedRelayConfig {
+                    socket_path: approval_relay_dir.join("approval.sock"),
+                    binding: binding.clone(),
+                    run_deadline,
+                    server_url: relay_endpoint.server_url.clone(),
+                    token: relay_endpoint.token.clone(),
+                    docker_path: docker_path.clone(),
+                    container_name: container_name.clone(),
+                },
+                &effects,
+                cancel_tx.clone(),
+            ).await?);
+        }
         let credentials = resolve_attended_credentials(
             &deployment,
             &runner,
@@ -775,6 +852,47 @@ pub async fn run(
                 environment.insert(name.clone(), value.clone()).is_none(),
                 "trusted OpenCode environment conflicts with authorized variable '{name}'"
             );
+        }
+        verify_host_only_approval_environment(&environment)?;
+        if let (Some(relay), Some(material)) = (&attended_relay, &approval_material) {
+            relay.verify_for_mount()?;
+            mounts.push(DockerMount::new(
+                &material.plugin_path,
+                "/agent-hub/attended-approval-plugin.js",
+                true,
+            )?);
+            mounts.push(DockerMount::new(
+                &material.config_path,
+                "/opencode/config/opencode/opencode.json",
+                true,
+            )?);
+            mounts.push(DockerMount::new(
+                relay.socket_path.parent().context("approval relay socket has no parent")?,
+                "/agent-hub/approval",
+                true,
+            )?);
+            ensure!(
+                environment.insert(
+                    "AGENT_HUB_ATTENDED_APPROVAL_SOCKET".into(),
+                    protocol::ATTENDED_GATEWAY_SOCKET_PATH.into(),
+                ).is_none(),
+                "authorized environment conflicts with attended relay socket"
+            );
+            ensure!(
+                environment.insert(
+                    "AGENT_HUB_ATTENDED_APPROVAL_BINDING".into(),
+                    serde_json::to_string(relay.binding())?,
+                ).is_none(),
+                "authorized environment conflicts with attended relay binding"
+            );
+            ensure!(
+                environment.insert(
+                    "AGENT_HUB_ATTENDED_RUN_DEADLINE".into(),
+                    relay.deadline().to_rfc3339(),
+                ).is_none(),
+                "authorized environment conflicts with attended relay deadline"
+            );
+            verify_exact_relay_mount(&mounts, &relay.socket_path)?;
         }
         if !request.proposal.network_resources.is_empty() {
             for name in [
@@ -921,6 +1039,10 @@ pub async fn run(
         );
         captured_execution_outcome = Some(execution_outcome.clone());
         drop(poll);
+        let relay_cleanup = match &mut attended_relay {
+            Some(relay) => relay.stop().await,
+            None => Ok(()),
+        };
         let cleanup_deadline = Deadline::new(Some(ATTENDED_CLEANUP_TIMEOUT_SECS))?;
         let egress_cleanup = match &mut prepared_egress {
             Some(prepared) => prepared.cleanup(&cleanup_deadline).await,
@@ -952,7 +1074,7 @@ pub async fn run(
             )),
         };
         let credential_cleanup = credential_cleanup.cleanup();
-        let containment_absent = helper_cleanup.is_ok()
+        let containment_absent = relay_cleanup.is_ok() && helper_cleanup.is_ok()
             && primary_cleanup.is_ok()
             && egress_cleanup.is_ok();
         let credential_effect_cleanup = if containment_absent {
@@ -991,6 +1113,7 @@ pub async fn run(
         captured_cleanup_evidence = Some(AttendedCleanupEvidence {
             process: CleanupCheck::from_result(&helper_cleanup),
             container: CleanupCheck::from_result(&primary_cleanup),
+            relay: CleanupCheck::from_result(&relay_cleanup),
             egress: CleanupCheck::from_result(&egress_cleanup),
             credentials: credential_check,
             runtime_data: CleanupCheck::from_result(&runtime_data_cleanup),
@@ -1000,7 +1123,10 @@ pub async fn run(
             operation,
             merge_cleanup_results(
                 merge_cleanup_results(
-                    merge_cleanup_results(egress_cleanup, helper_cleanup),
+                    merge_cleanup_results(
+                        merge_cleanup_results(egress_cleanup, relay_cleanup),
+                        helper_cleanup,
+                    ),
                     primary_cleanup,
                 ),
                 effect_cleanup,
@@ -1334,7 +1460,11 @@ pub async fn cancel(store: &StateStore, id: &str) -> anyhow::Result<()> {
     }
 }
 
-pub async fn cleanup(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> {
+pub async fn cleanup(
+    store: &StateStore,
+    id: &str,
+    relay_endpoint: RelayEndpoint,
+) -> anyhow::Result<RunRecord> {
     let mut record = status(store, id)?;
     ensure!(
         !matches!(
@@ -1357,6 +1487,7 @@ pub async fn cleanup(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> 
         id,
         &record.container_name,
         &record.ownership,
+        Some(&relay_endpoint),
     )
     .await
     .and_then(|()| {
@@ -1397,6 +1528,7 @@ async fn recover_owned_run_resources(
     id: &str,
     container_name: &str,
     ownership: &BTreeMap<String, String>,
+    relay_endpoint: Option<&RelayEndpoint>,
 ) -> anyhow::Result<()> {
     let mut failures = Vec::new();
     let effects = if run_dir.join("effects").exists() {
@@ -1439,6 +1571,25 @@ async fn recover_owned_run_resources(
         failures.push(format!("egress: {error:#}"));
     }
     if let Some(effects) = &effects {
+        let result = match relay_endpoint {
+            Some(endpoint) => {
+                recover_attended_relay(
+                    &run_dir.join("approval-relay/approval.sock"),
+                    &endpoint.server_url,
+                    endpoint.token.as_ref(),
+                    effects,
+                )
+                .await
+            }
+            None => Err(anyhow::anyhow!(
+                "host approval endpoint is required for attended relay recovery"
+            )),
+        };
+        if let Err(error) = result {
+            failures.push(format!("approval relay: {error:#}"));
+        }
+    }
+    if let Some(effects) = &effects {
         let data_dir = run_dir.join("data");
         let runtime_data_dir = data_dir.join("opencode");
         if failures.is_empty() {
@@ -1470,7 +1621,7 @@ async fn recover_owned_run_resources(
     Ok(())
 }
 
-fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::Result<()> {
+fn verify_execution_inputs(request: &AttendedAuthorizationRequestV2) -> anyhow::Result<()> {
     let config_root = Path::new(&request.execution.config_root);
     ensure!(
         std::fs::canonicalize(config_root)? == config_root,
@@ -1493,6 +1644,11 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
     bundle
         .verify_digest(&request.execution.environment_bundle_digest)
         .map_err(anyhow::Error::msg)?;
+    ensure!(
+        approval_bundle_digest(&bundle.digest, request.proposal.tool_approval)?
+            == request.approval_bundle_digest,
+        "attended approval bundle changed after authorization"
+    );
     let environment = bundle_environment(bundle)?;
     ensure!(
         environment.name == request.proposal.environment,
@@ -1613,7 +1769,7 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV1) -> anyhow::
 }
 
 fn verify_mount_filesystem_identity(
-    request: &AttendedAuthorizationRequestV1,
+    request: &AttendedAuthorizationRequestV2,
 ) -> anyhow::Result<()> {
     verify_execution_inputs(request)
         .context("revalidate attended filesystem identity immediately before launch")
@@ -1672,7 +1828,7 @@ async fn resolve_attended_credentials(
 }
 
 fn validate_credential_runtime_conflicts(
-    request: &AttendedAuthorizationRequestV1,
+    request: &AttendedAuthorizationRequestV2,
     runner: &config::ResolvedRunnerProfile,
 ) -> anyhow::Result<()> {
     let mut environment = request
@@ -1770,7 +1926,7 @@ fn project_config_mask_mounts(
 }
 
 fn verify_materialized_credential_identities(
-    request: &AttendedAuthorizationRequestV1,
+    request: &AttendedAuthorizationRequestV2,
     credentials: &agent_hub_executor::credential_provider::ResolvedCredentials,
 ) -> anyhow::Result<()> {
     for (name, identity) in &credentials.source_identities {
@@ -2379,7 +2535,7 @@ struct AttendedEgressPreparation<'a> {
 
 async fn prepare_execution_egress(
     deployment: &config::ValidatedDeployment,
-    request: &AttendedAuthorizationRequestV1,
+    request: &AttendedAuthorizationRequestV2,
     docker: &Path,
     deadline: &Deadline,
     preparation: AttendedEgressPreparation<'_>,
@@ -2564,6 +2720,23 @@ fn tool_approval_name(value: ToolApprovalMode) -> &'static str {
         ToolApprovalMode::Auto => "auto",
         ToolApprovalMode::Dippy => "dippy",
     }
+}
+
+fn approval_bundle_digest(
+    environment_bundle_digest: &str,
+    mode: ToolApprovalMode,
+) -> anyhow::Result<String> {
+    protocol::attended_approval_bundle_digest(&serde_json::json!({
+        "environment_bundle_digest": environment_bundle_digest,
+        "mode": tool_approval_name(mode),
+        "plugin_sha256": protocol::sha256_hex_with_domain(
+            b"agent-hub:attended-approval-plugin:v2\0",
+            include_bytes!("attended-approval-plugin.js"),
+        ),
+        "protocol": protocol::ATTENDED_GATEWAY_REQUEST_VERSION,
+        "socket": protocol::ATTENDED_GATEWAY_SOCKET_PATH,
+    }))
+    .map_err(anyhow::Error::msg)
 }
 
 fn canonical_resources(mut resources: Vec<NetworkResourceKind>) -> Vec<NetworkResourceKind> {
@@ -2854,7 +3027,7 @@ fn sync_private_tree(root: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn runtime_identity(request: &AttendedAuthorizationRequestV1) -> anyhow::Result<(u32, u32)> {
+fn runtime_identity(request: &AttendedAuthorizationRequestV2) -> anyhow::Result<(u32, u32)> {
     use std::os::unix::fs::MetadataExt;
 
     let path = request
@@ -2873,16 +3046,98 @@ fn runtime_identity(request: &AttendedAuthorizationRequestV1) -> anyhow::Result<
     Ok((metadata.uid(), metadata.gid()))
 }
 
-fn verify_tool_approval(mode: ToolApprovalMode) -> anyhow::Result<()> {
+fn verify_tool_approval(
+    mode: ToolApprovalMode,
+    relay: Option<&RelayEndpoint>,
+) -> anyhow::Result<()> {
+    if mode == ToolApprovalMode::Dippy {
+        let relay = relay.context("supervised approval requires the host attended relay")?;
+        ensure!(
+            !relay.server_url.trim().is_empty(),
+            "host approvals server is empty"
+        );
+    }
+    Ok(())
+}
+
+struct AttendedApprovalMaterial {
+    plugin_path: PathBuf,
+    config_path: PathBuf,
+}
+
+fn materialize_attended_approval_material(
+    run_dir: &Path,
+    bundle_dir: &Path,
+    mode: ToolApprovalMode,
+) -> anyhow::Result<Option<AttendedApprovalMaterial>> {
+    if mode == ToolApprovalMode::Auto {
+        return Ok(None);
+    }
+    let plugin_path = run_dir.join("attended-approval-plugin.js");
+    write_private_durable(&plugin_path, include_bytes!("attended-approval-plugin.js"))?;
+    let source_config = bundle_dir.join("opencode.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&source_config)?)?;
+    let object = config
+        .as_object_mut()
+        .context("authorized OpenCode config is not an object")?;
+    object.insert(
+        "plugin".into(),
+        serde_json::json!(["file:///agent-hub/attended-approval-plugin.js"]),
+    );
+    let config_path = run_dir.join("attended-opencode.json");
+    write_private_durable(&config_path, &serde_json::to_vec_pretty(&config)?)?;
+    Ok(Some(AttendedApprovalMaterial {
+        plugin_path,
+        config_path,
+    }))
+}
+
+fn verify_exact_relay_mount(mounts: &[DockerMount], socket_path: &Path) -> anyhow::Result<()> {
+    let parent = socket_path
+        .parent()
+        .context("approval relay socket has no parent")?;
+    let matches = mounts
+        .iter()
+        .filter(|mount| mount.container_path == "/agent-hub/approval")
+        .collect::<Vec<_>>();
     ensure!(
-        mode == ToolApprovalMode::Auto,
-        "in-sandbox Dippy approval is unavailable: no verified externally mediated OpenCode permission path is configured"
+        matches.len() == 1,
+        "attended relay requires one exact parent bind mount"
+    );
+    let mount = matches[0];
+    ensure!(
+        mount.host_path == parent,
+        "attended relay parent bind source mismatch"
+    );
+    ensure!(
+        mount.read_only,
+        "attended relay parent bind must be read-only"
+    );
+    ensure!(
+        mount.bind_argument()
+            == format!(
+                "type=bind,src={},dst=/agent-hub/approval,readonly",
+                parent.to_string_lossy(),
+            ),
+        "attended relay parent bind is not exact"
     );
     Ok(())
 }
 
+fn verify_host_only_approval_environment(
+    environment: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    for forbidden in HOST_ONLY_APPROVAL_ENVIRONMENT {
+        ensure!(
+            !environment.contains_key(forbidden),
+            "host approval endpoint or credential variable '{forbidden}' must not enter the sandbox"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
-fn runtime_identity(_request: &AttendedAuthorizationRequestV1) -> anyhow::Result<(u32, u32)> {
+fn runtime_identity(_request: &AttendedAuthorizationRequestV2) -> anyhow::Result<(u32, u32)> {
     anyhow::bail!("attended job-code preflight requires Unix ownership metadata")
 }
 
@@ -2911,10 +3166,11 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttendedExecutionOutcome, FinalizationError, RunRecord, RunStatus,
+        AttendedExecutionOutcome, FinalizationError, RelayEndpoint, RunRecord, RunStatus,
         attended_execution_outcome, merge_execution_cleanup, network_class_within_ceiling,
         prepare_consumption, resolve_network_resources, selector_resources,
-        serialize_pretty_bounded, verify_tool_approval,
+        serialize_pretty_bounded, verify_exact_relay_mount, verify_host_only_approval_environment,
+        verify_tool_approval,
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
@@ -2926,12 +3182,51 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn supervised_tool_approval_fails_before_launch() {
-        verify_tool_approval(protocol::ToolApprovalMode::Auto).unwrap();
-        let error = verify_tool_approval(protocol::ToolApprovalMode::Dippy)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("no verified externally mediated OpenCode permission path"));
+    fn supervised_tool_approval_requires_host_relay_endpoint() {
+        verify_tool_approval(protocol::ToolApprovalMode::Auto, None).unwrap();
+        assert!(verify_tool_approval(protocol::ToolApprovalMode::Dippy, None).is_err());
+        verify_tool_approval(
+            protocol::ToolApprovalMode::Dippy,
+            Some(&RelayEndpoint {
+                server_url: "https://approvals.example".into(),
+                token: None,
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn relay_mount_must_be_one_exact_read_only_parent_bind() {
+        let socket = PathBuf::from("/run/agent-hub/approval.sock");
+        let exact = agent_hub_executor::DockerMount::new(
+            socket.parent().unwrap(),
+            "/agent-hub/approval",
+            true,
+        )
+        .unwrap();
+        verify_exact_relay_mount(std::slice::from_ref(&exact), &socket).unwrap();
+        let writable = agent_hub_executor::DockerMount::new(
+            socket.parent().unwrap(),
+            "/agent-hub/approval",
+            false,
+        )
+        .unwrap();
+        assert!(verify_exact_relay_mount(&[writable], &socket).is_err());
+        assert!(verify_exact_relay_mount(&[exact.clone(), exact], &socket).is_err());
+    }
+
+    #[test]
+    fn relay_environment_contains_bindings_but_never_host_endpoint_or_bearer() {
+        let mut environment = BTreeMap::from([
+            (
+                "AGENT_HUB_ATTENDED_APPROVAL_SOCKET".into(),
+                protocol::ATTENDED_GATEWAY_SOCKET_PATH.into(),
+            ),
+            ("AGENT_HUB_ATTENDED_APPROVAL_BINDING".into(), "{}".into()),
+        ]);
+        verify_host_only_approval_environment(&environment).unwrap();
+        environment.insert("AGENT_HUB_TOKEN".into(), "secret".into());
+        assert!(verify_host_only_approval_environment(&environment).is_err());
     }
 
     #[cfg(unix)]
