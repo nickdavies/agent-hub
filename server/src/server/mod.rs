@@ -15,6 +15,7 @@ pub mod webhook;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::rejection::JsonRejection;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -379,8 +380,16 @@ async fn handle_approval_wait<N: Notifier>(
 async fn handle_approval_resolve<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
-    Json(req): Json<ApprovalResolveRequest>,
+    body: Result<Json<ApprovalResolveRequest>, JsonRejection>,
 ) -> Result<Json<approvals::Approval>, AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.body_text()))?;
+    if req.approve_for.is_some() && req.decision != ApprovalDecision::Approve {
+        return Err(AppError::BadRequest(
+            "approve_for is valid only with an approve decision".to_string(),
+        ));
+    }
+
+    let approve_for = req.approve_for;
     let new_status = match req.decision {
         ApprovalDecision::Approve => ApprovalStatus::Approved {
             message: req.message,
@@ -391,12 +400,26 @@ async fn handle_approval_resolve<N: Notifier>(
         ApprovalDecision::Cancel => ApprovalStatus::Cancelled,
     };
 
-    state
-        .approvals
-        .resolve(id, new_status)
-        .await
-        .ok_or_else(|| AppError::ApprovalNotFound(id.to_string()))
-        .map(Json)
+    if let Some(duration) = approve_for {
+        state
+            .approvals
+            .resolve_with_grant(id, new_status, duration)
+            .await
+            .map(Json)
+            .map_err(|error| match error {
+                approvals::TemporaryGrantError::ApprovalNotFound => {
+                    AppError::ApprovalNotFound(id.to_string())
+                }
+                _ => AppError::BadRequest(error.to_string()),
+            })
+    } else {
+        state
+            .approvals
+            .resolve(id, new_status)
+            .await
+            .ok_or_else(|| AppError::ApprovalNotFound(id.to_string()))
+            .map(Json)
+    }
 }
 
 /// GET /api/v1/sessions/{id}/approval-mode
@@ -554,10 +577,71 @@ mod integration_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode as AxumStatus};
+    use chrono::Utc;
     use config::{ApprovalFeatureMode, AuthMode, ServerConfig, Token};
-    use notifier::NullNotifier;
+    use notifier::{Notifier, NotifyError, NullNotifier};
+    use protocol::{
+        ApprovalContext, ApprovalGrantDuration, ApprovalRequest, HookEventName, RequestType, Tool,
+    };
     use sessions::SessionApprovalMode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt; // for oneshot
+
+    struct CountingNotifier {
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CapturedNotification {
+        title: String,
+        message: String,
+        url: Option<String>,
+    }
+
+    struct CapturingNotifier {
+        sends: Arc<std::sync::Mutex<Vec<CapturedNotification>>>,
+        sent: Arc<tokio::sync::Notify>,
+    }
+
+    impl Notifier for CountingNotifier {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        async fn send(
+            &self,
+            _title: &str,
+            _message: &str,
+            _url: Option<&str>,
+        ) -> Result<(), NotifyError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Notifier for CapturingNotifier {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+
+        async fn send(
+            &self,
+            title: &str,
+            message: &str,
+            url: Option<&str>,
+        ) -> Result<(), NotifyError> {
+            self.sends
+                .lock()
+                .expect("captured notifications lock should not be poisoned")
+                .push(CapturedNotification {
+                    title: title.to_string(),
+                    message: message.to_string(),
+                    url: url.map(str::to_string),
+                });
+            self.sent.notify_one();
+            Ok(())
+        }
+    }
 
     /// Build a test router with auth disabled (no Bearer tokens needed).
     fn test_app_with_mode(approval_mode: ApprovalFeatureMode) -> Router {
@@ -578,6 +662,47 @@ mod integration_tests {
 
     fn test_app() -> Router {
         test_app_with_mode(ApprovalFeatureMode::Readwrite)
+    }
+
+    fn test_state_with_mode(approval_mode: ApprovalFeatureMode) -> AppState<NullNotifier> {
+        let config = ServerConfig {
+            auth_mode: AuthMode::None,
+            tokens: vec![],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode,
+            base_url: Some("http://localhost:8080".into()),
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        AppState::new(config, NullNotifier, None)
+    }
+
+    async fn register_web_approval(
+        state: &AppState<NullNotifier>,
+        request_id: &str,
+        tool: Tool,
+        tool_input: serde_json::Value,
+    ) -> approvals::Approval {
+        state
+            .approvals
+            .register(approvals::RegisterApproval {
+                request_id: request_id.to_string(),
+                session_id: SessionId::new(format!("session-{request_id}")),
+                session_display_name: "test session".to_string(),
+                project: "/workspace".to_string(),
+                tool,
+                tool_input,
+                provider: "opencode".to_string(),
+                request_type: RequestType::ToolUse,
+                context: ApprovalContext {
+                    workspace_roots: vec!["/workspace".to_string()],
+                    hook_event_name: HookEventName::Other("test".to_string()),
+                    extra: None,
+                },
+            })
+            .await
     }
 
     /// Helper: POST JSON to a path and return the status code.
@@ -630,6 +755,420 @@ mod integration_tests {
         assert!(body.contains("id=\"readonly-status\""));
         assert!(!body.contains("id=\"queue-actions\""));
         assert!(!body.contains("aria-keyshortcuts"));
+    }
+
+    #[tokio::test]
+    async fn approval_detail_json_cannot_close_its_script_element() {
+        let state = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let attacker_command =
+            "printf '</script><script>grantAuthority()</script>&>\u{2028}\u{2029}'";
+        let approval = register_web_approval(
+            &state,
+            "malicious-json",
+            Tool::Bash,
+            serde_json::json!({"command": attacker_command}),
+        )
+        .await;
+        let app = router(state);
+
+        let (status, body) = get_json(&app, &format!("/approvals/{}", approval.id)).await;
+        assert_eq!(status, AxumStatus::OK);
+        let payload = body
+            .split_once("<script type=\"application/json\" id=\"approval-data\">")
+            .expect("detail page should contain approval JSON")
+            .1
+            .split_once("</script>\n<script>")
+            .expect("approval JSON script should have a fixed closing delimiter")
+            .0;
+
+        assert!(
+            !payload.to_ascii_lowercase().contains("</script"),
+            "attacker-controlled JSON must not contain a literal closing script sequence: {payload}"
+        );
+        for character in ['<', '>', '&', '\u{2028}', '\u{2029}'] {
+            assert!(
+                !payload.contains(character),
+                "approval JSON must escape {character:?}: {payload}"
+            );
+        }
+        let rendered: serde_json::Value =
+            serde_json::from_str(payload).expect("escaped payload should remain valid JSON");
+        assert_eq!(rendered["tool_input"]["command"], attacker_command);
+    }
+
+    #[tokio::test]
+    async fn dashboard_timed_controls_render_only_for_bash_approvals() {
+        let state = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let bash = register_web_approval(
+            &state,
+            "bash-controls",
+            Tool::Bash,
+            serde_json::json!({"command": "cargo test"}),
+        )
+        .await;
+        let write = register_web_approval(
+            &state,
+            "write-controls",
+            Tool::Write,
+            serde_json::json!({"file_path": "/workspace/file", "content": "text"}),
+        )
+        .await;
+        let app = router(state);
+
+        let (_, dashboard) = get_json(&app, "/approvals").await;
+        assert!(dashboard.contains(&format!("showTimedApproval('{}')", bash.id)));
+        assert!(!dashboard.contains(&format!("showTimedApproval('{}')", write.id)));
+    }
+
+    #[tokio::test]
+    async fn detail_timed_controls_render_only_for_bash_approvals() {
+        let state = test_state_with_mode(ApprovalFeatureMode::Readwrite);
+        let bash = register_web_approval(
+            &state,
+            "bash-detail-controls",
+            Tool::Bash,
+            serde_json::json!({"command": "cargo test"}),
+        )
+        .await;
+        let write = register_web_approval(
+            &state,
+            "write-detail-controls",
+            Tool::Write,
+            serde_json::json!({"file_path": "/workspace/file", "content": "text"}),
+        )
+        .await;
+        let app = router(state);
+
+        let (_, bash_detail) = get_json(&app, &format!("/approvals/{}", bash.id)).await;
+        let (_, write_detail) = get_json(&app, &format!("/approvals/{}", write.id)).await;
+        assert!(bash_detail.contains(">Timed approve</button>"));
+        assert!(!write_detail.contains(">Timed approve</button>"));
+    }
+
+    fn assert_resolution_script_checks_http_errors(
+        name: &str,
+        template: &str,
+        action_start: &str,
+        action_end: &str,
+    ) {
+        let action = template
+            .split_once(action_start)
+            .unwrap_or_else(|| panic!("{name} approval action is missing"))
+            .1
+            .split_once(action_end)
+            .unwrap_or_else(|| panic!("{name} approval action has no end"))
+            .0;
+
+        assert!(
+            action.contains(".ok"),
+            "{name} must check response.ok before treating an approval as resolved"
+        );
+        assert!(
+            action.contains("catch"),
+            "{name} must retain an actionable approval error when the request fails"
+        );
+        assert!(
+            action.contains("showError(")
+                && template.contains("function showError")
+                && template.contains("role=\"alert\""),
+            "{name} must show the failed approval action in a persistent alert"
+        );
+    }
+
+    #[test]
+    fn dashboard_resolution_script_checks_http_errors() {
+        assert_resolution_script_checks_http_errors(
+            "dashboard",
+            include_str!("../../templates/dashboard.html"),
+            "window.approveRow = async function",
+            "window.showTimedApproval = function",
+        );
+    }
+
+    #[test]
+    fn detail_resolution_script_checks_http_errors() {
+        assert_resolution_script_checks_http_errors(
+            "approval detail",
+            include_str!("../../templates/approval_detail.html"),
+            "window.doApprove = async function",
+            "window.showTimedApproval = function",
+        );
+    }
+
+    #[test]
+    fn dashboard_polling_adds_timed_controls_only_for_bash() {
+        let template = include_str!("../../templates/dashboard.html");
+        let dynamic_rows = template
+            .split_once("function createApprovalRows")
+            .expect("dashboard should render approval rows from polling")
+            .1
+            .split_once("function renderApprovals")
+            .expect("dynamic approval row function should have an end")
+            .0;
+
+        assert!(
+            dynamic_rows.contains("tool_name")
+                && dynamic_rows.contains("Bash")
+                && dynamic_rows.contains("showTimedApproval"),
+            "polled dashboard rows must gate timed controls on Bash approvals"
+        );
+    }
+
+    #[test]
+    fn all_approval_templates_expose_timed_and_one_time_keyboard_choices() {
+        let templates = [
+            ("dashboard", include_str!("../../templates/dashboard.html")),
+            (
+                "approval detail",
+                include_str!("../../templates/approval_detail.html"),
+            ),
+            (
+                "mobile queue",
+                include_str!("../../templates/approval_queue.html"),
+            ),
+        ];
+
+        for (name, template) in templates {
+            assert!(
+                template.contains("key === 'a'") || template.contains("event.key === 'a'"),
+                "{name} lost the lowercase-a one-time approval shortcut"
+            );
+            assert!(
+                template.contains("key === 'A'") || template.contains("event.key === 'A'"),
+                "{name} has no timed-approval submenu"
+            );
+            for (key, duration) in [
+                ("1", "30m"),
+                ("2", "1h"),
+                ("3", "2h"),
+                ("4", "6h"),
+                ("5", "24h"),
+            ] {
+                assert!(
+                    template.contains(duration),
+                    "{name} does not expose {duration}"
+                );
+                assert!(
+                    template.contains(&format!("'{key}'")),
+                    "{name} does not expose key {key}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_timed_approval_requests_return_bad_request_without_resolving() {
+        let config = ServerConfig {
+            auth_mode: AuthMode::None,
+            tokens: vec![],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode: ApprovalFeatureMode::Readwrite,
+            base_url: None,
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        let state = AppState::new(config, NullNotifier, None);
+        let approval = state
+            .approvals
+            .register(approvals::RegisterApproval {
+                request_id: "request-invalid-timed".to_string(),
+                session_id: SessionId::new("session-1"),
+                session_display_name: "test session".to_string(),
+                project: "/workspace".to_string(),
+                tool: Tool::Bash,
+                tool_input: serde_json::json!({"command": "cargo test"}),
+                provider: "opencode".to_string(),
+                request_type: RequestType::ToolUse,
+                context: ApprovalContext {
+                    workspace_roots: vec!["/workspace".to_string()],
+                    hook_event_name: HookEventName::Other("test".to_string()),
+                    extra: None,
+                },
+            })
+            .await;
+        let app = router(state.clone());
+
+        for body in [
+            r#"{"decision":"approve","message":null,"approve_for":"90m"}"#,
+            r#"{"decision":"deny","message":null,"approve_for":"30m"}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/approvals/{}/resolve", approval.id))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), AxumStatus::BAD_REQUEST);
+            assert_eq!(
+                state.approvals.get(approval.id).await.unwrap().status,
+                ApprovalStatus::Pending
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_incoming_approval_is_immediately_approved_without_notification() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let config = ServerConfig {
+            auth_mode: AuthMode::None,
+            tokens: vec![],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode: ApprovalFeatureMode::Readwrite,
+            base_url: Some("http://localhost:8080".into()),
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        let state = AppState::new(
+            config,
+            CountingNotifier {
+                sends: Arc::clone(&sends),
+            },
+            None,
+        );
+        let context = ApprovalContext {
+            workspace_roots: vec!["/workspace".to_string()],
+            hook_event_name: HookEventName::Other("test".to_string()),
+            extra: None,
+        };
+        let monotonic_now = tokio::time::Instant::now();
+        let first = state
+            .approvals
+            .register_at(
+                approvals::RegisterApproval {
+                    request_id: "request-1".to_string(),
+                    session_id: SessionId::new("session-1"),
+                    session_display_name: "test session".to_string(),
+                    project: "/workspace".to_string(),
+                    tool: Tool::Bash,
+                    tool_input: serde_json::json!({"command": "cargo test"}),
+                    provider: "opencode".to_string(),
+                    request_type: RequestType::ToolUse,
+                    context: context.clone(),
+                },
+                Utc::now(),
+                monotonic_now,
+            )
+            .await;
+        state
+            .approvals
+            .resolve_with_grant_at(
+                first.id,
+                ApprovalStatus::Approved { message: None },
+                ApprovalGrantDuration::ThirtyMinutes,
+                monotonic_now,
+            )
+            .await
+            .unwrap();
+
+        let Json(response) = hooks::approval(
+            axum::extract::State(state),
+            Json(ApprovalRequest {
+                id: "request-2".to_string(),
+                session_id: SessionId::new("session-1"),
+                session_display_name: "test session".to_string(),
+                cwd: "/workspace".to_string(),
+                tool: Tool::Bash,
+                tool_input: serde_json::json!({"command": "cargo test"}),
+                provider: "opencode".to_string(),
+                request_type: RequestType::ToolUse,
+                context,
+            }),
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(response.status, ApprovalStatus::Approved { message: None });
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_approval_hook_notifies_only_from_the_authoritative_stored_request() {
+        let sends = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let config = ServerConfig {
+            auth_mode: AuthMode::None,
+            tokens: vec![],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode: ApprovalFeatureMode::Readwrite,
+            base_url: Some("http://localhost:8080".into()),
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        let state = AppState::new(
+            config,
+            CapturingNotifier {
+                sends: Arc::clone(&sends),
+                sent: Arc::clone(&sent),
+            },
+            None,
+        );
+        let authoritative = ApprovalRequest {
+            id: "duplicate-request".to_string(),
+            session_id: SessionId::new("authoritative-session"),
+            session_display_name: "authoritative display name".to_string(),
+            cwd: "/workspace/authoritative-project".to_string(),
+            tool: Tool::Bash,
+            tool_input: serde_json::json!({"command": "authoritative command"}),
+            provider: "opencode".to_string(),
+            request_type: RequestType::ToolUse,
+            context: ApprovalContext {
+                workspace_roots: vec!["/workspace/authoritative-project".to_string()],
+                hook_event_name: HookEventName::Other("test".to_string()),
+                extra: None,
+            },
+        };
+        let replay = ApprovalRequest {
+            id: authoritative.id.clone(),
+            session_id: SessionId::new("replay-session"),
+            session_display_name: "replay display name".to_string(),
+            cwd: "/workspace/replay-project".to_string(),
+            tool: Tool::Write,
+            tool_input: serde_json::json!({
+                "file_path": "/workspace/replay-project/conflicting",
+                "content": "replay content"
+            }),
+            provider: "conflicting-provider".to_string(),
+            request_type: RequestType::ToolUse,
+            context: ApprovalContext {
+                workspace_roots: vec!["/workspace/replay-project".to_string()],
+                hook_event_name: HookEventName::Other("conflicting".to_string()),
+                extra: None,
+            },
+        };
+
+        let Json(first_response) =
+            hooks::approval(axum::extract::State(state.clone()), Json(authoritative)).await;
+        sent.notified().await;
+        let Json(replay_response) =
+            hooks::approval(axum::extract::State(state), Json(replay)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(replay_response.id, first_response.id);
+        assert_eq!(
+            *sends
+                .lock()
+                .expect("captured notifications lock should not be poisoned"),
+            vec![CapturedNotification {
+                title: "Agent Hub (approval)".to_string(),
+                message: "[authoritative-project] Bash — {\"command\":\"authoritative command\"}"
+                    .to_string(),
+                url: Some(format!(
+                    "http://localhost:8080/approvals/{}",
+                    first_response.id
+                )),
+            }],
+            "a duplicate request must not notify again or use conflicting replay fields"
+        );
     }
 
     #[tokio::test]

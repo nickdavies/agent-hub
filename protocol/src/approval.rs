@@ -220,9 +220,39 @@ pub struct ApprovalWaitResponse {
 
 /// POST /api/v1/approvals/{id}/resolve — request body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalResolveRequest {
     pub decision: ApprovalDecision,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approve_for: Option<ApprovalGrantDuration>,
+}
+
+/// Supported lifetimes for a temporary Bash approval grant.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub enum ApprovalGrantDuration {
+    #[serde(rename = "30m")]
+    ThirtyMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "2h")]
+    TwoHours,
+    #[serde(rename = "6h")]
+    SixHours,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+}
+
+impl ApprovalGrantDuration {
+    pub fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Self::ThirtyMinutes => 30 * 60,
+            Self::OneHour => 60 * 60,
+            Self::TwoHours => 2 * 60 * 60,
+            Self::SixHours => 6 * 60 * 60,
+            Self::TwentyFourHours => 24 * 60 * 60,
+        })
+    }
 }
 
 /// Decision sent when resolving an approval.
@@ -232,4 +262,64 @@ pub enum ApprovalDecision {
     Approve,
     Deny,
     Cancel,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApprovalDecision, ApprovalGrantDuration, ApprovalResolveRequest};
+
+    #[test]
+    fn approval_grant_durations_use_the_exact_wire_strings() {
+        let cases = [
+            ("30m", ApprovalGrantDuration::ThirtyMinutes),
+            ("1h", ApprovalGrantDuration::OneHour),
+            ("2h", ApprovalGrantDuration::TwoHours),
+            ("6h", ApprovalGrantDuration::SixHours),
+            ("24h", ApprovalGrantDuration::TwentyFourHours),
+        ];
+
+        for (wire_value, duration) in cases {
+            let request = ApprovalResolveRequest {
+                decision: ApprovalDecision::Approve,
+                message: None,
+                approve_for: Some(duration),
+            };
+            let json = serde_json::to_value(&request).expect("request should serialize");
+            assert_eq!(json["approve_for"], wire_value);
+
+            let decoded: ApprovalResolveRequest = serde_json::from_value(json)
+                .unwrap_or_else(|error| panic!("{wire_value} should deserialize: {error}"));
+            assert_eq!(decoded.approve_for, Some(duration));
+        }
+    }
+
+    #[test]
+    fn one_time_approval_omits_approve_for() {
+        let request = ApprovalResolveRequest {
+            decision: ApprovalDecision::Approve,
+            message: None,
+            approve_for: None,
+        };
+
+        let json = serde_json::to_value(request).expect("request should serialize");
+
+        assert_eq!(
+            json,
+            serde_json::json!({"decision": "approve", "message": null})
+        );
+    }
+
+    #[test]
+    fn approval_resolve_rejects_unlisted_durations_and_seconds_fields() {
+        for json in [
+            r#"{"decision":"approve","message":null,"approve_for":"90m"}"#,
+            r#"{"decision":"approve","message":null,"approve_for":3600}"#,
+            r#"{"decision":"approve","message":null,"approve_for_seconds":3600}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ApprovalResolveRequest>(json).is_err(),
+                "unexpectedly accepted {json}"
+            );
+        }
+    }
 }

@@ -36,6 +36,8 @@
         #deny-panel input { margin-bottom: 0.5rem; }
         #deny-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
         #deny-actions button { margin: 0; }
+        #timed-approval { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; }
+        #timed-approval button { margin: 0; }
         [hidden] { display: none !important; }
     </style>
 </head>
@@ -91,8 +93,17 @@
                 <button type="button" class="outline secondary" id="cancel-deny">Cancel</button>
             </div>
         </div>
+        <div id="timed-approval" hidden>
+            <button type="button" data-duration="30m">1 · 30m</button>
+            <button type="button" data-duration="1h">2 · 1h</button>
+            <button type="button" data-duration="2h">3 · 2h</button>
+            <button type="button" data-duration="6h">4 · 6h</button>
+            <button type="button" data-duration="24h">5 · 24h</button>
+            <button type="button" class="outline secondary" id="cancel-timed">Cancel</button>
+        </div>
         <div id="primary-actions">
             <button type="button" id="approve-button" aria-label="Approve current request" aria-keyshortcuts="a">Approve</button>
+            <button type="button" class="outline" id="timed-button" aria-label="Approve matching Bash commands temporarily" aria-keyshortcuts="A">Timed</button>
             <button type="button" class="secondary" id="deny-button" aria-label="Deny current request" aria-keyshortcuts="d">Deny</button>
         </div>
         <small id="action-status" role="status" aria-live="assertive"></small>
@@ -112,6 +123,8 @@
     let errorKind = null;
     let focusNewRequest = false;
     let resolvedApprovalId = null;
+    let timedApprovalVisible = false;
+    let currentIsBash = false;
 
     const loadingState = document.getElementById('loading-state');
     const emptyState = document.getElementById('empty-state');
@@ -315,6 +328,7 @@
 
     function renderApproval(approval, count) {
         currentId = approval.id;
+        currentIsBash = approval.tool_name === 'Bash';
         rawMode = false;
         setText('tool-name', approval.tool_name || 'Unknown tool');
         setText('project', approval.project || 'Unknown project');
@@ -333,8 +347,11 @@
         requestState.hidden = false;
         queueSummary.textContent = count + ' pending';
         if (queueActions) queueActions.hidden = false;
+        const timedButton = document.getElementById('timed-button');
+        if (timedButton) timedButton.hidden = !currentIsBash;
         setText('action-status', '');
         hideDeny();
+        hideTimedApproval();
         requestActionSpacingUpdate();
         if (focusNewRequest) {
             focusNewRequest = false;
@@ -344,6 +361,7 @@
 
     function renderEmpty() {
         currentId = null;
+        currentIsBash = false;
         loadingState.hidden = true;
         requestState.hidden = true;
         emptyState.hidden = false;
@@ -407,7 +425,7 @@
 
     function setActionBusy(busy, message) {
         actionInFlight = busy;
-        for (const id of ['approve-button', 'deny-button', 'confirm-deny', 'cancel-deny']) {
+        for (const id of ['approve-button', 'timed-button', 'deny-button', 'confirm-deny', 'cancel-deny', 'cancel-timed']) {
             const button = document.getElementById(id);
             if (button) button.disabled = busy;
         }
@@ -415,8 +433,12 @@
         requestActionSpacingUpdate();
     }
 
-    async function resolveCurrent(decision, message) {
+    async function resolveCurrent(decision, message, approveFor = null) {
         if (!READWRITE || !currentId || actionInFlight) return;
+        if (approveFor && !currentIsBash) {
+            showError('Temporary approval is available only for Bash requests.', 'action');
+            return;
+        }
         const approvalId = currentId;
         setActionBusy(true, decision === 'approve' ? 'Approving…' : 'Denying…');
         clearError();
@@ -427,7 +449,7 @@
                 method: 'POST',
                 credentials: 'same-origin',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ decision, message })
+                body: JSON.stringify(approveFor ? { decision, message, approve_for: approveFor } : { decision, message })
             });
             if (!response.ok) throw new Error('Could not resolve approval (HTTP ' + response.status + ').');
         } catch (error) {
@@ -460,6 +482,7 @@
 
     function showDeny() {
         if (!READWRITE || !currentId || actionInFlight) return;
+        hideTimedApproval();
         document.getElementById('deny-panel').hidden = false;
         document.getElementById('primary-actions').hidden = true;
         document.getElementById('deny-reason').focus();
@@ -474,6 +497,23 @@
         requestActionSpacingUpdate();
     }
 
+    function showTimedApproval() {
+        if (!READWRITE || !currentId || !currentIsBash || actionInFlight) return;
+        hideDeny();
+        timedApprovalVisible = true;
+        document.getElementById('timed-approval').hidden = false;
+        document.getElementById('primary-actions').hidden = true;
+        requestActionSpacingUpdate();
+    }
+
+    function hideTimedApproval() {
+        if (!READWRITE) return;
+        timedApprovalVisible = false;
+        document.getElementById('timed-approval').hidden = true;
+        document.getElementById('primary-actions').hidden = false;
+        requestActionSpacingUpdate();
+    }
+
     document.getElementById('view-toggle').addEventListener('click', () => {
         rawMode = !rawMode;
         document.getElementById('smart-view').hidden = rawMode;
@@ -484,6 +524,11 @@
 
     if (READWRITE) {
         document.getElementById('approve-button').addEventListener('click', () => resolveCurrent('approve', null));
+        document.getElementById('timed-button').addEventListener('click', showTimedApproval);
+        document.getElementById('cancel-timed').addEventListener('click', hideTimedApproval);
+        document.querySelectorAll('#timed-approval [data-duration]').forEach(button => {
+            button.addEventListener('click', () => resolveCurrent('approve', null, button.dataset.duration));
+        });
         document.getElementById('deny-button').addEventListener('click', showDeny);
         document.getElementById('cancel-deny').addEventListener('click', hideDeny);
         document.getElementById('confirm-deny').addEventListener('click', () => {
@@ -497,10 +542,24 @@
             const target = event.target;
             const editable = target instanceof Element &&
                 (target.matches('input, textarea, select') || target.isContentEditable);
-            if (actionInFlight || !currentId || event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || editable) return;
+            if (actionInFlight || !currentId || event.repeat || event.altKey || event.ctrlKey || event.metaKey || editable) return;
+            if (timedApprovalVisible) {
+                const durations = { '1': '30m', '2': '1h', '3': '2h', '4': '6h', '5': '24h' };
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    hideTimedApproval();
+                } else if (durations[event.key]) {
+                    event.preventDefault();
+                    resolveCurrent('approve', null, durations[event.key]);
+                }
+                return;
+            }
             if (event.key === 'a') {
                 event.preventDefault();
                 resolveCurrent('approve', null);
+            } else if (event.key === 'A' && currentIsBash) {
+                event.preventDefault();
+                showTimedApproval();
             } else if (event.key === 'd') {
                 event.preventDefault();
                 showDeny();

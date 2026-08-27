@@ -19,9 +19,9 @@ pub mod tool_call;
 
 // Re-export the most commonly used types at the crate root for convenience.
 pub use approval::{
-    Approval, ApprovalContext, ApprovalDecision, ApprovalRequest, ApprovalResolveRequest,
-    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, ExtraContext, HookEventName,
-    KnownHookEvent, RequestType,
+    Approval, ApprovalContext, ApprovalDecision, ApprovalGrantDuration, ApprovalRequest,
+    ApprovalResolveRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, ExtraContext,
+    HookEventName, KnownHookEvent, RequestType,
 };
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{

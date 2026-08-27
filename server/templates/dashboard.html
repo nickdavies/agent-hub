@@ -16,6 +16,10 @@
         .deny-input.visible { display: flex; gap: 0.5rem; align-items: center; }
         .deny-input input { margin: 0; padding: 0.25rem 0.5rem; font-size: 0.85rem; }
         .deny-input button { margin: 0; padding: 0.25rem 0.5rem; font-size: 0.85rem; white-space: nowrap; }
+        .timed-approval { display: none; gap: 0.25rem; margin-top: 0.25rem; flex-wrap: wrap; }
+        .timed-approval.visible { display: flex; }
+        .timed-approval button { margin: 0; padding: 0.2rem 0.4rem; font-size: 0.8rem; width: auto; }
+        #action-error { border: 1px solid var(--pico-del-color); color: var(--pico-del-color); padding: 0.75rem; border-radius: var(--pico-border-radius); }
         tr.meta-row td { border-bottom: none; }
         tr.tool-preview { display: none; }
         tr.tool-preview td { border-top: none; padding-top: 0; padding-bottom: 0.75rem; }
@@ -57,6 +61,7 @@
     </ul>
 </nav>
 <main class="container">
+    <p id="action-error" role="alert" hidden></p>
     <h3>Pending Approvals <small><a href="/approvals/queue">Mobile queue</a></small></h3>
     <div id="approvals-container">
     {% if pending_approvals.is_empty() %}
@@ -74,7 +79,7 @@
         </thead>
         <tbody>
             {% for a in pending_approvals %}
-            <tr class="meta-row" data-id="{{ a.id }}">
+            <tr class="meta-row" data-id="{{ a.id }}" data-tool="{{ a.tool }}">
                 <td>{{ a.project }}</td>
                 <td>{{ a.session_display_name }}</td>
                 <td>{{ a.tool }}</td>
@@ -84,8 +89,20 @@
                     {% if readwrite %}
                     <span style="margin-left:0.5rem">
                         <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="approveRow('{{ a.id }}')">Approve</button>
+                        {% if a.tool == protocol::Tool::Bash %}
+                        <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showTimedApproval('{{ a.id }}')">Timed</button>
+                        {% endif %}
                         <button class="outline secondary" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showDenyInput('{{ a.id }}')">Deny</button>
                     </span>
+                    {% if a.tool == protocol::Tool::Bash %}
+                    <div class="timed-approval" id="timed-{{ a.id }}">
+                        <button onclick="approveRow('{{ a.id }}','30m')">1 · 30m</button>
+                        <button onclick="approveRow('{{ a.id }}','1h')">2 · 1h</button>
+                        <button onclick="approveRow('{{ a.id }}','2h')">3 · 2h</button>
+                        <button onclick="approveRow('{{ a.id }}','6h')">4 · 6h</button>
+                        <button onclick="approveRow('{{ a.id }}','24h')">5 · 24h</button>
+                    </div>
+                    {% endif %}
                     <div class="deny-input" id="deny-{{ a.id }}">
                         <input type="text" placeholder="Reason..." onkeydown="if(event.key==='Enter'){denyRow('{{ a.id }}',this.value);} if(event.key==='Escape'){hideDenyInputs();}">
                         <button class="secondary" onclick="denyRow('{{ a.id }}',this.previousElementSibling.value)">Send</button>
@@ -155,7 +172,7 @@
 
 <div id="help-bar">
     <span><kbd>j</kbd>/<kbd>k</kbd> navigate &nbsp; <kbd>Enter</kbd> review &nbsp;
-    {% if readwrite %}<kbd>a</kbd> approve &nbsp; <kbd>d</kbd> deny &nbsp;{% endif %}
+    {% if readwrite %}<kbd>a</kbd> approve &nbsp; <kbd>A</kbd> timed approve &nbsp; <kbd>d</kbd> deny &nbsp;{% endif %}
     <kbd>?</kbd> help</span>
     <div id="help-detail">
         <strong>Keyboard Shortcuts</strong><br>
@@ -164,6 +181,7 @@
         <kbd>Enter</kbd> — Open selected approval<br>
         {% if readwrite %}
         <kbd>a</kbd> / <kbd>1</kbd> — Approve selected<br>
+        <kbd>A</kbd> — Choose a temporary Bash approval duration<br>
         <kbd>d</kbd> / <kbd>2</kbd> — Deny selected (prompts for reason)<br>
         {% endif %}
         <kbd>?</kbd> — Toggle this help
@@ -177,6 +195,7 @@
     const MAX_DETAIL_LEN = 2000;
     let selectedIdx = -1;
     let denyActiveId = null;
+    let timedActiveId = null;
 
     function inputSummary(input) {
         if (input == null) return '';
@@ -247,14 +266,28 @@
         const metaRow = document.createElement('tr');
         metaRow.className = sel ? 'meta-row selected' : 'meta-row';
         metaRow.dataset.id = a.id;
+        metaRow.dataset.tool = a.tool_name;
         metaRow.dataset.fp = approvalFingerprint(a);
 
         let actionHtml = `<a href="/approvals/${a.id}">Review</a>`;
         if (READWRITE) {
+            const timedButton = a.tool_name === 'Bash'
+                ? `<button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showTimedApproval('${a.id}')">Timed</button>`
+                : '';
+            const timedPanel = a.tool_name === 'Bash' ? `
+                <div class="timed-approval" id="timed-${a.id}">
+                    <button onclick="approveRow('${a.id}','30m')">1 · 30m</button>
+                    <button onclick="approveRow('${a.id}','1h')">2 · 1h</button>
+                    <button onclick="approveRow('${a.id}','2h')">3 · 2h</button>
+                    <button onclick="approveRow('${a.id}','6h')">4 · 6h</button>
+                    <button onclick="approveRow('${a.id}','24h')">5 · 24h</button>
+                </div>` : '';
             actionHtml += ` <span style="margin-left:0.5rem">
                 <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="approveRow('${a.id}')">Approve</button>
+                ${timedButton}
                 <button class="outline secondary" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showDenyInput('${a.id}')">Deny</button>
             </span>
+            ${timedPanel}
             <div class="deny-input" id="deny-${a.id}">
                 <input type="text" placeholder="Reason..." onkeydown="if(event.key==='Enter'){denyRow('${a.id}',this.value);} if(event.key==='Escape'){hideDenyInputs();}">
                 <button class="secondary" onclick="denyRow('${a.id}',this.previousElementSibling.value)">Send</button>
@@ -280,10 +313,12 @@
         const container = document.getElementById('approvals-container');
 
         // Don't touch the DOM while user is typing a deny reason
-        if (denyActiveId) {
+        if (denyActiveId || timedActiveId) {
             const currentIds = new Set(approvals.map(a => a.id));
-            if (!currentIds.has(denyActiveId)) {
+            if (denyActiveId && !currentIds.has(denyActiveId)) {
                 denyActiveId = null;
+            } else if (timedActiveId && !currentIds.has(timedActiveId)) {
+                timedActiveId = null;
             } else {
                 return;
             }
@@ -466,17 +501,53 @@
     }
 
     // --- Actions ---
-    window.approveRow = async function(id) {
-        await fetch(`/api/v1/approvals/${id}/resolve`, {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ decision: 'approve', message: null })
-        });
-        poll();
+    function showError(message) {
+        const error = document.getElementById('action-error');
+        error.textContent = message;
+        error.hidden = false;
+    }
+
+    function clearError() {
+        const error = document.getElementById('action-error');
+        error.textContent = '';
+        error.hidden = true;
+    }
+
+    window.approveRow = async function(id, approveFor = null) {
+        const body = { decision: 'approve', message: null };
+        if (approveFor) body.approve_for = approveFor;
+        try {
+            const response = await fetch(`/api/v1/approvals/${id}/resolve`, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            if (!response.ok) throw new Error(`Could not approve request (HTTP ${response.status}).`);
+            clearError();
+            hideTimedApprovals();
+            poll();
+        } catch (error) {
+            showError((error.message || 'Could not approve request.') + ' Check your connection and try again.');
+        }
+    };
+
+    window.showTimedApproval = function(id) {
+        const row = getMetaRows().find(row => row.dataset.id === id);
+        if (!row || row.dataset.tool !== 'Bash') return;
+        hideDenyInputs();
+        hideTimedApprovals();
+        timedActiveId = id;
+        document.getElementById('timed-' + id)?.classList.add('visible');
+    };
+
+    window.hideTimedApprovals = function() {
+        timedActiveId = null;
+        document.querySelectorAll('.timed-approval').forEach(el => el.classList.remove('visible'));
     };
 
     window.showDenyInput = function(id) {
+        hideTimedApprovals();
         hideDenyInputs();
         denyActiveId = id;
         const el = document.getElementById('deny-' + id);
@@ -493,14 +564,20 @@
     };
 
     window.denyRow = async function(id, reason) {
-        await fetch(`/api/v1/approvals/${id}/resolve`, {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ decision: 'deny', message: reason || '' })
-        });
-        hideDenyInputs();
-        poll();
+        try {
+            const response = await fetch(`/api/v1/approvals/${id}/resolve`, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ decision: 'deny', message: reason || '' })
+            });
+            if (!response.ok) throw new Error(`Could not deny request (HTTP ${response.status}).`);
+            clearError();
+            hideDenyInputs();
+            poll();
+        } catch (error) {
+            showError((error.message || 'Could not deny request.') + ' Check your connection and try again.');
+        }
     };
 
     window.toggleMode = async function(sessionId, mode) {
@@ -637,6 +714,12 @@
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
         const key = e.key;
+        if (timedActiveId) {
+            const durations = { '1': '30m', '2': '1h', '3': '2h', '4': '6h', '5': '24h' };
+            if (key === 'Escape') { e.preventDefault(); hideTimedApprovals(); }
+            else if (durations[key]) { e.preventDefault(); approveRow(timedActiveId, durations[key]); }
+            return;
+        }
         if (key === 'j' || key === 'ArrowDown') { e.preventDefault(); moveSelection(1); }
         else if (key === 'k' || key === 'ArrowUp') { e.preventDefault(); moveSelection(-1); }
         else if (key === 'Enter') {
@@ -646,6 +729,11 @@
         else if (READWRITE && (key === 'a' || key === '1')) {
             const id = getSelectedId();
             if (id) { e.preventDefault(); approveRow(id); }
+        }
+        else if (READWRITE && key === 'A') {
+            const id = getSelectedId();
+            const row = getMetaRows()[selectedIdx];
+            if (id && row?.dataset.tool === 'Bash') { e.preventDefault(); showTimedApproval(id); }
         }
         else if (READWRITE && (key === 'd' || key === '2')) {
             const id = getSelectedId();

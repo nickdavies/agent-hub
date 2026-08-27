@@ -182,6 +182,10 @@ async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result
             if orphaned > 0 {
                 info!(count = orphaned, "cancelled orphaned approvals");
             }
+            let expired_grants = approvals.purge_expired_grants().await;
+            if expired_grants > 0 {
+                info!(count = expired_grants, "purged expired approval grants");
+            }
             let orphaned_q = questions.evict_orphaned(Duration::from_secs(120)).await;
             if orphaned_q > 0 {
                 info!(count = orphaned_q, "cancelled orphaned questions");
