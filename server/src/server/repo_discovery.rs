@@ -6,9 +6,9 @@ use std::process::Command;
 #[cfg(test)]
 use anyhow::Context;
 
-use super::config::RepoDiscoveryConfig;
+use agent_hub_config::system::SystemRepoDiscoveryConfig;
 #[cfg(test)]
-use super::config::RepoDiscoveryStrategy;
+use agent_hub_config::system::SystemRepoDiscoveryStrategyConfig;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredRepo {
@@ -18,14 +18,14 @@ pub struct DiscoveredRepo {
 }
 
 pub fn discover_repositories_from_config(
-    config: Option<&RepoDiscoveryConfig>,
+    config: Option<&SystemRepoDiscoveryConfig>,
     mounts: &[agent_hub_config::TriageRepositoryMount],
 ) -> anyhow::Result<Vec<DiscoveredRepo>> {
     let Some(config) = config else {
         return Ok(Vec::new());
     };
 
-    if !config.enabled.unwrap_or(false) {
+    if !config.enabled {
         return Ok(Vec::new());
     }
 
@@ -48,16 +48,14 @@ pub fn discover_repositories_from_config(
 
 #[cfg(test)]
 fn discover_repositories_from_directory_strategy(
-    strategy: &RepoDiscoveryStrategy,
+    strategy: &SystemRepoDiscoveryStrategyConfig,
 ) -> anyhow::Result<Vec<DiscoveredRepo>> {
-    let raw_path = strategy
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("directory repo discovery strategy requires a non-empty path")
-        })?;
+    let raw_path = strategy.path.trim();
+    if raw_path.is_empty() {
+        return Err(anyhow::anyhow!(
+            "directory repo discovery strategy requires a non-empty path"
+        ));
+    }
     let root = expand_home(raw_path)?;
 
     if !root.exists() {
@@ -85,7 +83,7 @@ fn discover_repositories_from_directory_strategy(
 fn walk_for_repositories(
     root: &Path,
     current: &Path,
-    strategy: &RepoDiscoveryStrategy,
+    strategy: &SystemRepoDiscoveryStrategyConfig,
     discovered: &mut Vec<DiscoveredRepo>,
 ) -> anyhow::Result<()> {
     if current.join(".git").exists() {
@@ -128,7 +126,11 @@ fn walk_for_repositories(
 }
 
 #[cfg(test)]
-fn repo_matches(root: &Path, repo_path: &Path, strategy: &RepoDiscoveryStrategy) -> bool {
+fn repo_matches(
+    root: &Path,
+    repo_path: &Path,
+    strategy: &SystemRepoDiscoveryStrategyConfig,
+) -> bool {
     let rel = repo_path
         .strip_prefix(root)
         .unwrap_or(repo_path)
@@ -326,9 +328,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".git"), "gitdir: /synthetic/worktree\n").unwrap();
-        let strategy = RepoDiscoveryStrategy {
+        let strategy = SystemRepoDiscoveryStrategyConfig {
             strategy_type: "directory".to_string(),
-            path: Some(root.to_string_lossy().into_owned()),
+            path: root.to_string_lossy().into_owned(),
             include: Vec::new(),
             exclude: Vec::new(),
         };

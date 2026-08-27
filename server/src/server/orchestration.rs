@@ -15405,7 +15405,7 @@ mod tests {
 
     fn test_scm_registry() -> super::super::scm::ScmHostRegistry {
         unsafe { std::env::set_var("SCM_AUTHORIZED_HARNESS_TOKEN", "test-token") };
-        super::super::scm::ScmHostRegistry::from_configs(&[super::super::config::ScmHostConfig {
+        super::super::scm::ScmHostRegistry::from_configs(&[agent_hub_config::SystemScmHostConfig {
             kind: "github".to_string(),
             host: "github.com".to_string(),
             api_base_url: "https://api.github.com".to_string(),

@@ -547,13 +547,9 @@ impl<N: Notifier> AppState<N> {
                     server_config.config_root
                 )
             });
-        let system_operator_login = loaded
-            .system
-            .operator
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
+        let system_operator_login = loaded.system.operator.as_str().trim().to_string();
+        let system_operator_login =
+            (!system_operator_login.is_empty()).then_some(system_operator_login);
         // WORKFLOWS_DIR is an independently supplied runtime catalog, not an
         // authoritative CONFIG_ROOT deployment input. It is parsed and validated
         // as one catalog before orchestration accepts work.
@@ -751,6 +747,8 @@ mod integration_tests {
             std::env::temp_dir().join(format!("ah-test-config-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root).expect("create hermetic config root");
         let body = r#"[system]
+operator = "test-operator"
+bot_identity = "test-bot"
 
 [system.images]
 installed = []
@@ -760,6 +758,7 @@ installed = []
 
 [system.environments]
 installed = []
+triage_environment = "test-triage"
 
 [[system.scm_hosts]]
 kind = "github"

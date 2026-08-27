@@ -208,98 +208,10 @@ fn validate_task_adapter(value: &str) -> Result<(), AppError> {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct SystemManifestFile {
-    system: SystemManifest,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct SystemManifest {
-    pub operator: Option<String>,
-    pub github: Option<SystemGithubConfig>,
-    /// SCM hosts and their authoritative read-only observation credentials.
-    #[serde(default)]
-    pub scm_hosts: Vec<ScmHostConfig>,
-    pub network_policies: NetworkPoliciesConfig,
-    pub environments: EnvironmentsConfig,
-    pub workflows: Option<WorkflowsConfig>,
-    pub repo_discovery: Option<RepoDiscoveryConfig>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SystemGithubConfig {
-    pub webhook_secret_env: String,
-    #[serde(rename = "poll_interval_secs")]
-    pub _poll_interval_secs: u64,
-    #[serde(rename = "owner_login")]
-    pub _owner_login: String,
-}
-
-/// Source-control-management host registered with the orchestrator.
-///
-/// Each `[[system.scm_hosts]]` row describes one upstream SCM endpoint —
-/// one GitHub instance, one GitLab instance, etc. The `kind` discriminator
-/// picks which polling/integration backend handles the host. For now only
-/// `kind = "github"` is implemented; new kinds plug in by adding another
-/// `Poller` impl + a `kind` arm.
-///
-/// Tokens are deliberately *not* embedded in the TOML. We point at an
-/// environment variable name (`read_token_env`) so secrets stay out of repo and
-/// rotate independently of config.
-///
-/// Webhook authentication uses the canonical
-/// `AGENT_HUB_GITHUB_WEBHOOK_SECRET` process environment variable.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ScmHostConfig {
-    pub kind: String,
-    pub host: String,
-    pub api_base_url: String,
-    pub read_token_env: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct NetworkPoliciesConfig {
-    pub installed: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct EnvironmentsConfig {
-    pub installed: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct WorkflowsConfig {
-    pub installed: Vec<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct LoadedTriagePrompt {
     pub system: Option<String>,
     pub user: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct RepoDiscoveryConfig {
-    pub enabled: Option<bool>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub strategies: Vec<RepoDiscoveryStrategy>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct RepoDiscoveryStrategy {
-    #[allow(dead_code)]
-    #[serde(rename = "type")]
-    pub strategy_type: String,
-    #[allow(dead_code)]
-    pub path: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub include: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub exclude: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -333,7 +245,7 @@ pub struct EnvironmentToml {
 pub type NetworkPolicyToml = agent_hub_config::NetworkPolicyConfig;
 
 pub struct LoadedConfigTree {
-    pub system: SystemManifest,
+    pub system: agent_hub_config::SystemConfig,
     pub environments: Vec<LoadedEnvironment>,
     pub network_policies: Vec<NetworkPolicyToml>,
     pub network_policy_file_digests:
@@ -372,18 +284,19 @@ impl LoadedEnvironment {
 pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
     let deployment =
         agent_hub_config::validate_authoritative_config_root(root).map_err(anyhow::Error::msg)?;
-    let system_file: SystemManifestFile = toml::from_str(&deployment.system_toml)
-        .context("parse captured validated system manifest")?;
-    let system = system_file.system;
-    if let Some(github) = system.github.as_ref()
-        && github.webhook_secret_env != GITHUB_WEBHOOK_SECRET_ENV
-    {
-        anyhow::bail!("system.github.webhook_secret_env must be {GITHUB_WEBHOOK_SECRET_ENV}");
-    }
+    let system = agent_hub_config::SystemConfig::from_toml(
+        &deployment.system_toml,
+        "captured validated system manifest",
+    )
+    .map_err(anyhow::Error::msg)?;
     let runner_profiles = deployment.runner_profiles.clone();
 
     let mut environments = Vec::new();
-    for environment_name in &system.environments.installed {
+    let installed_environments = system
+        .environments
+        .as_ref()
+        .context("system.environments is required")?;
+    for environment_name in &installed_environments.installed {
         let bundle = deployment
             .environment_bundles
             .get(environment_name)
@@ -406,6 +319,8 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
 
     let network_policies = system
         .network_policies
+        .as_ref()
+        .context("system.network_policies is required")?
         .installed
         .iter()
         .map(|name| {

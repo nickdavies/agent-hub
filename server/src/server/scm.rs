@@ -16,7 +16,7 @@ use std::env;
 
 use crate::error::AppError;
 
-use super::config::ScmHostConfig;
+use agent_hub_config::SystemScmHostConfig;
 
 /// What kind of SCM the host runs. Determines which `Poller`/webhook
 /// implementation handles it. Today only `Github` is implemented; new
@@ -85,7 +85,7 @@ impl ScmHostRegistry {
     /// skipping makes "polling stopped working" debugging miserable;
     /// if you don't want a host registered, delete its
     /// `[[system.scm_hosts]]` row.
-    pub fn from_configs(configs: &[ScmHostConfig]) -> Result<Self, AppError> {
+    pub fn from_configs(configs: &[SystemScmHostConfig]) -> Result<Self, AppError> {
         let mut hosts = Vec::with_capacity(configs.len());
         for cfg in configs {
             let kind = ScmHostKind::parse(&cfg.kind)?;
@@ -164,8 +164,13 @@ fn read_secret_env(name: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn cfg(kind: &str, host: &str, base: &str, read_token_env: Option<&str>) -> ScmHostConfig {
-        ScmHostConfig {
+    fn cfg(
+        kind: &str,
+        host: &str,
+        base: &str,
+        read_token_env: Option<&str>,
+    ) -> SystemScmHostConfig {
+        SystemScmHostConfig {
             kind: kind.into(),
             host: host.into(),
             api_base_url: base.into(),
