@@ -155,10 +155,6 @@ pub fn supervised_opencode_runtime_env(
     }
     let mut environment = trusted_env.clone();
     environment.remove("OPENCODE_PURE");
-    environment.insert(
-        "OPENCODE_DISABLE_DEFAULT_PLUGINS".to_string(),
-        "1".to_string(),
-    );
     Ok(environment)
 }
 
@@ -1898,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn supervised_opencode_environment_loads_only_configured_plugins() {
+    fn supervised_opencode_environment_loads_pinned_default_plugins() {
         let automatic = trusted_opencode_runtime_env();
         let supervised = supervised_opencode_runtime_env(&automatic).unwrap();
 
@@ -1908,12 +1904,7 @@ mod tests {
         );
         assert!(!automatic.contains_key("OPENCODE_DISABLE_DEFAULT_PLUGINS"));
         assert!(!supervised.contains_key("OPENCODE_PURE"));
-        assert_eq!(
-            supervised
-                .get("OPENCODE_DISABLE_DEFAULT_PLUGINS")
-                .map(String::as_str),
-            Some("1")
-        );
+        assert!(!supervised.contains_key("OPENCODE_DISABLE_DEFAULT_PLUGINS"));
         for name in [
             "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
             "OPENCODE_DISABLE_EXTERNAL_SKILLS",

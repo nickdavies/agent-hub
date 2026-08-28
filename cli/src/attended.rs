@@ -3790,7 +3790,16 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires the attended OpenCode integration environment and a built plugin artifact"]
     async fn real_docker_supervised_opencode_routes_permissions() {
-        run_real_docker_supervised_opencode_permissions()
+        run_real_docker_supervised_opencode_permissions(false)
+            .await
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires the attended OpenCode integration environment, a built plugin artifact, and real OpenAI credentials"]
+    async fn real_docker_supervised_opencode_reaches_real_llm() {
+        run_real_docker_supervised_opencode_permissions(true)
             .await
             .unwrap();
     }
@@ -4005,7 +4014,7 @@ exit 0
     }
 
     #[cfg(target_os = "linux")]
-    async fn run_real_docker_supervised_opencode_permissions() -> anyhow::Result<()> {
+    async fn run_real_docker_supervised_opencode_permissions(real_llm: bool) -> anyhow::Result<()> {
         use crate::attended_relay::{
             AttendedRelay, AttendedRelayConfig, host_relay_socket_location,
         };
@@ -4088,6 +4097,14 @@ exit 0
         super::set_private_directory(&data_dir.join("opencode"))?;
         std::fs::create_dir(data_dir.join("opencode/log"))?;
         super::set_private_directory(&data_dir.join("opencode/log"))?;
+        if real_llm {
+            let auth_path = std::fs::canonicalize(PathBuf::from(std::env::var(
+                "AGENT_HUB_ATTENDED_OPENCODE_AUTH",
+            )?))?;
+            let materialized_auth = data_dir.join("opencode/auth.json");
+            std::fs::copy(auth_path, &materialized_auth)?;
+            super::set_private_file(&materialized_auth)?;
+        }
 
         #[derive(Default)]
         struct FakeState {
@@ -4379,9 +4396,9 @@ exit 0
             ..FakeState::default()
         }));
         let _server = AbortTask(tokio::spawn(fake_server(listener, Arc::clone(&fake_state))));
-        let opencode_config_path = bundle_dir.join("opencode.json");
+        let opencode_config_path = bundle_dir.join("fixture-opencode.json");
         let mut opencode_config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&opencode_config_path)?)?;
+            serde_json::from_slice(&std::fs::read(bundle_dir.join("opencode.json"))?)?;
         opencode_config["model"] = serde_json::json!("openai/gpt-5.2");
         opencode_config["small_model"] = serde_json::json!("openai/gpt-5.2");
         opencode_config["provider"] = serde_json::json!({
@@ -4392,6 +4409,12 @@ exit 0
                 }
             }
         });
+        opencode_config["permission"] = serde_json::json!({"*":"allow"});
+        if let Some(agents) = opencode_config["agent"].as_object_mut() {
+            for agent in agents.values_mut() {
+                agent["permission"] = serde_json::json!({"*":"allow"});
+            }
+        }
         std::fs::write(&opencode_config_path, serde_json::to_vec(&opencode_config)?)?;
         let run_epoch = uuid::Uuid::new_v4();
         let socket = host_relay_socket_location(run_epoch)?;
@@ -4403,7 +4426,7 @@ exit 0
             network_digest: "b".repeat(64),
             approval_bundle_digest: approval_bundle.digest.clone(),
         };
-        let run_deadline = Utc::now() + chrono::Duration::minutes(2);
+        let run_deadline = Utc::now() + chrono::Duration::minutes(5);
         let effects =
             ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never())?;
         let container_name = format!(
@@ -4414,23 +4437,24 @@ exit 0
             ("agent-hub.owner".to_string(), "supervised-test".to_string()),
             ("agent-hub.run".to_string(), container_name.clone()),
         ]))?;
-        let script = r#"set -eu
+        let mut script = r#"set -eu
 test -z "${AGENT_HUB_SERVER+x}"
 test -z "${AGENT_HUB_TOKEN+x}"
 test -z "${AGENT_HUB_APPROVALS_SERVER+x}"
 test -z "${AGENT_HUB_APPROVALS_TOKEN+x}"
 test -z "${OPENCODE_PURE+x}"
-test "$OPENCODE_DISABLE_DEFAULT_PLUGINS" = 1
-if ! /usr/local/bin/node -e 'import("file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js").then(module => { if (module.default?.id !== "agent-hub" || typeof module.default?.server !== "function") throw new Error("bundled OpenCode plugin does not default export the required id/server module API") })' 2> plugin-import.err; then
+test -z "${OPENCODE_DISABLE_DEFAULT_PLUGINS+x}"
+if ! /usr/local/bin/node -e 'import("file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js").then(module => { if (typeof module.default !== "function") throw new Error("bundled OpenCode plugin default export is not a function") })' 2> plugin-import.err; then
   cat plugin-import.err >&2
   exit 1
 fi
 printf 'read fixture\n' > native-read.txt
-timeout 60 /usr/local/bin/opencode --print-logs --log-level DEBUG run 'Use Bash as instructed.' > opencode.log 2>&1
+OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCODE_CONFIG=/opencode/config/opencode/fixture-opencode.json timeout 60 /usr/local/bin/opencode --print-logs --log-level DEBUG run --title fixture --model openai/gpt-5.6-sol 'Use Bash as instructed.' > opencode.log 2>&1
 cp /opencode/state/agent-hub/tool-executions.json foreground-gpt5-evidence.json
 rm -rf /opencode/state/agent-hub
-timeout 60 /usr/local/bin/opencode --print-logs --log-level DEBUG run --model openai/gpt-4.1 'Use file tools as instructed.' >> opencode.log 2>&1
+OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCODE_CONFIG=/opencode/config/opencode/fixture-opencode.json timeout 60 /usr/local/bin/opencode --print-logs --log-level DEBUG run --title fixture --model openai/gpt-4.1 'Use file tools as instructed.' >> opencode.log 2>&1
 cp /opencode/state/agent-hub/tool-executions.json foreground-gpt4-evidence.json
+! grep -q 'schema rejection' opencode.log
 test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
 test "$(jq -r '.version' /opencode/state/agent-hub/tool-executions.json)" = 2
 jq -e '.calls | length > 0 and all(.call_id != "" and .raw_args_digest != "")' /opencode/state/agent-hub/tool-executions.json >/dev/null
@@ -4441,7 +4465,15 @@ test ! -e denied-marker
 test ! -e pending-marker
 test "$(cat native-patch.txt)" = patched
 test "$(cat native-write.txt)" = after
-"#;
+"#.to_string();
+        if real_llm {
+            script.push_str(r#"rm -rf /opencode/state/agent-hub
+env -u OPENAI_API_KEY timeout 120 /usr/local/bin/opencode --print-logs --log-level DEBUG run 'Reply with exactly: ready. Do not use tools.' > real-llm.log 2>&1
+grep -qx 'ready\|ready\.' real-llm.log
+! grep -q 'schema rejection\|UnknownError\|ProviderModelNotFoundError' real-llm.log
+test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
+"#);
+        }
         let mut environment = config::supervised_opencode_runtime_env(&runner.opencode.trusted_env)
             .map_err(anyhow::Error::msg)?;
         environment.insert("AGENT_HUB_APPROVAL_MODE".into(), "attended_socket".into());
@@ -4495,7 +4527,7 @@ test "$(cat native-write.txt)" = after
             image_identity: image_id,
             container_name: container_name.clone(),
             entrypoint: "/usr/bin/sh".into(),
-            command_args: vec!["-lc".into(), script.into()],
+            command_args: vec!["-lc".into(), script],
             mounts,
             environment,
             network: agent_hub_executor::NetworkMode::Unrestricted,

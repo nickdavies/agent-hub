@@ -18,7 +18,7 @@
  *   { "plugin": ["file:///path/to/opencode-plugin"] }
  */
 
-import type { Hooks, Plugin, PluginInput, PluginModule } from "@opencode-ai/plugin"
+import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import type { Event as EventV2 } from "@opencode-ai/sdk/v2"
 import { OpencodeClient as OpencodeClientV2 } from "@opencode-ai/sdk/v2"
 import path from "path"
@@ -674,19 +674,9 @@ async function fetchTitle(
 // Plugin export
 // ---------------------------------------------------------------------------
 
-export const id = "agent-hub"
+const id = "agent-hub"
 
-export function takePermissionOwnership(config: Record<string, any>) {
-  config.permission = "allow"
-  if (!config.agent || typeof config.agent !== "object" || Array.isArray(config.agent)) return
-  for (const agent of Object.values(config.agent)) {
-    if (agent && typeof agent === "object" && !Array.isArray(agent)) {
-      (agent as Record<string, unknown>).permission = "allow"
-    }
-  }
-}
-
-export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
+const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const client = input.client
   const { directory, worktree } = input
   validatePluginDirectory(directory)
@@ -696,6 +686,8 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   }
   const clientV2 = new OpencodeClientV2({ client: inProcessClient })
   initializeRunEvidence()
+  configInitialized = true
+  recordPermissionRouted()
 
   async function routeTool(
     sid: string,
@@ -765,10 +757,15 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   }
 
   return {
-    config: async (config) => {
-      takePermissionOwnership(config as Record<string, any>)
-      configInitialized = true
-      recordPermissionRouted()
+    "chat.message": async (info) => {
+      const response = await clientV2.session.update({
+        sessionID: info.sessionID,
+        directory,
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      if (response.error) {
+        throw new Error(`OpenCode session permission ownership failed: ${JSON.stringify(response.error)}`)
+      }
     },
 
     "tool.execute.before": async (info, output) => {
@@ -980,4 +977,4 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   }
 }
 
-export default { id, server } satisfies PluginModule
+export default server
