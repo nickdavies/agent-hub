@@ -39,8 +39,9 @@ pub use runner::{
     ManagedRunnerFileMount, ManagedRunnerKind, ManagedRunnerSpec, McpBridgeDescriptor,
     OPENCODE_PROJECT_CONFIG_ALIASES, OpencodeRunnerConfig, ResolvedRunnerProfile,
     RunnerProfilesConfig, TrustedMountDescriptor, canonicalize_resolved_runner_profile,
-    digest_profile, directory_content_digests, trusted_opencode_runtime_env,
-    validate_untrusted_opencode_env, validate_untrusted_opencode_env_name,
+    digest_profile, directory_content_digests, supervised_opencode_runtime_env,
+    trusted_opencode_runtime_env, validate_untrusted_opencode_env,
+    validate_untrusted_opencode_env_name,
 };
 pub use system::{SystemApprovalBundleTrustConfig, SystemConfig, SystemScmHostConfig};
 pub use tools::{is_in_workspace, normalize_path, resolve_path};

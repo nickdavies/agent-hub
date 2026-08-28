@@ -147,6 +147,21 @@ pub fn trusted_opencode_runtime_env() -> BTreeMap<String, String> {
     ])
 }
 
+pub fn supervised_opencode_runtime_env(
+    trusted_env: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    if trusted_env != &trusted_opencode_runtime_env() {
+        return Err("trusted OpenCode environment is not canonical".to_string());
+    }
+    let mut environment = trusted_env.clone();
+    environment.remove("OPENCODE_PURE");
+    environment.insert(
+        "OPENCODE_DISABLE_DEFAULT_PLUGINS".to_string(),
+        "1".to_string(),
+    );
+    Ok(environment)
+}
+
 pub fn validate_untrusted_opencode_env(env: &BTreeMap<String, String>) -> Result<(), String> {
     for name in env.keys() {
         validate_untrusted_opencode_env_name(name)?;
@@ -1880,6 +1895,36 @@ mod tests {
             .trusted_env
             .insert("OPENCODE_PURE".to_string(), "0".to_string());
         assert_ne!(digest_profile(&mutated).unwrap(), profile.config_digest);
+    }
+
+    #[test]
+    fn supervised_opencode_environment_loads_only_configured_plugins() {
+        let automatic = trusted_opencode_runtime_env();
+        let supervised = supervised_opencode_runtime_env(&automatic).unwrap();
+
+        assert_eq!(
+            automatic.get("OPENCODE_PURE").map(String::as_str),
+            Some("1")
+        );
+        assert!(!automatic.contains_key("OPENCODE_DISABLE_DEFAULT_PLUGINS"));
+        assert!(!supervised.contains_key("OPENCODE_PURE"));
+        assert_eq!(
+            supervised
+                .get("OPENCODE_DISABLE_DEFAULT_PLUGINS")
+                .map(String::as_str),
+            Some("1")
+        );
+        for name in [
+            "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+            "OPENCODE_DISABLE_EXTERNAL_SKILLS",
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+        ] {
+            assert_eq!(supervised.get(name).map(String::as_str), Some("1"));
+        }
+
+        let mut noncanonical = automatic;
+        noncanonical.insert("OPENCODE_PURE".to_string(), "0".to_string());
+        assert!(supervised_opencode_runtime_env(&noncanonical).is_err());
     }
 
     #[test]

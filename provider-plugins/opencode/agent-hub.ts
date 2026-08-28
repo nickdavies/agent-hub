@@ -38,6 +38,56 @@ import { approvalTransport, gatewayApprovalInvocation } from "./approval-transpo
 import { normalizePermission } from "./permission-normalization"
 
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
+const EVIDENCE_VERSION = 1
+let evidenceSequence = 0
+
+function writeEvidence(pathname: string, value: Record<string, unknown>, replace: boolean) {
+  const directory = path.dirname(pathname)
+  const metadata = fs.lstatSync(directory)
+  if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) {
+    throw new Error(`run evidence directory is not private at ${directory}`)
+  }
+  const temporary = `${pathname}.${process.pid}.${evidenceSequence++}.tmp`
+  const descriptor = fs.openSync(temporary, "wx", 0o600)
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`)
+    fs.fsyncSync(descriptor)
+  } finally {
+    fs.closeSync(descriptor)
+  }
+  if (!replace && fs.existsSync(pathname)) {
+    fs.unlinkSync(temporary)
+    throw new Error(`run evidence already exists at ${pathname}`)
+  }
+  fs.renameSync(temporary, pathname)
+}
+
+function initializeRunEvidence() {
+  if (APPROVAL_TRANSPORT.kind !== "attended_socket") return
+  const directory = path.dirname(APPROVAL_TRANSPORT.readinessPath)
+  if (directory !== path.dirname(APPROVAL_TRANSPORT.outcomePath)) {
+    throw new Error("run evidence paths do not share one trusted directory")
+  }
+  fs.mkdirSync(directory, { mode: 0o700 })
+  const common = {
+    version: EVIDENCE_VERSION,
+    plugin: id,
+    nonce: APPROVAL_TRANSPORT.nonce,
+  }
+  writeEvidence(APPROVAL_TRANSPORT.readinessPath, { ...common, status: "ready" }, false)
+  writeEvidence(APPROVAL_TRANSPORT.outcomePath, { ...common, status: "no_denials" }, false)
+}
+
+function recordPermissionDenied(reason?: string) {
+  if (APPROVAL_TRANSPORT.kind !== "attended_socket") return
+  writeEvidence(APPROVAL_TRANSPORT.outcomePath, {
+    version: EVIDENCE_VERSION,
+    plugin: id,
+    nonce: APPROVAL_TRANSPORT.nonce,
+    status: "denied",
+    reason: reason?.slice(0, 1024) ?? null,
+  }, true)
+}
 
 // ---------------------------------------------------------------------------
 // Hook output type — extracted from Hooks["permission.ask"] so `apply()`
@@ -519,7 +569,10 @@ function validatePluginDirectory(directory: string) {
 // Apply a GatewayResult to the hook output object.
 function apply(r: GatewayResult, output: PermissionOutput) {
   output.status = r.allowed ? "allow" : "deny"
-  if (r.reason && !r.allowed) output.message = r.reason
+  if (!r.allowed) {
+    recordPermissionDenied(r.reason ?? undefined)
+    if (r.reason) output.message = r.reason
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +631,7 @@ async function fetchTitle(
 export const id = "agent-hub"
 
 const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
+  initializeRunEvidence()
   const client = input.client
   const { directory, worktree } = input
   validatePluginDirectory(directory)
@@ -625,6 +679,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         requests = normalizePermission(info, directory, worktree)
       } catch (error) {
         log("ERROR", "permission normalization failed closed", { err: String(error) })
+        recordPermissionDenied(String(error))
         output.status = "deny"
         Object.assign(output, { message: String(error) })
         return
@@ -807,4 +862,4 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   }
 }
 
-export default { id, server }
+export default server

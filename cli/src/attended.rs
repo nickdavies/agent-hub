@@ -118,6 +118,14 @@ pub enum RunStatus {
     Cleaned,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOutcome {
+    NoDenials,
+    Denied,
+    ReadinessFailed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuthorizationRecord {
@@ -146,6 +154,10 @@ pub struct RunRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub execution_status: Option<RunStatus>,
+    #[serde(default)]
+    pub process_status: Option<RunStatus>,
+    #[serde(default)]
+    pub permission_outcome: Option<PermissionOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -653,6 +665,8 @@ pub async fn run(
                 exit_code: None,
                 error: None,
                 execution_status: None,
+                process_status: None,
+                permission_outcome: None,
             };
             store.create_json(&run_record_path(&id), &record)?;
             record
@@ -662,6 +676,8 @@ pub async fn run(
     prepare_consumption(store, &mut record, &digest, |_| Ok(()))?;
 
     let mut captured_execution_outcome = None;
+    let mut captured_process_status = None;
+    let mut captured_permission_outcome = None;
     let mut captured_cleanup_evidence = None;
     let result = async {
     let cancel_marker = store.path(&cancel_path(&id))?;
@@ -764,6 +780,8 @@ pub async fn run(
         let state_dir = run_dir.join("state");
         let cache_dir = run_dir.join("cache");
         let project_config_mask_dir = run_dir.join("project-config-mask");
+        let plugin_run_nonce = (request.proposal.tool_approval == ToolApprovalMode::Dippy)
+            .then(|| uuid::Uuid::new_v4().simple().to_string());
         let prompt_path = run_dir.join("prompt.txt");
         write_private_durable(&prompt_path, request.proposal.prompt.as_bytes())?;
         let deployment =
@@ -909,7 +927,14 @@ pub async fn run(
             "AGENT_PROMPT_USER_PATH".into(),
             "/agent-hub/prompt.txt".into(),
         );
-        for (name, value) in &runner.opencode.trusted_env {
+        let trusted_opencode_environment =
+            if request.proposal.tool_approval == ToolApprovalMode::Dippy {
+                config::supervised_opencode_runtime_env(&runner.opencode.trusted_env)
+                    .map_err(anyhow::Error::msg)?
+            } else {
+                runner.opencode.trusted_env.clone()
+            };
+        for (name, value) in &trusted_opencode_environment {
             ensure!(
                 environment.insert(name.clone(), value.clone()).is_none(),
                 "trusted OpenCode environment conflicts with authorized variable '{name}'"
@@ -958,6 +983,25 @@ pub async fn run(
                 ).is_none(),
                 "authorized environment conflicts with attended gateway config"
             );
+            let plugin_run_nonce = plugin_run_nonce
+                .as_deref()
+                .context("supervised execution has no plugin run nonce")?;
+            for (name, value) in [
+                (
+                    "AGENT_HUB_PLUGIN_READINESS_PATH",
+                    "/opencode/state/agent-hub/plugin-ready.json",
+                ),
+                (
+                    "AGENT_HUB_PLUGIN_OUTCOME_PATH",
+                    "/opencode/state/agent-hub/permission-outcome.json",
+                ),
+                ("AGENT_HUB_PLUGIN_RUN_NONCE", plugin_run_nonce),
+            ] {
+                ensure!(
+                    environment.insert(name.into(), value.into()).is_none(),
+                    "authorized environment conflicts with supervised plugin evidence variable '{name}'"
+                );
+            }
             verify_exact_relay_mount(&mounts, &relay.socket_path)?;
         }
         if !request.proposal.network_resources.is_empty() {
@@ -1076,7 +1120,7 @@ pub async fn run(
             );
             record.status = RunStatus::Running;
             store.replace_json(&run_record_path(&id), &record)?;
-            execute_process(ExecutionRequest {
+            let process_result = execute_process(ExecutionRequest {
                 command: docker_path.clone(),
                 args,
                 current_dir: run_dir.clone(),
@@ -1096,7 +1140,27 @@ pub async fn run(
                     "container={container_name};digest={digest};image={image_identity}"
                 )),
             })
-            .await
+            .await?;
+            captured_process_status = Some(run_status_for_execution_status(&process_result.status));
+            if let Some(nonce) = plugin_run_nonce.as_deref() {
+                match verify_supervised_plugin_evidence(&state_dir, nonce) {
+                    Ok(PermissionOutcome::NoDenials) => {
+                        captured_permission_outcome = Some(PermissionOutcome::NoDenials);
+                    }
+                    Ok(PermissionOutcome::Denied) => {
+                        captured_permission_outcome = Some(PermissionOutcome::Denied);
+                        anyhow::bail!(
+                            "OpenCode process completed after a supervised permission was denied"
+                        );
+                    }
+                    Ok(PermissionOutcome::ReadinessFailed) => unreachable!(),
+                    Err(error) => {
+                        captured_permission_outcome = Some(PermissionOutcome::ReadinessFailed);
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(process_result)
         }
         .await;
         let execution_outcome = attended_execution_outcome(
@@ -1254,6 +1318,8 @@ pub async fn run(
     if record.execution_status.is_none() && record.status != RunStatus::CleanupFailed {
         record.execution_status = Some(record.status.clone());
     }
+    record.process_status = captured_process_status;
+    record.permission_outcome = captured_permission_outcome;
     let outer_container_cleanup = async {
         let effects = if run_dir.join("effects").exists() {
             Some(agent_hub_executor::ExecutionCancellationContext::new(
@@ -2489,6 +2555,73 @@ fn attended_execution_outcome(
     }
 }
 
+fn run_status_for_execution_status(status: &ExecutionStatus) -> RunStatus {
+    match status {
+        ExecutionStatus::Exited(0) => RunStatus::Succeeded,
+        ExecutionStatus::Exited(_) | ExecutionStatus::OutputLimitExceeded => RunStatus::Failed,
+        ExecutionStatus::Cancelled => RunStatus::Cancelled,
+        ExecutionStatus::TimedOut => RunStatus::TimedOut,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginEvidence {
+    version: u32,
+    plugin: String,
+    nonce: String,
+    status: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn read_plugin_evidence(path: &Path) -> anyhow::Result<PluginEvidence> {
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "supervised OpenCode plugin did not create {}",
+            path.display()
+        )
+    })?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 4096,
+        "supervised OpenCode plugin evidence is not a bounded regular file"
+    );
+    serde_json::from_slice(&std::fs::read(path)?)
+        .context("supervised OpenCode plugin evidence is invalid")
+}
+
+fn verify_supervised_plugin_evidence(
+    state_dir: &Path,
+    nonce: &str,
+) -> anyhow::Result<PermissionOutcome> {
+    let evidence_dir = state_dir.join("agent-hub");
+    let directory_metadata = std::fs::symlink_metadata(&evidence_dir)
+        .context("supervised OpenCode plugin evidence directory is missing")?;
+    ensure!(
+        directory_metadata.is_dir() && !directory_metadata.file_type().is_symlink(),
+        "supervised OpenCode plugin evidence directory is not a real directory"
+    );
+    let readiness = read_plugin_evidence(&evidence_dir.join("plugin-ready.json"))?;
+    ensure!(
+        readiness.version == 1
+            && readiness.plugin == "agent-hub"
+            && readiness.nonce == nonce
+            && readiness.status == "ready"
+            && readiness.reason.is_none(),
+        "supervised OpenCode plugin readiness evidence does not match this run"
+    );
+    let outcome = read_plugin_evidence(&evidence_dir.join("permission-outcome.json"))?;
+    ensure!(
+        outcome.version == 1 && outcome.plugin == "agent-hub" && outcome.nonce == nonce,
+        "supervised OpenCode permission evidence does not match this run"
+    );
+    match outcome.status.as_str() {
+        "no_denials" if outcome.reason.is_none() => Ok(PermissionOutcome::NoDenials),
+        "denied" => Ok(PermissionOutcome::Denied),
+        _ => anyhow::bail!("supervised OpenCode permission evidence has invalid status"),
+    }
+}
+
 impl std::fmt::Display for FinalizationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut details = Vec::new();
@@ -3335,12 +3468,12 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttendedExecutionOutcome, FinalizationError, RelayEndpoint, RelayEpochState, RunRecord,
-        RunStatus, attended_execution_outcome, merge_execution_cleanup,
+        AttendedExecutionOutcome, FinalizationError, PermissionOutcome, RelayEndpoint,
+        RelayEpochState, RunRecord, RunStatus, attended_execution_outcome, merge_execution_cleanup,
         network_class_within_ceiling, prepare_consumption, resolve_network_resources,
         selector_resources, serialize_pretty_bounded, verify_exact_relay_mount,
         verify_host_only_approval_environment, verify_recovery_relay_endpoint,
-        verify_tool_approval,
+        verify_supervised_plugin_evidence, verify_tool_approval,
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
@@ -3400,6 +3533,65 @@ mod tests {
     }
 
     #[test]
+    fn supervised_plugin_evidence_distinguishes_denial_from_process_completion() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target")
+            .join(format!("plugin-evidence-test-{}", uuid::Uuid::new_v4()));
+        let evidence = root.join("agent-hub");
+        std::fs::create_dir_all(&evidence).unwrap();
+        let nonce = "f".repeat(32);
+        std::fs::write(
+            evidence.join("plugin-ready.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "plugin": "agent-hub",
+                "nonce": nonce,
+                "status": "ready"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            evidence.join("permission-outcome.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "plugin": "agent-hub",
+                "nonce": nonce,
+                "status": "no_denials"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_supervised_plugin_evidence(&root, &nonce).unwrap(),
+            PermissionOutcome::NoDenials
+        );
+
+        std::fs::write(
+            evidence.join("permission-outcome.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "plugin": "agent-hub",
+                "nonce": nonce,
+                "status": "denied",
+                "reason": "fixture denial"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_supervised_plugin_evidence(&root, &nonce).unwrap(),
+            PermissionOutcome::Denied
+        );
+        std::fs::remove_file(evidence.join("plugin-ready.json")).unwrap();
+        assert!(verify_supervised_plugin_evidence(&root, &nonce).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn recovery_requires_exact_normalized_nonsecret_relay_endpoint() {
         let root = std::env::current_dir()
             .unwrap()
@@ -3451,6 +3643,15 @@ mod tests {
     #[ignore = "requires AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION=1 and tester-managed Docker cleanup"]
     async fn real_docker_attended_opencode_reaches_model_initialization() {
         run_real_docker_attended_opencode_startup().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION=1 and tester-managed Docker cleanup"]
+    async fn real_docker_supervised_opencode_routes_permissions() {
+        run_real_docker_supervised_opencode_permissions()
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -3662,6 +3863,407 @@ exit 0
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    async fn run_real_docker_supervised_opencode_permissions() -> anyhow::Result<()> {
+        use crate::attended_relay::{
+            AttendedRelay, AttendedRelayConfig, host_relay_socket_location,
+        };
+        use agent_hub_executor::{Cancellation, ExecutionCancellationContext};
+        use protocol::{
+            Approval, ApprovalRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::Mutex;
+
+        anyhow::ensure!(
+            std::env::var("AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION").as_deref() == Ok("1"),
+            "AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION=1 is required"
+        );
+        anyhow::ensure!(
+            std::env::var("AGENT_HUB_ATTENDED_OPENCODE_ALLOW_CLEANUP").as_deref() == Ok("1"),
+            "AGENT_HUB_ATTENDED_OPENCODE_ALLOW_CLEANUP=1 is required"
+        );
+        let config_root = std::fs::canonicalize(PathBuf::from(std::env::var(
+            "AGENT_HUB_ATTENDED_OPENCODE_CONFIG_ROOT",
+        )?))?;
+        let integration_root = std::fs::canonicalize(PathBuf::from(std::env::var(
+            "AGENT_HUB_ATTENDED_OPENCODE_ROOT",
+        )?))?;
+        let expected_image_id = std::env::var("AGENT_HUB_ATTENDED_OPENCODE_IMAGE_ID")?;
+        let deployment =
+            config::validate_authoritative_config_root(&config_root).map_err(anyhow::Error::msg)?;
+        let bundle = deployment
+            .environment_bundles
+            .get("code-supervised")
+            .context("code-supervised environment bundle is required")?;
+        let approval_bundle = bundle
+            .approval_bundle
+            .as_ref()
+            .context("code-supervised approval bundle is required")?;
+        let runner = deployment
+            .runner_profiles
+            .resolve_agent_profile(None)
+            .map_err(anyhow::Error::msg)?;
+        let docker = which::which("docker")?;
+        let image_id = agent_hub_executor::inspect_image_identity(
+            &docker,
+            config::DURABLE_OPENCODE_IMAGE,
+            &agent_hub_executor::Deadline::new(Some(15))?,
+            &Cancellation::never(),
+        )
+        .await?;
+        anyhow::ensure!(
+            image_id == expected_image_id,
+            "Docker image identity changed"
+        );
+
+        let root = integration_root.join(format!(
+            "supervised-opencode-permissions-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&root)?;
+        super::set_private_directory(&root)?;
+        let bundle_dir = root.join("config");
+        let data_dir = root.join("data");
+        let state_dir = root.join("state");
+        let cache_dir = root.join("cache");
+        let workspace = root.join("workspace");
+        bundle.write_to(&bundle_dir).map_err(anyhow::Error::msg)?;
+        for directory in [&data_dir, &state_dir, &cache_dir, &workspace] {
+            std::fs::create_dir(directory)?;
+            super::set_private_directory(directory)?;
+        }
+        std::fs::create_dir(state_dir.join("home"))?;
+        std::fs::create_dir(data_dir.join("opencode"))?;
+        super::set_private_directory(&data_dir.join("opencode"))?;
+        std::fs::create_dir(data_dir.join("opencode/log"))?;
+        super::set_private_directory(&data_dir.join("opencode/log"))?;
+
+        #[derive(Default)]
+        struct FakeState {
+            approvals: HashMap<uuid::Uuid, Approval>,
+            registrations: Vec<String>,
+            cancellations: usize,
+        }
+
+        async fn fake_server(listener: tokio::net::TcpListener, state: Arc<Mutex<FakeState>>) {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if stream.read_exact(&mut byte).await.is_err() || request.len() >= 64 * 1024
+                        {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let headers = String::from_utf8_lossy(&request);
+                    let request_line = headers.lines().next().unwrap_or_default().to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0; content_length];
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+
+                    let response = if request_line.starts_with("POST /api/v1/hooks/approval ") {
+                        let request: ApprovalRequest = match serde_json::from_slice(&body) {
+                            Ok(request) => request,
+                            Err(_) => return,
+                        };
+                        let command = request
+                            .tool_input
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let status = match command.as_str() {
+                            "touch approved-marker" => ApprovalStatus::Approved {
+                                message: Some("fixture approved".into()),
+                            },
+                            "touch denied-marker" => ApprovalStatus::Denied {
+                                reason: "fixture denied".into(),
+                            },
+                            "touch pending-marker" => ApprovalStatus::Pending,
+                            _ => return,
+                        };
+                        let id = uuid::Uuid::new_v4();
+                        let approval = Approval {
+                            id,
+                            request_id: request.id,
+                            session_id: request.session_id,
+                            session_display_name: request.session_display_name,
+                            project: "primary".into(),
+                            tool: request.tool,
+                            tool_input: request.tool_input,
+                            provider: request.provider,
+                            request_type: request.request_type,
+                            context: request.context,
+                            created_at: Utc::now(),
+                            status: status.clone(),
+                        };
+                        let mut state = state.lock().await;
+                        state.registrations.push(command);
+                        state.approvals.insert(id, approval);
+                        serde_json::to_vec(&ApprovalResponse { id, status }).unwrap()
+                    } else {
+                        let path = request_line.split_whitespace().nth(1).unwrap_or_default();
+                        let Some(id) = path
+                            .split('/')
+                            .find_map(|part| uuid::Uuid::parse_str(part).ok())
+                        else {
+                            return;
+                        };
+                        let mut state = state.lock().await;
+                        if request_line.starts_with("POST ") && path.ends_with("/resolve") {
+                            let Some(approval) = state.approvals.get_mut(&id) else {
+                                return;
+                            };
+                            approval.status = ApprovalStatus::Cancelled;
+                            state.cancellations += 1;
+                        }
+                        let Some(approval) = state.approvals.get(&id) else {
+                            return;
+                        };
+                        if path.ends_with("/wait") {
+                            serde_json::to_vec(&ApprovalWaitResponse {
+                                status: approval.status.clone(),
+                            })
+                            .unwrap()
+                        } else {
+                            serde_json::to_vec(approval).unwrap()
+                        }
+                    };
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        response.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&response).await;
+                });
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let server_url = format!("http://{}", listener.local_addr()?);
+        let fake_state = Arc::new(Mutex::new(FakeState::default()));
+        let server = tokio::spawn(fake_server(listener, Arc::clone(&fake_state)));
+        let run_epoch = uuid::Uuid::new_v4();
+        let socket = host_relay_socket_location(run_epoch)?;
+        let binding = protocol::AttendedGatewayBindingV1 {
+            run_epoch: run_epoch.to_string(),
+            authorization_digest: "a".repeat(64),
+            environment_bundle_digest: bundle.digest.clone(),
+            image_digest: image_id.clone(),
+            network_digest: "b".repeat(64),
+            approval_bundle_digest: approval_bundle.digest.clone(),
+        };
+        let run_deadline = Utc::now() + chrono::Duration::minutes(2);
+        let effects =
+            ExecutionCancellationContext::new(&root.join("effects"), Cancellation::never())?;
+        let container_name = format!(
+            "agent-hub-supervised-opencode-test-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let ownership = agent_hub_executor::DockerOwnership::new(BTreeMap::from([
+            ("agent-hub.owner".to_string(), "supervised-test".to_string()),
+            ("agent-hub.run".to_string(), container_name.clone()),
+        ]))?;
+        let mut relay = AttendedRelay::start(
+            AttendedRelayConfig {
+                socket_path: socket.socket_path.clone(),
+                binding: binding.clone(),
+                approval_bundle: protocol::AttendedApprovalBundleIdentity {
+                    name: approval_bundle.name.clone(),
+                    digest: approval_bundle.digest.clone(),
+                    protocol: approval_bundle.protocol.clone(),
+                    manifest_sha256: approval_bundle.manifest_sha256.clone(),
+                    gateway_commit: approval_bundle.gateway_commit.clone(),
+                    gateway_archive_sha256: approval_bundle.gateway_archive_sha256.clone(),
+                    plugin_sha256: approval_bundle.plugin_sha256.clone(),
+                    dippy_commit: approval_bundle.dippy_commit.clone(),
+                    dippy_archive_sha256: approval_bundle.dippy_archive_sha256.clone(),
+                    dippy_wheel_sha256: approval_bundle.dippy_wheel_sha256.clone(),
+                },
+                run_deadline,
+                server_url,
+                token: None,
+                docker_path: docker.clone(),
+                container_name: container_name.clone(),
+            },
+            &effects,
+            tokio::sync::watch::channel(false).0,
+        )
+        .await?;
+
+        let script = r#"set -eu
+test -z "${AGENT_HUB_SERVER+x}"
+test -z "${AGENT_HUB_TOKEN+x}"
+test -z "${AGENT_HUB_APPROVALS_SERVER+x}"
+test -z "${AGENT_HUB_APPROVALS_TOKEN+x}"
+test -z "${OPENCODE_PURE+x}"
+test "$OPENCODE_DISABLE_DEFAULT_PLUGINS" = 1
+if ! /usr/local/bin/node -e 'import("file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js").then(module => { if (typeof module.default !== "function") throw new Error("bundled OpenCode plugin default export is not a function") })' 2> plugin-import.err; then
+  cat plugin-import.err >&2
+  exit 1
+fi
+/usr/local/bin/opencode --print-logs --log-level DEBUG serve --hostname 127.0.0.1 --port 4097 > opencode.log 2>&1 &
+server=$!
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -fsS http://127.0.0.1:4097/doc >/dev/null; then break; fi
+  if ! kill -0 "$server" 2>/dev/null; then
+    wait "$server"
+    exit $?
+  fi
+  sleep 1
+done
+session=$(curl -fsS -X POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:4097/api/session | jq -r '.data.id // .id')
+permission() {
+  command=$1
+  jq -cn --arg command "$command" '{action:"bash",resources:[$command],metadata:{command:$command}}' |
+    curl -fsS -X POST -H 'content-type: application/json' --data-binary @- "http://127.0.0.1:4097/api/session/$session/permission"
+}
+test "$(permission 'git status' | jq -r '.data.effect // .effect')" = allow
+git status > local-allow.log
+test "$(permission 'touch approved-marker' | jq -r '.data.effect // .effect')" = allow
+touch approved-marker
+test "$(permission 'touch denied-marker' | jq -r '.data.effect // .effect')" = deny
+test ! -e denied-marker
+timeout 3 sh -c "jq -cn '{action:\"bash\",resources:[\"touch pending-marker\"],metadata:{command:\"touch pending-marker\"}}' | curl -fsS -X POST -H 'content-type: application/json' --data-binary @- http://127.0.0.1:4097/api/session/$session/permission" || true
+kill "$server"
+wait "$server" || true
+test ! -e pending-marker
+"#;
+        let mut environment = config::supervised_opencode_runtime_env(&runner.opencode.trusted_env)
+            .map_err(anyhow::Error::msg)?;
+        environment.insert("AGENT_HUB_APPROVAL_MODE".into(), "attended_socket".into());
+        environment.insert(
+            "AGENT_HUB_ATTENDED_APPROVAL_SOCKET".into(),
+            protocol::ATTENDED_GATEWAY_SOCKET_PATH.into(),
+        );
+        environment.insert(
+            "AGENT_HUB_ATTENDED_APPROVAL_BINDING".into(),
+            serde_json::to_string(&binding)?,
+        );
+        environment.insert(
+            "AGENT_HUB_ATTENDED_RUN_DEADLINE".into(),
+            run_deadline.to_rfc3339(),
+        );
+        environment.insert(
+            "AGENT_HUB_CONFIG".into(),
+            "/opencode/config/opencode/approval/agent-hub-permissions.json".into(),
+        );
+        environment.insert(
+            "AGENT_HUB_PLUGIN_READINESS_PATH".into(),
+            "/opencode/state/agent-hub/plugin-ready.json".into(),
+        );
+        environment.insert(
+            "AGENT_HUB_PLUGIN_OUTCOME_PATH".into(),
+            "/opencode/state/agent-hub/permission-outcome.json".into(),
+        );
+        environment.insert(
+            "AGENT_HUB_PLUGIN_RUN_NONCE".into(),
+            run_epoch.simple().to_string(),
+        );
+        super::verify_host_only_approval_environment(&environment)?;
+        let mounts = vec![
+            agent_hub_executor::DockerMount::new(&bundle_dir, "/opencode/config/opencode", true)?,
+            agent_hub_executor::DockerMount::new(&data_dir, "/opencode/data", false)?,
+            agent_hub_executor::DockerMount::new(&state_dir, "/opencode/state", false)?,
+            agent_hub_executor::DockerMount::new(&cache_dir, "/opencode/cache", false)?,
+            agent_hub_executor::DockerMount::new(&workspace, "/workspace/primary", false)?,
+            agent_hub_executor::DockerMount::new(
+                socket
+                    .socket_path
+                    .parent()
+                    .context("relay socket has no parent")?,
+                "/agent-hub/approval",
+                true,
+            )?,
+        ];
+        super::verify_exact_relay_mount(&mounts, &socket.socket_path)?;
+        let plan = agent_hub_executor::DockerExecutionPlan {
+            image_identity: image_id,
+            container_name: container_name.clone(),
+            entrypoint: "/usr/bin/sh".into(),
+            command_args: vec!["-lc".into(), script.into()],
+            mounts,
+            environment,
+            network: agent_hub_executor::NetworkMode::None,
+            dns: Vec::new(),
+            extra_hosts: Vec::new(),
+            ownership: ownership.clone(),
+            user: format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                libc::getegid()
+            }),
+            workdir: Some("/workspace/primary".into()),
+            memory_limit: "2g".into(),
+            cpu_limit: "2".into(),
+            pids_limit: protocol::APPROVED_EXECUTION_PIDS_LIMIT,
+            read_only: true,
+            tmpfs: vec!["/tmp:rw,size=256m".into()],
+        };
+        let output = tokio::process::Command::new(&docker)
+            .args(plan.materialize_args()?)
+            .output()
+            .await;
+        let relay_cleanup = relay.stop().await;
+        let container_cleanup = agent_hub_executor::DockerCli::new(&docker)
+            .remove_owned(&container_name, &ownership, Duration::from_secs(15))
+            .await;
+        server.abort();
+        relay_cleanup?;
+        container_cleanup?;
+        effects.finalize()?;
+        let output = output?;
+        let opencode_log =
+            std::fs::read_to_string(workspace.join("opencode.log")).unwrap_or_default();
+        anyhow::ensure!(
+            output.status.success(),
+            "supervised OpenCode fixture failed: status={:?} stdout={:?} stderr={:?} log={opencode_log:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let fake_state = fake_state.lock().await;
+        anyhow::ensure!(
+            fake_state.registrations
+                == [
+                    "touch approved-marker".to_string(),
+                    "touch denied-marker".to_string(),
+                    "touch pending-marker".to_string(),
+                ],
+            "local Dippy allow unexpectedly reached the host relay: {:?}",
+            fake_state.registrations
+        );
+        anyhow::ensure!(
+            fake_state.cancellations == 1,
+            "pending approval was not cancelled"
+        );
+        anyhow::ensure!(
+            workspace.join("approved-marker").is_file()
+                && !workspace.join("denied-marker").exists()
+                && !workspace.join("pending-marker").exists(),
+            "supervised permission decisions did not control command execution"
+        );
+        drop(fake_state);
+        std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
     #[test]
     fn attended_network_selectors_have_exact_canonical_ceilings() {
         assert_eq!(selector_resources("none").unwrap(), []);
@@ -3758,6 +4360,8 @@ exit 0
                 exit_code: None,
                 error: None,
                 execution_status: None,
+                process_status: None,
+                permission_outcome: None,
             };
             store
                 .create_json(&super::run_record_path(&record.id), &record)

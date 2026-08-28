@@ -10,6 +10,12 @@ const binding = JSON.stringify({
   approval_bundle_digest: "e".repeat(64),
 })
 
+const readiness = {
+  AGENT_HUB_PLUGIN_READINESS_PATH: "/opencode/state/agent-hub/plugin-ready.json",
+  AGENT_HUB_PLUGIN_OUTCOME_PATH: "/opencode/state/agent-hub/permission-outcome.json",
+  AGENT_HUB_PLUGIN_RUN_NONCE: "f".repeat(32),
+}
+
 describe("attended socket approval transport", () => {
   test("passes only one complete immutable transport to the gateway", () => {
     const transport = approvalTransport({
@@ -17,6 +23,7 @@ describe("attended socket approval transport", () => {
       AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/approval/approval.sock",
       AGENT_HUB_ATTENDED_APPROVAL_BINDING: binding,
       AGENT_HUB_ATTENDED_RUN_DEADLINE: "2099-01-02T03:04:05Z",
+      ...readiness,
     })
     const invocation = gatewayApprovalInvocation(transport, {
       PATH: "/bin",
@@ -24,6 +31,7 @@ describe("attended socket approval transport", () => {
       AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/replaced.sock",
       AGENT_HUB_ATTENDED_APPROVAL_BINDING: "replaced",
       AGENT_HUB_ATTENDED_RUN_DEADLINE: "replaced",
+      ...readiness,
       AGENT_HUB_SERVER: "secret",
       AGENT_HUB_TOKEN: "secret",
     })
@@ -41,12 +49,14 @@ describe("attended socket approval transport", () => {
       AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "relative.sock",
       AGENT_HUB_ATTENDED_APPROVAL_BINDING: binding,
       AGENT_HUB_ATTENDED_RUN_DEADLINE: "2099-01-02T03:04:05Z",
+      ...readiness,
     })).toThrow()
     expect(() => approvalTransport({
       AGENT_HUB_APPROVAL_MODE: "attended_socket",
       AGENT_HUB_ATTENDED_APPROVAL_SOCKET: "/agent-hub/approval/approval.sock",
       AGENT_HUB_ATTENDED_APPROVAL_BINDING: binding,
       AGENT_HUB_ATTENDED_RUN_DEADLINE: "2099-01-02T03:04:05Z",
+      ...readiness,
       AGENT_HUB_TOKEN: "must-not-enter-sandbox",
     })).toThrow()
   })

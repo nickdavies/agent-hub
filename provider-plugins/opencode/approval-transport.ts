@@ -12,7 +12,15 @@ type AttendedBinding = Readonly<{
 }>
 
 export type ApprovalTransport = Readonly<
-  | { kind: "attended_socket"; socket: string; binding: string; deadline: string }
+  | {
+    kind: "attended_socket"
+    socket: string
+    binding: string
+    deadline: string
+    readinessPath: string
+    outcomePath: string
+    nonce: string
+  }
   | { kind: "http"; server: string; token?: string }
 >
 
@@ -20,6 +28,9 @@ const ATTENDED_KEYS = [
   "AGENT_HUB_ATTENDED_APPROVAL_SOCKET",
   "AGENT_HUB_ATTENDED_APPROVAL_BINDING",
   "AGENT_HUB_ATTENDED_RUN_DEADLINE",
+  "AGENT_HUB_PLUGIN_READINESS_PATH",
+  "AGENT_HUB_PLUGIN_OUTCOME_PATH",
+  "AGENT_HUB_PLUGIN_RUN_NONCE",
 ] as const
 
 const SECRET_KEYS = [
@@ -91,7 +102,27 @@ export function approvalTransport(env: ApprovalEnvironment): ApprovalTransport {
     if (!Number.isFinite(Date.parse(deadline)) || Date.parse(deadline) <= Date.now()) {
       throw new Error("AGENT_HUB_ATTENDED_RUN_DEADLINE must be a future RFC 3339 timestamp")
     }
-    return Object.freeze({ kind: "attended_socket" as const, socket, binding, deadline })
+    const readinessPath = required(env, "AGENT_HUB_PLUGIN_READINESS_PATH")
+    const outcomePath = required(env, "AGENT_HUB_PLUGIN_OUTCOME_PATH")
+    if (readinessPath !== "/opencode/state/agent-hub/plugin-ready.json") {
+      throw new Error("AGENT_HUB_PLUGIN_READINESS_PATH is not the trusted runtime path")
+    }
+    if (outcomePath !== "/opencode/state/agent-hub/permission-outcome.json") {
+      throw new Error("AGENT_HUB_PLUGIN_OUTCOME_PATH is not the trusted runtime path")
+    }
+    const nonce = required(env, "AGENT_HUB_PLUGIN_RUN_NONCE")
+    if (!/^[0-9a-f]{32}$/.test(nonce)) {
+      throw new Error("AGENT_HUB_PLUGIN_RUN_NONCE must be 32 lowercase hexadecimal characters")
+    }
+    return Object.freeze({
+      kind: "attended_socket" as const,
+      socket,
+      binding,
+      deadline,
+      readinessPath,
+      outcomePath,
+      nonce,
+    })
   }
   if (mode !== undefined) throw new Error(`unsupported AGENT_HUB_APPROVAL_MODE '${mode}'`)
   for (const name of ATTENDED_KEYS) {
