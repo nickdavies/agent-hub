@@ -740,12 +740,21 @@ pub async fn run(
         "job-code preflight failed: {}",
         String::from_utf8_lossy(&preflight.stderr).trim()
     );
-    config::validate_job_code_preflight_report(
-        &preflight.stdout,
-        &image_identity,
-        runtime_uid,
-        runtime_gid,
-    )
+    if request.proposal.tool_approval == ToolApprovalMode::Dippy {
+        config::validate_supervised_opencode_preflight_report(
+            &preflight.stdout,
+            &image_identity,
+            runtime_uid,
+            runtime_gid,
+        )
+    } else {
+        config::validate_job_code_preflight_report(
+            &preflight.stdout,
+            &image_identity,
+            runtime_uid,
+            runtime_gid,
+        )
+    }
     .map_err(anyhow::Error::msg)?;
     let runs_dir = run_dir.parent().context("run directory has no parent")?;
     if !runs_dir.exists() {
@@ -3647,7 +3656,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "requires AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION=1 and tester-managed Docker cleanup"]
+    #[ignore = "requires the attended OpenCode integration environment, a built plugin artifact, and tester-managed Docker cleanup"]
     async fn real_docker_supervised_opencode_routes_permissions() {
         run_real_docker_supervised_opencode_permissions()
             .await
@@ -3872,7 +3881,7 @@ exit 0
         use protocol::{
             Approval, ApprovalRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
         };
-        use std::collections::HashMap;
+        use std::collections::{HashMap, VecDeque};
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::sync::Mutex;
@@ -3892,6 +3901,12 @@ exit 0
             "AGENT_HUB_ATTENDED_OPENCODE_ROOT",
         )?))?;
         let expected_image_id = std::env::var("AGENT_HUB_ATTENDED_OPENCODE_IMAGE_ID")?;
+        let plugin_artifact = std::fs::canonicalize(PathBuf::from(std::env::var(
+            "AGENT_HUB_ATTENDED_OPENCODE_PLUGIN_ARTIFACT",
+        )?))?;
+        let gateway_artifact = std::fs::canonicalize(PathBuf::from(std::env::var(
+            "AGENT_HUB_ATTENDED_OPENCODE_GATEWAY_ARTIFACT",
+        )?))?;
         let deployment =
             config::validate_authoritative_config_root(&config_root).map_err(anyhow::Error::msg)?;
         let bundle = deployment
@@ -3931,6 +3946,10 @@ exit 0
         let cache_dir = root.join("cache");
         let workspace = root.join("workspace");
         bundle.write_to(&bundle_dir).map_err(anyhow::Error::msg)?;
+        std::fs::copy(
+            &plugin_artifact,
+            bundle_dir.join("approval/agent-hub-opencode-plugin.js"),
+        )?;
         for directory in [&data_dir, &state_dir, &cache_dir, &workspace] {
             std::fs::create_dir(directory)?;
             super::set_private_directory(directory)?;
@@ -3946,6 +3965,7 @@ exit 0
             approvals: HashMap<uuid::Uuid, Approval>,
             registrations: Vec<String>,
             cancellations: usize,
+            model_commands: VecDeque<String>,
         }
 
         async fn fake_server(listener: tokio::net::TcpListener, state: Arc<Mutex<FakeState>>) {
@@ -3979,7 +3999,106 @@ exit 0
                         return;
                     }
 
-                    let response = if request_line.starts_with("POST /api/v1/hooks/approval ") {
+                    let (content_type, response) = if request_line
+                        .starts_with("POST /v1/responses ")
+                    {
+                        let model_request: serde_json::Value = match serde_json::from_slice(&body) {
+                            Ok(request) => request,
+                            Err(_) => return,
+                        };
+                        let has_tool_output = model_request
+                            .get("input")
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|input| input.last())
+                            .and_then(|input| input.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("function_call_output");
+                        let has_tools = model_request
+                            .get("tools")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|tools| !tools.is_empty());
+                        let chunks = if has_tool_output || !has_tools {
+                            vec![
+                                serde_json::json!({
+                                    "type":"response.created",
+                                    "response":{"id":"response-complete","created_at":1787932800,"model":"gpt-5.2","service_tier":null}
+                                }),
+                                serde_json::json!({
+                                    "type":"response.output_item.added",
+                                    "output_index":0,
+                                    "item":{"type":"message","id":"item-complete","status":"in_progress","role":"assistant","content":[]}
+                                }),
+                                serde_json::json!({
+                                    "type":"response.content_part.added",
+                                    "item_id":"item-complete",
+                                    "output_index":0,
+                                    "content_index":0,
+                                    "part":{"type":"output_text","text":"","annotations":[]}
+                                }),
+                                serde_json::json!({
+                                    "type":"response.output_text.delta",
+                                    "item_id":"item-complete",
+                                    "output_index":0,
+                                    "content_index":0,
+                                    "delta":"done",
+                                    "logprobs":null
+                                }),
+                                serde_json::json!({
+                                    "type":"response.completed",
+                                    "response":{"incomplete_details":null,"usage":{"input_tokens":1,"output_tokens":1}}
+                                }),
+                            ]
+                        } else {
+                            let command = {
+                                let mut state = state.lock().await;
+                                let Some(command) = state.model_commands.pop_front() else {
+                                    return;
+                                };
+                                command
+                            };
+                            let item_id = format!("item-{}", uuid::Uuid::new_v4().simple());
+                            let call_id = format!("call-{}", uuid::Uuid::new_v4().simple());
+                            let arguments = serde_json::json!({"command":command}).to_string();
+                            vec![
+                                serde_json::json!({
+                                    "type":"response.created",
+                                    "response":{"id":format!("response-{}", uuid::Uuid::new_v4().simple()),"created_at":1787932800,"model":"gpt-5.2","service_tier":null}
+                                }),
+                                serde_json::json!({
+                                    "type":"response.output_item.added",
+                                    "output_index":0,
+                                    "item":{"type":"function_call","id":item_id,"call_id":call_id,"name":"bash","arguments":"","status":"in_progress"}
+                                }),
+                                serde_json::json!({
+                                    "type":"response.function_call_arguments.delta",
+                                    "item_id":item_id,
+                                    "output_index":0,
+                                    "delta":arguments
+                                }),
+                                serde_json::json!({
+                                    "type":"response.function_call_arguments.done",
+                                    "item_id":item_id,
+                                    "output_index":0,
+                                    "arguments":arguments
+                                }),
+                                serde_json::json!({
+                                    "type":"response.output_item.done",
+                                    "output_index":0,
+                                    "item":{"type":"function_call","id":item_id,"call_id":call_id,"name":"bash","arguments":arguments,"status":"completed"}
+                                }),
+                                serde_json::json!({
+                                    "type":"response.completed",
+                                    "response":{"status":"completed","incomplete_details":null,"output":[{"type":"function_call","id":item_id,"call_id":call_id,"name":"bash","arguments":arguments,"status":"completed"}],"usage":{"input_tokens":1,"input_tokens_details":null,"output_tokens":1,"output_tokens_details":null},"service_tier":null}
+                                }),
+                            ]
+                        };
+                        let mut response = chunks
+                            .into_iter()
+                            .map(|chunk| format!("data: {chunk}\n\n"))
+                            .collect::<String>();
+                        response.push_str("data: [DONE]\n\n");
+                        ("text/event-stream", response.into_bytes())
+                    } else if request_line.starts_with("POST /api/v1/hooks/approval ") {
                         let request: ApprovalRequest = match serde_json::from_slice(&body) {
                             Ok(request) => request,
                             Err(_) => return,
@@ -4018,7 +4137,10 @@ exit 0
                         let mut state = state.lock().await;
                         state.registrations.push(command);
                         state.approvals.insert(id, approval);
-                        serde_json::to_vec(&ApprovalResponse { id, status }).unwrap()
+                        (
+                            "application/json",
+                            serde_json::to_vec(&ApprovalResponse { id, status }).unwrap(),
+                        )
                     } else {
                         let path = request_line.split_whitespace().nth(1).unwrap_or_default();
                         let Some(id) = path
@@ -4039,16 +4161,19 @@ exit 0
                             return;
                         };
                         if path.ends_with("/wait") {
-                            serde_json::to_vec(&ApprovalWaitResponse {
-                                status: approval.status.clone(),
-                            })
-                            .unwrap()
+                            (
+                                "application/json",
+                                serde_json::to_vec(&ApprovalWaitResponse {
+                                    status: approval.status.clone(),
+                                })
+                                .unwrap(),
+                            )
                         } else {
-                            serde_json::to_vec(approval).unwrap()
+                            ("application/json", serde_json::to_vec(approval).unwrap())
                         }
                     };
                     let header = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         response.len()
                     );
                     let _ = stream.write_all(header.as_bytes()).await;
@@ -4057,10 +4182,33 @@ exit 0
             }
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let server_url = format!("http://{}", listener.local_addr()?);
-        let fake_state = Arc::new(Mutex::new(FakeState::default()));
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let server_port = listener.local_addr()?.port();
+        let server_url = format!("http://127.0.0.1:{server_port}");
+        let fake_state = Arc::new(Mutex::new(FakeState {
+            model_commands: VecDeque::from([
+                "git status".to_string(),
+                "touch approved-marker".to_string(),
+                "touch denied-marker".to_string(),
+                "touch pending-marker".to_string(),
+            ]),
+            ..FakeState::default()
+        }));
         let server = tokio::spawn(fake_server(listener, Arc::clone(&fake_state)));
+        let opencode_config_path = bundle_dir.join("opencode.json");
+        let mut opencode_config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&opencode_config_path)?)?;
+        opencode_config["model"] = serde_json::json!("openai/gpt-5.2");
+        opencode_config["small_model"] = serde_json::json!("openai/gpt-5.2");
+        opencode_config["provider"] = serde_json::json!({
+            "openai": {
+                "options": {
+                    "apiKey": "supervised-fixture-key",
+                    "baseURL": format!("http://host.docker.internal:{server_port}/v1")
+                }
+            }
+        });
+        std::fs::write(&opencode_config_path, serde_json::to_vec(&opencode_config)?)?;
         let run_epoch = uuid::Uuid::new_v4();
         let socket = host_relay_socket_location(run_epoch)?;
         let binding = protocol::AttendedGatewayBindingV1 {
@@ -4116,33 +4264,46 @@ test -z "${AGENT_HUB_APPROVALS_SERVER+x}"
 test -z "${AGENT_HUB_APPROVALS_TOKEN+x}"
 test -z "${OPENCODE_PURE+x}"
 test "$OPENCODE_DISABLE_DEFAULT_PLUGINS" = 1
-if ! /usr/local/bin/node -e 'import("file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js").then(module => { if (typeof module.default !== "function") throw new Error("bundled OpenCode plugin default export is not a function") })' 2> plugin-import.err; then
+if ! /usr/local/bin/node -e 'import("file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js").then(module => { if (module.default?.id !== "agent-hub" || typeof module.default?.server !== "function") throw new Error("bundled OpenCode plugin does not default export the required id/server module API") })' 2> plugin-import.err; then
   cat plugin-import.err >&2
   exit 1
 fi
-/usr/local/bin/opencode --print-logs --log-level DEBUG serve --hostname 127.0.0.1 --port 4097 > opencode.log 2>&1 &
+/usr/local/bin/opencode --print-logs --log-level DEBUG serve --hostname 0.0.0.0 --port 4097 > opencode.log 2>&1 &
 server=$!
+container_ip=$(hostname -i | cut -d' ' -f1)
+test -n "$container_ip"
+server_url="http://$container_ip:4097"
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
-  if curl -fsS http://127.0.0.1:4097/doc >/dev/null; then break; fi
+  if curl --max-time 2 -fsS "$server_url/global/health" >/dev/null; then break; fi
   if ! kill -0 "$server" 2>/dev/null; then
     wait "$server"
     exit $?
   fi
   sleep 1
 done
-session=$(curl -fsS -X POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:4097/api/session | jq -r '.data.id // .id')
-permission() {
+session=$(curl --max-time 20 -fsS -X POST -H 'content-type: application/json' -d '{}' "$server_url/session?directory=/workspace/primary" | jq -er '.id')
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if test -s /opencode/state/agent-hub/plugin-ready.json; then break; fi
+  if ! kill -0 "$server" 2>/dev/null; then
+    wait "$server"
+    exit $?
+  fi
+  sleep 1
+done
+test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
+request_bash() {
   command=$1
-  jq -cn --arg command "$command" '{action:"bash",resources:[$command],metadata:{command:$command}}' |
-    curl -fsS -X POST -H 'content-type: application/json' --data-binary @- "http://127.0.0.1:4097/api/session/$session/permission"
+  output=$2
+  jq -cn --arg command "$command" '{agent:"coder",model:{providerID:"openai",modelID:"gpt-5.2"},parts:[{type:"text",text:("Run exactly this Bash command and no other command: " + $command)}]}' |
+    curl --max-time 30 -sS -X POST -H 'content-type: application/json' --data-binary @- "$server_url/session/$session/message?directory=/workspace/primary" > "$output"
 }
-test "$(permission 'git status' | jq -r '.data.effect // .effect')" = allow
-git status > local-allow.log
-test "$(permission 'touch approved-marker' | jq -r '.data.effect // .effect')" = allow
-touch approved-marker
-test "$(permission 'touch denied-marker' | jq -r '.data.effect // .effect')" = deny
+request_bash 'git status' local-allow.json
+request_bash 'touch approved-marker' approved.json
+test -e approved-marker
+request_bash 'touch denied-marker' denied.json
 test ! -e denied-marker
-timeout 3 sh -c "jq -cn '{action:\"bash\",resources:[\"touch pending-marker\"],metadata:{command:\"touch pending-marker\"}}' | curl -fsS -X POST -H 'content-type: application/json' --data-binary @- http://127.0.0.1:4097/api/session/$session/permission" || true
+timeout 3 sh -c "jq -cn '{agent:\"coder\",model:{providerID:\"openai\",modelID:\"gpt-5.2\"},parts:[{type:\"text\",text:\"Run exactly this Bash command and no other command: touch pending-marker\"}]}' | curl -sS -X POST -H 'content-type: application/json' --data-binary @- '$server_url/session/$session/message?directory=/workspace/primary' > pending.json" || true
+kill -0 "$server"
 kill "$server"
 wait "$server" || true
 test ! -e pending-marker
@@ -4178,6 +4339,8 @@ test ! -e pending-marker
             "AGENT_HUB_PLUGIN_RUN_NONCE".into(),
             run_epoch.simple().to_string(),
         );
+        environment.insert("OPENAI_API_KEY".into(), "supervised-fixture-key".into());
+        environment.insert("AGENT_HUB_GATEWAY".into(), "/agent-hub/test-gateway".into());
         super::verify_host_only_approval_environment(&environment)?;
         let mounts = vec![
             agent_hub_executor::DockerMount::new(&bundle_dir, "/opencode/config/opencode", true)?,
@@ -4185,6 +4348,11 @@ test ! -e pending-marker
             agent_hub_executor::DockerMount::new(&state_dir, "/opencode/state", false)?,
             agent_hub_executor::DockerMount::new(&cache_dir, "/opencode/cache", false)?,
             agent_hub_executor::DockerMount::new(&workspace, "/workspace/primary", false)?,
+            agent_hub_executor::DockerMount::new(
+                &gateway_artifact,
+                "/agent-hub/test-gateway",
+                true,
+            )?,
             agent_hub_executor::DockerMount::new(
                 socket
                     .socket_path
@@ -4202,9 +4370,9 @@ test ! -e pending-marker
             command_args: vec!["-lc".into(), script.into()],
             mounts,
             environment,
-            network: agent_hub_executor::NetworkMode::None,
+            network: agent_hub_executor::NetworkMode::Unrestricted,
             dns: Vec::new(),
-            extra_hosts: Vec::new(),
+            extra_hosts: vec!["host.docker.internal:host-gateway".into()],
             ownership: ownership.clone(),
             user: format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
                 libc::getegid()

@@ -19,7 +19,7 @@
  *   { "plugin": ["file:///path/to/opencode-plugin"] }
  */
 
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
+import type { Hooks, Plugin, PluginInput, PluginModule } from "@opencode-ai/plugin"
 import type { Event as EventV2, PermissionRequest } from "@opencode-ai/sdk/v2"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import path from "path"
@@ -88,19 +88,6 @@ function recordPermissionDenied(reason?: string) {
     reason: reason?.slice(0, 1024) ?? null,
   }, true)
 }
-
-// ---------------------------------------------------------------------------
-// Hook output type — extracted from Hooks["permission.ask"] so `apply()`
-// stays in sync with the SDK definition automatically.
-// ---------------------------------------------------------------------------
-
-// The published @opencode-ai/plugin types the hook output as { status },
-// but opencode's runtime also reads `message?: string` from the output
-// (see opencode/packages/opencode/src/permission/index.ts).  Extend the
-// SDK-derived type until the published types catch up.
-type PermissionOutputBase = NonNullable<Hooks["permission.ask"]> extends
-  (input: any, output: infer O) => any ? O : never
-type PermissionOutput = PermissionOutputBase & { message?: string }
 
 // ---------------------------------------------------------------------------
 // Minimal structured logger — writes to the same dev.log opencode uses.
@@ -210,8 +197,14 @@ function onExit() {
   registeredSessions.clear()
 }
 process.on("exit", onExit)
-process.on("SIGINT", onExit)
-process.on("SIGTERM", onExit)
+process.on("SIGINT", () => {
+  onExit()
+  process.exit(130)
+})
+process.on("SIGTERM", () => {
+  onExit()
+  process.exit(143)
+})
 
 function reportStatus(
   sid: string,
@@ -565,16 +558,6 @@ function validatePluginDirectory(directory: string) {
   if (directory.length === 0) throw new Error("Plugin directory must not be empty")
   if (!path.isAbsolute(directory)) throw new Error("Plugin directory must be absolute")
 }
-
-// Apply a GatewayResult to the hook output object.
-function apply(r: GatewayResult, output: PermissionOutput) {
-  output.status = r.allowed ? "allow" : "deny"
-  if (!r.allowed) {
-    recordPermissionDenied(r.reason ?? undefined)
-    if (r.reason) output.message = r.reason
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Session title cache — avoids repeated SDK calls for the same session.
 // Stores the LLM-generated title once it's available; null means we haven't
@@ -630,8 +613,7 @@ async function fetchTitle(
 
 export const id = "agent-hub"
 
-const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
-  initializeRunEvidence()
+export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const client = input.client
   const { directory, worktree } = input
   validatePluginDirectory(directory)
@@ -644,6 +626,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   // to input.serverUrl would fail with ECONNREFUSED.
   const inProcessFetch: typeof fetch | undefined =
     (input.client as any)?._client?.getConfig?.()?.fetch
+  if (APPROVAL_TRANSPORT.kind === "attended_socket" && !inProcessFetch) {
+    throw new Error("OpenCode runtime does not expose the in-process SDK transport required for supervised permissions")
+  }
   log("INFO", "init clientV2", {
     serverUrl: input.serverUrl.toString(),
     hasInProcessFetch: String(!!inProcessFetch),
@@ -652,56 +637,72 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     baseUrl: input.serverUrl.toString(),
     ...(inProcessFetch ? { fetch: inProcessFetch } : {}),
   })
+  initializeRunEvidence()
 
-  return {
-    "permission.ask": async (_info, output) => {
-      // The published @opencode-ai/plugin types permission.ask input as the
-      // v1 Permission type, but opencode actually sends v2 PermissionRequest
-      // at runtime (with `permission`/`patterns` instead of `type`/`pattern`).
-      // This cast is safe and necessary until the published types catch up.
-      const info = _info as unknown as PermissionRequest
-      log("INFO", "permission.ask handler entered", { permission: info.permission ?? "?" })
-      const sid = info.sessionID
+  async function routePermission(info: PermissionRequest) {
+    log("INFO", "permission.asked handler entered", { permission: info.permission ?? "?", requestId: info.id })
+    const sid = info.sessionID
 
-      // First tool call for this session — immediately register it on the
-      // server so it shows up in the session list right away, rather than
-      // waiting for a debounced session.status event or an approval escalation.
-      if (!registeredSessions.has(sid)) {
-        registeredSessions.add(sid)
-        spawnStatusReport(sid, "active")
-      }
+    if (!registeredSessions.has(sid)) {
+      registeredSessions.add(sid)
+      spawnStatusReport(sid, "active")
+    }
 
-      log("INFO", "about to call fetchTitle", { sid, permission: info.permission })
-      const title = await fetchTitle(client, sid, directory)
-      log("INFO", "fetchTitle returned", { sid, title: title ?? "(none)" })
-      let requests
-      try {
-        requests = normalizePermission(info, directory, worktree)
-      } catch (error) {
-        log("ERROR", "permission normalization failed closed", { err: String(error) })
-        recordPermissionDenied(String(error))
-        output.status = "deny"
-        Object.assign(output, { message: String(error) })
+    const title = await fetchTitle(client, sid, directory)
+    let requests
+    try {
+      requests = normalizePermission(info, directory, worktree)
+    } catch (error) {
+      const reason = String(error)
+      log("ERROR", "permission normalization failed closed", { err: reason })
+      recordPermissionDenied(reason)
+      const reply = await clientV2.permission.reply({
+        requestID: info.id,
+        directory,
+        reply: "reject",
+        message: reason,
+      })
+      if (reply.error) throw new Error(`OpenCode permission reply failed: ${JSON.stringify(reply.error)}`)
+      return
+    }
+
+    for (const request of requests) {
+      const result = await callGateway(
+        sid,
+        makePayload(sid, request.tool, request.toolInput, directory, worktree, title),
+      )
+      if (!result.allowed) {
+        recordPermissionDenied(result.reason ?? undefined)
+        const reply = await clientV2.permission.reply({
+          requestID: info.id,
+          directory,
+          reply: "reject",
+          message: result.reason ?? undefined,
+        })
+        if (reply.error) throw new Error(`OpenCode permission reply failed: ${JSON.stringify(reply.error)}`)
         return
       }
-      for (const request of requests) {
-        const result = await callGateway(
-          sid,
-          makePayload(sid, request.tool, request.toolInput, directory, worktree, title),
-        )
-        if (!result.allowed) {
-          apply(result, output)
-          return
-        }
-      }
-      output.status = "allow"
-    },
+    }
 
+    const reply = await clientV2.permission.reply({
+      requestID: info.id,
+      directory,
+      reply: "once",
+    })
+    if (reply.error) throw new Error(`OpenCode permission reply failed: ${JSON.stringify(reply.error)}`)
+  }
+
+  return {
     event: async ({ event: _event }) => {
       // The published @opencode-ai/plugin types the event hook using the v1
       // SDK Event union, which doesn't include question.* variants. Cast to
       // the v2 Event type which does; the v2 bus is what fires at runtime.
       const event = _event as unknown as EventV2
+
+      if (event.type === "permission.asked") {
+        await routePermission(event.properties)
+        return
+      }
 
       // session.status — map opencode statuses to agent-hub statuses
       if (event.type === "session.status") {
@@ -862,4 +863,4 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   }
 }
 
-export default server
+export default { id, server } satisfies PluginModule

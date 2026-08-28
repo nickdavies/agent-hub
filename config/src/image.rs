@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 pub const JOB_CODE_PREFLIGHT_PATH: &str = "/usr/local/bin/agent-hub-job-code-preflight";
 pub const JOB_CODE_TOOL_MANIFEST_PATH: &str =
     "/usr/local/share/agent-hub/job-code-tool-manifest.json";
+pub const SUPERVISED_OPENCODE_VERSION: &str = "1.18.18";
 
 pub fn job_code_tool_manifest_sha256(contents: &str) -> String {
     hex::encode(Sha256::digest(contents.as_bytes()))
@@ -90,6 +91,29 @@ pub fn validate_job_code_preflight_report(
 
     serde_json::from_slice(bytes)
         .map_err(|error| format!("preflight returned invalid JSON: {error}"))
+}
+
+pub fn validate_supervised_opencode_preflight_report(
+    bytes: &[u8],
+    expected_image: &str,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<serde_json::Value, String> {
+    let report =
+        validate_job_code_preflight_report(bytes, expected_image, expected_uid, expected_gid)?;
+    let contents = report
+        .pointer("/manifest/contents")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "preflight report has no tool manifest contents".to_string())?;
+    let manifest: JobCodeToolManifest = serde_json::from_str(contents)
+        .map_err(|error| format!("preflight returned an invalid tool manifest: {error}"))?;
+    if manifest.tools.opencode != SUPERVISED_OPENCODE_VERSION {
+        return Err(format!(
+            "supervised OpenCode requires runtime {SUPERVISED_OPENCODE_VERSION} with permission.asked and permission reply API support, got {}",
+            manifest.tools.opencode
+        ));
+    }
+    Ok(report)
 }
 
 fn is_sha256_identity(value: &str) -> bool {
@@ -661,6 +685,34 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         );
     }
 
+    #[test]
+    fn supervised_opencode_preflight_requires_compatible_runtime() {
+        let valid = valid_preflight_report();
+        validate_supervised_opencode_preflight_report(
+            &serde_json::to_vec(&valid).unwrap(),
+            &format!("sha256:{}", "a".repeat(64)),
+            1000,
+            1001,
+        )
+        .unwrap();
+
+        let mut incompatible = valid;
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(incompatible["manifest"]["contents"].as_str().unwrap()).unwrap();
+        manifest["tools"]["opencode"] = serde_json::json!("1.18.17");
+        set_manifest(&mut incompatible, &manifest);
+        assert!(
+            validate_supervised_opencode_preflight_report(
+                &serde_json::to_vec(&incompatible).unwrap(),
+                &format!("sha256:{}", "a".repeat(64)),
+                1000,
+                1001,
+            )
+            .unwrap_err()
+            .contains("permission.asked")
+        );
+    }
+
     fn valid_preflight_report() -> serde_json::Value {
         let tool_names = [
             "agent_hub_gateway",
@@ -692,7 +744,14 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         ];
         let tools = tool_names
             .into_iter()
-            .map(|name| (name.to_string(), serde_json::json!(format!("{name} 1.0"))))
+            .map(|name| {
+                let version = if name == "opencode" {
+                    SUPERVISED_OPENCODE_VERSION.to_string()
+                } else {
+                    format!("{name} 1.0")
+                };
+                (name.to_string(), serde_json::json!(version))
+            })
             .collect::<serde_json::Map<_, _>>();
         let source_names = [
             "agent_hub",

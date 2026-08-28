@@ -13,9 +13,8 @@ review escalates to the agent-hub server.
   workspace)
 - An `agent-hub-server` instance running (only needed for `ask`-escalated
   decisions; local allow/deny work without it)
-- opencode with the `permission.ask` plugin hook (the fix is in the
-  `feat(permission): add permission.ask plugin hook` commit in the `opencode/`
-  subdir of this workspace)
+- opencode 1.18.18, whose `permission.asked` event and permission reply API are
+  the runtime permission integration used by this plugin
 
 ## Installation
 
@@ -140,6 +139,8 @@ Add the plugin to your project or global opencode config. The config file is
 
 The path must be absolute and point to the `opencode-plugin/` directory in
 this workspace (the one that contains `package.json` and `agent-hub.ts`).
+Bundled single-file artifacts must preserve the default `{ id, server }`
+export required by OpenCode's v1 plugin module loader.
 
 ### 5. Verify
 
@@ -152,11 +153,11 @@ without showing its own approval prompt.
 ## How it works
 
 ```
-opencode permission.ask hook
+opencode permission.asked event
   └─ plugin calls agent-hub-gateway --opencode (once per pattern)
         └─ gateway loads ~/.config/agent-hub/agent-hub-permissions.json
-              Allow  → plugin sets output.status = "allow"  (no prompt shown)
-              Deny   → plugin sets output.status = "deny"   (LLM gets reason)
+              Allow  → plugin replies "once" through the OpenCode API
+              Deny   → plugin replies "reject" through the OpenCode API
               Delegate(dippy) → Dippy allow/deny → same as above
                                 Dippy ask        → gateway escalates to server
               Ask    → gateway long-polls server → allow/deny → same as above
@@ -183,10 +184,7 @@ Unknown permissions fall through to the `default` action in
 
 ## Caveats
 
-- **Blocking**: opencode currently shows its own approval UI before the plugin
-  hook fires (`inline_approval = false` in the plan). Once the upstream race
-  condition fix lands and is merged, the plugin hook runs first and the UI is
-  skipped entirely. Until then, the hook still fires and its decision is
-  respected — it just races with the UI.
+- **Reply race**: the plugin and an attached OpenCode UI can both reply to the
+  same request. Supervised headless runs do not attach an OpenCode approval UI.
 - **Multiple patterns**: the plugin calls the gateway once per pattern in the
   `patterns` array. The first denied pattern stops evaluation immediately.

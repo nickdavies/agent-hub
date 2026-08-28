@@ -28,8 +28,33 @@ impl From<&ToolHookEvent> for protocol::DelegatePayload {
             tool: event.tool_call.tool(),
             tool_input: event.tool_call.raw_input().clone(),
             cwd: event.cwd.clone(),
-            hook_event_name: event.hook_event_name.clone(),
+            hook_event_name: "PreToolUse".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{SessionId, Tool, ToolCall};
+
+    #[test]
+    fn delegate_payload_uses_claude_pre_tool_use_wire_event() {
+        let event = ToolHookEvent {
+            session_id: SessionId::new("session"),
+            session_display_name: "session".to_string(),
+            tool_call: ToolCall::try_from((
+                Tool::Bash,
+                serde_json::json!({"command":"git status"}),
+            ))
+            .unwrap(),
+            cwd: "/workspace".to_string(),
+            workspace_roots: vec!["/workspace".to_string()],
+            hook_event_name: "permission.ask".to_string(),
+        };
+
+        let payload = protocol::DelegatePayload::from(&event);
+        assert_eq!(payload.hook_event_name, "PreToolUse");
     }
 }
 
