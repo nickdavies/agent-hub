@@ -28,7 +28,10 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::attended_relay::{AttendedRelay, AttendedRelayConfig, recover_attended_relay};
+use crate::attended_relay::{
+    AttendedRelay, AttendedRelayConfig, RelaySocketLocation, host_relay_socket_location,
+    recover_attended_relay,
+};
 use crate::local::{
     ApprovedRoots, RequestedContextRoot, RequestedWorkspace, ResolvedMounts, resolve_mounts,
 };
@@ -97,6 +100,7 @@ struct RelayEpochState {
     binding: protocol::AttendedGatewayBindingV1,
     deadline: DateTime<Utc>,
     endpoint: RelayEndpointIdentity,
+    socket: RelaySocketLocation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -760,7 +764,6 @@ pub async fn run(
         let state_dir = run_dir.join("state");
         let cache_dir = run_dir.join("cache");
         let project_config_mask_dir = run_dir.join("project-config-mask");
-        let approval_relay_dir = run_dir.join("approval-relay");
         let prompt_path = run_dir.join("prompt.txt");
         write_private_durable(&prompt_path, request.proposal.prompt.as_bytes())?;
         let deployment =
@@ -776,7 +779,6 @@ pub async fn run(
             &state_dir,
             &cache_dir,
             &project_config_mask_dir,
-            &approval_relay_dir,
         ] {
             std::fs::create_dir(directory)?;
             set_private_directory(directory)?;
@@ -800,6 +802,7 @@ pub async fn run(
         let operation = async {
         if request.proposal.tool_approval == ToolApprovalMode::Dippy {
             let run_epoch = uuid::Uuid::new_v4();
+            let relay_socket = host_relay_socket_location(run_epoch)?;
             let network_digest = protocol::attended_network_digest(&serde_json::json!({
                 "class": request.proposal.network_class,
                 "resources": request.proposal.network_resources,
@@ -824,11 +827,12 @@ pub async fn run(
                     binding: binding.clone(),
                     deadline: run_deadline,
                     endpoint,
+                    socket: relay_socket.clone(),
                 })?,
             )?;
             attended_relay = Some(AttendedRelay::start(
                 AttendedRelayConfig {
-                    socket_path: approval_relay_dir.join("approval.sock"),
+                    socket_path: relay_socket.socket_path,
                     binding: binding.clone(),
                     approval_bundle: request
                         .approval_bundle
@@ -1697,9 +1701,9 @@ async fn recover_owned_run_resources(
     if let Some(effects) = &effects {
         let result = match relay_endpoint {
             Some(endpoint) => {
-                verify_recovery_relay_endpoint(run_dir, endpoint)?;
+                let relay_state = verify_recovery_relay_endpoint(run_dir, endpoint)?;
                 recover_attended_relay(
-                    &run_dir.join("approval-relay/approval.sock"),
+                    &relay_state.socket.socket_path,
                     &endpoint.server_url,
                     endpoint.token.as_ref(),
                     effects,
@@ -1746,7 +1750,10 @@ async fn recover_owned_run_resources(
     Ok(())
 }
 
-fn verify_recovery_relay_endpoint(run_dir: &Path, supplied: &RelayEndpoint) -> anyhow::Result<()> {
+fn verify_recovery_relay_endpoint(
+    run_dir: &Path,
+    supplied: &RelayEndpoint,
+) -> anyhow::Result<RelayEpochState> {
     let state: RelayEpochState = serde_json::from_slice(
         &std::fs::read(run_dir.join("approval-relay-epoch.json"))
             .context("attended relay endpoint state is missing")?,
@@ -1756,7 +1763,15 @@ fn verify_recovery_relay_endpoint(run_dir: &Path, supplied: &RelayEndpoint) -> a
         state.endpoint == relay_endpoint_identity(&supplied.server_url, supplied.token.is_some())?,
         "supplied approval endpoint does not match the attended run"
     );
-    Ok(())
+    ensure!(
+        state.socket == host_relay_socket_location(state.run_epoch)?,
+        "persisted attended relay socket location is invalid"
+    );
+    ensure!(
+        state.binding.run_epoch == state.run_epoch.to_string(),
+        "persisted attended relay epoch is inconsistent"
+    );
+    Ok(state)
 }
 
 fn verify_execution_inputs(request: &AttendedAuthorizationRequestV2) -> anyhow::Result<()> {
@@ -3397,8 +3412,9 @@ mod tests {
             server_url: "https://approvals.example/base".into(),
             token: Some(protocol::Secret::new("host-only-secret")),
         };
+        let run_epoch = uuid::Uuid::new_v4();
         let binding = protocol::AttendedGatewayBindingV1 {
-            run_epoch: uuid::Uuid::new_v4().to_string(),
+            run_epoch: run_epoch.to_string(),
             authorization_digest: "a".repeat(64),
             environment_bundle_digest: "b".repeat(64),
             image_digest: format!("sha256:{}", "c".repeat(64)),
@@ -3406,11 +3422,12 @@ mod tests {
             approval_bundle_digest: "e".repeat(64),
         };
         let state = RelayEpochState {
-            run_epoch: uuid::Uuid::parse_str(&binding.run_epoch).unwrap(),
+            run_epoch,
             binding,
             deadline: Utc::now() + chrono::Duration::minutes(1),
             endpoint: super::relay_endpoint_identity("https://approvals.example/base", true)
                 .unwrap(),
+            socket: super::host_relay_socket_location(run_epoch).unwrap(),
         };
         let bytes = serde_json::to_vec(&state).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("host-only-secret"));

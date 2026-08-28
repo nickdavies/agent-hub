@@ -27,6 +27,19 @@ const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_SLICE: Duration = Duration::from_secs(60);
 const CANCELLATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(target_os = "linux")]
+const UNIX_SOCKET_PATH_CAPACITY: usize = 108;
+#[cfg(target_os = "linux")]
+const MAX_RELAY_SOCKET_PATH_BYTES: usize =
+    "/run/user/".len() + 10 + "/agent-hub/".len() + 36 + "/approval.sock".len();
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RelaySocketLocation {
+    pub runtime_dir: PathBuf,
+    pub socket_root: PathBuf,
+    pub socket_path: PathBuf,
+}
 
 #[derive(Clone)]
 pub(crate) struct AttendedRelayConfig {
@@ -42,6 +55,13 @@ pub(crate) struct AttendedRelayConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SocketIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectoryIdentity {
     device: u64,
     inode: u64,
     uid: u32,
@@ -86,9 +106,88 @@ struct ApprovalStateEffect {
 pub(crate) struct AttendedRelay {
     pub(crate) socket_path: PathBuf,
     identity: SocketIdentity,
+    socket_root: PathBuf,
+    root_identity: DirectoryIdentity,
     shutdown: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     runtime: RelayRuntime,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn host_relay_socket_location(run_epoch: Uuid) -> anyhow::Result<RelaySocketLocation> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    ensure!(
+        MAX_RELAY_SOCKET_PATH_BYTES < UNIX_SOCKET_PATH_CAPACITY,
+        "maximum attended relay socket path exceeds sockaddr_un.sun_path"
+    );
+    let uid = unsafe { libc::geteuid() };
+    let expected = PathBuf::from(format!("/run/user/{uid}"));
+    if let Some(configured) = std::env::var_os("XDG_RUNTIME_DIR") {
+        ensure!(
+            Path::new(&configured) == expected,
+            "XDG_RUNTIME_DIR is not the owner runtime directory"
+        );
+    }
+    verify_runtime_directory(&expected, uid)?;
+    let socket_root = expected.join("agent-hub").join(run_epoch.to_string());
+    let socket_path = socket_root.join("approval.sock");
+    ensure!(
+        socket_path.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_CAPACITY,
+        "attended relay socket path exceeds sockaddr_un.sun_path"
+    );
+    Ok(RelaySocketLocation {
+        runtime_dir: expected,
+        socket_root,
+        socket_path,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn host_relay_socket_location(_run_epoch: Uuid) -> anyhow::Result<RelaySocketLocation> {
+    anyhow::bail!("secure attended relay runtime directories require Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn verify_runtime_directory(path: &Path, expected_uid: u32) -> anyhow::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect owner runtime directory {}", path.display()))?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "owner runtime directory is not a real directory"
+    );
+    ensure!(
+        std::fs::canonicalize(path)? == path,
+        "owner runtime directory is not canonical"
+    );
+    ensure!(
+        metadata.uid() == expected_uid,
+        "owner runtime directory owner mismatch"
+    );
+    ensure!(
+        metadata.permissions().mode() & 0o777 == 0o700,
+        "owner runtime directory mode is not 0700"
+    );
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::statfs(path.as_ptr(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("inspect owner runtime filesystem");
+    }
+    let filesystem = unsafe { filesystem.assume_init() };
+    ensure!(
+        filesystem.f_type as libc::c_long == libc::TMPFS_MAGIC as libc::c_long,
+        "owner runtime directory is not on a runtime tmpfs"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_runtime_directory(_path: &Path, _expected_uid: u32) -> anyhow::Result<()> {
+    anyhow::bail!("secure attended relay runtime directories require Linux")
 }
 
 impl AttendedRelay {
@@ -107,23 +206,26 @@ impl AttendedRelay {
             config.socket_path.is_absolute(),
             "approval relay socket path is not absolute"
         );
+        verify_socket_path_length(&config.socket_path)?;
+        let socket_root = config
+            .socket_path
+            .parent()
+            .context("approval relay socket has no parent")?
+            .to_path_buf();
+        let root_identity = prepare_socket_root(&socket_root, effects)?;
         verify_socket_parent(&config.socket_path)?;
-        ensure!(
-            std::fs::symlink_metadata(&config.socket_path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-            "approval relay socket path already exists"
-        );
-        let bind = effects.begin_external_operation(
-            "attended_relay_socket_bind",
-            &config.socket_path.to_string_lossy(),
-        )?;
-        let listener = UnixListener::bind(&config.socket_path).with_context(|| {
-            format!(
-                "bind approval relay socket {}",
-                config.socket_path.display()
-            )
-        })?;
-        bind.completed()?;
+        let listener = match bind_listener(&config.socket_path, effects) {
+            Ok(listener) => listener,
+            Err(error) => {
+                if std::fs::symlink_metadata(&config.socket_path)
+                    .is_err_and(|inspect| inspect.kind() == std::io::ErrorKind::NotFound)
+                {
+                    remove_socket_root(&socket_root, Some(root_identity), effects)?;
+                }
+                return Err(error);
+            }
+        };
+        let bound_identity = socket_identity(&config.socket_path)?;
         let chmod = effects.begin_external_operation(
             "attended_relay_socket_chmod",
             &config.socket_path.to_string_lossy(),
@@ -131,7 +233,16 @@ impl AttendedRelay {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
+            if let Err(error) = std::fs::set_permissions(
+                &config.socket_path,
+                std::fs::Permissions::from_mode(0o600),
+            ) {
+                drop(listener);
+                remove_socket_if_exact(&config.socket_path, bound_identity, effects)?;
+                chmod.reconciled()?;
+                remove_socket_root(&socket_root, Some(root_identity), effects)?;
+                return Err(error).context("set approval relay socket permissions");
+            }
         }
         chmod.completed()?;
         let identity = verify_socket(&config.socket_path, None)?;
@@ -164,6 +275,8 @@ impl AttendedRelay {
         Ok(Self {
             socket_path: config.socket_path,
             identity,
+            socket_root,
+            root_identity,
             shutdown,
             task: Some(task),
             runtime,
@@ -205,7 +318,14 @@ impl AttendedRelay {
         .await
         .context("pending approval cancellation drain timed out")
         .and_then(|result| result);
-        let socket_result = remove_socket(&self.socket_path, self.identity, &self.runtime.effects);
+        let socket_result = remove_socket(&self.socket_path, self.identity, &self.runtime.effects)
+            .and_then(|()| {
+                remove_socket_root(
+                    &self.socket_root,
+                    Some(self.root_identity),
+                    &self.runtime.effects,
+                )
+            });
         let mut failures = Vec::new();
         for (label, result) in [
             ("listener", task_result),
@@ -222,6 +342,46 @@ impl AttendedRelay {
             failures.join("; ")
         );
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_socket_path_length(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    ensure!(
+        path.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_CAPACITY,
+        "attended relay socket path exceeds sockaddr_un.sun_path"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_socket_path_length(_path: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("secure attended relay socket paths require Linux")
+}
+
+fn bind_listener(
+    path: &Path,
+    effects: &ExecutionCancellationContext,
+) -> anyhow::Result<UnixListener> {
+    let bind =
+        effects.begin_external_operation("attended_relay_socket_bind", &path.to_string_lossy())?;
+    match UnixListener::bind(path) {
+        Ok(listener) => {
+            bind.completed()?;
+            Ok(listener)
+        }
+        Err(error) => {
+            let absence = std::fs::symlink_metadata(path)
+                .is_err_and(|inspect| inspect.kind() == std::io::ErrorKind::NotFound);
+            if absence || error.kind() == std::io::ErrorKind::AddrInUse {
+                bind.reconciled()?;
+            } else {
+                bind.ambiguous("attended_relay_bind_outcome_unknown")?;
+            }
+            Err(error).with_context(|| format!("bind approval relay socket {}", path.display()))
+        }
     }
 }
 
@@ -335,12 +495,29 @@ pub(crate) fn recover_attended_relay_socket(
     socket_path: &Path,
     effects: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
+    let socket_resource = socket_path.to_string_lossy();
+    let socket_owned = [
+        "attended_relay_socket_bind",
+        "attended_relay_socket_chmod",
+        "attended_relay_socket_remove",
+    ]
+    .into_iter()
+    .any(|kind| {
+        effects
+            .unresolved_operation_resources(kind)
+            .iter()
+            .any(|resource| resource == socket_resource.as_ref())
+    });
     match std::fs::symlink_metadata(socket_path) {
         Ok(_) => {
-            verify_socket(socket_path, None)?;
+            ensure!(
+                socket_owned,
+                "approval relay socket has no run-owned effect"
+            );
+            socket_identity(socket_path)?;
             let remove = effects.begin_external_operation(
                 "attended_relay_socket_recovery_remove",
-                &socket_path.to_string_lossy(),
+                &socket_resource,
             )?;
             std::fs::remove_file(socket_path)?;
             remove.completed()?;
@@ -359,8 +536,31 @@ pub(crate) fn recover_attended_relay_socket(
         "attended_relay_socket_remove",
         "attended_relay_socket_recovery_remove",
     ] {
-        effects.reconcile_operation_kind_resource(kind, &socket_path.to_string_lossy())?;
+        effects.reconcile_operation_kind_resource(kind, &socket_resource)?;
     }
+    let socket_root = socket_path
+        .parent()
+        .context("approval relay socket has no parent")?;
+    let root_resource = socket_root.to_string_lossy();
+    let root_owned = effects
+        .unresolved_operation_resources("attended_relay_socket_root_create")
+        .iter()
+        .any(|resource| resource == root_resource.as_ref());
+    match std::fs::symlink_metadata(socket_root) {
+        Ok(_) if root_owned => {
+            verify_private_directory(socket_root, None)?;
+            let remove = effects.begin_external_operation(
+                "attended_relay_socket_root_recovery_remove",
+                &root_resource,
+            )?;
+            std::fs::remove_dir(socket_root)?;
+            remove.completed()?;
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    remove_socket_root(socket_root, None, effects)?;
     Ok(())
 }
 
@@ -1038,6 +1238,188 @@ fn remove_socket(
     Ok(())
 }
 
+fn remove_socket_if_exact(
+    path: &Path,
+    identity: SocketIdentity,
+    effects: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => remove_socket(path, identity, effects),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for kind in [
+                "attended_relay_socket_bind",
+                "attended_relay_socket_chmod",
+                "attended_relay_socket_remove",
+            ] {
+                effects.reconcile_operation_kind_resource(kind, &path.to_string_lossy())?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn prepare_socket_root(
+    socket_root: &Path,
+    effects: &ExecutionCancellationContext,
+) -> anyhow::Result<DirectoryIdentity> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    let runtime_parent = socket_root
+        .parent()
+        .context("approval relay socket root has no Agent Hub parent")?;
+    let runtime_dir = runtime_parent
+        .parent()
+        .context("approval relay Agent Hub directory has no runtime parent")?;
+    verify_runtime_directory(runtime_dir, unsafe { libc::geteuid() })?;
+    ensure!(
+        runtime_parent
+            .file_name()
+            .is_some_and(|name| name == "agent-hub"),
+        "approval relay socket root is outside the Agent Hub runtime directory"
+    );
+    if std::fs::symlink_metadata(runtime_parent)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        let create = effects.begin_external_operation(
+            "attended_relay_runtime_parent_create",
+            &runtime_parent.to_string_lossy(),
+        )?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(runtime_parent) {
+            Ok(()) => create.completed()?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                create.reconciled()?
+            }
+            Err(error) => {
+                if std::fs::symlink_metadata(runtime_parent)
+                    .is_err_and(|inspect| inspect.kind() == std::io::ErrorKind::NotFound)
+                {
+                    create.reconciled()?;
+                }
+                return Err(error).context("create Agent Hub runtime directory");
+            }
+        }
+    }
+    verify_private_directory(runtime_parent, None)?;
+    effects.reconcile_operation_kind_resource(
+        "attended_relay_runtime_parent_create",
+        &runtime_parent.to_string_lossy(),
+    )?;
+    ensure!(
+        std::fs::symlink_metadata(socket_root)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "approval relay socket root already exists"
+    );
+    let create = effects.begin_external_operation(
+        "attended_relay_socket_root_create",
+        &socket_root.to_string_lossy(),
+    )?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    if let Err(error) = builder.create(socket_root) {
+        if std::fs::symlink_metadata(socket_root)
+            .is_err_and(|inspect| inspect.kind() == std::io::ErrorKind::NotFound)
+        {
+            create.reconciled()?;
+        }
+        return Err(error).context("create attended relay socket root");
+    }
+    std::fs::set_permissions(socket_root, std::fs::Permissions::from_mode(0o700))?;
+    let identity = verify_private_directory(socket_root, None)?;
+    create.completed()?;
+    Ok(identity)
+}
+
+#[cfg(not(unix))]
+fn prepare_socket_root(
+    _socket_root: &Path,
+    _effects: &ExecutionCancellationContext,
+) -> anyhow::Result<DirectoryIdentity> {
+    anyhow::bail!("attended approval relay requires Unix directories")
+}
+
+fn remove_socket_root(
+    socket_root: &Path,
+    expected: Option<DirectoryIdentity>,
+    effects: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(socket_root) {
+        Ok(_) => {
+            verify_private_directory(socket_root, expected)?;
+            let remove = effects.begin_external_operation(
+                "attended_relay_socket_root_remove",
+                &socket_root.to_string_lossy(),
+            )?;
+            std::fs::remove_dir(socket_root)?;
+            remove.completed()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    ensure!(
+        std::fs::symlink_metadata(socket_root)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "approval relay socket root remains after cleanup"
+    );
+    for kind in [
+        "attended_relay_socket_root_create",
+        "attended_relay_socket_root_remove",
+        "attended_relay_socket_root_recovery_remove",
+    ] {
+        effects.reconcile_operation_kind_resource(kind, &socket_root.to_string_lossy())?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_private_directory(
+    path: &Path,
+    expected: Option<DirectoryIdentity>,
+) -> anyhow::Result<DirectoryIdentity> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "approval relay runtime path is not a real directory"
+    );
+    ensure!(
+        std::fs::canonicalize(path)? == path,
+        "approval relay runtime path is not canonical"
+    );
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "approval relay runtime path owner mismatch"
+    );
+    ensure!(
+        metadata.permissions().mode() & 0o777 == 0o700,
+        "approval relay runtime path mode is not 0700"
+    );
+    let identity = DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+    };
+    if let Some(expected) = expected {
+        ensure!(
+            identity == expected,
+            "approval relay socket root inode changed"
+        );
+    }
+    Ok(identity)
+}
+
+#[cfg(not(unix))]
+fn verify_private_directory(
+    _path: &Path,
+    _expected: Option<DirectoryIdentity>,
+) -> anyhow::Result<DirectoryIdentity> {
+    anyhow::bail!("attended approval relay requires Unix directories")
+}
+
 #[cfg(unix)]
 fn verify_socket_parent(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1097,6 +1479,32 @@ fn verify_socket(path: &Path, expected: Option<SocketIdentity>) -> anyhow::Resul
     Ok(identity)
 }
 
+#[cfg(unix)]
+fn socket_identity(path: &Path) -> anyhow::Result<SocketIdentity> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    verify_socket_parent(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.file_type().is_socket(),
+        "approval relay path is not a Unix socket"
+    );
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "approval relay socket owner mismatch"
+    );
+    Ok(SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        uid: metadata.uid(),
+    })
+}
+
+#[cfg(not(unix))]
+fn socket_identity(_path: &Path) -> anyhow::Result<SocketIdentity> {
+    anyhow::bail!("attended approval relay requires Unix sockets")
+}
+
 #[cfg(not(unix))]
 fn verify_socket(
     _path: &Path,
@@ -1113,6 +1521,155 @@ mod tests {
         tool_input_digest,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_root(label: &str) -> PathBuf {
+        let root = std::env::current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target")
+            .join(format!("attended-relay-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root
+    }
+
+    fn test_effects(root: &Path) -> ExecutionCancellationContext {
+        ExecutionCancellationContext::new(
+            &root.join("effects"),
+            agent_hub_executor::Cancellation::never(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relay_location_is_short_even_when_attended_state_root_is_long() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let long_state_root = PathBuf::from("/state").join("x".repeat(4096));
+        let location = host_relay_socket_location(Uuid::new_v4()).unwrap();
+        assert!(!location.socket_path.starts_with(long_state_root));
+        assert!(location.socket_path.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_CAPACITY);
+        let too_long = PathBuf::from("/").join("x".repeat(UNIX_SOCKET_PATH_CAPACITY));
+        assert!(verify_socket_path_length(&too_long).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_directory_rejects_symlink_wrong_owner_and_non_runtime_filesystem() {
+        let uid = unsafe { libc::geteuid() };
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        verify_runtime_directory(&runtime, uid).unwrap();
+        assert!(verify_runtime_directory(&runtime, uid.wrapping_add(1)).is_err());
+
+        let root = test_root("runtime-validation");
+        let link = root.join("runtime-link");
+        std::os::unix::fs::symlink(&runtime, &link).unwrap();
+        assert!(verify_runtime_directory(&link, uid).is_err());
+        assert!(verify_runtime_directory(&root, uid).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bind_address_in_use_preserves_existing_socket_and_reconciles_bind() {
+        let journal_root = test_root("address-in-use");
+        let effects = test_effects(&journal_root);
+        let location = host_relay_socket_location(Uuid::new_v4()).unwrap();
+        prepare_socket_root(&location.socket_root, &effects).unwrap();
+        let socket = location.socket_path;
+        let existing = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let error = bind_listener(&socket, &effects).unwrap_err();
+        assert!(format!("{error:#}").contains("Address already in use"));
+        assert!(socket_identity(&socket).is_ok());
+        drop(existing);
+        std::fs::remove_file(&socket).unwrap();
+        remove_socket_root(&location.socket_root, None, &effects).unwrap();
+        effects.finalize().unwrap();
+        std::fs::remove_dir_all(journal_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn crash_recovery_removes_run_owned_socket_root_idempotently() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let journal_root = test_root("crash-recovery");
+        let effects = test_effects(&journal_root);
+        let location = host_relay_socket_location(Uuid::new_v4()).unwrap();
+        prepare_socket_root(&location.socket_root, &effects).unwrap();
+        let listener = bind_listener(&location.socket_path, &effects).unwrap();
+        std::fs::set_permissions(
+            &location.socket_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        effects
+            .begin_external_operation(
+                "attended_relay_socket_chmod",
+                &location.socket_path.to_string_lossy(),
+            )
+            .unwrap()
+            .completed()
+            .unwrap();
+        drop(listener);
+
+        recover_attended_relay_socket(&location.socket_path, &effects).unwrap();
+        recover_attended_relay_socket(&location.socket_path, &effects).unwrap();
+        assert!(!location.socket_path.exists());
+        assert!(!location.socket_root.exists());
+        effects.finalize().unwrap();
+        std::fs::remove_dir_all(journal_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn real_unix_socket_starts_listens_and_cleans_up() {
+        let journal_root = test_root("real-socket");
+        let effects = test_effects(&journal_root);
+        let location = host_relay_socket_location(Uuid::new_v4()).unwrap();
+        let binding = gateway_request().binding;
+        let approval_bundle = protocol::AttendedApprovalBundleIdentity {
+            name: "approval".into(),
+            digest: binding.approval_bundle_digest.clone(),
+            protocol: protocol::APPROVAL_BUNDLE_PROTOCOL.into(),
+            manifest_sha256: "a".repeat(64),
+            gateway_commit: "gateway".into(),
+            gateway_archive_sha256: "b".repeat(64),
+            plugin_sha256: "c".repeat(64),
+            dippy_commit: "dippy".into(),
+            dippy_archive_sha256: "d".repeat(64),
+            dippy_wheel_sha256: "e".repeat(64),
+        };
+        let (fail_closed, _) = watch::channel(false);
+        let mut relay = AttendedRelay::start(
+            AttendedRelayConfig {
+                socket_path: location.socket_path.clone(),
+                binding,
+                approval_bundle,
+                run_deadline: Utc::now() + chrono::Duration::minutes(1),
+                server_url: "http://127.0.0.1:1".into(),
+                token: None,
+                docker_path: PathBuf::from("docker"),
+                container_name: "unused".into(),
+            },
+            &effects,
+            fail_closed,
+        )
+        .await
+        .unwrap();
+        let _stream = UnixStream::connect(&location.socket_path).await.unwrap();
+        relay.stop().await.unwrap();
+        effects.finalize().unwrap();
+        assert!(!location.socket_root.exists());
+        std::fs::remove_dir_all(journal_root).unwrap();
+    }
 
     #[test]
     fn endpoint_rejects_credentials_and_insecure_bearer() {
