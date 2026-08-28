@@ -460,7 +460,7 @@ impl JsonSchema for CursorTool {
 // OpenCode
 // ---------------------------------------------------------------------------
 
-/// Input from the opencode hook (stdin JSON for both tool.execute.before and permission.ask).
+/// Input from the OpenCode execution hook.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OpenCodeHookInput {
     pub session_id: SessionId,
@@ -468,6 +468,11 @@ pub struct OpenCodeHookInput {
     pub tool: OpenCodeTool,
     #[serde(default)]
     pub tool_input: serde_json::Value,
+    /// Canonical fields used only for typed matching. The original tool input
+    /// remains intact for review, delegation, and attended request digests.
+    #[serde(default)]
+    pub tool_match_input: Option<serde_json::Value>,
+    #[serde(default = "default_cwd")]
     pub cwd: String,
     #[serde(default)]
     pub workspace_roots: Option<Vec<String>>,

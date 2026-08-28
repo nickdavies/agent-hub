@@ -51,7 +51,7 @@ describe("bundled plugin entrypoint", () => {
       defaultId: "agent-hub",
       defaultServerType: "function",
       id: "agent-hub",
-      keys: ["default", "id", "server"],
+      keys: ["default", "id", "server", "takePermissionOwnership"],
     })
   })
 })

@@ -20,7 +20,8 @@ impl TryFrom<OpenCodeHookInput> for ToolHookEvent {
 
         let tool: Tool = input.tool.into();
         let tool_call =
-            ToolCall::try_from((tool, input.tool_input)).map_err(|e| ParseError(e.to_string()))?;
+            ToolCall::from_raw_and_match_input(tool, input.tool_input, input.tool_match_input)
+                .map_err(|e| ParseError(e.to_string()))?;
 
         // OpenCode sends workspace_roots; fall back to cwd
         let workspace_roots = input
@@ -45,11 +46,7 @@ impl TryFrom<OpenCodeHookInput> for ToolHookEvent {
     }
 }
 
-/// Format a HookOutput into Opencode's wire format (stdout JSON).
-///
-/// Opencode currently has inline_approval = false due to the tool.execute.before
-/// race condition. Once the upstream fix lands this will need to return a blocking
-/// decision. For now we return the decision anyway so it's wired up and ready.
+/// Format a HookOutput into OpenCode's gateway wire format.
 pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
     let allowed = matches!(decision.status, DecisionStatus::Approved);
     let reason = match &decision.status {

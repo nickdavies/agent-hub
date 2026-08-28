@@ -1,27 +1,27 @@
 import path from "path"
 import type { OpenCodeTool } from "./generated/gateway-types"
 
-export interface PermissionInfo {
-  permission: string
-  patterns: string[]
-  metadata: Record<string, unknown>
-}
-
-export interface NormalizedPermission {
+export interface NormalizedExecution {
   tool: OpenCodeTool
-  toolInput: Record<string, unknown>
+  rawArgs: Record<string, unknown>
+  matchInputs: Record<string, unknown>[]
+  resolvedPaths: string[]
+  postPolicyValidationError?: string
 }
 
 const TOOL_NAMES: Record<string, OpenCodeTool> = {
+  apply_patch: "Write",
   bash: "Bash",
   codesearch: "CodeSearch",
+  code_search: "CodeSearch",
   doom_loop: "DoomLoop",
-  edit: "Write",
+  edit: "Edit",
   external_directory: "ExternalDirectory",
   glob: "Glob",
   grep: "Grep",
   list: "List",
   lsp: "Lsp",
+  multiedit: "MultiEdit",
   question: "Question",
   read: "Read",
   skill: "Skill",
@@ -29,123 +29,160 @@ const TOOL_NAMES: Record<string, OpenCodeTool> = {
   todowrite: "TodoWrite",
   webfetch: "WebFetch",
   websearch: "WebSearch",
+  write: "Write",
 }
 
-const EXECUTION_TOOL_NAMES: Record<string, OpenCodeTool> = {
-  ...TOOL_NAMES,
-  apply_patch: "Write",
-  write: "Write",
+export const STRUCTURED_OUTPUT_TOOLS = new Set(["structured_output", "structuredoutput", "StructuredOutput"])
+
+function objectArgs(args: unknown): Record<string, unknown> {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("OpenCode tool arguments must be an object")
+  }
+  return structuredClone(args as Record<string, unknown>)
+}
+
+function requiredString(args: Record<string, unknown>, key: string, toolName: string): string {
+  const value = args[key]
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new Error(`OpenCode ${toolName}.${key} must be a non-empty string`)
+  }
+  return value
+}
+
+function optionalString(args: Record<string, unknown>, key: string, toolName: string): string | undefined {
+  const value = args[key]
+  if (value === undefined) return undefined
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error(`OpenCode ${toolName}.${key} must be a string`)
+  }
+  return value
+}
+
+function absolute(value: string, base: string): string {
+  return path.isAbsolute(value) ? path.normalize(value) : path.resolve(base, value)
+}
+
+function patchPaths(patchText: string, directory: string): string[] {
+  const result: string[] = []
+  for (const line of patchText.replaceAll("\r\n", "\n").split("\n")) {
+    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/) ?? line.match(/^\*\*\* Move to: (.+)$/)
+    if (!match) continue
+    const value = match[1]
+    if (!value || value.includes("\0")) throw new Error("OpenCode apply_patch contains an invalid path")
+    result.push(absolute(value, directory))
+  }
+  if (result.length === 0) throw new Error("OpenCode apply_patch contains no file operations")
+  return [...new Set(result)]
+}
+
+function unknownPaths(
+  args: Record<string, unknown>,
+  directory: string,
+): { paths: string[]; error?: string } {
+  const result: string[] = []
+  let error: string | undefined
+  const visit = (value: unknown, key?: string) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, key)
+      return
+    }
+    if (value && typeof value === "object") {
+      for (const [nestedKey, nested] of Object.entries(value)) visit(nested, nestedKey)
+      return
+    }
+    if (!key || !/(?:^|_)(?:file|directory|cwd|root)?path$/i.test(key)) return
+    if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+      error ??= `OpenCode unknown tool path-bearing argument '${key}' is malformed`
+      return
+    }
+    result.push(absolute(value, directory))
+  }
+  visit(args)
+  return { paths: [...new Set(result)], error }
 }
 
 export function normalizeToolExecution(
   toolName: string,
-  args: Record<string, unknown>,
-): NormalizedPermission {
-  const tool = EXECUTION_TOOL_NAMES[toolName]
-  if (!tool) throw new Error(`unsupported OpenCode tool '${toolName}'`)
-  return { tool, toolInput: structuredClone(args) }
-}
+  args: unknown,
+  directory = process.cwd(),
+  worktree = directory,
+): NormalizedExecution {
+  const rawArgs = objectArgs(args)
+  const tool = TOOL_NAMES[toolName] ?? toolName
+  const one = (matchInput: Record<string, unknown>, resolvedPaths: string[] = []): NormalizedExecution => ({
+    tool,
+    rawArgs,
+    matchInputs: [matchInput],
+    resolvedPaths,
+  })
 
-function absolute(value: string, base: string): string {
-  return path.isAbsolute(value) ? value : path.resolve(base, value)
-}
-
-function stringMetadata(info: PermissionInfo, key: string): string | undefined {
-  const value = info.metadata[key]
-  return typeof value === "string" && value.length > 0 ? value : undefined
-}
-
-function requireValue(value: string | undefined, description: string): string {
-  if (!value) throw new Error(`OpenCode ${description} is missing`)
-  return value
-}
-
-function within(candidate: string, root: string): boolean {
-  const relative = path.relative(root, candidate)
-  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
-}
-
-export function normalizePermission(
-  info: PermissionInfo,
-  directory: string,
-  worktree: string,
-): NormalizedPermission[] {
-  const tool = TOOL_NAMES[info.permission]
-  if (!tool) throw new Error(`unsupported OpenCode permission '${info.permission}'`)
-  if (info.permission === "bash") {
-    return [{ tool, toolInput: { command: requireValue(stringMetadata(info, "command"), "bash command") } }]
+  if (toolName === "read") {
+    const filePath = absolute(requiredString(rawArgs, "filePath", toolName), worktree)
+    return one({ path: filePath }, [filePath])
   }
-  if (info.permission === "edit") {
-    if (Object.prototype.hasOwnProperty.call(info.metadata, "files")) {
-      if (!Array.isArray(info.metadata.files) || info.metadata.files.length === 0) {
-        throw new Error("OpenCode apply_patch files are missing")
+  if (toolName === "write") {
+    const filePath = absolute(requiredString(rawArgs, "filePath", toolName), worktree)
+    return one({ path: filePath }, [filePath])
+  }
+  if (toolName === "edit") {
+    const filePath = absolute(requiredString(rawArgs, "filePath", toolName), worktree)
+    return one({ path: filePath }, [filePath])
+  }
+  if (toolName === "apply_patch") {
+    const paths = patchPaths(requiredString(rawArgs, "patchText", toolName), worktree)
+    return { tool, rawArgs, matchInputs: paths.map((filePath) => ({ path: filePath })), resolvedPaths: paths }
+  }
+  if (toolName === "multiedit") {
+    const filePath = absolute(requiredString(rawArgs, "filePath", toolName), worktree)
+    if (!Array.isArray(rawArgs.edits)) throw new Error("OpenCode multiedit.edits must be an array")
+    const edits = rawArgs.edits.map((entry, index) => {
+      const edit = objectArgs(entry)
+      const oldString = edit.oldString
+      const newString = edit.newString
+      if (typeof oldString !== "string" || typeof newString !== "string") {
+        throw new Error(`OpenCode multiedit.edits[${index}] has malformed strings`)
       }
-      return info.metadata.files.map((entry, index) => {
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-          throw new Error(`OpenCode apply_patch file ${index} is malformed`)
-        }
-        const filePath = (entry as Record<string, unknown>).filePath
-        if (typeof filePath !== "string" || filePath.length === 0) {
-          throw new Error(`OpenCode apply_patch file ${index} has no filePath`)
-        }
-        return { tool, toolInput: { path: absolute(filePath, worktree) } }
-      })
-    }
-    const filepath = stringMetadata(info, "filepath")
-    if (filepath) return [{ tool, toolInput: { path: absolute(filepath, worktree) } }]
-    if (info.patterns.length === 0) throw new Error("OpenCode edit path is missing")
-    return info.patterns.map((pattern) => ({ tool, toolInput: { path: absolute(pattern, worktree) } }))
+      return { old_string: oldString, new_string: newString }
+    })
+    return one({ path: filePath, edits }, [filePath])
   }
-  if (info.permission === "read") {
-    if (info.patterns.length === 0) throw new Error("OpenCode read path is missing")
-    return info.patterns.map((pattern) => ({ tool, toolInput: { path: absolute(pattern, worktree) } }))
+  if (toolName === "external_directory") {
+    const target = absolute(requiredString(rawArgs, "path", toolName), directory)
+    return one({ path: target }, [target])
   }
-  if (["list", "external_directory"].includes(info.permission)) {
-    if (info.patterns.length === 0) throw new Error(`OpenCode ${info.permission} path is missing`)
-    return info.patterns.map((pattern) => ({ tool, toolInput: { path: absolute(pattern, directory) } }))
+  if (toolName === "glob") {
+    const target = absolute(optionalString(rawArgs, "path", toolName) ?? directory, directory)
+    return one({ target_directory: target }, [target])
   }
-  if (info.permission === "external_directory") {
-    if (info.patterns.length !== 1) throw new Error("OpenCode external_directory requires one exact requested path")
-    const requested = absolute(info.patterns[0], directory)
-    const authorizedRoots = [absolute(directory, directory), absolute(worktree, directory)]
-    if (!authorizedRoots.some((root) => within(requested, root))) {
-      throw new Error("OpenCode external_directory path is outside the authorized workspace/context")
-    }
-    return [{ tool, toolInput: { path: requested } }]
+  if (toolName === "list") {
+    const target = absolute(requiredString(rawArgs, "path", toolName), directory)
+    return one({ path: target }, [target])
   }
-  if (info.permission === "webfetch") {
-    return [{ tool, toolInput: { url: requireValue(stringMetadata(info, "url"), "webfetch URL") } }]
+  if (toolName === "grep") {
+    const target = absolute(optionalString(rawArgs, "path", toolName) ?? directory, directory)
+    return one({ path: target, pattern: requiredString(rawArgs, "pattern", toolName) }, [target])
   }
-  if (info.permission === "grep") {
-    const pattern = requireValue(info.patterns[0], "grep pattern")
-    const target = stringMetadata(info, "path") ?? stringMetadata(info, "directory") ?? directory
-    return [{ tool, toolInput: { pattern, path: absolute(target, directory) } }]
+  if (toolName === "bash") return one({ command: requiredString(rawArgs, "command", toolName) })
+  if (toolName === "webfetch") return one({ url: requiredString(rawArgs, "url", toolName) })
+  if (toolName === "websearch" || toolName === "codesearch" || toolName === "code_search") {
+    return one({ query: requiredString(rawArgs, "query", toolName) })
   }
-  if (info.permission === "glob") {
-    if (info.patterns.length === 0) throw new Error("OpenCode glob pattern is missing")
-    const target = stringMetadata(info, "path") ?? stringMetadata(info, "directory") ?? directory
-    const pattern = stringMetadata(info, "pattern")
-    return [{ tool, toolInput: { path: absolute(target, directory), ...(pattern ? { pattern } : {}) } }]
+  if (toolName === "skill") return one({ name: requiredString(rawArgs, "name", toolName), metadata: rawArgs })
+  if (toolName === "lsp") {
+    const operation = requiredString(rawArgs, "operation", toolName)
+    const filePath = optionalString(rawArgs, "filePath", toolName)
+    const resolved = filePath ? [absolute(filePath, directory)] : []
+    return one({ name: operation, metadata: { ...rawArgs, ...(resolved[0] ? { filePath: resolved[0] } : {}) } }, resolved)
   }
-  if (["websearch", "codesearch"].includes(info.permission)) {
-    const query = stringMetadata(info, "query") ?? info.patterns[0]
-    return [{ tool, toolInput: { query: requireValue(query, `${info.permission} query`) } }]
+  if (toolName === "doom_loop" || toolName === "question") {
+    return one({ patterns: [], metadata: rawArgs })
   }
-  if (["task", "todowrite"].includes(info.permission)) {
-    return [{
-      tool,
-      toolInput: {
-        patterns: [...info.patterns],
-        metadata: structuredClone(info.metadata),
-      },
-    }]
-  }
-  if (["question", "doom_loop"].includes(info.permission)) {
-    return [{ tool, toolInput: { patterns: [...info.patterns], metadata: structuredClone(info.metadata) } }]
-  }
-  if (["lsp", "skill"].includes(info.permission)) {
-    const name = requireValue(info.patterns[0], `${info.permission} name`)
-    return [{ tool, toolInput: { name, metadata: structuredClone(info.metadata) } }]
-  }
-  return [{ tool, toolInput: {} }]
+  if (toolName === "task" || toolName === "todowrite") return one(rawArgs)
+
+  const validation = unknownPaths(rawArgs, directory)
+  return { ...one(rawArgs, validation.paths), postPolicyValidationError: validation.error }
+}
+
+export function isStructuredOutputTool(toolName: string): boolean {
+  return STRUCTURED_OUTPUT_TOOLS.has(toolName)
 }

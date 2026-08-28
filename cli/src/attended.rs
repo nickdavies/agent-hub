@@ -2584,6 +2584,27 @@ struct PluginEvidence {
     reason: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolExecutionEvidence {
+    version: u32,
+    plugin: String,
+    nonce: String,
+    calls: Vec<ToolExecutionRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolExecutionRecord {
+    call_id: String,
+    session_id: String,
+    tool_name: String,
+    raw_args_digest: String,
+    canonical_match_digests: Vec<String>,
+    resolved_paths: Vec<String>,
+    status: String,
+}
+
 fn read_plugin_evidence(path: &Path) -> anyhow::Result<PluginEvidence> {
     let metadata = std::fs::symlink_metadata(path).with_context(|| {
         format!(
@@ -2592,7 +2613,7 @@ fn read_plugin_evidence(path: &Path) -> anyhow::Result<PluginEvidence> {
         )
     })?;
     ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 4096,
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 1024 * 1024,
         "supervised OpenCode plugin evidence is not a bounded regular file"
     );
     serde_json::from_slice(&std::fs::read(path)?)
@@ -2612,7 +2633,7 @@ fn verify_supervised_plugin_evidence(
     );
     let readiness = read_plugin_evidence(&evidence_dir.join("plugin-ready.json"))?;
     ensure!(
-        readiness.version == 1
+        readiness.version == 2
             && readiness.plugin == "agent-hub"
             && readiness.nonce == nonce
             && readiness.status == "ready"
@@ -2621,12 +2642,71 @@ fn verify_supervised_plugin_evidence(
     );
     let outcome = read_plugin_evidence(&evidence_dir.join("permission-outcome.json"))?;
     ensure!(
-        outcome.version == 1 && outcome.plugin == "agent-hub" && outcome.nonce == nonce,
+        outcome.version == 2 && outcome.plugin == "agent-hub" && outcome.nonce == nonce,
         "supervised OpenCode permission evidence does not match this run"
     );
+    let executions: ToolExecutionEvidence =
+        serde_json::from_slice(&std::fs::read(evidence_dir.join("tool-executions.json"))?)
+            .context("supervised OpenCode tool execution evidence is invalid")?;
+    ensure!(
+        executions.version == 2 && executions.plugin == "agent-hub" && executions.nonce == nonce,
+        "supervised OpenCode tool execution evidence does not match this run"
+    );
+    let mut call_ids = std::collections::BTreeSet::new();
+    for call in &executions.calls {
+        ensure!(
+            !call.call_id.is_empty()
+                && !call.session_id.is_empty()
+                && !call.tool_name.is_empty()
+                && call_ids.insert(&call.call_id),
+            "supervised OpenCode tool execution IDs are missing or duplicated"
+        );
+        ensure!(
+            call.raw_args_digest.len() == 64
+                && call
+                    .raw_args_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && call.canonical_match_digests.iter().all(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }),
+            "supervised OpenCode raw/canonical execution digests are invalid"
+        );
+        ensure!(
+            call.resolved_paths.iter().all(|path| path.starts_with('/')),
+            "supervised OpenCode resolved execution paths are not absolute"
+        );
+        if call.status == "transcript_only" {
+            ensure!(
+                matches!(
+                    call.tool_name.as_str(),
+                    "StructuredOutput" | "structured_output" | "structuredoutput"
+                ) && call.canonical_match_digests.is_empty()
+                    && call.resolved_paths.is_empty(),
+                "supervised OpenCode transcript-only exclusion is invalid"
+            );
+        } else {
+            ensure!(
+                !call.canonical_match_digests.is_empty(),
+                "supervised OpenCode routed execution has no canonical digest"
+            );
+        }
+    }
     match outcome.status.as_str() {
-        "no_denials" if outcome.reason.is_none() => Ok(PermissionOutcome::NoDenials),
-        "denied" => Ok(PermissionOutcome::Denied),
+        "no_denials"
+            if outcome.reason.is_none()
+                && executions.calls.iter().all(|call| {
+                    matches!(call.status.as_str(), "completed" | "transcript_only")
+                }) =>
+        {
+            Ok(PermissionOutcome::NoDenials)
+        }
+        "denied" if executions.calls.iter().any(|call| call.status == "denied") => {
+            Ok(PermissionOutcome::Denied)
+        }
         _ => anyhow::bail!("supervised OpenCode permission evidence has invalid status"),
     }
 }
@@ -3555,7 +3635,7 @@ mod tests {
         std::fs::write(
             evidence.join("plugin-ready.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": 1,
+                "version": 2,
                 "plugin": "agent-hub",
                 "nonce": nonce,
                 "status": "ready"
@@ -3566,10 +3646,29 @@ mod tests {
         std::fs::write(
             evidence.join("permission-outcome.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": 1,
+                "version": 2,
                 "plugin": "agent-hub",
                 "nonce": nonce,
                 "status": "no_denials"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            evidence.join("tool-executions.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "plugin": "agent-hub",
+                "nonce": nonce,
+                "calls": [{
+                    "call_id": "call-1",
+                    "session_id": "session-1",
+                    "tool_name": "read",
+                    "raw_args_digest": "a".repeat(64),
+                    "canonical_match_digests": ["b".repeat(64)],
+                    "resolved_paths": ["/workspace/file"],
+                    "status": "completed"
+                }]
             }))
             .unwrap(),
         )
@@ -3578,17 +3677,50 @@ mod tests {
             verify_supervised_plugin_evidence(&root, &nonce).unwrap(),
             PermissionOutcome::NoDenials
         );
+        let mut incomplete: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(evidence.join("tool-executions.json")).unwrap())
+                .unwrap();
+        incomplete["calls"][0]["status"] = serde_json::json!("authorized");
+        std::fs::write(
+            evidence.join("tool-executions.json"),
+            serde_json::to_vec(&incomplete).unwrap(),
+        )
+        .unwrap();
+        assert!(verify_supervised_plugin_evidence(&root, &nonce).is_err());
+        incomplete["calls"][0]["status"] = serde_json::json!("completed");
+        incomplete["calls"][0]["raw_args_digest"] = serde_json::json!("not-a-digest");
+        std::fs::write(
+            evidence.join("tool-executions.json"),
+            serde_json::to_vec(&incomplete).unwrap(),
+        )
+        .unwrap();
+        assert!(verify_supervised_plugin_evidence(&root, &nonce).is_err());
+        incomplete["calls"][0]["raw_args_digest"] = serde_json::json!("a".repeat(64));
+        std::fs::write(
+            evidence.join("tool-executions.json"),
+            serde_json::to_vec(&incomplete).unwrap(),
+        )
+        .unwrap();
 
         std::fs::write(
             evidence.join("permission-outcome.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": 1,
+                "version": 2,
                 "plugin": "agent-hub",
                 "nonce": nonce,
                 "status": "denied",
                 "reason": "fixture denial"
             }))
             .unwrap(),
+        )
+        .unwrap();
+        let mut executions: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(evidence.join("tool-executions.json")).unwrap())
+                .unwrap();
+        executions["calls"][0]["status"] = serde_json::json!("denied");
+        std::fs::write(
+            evidence.join("tool-executions.json"),
+            serde_json::to_vec(&executions).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -3962,7 +4094,7 @@ exit 0
             approvals: HashMap<uuid::Uuid, Approval>,
             registrations: Vec<String>,
             cancellations: usize,
-            model_commands: VecDeque<String>,
+            model_calls: VecDeque<(String, serde_json::Value)>,
         }
 
         async fn fake_server(listener: tokio::net::TcpListener, state: Arc<Mutex<FakeState>>) {
@@ -4003,19 +4135,32 @@ exit 0
                             Ok(request) => request,
                             Err(_) => return,
                         };
-                        let has_tools = model_request
+                        let available_tools = model_request
                             .get("tools")
                             .and_then(serde_json::Value::as_array)
-                            .is_some_and(|tools| !tools.is_empty());
-                        let command = if has_tools {
-                            state.lock().await.model_commands.pop_front()
-                        } else {
+                            .map(|tools| {
+                                tools
+                                    .iter()
+                                    .filter_map(|tool| {
+                                        tool.get("name").and_then(serde_json::Value::as_str)
+                                    })
+                                    .collect::<std::collections::BTreeSet<_>>()
+                            })
+                            .unwrap_or_default();
+                        let call = if available_tools.is_empty() {
                             None
+                        } else {
+                            let mut state = state.lock().await;
+                            state
+                                .model_calls
+                                .iter()
+                                .position(|(name, _)| available_tools.contains(name.as_str()))
+                                .and_then(|index| state.model_calls.remove(index))
                         };
-                        let chunks = if let Some(command) = command {
+                        let chunks = if let Some((tool_name, arguments)) = call {
                             let item_id = format!("item-{}", uuid::Uuid::new_v4().simple());
                             let call_id = format!("call-{}", uuid::Uuid::new_v4().simple());
-                            let arguments = serde_json::json!({"command":command}).to_string();
+                            let arguments = arguments.to_string();
                             vec![
                                 serde_json::json!({
                                     "type":"response.created",
@@ -4024,7 +4169,7 @@ exit 0
                                 serde_json::json!({
                                     "type":"response.output_item.added",
                                     "output_index":0,
-                                    "item":{"type":"function_call","id":item_id,"call_id":call_id,"name":"bash","arguments":"","status":"in_progress"}
+                                    "item":{"type":"function_call","id":item_id,"call_id":call_id,"name":tool_name,"arguments":"","status":"in_progress"}
                                 }),
                                 serde_json::json!({
                                     "type":"response.function_call_arguments.delta",
@@ -4041,11 +4186,11 @@ exit 0
                                 serde_json::json!({
                                     "type":"response.output_item.done",
                                     "output_index":0,
-                                    "item":{"type":"function_call","id":item_id,"call_id":call_id,"name":"bash","arguments":arguments,"status":"completed"}
+                                    "item":{"type":"function_call","id":item_id,"call_id":call_id,"name":tool_name,"arguments":arguments,"status":"completed"}
                                 }),
                                 serde_json::json!({
                                     "type":"response.completed",
-                                    "response":{"status":"completed","incomplete_details":null,"output":[{"type":"function_call","id":item_id,"call_id":call_id,"name":"bash","arguments":arguments,"status":"completed"}],"usage":{"input_tokens":1,"input_tokens_details":null,"output_tokens":1,"output_tokens_details":null},"service_tier":null}
+                                    "response":{"status":"completed","incomplete_details":null,"output":[{"type":"function_call","id":item_id,"call_id":call_id,"name":tool_name,"arguments":arguments,"status":"completed"}],"usage":{"input_tokens":1,"input_tokens_details":null,"output_tokens":1,"output_tokens_details":null},"service_tier":null}
                                 }),
                             ]
                         } else {
@@ -4105,7 +4250,14 @@ exit 0
                                 reason: "fixture denied".into(),
                             },
                             "touch pending-marker" => ApprovalStatus::Pending,
-                            _ => return,
+                            _ => ApprovalStatus::Approved {
+                                message: Some("fixture non-shell approval".into()),
+                            },
+                        };
+                        let registration = if command.is_empty() {
+                            request.tool.to_string()
+                        } else {
+                            command
                         };
                         let id = uuid::Uuid::new_v4();
                         let approval = Approval {
@@ -4123,7 +4275,7 @@ exit 0
                             status: status.clone(),
                         };
                         let mut state = state.lock().await;
-                        state.registrations.push(command);
+                        state.registrations.push(registration);
                         state.approvals.insert(id, approval);
                         (
                             "application/json",
@@ -4182,11 +4334,47 @@ exit 0
         let server_port = listener.local_addr()?.port();
         let server_url = format!("http://127.0.0.1:{server_port}");
         let fake_state = Arc::new(Mutex::new(FakeState {
-            model_commands: VecDeque::from([
-                "git status".to_string(),
-                "touch approved-marker".to_string(),
-                "touch denied-marker".to_string(),
-                "touch pending-marker".to_string(),
+            model_calls: VecDeque::from([
+                (
+                    "read".to_string(),
+                    serde_json::json!({"filePath":"native-read.txt","offset":1,"limit":10}),
+                ),
+                (
+                    "apply_patch".to_string(),
+                    serde_json::json!({"patchText":"*** Begin Patch\n*** Add File: native-patch.txt\n+patched\n*** End Patch"}),
+                ),
+                (
+                    "bash".to_string(),
+                    serde_json::json!({"command":"git status","description":"local policy"}),
+                ),
+                (
+                    "bash".to_string(),
+                    serde_json::json!({"command":"touch approved-marker","description":"remote approval"}),
+                ),
+                (
+                    "bash".to_string(),
+                    serde_json::json!({"command":"touch denied-marker","description":"remote denial"}),
+                ),
+                (
+                    "bash".to_string(),
+                    serde_json::json!({"command":"touch pending-marker","description":"remote cancellation"}),
+                ),
+                (
+                    "webfetch".to_string(),
+                    serde_json::json!({"url":"http://host.docker.internal:1/blocked","format":"text","timeout":1}),
+                ),
+                (
+                    "task".to_string(),
+                    serde_json::json!({"description":"fixture subagent","prompt":"Reply done","subagent_type":"general"}),
+                ),
+                (
+                    "write".to_string(),
+                    serde_json::json!({"filePath":"native-write.txt","content":"before\n"}),
+                ),
+                (
+                    "edit".to_string(),
+                    serde_json::json!({"filePath":"native-write.txt","oldString":"before","newString":"after","replaceAll":false}),
+                ),
             ]),
             ..FakeState::default()
         }));
@@ -4237,11 +4425,22 @@ if ! /usr/local/bin/node -e 'import("file:///opencode/config/opencode/approval/a
   cat plugin-import.err >&2
   exit 1
 fi
+printf 'read fixture\n' > native-read.txt
 timeout 60 /usr/local/bin/opencode --print-logs --log-level DEBUG run 'Use Bash as instructed.' > opencode.log 2>&1
+cp /opencode/state/agent-hub/tool-executions.json foreground-gpt5-evidence.json
+rm -rf /opencode/state/agent-hub
+timeout 60 /usr/local/bin/opencode --print-logs --log-level DEBUG run --model openai/gpt-4.1 'Use file tools as instructed.' >> opencode.log 2>&1
+cp /opencode/state/agent-hub/tool-executions.json foreground-gpt4-evidence.json
 test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
+test "$(jq -r '.version' /opencode/state/agent-hub/tool-executions.json)" = 2
+jq -e '.calls | length > 0 and all(.call_id != "" and .raw_args_digest != "")' /opencode/state/agent-hub/tool-executions.json >/dev/null
+jq -e '[.calls[].tool_name] | index("read") != null and index("apply_patch") != null and index("bash") != null and index("webfetch") != null and index("task") != null' foreground-gpt5-evidence.json >/dev/null
+jq -e '[.calls[].tool_name] | index("write") != null and index("edit") != null' foreground-gpt4-evidence.json >/dev/null
 test -e approved-marker
 test ! -e denied-marker
 test ! -e pending-marker
+test "$(cat native-patch.txt)" = patched
+test "$(cat native-write.txt)" = after
 "#;
         let mut environment = config::supervised_opencode_runtime_env(&runner.opencode.trusted_env)
             .map_err(anyhow::Error::msg)?;
@@ -4363,13 +4562,17 @@ test ! -e pending-marker
         );
         let fake_state = fake_state.lock().await;
         anyhow::ensure!(
-            fake_state.registrations
-                == [
-                    "touch approved-marker".to_string(),
-                    "touch denied-marker".to_string(),
-                    "touch pending-marker".to_string(),
-                ],
-            "local Dippy allow unexpectedly reached the host relay: {:?}",
+            !fake_state.registrations.contains(&"git status".to_string())
+                && fake_state
+                    .registrations
+                    .contains(&"touch approved-marker".to_string())
+                && fake_state
+                    .registrations
+                    .contains(&"touch denied-marker".to_string())
+                && fake_state
+                    .registrations
+                    .contains(&"touch pending-marker".to_string()),
+            "local/remote policy routing did not match the fixture: {:?}",
             fake_state.registrations
         );
         anyhow::ensure!(

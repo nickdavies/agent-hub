@@ -424,9 +424,6 @@ fn validate_supervised_opencode_config(bytes: &[u8]) -> Result<(), String> {
         .ok_or_else(|| {
             "supervised OpenCode environments require explicit permissions".to_string()
         })?;
-    if permissions.get("*").and_then(serde_json::Value::as_str) != Some("ask") {
-        return Err("supervised OpenCode permissions must ask by default".to_string());
-    }
     validate_supervised_permission_tree(
         &serde_json::Value::Object(permissions.clone()),
         "permission",
@@ -454,19 +451,15 @@ fn validate_supervised_permission_tree(
     value: &serde_json::Value,
     location: &str,
 ) -> Result<(), String> {
-    match value {
-        serde_json::Value::String(action) if matches!(action.as_str(), "ask" | "deny") => Ok(()),
-        serde_json::Value::String(action) if action == "allow" => Err(format!(
-            "supervised OpenCode {location} contains a direct allow that bypasses permission.ask"
-        )),
-        serde_json::Value::Object(entries) => {
-            for (key, entry) in entries {
-                validate_supervised_permission_tree(entry, &format!("{location}.{key}"))?;
-            }
+    match value.as_object() {
+        Some(entries)
+            if entries.len() == 1
+                && entries.get("*").and_then(serde_json::Value::as_str) == Some("ask") =>
+        {
             Ok(())
         }
         _ => Err(format!(
-            "supervised OpenCode {location} contains an unsupported permission value"
+            "supervised OpenCode {location} must be the exact fail-closed {{\"*\":\"ask\"}} startup fallback"
         )),
     }
 }
@@ -1091,8 +1084,9 @@ dippy_wheel_sha256 = "{}"
     #[test]
     fn approval_modes_require_fail_closed_supervision_or_non_interactive_auto_rules() {
         let supervised = serde_json::to_vec(&json!({
-            "permission":{"*":"ask","external_directory":"deny"},
-            "plugin":[APPROVAL_PLUGIN_URI]
+            "permission":{"*":"ask"},
+            "plugin":[APPROVAL_PLUGIN_URI],
+            "agent":{"review":{"permission":{"*":"ask"}}}
         }))
         .unwrap();
         validate_supervised_opencode_config(&supervised).unwrap();

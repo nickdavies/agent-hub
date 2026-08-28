@@ -11,6 +11,7 @@ let questionGatewayResults: Array<{
 }> = []
 let questionReplies: Array<{ requestID: string; directory: string; answers: string[][] }> = []
 let questionRejections: Array<{ requestID: string; directory: string }> = []
+import { takePermissionOwnership } from "./agent-hub"
 
 mock.module("fs", () => ({
   default: { appendFileSync: () => {} },
@@ -321,6 +322,30 @@ describe("question gateway outcomes", () => {
     expect(questionReplies).toHaveLength(1)
     expect(questionReplies[0]?.answers).toEqual([[message], [message]])
     expect(questionRejections).toHaveLength(0)
+  })
+})
+
+describe("runtime permission ownership", () => {
+  test("replaces only top-level and every configured agent permission tree", () => {
+    const config: Record<string, any> = {
+      model: "openai/gpt-5.6-sol",
+      permission: { "*": "ask" },
+      agent: {
+        coder: { model: "openai/gpt-5.6-sol", permission: { "*": "ask" } },
+        review: { description: "review" },
+      },
+      plugin: ["file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js"],
+    }
+    takePermissionOwnership(config)
+    expect(config).toEqual({
+      model: "openai/gpt-5.6-sol",
+      permission: "allow",
+      agent: {
+        coder: { model: "openai/gpt-5.6-sol", permission: "allow" },
+        review: { description: "review", permission: "allow" },
+      },
+      plugin: ["file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js"],
+    })
   })
 })
 

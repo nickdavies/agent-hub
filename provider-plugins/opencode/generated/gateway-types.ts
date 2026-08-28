@@ -19,7 +19,7 @@ export type SessionId = string
 export type OpenCodeTool = string
 
 /**
- * Input from the opencode hook (stdin JSON for both tool.execute.before and permission.ask).
+ * Input from the OpenCode execution hook.
  */
 export interface OpenCodeHookInput {
   cwd: string
@@ -30,6 +30,13 @@ export interface OpenCodeHookInput {
    */
   session_title?: string | null
   tool_input?: {
+    [k: string]: unknown
+  }
+  /**
+   * Canonical fields used only for typed matching. The original tool input
+   * remains intact for review, delegation, and attended request digests.
+   */
+  tool_match_input?: {
     [k: string]: unknown
   }
   tool_name: OpenCodeTool

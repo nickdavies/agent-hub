@@ -2,10 +2,10 @@
 
 opencode plugin that connects `tool.execute.before` to `agent-hub-gateway`.
 
-Every tool-use permission check opencode would normally show to the user is
-instead evaluated by the gateway's local rule engine first. Fast allow/deny
-decisions return immediately with no network call. Anything that needs human
-review escalates to the agent-hub server.
+Every capability-bearing OpenCode 1.18.18 execution is awaited in
+`tool.execute.before` and evaluated by the gateway before the tool can run.
+Fast allow/deny decisions return immediately with no network call. Anything
+that needs human review escalates to the agent-hub server.
 
 ## Prerequisites
 
@@ -163,30 +163,53 @@ opencode tool.execute.before hook
               Ask    → gateway long-polls server → allow/deny → same as above
 ```
 
-The `permission` field from opencode (`bash`, `edit`, `read`) is normalised to
-the canonical gateway tool name (`Bash`, `Write`, `Read`) before rule
-evaluation. The `patterns` array from opencode (commands or file paths) is
-mapped to the correct `tool_input` field (`command` for shell, `path` for file
-tools) so that pattern-matching rules in
-`~/.config/agent-hub/agent-hub-permissions.json` work as expected.
+The hook contract uses the execution tool name, `callID`, and the tool's actual
+camelCase argument object. The complete raw argument object is retained for
+review, delegation, transcript reconciliation, and attended request digests.
+A separate canonical match input resolves paths and maps the fields consumed by
+the gateway rule engine. `ApplyPatch` produces one canonical authorization for
+every source and move destination while retaining the complete `patchText` in
+each review request.
 
-## Permission → tool name mapping
+## Execution-hook contract
 
-| opencode `permission` | gateway canonical name | `tool_input` field |
+| OpenCode execution | gateway canonical name | canonical match field |
 |---|---|---|
 | `bash` | `Bash` | `command` |
-| `edit` | `Write` | `path` |
-| `read` | `Read` | `path` |
-| anything else | passed through unchanged | `pattern` (no rule match) |
+| `read` | `Read` | resolved `path` from `filePath` |
+| `write`, `edit`, `apply_patch` | write category | every resolved file `path` |
+| `glob`, `list`, `grep` | matching file category | resolved search root |
+| `webfetch`, `websearch`, code search | matching network/search category | URL or query |
+| `task`, `skill`, `lsp`, `question`, todo, doom loop | matching built-in category | built-in canonical fields |
+| MCP, plugin, custom, and future names | typed `Unknown(name)` | no known-tool match |
 
-Unknown permissions fall through to the `default` action in
-`~/.config/agent-hub/agent-hub-permissions.json`.
+Unknown executions retain their exact typed name and raw arguments. Valid
+path-bearing fields are resolved for evidence, but are not reclassified as a
+known tool. The immutable default ask/deny policy therefore decides them; the
+plugin never pre-denies an unknown name before policy evaluation. If policy
+allows an unknown call whose path-bearing field is malformed, conservative
+post-policy validation still blocks the execution before side effects.
+
+`StructuredOutput` is the sole explicit exclusion. OpenCode injects it to copy
+model-validated data into the transcript; it has no filesystem, network,
+process, or subagent capability. The plugin records its call ID and raw digest
+as `transcript_only`, but does not send it to policy. This is an OpenCode
+1.18.18 capability interception guarantee, not a claim that every possible
+tool in every runtime is universally intercepted.
+
+Before/after records bind `sessionID`, `callID`, typed tool name, raw argument
+digest, canonical match digests, and resolved paths. Finalization rejects
+missing, duplicate, pending, denied-as-success, or mismatched records. Thus a
+`no_denials` outcome is valid only when every routed execution has matching
+post-execution evidence and every exclusion is an exact StructuredOutput call.
 
 ## Caveats
 
-- **Permission ownership**: the plugin changes OpenCode's built-in tool
-  permissions to allow and becomes the mandatory pre-execution authorization
-  point. This avoids the non-interactive `opencode run` client auto-rejecting
-  `permission.asked` events before a remote decision can complete.
-- **Multiple patterns**: the plugin calls the gateway once per pattern in the
-  `patterns` array. The first denied pattern stops evaluation immediately.
+- **Permission ownership**: immutable supervised config starts with the exact
+  `{ "*": "ask" }` fail-closed fallback. Once the one exact bundled plugin is
+  initialized, its config hook replaces the top-level permission tree and every
+  configured agent-specific tree with `"allow"`. The awaited execution hook is
+  then the sole policy owner; any tool call observed before that transformation
+  fails closed.
+- **Multiple files**: the plugin calls the gateway once per canonical file. The
+  first denied file stops evaluation immediately.

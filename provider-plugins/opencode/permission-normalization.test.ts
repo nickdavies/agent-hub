@@ -1,73 +1,88 @@
 import { describe, expect, test } from "bun:test"
-import { normalizePermission, normalizeToolExecution } from "./permission-normalization"
+import { isStructuredOutputTool, normalizeToolExecution } from "./permission-normalization"
 
-describe("OpenCode permission normalization", () => {
-  test("normalizes every apply_patch file without dropping malformed entries", () => {
-    expect(normalizePermission({
-      permission: "edit",
-      patterns: [],
-      metadata: { files: [{ filePath: "a.txt" }, { filePath: "/workspace/b.txt" }] },
-    }, "/workspace", "/workspace")).toEqual([
-      { tool: "Write", toolInput: { path: "/workspace/a.txt" } },
-      { tool: "Write", toolInput: { path: "/workspace/b.txt" } },
-    ])
-    expect(() => normalizePermission({
-      permission: "edit",
-      patterns: [],
-      metadata: { files: [{ filePath: "a.txt" }, {}] },
-    }, "/workspace", "/workspace")).toThrow("file 1")
-  })
-
-  test("normalizes all mature path, shell, and network permissions", () => {
-    expect(normalizePermission({ permission: "bash", patterns: ["ignored"], metadata: { command: "git status" } }, "/w", "/w"))
-      .toEqual([{ tool: "Bash", toolInput: { command: "git status" } }])
-    expect(normalizePermission({ permission: "read", patterns: ["a", "b"], metadata: {} }, "/w", "/w"))
-      .toHaveLength(2)
-    expect(normalizePermission({ permission: "grep", patterns: ["needle"], metadata: { directory: "src" } }, "/w", "/w"))
-      .toEqual([{ tool: "Grep", toolInput: { pattern: "needle", path: "/w/src" } }])
-    expect(normalizePermission({ permission: "glob", patterns: ["**/*.ts"], metadata: {} }, "/w", "/w"))
-      .toEqual([{ tool: "Glob", toolInput: { path: "/w", patterns: ["**/*.ts"] } }])
-    expect(normalizePermission({ permission: "webfetch", patterns: [], metadata: { url: "https://example.test" } }, "/w", "/w"))
-      .toEqual([{ tool: "WebFetch", toolInput: { url: "https://example.test" } }])
-  })
-
-  test("maps every supported permission and fails closed on omissions", () => {
-    for (const permission of ["read", "list"]) {
-      expect(normalizePermission({ permission, patterns: ["src"], metadata: {} }, "/w", "/w"))
-        .toEqual([{ tool: permission === "read" ? "Read" : "List", toolInput: { path: "/w/src" } }])
+describe("OpenCode 1.18.18 execution-hook normalization", () => {
+  test("preserves raw camelCase file arguments and resolves canonical paths", () => {
+    const cases: Array<[string, Record<string, unknown>, string, Record<string, unknown>]> = [
+      ["read", { filePath: "src/a.ts", offset: 2, limit: 3 }, "Read", { path: "/workspace/src/a.ts" }],
+      ["write", { filePath: "src/a.ts", content: "body" }, "Write", { path: "/workspace/src/a.ts" }],
+      ["edit", { filePath: "src/a.ts", oldString: "old", newString: "new", replaceAll: true }, "Edit", {
+        path: "/workspace/src/a.ts",
+      }],
+    ]
+    for (const [name, args, tool, match] of cases) {
+      const normalized = normalizeToolExecution(name, args, "/workspace")
+      expect(normalized.tool).toBe(tool)
+      expect(normalized.rawArgs).toEqual(args)
+      expect(normalized.matchInputs).toEqual([match])
+      expect(normalized.resolvedPaths).toEqual(["/workspace/src/a.ts"])
     }
-    expect(normalizePermission({ permission: "external_directory", patterns: ["src"], metadata: {} }, "/w", "/w"))
-      .toEqual([{ tool: "ExternalDirectory", toolInput: { path: "/w/src" } }])
-    expect(() => normalizePermission({ permission: "external_directory", patterns: ["/etc"], metadata: {} }, "/w", "/w"))
-      .toThrow("outside")
-    expect(normalizePermission({ permission: "task", patterns: ["agent"], metadata: { prompt: "work" } }, "/w", "/w")[0].tool)
-      .toBe("Task")
-    expect(normalizePermission({ permission: "todowrite", patterns: [], metadata: {} }, "/w", "/w")[0].tool)
-      .toBe("TodoWrite")
-    expect(normalizePermission({ permission: "question", patterns: [], metadata: {} }, "/w", "/w")[0].tool)
-      .toBe("Question")
-    expect(normalizePermission({ permission: "doom_loop", patterns: [], metadata: {} }, "/w", "/w")[0].tool)
-      .toBe("DoomLoop")
-    expect(normalizePermission({ permission: "lsp", patterns: ["hover"], metadata: {} }, "/w", "/w"))
-      .toEqual([{ tool: "Lsp", toolInput: { name: "hover", metadata: {} } }])
-    expect(normalizePermission({ permission: "skill", patterns: ["local-workspaces"], metadata: {} }, "/w", "/w"))
-      .toEqual([{ tool: "Skill", toolInput: { name: "local-workspaces", metadata: {} } }])
-    expect(normalizePermission({ permission: "websearch", patterns: ["query"], metadata: {} }, "/w", "/w"))
-      .toEqual([{ tool: "WebSearch", toolInput: { query: "query" } }])
-    expect(normalizePermission({ permission: "codesearch", patterns: [], metadata: { query: "symbol" } }, "/w", "/w"))
-      .toEqual([{ tool: "CodeSearch", toolInput: { query: "symbol" } }])
-    expect(() => normalizePermission({ permission: "mcp_database_query", patterns: [], metadata: {} }, "/w", "/w"))
-      .toThrow("unsupported")
-    expect(() => normalizePermission({ permission: "external_directory", patterns: [], metadata: {} }, "/w", "/w"))
-      .toThrow("one exact requested path")
   })
 
-  test("routes pre-execution tool arguments without permission-event translation", () => {
-    expect(normalizeToolExecution("bash", { command: "git status" }))
-      .toEqual({ tool: "Bash", toolInput: { command: "git status" } })
-    expect(normalizeToolExecution("apply_patch", { patchText: "*** Begin Patch" }))
-      .toEqual({ tool: "Write", toolInput: { patchText: "*** Begin Patch" } })
-    expect(() => normalizeToolExecution("mcp_database_query", {}))
-      .toThrow("unsupported OpenCode tool")
+  test("extracts every apply_patch source and move destination", () => {
+    const patchText = "*** Begin Patch\n*** Add File: a.txt\n+x\n*** Update File: b.txt\n*** Move to: moved/b.txt\n@@\n-old\n+new\n*** Delete File: c.txt\n*** End Patch"
+    const normalized = normalizeToolExecution("apply_patch", { patchText }, "/workspace")
+    expect(normalized.rawArgs).toEqual({ patchText })
+    expect(normalized.matchInputs).toEqual([
+      { path: "/workspace/a.txt" },
+      { path: "/workspace/b.txt" },
+      { path: "/workspace/moved/b.txt" },
+      { path: "/workspace/c.txt" },
+    ])
+  })
+
+  test("normalizes filesystem, process, network, subagent, and UI built-ins", () => {
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ["glob", { pattern: "**/*.ts", path: "src" }, "Glob"],
+      ["list", { path: "src", ignore: ["target"] }, "List"],
+      ["grep", { pattern: "needle", path: "src", include: "*.ts" }, "Grep"],
+      ["multiedit", { filePath: "src/a.ts", edits: [{ oldString: "a", newString: "b" }] }, "MultiEdit"],
+      ["external_directory", { path: "src" }, "ExternalDirectory"],
+      ["bash", { command: "git status", timeout: 1000, description: "status" }, "Bash"],
+      ["task", { description: "work", prompt: "do it", subagentType: "general" }, "Task"],
+      ["skill", { name: "local-workspaces" }, "Skill"],
+      ["lsp", { operation: "hover", filePath: "src/a.ts", line: 1, character: 2 }, "Lsp"],
+      ["question", { questions: [{ question: "Continue?" }] }, "Question"],
+      ["webfetch", { url: "https://example.test", format: "markdown", timeout: 10 }, "WebFetch"],
+      ["websearch", { query: "query", numResults: 3 }, "WebSearch"],
+      ["codesearch", { query: "symbol", tokensNum: 500 }, "CodeSearch"],
+      ["doom_loop", { tool: "bash", args: { command: "false" } }, "DoomLoop"],
+      ["todowrite", { todos: [] }, "TodoWrite"],
+      ["plan_enter", {}, "plan_enter"],
+      ["plan_exit", {}, "plan_exit"],
+      ["execute", { code: "await tools.read({filePath: 'a'})" }, "execute"],
+      ["invalid", { tool: "missing", error: "bad" }, "invalid"],
+    ]
+    for (const [name, args, tool] of cases) {
+      const normalized = normalizeToolExecution(name, args, "/workspace")
+      expect(normalized.tool).toBe(tool)
+      expect(normalized.rawArgs).toEqual(args)
+      expect(normalized.matchInputs).toHaveLength(1)
+    }
+  })
+
+  test("passes MCP, plugin, custom, and future tools through as typed Unknown inputs", () => {
+    for (const name of ["mcp_database_query", "plugin_deploy", "custom_tool", "future_builtin"]) {
+      const args = { query: "select 1", filePath: "review/input.sql", extra: { retained: true } }
+      const normalized = normalizeToolExecution(name, args, "/workspace")
+      expect(normalized.tool).toBe(name)
+      expect(normalized.rawArgs).toEqual(args)
+      expect(normalized.matchInputs).toEqual([args])
+      expect(normalized.resolvedPaths).toEqual(["/workspace/review/input.sql"])
+    }
+  })
+
+  test("does not pre-deny unknowns and resolves only valid path-bearing arguments", () => {
+    const malformed = normalizeToolExecution("mcp_custom", { filePath: 42 }, "/workspace")
+    expect(malformed.resolvedPaths).toEqual([])
+    expect(malformed.postPolicyValidationError).toContain("path-bearing")
+    expect(normalizeToolExecution("mcp_custom", { opaque: 42 }, "/workspace").tool).toBe("mcp_custom")
+  })
+
+  test("classifies only StructuredOutput as transcript-only", () => {
+    expect(isStructuredOutputTool("StructuredOutput")).toBe(true)
+    expect(isStructuredOutputTool("structured_output")).toBe(true)
+    expect(isStructuredOutputTool("read")).toBe(false)
+    expect(isStructuredOutputTool("future_builtin")).toBe(false)
   })
 })

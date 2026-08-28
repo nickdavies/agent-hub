@@ -1,9 +1,8 @@
 /**
  * Agent Hub opencode plugin.
  *
- * Routes every tool execution through agent-hub-gateway so that opencode's
- * tool approvals run through the same rule engine and server
- * escalation path as Claude Code and Cursor.
+ * Routes OpenCode 1.18.18 capability executions through agent-hub-gateway so
+ * they use the same rule engine and escalation path as Claude Code and Cursor.
  *
  * Environment variables (set in the shell that launches opencode):
  *   AGENT_HUB_GATEWAY   path to the gateway binary (default: "agent-hub-gateway")
@@ -24,6 +23,7 @@ import type { Event as EventV2 } from "@opencode-ai/sdk/v2"
 import { OpencodeClient as OpencodeClientV2 } from "@opencode-ai/sdk/v2"
 import path from "path"
 import fs from "fs"
+import { createHash } from "crypto"
 import { spawn, spawnSync, type ChildProcess } from "child_process"
 import type {
   OpenCodeHookInput,
@@ -35,12 +35,56 @@ import type {
   StatusReport,
 } from "./generated/gateway-types"
 import { approvalTransport, gatewayApprovalInvocation } from "./approval-transport"
-import { normalizeToolExecution } from "./permission-normalization"
+import { isStructuredOutputTool, normalizeToolExecution } from "./permission-normalization"
 
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
-const EVIDENCE_VERSION = 1
+const EVIDENCE_VERSION = 2
 let evidenceSequence = 0
 let readinessRecorded = false
+let configInitialized = false
+
+type ExecutionStatus = "routing" | "authorized" | "completed" | "denied" | "transcript_only"
+interface ExecutionRecord {
+  call_id: string
+  session_id: string
+  tool_name: string
+  raw_args_digest: string
+  canonical_match_digests: string[]
+  resolved_paths: string[]
+  status: ExecutionStatus
+}
+
+const executionRecords = new Map<string, ExecutionRecord>()
+
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical)
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => [key, canonical(nested)]))
+  }
+  return value
+}
+
+function digest(domain: string, value: unknown): string {
+  return createHash("sha256").update(`${domain}\0`).update(JSON.stringify(canonical(value))).digest("hex")
+}
+
+function executionEvidencePath(): string | undefined {
+  if (APPROVAL_TRANSPORT.kind !== "attended_socket") return undefined
+  return path.join(path.dirname(APPROVAL_TRANSPORT.outcomePath), "tool-executions.json")
+}
+
+function writeExecutionEvidence() {
+  const pathname = executionEvidencePath()
+  if (!pathname) return
+  writeEvidence(pathname, {
+    version: EVIDENCE_VERSION,
+    plugin: id,
+    nonce: APPROVAL_TRANSPORT.kind === "attended_socket" ? APPROVAL_TRANSPORT.nonce : "",
+    calls: [...executionRecords.values()],
+  }, true)
+}
 
 function writeEvidence(pathname: string, value: Record<string, unknown>, replace: boolean) {
   const directory = path.dirname(pathname)
@@ -76,6 +120,7 @@ function initializeRunEvidence() {
     nonce: APPROVAL_TRANSPORT.nonce,
   }
   writeEvidence(APPROVAL_TRANSPORT.outcomePath, { ...common, status: "no_denials" }, false)
+  writeExecutionEvidence()
 }
 
 function recordPermissionRouted() {
@@ -87,6 +132,11 @@ function recordPermissionRouted() {
     status: "ready",
   }, false)
   readinessRecorded = true
+}
+
+function recordExecution(record: ExecutionRecord) {
+  executionRecords.set(record.call_id, record)
+  writeExecutionEvidence()
 }
 
 function recordPermissionDenied(reason?: string) {
@@ -523,17 +573,19 @@ async function callGatewayQuestion(
 // ---------------------------------------------------------------------------
 
 export function makePayload(
-  sessionId: string,
-  tool: OpenCodeTool,
-  toolInput: Record<string, unknown>,
-  directory: string,
-  _worktree: string,
-  title?: string,
+    sessionId: string,
+    tool: OpenCodeTool,
+    rawArgs: Record<string, unknown>,
+    matchInput: Record<string, unknown>,
+    directory: string,
+    _worktree: string,
+    title?: string,
 ): OpenCodeHookInput {
   return {
     session_id: sessionId,
     tool_name: tool,
-    tool_input: toolInput,
+    tool_input: rawArgs,
+    tool_match_input: matchInput,
     cwd: directory,
     hook_event_name: "tool.execute.before",
     session_title: title ?? null,
@@ -624,6 +676,16 @@ async function fetchTitle(
 
 export const id = "agent-hub"
 
+export function takePermissionOwnership(config: Record<string, any>) {
+  config.permission = "allow"
+  if (!config.agent || typeof config.agent !== "object" || Array.isArray(config.agent)) return
+  for (const agent of Object.values(config.agent)) {
+    if (agent && typeof agent === "object" && !Array.isArray(agent)) {
+      (agent as Record<string, unknown>).permission = "allow"
+    }
+  }
+}
+
 export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const client = input.client
   const { directory, worktree } = input
@@ -637,9 +699,20 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
 
   async function routeTool(
     sid: string,
+    callID: string,
     toolName: string,
     args: Record<string, unknown>,
   ) {
+    if (!configInitialized) {
+      const reason = "OpenCode executed a tool before the Agent Hub config hook took permission ownership"
+      recordPermissionDenied(reason)
+      throw new Error(reason)
+    }
+    if (executionRecords.has(callID)) {
+      const reason = `OpenCode reused tool call ID '${callID}'`
+      recordPermissionDenied(reason)
+      throw new Error(reason)
+    }
     if (!registeredSessions.has(sid)) {
       registeredSessions.add(sid)
       spawnStatusReport(sid, "active")
@@ -648,7 +721,7 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     const title = await fetchTitle(client, sid, directory)
     let request
     try {
-      request = normalizeToolExecution(toolName, args)
+      request = normalizeToolExecution(toolName, args, directory, worktree)
     } catch (error) {
       const reason = String(error)
       log("ERROR", "tool normalization failed closed", { err: reason })
@@ -657,25 +730,89 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       throw error
     }
 
-    const result = await callGateway(
-      sid,
-      makePayload(sid, request.tool, request.toolInput, directory, worktree, title),
-    )
-    recordPermissionRouted()
-    if (!result.allowed) {
-      const reason = result.reason ?? "Agent Hub denied tool execution"
-      recordPermissionDenied(reason)
-      throw new Error(reason)
+    const record: ExecutionRecord = {
+      call_id: callID,
+      session_id: sid,
+      tool_name: toolName,
+      raw_args_digest: digest("agent-hub:opencode-raw-args:v1", request.rawArgs),
+      canonical_match_digests: request.matchInputs.map((input) => digest("agent-hub:opencode-match-input:v1", input)),
+      resolved_paths: request.resolvedPaths,
+      status: "routing",
     }
+    recordExecution(record)
+    for (const matchInput of request.matchInputs) {
+      const result = await callGateway(
+        sid,
+        makePayload(sid, request.tool, request.rawArgs, matchInput, directory, worktree, title),
+      )
+      recordPermissionRouted()
+      if (!result.allowed) {
+        const reason = result.reason ?? "Agent Hub denied tool execution"
+        record.status = "denied"
+        recordExecution(record)
+        recordPermissionDenied(reason)
+        throw new Error(reason)
+      }
+    }
+    if (request.postPolicyValidationError) {
+      record.status = "denied"
+      recordExecution(record)
+      recordPermissionDenied(request.postPolicyValidationError)
+      throw new Error(request.postPolicyValidationError)
+    }
+    record.status = "authorized"
+    recordExecution(record)
   }
 
   return {
     config: async (config) => {
-      config.permission = { "*": "allow" } as typeof config.permission
+      takePermissionOwnership(config as Record<string, any>)
+      configInitialized = true
+      recordPermissionRouted()
     },
 
     "tool.execute.before": async (info, output) => {
-      await routeTool(info.sessionID, info.tool, output.args as Record<string, unknown>)
+      if (isStructuredOutputTool(info.tool)) {
+        if (!configInitialized || executionRecords.has(info.callID)) {
+          const reason = `invalid StructuredOutput execution evidence for tool call '${info.callID}'`
+          recordPermissionDenied(reason)
+          throw new Error(reason)
+        }
+        recordExecution({
+          call_id: info.callID,
+          session_id: info.sessionID,
+          tool_name: info.tool,
+          raw_args_digest: digest("agent-hub:opencode-raw-args:v1", output.args),
+          canonical_match_digests: [],
+          resolved_paths: [],
+          status: "transcript_only",
+        })
+        return
+      }
+      await routeTool(info.sessionID, info.callID, info.tool, output.args as Record<string, unknown>)
+    },
+
+    "tool.execute.after": async (info) => {
+      const record = executionRecords.get(info.callID)
+      if (!record) {
+        const reason = `OpenCode completed unrouted tool call '${info.callID}'`
+        recordPermissionDenied(reason)
+        throw new Error(reason)
+      }
+      const afterDigest = digest("agent-hub:opencode-raw-args:v1", info.args)
+      if (record.session_id !== info.sessionID || record.tool_name !== info.tool || record.raw_args_digest !== afterDigest) {
+        const reason = `OpenCode before/after evidence mismatch for tool call '${info.callID}'`
+        recordPermissionDenied(reason)
+        throw new Error(reason)
+      }
+      if (record.status === "transcript_only") return
+      if (record.status !== "authorized") {
+        const reason = `OpenCode completed unauthorized tool call '${info.callID}'`
+        recordPermissionDenied(reason)
+        throw new Error(reason)
+      }
+      record.status = "completed"
+      recordExecution(record)
     },
 
     event: async ({ event: _event }) => {

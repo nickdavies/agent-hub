@@ -138,6 +138,17 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
+    /// Construct a call whose provider arguments are preserved separately from
+    /// the canonical fields consumed by policy matching.
+    pub fn from_raw_and_match_input(
+        tool: Tool,
+        raw: Value,
+        match_input: Option<Value>,
+    ) -> Result<Self, ToolCallParseError> {
+        let kind = parse_kind(&tool, match_input.as_ref().unwrap_or(&raw))?;
+        Ok(Self { kind, raw })
+    }
+
     /// The canonical tool identity derived from the typed variant.
     pub fn tool(&self) -> Tool {
         match &self.kind {
@@ -303,8 +314,7 @@ impl TryFrom<(Tool, Value)> for ToolCall {
     type Error = ToolCallParseError;
 
     fn try_from((tool, raw): (Tool, Value)) -> Result<Self, Self::Error> {
-        let kind = parse_kind(&tool, &raw)?;
-        Ok(ToolCall { kind, raw })
+        Self::from_raw_and_match_input(tool, raw, None)
     }
 }
 
@@ -599,6 +609,16 @@ mod tests {
             }
         );
         assert_eq!(tc.matchable_args(), vec!["/home/user/file.rs"]);
+    }
+
+    #[test]
+    fn opencode_raw_and_canonical_inputs_remain_separate() {
+        let raw = json!({"filePath":"relative.txt","offset":2,"providerField":true});
+        let canonical = json!({"path":"/workspace/relative.txt"});
+        let call =
+            ToolCall::from_raw_and_match_input(Tool::Read, raw.clone(), Some(canonical)).unwrap();
+        assert_eq!(call.raw_input(), &raw);
+        assert_eq!(call.matchable_args(), ["/workspace/relative.txt"]);
     }
 
     #[test]
