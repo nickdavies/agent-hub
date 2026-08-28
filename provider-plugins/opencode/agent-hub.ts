@@ -1,8 +1,8 @@
 /**
  * Agent Hub opencode plugin.
  *
- * Routes every permission.ask decision through agent-hub-gateway so that
- * opencode's tool approvals run through the same rule engine and server
+ * Routes every tool execution through agent-hub-gateway so that opencode's
+ * tool approvals run through the same rule engine and server
  * escalation path as Claude Code and Cursor.
  *
  * Environment variables (set in the shell that launches opencode):
@@ -20,8 +20,8 @@
  */
 
 import type { Hooks, Plugin, PluginInput, PluginModule } from "@opencode-ai/plugin"
-import type { Event as EventV2, PermissionRequest } from "@opencode-ai/sdk/v2"
-import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import type { Event as EventV2 } from "@opencode-ai/sdk/v2"
+import { OpencodeClient as OpencodeClientV2 } from "@opencode-ai/sdk/v2"
 import path from "path"
 import fs from "fs"
 import { spawn, spawnSync, type ChildProcess } from "child_process"
@@ -35,11 +35,12 @@ import type {
   StatusReport,
 } from "./generated/gateway-types"
 import { approvalTransport, gatewayApprovalInvocation } from "./approval-transport"
-import { normalizePermission } from "./permission-normalization"
+import { normalizeToolExecution } from "./permission-normalization"
 
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
 const EVIDENCE_VERSION = 1
 let evidenceSequence = 0
+let readinessRecorded = false
 
 function writeEvidence(pathname: string, value: Record<string, unknown>, replace: boolean) {
   const directory = path.dirname(pathname)
@@ -74,8 +75,18 @@ function initializeRunEvidence() {
     plugin: id,
     nonce: APPROVAL_TRANSPORT.nonce,
   }
-  writeEvidence(APPROVAL_TRANSPORT.readinessPath, { ...common, status: "ready" }, false)
   writeEvidence(APPROVAL_TRANSPORT.outcomePath, { ...common, status: "no_denials" }, false)
+}
+
+function recordPermissionRouted() {
+  if (APPROVAL_TRANSPORT.kind !== "attended_socket" || readinessRecorded) return
+  writeEvidence(APPROVAL_TRANSPORT.readinessPath, {
+    version: EVIDENCE_VERSION,
+    plugin: id,
+    nonce: APPROVAL_TRANSPORT.nonce,
+    status: "ready",
+  }, false)
+  readinessRecorded = true
 }
 
 function recordPermissionDenied(reason?: string) {
@@ -175,7 +186,7 @@ const statusTimers: Map<string, NodeJS.Timeout> = new Map()
 const DEBOUNCE_MS = 2000
 
 // Track sessions we've already registered on the server so the first
-// permission.ask for a new session triggers an immediate "active" report.
+// tool execution for a new session triggers an immediate "active" report.
 const registeredSessions: Set<string> = new Set()
 
 // On process exit, report all tracked sessions as ended so the dashboard
@@ -524,7 +535,7 @@ export function makePayload(
     tool_name: tool,
     tool_input: toolInput,
     cwd: directory,
-    hook_event_name: "permission.ask",
+    hook_event_name: "tool.execute.before",
     session_title: title ?? null,
   }
 }
@@ -617,92 +628,61 @@ export const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const client = input.client
   const { directory, worktree } = input
   validatePluginDirectory(directory)
-
-  // Create the v2 SDK client once at plugin-init time.  We reuse the same
-  // in-process fetch that input.client uses (extracted via the internal
-  // _client property) so that the request is routed through the Hono app
-  // handler in-process rather than making a real TCP connection.  In the
-  // default TUI mode no TCP server is started at all, so a real TCP fetch
-  // to input.serverUrl would fail with ECONNREFUSED.
-  const inProcessFetch: typeof fetch | undefined =
-    (input.client as any)?._client?.getConfig?.()?.fetch
-  if (APPROVAL_TRANSPORT.kind === "attended_socket" && !inProcessFetch) {
-    throw new Error("OpenCode runtime does not expose the in-process SDK transport required for supervised permissions")
+  const inProcessClient = (client as any)?._client
+  if (!inProcessClient) {
+    throw new Error("OpenCode runtime does not expose the in-process plugin client")
   }
-  log("INFO", "init clientV2", {
-    serverUrl: input.serverUrl.toString(),
-    hasInProcessFetch: String(!!inProcessFetch),
-  })
-  const clientV2 = createOpencodeClient({
-    baseUrl: input.serverUrl.toString(),
-    ...(inProcessFetch ? { fetch: inProcessFetch } : {}),
-  })
+  const clientV2 = new OpencodeClientV2({ client: inProcessClient })
   initializeRunEvidence()
 
-  async function routePermission(info: PermissionRequest) {
-    log("INFO", "permission.asked handler entered", { permission: info.permission ?? "?", requestId: info.id })
-    const sid = info.sessionID
-
+  async function routeTool(
+    sid: string,
+    toolName: string,
+    args: Record<string, unknown>,
+  ) {
     if (!registeredSessions.has(sid)) {
       registeredSessions.add(sid)
       spawnStatusReport(sid, "active")
     }
 
     const title = await fetchTitle(client, sid, directory)
-    let requests
+    let request
     try {
-      requests = normalizePermission(info, directory, worktree)
+      request = normalizeToolExecution(toolName, args)
     } catch (error) {
       const reason = String(error)
-      log("ERROR", "permission normalization failed closed", { err: reason })
+      log("ERROR", "tool normalization failed closed", { err: reason })
+      recordPermissionRouted()
       recordPermissionDenied(reason)
-      const reply = await clientV2.permission.reply({
-        requestID: info.id,
-        directory,
-        reply: "reject",
-        message: reason,
-      })
-      if (reply.error) throw new Error(`OpenCode permission reply failed: ${JSON.stringify(reply.error)}`)
-      return
+      throw error
     }
 
-    for (const request of requests) {
-      const result = await callGateway(
-        sid,
-        makePayload(sid, request.tool, request.toolInput, directory, worktree, title),
-      )
-      if (!result.allowed) {
-        recordPermissionDenied(result.reason ?? undefined)
-        const reply = await clientV2.permission.reply({
-          requestID: info.id,
-          directory,
-          reply: "reject",
-          message: result.reason ?? undefined,
-        })
-        if (reply.error) throw new Error(`OpenCode permission reply failed: ${JSON.stringify(reply.error)}`)
-        return
-      }
+    const result = await callGateway(
+      sid,
+      makePayload(sid, request.tool, request.toolInput, directory, worktree, title),
+    )
+    recordPermissionRouted()
+    if (!result.allowed) {
+      const reason = result.reason ?? "Agent Hub denied tool execution"
+      recordPermissionDenied(reason)
+      throw new Error(reason)
     }
-
-    const reply = await clientV2.permission.reply({
-      requestID: info.id,
-      directory,
-      reply: "once",
-    })
-    if (reply.error) throw new Error(`OpenCode permission reply failed: ${JSON.stringify(reply.error)}`)
   }
 
   return {
+    config: async (config) => {
+      config.permission = { "*": "allow" } as typeof config.permission
+    },
+
+    "tool.execute.before": async (info, output) => {
+      await routeTool(info.sessionID, info.tool, output.args as Record<string, unknown>)
+    },
+
     event: async ({ event: _event }) => {
       // The published @opencode-ai/plugin types the event hook using the v1
       // SDK Event union, which doesn't include question.* variants. Cast to
       // the v2 Event type which does; the v2 bus is what fires at runtime.
       const event = _event as unknown as EventV2
-
-      if (event.type === "permission.asked") {
-        await routePermission(event.properties)
-        return
-      }
 
       // session.status — map opencode statuses to agent-hub statuses
       if (event.type === "session.status") {

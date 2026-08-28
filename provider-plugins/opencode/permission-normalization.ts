@@ -31,6 +31,21 @@ const TOOL_NAMES: Record<string, OpenCodeTool> = {
   websearch: "WebSearch",
 }
 
+const EXECUTION_TOOL_NAMES: Record<string, OpenCodeTool> = {
+  ...TOOL_NAMES,
+  apply_patch: "Write",
+  write: "Write",
+}
+
+export function normalizeToolExecution(
+  toolName: string,
+  args: Record<string, unknown>,
+): NormalizedPermission {
+  const tool = EXECUTION_TOOL_NAMES[toolName]
+  if (!tool) throw new Error(`unsupported OpenCode tool '${toolName}'`)
+  return { tool, toolInput: structuredClone(args) }
+}
+
 function absolute(value: string, base: string): string {
   return path.isAbsolute(value) ? value : path.resolve(base, value)
 }

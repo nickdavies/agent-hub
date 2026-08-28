@@ -1,6 +1,6 @@
 # opencode-plugin-agent-hub
 
-opencode plugin that connects the `permission.ask` hook to `agent-hub-gateway`.
+opencode plugin that connects `tool.execute.before` to `agent-hub-gateway`.
 
 Every tool-use permission check opencode would normally show to the user is
 instead evaluated by the gateway's local rule engine first. Fast allow/deny
@@ -13,8 +13,8 @@ review escalates to the agent-hub server.
   workspace)
 - An `agent-hub-server` instance running (only needed for `ask`-escalated
   decisions; local allow/deny work without it)
-- opencode 1.18.18, whose `permission.asked` event and permission reply API are
-  the runtime permission integration used by this plugin
+- opencode 1.18.18, whose config and `tool.execute.before` plugin APIs are the
+  runtime permission integration used by this plugin
 
 ## Installation
 
@@ -153,11 +153,11 @@ without showing its own approval prompt.
 ## How it works
 
 ```
-opencode permission.asked event
-  └─ plugin calls agent-hub-gateway --opencode (once per pattern)
+opencode tool.execute.before hook
+  └─ plugin calls agent-hub-gateway --opencode
         └─ gateway loads ~/.config/agent-hub/agent-hub-permissions.json
-              Allow  → plugin replies "once" through the OpenCode API
-              Deny   → plugin replies "reject" through the OpenCode API
+              Allow  → plugin permits tool execution
+              Deny   → plugin rejects tool execution
               Delegate(dippy) → Dippy allow/deny → same as above
                                 Dippy ask        → gateway escalates to server
               Ask    → gateway long-polls server → allow/deny → same as above
@@ -184,7 +184,9 @@ Unknown permissions fall through to the `default` action in
 
 ## Caveats
 
-- **Reply race**: the plugin and an attached OpenCode UI can both reply to the
-  same request. Supervised headless runs do not attach an OpenCode approval UI.
+- **Permission ownership**: the plugin changes OpenCode's built-in tool
+  permissions to allow and becomes the mandatory pre-execution authorization
+  point. This avoids the non-interactive `opencode run` client auto-rejecting
+  `permission.asked` events before a remote decision can complete.
 - **Multiple patterns**: the plugin calls the gateway once per pattern in the
   `patterns` array. The first denied pattern stops evaluation immediately.

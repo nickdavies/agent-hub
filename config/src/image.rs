@@ -109,7 +109,7 @@ pub fn validate_supervised_opencode_preflight_report(
         .map_err(|error| format!("preflight returned an invalid tool manifest: {error}"))?;
     if manifest.tools.opencode != SUPERVISED_OPENCODE_VERSION {
         return Err(format!(
-            "supervised OpenCode requires runtime {SUPERVISED_OPENCODE_VERSION} with permission.asked and permission reply API support, got {}",
+            "supervised OpenCode requires runtime {SUPERVISED_OPENCODE_VERSION} with config and tool.execute.before plugin API support, got {}",
             manifest.tools.opencode
         ));
     }
@@ -709,7 +709,7 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                 1001,
             )
             .unwrap_err()
-            .contains("permission.asked")
+            .contains("tool.execute.before")
         );
     }
 

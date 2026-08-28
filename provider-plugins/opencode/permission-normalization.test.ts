@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { normalizePermission } from "./permission-normalization"
+import { normalizePermission, normalizeToolExecution } from "./permission-normalization"
 
 describe("OpenCode permission normalization", () => {
   test("normalizes every apply_patch file without dropping malformed entries", () => {
@@ -60,5 +60,14 @@ describe("OpenCode permission normalization", () => {
       .toThrow("unsupported")
     expect(() => normalizePermission({ permission: "external_directory", patterns: [], metadata: {} }, "/w", "/w"))
       .toThrow("one exact requested path")
+  })
+
+  test("routes pre-execution tool arguments without permission-event translation", () => {
+    expect(normalizeToolExecution("bash", { command: "git status" }))
+      .toEqual({ tool: "Bash", toolInput: { command: "git status" } })
+    expect(normalizeToolExecution("apply_patch", { patchText: "*** Begin Patch" }))
+      .toEqual({ tool: "Write", toolInput: { patchText: "*** Begin Patch" } })
+    expect(() => normalizeToolExecution("mcp_database_query", {}))
+      .toThrow("unsupported OpenCode tool")
   })
 })
