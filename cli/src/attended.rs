@@ -123,6 +123,7 @@ pub enum RunStatus {
 pub enum PermissionOutcome {
     NoDenials,
     Denied,
+    Cancelled,
     ReadinessFailed,
 }
 
@@ -1149,8 +1150,14 @@ pub async fn run(
         }
         .await;
         let mut operation = operation;
+        let run_cancelled = cancellation.requested()
+            || matches!(&operation, Ok(result) if result.status == ExecutionStatus::Cancelled);
+        let mut relay_cleanup = Ok(());
+        if run_cancelled && let Some(relay) = &mut attended_relay {
+            relay_cleanup = relay.stop().await;
+        }
         if let Some(relay) = &attended_relay {
-            match relay.supervision_outcome().await {
+            match relay.supervision_outcome(run_cancelled).await {
                 Ok(SupervisionOutcome::NoDenials) => {
                     captured_permission_outcome = Some(PermissionOutcome::NoDenials);
                 }
@@ -1162,6 +1169,9 @@ pub async fn run(
                         ));
                     }
                 }
+                Ok(SupervisionOutcome::Cancelled) => {
+                    captured_permission_outcome = Some(PermissionOutcome::Cancelled);
+                }
                 Err(error) => {
                     captured_permission_outcome = Some(PermissionOutcome::ReadinessFailed);
                     if operation.is_ok() {
@@ -1170,16 +1180,15 @@ pub async fn run(
                 }
             }
         }
-        let execution_outcome = attended_execution_outcome(
-            &operation,
-            cancellation.requested(),
-        );
+        let execution_outcome = attended_execution_outcome(&operation, run_cancelled);
         captured_execution_outcome = Some(execution_outcome.clone());
         drop(poll);
-        let relay_cleanup = match &mut attended_relay {
-            Some(relay) => relay.stop().await,
-            None => Ok(()),
-        };
+        if !run_cancelled {
+            relay_cleanup = match &mut attended_relay {
+                Some(relay) => relay.stop().await,
+                None => Ok(()),
+            };
+        }
         let cleanup_deadline = Deadline::new(Some(ATTENDED_CLEANUP_TIMEOUT_SECS))?;
         let egress_cleanup = match &mut prepared_egress {
             Some(prepared) => prepared.cleanup(&cleanup_deadline).await,
@@ -4328,7 +4337,7 @@ grep -qx 'ready\|ready\.' real-llm.log
             .args(docker_args)
             .output()
             .await;
-        let supervision_outcome = relay.supervision_outcome().await;
+        let supervision_outcome = relay.supervision_outcome(false).await;
         let relay_cleanup = relay.stop().await;
         let container_cleanup = agent_hub_executor::DockerCli::new(&docker)
             .remove_owned(&container_name, &ownership, Duration::from_secs(15))
@@ -4343,10 +4352,30 @@ grep -qx 'ready\|ready\.' real-llm.log
         );
         let supervision_ledger =
             std::fs::read_to_string(root.join("supervision-transitions.jsonl"))?;
+        let supervision_transitions = supervision_ledger
+            .lines()
+            .map(serde_json::from_str::<protocol::AttendedGatewayTransitionV1>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let transcript_only = supervision_transitions
+            .iter()
+            .filter(|transition| {
+                transition.transition == protocol::AttendedGatewayTransitionKind::TranscriptOnly
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !transcript_only.is_empty()
+                && transcript_only
+                    .iter()
+                    .all(|transition| transition.tool_name.as_deref() == Some("StructuredOutput")),
+            "StructuredOutput was not the sole transcript-only supervision exclusion"
+        );
         for tool in ["Read", "Write", "Bash", "WebFetch", "Task"] {
             anyhow::ensure!(
-                supervision_ledger.contains(&format!("\"tool_name\":\"{tool}\"")),
-                "host supervision ledger omitted {tool}"
+                supervision_transitions.iter().any(|transition| {
+                    transition.transition == protocol::AttendedGatewayTransitionKind::Created
+                        && transition.tool_name.as_deref() == Some(tool)
+                }),
+                "eligible tool {tool} bypassed host supervision"
             );
         }
         let opencode_log =

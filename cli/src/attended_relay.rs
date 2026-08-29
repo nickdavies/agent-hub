@@ -120,6 +120,7 @@ struct LedgerEntry {
 pub(crate) enum SupervisionOutcome {
     NoDenials,
     Denied,
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -396,18 +397,29 @@ impl AttendedRelay {
         Ok(())
     }
 
-    pub(crate) async fn supervision_outcome(&self) -> anyhow::Result<SupervisionOutcome> {
+    pub(crate) async fn supervision_outcome(
+        &self,
+        cancelled: bool,
+    ) -> anyhow::Result<SupervisionOutcome> {
         let state = self.runtime.state.lock().await;
+        supervision_outcome(&state, cancelled)
+    }
+}
+
+fn supervision_outcome(state: &RelayState, cancelled: bool) -> anyhow::Result<SupervisionOutcome> {
+    if !cancelled {
         ensure!(
             state.ready,
             "supervised OpenCode plugin never became host-ready"
         );
-        let denied = state.entries.values().any(|entry| {
-            matches!(
-                entry.status,
-                LedgerStatus::LocalDeny | LedgerStatus::RemoteDeny | LedgerStatus::RemoteCancel
-            )
-        });
+    }
+    let denied = state.entries.values().any(|entry| {
+        matches!(
+            entry.status,
+            LedgerStatus::LocalDeny | LedgerStatus::RemoteDeny | LedgerStatus::RemoteCancel
+        )
+    });
+    if !cancelled {
         for call in state.calls.values().filter(|call| !call.transcript_only) {
             let statuses = state
                 .entries
@@ -436,11 +448,14 @@ impl AttendedRelay {
                 "supervised OpenCode run has unresolved, failed, or missing routed calls"
             );
         }
-        if denied {
-            return Ok(SupervisionOutcome::Denied);
-        }
-        Ok(SupervisionOutcome::NoDenials)
     }
+    if denied {
+        return Ok(SupervisionOutcome::Denied);
+    }
+    if cancelled {
+        return Ok(SupervisionOutcome::Cancelled);
+    }
+    Ok(SupervisionOutcome::NoDenials)
 }
 
 #[cfg(unix)]
@@ -2029,13 +2044,13 @@ mod tests {
         );
         record_sandbox_transition(&runtime, &allowed).await.unwrap();
         assert!(record_sandbox_transition(&runtime, &allowed).await.is_err());
-        assert!(runtime_outcome(&runtime).await.is_err());
+        assert!(runtime_outcome(&runtime, false).await.is_err());
         let completed = transition(&runtime, protocol::AttendedGatewayTransitionKind::Completed);
         record_sandbox_transition(&runtime, &completed)
             .await
             .unwrap();
         assert_eq!(
-            runtime_outcome(&runtime).await.unwrap(),
+            runtime_outcome(&runtime, false).await.unwrap(),
             SupervisionOutcome::NoDenials
         );
         runtime.effects.finalize().unwrap();
@@ -2043,25 +2058,57 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    async fn runtime_outcome(runtime: &RelayRuntime) -> anyhow::Result<SupervisionOutcome> {
+    async fn runtime_outcome(
+        runtime: &RelayRuntime,
+        cancelled: bool,
+    ) -> anyhow::Result<SupervisionOutcome> {
         let state = runtime.state.lock().await;
-        ensure!(state.ready, "not ready");
-        if state.entries.values().any(|entry| {
-            matches!(
-                entry.status,
-                LedgerStatus::LocalDeny | LedgerStatus::RemoteDeny | LedgerStatus::RemoteCancel
-            )
-        }) {
-            return Ok(SupervisionOutcome::Denied);
-        }
-        ensure!(
-            state
-                .entries
-                .values()
-                .all(|entry| entry.status == LedgerStatus::Completed),
-            "unresolved"
+        supervision_outcome(&state, cancelled)
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_distinct_without_overriding_host_denials() {
+        let root = test_root("ledger-cancellation");
+        let runtime = ledger_runtime(&root);
+        assert_eq!(
+            runtime_outcome(&runtime, true).await.unwrap(),
+            SupervisionOutcome::Cancelled
         );
-        Ok(SupervisionOutcome::NoDenials)
+        let mut ready = transition(
+            &runtime,
+            protocol::AttendedGatewayTransitionKind::PluginReady,
+        );
+        ready.request_id = None;
+        ready.call_id = None;
+        ready.session_id = None;
+        ready.tool_name = None;
+        ready.raw_args_digest = None;
+        ready.canonical_args_digest = None;
+        ready.plugin_nonce = Some("f".repeat(32));
+        record_sandbox_transition(&runtime, &ready).await.unwrap();
+        record_sandbox_transition(
+            &runtime,
+            &transition(&runtime, protocol::AttendedGatewayTransitionKind::Created),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime_outcome(&runtime, true).await.unwrap(),
+            SupervisionOutcome::Cancelled
+        );
+        record_sandbox_transition(
+            &runtime,
+            &transition(&runtime, protocol::AttendedGatewayTransitionKind::LocalDeny),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime_outcome(&runtime, true).await.unwrap(),
+            SupervisionOutcome::Denied
+        );
+        runtime.effects.finalize().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2104,7 +2151,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            runtime_outcome(&runtime).await.unwrap(),
+            runtime_outcome(&runtime, false).await.unwrap(),
             SupervisionOutcome::Denied
         );
         runtime.effects.finalize().unwrap();
