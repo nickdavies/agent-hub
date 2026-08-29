@@ -23,7 +23,7 @@ import type { Event as EventV2 } from "@opencode-ai/sdk/v2"
 import { OpencodeClient as OpencodeClientV2 } from "@opencode-ai/sdk/v2"
 import path from "path"
 import fs from "fs"
-import { createHash } from "crypto"
+import { createHash, randomUUID } from "crypto"
 import { spawn, spawnSync, type ChildProcess } from "child_process"
 import type {
   OpenCodeHookInput,
@@ -34,12 +34,10 @@ import type {
   SessionStatus,
   StatusReport,
 } from "./generated/gateway-types"
-import { approvalTransport, gatewayApprovalInvocation } from "./approval-transport"
+import { approvalTransport, gatewayApprovalInvocation, gatewaySupervisionInvocation } from "./approval-transport"
 import { isStructuredOutputTool, normalizeToolExecution } from "./permission-normalization"
 
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
-const EVIDENCE_VERSION = 2
-let evidenceSequence = 0
 let readinessRecorded = false
 let configInitialized = false
 
@@ -48,10 +46,12 @@ interface ExecutionRecord {
   call_id: string
   session_id: string
   tool_name: string
+  runtime_tool_name: string
   raw_args_digest: string
   canonical_match_digests: string[]
   resolved_paths: string[]
   status: ExecutionStatus
+  requests: { requestID: string; canonicalDigest: string }[]
 }
 
 const executionRecords = new Map<string, ExecutionRecord>()
@@ -70,85 +70,15 @@ function digest(domain: string, value: unknown): string {
   return createHash("sha256").update(`${domain}\0`).update(JSON.stringify(canonical(value))).digest("hex")
 }
 
-function executionEvidencePath(): string | undefined {
-  if (APPROVAL_TRANSPORT.kind !== "attended_socket") return undefined
-  return path.join(path.dirname(APPROVAL_TRANSPORT.outcomePath), "tool-executions.json")
-}
-
-function writeExecutionEvidence() {
-  const pathname = executionEvidencePath()
-  if (!pathname) return
-  writeEvidence(pathname, {
-    version: EVIDENCE_VERSION,
-    plugin: id,
-    nonce: APPROVAL_TRANSPORT.kind === "attended_socket" ? APPROVAL_TRANSPORT.nonce : "",
-    calls: [...executionRecords.values()],
-  }, true)
-}
-
-function writeEvidence(pathname: string, value: Record<string, unknown>, replace: boolean) {
-  const directory = path.dirname(pathname)
-  const metadata = fs.lstatSync(directory)
-  if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) {
-    throw new Error(`run evidence directory is not private at ${directory}`)
-  }
-  const temporary = `${pathname}.${process.pid}.${evidenceSequence++}.tmp`
-  const descriptor = fs.openSync(temporary, "wx", 0o600)
-  try {
-    fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`)
-    fs.fsyncSync(descriptor)
-  } finally {
-    fs.closeSync(descriptor)
-  }
-  if (!replace && fs.existsSync(pathname)) {
-    fs.unlinkSync(temporary)
-    throw new Error(`run evidence already exists at ${pathname}`)
-  }
-  fs.renameSync(temporary, pathname)
-}
-
 function initializeRunEvidence() {
-  if (APPROVAL_TRANSPORT.kind !== "attended_socket") return
-  const directory = path.dirname(APPROVAL_TRANSPORT.readinessPath)
-  if (directory !== path.dirname(APPROVAL_TRANSPORT.outcomePath)) {
-    throw new Error("run evidence paths do not share one trusted directory")
-  }
-  fs.mkdirSync(directory, { mode: 0o700 })
-  const common = {
-    version: EVIDENCE_VERSION,
-    plugin: id,
-    nonce: APPROVAL_TRANSPORT.nonce,
-  }
-  writeEvidence(APPROVAL_TRANSPORT.outcomePath, { ...common, status: "no_denials" }, false)
-  writeExecutionEvidence()
-}
-
-function recordPermissionRouted() {
-  if (APPROVAL_TRANSPORT.kind !== "attended_socket" || readinessRecorded) return
-  writeEvidence(APPROVAL_TRANSPORT.readinessPath, {
-    version: EVIDENCE_VERSION,
-    plugin: id,
-    nonce: APPROVAL_TRANSPORT.nonce,
-    status: "ready",
-  }, false)
-  readinessRecorded = true
+  executionRecords.clear()
 }
 
 function recordExecution(record: ExecutionRecord) {
   executionRecords.set(record.call_id, record)
-  writeExecutionEvidence()
 }
 
-function recordPermissionDenied(reason?: string) {
-  if (APPROVAL_TRANSPORT.kind !== "attended_socket") return
-  writeEvidence(APPROVAL_TRANSPORT.outcomePath, {
-    version: EVIDENCE_VERSION,
-    plugin: id,
-    nonce: APPROVAL_TRANSPORT.nonce,
-    status: "denied",
-    reason: reason?.slice(0, 1024) ?? null,
-  }, true)
-}
+function recordPermissionDenied(_reason?: string) {}
 
 // ---------------------------------------------------------------------------
 // Minimal structured logger — writes to the same dev.log opencode uses.
@@ -397,15 +327,17 @@ function isValidGatewayOutput(v: unknown): v is OpenCodeHookOutput {
   return true
 }
 
-async function callGateway(sid: string, payload: OpenCodeHookInput): Promise<GatewayResult> {
-  return callGatewayOnce(sid, payload)
+type ExecutionBinding = Readonly<{ callID: string; requestID: string; rawDigest: string; canonicalDigest: string }>
+
+async function callGateway(sid: string, payload: OpenCodeHookInput, execution: ExecutionBinding): Promise<GatewayResult> {
+  return callGatewayOnce(sid, payload, execution)
 }
 
-async function callGatewayOnce(sid: string, payload: OpenCodeHookInput): Promise<GatewayResult> {
+async function callGatewayOnce(sid: string, payload: OpenCodeHookInput, execution: ExecutionBinding): Promise<GatewayResult> {
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const config = process.env.AGENT_HUB_CONFIG
 
-  const invocation = gatewayApprovalInvocation(APPROVAL_TRANSPORT, process.env)
+  const invocation = gatewayApprovalInvocation(APPROVAL_TRANSPORT, process.env, execution)
   const args = invocation.args
   if (config) args.push("--config", config)
 
@@ -463,6 +395,50 @@ async function callGatewayOnce(sid: string, payload: OpenCodeHookInput): Promise
 
     proc.stdin.end(JSON.stringify(payload))
   })
+}
+
+async function reportSupervision(transition: Record<string, unknown>): Promise<void> {
+  if (APPROVAL_TRANSPORT.kind !== "attended_socket") return
+  const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
+  const invocation = gatewaySupervisionInvocation(APPROVAL_TRANSPORT, process.env)
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn(bin, invocation.args, { stdio: ["pipe", "ignore", "pipe"], env: invocation.env })
+    let stderr = ""
+    let exceeded = false
+    proc.stderr.on("data", (chunk: Buffer) => {
+      const next = appendBounded(stderr, chunk)
+      if (next === undefined) {
+        exceeded = true
+        proc.kill("SIGKILL")
+      } else {
+        stderr = next
+      }
+    })
+    proc.on("error", reject)
+    proc.on("close", (code) => {
+      if (exceeded) return reject(new Error("supervision gateway output exceeded limit"))
+      if (code !== 0) return reject(new Error(stderr.trim() || `supervision gateway exited ${code}`))
+      resolve()
+    })
+    proc.stdin.end(JSON.stringify({
+      version: "attended_gateway_transition_v1",
+      ...JSON.parse(APPROVAL_TRANSPORT.binding),
+      ...transition,
+    }))
+  })
+}
+
+function executionTransition(record: ExecutionRecord, request: ExecutionRecord["requests"][number], transition: string) {
+  return {
+    transition,
+    request_id: request.requestID,
+    call_id: record.call_id,
+    session_id: record.session_id,
+    tool_name: record.tool_name,
+    raw_args_digest: record.raw_args_digest,
+    canonical_args_digest: request.canonicalDigest,
+    plugin_nonce: null,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +663,6 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   const clientV2 = new OpencodeClientV2({ client: inProcessClient })
   initializeRunEvidence()
   configInitialized = true
-  recordPermissionRouted()
 
   async function routeTool(
     sid: string,
@@ -699,6 +674,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       const reason = "OpenCode executed a tool before the Agent Hub config hook took permission ownership"
       recordPermissionDenied(reason)
       throw new Error(reason)
+    }
+    if (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded) {
+      throw new Error("OpenCode tool execution attempted before host supervision readiness")
     }
     if (executionRecords.has(callID)) {
       const reason = `OpenCode reused tool call ID '${callID}'`
@@ -717,7 +695,6 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     } catch (error) {
       const reason = String(error)
       log("ERROR", "tool normalization failed closed", { err: reason })
-      recordPermissionRouted()
       recordPermissionDenied(reason)
       throw error
     }
@@ -725,21 +702,36 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     const record: ExecutionRecord = {
       call_id: callID,
       session_id: sid,
-      tool_name: toolName,
+      tool_name: request.tool,
+      runtime_tool_name: toolName,
       raw_args_digest: digest("agent-hub:opencode-raw-args:v1", request.rawArgs),
       canonical_match_digests: request.matchInputs.map((input) => digest("agent-hub:opencode-match-input:v1", input)),
       resolved_paths: request.resolvedPaths,
       status: "routing",
+      requests: [],
     }
     recordExecution(record)
     for (const matchInput of request.matchInputs) {
+      const requestID = randomUUID()
+      const canonicalDigest = digest("agent-hub:opencode-match-input:v1", matchInput)
+      const execution = {
+        callID,
+        requestID,
+        rawDigest: record.raw_args_digest,
+        canonicalDigest,
+      }
+      record.requests.push({ requestID, canonicalDigest })
+      await reportSupervision(executionTransition(record, record.requests.at(-1)!, "created"))
       const result = await callGateway(
         sid,
         makePayload(sid, request.tool, request.rawArgs, matchInput, directory, worktree, title),
+        execution,
       )
-      recordPermissionRouted()
       if (!result.allowed) {
         const reason = result.reason ?? "Agent Hub denied tool execution"
+        for (const prior of record.requests.slice(0, -1)) {
+          await reportSupervision(executionTransition(record, prior, "failed"))
+        }
         record.status = "denied"
         recordExecution(record)
         recordPermissionDenied(reason)
@@ -747,6 +739,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       }
     }
     if (request.postPolicyValidationError) {
+      for (const routed of record.requests) {
+        await reportSupervision(executionTransition(record, routed, "failed"))
+      }
       record.status = "denied"
       recordExecution(record)
       recordPermissionDenied(request.postPolicyValidationError)
@@ -766,24 +761,52 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       if (response.error) {
         throw new Error(`OpenCode session permission ownership failed: ${JSON.stringify(response.error)}`)
       }
+      if (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded) {
+        await reportSupervision({
+          transition: "plugin_ready",
+          request_id: null,
+          call_id: null,
+          session_id: null,
+          tool_name: null,
+          raw_args_digest: null,
+          canonical_args_digest: null,
+          plugin_nonce: APPROVAL_TRANSPORT.nonce,
+        })
+        readinessRecorded = true
+      }
     },
 
     "tool.execute.before": async (info, output) => {
       if (isStructuredOutputTool(info.tool)) {
-        if (!configInitialized || executionRecords.has(info.callID)) {
+        if (!configInitialized
+          || (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded)
+          || executionRecords.has(info.callID)) {
           const reason = `invalid StructuredOutput execution evidence for tool call '${info.callID}'`
           recordPermissionDenied(reason)
           throw new Error(reason)
         }
-        recordExecution({
+        const record: ExecutionRecord = {
           call_id: info.callID,
           session_id: info.sessionID,
           tool_name: info.tool,
+          runtime_tool_name: info.tool,
           raw_args_digest: digest("agent-hub:opencode-raw-args:v1", output.args),
           canonical_match_digests: [],
           resolved_paths: [],
           status: "transcript_only",
+          requests: [],
+        }
+        await reportSupervision({
+          transition: "transcript_only",
+          request_id: null,
+          call_id: record.call_id,
+          session_id: record.session_id,
+          tool_name: record.tool_name,
+          raw_args_digest: record.raw_args_digest,
+          canonical_args_digest: null,
+          plugin_nonce: null,
         })
+        recordExecution(record)
         return
       }
       await routeTool(info.sessionID, info.callID, info.tool, output.args as Record<string, unknown>)
@@ -797,7 +820,12 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         throw new Error(reason)
       }
       const afterDigest = digest("agent-hub:opencode-raw-args:v1", info.args)
-      if (record.session_id !== info.sessionID || record.tool_name !== info.tool || record.raw_args_digest !== afterDigest) {
+      if (record.session_id !== info.sessionID || record.runtime_tool_name !== info.tool || record.raw_args_digest !== afterDigest) {
+        if (record.status === "authorized") {
+          for (const request of record.requests) {
+            await reportSupervision(executionTransition(record, request, "failed"))
+          }
+        }
         const reason = `OpenCode before/after evidence mismatch for tool call '${info.callID}'`
         recordPermissionDenied(reason)
         throw new Error(reason)
@@ -807,6 +835,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         const reason = `OpenCode completed unauthorized tool call '${info.callID}'`
         recordPermissionDenied(reason)
         throw new Error(reason)
+      }
+      for (const request of record.requests) {
+        await reportSupervision(executionTransition(record, request, "completed"))
       }
       record.status = "completed"
       recordExecution(record)

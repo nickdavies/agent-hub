@@ -1,7 +1,7 @@
 # Attended approval gateway v1
 
 The foreground `agent-hub local run` process is the sole owner of one Unix
-socket at host path `<run-dir>/approval-relay/approval.sock`. Docker bind-mounts
+socket below `/run/user/<uid>/agent-hub/<run-epoch>/approval.sock`. Docker bind-mounts
 the private `0700` parent read-only at `/agent-hub/approval`; the socket is
 `/agent-hub/approval/approval.sock`. The sandbox receives the
 socket path and non-secret binding values only. It never receives an approvals
@@ -32,6 +32,9 @@ URL or bearer credential.
   "network_digest": "64 lowercase hex",
   "approval_bundle_digest": "64 lowercase hex",
   "request_id": "UUID",
+  "call_id": "OpenCode call ID",
+  "raw_args_digest": "64 lowercase hex",
+  "canonical_args_digest": "64 lowercase hex",
   "approval": {
     "id": "the same UUID",
     "session_id": "...",
@@ -54,6 +57,30 @@ later than the run deadline. `tool_input_digest` is
 SHA-256 over the byte concatenation of
 `agent-hub:attended-tool-input:v1\0` and canonical compact JSON (object keys
 sorted recursively; arrays retain order) for the exact `tool_input` value.
+`raw_args_digest` and `canonical_args_digest` use the domains
+`agent-hub:opencode-raw-args:v1\0` and
+`agent-hub:opencode-match-input:v1\0` respectively.
+
+## Supervision transitions
+
+The same framed socket accepts `attended_gateway_transition_v1` messages and
+returns an exact `attended_gateway_ack_v1`. The plugin first reports
+`plugin_ready` with the run nonce after OpenCode permission ownership succeeds.
+Each capability then follows one legal monotonic path:
+
+* `created` → `local_allow` or host-recorded `remote_allow` → `completed` or `failed`
+* `created` → `local_deny`, host-recorded `remote_deny`, or host-recorded `remote_cancel`
+
+Transitions carry the complete run binding, request ID, call ID, session, tool,
+and exact raw and canonical argument digests. Duplicate, conflicting, omitted,
+or out-of-order transitions fail the relay. A sandbox cannot report remote
+decisions. `StructuredOutput` is reported separately as `transcript_only`; it
+is an explicit non-capability exclusion and has no request or canonical digest.
+
+The host writes accepted transitions to a private `0600`, `O_NOFOLLOW`, bounded,
+append-only ledger under the host run directory. This ledger is never mounted
+into the sandbox. Run success requires readiness and a terminal legal path for
+every routed call; sandbox-writable state JSON is not an authority.
 
 The network digest uses domain `agent-hub:attended-network:v1\0` over canonical
 JSON containing the authorized network class, resources, and runtime request.

@@ -43,6 +43,10 @@ fn real_gateway_cli_exchanges_one_framed_relay_decision() {
         "network_digest": "d".repeat(64),
         "approval_bundle_digest": "e".repeat(64),
     });
+    let raw_input = serde_json::json!({"opaque": true});
+    let raw_digest = protocol::opencode_raw_args_digest(&raw_input).unwrap();
+    let canonical_digest = protocol::opencode_match_input_digest(&raw_input).unwrap();
+    let request_id = Uuid::new_v4().to_string();
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hub-gateway"))
         .env_clear()
         .args([
@@ -56,6 +60,14 @@ fn real_gateway_cli_exchanges_one_framed_relay_decision() {
             &serde_json::to_string(&binding).unwrap(),
             "--approval-deadline",
             "2099-01-02T03:04:05Z",
+            "--call-id",
+            "call-golden",
+            "--request-id",
+            &request_id,
+            "--raw-args-digest",
+            &raw_digest,
+            "--canonical-args-digest",
+            &canonical_digest,
             "--config",
             config.to_str().unwrap(),
             "--timeout",
@@ -98,6 +110,7 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
         "network_digest": "d".repeat(64),
         "approval_bundle_digest": "e".repeat(64),
     });
+    let raw_digest = protocol::opencode_raw_args_digest(&serde_json::json!({})).unwrap();
     for contents in [
         r#"{"version":1,"default":"ask","rules":[],"unexpected":true}"#,
         r#"{"version":2,"default":"ask","rules":[]}"#,
@@ -107,6 +120,7 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
         r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"delegate"}]}"#,
     ] {
         let config = dir.path().join(Uuid::new_v4().to_string());
+        let request_id = Uuid::new_v4().to_string();
         std::fs::write(&config, contents).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hub-gateway"))
             .env_clear()
@@ -121,6 +135,14 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
                 &serde_json::to_string(&binding).unwrap(),
                 "--approval-deadline",
                 "2099-01-02T03:04:05Z",
+                "--call-id",
+                "call-strict",
+                "--request-id",
+                &request_id,
+                "--raw-args-digest",
+                &raw_digest,
+                "--canonical-args-digest",
+                &"b".repeat(64),
                 "--config",
                 config.to_str().unwrap(),
             ])

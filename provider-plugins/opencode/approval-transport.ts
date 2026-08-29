@@ -17,8 +17,6 @@ export type ApprovalTransport = Readonly<
     socket: string
     binding: string
     deadline: string
-    readinessPath: string
-    outcomePath: string
     nonce: string
   }
   | { kind: "http"; server: string; token?: string }
@@ -28,8 +26,6 @@ const ATTENDED_KEYS = [
   "AGENT_HUB_ATTENDED_APPROVAL_SOCKET",
   "AGENT_HUB_ATTENDED_APPROVAL_BINDING",
   "AGENT_HUB_ATTENDED_RUN_DEADLINE",
-  "AGENT_HUB_PLUGIN_READINESS_PATH",
-  "AGENT_HUB_PLUGIN_OUTCOME_PATH",
   "AGENT_HUB_PLUGIN_RUN_NONCE",
 ] as const
 
@@ -102,14 +98,6 @@ export function approvalTransport(env: ApprovalEnvironment): ApprovalTransport {
     if (!Number.isFinite(Date.parse(deadline)) || Date.parse(deadline) <= Date.now()) {
       throw new Error("AGENT_HUB_ATTENDED_RUN_DEADLINE must be a future RFC 3339 timestamp")
     }
-    const readinessPath = required(env, "AGENT_HUB_PLUGIN_READINESS_PATH")
-    const outcomePath = required(env, "AGENT_HUB_PLUGIN_OUTCOME_PATH")
-    if (readinessPath !== "/opencode/state/agent-hub/plugin-ready.json") {
-      throw new Error("AGENT_HUB_PLUGIN_READINESS_PATH is not the trusted runtime path")
-    }
-    if (outcomePath !== "/opencode/state/agent-hub/permission-outcome.json") {
-      throw new Error("AGENT_HUB_PLUGIN_OUTCOME_PATH is not the trusted runtime path")
-    }
     const nonce = required(env, "AGENT_HUB_PLUGIN_RUN_NONCE")
     if (!/^[0-9a-f]{32}$/.test(nonce)) {
       throw new Error("AGENT_HUB_PLUGIN_RUN_NONCE must be 32 lowercase hexadecimal characters")
@@ -119,8 +107,6 @@ export function approvalTransport(env: ApprovalEnvironment): ApprovalTransport {
       socket,
       binding,
       deadline,
-      readinessPath,
-      outcomePath,
       nonce,
     })
   }
@@ -140,6 +126,7 @@ export function approvalTransport(env: ApprovalEnvironment): ApprovalTransport {
 export function gatewayApprovalInvocation(
   transport: ApprovalTransport,
   inheritedEnv: ApprovalEnvironment,
+  execution?: Readonly<{ callID: string; requestID: string; rawDigest: string; canonicalDigest: string }>,
 ): { args: string[]; env: ApprovalEnvironment } {
   if (transport.kind === "http") {
     return {
@@ -157,6 +144,30 @@ export function gatewayApprovalInvocation(
     args: [
       "approval", "--opencode",
       "--approval-mode", "attended_socket",
+      "--approval-socket", transport.socket,
+      "--approval-binding", transport.binding,
+      "--approval-deadline", transport.deadline,
+      ...(execution ? [
+        "--call-id", execution.callID,
+        "--request-id", execution.requestID,
+        "--raw-args-digest", execution.rawDigest,
+        "--canonical-args-digest", execution.canonicalDigest,
+      ] : []),
+    ],
+    env,
+  }
+}
+
+export function gatewaySupervisionInvocation(
+  transport: Extract<ApprovalTransport, { kind: "attended_socket" }>,
+  inheritedEnv: ApprovalEnvironment,
+): { args: string[]; env: ApprovalEnvironment } {
+  const env = { ...inheritedEnv }
+  delete env.AGENT_HUB_APPROVAL_MODE
+  for (const name of [...ATTENDED_KEYS, ...SECRET_KEYS]) delete env[name]
+  return {
+    args: [
+      "supervision",
       "--approval-socket", transport.socket,
       "--approval-binding", transport.binding,
       "--approval-deadline", transport.deadline,

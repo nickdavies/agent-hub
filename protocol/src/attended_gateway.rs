@@ -11,9 +11,13 @@ use crate::ApprovalRequest;
 
 pub const ATTENDED_GATEWAY_REQUEST_VERSION: &str = "attended_gateway_request_v1";
 pub const ATTENDED_GATEWAY_DECISION_VERSION: &str = "attended_gateway_decision_v1";
+pub const ATTENDED_GATEWAY_TRANSITION_VERSION: &str = "attended_gateway_transition_v1";
+pub const ATTENDED_GATEWAY_ACK_VERSION: &str = "attended_gateway_ack_v1";
 pub const ATTENDED_GATEWAY_MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const ATTENDED_GATEWAY_SOCKET_PATH: &str = "/agent-hub/approval/approval.sock";
 const TOOL_INPUT_DOMAIN: &[u8] = b"agent-hub:attended-tool-input:v1\0";
+const OPENCODE_RAW_ARGS_DOMAIN: &[u8] = b"agent-hub:opencode-raw-args:v1\0";
+const OPENCODE_MATCH_INPUT_DOMAIN: &[u8] = b"agent-hub:opencode-match-input:v1\0";
 const NETWORK_DOMAIN: &[u8] = b"agent-hub:attended-network:v1\0";
 const APPROVAL_BUNDLE_DOMAIN: &[u8] = b"agent-hub:attended-approval-bundle:v2\0";
 
@@ -37,6 +41,9 @@ pub struct AttendedGatewayRequestV1 {
     #[serde(flatten)]
     pub binding: AttendedGatewayBindingV1,
     pub request_id: String,
+    pub call_id: String,
+    pub raw_args_digest: String,
+    pub canonical_args_digest: String,
     pub approval: ApprovalRequest,
     pub tool_input_digest: String,
     pub deadline: DateTime<Utc>,
@@ -64,6 +71,51 @@ pub struct AttendedGatewayDecisionV1 {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttendedGatewayTransitionKind {
+    PluginReady,
+    Created,
+    LocalAllow,
+    LocalDeny,
+    RemoteAllow,
+    RemoteDeny,
+    RemoteCancel,
+    Completed,
+    Failed,
+    TranscriptOnly,
+}
+
+/// A supervision transition sent through the host relay. Capability transitions
+/// carry a request ID and both exact argument digests. Plugin readiness and the
+/// explicit StructuredOutput exclusion use only the fields applicable to them.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedGatewayTransitionV1 {
+    pub version: String,
+    #[serde(flatten)]
+    pub binding: AttendedGatewayBindingV1,
+    pub transition: AttendedGatewayTransitionKind,
+    pub request_id: Option<String>,
+    pub call_id: Option<String>,
+    pub session_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub raw_args_digest: Option<String>,
+    pub canonical_args_digest: Option<String>,
+    pub plugin_nonce: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedGatewayAckV1 {
+    pub version: String,
+    #[serde(flatten)]
+    pub binding: AttendedGatewayBindingV1,
+    pub transition: AttendedGatewayTransitionKind,
+    pub request_id: Option<String>,
+    pub call_id: Option<String>,
+}
+
 impl AttendedGatewayRequestV1 {
     pub fn validate(
         &self,
@@ -81,6 +133,12 @@ impl AttendedGatewayRequestV1 {
         if self.approval.id != self.request_id {
             return Err("attended gateway approval ID does not match request ID".into());
         }
+        validate_execution_identity(
+            &self.request_id,
+            &self.call_id,
+            &self.raw_args_digest,
+            &self.canonical_args_digest,
+        )?;
         if self.deadline <= now {
             return Err("attended gateway request deadline has expired".into());
         }
@@ -109,9 +167,134 @@ impl AttendedGatewayRequestV1 {
     }
 }
 
+impl AttendedGatewayTransitionV1 {
+    pub fn validate(
+        &self,
+        expected: &AttendedGatewayBindingV1,
+        expected_nonce: &str,
+    ) -> Result<(), String> {
+        if self.version != ATTENDED_GATEWAY_TRANSITION_VERSION {
+            return Err("unsupported attended gateway transition version".into());
+        }
+        if &self.binding != expected {
+            return Err("attended gateway transition run binding mismatch".into());
+        }
+        validate_binding(expected)?;
+        match self.transition {
+            AttendedGatewayTransitionKind::PluginReady => {
+                if self.plugin_nonce.as_deref() != Some(expected_nonce)
+                    || self.request_id.is_some()
+                    || self.call_id.is_some()
+                    || self.session_id.is_some()
+                    || self.tool_name.is_some()
+                    || self.raw_args_digest.is_some()
+                    || self.canonical_args_digest.is_some()
+                {
+                    return Err("invalid attended gateway plugin readiness transition".into());
+                }
+            }
+            AttendedGatewayTransitionKind::TranscriptOnly => {
+                validate_common_transition(self)?;
+                if self.request_id.is_some()
+                    || self.canonical_args_digest.is_some()
+                    || self.plugin_nonce.is_some()
+                    || !matches!(
+                        self.tool_name.as_deref(),
+                        Some("StructuredOutput" | "structured_output" | "structuredoutput")
+                    )
+                {
+                    return Err("invalid attended gateway StructuredOutput exclusion".into());
+                }
+            }
+            _ => {
+                validate_common_transition(self)?;
+                validate_execution_identity(
+                    self.request_id
+                        .as_deref()
+                        .ok_or("transition request ID is missing")?,
+                    self.call_id
+                        .as_deref()
+                        .ok_or("transition call ID is missing")?,
+                    self.raw_args_digest
+                        .as_deref()
+                        .ok_or("transition raw digest is missing")?,
+                    self.canonical_args_digest
+                        .as_deref()
+                        .ok_or("transition canonical digest is missing")?,
+                )?;
+                if self.plugin_nonce.is_some() {
+                    return Err("execution transition contains a plugin nonce".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ack(&self) -> AttendedGatewayAckV1 {
+        AttendedGatewayAckV1 {
+            version: ATTENDED_GATEWAY_ACK_VERSION.into(),
+            binding: self.binding.clone(),
+            transition: self.transition,
+            request_id: self.request_id.clone(),
+            call_id: self.call_id.clone(),
+        }
+    }
+}
+
+fn validate_common_transition(transition: &AttendedGatewayTransitionV1) -> Result<(), String> {
+    for (name, value) in [
+        ("call ID", transition.call_id.as_deref()),
+        ("session ID", transition.session_id.as_deref()),
+        ("tool name", transition.tool_name.as_deref()),
+        ("raw digest", transition.raw_args_digest.as_deref()),
+    ] {
+        let value = value.ok_or_else(|| format!("transition {name} is missing"))?;
+        if value.is_empty() || value.len() > 256 || value.contains('\0') {
+            return Err(format!("transition {name} is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_execution_identity(
+    request_id: &str,
+    call_id: &str,
+    raw_args_digest: &str,
+    canonical_args_digest: &str,
+) -> Result<(), String> {
+    uuid::Uuid::parse_str(request_id)
+        .map_err(|_| "attended gateway request ID is not a UUID".to_string())?;
+    if call_id.is_empty() || call_id.len() > 256 || call_id.contains('\0') {
+        return Err("attended gateway call ID is invalid".into());
+    }
+    for (name, digest) in [
+        ("raw argument", raw_args_digest),
+        ("canonical argument", canonical_args_digest),
+    ] {
+        if !is_sha256(digest) {
+            return Err(format!("attended gateway {name} digest is invalid"));
+        }
+    }
+    Ok(())
+}
+
 pub fn tool_input_digest(input: &serde_json::Value) -> Result<String, String> {
     let bytes = canonical_json_bytes(input.clone())?;
     Ok(crate::sha256_hex_with_domain(TOOL_INPUT_DOMAIN, &bytes))
+}
+
+pub fn opencode_raw_args_digest(input: &serde_json::Value) -> Result<String, String> {
+    Ok(crate::sha256_hex_with_domain(
+        OPENCODE_RAW_ARGS_DOMAIN,
+        &canonical_json_bytes(input.clone())?,
+    ))
+}
+
+pub fn opencode_match_input_digest(input: &serde_json::Value) -> Result<String, String> {
+    Ok(crate::sha256_hex_with_domain(
+        OPENCODE_MATCH_INPUT_DOMAIN,
+        &canonical_json_bytes(input.clone())?,
+    ))
 }
 
 pub fn attended_network_digest(value: &serde_json::Value) -> Result<String, String> {
@@ -187,6 +370,13 @@ fn validate_binding(binding: &AttendedGatewayBindingV1) -> Result<(), String> {
     Ok(())
 }
 
+fn is_sha256(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn canonical_json_bytes(value: serde_json::Value) -> Result<Vec<u8>, String> {
     fn normalize(value: serde_json::Value) -> Result<serde_json::Value, String> {
         Ok(match value {
@@ -241,6 +431,9 @@ mod tests {
             version: ATTENDED_GATEWAY_REQUEST_VERSION.into(),
             binding: binding.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
+            call_id: "call-1".into(),
+            raw_args_digest: opencode_raw_args_digest(&input).unwrap(),
+            canonical_args_digest: opencode_match_input_digest(&input).unwrap(),
             approval: ApprovalRequest {
                 id: String::new(),
                 session_id: crate::SessionId::new("session"),
@@ -289,6 +482,9 @@ mod tests {
             version: ATTENDED_GATEWAY_REQUEST_VERSION.into(),
             binding: binding.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
+            call_id: "call-1".into(),
+            raw_args_digest: opencode_raw_args_digest(&input).unwrap(),
+            canonical_args_digest: opencode_match_input_digest(&input).unwrap(),
             approval: ApprovalRequest {
                 id: String::new(),
                 session_id: crate::SessionId::new("session"),
@@ -333,5 +529,48 @@ mod tests {
         let decoded: serde_json::Value = decode_attended_gateway_payload(&frame[4..]).unwrap();
         assert_eq!(decoded, value);
         assert!(decode_attended_gateway_payload::<serde_json::Value>(br#"{"z":1,"a":2}"#).is_err());
+    }
+
+    #[test]
+    fn transitions_bind_readiness_capabilities_and_structured_output_exclusion() {
+        let binding = binding();
+        let nonce = "f".repeat(32);
+        let ready = AttendedGatewayTransitionV1 {
+            version: ATTENDED_GATEWAY_TRANSITION_VERSION.into(),
+            binding: binding.clone(),
+            transition: AttendedGatewayTransitionKind::PluginReady,
+            request_id: None,
+            call_id: None,
+            session_id: None,
+            tool_name: None,
+            raw_args_digest: None,
+            canonical_args_digest: None,
+            plugin_nonce: Some(nonce.clone()),
+        };
+        ready.validate(&binding, &nonce).unwrap();
+        let mut capability = AttendedGatewayTransitionV1 {
+            version: ATTENDED_GATEWAY_TRANSITION_VERSION.into(),
+            binding: binding.clone(),
+            transition: AttendedGatewayTransitionKind::Created,
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
+            call_id: Some("call-1".into()),
+            session_id: Some("session-1".into()),
+            tool_name: Some("mcp_custom_tool".into()),
+            raw_args_digest: Some("a".repeat(64)),
+            canonical_args_digest: Some("b".repeat(64)),
+            plugin_nonce: None,
+        };
+        capability.validate(&binding, &nonce).unwrap();
+        capability.canonical_args_digest = None;
+        assert!(capability.validate(&binding, &nonce).is_err());
+
+        let exclusion = AttendedGatewayTransitionV1 {
+            transition: AttendedGatewayTransitionKind::TranscriptOnly,
+            request_id: None,
+            canonical_args_digest: None,
+            tool_name: Some("StructuredOutput".into()),
+            ..capability
+        };
+        exclusion.validate(&binding, &nonce).unwrap();
     }
 }

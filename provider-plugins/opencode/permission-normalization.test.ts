@@ -6,7 +6,7 @@ describe("OpenCode 1.18.18 execution-hook normalization", () => {
     const cases: Array<[string, Record<string, unknown>, string, Record<string, unknown>]> = [
       ["read", { filePath: "src/a.ts", offset: 2, limit: 3 }, "Read", { path: "/workspace/src/a.ts" }],
       ["write", { filePath: "src/a.ts", content: "body" }, "Write", { path: "/workspace/src/a.ts" }],
-      ["edit", { filePath: "src/a.ts", oldString: "old", newString: "new", replaceAll: true }, "Edit", {
+      ["edit", { filePath: "src/a.ts", oldString: "old", newString: "new", replaceAll: true }, "Write", {
         path: "/workspace/src/a.ts",
       }],
     ]

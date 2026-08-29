@@ -3,8 +3,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use protocol::{
-    ATTENDED_GATEWAY_DECISION_VERSION, ATTENDED_GATEWAY_MAX_FRAME_BYTES, AttendedGatewayDecisionV1,
-    AttendedGatewayRequestV1, decode_attended_gateway_payload, encode_attended_gateway_frame,
+    ATTENDED_GATEWAY_ACK_VERSION, ATTENDED_GATEWAY_DECISION_VERSION,
+    ATTENDED_GATEWAY_MAX_FRAME_BYTES, AttendedGatewayAckV1, AttendedGatewayDecisionV1,
+    AttendedGatewayRequestV1, AttendedGatewayTransitionV1, decode_attended_gateway_payload,
+    encode_attended_gateway_frame,
 };
 
 #[cfg(unix)]
@@ -29,6 +31,50 @@ where
     {
         let _ = (socket, request, timeout, cancellation);
         Err("attended approval sockets are unsupported on this platform".to_string())
+    }
+}
+
+pub(crate) async fn report_transition<F>(
+    socket: &Path,
+    transition: &AttendedGatewayTransitionV1,
+    timeout: Duration,
+    cancellation: F,
+) -> Result<(), String>
+where
+    F: Future<Output = ()>,
+{
+    #[cfg(unix)]
+    {
+        let socket_identity = validate_socket(socket)?;
+        let frame = encode_attended_gateway_frame(transition)?;
+        let exchange = exchange(socket, socket_identity, &frame);
+        tokio::pin!(exchange);
+        tokio::pin!(cancellation);
+        let response = tokio::select! {
+            result = tokio::time::timeout(timeout, &mut exchange) => match result {
+                Ok(result) => result?,
+                Err(_) => return Err("attended supervision socket timeout".to_string()),
+            },
+            _ = &mut cancellation => return Err("attended supervision socket cancellation".to_string()),
+        };
+        let ack: AttendedGatewayAckV1 =
+            decode_attended_gateway_payload(&response).map_err(|error| {
+                format!("attended supervision socket returned malformed ack: {error}")
+            })?;
+        if ack.version != ATTENDED_GATEWAY_ACK_VERSION
+            || ack.binding != transition.binding
+            || ack.transition != transition.transition
+            || ack.request_id != transition.request_id
+            || ack.call_id != transition.call_id
+        {
+            return Err("attended supervision acknowledgement mismatch or replay".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, transition, timeout, cancellation);
+        Err("attended supervision sockets are unsupported on this platform".to_string())
     }
 }
 
@@ -266,6 +312,9 @@ mod tests {
                 approval_bundle_digest: "e".repeat(64),
             },
             request_id: "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
+            call_id: "call-1".into(),
+            raw_args_digest: protocol::opencode_raw_args_digest(&tool_input).unwrap(),
+            canonical_args_digest: protocol::opencode_match_input_digest(&tool_input).unwrap(),
             approval: ApprovalRequest {
                 id: "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
                 session_id: SessionId::new("golden"),

@@ -29,8 +29,8 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::attended_relay::{
-    AttendedRelay, AttendedRelayConfig, RelaySocketLocation, host_relay_socket_location,
-    recover_attended_relay,
+    AttendedRelay, AttendedRelayConfig, RelaySocketLocation, SupervisionOutcome,
+    host_relay_socket_location, recover_attended_relay,
 };
 use crate::local::{
     ApprovedRoots, RequestedContextRoot, RequestedWorkspace, ResolvedMounts, resolve_mounts,
@@ -870,6 +870,10 @@ pub async fn run(
                     token: relay_endpoint.token.clone(),
                     docker_path: docker_path.clone(),
                     container_name: container_name.clone(),
+                    ledger_path: run_dir.join("supervision-transitions.jsonl"),
+                    plugin_nonce: plugin_run_nonce
+                        .clone()
+                        .context("supervised execution has no plugin run nonce")?,
                 },
                 &effects,
                 cancel_tx.clone(),
@@ -995,22 +999,12 @@ pub async fn run(
             let plugin_run_nonce = plugin_run_nonce
                 .as_deref()
                 .context("supervised execution has no plugin run nonce")?;
-            for (name, value) in [
-                (
-                    "AGENT_HUB_PLUGIN_READINESS_PATH",
-                    "/opencode/state/agent-hub/plugin-ready.json",
-                ),
-                (
-                    "AGENT_HUB_PLUGIN_OUTCOME_PATH",
-                    "/opencode/state/agent-hub/permission-outcome.json",
-                ),
-                ("AGENT_HUB_PLUGIN_RUN_NONCE", plugin_run_nonce),
-            ] {
-                ensure!(
-                    environment.insert(name.into(), value.into()).is_none(),
-                    "authorized environment conflicts with supervised plugin evidence variable '{name}'"
-                );
-            }
+            ensure!(
+                environment
+                    .insert("AGENT_HUB_PLUGIN_RUN_NONCE".into(), plugin_run_nonce.into())
+                    .is_none(),
+                "authorized environment conflicts with supervised plugin run nonce"
+            );
             verify_exact_relay_mount(&mounts, &relay.socket_path)?;
         }
         if !request.proposal.network_resources.is_empty() {
@@ -1151,27 +1145,31 @@ pub async fn run(
             })
             .await?;
             captured_process_status = Some(run_status_for_execution_status(&process_result.status));
-            if let Some(nonce) = plugin_run_nonce.as_deref() {
-                match verify_supervised_plugin_evidence(&state_dir, nonce) {
-                    Ok(PermissionOutcome::NoDenials) => {
-                        captured_permission_outcome = Some(PermissionOutcome::NoDenials);
-                    }
-                    Ok(PermissionOutcome::Denied) => {
-                        captured_permission_outcome = Some(PermissionOutcome::Denied);
-                        anyhow::bail!(
-                            "OpenCode process completed after a supervised permission was denied"
-                        );
-                    }
-                    Ok(PermissionOutcome::ReadinessFailed) => unreachable!(),
-                    Err(error) => {
-                        captured_permission_outcome = Some(PermissionOutcome::ReadinessFailed);
-                        return Err(error);
-                    }
-                }
-            }
             Ok(process_result)
         }
         .await;
+        let mut operation = operation;
+        if let Some(relay) = &attended_relay {
+            match relay.supervision_outcome().await {
+                Ok(SupervisionOutcome::NoDenials) => {
+                    captured_permission_outcome = Some(PermissionOutcome::NoDenials);
+                }
+                Ok(SupervisionOutcome::Denied) => {
+                    captured_permission_outcome = Some(PermissionOutcome::Denied);
+                    if operation.is_ok() {
+                        operation = Err(anyhow::anyhow!(
+                            "OpenCode process completed after a host-recorded permission denial"
+                        ));
+                    }
+                }
+                Err(error) => {
+                    captured_permission_outcome = Some(PermissionOutcome::ReadinessFailed);
+                    if operation.is_ok() {
+                        operation = Err(error);
+                    }
+                }
+            }
+        }
         let execution_outcome = attended_execution_outcome(
             &operation,
             cancellation.requested(),
@@ -2573,144 +2571,6 @@ fn run_status_for_execution_status(status: &ExecutionStatus) -> RunStatus {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PluginEvidence {
-    version: u32,
-    plugin: String,
-    nonce: String,
-    status: String,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolExecutionEvidence {
-    version: u32,
-    plugin: String,
-    nonce: String,
-    calls: Vec<ToolExecutionRecord>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolExecutionRecord {
-    call_id: String,
-    session_id: String,
-    tool_name: String,
-    raw_args_digest: String,
-    canonical_match_digests: Vec<String>,
-    resolved_paths: Vec<String>,
-    status: String,
-}
-
-fn read_plugin_evidence(path: &Path) -> anyhow::Result<PluginEvidence> {
-    let metadata = std::fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "supervised OpenCode plugin did not create {}",
-            path.display()
-        )
-    })?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 1024 * 1024,
-        "supervised OpenCode plugin evidence is not a bounded regular file"
-    );
-    serde_json::from_slice(&std::fs::read(path)?)
-        .context("supervised OpenCode plugin evidence is invalid")
-}
-
-fn verify_supervised_plugin_evidence(
-    state_dir: &Path,
-    nonce: &str,
-) -> anyhow::Result<PermissionOutcome> {
-    let evidence_dir = state_dir.join("agent-hub");
-    let directory_metadata = std::fs::symlink_metadata(&evidence_dir)
-        .context("supervised OpenCode plugin evidence directory is missing")?;
-    ensure!(
-        directory_metadata.is_dir() && !directory_metadata.file_type().is_symlink(),
-        "supervised OpenCode plugin evidence directory is not a real directory"
-    );
-    let readiness = read_plugin_evidence(&evidence_dir.join("plugin-ready.json"))?;
-    ensure!(
-        readiness.version == 2
-            && readiness.plugin == "agent-hub"
-            && readiness.nonce == nonce
-            && readiness.status == "ready"
-            && readiness.reason.is_none(),
-        "supervised OpenCode plugin readiness evidence does not match this run"
-    );
-    let outcome = read_plugin_evidence(&evidence_dir.join("permission-outcome.json"))?;
-    ensure!(
-        outcome.version == 2 && outcome.plugin == "agent-hub" && outcome.nonce == nonce,
-        "supervised OpenCode permission evidence does not match this run"
-    );
-    let executions: ToolExecutionEvidence =
-        serde_json::from_slice(&std::fs::read(evidence_dir.join("tool-executions.json"))?)
-            .context("supervised OpenCode tool execution evidence is invalid")?;
-    ensure!(
-        executions.version == 2 && executions.plugin == "agent-hub" && executions.nonce == nonce,
-        "supervised OpenCode tool execution evidence does not match this run"
-    );
-    let mut call_ids = std::collections::BTreeSet::new();
-    for call in &executions.calls {
-        ensure!(
-            !call.call_id.is_empty()
-                && !call.session_id.is_empty()
-                && !call.tool_name.is_empty()
-                && call_ids.insert(&call.call_id),
-            "supervised OpenCode tool execution IDs are missing or duplicated"
-        );
-        ensure!(
-            call.raw_args_digest.len() == 64
-                && call
-                    .raw_args_digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                && call.canonical_match_digests.iter().all(|digest| {
-                    digest.len() == 64
-                        && digest
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                }),
-            "supervised OpenCode raw/canonical execution digests are invalid"
-        );
-        ensure!(
-            call.resolved_paths.iter().all(|path| path.starts_with('/')),
-            "supervised OpenCode resolved execution paths are not absolute"
-        );
-        if call.status == "transcript_only" {
-            ensure!(
-                matches!(
-                    call.tool_name.as_str(),
-                    "StructuredOutput" | "structured_output" | "structuredoutput"
-                ) && call.canonical_match_digests.is_empty()
-                    && call.resolved_paths.is_empty(),
-                "supervised OpenCode transcript-only exclusion is invalid"
-            );
-        } else {
-            ensure!(
-                !call.canonical_match_digests.is_empty(),
-                "supervised OpenCode routed execution has no canonical digest"
-            );
-        }
-    }
-    match outcome.status.as_str() {
-        "no_denials"
-            if outcome.reason.is_none()
-                && executions.calls.iter().all(|call| {
-                    matches!(call.status.as_str(), "completed" | "transcript_only")
-                }) =>
-        {
-            Ok(PermissionOutcome::NoDenials)
-        }
-        "denied" if executions.calls.iter().any(|call| call.status == "denied") => {
-            Ok(PermissionOutcome::Denied)
-        }
-        _ => anyhow::bail!("supervised OpenCode permission evidence has invalid status"),
-    }
-}
-
 impl std::fmt::Display for FinalizationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut details = Vec::new();
@@ -3557,12 +3417,12 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AbortTask, AttendedExecutionOutcome, FinalizationError, PermissionOutcome, RelayEndpoint,
-        RelayEpochState, RunRecord, RunStatus, attended_execution_outcome, merge_execution_cleanup,
+        AbortTask, AttendedExecutionOutcome, FinalizationError, RelayEndpoint, RelayEpochState,
+        RunRecord, RunStatus, attended_execution_outcome, merge_execution_cleanup,
         network_class_within_ceiling, prepare_consumption, resolve_network_resources,
         selector_resources, serialize_pretty_bounded, verify_exact_relay_mount,
         verify_host_only_approval_environment, verify_recovery_relay_endpoint,
-        verify_supervised_plugin_evidence, verify_tool_approval,
+        verify_tool_approval,
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
@@ -3572,6 +3432,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    struct IntegrationRootCleanup(PathBuf);
+
+    impl Drop for IntegrationRootCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn supervised_tool_approval_requires_host_relay_endpoint() {
@@ -3619,117 +3487,6 @@ mod tests {
         verify_host_only_approval_environment(&environment).unwrap();
         environment.insert("AGENT_HUB_TOKEN".into(), "secret".into());
         assert!(verify_host_only_approval_environment(&environment).is_err());
-    }
-
-    #[test]
-    fn supervised_plugin_evidence_distinguishes_denial_from_process_completion() {
-        let root = std::env::current_dir()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("target")
-            .join(format!("plugin-evidence-test-{}", uuid::Uuid::new_v4()));
-        let evidence = root.join("agent-hub");
-        std::fs::create_dir_all(&evidence).unwrap();
-        let nonce = "f".repeat(32);
-        std::fs::write(
-            evidence.join("plugin-ready.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 2,
-                "plugin": "agent-hub",
-                "nonce": nonce,
-                "status": "ready"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            evidence.join("permission-outcome.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 2,
-                "plugin": "agent-hub",
-                "nonce": nonce,
-                "status": "no_denials"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            evidence.join("tool-executions.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 2,
-                "plugin": "agent-hub",
-                "nonce": nonce,
-                "calls": [{
-                    "call_id": "call-1",
-                    "session_id": "session-1",
-                    "tool_name": "read",
-                    "raw_args_digest": "a".repeat(64),
-                    "canonical_match_digests": ["b".repeat(64)],
-                    "resolved_paths": ["/workspace/file"],
-                    "status": "completed"
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            verify_supervised_plugin_evidence(&root, &nonce).unwrap(),
-            PermissionOutcome::NoDenials
-        );
-        let mut incomplete: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(evidence.join("tool-executions.json")).unwrap())
-                .unwrap();
-        incomplete["calls"][0]["status"] = serde_json::json!("authorized");
-        std::fs::write(
-            evidence.join("tool-executions.json"),
-            serde_json::to_vec(&incomplete).unwrap(),
-        )
-        .unwrap();
-        assert!(verify_supervised_plugin_evidence(&root, &nonce).is_err());
-        incomplete["calls"][0]["status"] = serde_json::json!("completed");
-        incomplete["calls"][0]["raw_args_digest"] = serde_json::json!("not-a-digest");
-        std::fs::write(
-            evidence.join("tool-executions.json"),
-            serde_json::to_vec(&incomplete).unwrap(),
-        )
-        .unwrap();
-        assert!(verify_supervised_plugin_evidence(&root, &nonce).is_err());
-        incomplete["calls"][0]["raw_args_digest"] = serde_json::json!("a".repeat(64));
-        std::fs::write(
-            evidence.join("tool-executions.json"),
-            serde_json::to_vec(&incomplete).unwrap(),
-        )
-        .unwrap();
-
-        std::fs::write(
-            evidence.join("permission-outcome.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 2,
-                "plugin": "agent-hub",
-                "nonce": nonce,
-                "status": "denied",
-                "reason": "fixture denial"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let mut executions: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(evidence.join("tool-executions.json")).unwrap())
-                .unwrap();
-        executions["calls"][0]["status"] = serde_json::json!("denied");
-        std::fs::write(
-            evidence.join("tool-executions.json"),
-            serde_json::to_vec(&executions).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            verify_supervised_plugin_evidence(&root, &nonce).unwrap(),
-            PermissionOutcome::Denied
-        );
-        std::fs::remove_file(evidence.join("plugin-ready.json")).unwrap();
-        assert!(verify_supervised_plugin_evidence(&root, &nonce).is_err());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4077,6 +3834,7 @@ exit 0
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir(&root)?;
+        let root_cleanup = IntegrationRootCleanup(root.clone());
         super::set_private_directory(&root)?;
         let bundle_dir = root.join("config");
         let data_dir = root.join("data");
@@ -4111,6 +3869,7 @@ exit 0
             approvals: HashMap<uuid::Uuid, Approval>,
             registrations: Vec<String>,
             cancellations: usize,
+            terminal_verifications: usize,
             model_calls: VecDeque<(String, serde_json::Value)>,
         }
 
@@ -4248,6 +4007,8 @@ exit 0
                             .collect::<String>();
                         response.push_str("data: [DONE]\n\n");
                         ("text/event-stream", response.into_bytes())
+                    } else if request_line.starts_with("GET /fixture-web ") {
+                        ("text/plain", b"fixture web response".to_vec())
                     } else if request_line.starts_with("POST /api/v1/hooks/approval ") {
                         let request: ApprovalRequest = match serde_json::from_slice(&body) {
                             Ok(request) => request,
@@ -4308,6 +4069,16 @@ exit 0
                         };
                         let mut state = state.lock().await;
                         if request_line.starts_with("POST ") && path.ends_with("/resolve") {
+                            let Ok(resolve) =
+                                serde_json::from_slice::<protocol::ApprovalResolveRequest>(&body)
+                            else {
+                                return;
+                            };
+                            if resolve.decision != protocol::ApprovalDecision::Cancel
+                                || resolve.message.is_some()
+                            {
+                                return;
+                            }
                             let Some(approval) = state.approvals.get_mut(&id) else {
                                 return;
                             };
@@ -4315,26 +4086,22 @@ exit 0
                             state.cancellations += 1;
                         }
                         if path.ends_with("/wait") {
-                            let Some(approval) = state.approvals.get_mut(&id) else {
+                            let Some(approval) = state.approvals.get(&id).cloned() else {
                                 return;
                             };
-                            let cancelled = matches!(approval.status, ApprovalStatus::Pending);
-                            if cancelled {
-                                approval.status = ApprovalStatus::Cancelled;
-                            }
                             let status = approval.status.clone();
-                            if cancelled {
-                                state.cancellations += 1;
-                            }
                             (
                                 "application/json",
                                 serde_json::to_vec(&ApprovalWaitResponse { status }).unwrap(),
                             )
                         } else {
-                            let Some(approval) = state.approvals.get(&id) else {
+                            let Some(approval) = state.approvals.get(&id).cloned() else {
                                 return;
                             };
-                            ("application/json", serde_json::to_vec(approval).unwrap())
+                            if approval.status.is_resolved() {
+                                state.terminal_verifications += 1;
+                            }
+                            ("application/json", serde_json::to_vec(&approval).unwrap())
                         }
                     };
                     let header = format!(
@@ -4378,7 +4145,7 @@ exit 0
                 ),
                 (
                     "webfetch".to_string(),
-                    serde_json::json!({"url":"http://host.docker.internal:1/blocked","format":"text","timeout":1}),
+                    serde_json::json!({"url":format!("http://host.docker.internal:{server_port}/fixture-web"),"format":"text","timeout":5}),
                 ),
                 (
                     "task".to_string(),
@@ -4449,17 +4216,13 @@ if ! /usr/local/bin/node -e 'import("file:///opencode/config/opencode/approval/a
   exit 1
 fi
 printf 'read fixture\n' > native-read.txt
-OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCODE_CONFIG=/opencode/config/opencode/fixture-opencode.json timeout 60 /usr/local/bin/opencode --print-logs --log-level DEBUG run --title fixture --model openai/gpt-5.6-sol 'Use Bash as instructed.' > opencode.log 2>&1
-cp /opencode/state/agent-hub/tool-executions.json foreground-gpt5-evidence.json
-rm -rf /opencode/state/agent-hub
+set +e
+OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCODE_CONFIG=/opencode/config/opencode/fixture-opencode.json timeout 10 /usr/local/bin/opencode --print-logs --log-level DEBUG run --title fixture --model openai/gpt-5.6-sol 'Use Bash as instructed.' > opencode.log 2>&1
+first_status=$?
+set -e
+test "$first_status" = 124
 OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCODE_CONFIG=/opencode/config/opencode/fixture-opencode.json timeout 60 /usr/local/bin/opencode --print-logs --log-level DEBUG run --title fixture --model openai/gpt-4.1 'Use file tools as instructed.' >> opencode.log 2>&1
-cp /opencode/state/agent-hub/tool-executions.json foreground-gpt4-evidence.json
 ! grep -q 'schema rejection' opencode.log
-test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
-test "$(jq -r '.version' /opencode/state/agent-hub/tool-executions.json)" = 2
-jq -e '.calls | length > 0 and all(.call_id != "" and .raw_args_digest != "")' /opencode/state/agent-hub/tool-executions.json >/dev/null
-jq -e '[.calls[].tool_name] | index("read") != null and index("apply_patch") != null and index("bash") != null and index("webfetch") != null and index("task") != null' foreground-gpt5-evidence.json >/dev/null
-jq -e '[.calls[].tool_name] | index("write") != null and index("edit") != null' foreground-gpt4-evidence.json >/dev/null
 test -e approved-marker
 test ! -e denied-marker
 test ! -e pending-marker
@@ -4467,11 +4230,9 @@ test "$(cat native-patch.txt)" = patched
 test "$(cat native-write.txt)" = after
 "#.to_string();
         if real_llm {
-            script.push_str(r#"rm -rf /opencode/state/agent-hub
-env -u OPENAI_API_KEY timeout 120 /usr/local/bin/opencode --print-logs --log-level DEBUG run 'Reply with exactly: ready. Do not use tools.' > real-llm.log 2>&1
+            script.push_str(r#"env -u OPENAI_API_KEY timeout 120 /usr/local/bin/opencode --print-logs --log-level DEBUG run 'Reply with exactly: ready. Do not use tools.' > real-llm.log 2>&1
 grep -qx 'ready\|ready\.' real-llm.log
 ! grep -q 'schema rejection\|UnknownError\|ProviderModelNotFoundError' real-llm.log
-test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
 "#);
         }
         let mut environment = config::supervised_opencode_runtime_env(&runner.opencode.trusted_env)
@@ -4493,18 +4254,8 @@ test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
             "AGENT_HUB_CONFIG".into(),
             "/opencode/config/opencode/approval/agent-hub-permissions.json".into(),
         );
-        environment.insert(
-            "AGENT_HUB_PLUGIN_READINESS_PATH".into(),
-            "/opencode/state/agent-hub/plugin-ready.json".into(),
-        );
-        environment.insert(
-            "AGENT_HUB_PLUGIN_OUTCOME_PATH".into(),
-            "/opencode/state/agent-hub/permission-outcome.json".into(),
-        );
-        environment.insert(
-            "AGENT_HUB_PLUGIN_RUN_NONCE".into(),
-            run_epoch.simple().to_string(),
-        );
+        let plugin_nonce = run_epoch.simple().to_string();
+        environment.insert("AGENT_HUB_PLUGIN_RUN_NONCE".into(), plugin_nonce.clone());
         environment.insert("OPENAI_API_KEY".into(), "supervised-fixture-key".into());
         super::verify_host_only_approval_environment(&environment)?;
         let mounts = vec![
@@ -4524,7 +4275,7 @@ test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
         ];
         super::verify_exact_relay_mount(&mounts, &socket.socket_path)?;
         let plan = agent_hub_executor::DockerExecutionPlan {
-            image_identity: image_id,
+            image_identity: image_id.clone(),
             container_name: container_name.clone(),
             entrypoint: "/usr/bin/sh".into(),
             command_args: vec!["-lc".into(), script],
@@ -4566,6 +4317,8 @@ test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
                 token: None,
                 docker_path: docker.clone(),
                 container_name: container_name.clone(),
+                ledger_path: root.join("supervision-transitions.jsonl"),
+                plugin_nonce: plugin_nonce.clone(),
             },
             &effects,
             tokio::sync::watch::channel(false).0,
@@ -4575,6 +4328,7 @@ test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
             .args(docker_args)
             .output()
             .await;
+        let supervision_outcome = relay.supervision_outcome().await;
         let relay_cleanup = relay.stop().await;
         let container_cleanup = agent_hub_executor::DockerCli::new(&docker)
             .remove_owned(&container_name, &ownership, Duration::from_secs(15))
@@ -4583,6 +4337,18 @@ test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
         container_cleanup?;
         effects.finalize()?;
         let output = output?;
+        anyhow::ensure!(
+            supervision_outcome? == crate::attended_relay::SupervisionOutcome::Denied,
+            "host supervision ledger did not preserve authoritative denials"
+        );
+        let supervision_ledger =
+            std::fs::read_to_string(root.join("supervision-transitions.jsonl"))?;
+        for tool in ["Read", "Write", "Bash", "WebFetch", "Task"] {
+            anyhow::ensure!(
+                supervision_ledger.contains(&format!("\"tool_name\":\"{tool}\"")),
+                "host supervision ledger omitted {tool}"
+            );
+        }
         let opencode_log =
             std::fs::read_to_string(workspace.join("opencode.log")).unwrap_or_default();
         anyhow::ensure!(
@@ -4612,13 +4378,58 @@ test "$(jq -r '.status' /opencode/state/agent-hub/plugin-ready.json)" = ready
             "pending approval was not cancelled"
         );
         anyhow::ensure!(
+            fake_state.terminal_verifications >= 1,
+            "cancelled approval did not receive terminal GET verification"
+        );
+        anyhow::ensure!(
             workspace.join("approved-marker").is_file()
                 && !workspace.join("denied-marker").exists()
                 && !workspace.join("pending-marker").exists(),
             "supervised permission decisions did not control command execution"
         );
         drop(fake_state);
-        std::fs::remove_dir_all(&root)?;
+        let evidence_commit = std::env::var("AGENT_HUB_ATTENDED_OPENCODE_EVIDENCE_COMMIT")?;
+        anyhow::ensure!(
+            evidence_commit.len() == 40
+                && evidence_commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "E2E evidence commit must be a lowercase 40-character Git SHA"
+        );
+        let plugin_digest = protocol::sha256_hex_with_domain(
+            b"agent-hub:supervised-e2e-plugin:v1\0",
+            &std::fs::read(&plugin_artifact)?,
+        );
+        let evidence = serde_json::to_vec(&serde_json::json!({
+            "status": "PASS",
+            "commit": evidence_commit,
+            "plugin_artifact_digest": plugin_digest,
+            "plugin_artifact_digest_protocol": "agent-hub:supervised-e2e-plugin:v1",
+            "image_digest": image_id,
+            "approval_bundle_digest": approval_bundle.digest,
+            "run_epoch": run_epoch,
+        }))?;
+        let evidence_path = integration_root.join(format!(
+            "PASS-supervised-opencode-{}-{}.json",
+            evidence_commit, run_epoch
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&evidence_path)?;
+            std::io::Write::write_all(&mut file, &evidence)?;
+            std::io::Write::write_all(&mut file, b"\n")?;
+            file.sync_all()?;
+            std::fs::set_permissions(&evidence_path, std::fs::Permissions::from_mode(0o400))?;
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("immutable supervised E2E evidence requires Unix");
+        drop(root_cleanup);
         Ok(())
     }
 

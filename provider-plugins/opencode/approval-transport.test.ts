@@ -11,8 +11,6 @@ const binding = JSON.stringify({
 })
 
 const readiness = {
-  AGENT_HUB_PLUGIN_READINESS_PATH: "/opencode/state/agent-hub/plugin-ready.json",
-  AGENT_HUB_PLUGIN_OUTCOME_PATH: "/opencode/state/agent-hub/permission-outcome.json",
   AGENT_HUB_PLUGIN_RUN_NONCE: "f".repeat(32),
 }
 

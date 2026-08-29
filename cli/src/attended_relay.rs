@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +25,8 @@ use uuid::Uuid;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_IN_FLIGHT_APPROVALS: usize = 16;
 const MAX_REPLAY_IDS: usize = 4096;
+const MAX_LEDGER_TRANSITIONS: usize = 32_768;
+const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const WAIT_SLICE: Duration = Duration::from_secs(60);
@@ -51,6 +55,8 @@ pub(crate) struct AttendedRelayConfig {
     pub token: Option<Secret>,
     pub docker_path: PathBuf,
     pub container_name: String,
+    pub ledger_path: PathBuf,
+    pub plugin_nonce: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +81,45 @@ struct PendingApproval {
 struct RelayState {
     request_ids: HashSet<String>,
     pending: HashMap<String, PendingApproval>,
+    ready: bool,
+    calls: HashMap<String, CallBinding>,
+    entries: HashMap<String, LedgerEntry>,
+    transitions: usize,
+    ledger_bytes: usize,
+    ledger_file: File,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CallBinding {
+    call_id: String,
+    session_id: String,
+    tool_name: String,
+    raw_args_digest: String,
+    transcript_only: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LedgerStatus {
+    Created,
+    LocalAllow,
+    LocalDeny,
+    RemoteAllow,
+    RemoteDeny,
+    RemoteCancel,
+    Completed,
+    Failed,
+}
+
+struct LedgerEntry {
+    call: CallBinding,
+    canonical_args_digest: String,
+    status: LedgerStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisionOutcome {
+    NoDenials,
+    Denied,
 }
 
 #[derive(Clone)]
@@ -251,6 +296,7 @@ impl AttendedRelay {
             .connect_timeout(HTTP_OPERATION_TIMEOUT)
             .timeout(HTTP_OPERATION_TIMEOUT)
             .build()?;
+        let ledger_file = create_private_ledger(&config.ledger_path)?;
         let runtime = RelayRuntime {
             config: config.clone(),
             endpoint,
@@ -258,6 +304,12 @@ impl AttendedRelay {
             state: Arc::new(Mutex::new(RelayState {
                 request_ids: HashSet::new(),
                 pending: HashMap::new(),
+                ready: false,
+                calls: HashMap::new(),
+                entries: HashMap::new(),
+                transitions: 0,
+                ledger_bytes: 0,
+                ledger_file,
             })),
             effects: effects.clone(),
             approvals: Arc::new(Semaphore::new(MAX_IN_FLIGHT_APPROVALS)),
@@ -343,6 +395,90 @@ impl AttendedRelay {
         );
         Ok(())
     }
+
+    pub(crate) async fn supervision_outcome(&self) -> anyhow::Result<SupervisionOutcome> {
+        let state = self.runtime.state.lock().await;
+        ensure!(
+            state.ready,
+            "supervised OpenCode plugin never became host-ready"
+        );
+        let denied = state.entries.values().any(|entry| {
+            matches!(
+                entry.status,
+                LedgerStatus::LocalDeny | LedgerStatus::RemoteDeny | LedgerStatus::RemoteCancel
+            )
+        });
+        for call in state.calls.values().filter(|call| !call.transcript_only) {
+            let statuses = state
+                .entries
+                .values()
+                .filter(|entry| &entry.call == call)
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>();
+            let call_denied = statuses.iter().any(|status| {
+                matches!(
+                    status,
+                    LedgerStatus::LocalDeny | LedgerStatus::RemoteDeny | LedgerStatus::RemoteCancel
+                )
+            });
+            ensure!(
+                statuses.iter().all(|status| {
+                    *status == LedgerStatus::Completed
+                        || call_denied
+                            && matches!(
+                                status,
+                                LedgerStatus::LocalDeny
+                                    | LedgerStatus::RemoteDeny
+                                    | LedgerStatus::RemoteCancel
+                                    | LedgerStatus::Failed
+                            )
+                }),
+                "supervised OpenCode run has unresolved, failed, or missing routed calls"
+            );
+        }
+        if denied {
+            return Ok(SupervisionOutcome::Denied);
+        }
+        Ok(SupervisionOutcome::NoDenials)
+    }
+}
+
+#[cfg(unix)]
+fn create_private_ledger(path: &Path) -> anyhow::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let parent = path.parent().context("supervision ledger has no parent")?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "supervision ledger parent is not a real directory"
+    );
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "supervision ledger parent owner mismatch"
+    );
+    ensure!(
+        metadata.permissions().mode() & 0o077 == 0,
+        "supervision ledger parent is not private"
+    );
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("create private supervision ledger {}", path.display()))?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "supervision ledger is not a regular file"
+    );
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn create_private_ledger(_path: &Path) -> anyhow::Result<File> {
+    anyhow::bail!("private supervision ledgers require Unix")
 }
 
 #[cfg(target_os = "linux")]
@@ -635,7 +771,19 @@ async fn relay_loop(
 }
 
 async fn handle_connection(mut stream: UnixStream, runtime: RelayRuntime) -> anyhow::Result<()> {
-    let request: AttendedGatewayRequestV1 = read_frame(&mut stream).await?;
+    let payload: serde_json::Value = read_frame(&mut stream).await?;
+    if payload.get("version").and_then(serde_json::Value::as_str)
+        == Some(protocol::ATTENDED_GATEWAY_TRANSITION_VERSION)
+    {
+        let transition: protocol::AttendedGatewayTransitionV1 = serde_json::from_value(payload)?;
+        transition
+            .validate(&runtime.config.binding, &runtime.config.plugin_nonce)
+            .map_err(anyhow::Error::msg)?;
+        record_sandbox_transition(&runtime, &transition).await?;
+        write_frame(&mut stream, &transition.ack()).await?;
+        return Ok(());
+    }
+    let request: AttendedGatewayRequestV1 = serde_json::from_value(payload)?;
     request
         .validate(&runtime.config.binding, Utc::now())
         .map_err(anyhow::Error::msg)?;
@@ -643,12 +791,20 @@ async fn handle_connection(mut stream: UnixStream, runtime: RelayRuntime) -> any
         request.deadline <= runtime.config.run_deadline,
         "approval deadline exceeds run deadline"
     );
+    verify_created_request(&runtime, &request).await?;
     claim_request_id(&runtime.state, &request.request_id).await?;
     let Ok(_approval_permit) = runtime.approvals.clone().try_acquire_owned() else {
         let decision = request.decision(
             AttendedGatewayDecisionKind::Deny,
             Some("approval_capacity_exhausted".into()),
         );
+        record_remote_decision(
+            &runtime,
+            &request,
+            LedgerStatus::RemoteDeny,
+            protocol::AttendedGatewayTransitionKind::RemoteDeny,
+        )
+        .await?;
         write_frame(&mut stream, &decision).await?;
         return Ok(());
     };
@@ -685,6 +841,191 @@ async fn handle_connection(mut stream: UnixStream, runtime: RelayRuntime) -> any
         write_frame(&mut stream, &decision).await?;
     }
     Ok(())
+}
+
+async fn record_sandbox_transition(
+    runtime: &RelayRuntime,
+    transition: &protocol::AttendedGatewayTransitionV1,
+) -> anyhow::Result<()> {
+    use protocol::AttendedGatewayTransitionKind as Kind;
+
+    ensure!(
+        !matches!(
+            transition.transition,
+            Kind::RemoteAllow | Kind::RemoteDeny | Kind::RemoteCancel
+        ),
+        "sandbox cannot report an authoritative remote decision"
+    );
+    let mut state = runtime.state.lock().await;
+    match transition.transition {
+        Kind::PluginReady => {
+            if state.ready {
+                return Ok(());
+            }
+            state.ready = true;
+        }
+        Kind::TranscriptOnly => {
+            ensure!(state.ready, "tool transition arrived before host readiness");
+            let call_id = transition.call_id.as_deref().expect("validated");
+            ensure!(
+                !state.calls.contains_key(call_id),
+                "duplicate or conflicting tool call ID"
+            );
+            state
+                .calls
+                .insert(call_id.to_string(), transition_call(transition, true));
+        }
+        Kind::Created => {
+            ensure!(state.ready, "tool transition arrived before host readiness");
+            let request_id = transition.request_id.as_deref().expect("validated");
+            ensure!(
+                !state.entries.contains_key(request_id),
+                "duplicate or replayed execution request ID"
+            );
+            let call_id = transition.call_id.as_deref().expect("validated");
+            let call = transition_call(transition, false);
+            if let Some(existing) = state.calls.get(call_id) {
+                ensure!(existing == &call, "conflicting tool call binding");
+            } else {
+                state.calls.insert(call_id.to_string(), call.clone());
+            }
+            let canonical = transition
+                .canonical_args_digest
+                .as_deref()
+                .expect("validated");
+            ensure!(
+                !state.entries.values().any(|entry| {
+                    entry.call == call && entry.canonical_args_digest == canonical
+                }),
+                "duplicate canonical execution binding"
+            );
+            ensure!(
+                state.entries.len() < MAX_REPLAY_IDS,
+                "host supervision call limit exceeded"
+            );
+            state.entries.insert(
+                request_id.to_string(),
+                LedgerEntry {
+                    call,
+                    canonical_args_digest: canonical.to_string(),
+                    status: LedgerStatus::Created,
+                },
+            );
+        }
+        Kind::LocalAllow | Kind::LocalDeny | Kind::Completed | Kind::Failed => {
+            let request_id = transition.request_id.as_deref().expect("validated");
+            let entry = state
+                .entries
+                .get_mut(request_id)
+                .context("execution transition omitted its created entry")?;
+            verify_transition_binding(entry, transition)?;
+            let next = match transition.transition {
+                Kind::LocalAllow if entry.status == LedgerStatus::Created => {
+                    LedgerStatus::LocalAllow
+                }
+                Kind::LocalDeny if entry.status == LedgerStatus::Created => LedgerStatus::LocalDeny,
+                Kind::Completed
+                    if matches!(
+                        entry.status,
+                        LedgerStatus::LocalAllow | LedgerStatus::RemoteAllow
+                    ) =>
+                {
+                    LedgerStatus::Completed
+                }
+                Kind::Failed
+                    if matches!(
+                        entry.status,
+                        LedgerStatus::LocalAllow | LedgerStatus::RemoteAllow
+                    ) =>
+                {
+                    LedgerStatus::Failed
+                }
+                _ => anyhow::bail!("illegal, conflicting, or replayed supervision transition"),
+            };
+            entry.status = next;
+        }
+        Kind::RemoteAllow | Kind::RemoteDeny | Kind::RemoteCancel => unreachable!(),
+    }
+    append_ledger(&mut state, transition)?;
+    Ok(())
+}
+
+fn transition_call(
+    transition: &protocol::AttendedGatewayTransitionV1,
+    transcript_only: bool,
+) -> CallBinding {
+    CallBinding {
+        call_id: transition.call_id.clone().expect("validated"),
+        session_id: transition.session_id.clone().expect("validated"),
+        tool_name: transition.tool_name.clone().expect("validated"),
+        raw_args_digest: transition.raw_args_digest.clone().expect("validated"),
+        transcript_only,
+    }
+}
+
+fn verify_transition_binding(
+    entry: &LedgerEntry,
+    transition: &protocol::AttendedGatewayTransitionV1,
+) -> anyhow::Result<()> {
+    ensure!(
+        entry.call == transition_call(transition, false)
+            && entry.canonical_args_digest
+                == transition
+                    .canonical_args_digest
+                    .as_deref()
+                    .expect("validated"),
+        "execution transition binding or digest conflict"
+    );
+    Ok(())
+}
+
+fn append_ledger(
+    state: &mut RelayState,
+    transition: &protocol::AttendedGatewayTransitionV1,
+) -> anyhow::Result<()> {
+    ensure!(
+        state.transitions < MAX_LEDGER_TRANSITIONS,
+        "host supervision transition limit exceeded"
+    );
+    let mut bytes = serde_json::to_vec(transition)?;
+    bytes.push(b'\n');
+    ensure!(
+        state.ledger_bytes.saturating_add(bytes.len()) <= MAX_LEDGER_BYTES,
+        "host supervision ledger byte limit exceeded"
+    );
+    state.ledger_file.write_all(&bytes)?;
+    state.ledger_file.sync_data()?;
+    state.transitions += 1;
+    state.ledger_bytes += bytes.len();
+    Ok(())
+}
+
+async fn verify_created_request(
+    runtime: &RelayRuntime,
+    request: &AttendedGatewayRequestV1,
+) -> anyhow::Result<()> {
+    let state = runtime.state.lock().await;
+    ensure!(state.ready, "approval arrived before host plugin readiness");
+    let entry = state
+        .entries
+        .get(&request.request_id)
+        .context("approval has no created host ledger entry")?;
+    ensure!(
+        entry.status == LedgerStatus::Created
+            && entry.call.call_id_matches(request)
+            && entry.canonical_args_digest == request.canonical_args_digest
+            && entry.call.raw_args_digest == request.raw_args_digest,
+        "approval conflicts with its host ledger entry"
+    );
+    Ok(())
+}
+
+impl CallBinding {
+    fn call_id_matches(&self, request: &AttendedGatewayRequestV1) -> bool {
+        self.call_id == request.call_id
+            && self.session_id == request.approval.session_id.to_string()
+            && self.tool_name == request.approval.tool.to_string()
+    }
 }
 
 async fn claim_request_id(state: &Mutex<RelayState>, request_id: &str) -> anyhow::Result<()> {
@@ -845,6 +1186,23 @@ async fn relay_request(
         .await
         .pending
         .remove(&request.request_id);
+    let (ledger_status, transition) = match &status {
+        ApprovalStatus::Approved { .. } => (
+            LedgerStatus::RemoteAllow,
+            protocol::AttendedGatewayTransitionKind::RemoteAllow,
+        ),
+        ApprovalStatus::Denied { .. } => (
+            LedgerStatus::RemoteDeny,
+            protocol::AttendedGatewayTransitionKind::RemoteDeny,
+        ),
+        ApprovalStatus::Cancelled | ApprovalStatus::Pending => (
+            LedgerStatus::RemoteCancel,
+            protocol::AttendedGatewayTransitionKind::RemoteCancel,
+        ),
+    };
+    record_remote_decision(&runtime, &request, ledger_status, transition)
+        .await
+        .map_err(|_| RelayFailure::Persistence)?;
     Ok(match status {
         ApprovalStatus::Approved { message } => {
             request.decision(AttendedGatewayDecisionKind::Allow, message)
@@ -857,6 +1215,37 @@ async fn relay_request(
             Some(RelayFailure::Cancelled.as_str().into()),
         ),
     })
+}
+
+async fn record_remote_decision(
+    runtime: &RelayRuntime,
+    request: &AttendedGatewayRequestV1,
+    status: LedgerStatus,
+    transition: protocol::AttendedGatewayTransitionKind,
+) -> anyhow::Result<()> {
+    let mut state = runtime.state.lock().await;
+    let entry = state
+        .entries
+        .get_mut(&request.request_id)
+        .context("remote decision has no created host ledger entry")?;
+    ensure!(
+        entry.status == LedgerStatus::Created,
+        "conflicting or replayed remote decision"
+    );
+    entry.status = status;
+    let event = protocol::AttendedGatewayTransitionV1 {
+        version: protocol::ATTENDED_GATEWAY_TRANSITION_VERSION.into(),
+        binding: request.binding.clone(),
+        transition,
+        request_id: Some(request.request_id.clone()),
+        call_id: Some(request.call_id.clone()),
+        session_id: Some(request.approval.session_id.to_string()),
+        tool_name: Some(request.approval.tool.to_string()),
+        raw_args_digest: Some(request.raw_args_digest.clone()),
+        canonical_args_digest: Some(request.canonical_args_digest.clone()),
+        plugin_nonce: None,
+    };
+    append_ledger(&mut state, &event)
 }
 
 async fn settle_remote_after_failure(
@@ -1546,6 +1935,207 @@ mod tests {
         .unwrap()
     }
 
+    fn ledger_runtime(root: &Path) -> RelayRuntime {
+        let request = gateway_request();
+        let approval_bundle = protocol::AttendedApprovalBundleIdentity {
+            name: "approval".into(),
+            digest: request.binding.approval_bundle_digest.clone(),
+            protocol: protocol::APPROVAL_BUNDLE_PROTOCOL.into(),
+            manifest_sha256: "a".repeat(64),
+            gateway_commit: "gateway".into(),
+            gateway_archive_sha256: "b".repeat(64),
+            plugin_sha256: "c".repeat(64),
+            dippy_commit: "dippy".into(),
+            dippy_archive_sha256: "d".repeat(64),
+            dippy_wheel_sha256: "e".repeat(64),
+        };
+        RelayRuntime {
+            config: AttendedRelayConfig {
+                socket_path: root.join("unused.sock"),
+                binding: request.binding,
+                approval_bundle,
+                run_deadline: Utc::now() + chrono::Duration::minutes(1),
+                server_url: "http://127.0.0.1:1".into(),
+                token: None,
+                docker_path: PathBuf::from("docker"),
+                container_name: "unused".into(),
+                ledger_path: root.join("ledger.jsonl"),
+                plugin_nonce: "f".repeat(32),
+            },
+            endpoint: Url::parse("http://127.0.0.1:1").unwrap(),
+            client: Client::new(),
+            state: Arc::new(Mutex::new(RelayState {
+                request_ids: HashSet::new(),
+                pending: HashMap::new(),
+                ready: false,
+                calls: HashMap::new(),
+                entries: HashMap::new(),
+                transitions: 0,
+                ledger_bytes: 0,
+                ledger_file: create_private_ledger(&root.join("ledger.jsonl")).unwrap(),
+            })),
+            effects: test_effects(root),
+            approvals: Arc::new(Semaphore::new(MAX_IN_FLIGHT_APPROVALS)),
+            socket_identity: SocketIdentity {
+                device: 0,
+                inode: 0,
+                uid: unsafe { libc::geteuid() },
+            },
+        }
+    }
+
+    fn transition(
+        runtime: &RelayRuntime,
+        kind: protocol::AttendedGatewayTransitionKind,
+    ) -> protocol::AttendedGatewayTransitionV1 {
+        protocol::AttendedGatewayTransitionV1 {
+            version: protocol::ATTENDED_GATEWAY_TRANSITION_VERSION.into(),
+            binding: runtime.config.binding.clone(),
+            transition: kind,
+            request_id: Some("018f0f21-76c0-7b37-a446-31f82a5e7602".into()),
+            call_id: Some("call-1".into()),
+            session_id: Some("attended-test".into()),
+            tool_name: Some("Bash".into()),
+            raw_args_digest: Some("a".repeat(64)),
+            canonical_args_digest: Some("b".repeat(64)),
+            plugin_nonce: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_ledger_enforces_readiness_monotonicity_and_completion() {
+        let root = test_root("ledger-monotonicity");
+        let runtime = ledger_runtime(&root);
+        let created = transition(&runtime, protocol::AttendedGatewayTransitionKind::Created);
+        assert!(record_sandbox_transition(&runtime, &created).await.is_err());
+        let mut ready = transition(
+            &runtime,
+            protocol::AttendedGatewayTransitionKind::PluginReady,
+        );
+        ready.request_id = None;
+        ready.call_id = None;
+        ready.session_id = None;
+        ready.tool_name = None;
+        ready.raw_args_digest = None;
+        ready.canonical_args_digest = None;
+        ready.plugin_nonce = Some("f".repeat(32));
+        record_sandbox_transition(&runtime, &ready).await.unwrap();
+        record_sandbox_transition(&runtime, &ready).await.unwrap();
+        record_sandbox_transition(&runtime, &created).await.unwrap();
+        assert!(record_sandbox_transition(&runtime, &created).await.is_err());
+        let allowed = transition(
+            &runtime,
+            protocol::AttendedGatewayTransitionKind::LocalAllow,
+        );
+        record_sandbox_transition(&runtime, &allowed).await.unwrap();
+        assert!(record_sandbox_transition(&runtime, &allowed).await.is_err());
+        assert!(runtime_outcome(&runtime).await.is_err());
+        let completed = transition(&runtime, protocol::AttendedGatewayTransitionKind::Completed);
+        record_sandbox_transition(&runtime, &completed)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime_outcome(&runtime).await.unwrap(),
+            SupervisionOutcome::NoDenials
+        );
+        runtime.effects.finalize().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn runtime_outcome(runtime: &RelayRuntime) -> anyhow::Result<SupervisionOutcome> {
+        let state = runtime.state.lock().await;
+        ensure!(state.ready, "not ready");
+        if state.entries.values().any(|entry| {
+            matches!(
+                entry.status,
+                LedgerStatus::LocalDeny | LedgerStatus::RemoteDeny | LedgerStatus::RemoteCancel
+            )
+        }) {
+            return Ok(SupervisionOutcome::Denied);
+        }
+        ensure!(
+            state
+                .entries
+                .values()
+                .all(|entry| entry.status == LedgerStatus::Completed),
+            "unresolved"
+        );
+        Ok(SupervisionOutcome::NoDenials)
+    }
+
+    #[tokio::test]
+    async fn host_ledger_rejects_forged_remote_and_conflicting_digests() {
+        let root = test_root("ledger-authority");
+        let runtime = ledger_runtime(&root);
+        let mut ready = transition(
+            &runtime,
+            protocol::AttendedGatewayTransitionKind::PluginReady,
+        );
+        ready.request_id = None;
+        ready.call_id = None;
+        ready.session_id = None;
+        ready.tool_name = None;
+        ready.raw_args_digest = None;
+        ready.canonical_args_digest = None;
+        ready.plugin_nonce = Some("f".repeat(32));
+        record_sandbox_transition(&runtime, &ready).await.unwrap();
+        let created = transition(&runtime, protocol::AttendedGatewayTransitionKind::Created);
+        record_sandbox_transition(&runtime, &created).await.unwrap();
+        let forged = transition(
+            &runtime,
+            protocol::AttendedGatewayTransitionKind::RemoteAllow,
+        );
+        assert!(record_sandbox_transition(&runtime, &forged).await.is_err());
+        let mut conflict = transition(
+            &runtime,
+            protocol::AttendedGatewayTransitionKind::LocalAllow,
+        );
+        conflict.canonical_args_digest = Some("c".repeat(64));
+        assert!(
+            record_sandbox_transition(&runtime, &conflict)
+                .await
+                .is_err()
+        );
+        record_sandbox_transition(
+            &runtime,
+            &transition(&runtime, protocol::AttendedGatewayTransitionKind::LocalDeny),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime_outcome(&runtime).await.unwrap(),
+            SupervisionOutcome::Denied
+        );
+        runtime.effects.finalize().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_ledger_rejects_symlinks_replacement_and_hard_limits() {
+        let root = test_root("ledger-bounds");
+        let target = root.join("target");
+        std::fs::write(&target, b"forged sandbox evidence").unwrap();
+        let link = root.join("ledger-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(create_private_ledger(&link).is_err());
+
+        let runtime = ledger_runtime(&root);
+        let event = transition(&runtime, protocol::AttendedGatewayTransitionKind::Created);
+        {
+            let mut state = runtime.state.blocking_lock();
+            state.transitions = MAX_LEDGER_TRANSITIONS;
+            assert!(append_ledger(&mut state, &event).is_err());
+            state.transitions = 0;
+            state.ledger_bytes = MAX_LEDGER_BYTES;
+            assert!(append_ledger(&mut state, &event).is_err());
+        }
+        runtime.effects.finalize().unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn relay_location_is_short_even_when_attended_state_root_is_long() {
@@ -1658,6 +2248,8 @@ mod tests {
                 token: None,
                 docker_path: PathBuf::from("docker"),
                 container_name: "unused".into(),
+                ledger_path: journal_root.join("supervision.jsonl"),
+                plugin_nonce: "f".repeat(32),
             },
             &effects,
             fail_closed,
@@ -1749,9 +2341,16 @@ mod tests {
 
     #[tokio::test]
     async fn replay_state_allows_concurrency_and_hard_bounds_unique_ids() {
+        let root = test_root("replay-state");
         let state = Arc::new(Mutex::new(RelayState {
             request_ids: HashSet::new(),
             pending: HashMap::new(),
+            ready: false,
+            calls: HashMap::new(),
+            entries: HashMap::new(),
+            transitions: 0,
+            ledger_bytes: 0,
+            ledger_file: create_private_ledger(&root.join("ledger.jsonl")).unwrap(),
         }));
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..64 {
@@ -1774,6 +2373,8 @@ mod tests {
                 .await
                 .is_err()
         );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn gateway_request() -> AttendedGatewayRequestV1 {
@@ -1790,6 +2391,9 @@ mod tests {
                 approval_bundle_digest: "e".repeat(64),
             },
             request_id: request_id.clone(),
+            call_id: "call-1".into(),
+            raw_args_digest: protocol::opencode_raw_args_digest(&tool_input).unwrap(),
+            canonical_args_digest: protocol::opencode_match_input_digest(&tool_input).unwrap(),
             approval: ApprovalRequest {
                 id: request_id,
                 session_id: SessionId::new("attended-test"),

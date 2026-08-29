@@ -15,7 +15,7 @@ const TOOL_NAMES: Record<string, OpenCodeTool> = {
   codesearch: "CodeSearch",
   code_search: "CodeSearch",
   doom_loop: "DoomLoop",
-  edit: "Edit",
+  edit: "Write",
   external_directory: "ExternalDirectory",
   glob: "Glob",
   grep: "Grep",

@@ -39,11 +39,14 @@ pub use attended::{
     sha256_hex_with_domain,
 };
 pub use attended_gateway::{
-    ATTENDED_GATEWAY_DECISION_VERSION, ATTENDED_GATEWAY_MAX_FRAME_BYTES,
-    ATTENDED_GATEWAY_REQUEST_VERSION, ATTENDED_GATEWAY_SOCKET_PATH, AttendedGatewayBindingV1,
-    AttendedGatewayDecisionKind, AttendedGatewayDecisionV1, AttendedGatewayRequestV1,
+    ATTENDED_GATEWAY_ACK_VERSION, ATTENDED_GATEWAY_DECISION_VERSION,
+    ATTENDED_GATEWAY_MAX_FRAME_BYTES, ATTENDED_GATEWAY_REQUEST_VERSION,
+    ATTENDED_GATEWAY_SOCKET_PATH, ATTENDED_GATEWAY_TRANSITION_VERSION, AttendedGatewayAckV1,
+    AttendedGatewayBindingV1, AttendedGatewayDecisionKind, AttendedGatewayDecisionV1,
+    AttendedGatewayRequestV1, AttendedGatewayTransitionKind, AttendedGatewayTransitionV1,
     attended_approval_bundle_digest, attended_network_digest, decode_attended_gateway_payload,
-    encode_attended_gateway_frame, tool_input_digest,
+    encode_attended_gateway_frame, opencode_match_input_digest, opencode_raw_args_digest,
+    tool_input_digest,
 };
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{

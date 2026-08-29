@@ -11,6 +11,9 @@
     "network_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "approval_bundle_digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     "request_id": "018f0f21-76c0-7b37-a446-31f82a5e7602",
+    "call_id": "call-golden",
+    "raw_args_digest": "c0b3b1729ae7870930cb1cf613c81f632096075807957d4f925444dd571aa638",
+    "canonical_args_digest": "385deef7c46fce198d6da4cd1a9556792da0037ccfe8324c52ecd3f59a3066ec",
     "approval": {
       "id": "018f0f21-76c0-7b37-a446-31f82a5e7602",
       "session_id": "golden",
@@ -25,8 +28,8 @@
     "tool_input_digest": "3d1c46a777dbf7381795aa525f8902157afbf65d897bb4ce5800d7523d7a4f99",
     "deadline": "2099-01-02T03:04:05Z"
   },
-  "request_canonical": "{\"approval\":{\"context\":{\"extra\":null,\"hook_event_name\":\"permission.ask\",\"workspace_roots\":[\"/workspace\"]},\"cwd\":\"/workspace\",\"id\":\"018f0f21-76c0-7b37-a446-31f82a5e7602\",\"provider\":\"opencode\",\"request_type\":\"tool_use\",\"session_display_name\":\"Golden\",\"session_id\":\"golden\",\"tool_input\":{\"arguments\":{\"a\":[true,null,\"é\"],\"z\":2},\"command\":\"printf hi\"},\"tool_name\":\"Bash\"},\"approval_bundle_digest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"authorization_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"deadline\":\"2099-01-02T03:04:05Z\",\"environment_bundle_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"image_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"network_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"request_id\":\"018f0f21-76c0-7b37-a446-31f82a5e7602\",\"run_epoch\":\"018f0f21-76c0-7b37-a446-31f82a5e7601\",\"tool_input_digest\":\"3d1c46a777dbf7381795aa525f8902157afbf65d897bb4ce5800d7523d7a4f99\",\"version\":\"attended_gateway_request_v1\"}",
-  "request_frame_prefix_hex": "0000043b",
+  "request_canonical": "{\"approval\":{\"context\":{\"extra\":null,\"hook_event_name\":\"permission.ask\",\"workspace_roots\":[\"/workspace\"]},\"cwd\":\"/workspace\",\"id\":\"018f0f21-76c0-7b37-a446-31f82a5e7602\",\"provider\":\"opencode\",\"request_type\":\"tool_use\",\"session_display_name\":\"Golden\",\"session_id\":\"golden\",\"tool_input\":{\"arguments\":{\"a\":[true,null,\"é\"],\"z\":2},\"command\":\"printf hi\"},\"tool_name\":\"Bash\"},\"approval_bundle_digest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"authorization_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"call_id\":\"call-golden\",\"canonical_args_digest\":\"385deef7c46fce198d6da4cd1a9556792da0037ccfe8324c52ecd3f59a3066ec\",\"deadline\":\"2099-01-02T03:04:05Z\",\"environment_bundle_digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"image_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"network_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"raw_args_digest\":\"c0b3b1729ae7870930cb1cf613c81f632096075807957d4f925444dd571aa638\",\"request_id\":\"018f0f21-76c0-7b37-a446-31f82a5e7602\",\"run_epoch\":\"018f0f21-76c0-7b37-a446-31f82a5e7601\",\"tool_input_digest\":\"3d1c46a777dbf7381795aa525f8902157afbf65d897bb4ce5800d7523d7a4f99\",\"version\":\"attended_gateway_request_v1\"}",
+  "request_frame_prefix_hex": "00000503",
   "decision": {
     "version": "attended_gateway_decision_v1",
     "run_epoch": "018f0f21-76c0-7b37-a446-31f82a5e7601",
