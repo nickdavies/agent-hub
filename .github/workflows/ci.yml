@@ -29,6 +29,15 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Verify approvals-server deployment
+        run: |
+          command -v bash
+          command -v systemd-analyze
+          bash -n deploy/approvals-server/deploy.sh
+          bash -n deploy/approvals-server/tests/deploy_test.sh
+          bash deploy/approvals-server/tests/deploy_test.sh
+          systemd-analyze verify --user deploy/approvals-server/agent-hub-approvals.service
+
   typecheck-opencode-plugin:
     runs-on: ubuntu-latest
     defaults:
