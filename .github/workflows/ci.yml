@@ -29,6 +29,41 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Verify approvals-server deployment
+        run: |
+          command -v bash
+          command -v systemd-analyze
+          bash -n deploy/approvals-server/deploy.sh
+          bash -n deploy/approvals-server/tests/deploy_test.sh
+          bash deploy/approvals-server/tests/deploy_test.sh
+          verification_binary="$HOME/.local/libexec/agent-hub-approvals/agent-hub-server"
+          if [[ -e "$verification_binary" || -L "$verification_binary" ]]; then
+            printf 'error: verification binary path already exists: %s\n' "$verification_binary" >&2
+            exit 1
+          fi
+          mkdir -p -- "${verification_binary%/*}"
+          if ! (set -o noclobber; printf '#!/usr/bin/env sh\nexit 0\n' >"$verification_binary"); then
+            printf 'error: failed to create verification binary: %s\n' "$verification_binary" >&2
+            exit 1
+          fi
+          cleanup_verification_binary() {
+            rm -f -- "$verification_binary"
+          }
+          trap cleanup_verification_binary EXIT
+          chmod 0755 "$verification_binary"
+          set +e
+          systemd-analyze verify --user deploy/approvals-server/agent-hub-approvals.service
+          verification_status=$?
+          cleanup_verification_binary
+          cleanup_status=$?
+          if ((cleanup_status == 0)); then
+            trap - EXIT
+          fi
+          if ((verification_status != 0)); then
+            exit "$verification_status"
+          fi
+          exit "$cleanup_status"
+
   typecheck-opencode-plugin:
     runs-on: ubuntu-latest
     defaults:
