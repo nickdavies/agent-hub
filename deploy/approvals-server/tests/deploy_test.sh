@@ -1273,6 +1273,30 @@ test_ci_runs_deployment_syntax_harness_and_unit_verification() {
     assert_file_contains "$workflow" \
         'systemd-analyze[[:space:]]+verify[[:space:]].*agent-hub-approvals\.service' \
         "ubuntu CI must verify the packaged systemd unit"
+    assert_file_contains "$workflow" \
+        'verification_binary="\$HOME/\.local/libexec/agent-hub-approvals/agent-hub-server"' \
+        "CI must fixture the unit's exact executable path"
+    assert_file_contains "$workflow" \
+        '\[\[.*-e.*\$verification_binary.*\|\|.*-L.*\$verification_binary.*\]\]' \
+        "CI must hard-fail rather than overwrite an existing verification binary path"
+    assert_file_contains "$workflow" \
+        'set[[:space:]]+-o[[:space:]]+noclobber.*>"\$verification_binary"' \
+        "CI must create the verification placeholder without overwriting a raced path"
+    assert_file_contains "$workflow" \
+        'chmod[[:space:]]+0755[[:space:]]+"\$verification_binary"' \
+        "CI must make the verification placeholder executable"
+    assert_file_contains "$workflow" \
+        'trap[[:space:]]+cleanup_verification_binary[[:space:]]+EXIT' \
+        "CI must register verification placeholder cleanup"
+    assert_file_contains "$workflow" \
+        'rm[[:space:]]+-f[[:space:]]+--[[:space:]]+"\$verification_binary"' \
+        "CI must remove the verification placeholder"
+    assert_file_contains "$workflow" \
+        'verification_status=\$\?' \
+        "CI must capture the systemd verification status"
+    assert_file_contains "$workflow" \
+        'exit[[:space:]]+"\$verification_status"' \
+        "CI must return the preserved systemd verification status"
 }
 
 test_service_shutdown_allows_long_poll_and_state_save() {
