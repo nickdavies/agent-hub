@@ -352,9 +352,20 @@ if [[ "$environment_existed" == true ]]; then
     echo "Preserved existing environment: ${dest_environment}"
 else
     validate_destination environment "$dest_environment"
-    mv -T -n -- "$staged_environment" "$dest_environment"
+    environment_move_failed=false
+    if ! mv -T -n -- "$staged_environment" "$dest_environment"; then
+        environment_move_failed=true
+    fi
     if [[ -e "$staged_environment" ]]; then
-        echo "error: environment appeared before commit: $dest_environment" >&2
+        if [[ -e "$dest_environment" || -L "$dest_environment" ]]; then
+            echo "error: environment appeared before commit: $dest_environment" >&2
+        else
+            echo "error: failed to install environment: $dest_environment" >&2
+        fi
+        exit 1
+    fi
+    if [[ "$environment_move_failed" == true ]]; then
+        echo "error: failed to install environment: $dest_environment" >&2
         exit 1
     fi
     staged_environment=

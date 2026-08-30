@@ -143,6 +143,9 @@ if [[ -n "${FAKE_MV_CREATE_ENV_PATH:-}" && "$*" == *'.approvals-server.env.'* &&
         >"$FAKE_MV_CREATE_ENV_PATH"
     chmod 0600 "$FAKE_MV_CREATE_ENV_PATH"
 fi
+if [[ -n "${FAKE_MV_ENV_STATUS:-}" && "$*" == *'.approvals-server.env.'* ]]; then
+    exit "$FAKE_MV_ENV_STATUS"
+fi
 exec "$REAL_MV" "$@"
 EOF
 
@@ -652,29 +655,64 @@ test_concurrent_environment_edit_survives_without_inode_replacement() {
 }
 
 test_rejects_environment_appearing_during_first_install() {
-    make_fixture absent-environment-race
+    local mv_status
+
+    for mv_status in 0 98; do
+        make_fixture "absent-environment-race-${mv_status}"
+        seed_managed_artifacts
+        destination="$fixture_config/agent-hub/approvals-server.env"
+        rm -- "$destination"
+        export FAKE_MV_CREATE_ENV_PATH="$destination"
+        export FAKE_MV_CREATE_ENV_CONTENT='OPERATOR_SETTING=appeared-during-deployment'
+        export FAKE_MV_ENV_STATUS="$mv_status"
+        run_deploy "$fixture_repo"
+        unset FAKE_MV_CREATE_ENV_PATH
+        unset FAKE_MV_CREATE_ENV_CONTENT
+        unset FAKE_MV_ENV_STATUS
+
+        [[ "$deploy_status" -ne 0 ]] || fail "environment appearing during first install must hard-fail"
+        [[ -e "$fixture/mv-env-hook-ran" ]] || fail "absent-environment race hook must run"
+        assert_output_contains 'environment appeared before commit' \
+            "absent-environment race failure should explain the conflict"
+        assert_eq 'OPERATOR_SETTING=appeared-during-deployment' "$(<"$destination")" \
+            "deployment must not overwrite an environment that appears during first install"
+        assert_eq 600 "$(stat -c %a "$destination")" \
+            "deployment must not alter the appearing environment mode"
+        assert_eq 'installed-binary' \
+            "$(<"$fixture_home/.local/libexec/agent-hub-approvals/agent-hub-server")" \
+            "absent-environment race must preserve the installed binary"
+        assert_eq 'installed-unit' "$(<"$fixture_config/systemd/user/agent-hub-approvals.service")" \
+            "absent-environment race must preserve the installed unit"
+        if compgen -G "$fixture_config/agent-hub/.approvals-server.env.*" >/dev/null; then
+            fail "absent-environment race must clean the staged environment"
+        fi
+    done
+}
+
+test_reports_environment_move_failure_without_a_destination_conflict() {
+    make_fixture environment-move-failure
     seed_managed_artifacts
     destination="$fixture_config/agent-hub/approvals-server.env"
     rm -- "$destination"
-    export FAKE_MV_CREATE_ENV_PATH="$destination"
-    export FAKE_MV_CREATE_ENV_CONTENT='OPERATOR_SETTING=appeared-during-deployment'
+    export FAKE_MV_ENV_STATUS=98
     run_deploy "$fixture_repo"
-    unset FAKE_MV_CREATE_ENV_PATH
-    unset FAKE_MV_CREATE_ENV_CONTENT
+    unset FAKE_MV_ENV_STATUS
 
-    [[ "$deploy_status" -ne 0 ]] || fail "environment appearing during first install must hard-fail"
-    [[ -e "$fixture/mv-env-hook-ran" ]] || fail "absent-environment race hook must run"
-    assert_output_contains 'environment appeared before commit' \
-        "absent-environment race failure should explain the conflict"
-    assert_eq 'OPERATOR_SETTING=appeared-during-deployment' "$(<"$destination")" \
-        "deployment must not overwrite an environment that appears during first install"
-    assert_eq 600 "$(stat -c %a "$destination")" \
-        "deployment must not alter the appearing environment mode"
+    [[ "$deploy_status" -ne 0 ]] || fail "environment move failure must hard-fail"
+    assert_output_contains 'failed to install environment' \
+        "environment move failure should explain the failed operation"
+    if grep -Eqi 'environment appeared before commit' <<<"$deploy_output"; then
+        fail "environment move failure without a destination must not report a conflict"
+    fi
+    [[ ! -e "$destination" ]] || fail "failed environment move must not create the destination"
     assert_eq 'installed-binary' \
         "$(<"$fixture_home/.local/libexec/agent-hub-approvals/agent-hub-server")" \
-        "absent-environment race must preserve the installed binary"
+        "environment move failure must preserve the installed binary"
     assert_eq 'installed-unit' "$(<"$fixture_config/systemd/user/agent-hub-approvals.service")" \
-        "absent-environment race must preserve the installed unit"
+        "environment move failure must preserve the installed unit"
+    if compgen -G "$fixture_config/agent-hub/.approvals-server.env.*" >/dev/null; then
+        fail "environment move failure must clean the staged environment"
+    fi
 }
 
 test_existing_parent_directory_modes_are_preserved() {
@@ -1309,6 +1347,7 @@ run_test 'rejects an environment directory race' test_rejects_environment_direct
 run_test 'rejects a non-0600 existing environment before build' test_rejects_existing_environment_with_nonrestrictive_mode_before_build
 run_test 'preserves a concurrent regular-file environment edit' test_concurrent_environment_edit_survives_without_inode_replacement
 run_test 'rejects an environment appearing during first install' test_rejects_environment_appearing_during_first_install
+run_test 'reports an environment move failure without a conflict' test_reports_environment_move_failure_without_a_destination_conflict
 run_test 'preserves existing parent directory modes' test_existing_parent_directory_modes_are_preserved
 run_test 'preserves the binary when config staging fails' test_config_staging_failure_preserves_installed_binary
 run_test 'preserves the binary when unit staging fails' test_unit_staging_failure_preserves_installed_binary
