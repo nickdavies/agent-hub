@@ -2198,12 +2198,23 @@ fn classify_repo_source(entry: &str) -> RepoSourceKind {
     }
 }
 
-fn canonical_approved_repository_roots(
+fn canonical_repository_roots(
     local_agent_config: &LocalAgentConfig,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    if local_agent_config.approved_repository_roots.is_empty() {
+    let configured_roots = local_agent_config
+        .root_registry
+        .roots
+        .iter()
+        .filter(|root| {
+            root.roles.contains(&agent_hub_config::RootRole::ContextRo)
+                && root
+                    .roles
+                    .contains(&agent_hub_config::RootRole::GitMetadata)
+        })
+        .collect::<Vec<_>>();
+    if configured_roots.is_empty() {
         anyhow::bail!(
-            "assignment-driven triage requires explicit approved_repository_roots in local-agent config"
+            "assignment-driven triage requires a root_registry entry with context_ro and git_metadata"
         );
     }
 
@@ -2213,8 +2224,9 @@ fn canonical_approved_repository_roots(
         .transpose()
         .context("canonicalize HOME")?;
     let mut roots = Vec::new();
-    for configured_root in &local_agent_config.approved_repository_roots {
-        let expanded = expand_home_path(&configured_root.to_string_lossy()).with_context(|| {
+    for configured in configured_roots {
+        let configured_root = Path::new(&configured.path);
+        let expanded = expand_home_path(&configured.path).with_context(|| {
             format!(
                 "expand approved repository root {}",
                 configured_root.display()
@@ -2302,7 +2314,7 @@ fn validate_local_repo_dir(raw_dir: &str, approved_roots: &[PathBuf]) -> anyhow:
 
     if !approved_roots.iter().any(|root| host_dir.starts_with(root)) {
         anyhow::bail!(
-            "triage_repos entry '{}' canonicalized to '{}' outside approved_repository_roots",
+            "triage_repos entry '{}' canonicalized to '{}' outside root_registry",
             raw_dir,
             host_dir.display()
         );
@@ -2387,14 +2399,11 @@ fn validate_triage_repos_and_prime_cache(
     repo_cache_dir: &Path,
 ) -> anyhow::Result<Vec<String>> {
     if local_agent_config.triage_repos.is_empty() {
-        if !local_agent_config.approved_repository_roots.is_empty() {
-            anyhow::bail!("approved_repository_roots must be empty when triage_repos is empty");
-        }
         std::fs::create_dir_all(repo_cache_dir)
             .with_context(|| format!("create repo cache directory {}", repo_cache_dir.display()))?;
         return Ok(Vec::new());
     }
-    let approved_roots = canonical_approved_repository_roots(local_agent_config)?;
+    let approved_roots = canonical_repository_roots(local_agent_config)?;
     std::fs::create_dir_all(repo_cache_dir)
         .with_context(|| format!("create repo cache directory {}", repo_cache_dir.display()))?;
 
@@ -2421,7 +2430,7 @@ fn configured_repo_discovery_mounts(
     repo_cache_dir: &Path,
 ) -> anyhow::Result<Vec<protocol::orchestration::PlannedFileMount>> {
     let mut mounts = Vec::new();
-    let approved_roots = canonical_approved_repository_roots(local_agent_config)?;
+    let approved_roots = canonical_repository_roots(local_agent_config)?;
     let mut canonical_sources = Vec::new();
     let mut aliases = HashSet::new();
 
@@ -2511,6 +2520,25 @@ fn approval_mode_from_job_context(context: &serde_json::Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set_root_registry(config: &mut LocalAgentConfig, roots: Vec<PathBuf>) {
+        config.root_registry = agent_hub_config::RootRegistryConfig {
+            roots: roots
+                .into_iter()
+                .enumerate()
+                .map(|(index, path)| agent_hub_config::RootConfig {
+                    identity: format!("test-{index}"),
+                    path: path.to_string_lossy().into_owned(),
+                    roles: vec![
+                        agent_hub_config::RootRole::WorkspaceRo,
+                        agent_hub_config::RootRole::WorkspaceRw,
+                        agent_hub_config::RootRole::ContextRo,
+                        agent_hub_config::RootRole::GitMetadata,
+                    ],
+                })
+                .collect(),
+        };
+    }
 
     #[test]
     fn runner_preparation_requires_explicit_applied_running_transition() {
@@ -3188,12 +3216,12 @@ mod tests {
 
         let mut remote = LocalAgentConfig::default();
         remote.triage_repos = vec!["https://github.com/reddit/agent-hub.git".to_string()];
-        remote.approved_repository_roots = vec![approved.clone()];
+        set_root_registry(&mut remote, vec![approved.clone()]);
         assert!(validate_triage_repos_and_prime_cache(&remote, &cache).is_err());
 
         let mut local = LocalAgentConfig::default();
         local.triage_repos = vec![repo.to_string_lossy().into_owned()];
-        local.approved_repository_roots = vec![approved];
+        set_root_registry(&mut local, vec![approved]);
         assert!(
             validate_triage_repos_and_prime_cache(&local, &cache)
                 .expect("local pre-materialized repo")
@@ -3231,7 +3259,7 @@ mod tests {
             config_root.join("local-agent.json"),
             serde_json::to_vec(&serde_json::json!({
                 "triage_repos":[repo.clone()],
-                "approved_repository_roots":[repos],
+                "root_registry":{"roots":[{"identity":"repos","path":repos,"roles":["context_ro","git_metadata"]}]},
                 "triage_mounts":[{"host_path":repo.clone(),"container_path":"/repos/agent-hub","read_only":true}]
             }))
             .unwrap(),
@@ -3241,7 +3269,7 @@ mod tests {
         let expected_mounts = mounts.clone();
         let mut worker_config = LocalAgentConfig::default();
         worker_config.triage_repos = vec![repo.to_string_lossy().into_owned()];
-        worker_config.approved_repository_roots = vec![repos];
+        set_root_registry(&mut worker_config, vec![repos]);
         validate_triage_repos_and_prime_cache(&worker_config, &root.join("cache")).unwrap();
         let job = triage_validation_tests::triage_job();
         let mut runtime = canonical_runtime_spec_for_job(&job);
@@ -3292,7 +3320,7 @@ mod tests {
         }
 
         let mut config = LocalAgentConfig::default();
-        config.approved_repository_roots = vec![approved.clone()];
+        set_root_registry(&mut config, vec![approved.clone()]);
 
         config.triage_repos = vec![other_repo.to_string_lossy().into_owned()];
         assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
@@ -3300,11 +3328,11 @@ mod tests {
         config.triage_repos = vec![non_repo.to_string_lossy().into_owned()];
         assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
 
-        config.approved_repository_roots = vec![PathBuf::from("/etc")];
+        set_root_registry(&mut config, vec![PathBuf::from("/etc")]);
         config.triage_repos = vec!["/etc".to_string()];
         assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
 
-        config.approved_repository_roots = vec![approved.clone(), other_parent.clone()];
+        set_root_registry(&mut config, vec![approved.clone(), other_parent.clone()]);
         config.triage_repos = vec![
             repo.to_string_lossy().into_owned(),
             other_repo.to_string_lossy().into_owned(),
@@ -3313,9 +3341,9 @@ mod tests {
 
         let credential_root = tmp.join(".ssh");
         std::fs::create_dir_all(&credential_root).expect("create credential directory");
-        config.approved_repository_roots = vec![credential_root];
+        set_root_registry(&mut config, vec![credential_root]);
         config.triage_repos.clear();
-        assert!(canonical_approved_repository_roots(&config).is_err());
+        assert!(canonical_repository_roots(&config).is_err());
 
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -3339,7 +3367,7 @@ mod tests {
         symlink(&outside, &escaped).expect("create symlink");
 
         let mut config = LocalAgentConfig::default();
-        config.approved_repository_roots = vec![approved];
+        set_root_registry(&mut config, vec![approved]);
         config.triage_repos = vec![escaped.to_string_lossy().into_owned()];
         assert!(configured_repo_discovery_mounts(&config, &tmp.join("cache")).is_err());
 
@@ -5614,7 +5642,7 @@ mod tests {
         effects.hash(&mut hasher);
         assert_eq!(
             hasher.finish(),
-            3_378_904_046_597_755_744,
+            17_721_786_516_293_513_204,
             "external-effect source inventory changed; audit every changed helper and update the reviewed fingerprint"
         );
     }
@@ -13205,7 +13233,7 @@ fn validate_untrusted_runtime_mounts(
     if runtime.environment.file_mounts.is_empty() {
         return Ok(Vec::new());
     }
-    let approved_roots = canonical_approved_repository_roots(config)?;
+    let approved_roots = canonical_repository_roots(config)?;
     let mut normalized = Vec::new();
     for mount in &runtime.environment.file_mounts {
         let configured_host = Path::new(&mount.host_path);
@@ -13235,7 +13263,7 @@ fn validate_untrusted_runtime_mounts(
         }
         if !approved_roots.iter().any(|root| host.starts_with(root)) {
             anyhow::bail!(
-                "untrusted mount host source '{}' is outside approved_repository_roots",
+                "untrusted mount host source '{}' is outside root_registry",
                 host.display()
             );
         }
@@ -14703,10 +14731,10 @@ mod github_action_tests {
             "GH_CONFIG_DIR",
             "AGENT_HUB_GITHUB_TOKEN",
         ] {
-            let credentials = ResolvedCredentials {
-                env_vars: HashMap::from([(name.to_string(), TOKEN.to_string())]),
-                ..Default::default()
-            };
+            let mut credentials = ResolvedCredentials::default();
+            credentials
+                .env_vars
+                .insert(name.to_string(), TOKEN.to_string());
             let error = validate_general_job_credentials(&credentials).unwrap_err();
             assert!(!format!("{error:#}").contains(TOKEN));
         }
@@ -15232,17 +15260,16 @@ mod github_action_tests {
 
         let temp = std::env::temp_dir().join(format!("github-cred-{}", uuid::Uuid::new_v4()));
         std::fs::write(&temp, TOKEN).unwrap();
-        let credentials = ResolvedCredentials {
-            env_vars: HashMap::from([("GITHUB_TOKEN".to_string(), TOKEN.to_string())]),
-            file_mounts: vec![(
-                temp.to_string_lossy().into_owned(),
-                "/credential".to_string(),
-                true,
-            )],
-            temp_files: vec![temp.clone()],
-            redaction_values: Vec::new(),
-            source_identities: Default::default(),
-        };
+        let mut credentials = ResolvedCredentials::default();
+        credentials
+            .env_vars
+            .insert("GITHUB_TOKEN".to_string(), TOKEN.to_string());
+        credentials.file_mounts.push((
+            temp.to_string_lossy().into_owned(),
+            "/credential".to_string(),
+            true,
+        ));
+        credentials.temp_files.push(temp.clone());
         let error = github_token_from_credentials(credentials).unwrap_err();
         assert!(!format!("{error:#}").contains(TOKEN));
         assert!(!temp.exists());
@@ -15372,19 +15399,19 @@ mod github_action_tests {
 
     #[test]
     fn github_credential_shape_fails_closed() {
+        let credentials = |values: &[(&str, &str)]| {
+            let mut credentials = ResolvedCredentials::default();
+            credentials.env_vars.extend(
+                values
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
+            );
+            credentials
+        };
         for credentials in [
             ResolvedCredentials::default(),
-            ResolvedCredentials {
-                env_vars: HashMap::from([
-                    ("GITHUB_TOKEN".to_string(), TOKEN.to_string()),
-                    ("OTHER".to_string(), "value".to_string()),
-                ]),
-                ..Default::default()
-            },
-            ResolvedCredentials {
-                env_vars: HashMap::from([("OTHER".to_string(), TOKEN.to_string())]),
-                ..Default::default()
-            },
+            credentials(&[("GITHUB_TOKEN", TOKEN), ("OTHER", "value")]),
+            credentials(&[("OTHER", TOKEN)]),
         ] {
             let error = github_token_from_credentials(credentials).unwrap_err();
             assert!(!format!("{error:#}").contains(TOKEN));
@@ -20811,7 +20838,7 @@ fn validate_triage_mount_and_credential_requests(
             "triage runner may declare only the openai:chatgpt-oauth credential and no file mounts"
         );
     }
-    let approved_roots = canonical_approved_repository_roots(config)?;
+    let approved_roots = canonical_repository_roots(config)?;
     for mount in &runtime.environment.file_mounts {
         if !mount.read_only || !mount.container_path.starts_with("/repos/") {
             anyhow::bail!("triage repository mounts must be read-only under /repos");
@@ -21533,6 +21560,7 @@ mod runner_profile_projection_tests {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "installation_id":"synthetic-installation",
             "config_identity":"synthetic-config",
+            "root_registry":{"roots":[{"identity":"test","path":"/roots/test","roles":["workspace_ro"]}]},
             "egress":{
                 "preflight_image":"synthetic-preflight",
                 "llm":{"default_provider":"OPENAI","providers":{"OPENAI":["CHATGPT.COM","auth.openai.com"]}}
@@ -21575,6 +21603,7 @@ mod runner_profile_projection_tests {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "installation_id":"incident-installation",
             "config_identity":"incident-config",
+            "root_registry":{"roots":[{"identity":"test","path":"/roots/test","roles":["workspace_ro"]}]},
             "egress":{
                 "preflight_image":"synthetic-preflight",
                 "llm":{"default_provider":"OPENAI","providers":{
@@ -22291,7 +22320,18 @@ mod restricted_mount_tests {
         let source = approved.join("repo");
         std::fs::create_dir_all(&source).unwrap();
         let mut config = LocalAgentConfig::default();
-        config.approved_repository_roots = vec![approved.clone()];
+        config.root_registry = agent_hub_config::RootRegistryConfig {
+            roots: vec![agent_hub_config::RootConfig {
+                identity: "test".into(),
+                path: approved.to_string_lossy().into_owned(),
+                roles: vec![
+                    agent_hub_config::RootRole::WorkspaceRo,
+                    agent_hub_config::RootRole::WorkspaceRw,
+                    agent_hub_config::RootRole::ContextRo,
+                    agent_hub_config::RootRole::GitMetadata,
+                ],
+            }],
+        };
 
         for container in [
             "/repos/../opencode/data",

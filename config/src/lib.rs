@@ -3,6 +3,7 @@ pub mod environment;
 pub mod environment_bundle;
 pub mod image;
 pub mod network_policy;
+pub mod root_registry;
 mod rules;
 pub mod runner;
 pub mod system;
@@ -11,9 +12,9 @@ pub mod triage;
 pub mod triage_mounts;
 
 pub use deployment_validation::{
-    CapturedAuthoritativeFile, ValidatedDeployment, ValidatedImageManifest, ValidatedNetworkPolicy,
-    ValidatedOverlay, ValidatedOverlayRegistry, ValidatedTriagePrompt,
-    ValidatedTriagePromptContent, validate_authoritative_config_root,
+    CapturedAuthoritativeFile, GithubOverlayAccess, GithubOverlayConfig, ValidatedDeployment,
+    ValidatedImageManifest, ValidatedNetworkPolicy, ValidatedOverlay, ValidatedOverlayRegistry,
+    ValidatedTriagePrompt, ValidatedTriagePromptContent, validate_authoritative_config_root,
 };
 pub use environment::EnvironmentConfig;
 pub use environment_bundle::{
@@ -30,6 +31,7 @@ pub use image::{
 pub use network_policy::{
     FlattenedPolicy, NetworkPolicyConfig, PolicyAllowRule, canonical_policy_hosts, flatten_policy,
 };
+pub use root_registry::{RootConfig, RootRegistryConfig, RootRole, root_registry};
 pub use rules::{
     ConfigAction, ConfigDecision, DefaultAction, RuleAction, RuleSummary, ToolConfig,
     default_to_resolved, load_tool_config, resolve_action, validate_tool_config,

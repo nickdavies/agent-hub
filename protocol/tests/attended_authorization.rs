@@ -6,8 +6,8 @@ use protocol::{
     AttendedAuthorizationRequestV2, AttendedExecutionSpec, AttendedLifecycleContract,
     AttendedOutputContract, AttendedProposal, CanonicalRuntimeSpec, ContextRootSpec, ExecutionMode,
     PlannedEnvironmentSpec, PlannedEnvironmentTier, PlannedPermissionSet, PlannedPermissionTier,
-    RepositoryMountSpec, ResolvedAuthorizationBehavior, ToolApprovalMode, WorkspaceAccess,
-    WorkspaceSpec,
+    RepositoryMountSpec, ResolvedAuthorizationBehavior, ResolvedRoot, RootRole, ToolApprovalMode,
+    WorkspaceAccess, WorkspaceSpec,
 };
 
 fn request() -> AttendedAuthorizationRequestV1 {
@@ -93,14 +93,32 @@ fn request() -> AttendedAuthorizationRequestV1 {
             },
             credential_providers: vec![],
             overlays: vec![],
+            roots: vec![
+                ResolvedRoot {
+                    identity: "work".into(),
+                    host_path: "/work".into(),
+                    roles: vec![
+                        RootRole::WorkspaceRo,
+                        RootRole::WorkspaceRw,
+                        RootRole::GitMetadata,
+                    ],
+                },
+                ResolvedRoot {
+                    identity: "code".into(),
+                    host_path: "/home/nick.davies/code".into(),
+                    roles: vec![RootRole::ContextRo],
+                },
+            ],
             workspaces: vec![
                 WorkspaceSpec {
+                    root_identity: "work".into(),
                     alias: "zeta".into(),
                     host_path: "/work/zeta".into(),
                     container_path: "/workspace/zeta".into(),
                     access: WorkspaceAccess::ReadWrite,
                 },
                 WorkspaceSpec {
+                    root_identity: "work".into(),
                     alias: "alpha".into(),
                     host_path: "/work/alpha".into(),
                     container_path: "/workspace/alpha".into(),
@@ -108,6 +126,7 @@ fn request() -> AttendedAuthorizationRequestV1 {
                 },
             ],
             context_roots: vec![ContextRootSpec {
+                root_identity: "code".into(),
                 alias: "code".into(),
                 host_path: "/home/nick.davies/code".into(),
                 container_path: "/context/code".into(),
@@ -147,6 +166,67 @@ fn request() -> AttendedAuthorizationRequestV1 {
         output: AttendedOutputContract::default(),
         lifecycle: AttendedLifecycleContract::default(),
     }
+}
+
+fn with_github_overlay(
+    mut request: AttendedAuthorizationRequestV1,
+) -> AttendedAuthorizationRequestV1 {
+    let name = "github:github.com:read".to_string();
+    request.proposal.overlays = vec![name.clone()];
+    request.execution.overlays = vec![protocol::AuthorizedOverlay {
+        name: name.clone(),
+        provider: "github".into(),
+        config: serde_json::to_string(&protocol::GithubOverlayBinding {
+            host: "github.com".into(),
+            api_base_url: "https://api.github.com".into(),
+            access: "read".into(),
+            network_resource: "github".into(),
+            credential_provider: name.clone(),
+            credential_target: "/agent-hub/github/tokens/github.com".into(),
+            authenticated: true,
+            private_repositories: true,
+            repository_remotes: vec!["https://github.com/example/zeta.git".into()],
+        })
+        .unwrap(),
+    }];
+    request.execution.credential_providers = vec![protocol::AuthorizedCredentialProvider {
+        name,
+        provider_type: "github-token".into(),
+        source: "gh".into(),
+        command: Some("gh".into()),
+        args: vec!["auth".into(), "token".into()],
+        validity: None,
+        targets: vec!["/agent-hub/github/tokens/github.com".into()],
+        access: "read".into(),
+        constraints: BTreeMap::new(),
+    }];
+    request.execution.behavior.allow_remote_credentials = true;
+    request.execution.repositories[1].remote = Some("https://github.com/example/zeta.git".into());
+    request
+}
+
+#[test]
+fn github_credentials_require_matching_network_and_host() {
+    let without_network = with_github_overlay(request());
+    assert!(without_network.normalize().is_err());
+
+    let mut host_mismatch = with_github_overlay(request());
+    host_mismatch
+        .proposal
+        .network_resources
+        .push(protocol::NetworkResourceKind::Github);
+    host_mismatch
+        .execution
+        .runtime
+        .environment
+        .network_resources = Some(protocol::NetworkResourceRequest::Resources(
+        host_mismatch.proposal.network_resources.clone(),
+    ));
+    let mut binding: protocol::GithubOverlayBinding =
+        serde_json::from_str(&host_mismatch.execution.overlays[0].config).unwrap();
+    binding.repository_remotes = vec!["https://github.snooguts.net/example/zeta.git".into()];
+    host_mismatch.execution.overlays[0].config = serde_json::to_string(&binding).unwrap();
+    assert!(host_mismatch.normalize().is_err());
 }
 
 fn request_v2() -> AttendedAuthorizationRequestV2 {

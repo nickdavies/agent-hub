@@ -148,7 +148,16 @@ fn request() -> AttendedAuthorizationRequestV3 {
             },
             credential_providers: vec![],
             overlays: vec![],
+            roots: vec![protocol::ResolvedRoot {
+                identity: "work".into(),
+                host_path: "/work".into(),
+                roles: vec![
+                    protocol::RootRole::WorkspaceRo,
+                    protocol::RootRole::WorkspaceRw,
+                ],
+            }],
             workspaces: vec![protocol::WorkspaceSpec {
+                root_identity: "work".into(),
                 alias: "primary".into(),
                 host_path: "/work/repo".into(),
                 container_path: "/workspace/primary".into(),

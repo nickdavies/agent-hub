@@ -18,8 +18,8 @@ use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use protocol::{
     ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ApprovedExecutionSpec,
-    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV2,
-    AttendedAuthorizationRequestV3, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV3,
+    AttendedExecutionSpec, AttendedLifecycleContract,
     AttendedOutputContract, AttendedProposal, AuthorizedCredentialProvider, AuthorizedOverlay,
     CanonicalRuntimeSpec, ExecutionMode, NetworkResourceKind, NetworkResourceRequest,
     PlannedEnvironmentTier, PromptRef, ResolvedAuthorizationBehavior, ToolApprovalMode,
@@ -140,7 +140,7 @@ pub enum LaunchState {
     Terminal,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryClass {
     Prelaunch,
@@ -159,7 +159,7 @@ pub struct AttemptLineage {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionOutcome {
     #[default]
@@ -422,10 +422,6 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             .all(|overlay| environment.allowed_overlays.contains(overlay)),
         "requested overlay is not allowed by the environment"
     );
-    ensure!(
-        overlays.is_empty(),
-        "attended execution cannot apply environment overlays; reject the proposal instead of silently ignoring them"
-    );
     let approved_roots = approved_roots(&deployment.local_agent)?;
     let mounts = resolve_mounts(
         &approved_roots,
@@ -461,9 +457,14 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         runner.file_mounts.is_empty() && runner.mcp_bridges.is_empty(),
         "attended execution does not support runner host mounts or MCP bridges"
     );
-    validate_credential_descriptors(&deployment, &runner)?;
-    let credential_providers = authorized_credential_providers(&deployment, &runner)?;
-    let overlay_descriptors = authorized_overlays(&deployment, &overlays)?;
+    let overlay_descriptors = authorized_overlays(
+        &deployment,
+        &overlays,
+        &mounts.repositories,
+        &network_resources,
+    )?;
+    validate_credential_descriptors(&deployment, &runner, &overlays)?;
+    let credential_providers = authorized_credential_providers(&deployment, &runner, &overlays)?;
     let docker =
         which::which("docker").context("Docker CLI is required to resolve the reviewed image")?;
     let image_id = inspect_image_identity(
@@ -490,7 +491,7 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         primary_repo_branch: None,
         execution_context: serde_json::json!({"mode": "attended"}),
         triage: false,
-        allow_remote_credentials: !runner.credential_providers.is_empty(),
+        allow_remote_credentials: !credential_providers.is_empty(),
     };
     let approval_bundle = attended_approval_bundle_identity(bundle, tool_approval)?;
     let approval_bundle_digest = approval_bundle
@@ -530,6 +531,7 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             },
             credential_providers,
             overlays: overlay_descriptors,
+            roots: mounts.roots,
             workspaces: mounts.workspaces,
             context_roots: mounts.context_roots,
             repositories: mounts.repositories,
@@ -593,7 +595,7 @@ pub fn render_proposal(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!(
-        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nTimeout seconds: {}\nGit capability:\n{}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
+        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nOverlay bindings: {}\nTimeout seconds: {}\nGit capability:\n{}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
         request.proposal.environment,
         request.proposal.image_family,
         request.proposal.image_tag,
@@ -603,6 +605,13 @@ pub fn render_proposal(
         tool_approval_name(request.proposal.tool_approval),
         approval_bundle,
         request.proposal.overlays.join(","),
+        request
+            .execution
+            .overlays
+            .iter()
+            .map(|overlay| format!("{}={}", overlay.name, overlay.config))
+            .collect::<Vec<_>>()
+            .join(","),
         request.proposal.timeout_secs,
         git_capabilities,
         request.proposal.prompt_digest,
@@ -729,7 +738,7 @@ pub async fn run(
         serde_json::from_value(request.execution.behavior.runner_profile.clone())?;
     ensure!(
         request.execution.behavior.allow_remote_credentials
-            == !runner.credential_providers.is_empty(),
+            == !request.execution.credential_providers.is_empty(),
         "attended credential envelope does not match the authorized runner"
     );
     ensure!(
@@ -1094,7 +1103,7 @@ pub async fn run(
         }
         let credentials = resolve_attended_credentials(
             &deployment,
-            &runner,
+            &request,
             deadline.wall_clock(),
             &data_dir,
             &effects,
@@ -1591,7 +1600,10 @@ pub async fn run(
                 record.status = RunStatus::Cancelled;
             } else {
                 match result.status {
-                    ExecutionStatus::Exited(0) => record.status = RunStatus::Succeeded,
+                    ExecutionStatus::Exited(0) => {
+                        record.status = RunStatus::Succeeded;
+                        record.exit_code = Some(0);
+                    }
                     ExecutionStatus::Exited(code) => {
                         record.status = RunStatus::Failed;
                         record.exit_code = Some(code);
@@ -2651,6 +2663,7 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV3) -> anyhow::
     let expected_runtime = canonical_runtime(
         &environment,
         &ResolvedMounts {
+            roots: request.execution.roots.clone(),
             workspaces: request.execution.workspaces.clone(),
             context_roots: request.execution.context_roots.clone(),
             repositories: request.execution.repositories.clone(),
@@ -2665,12 +2678,17 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV3) -> anyhow::
         "authorized canonical runtime changed"
     );
     ensure!(
-        authorized_credential_providers(&deployment, &runner)?
+        authorized_credential_providers(&deployment, &runner, &request.proposal.overlays)?
             == request.execution.credential_providers,
         "authorized credential provider descriptors changed"
     );
     ensure!(
-        authorized_overlays(&deployment, &request.proposal.overlays)? == request.execution.overlays,
+        authorized_overlays(
+            &deployment,
+            &request.proposal.overlays,
+            &request.execution.repositories,
+            &request.proposal.network_resources,
+        )? == request.execution.overlays,
         "authorized overlay descriptors changed"
     );
     let approved = approved_roots(&deployment.local_agent)?;
@@ -2720,7 +2738,7 @@ fn verify_mount_filesystem_identity(
 fn provider_unavailable_retry_evidence(
     record: &RunRecord,
     run_dir: &Path,
-    request: &AttendedAuthorizationRequestV2,
+    request: &AttendedAuthorizationRequestV3,
 ) -> anyhow::Result<bool> {
     let stderr = read_optional_bounded(
         &run_dir.join("stderr.log"),
@@ -2819,13 +2837,14 @@ fn bundle_environment(
 
 async fn resolve_attended_credentials(
     deployment: &config::ValidatedDeployment,
-    runner: &config::ResolvedRunnerProfile,
+    request: &AttendedAuthorizationRequestV3,
     valid_through: Option<std::time::SystemTime>,
     credential_dir: &Path,
     cancellation: &agent_hub_executor::ExecutionCancellationContext,
 ) -> anyhow::Result<agent_hub_executor::credential_provider::ResolvedCredentials> {
     let configured = configured_credential_providers(deployment)?;
-    let providers = runner
+    let providers = request
+        .execution
         .credential_providers
         .iter()
         .map(|descriptor| {
@@ -3014,6 +3033,8 @@ fn configured_credential_providers(
 fn authorized_overlays(
     deployment: &config::ValidatedDeployment,
     selected: &[String],
+    repositories: &[protocol::RepositoryMountSpec],
+    network_resources: &[NetworkResourceKind],
 ) -> anyhow::Result<Vec<AuthorizedOverlay>> {
     if selected.is_empty() {
         return Ok(Vec::new());
@@ -3030,31 +3051,91 @@ fn authorized_overlays(
                 .iter()
                 .find(|overlay| overlay.name == *name)
                 .with_context(|| format!("selected overlay '{name}' is not installed"))?;
+            let config =
+                if let Some(github) = overlay.github_config().map_err(anyhow::Error::msg)? {
+                    ensure!(
+                        network_resources.contains(&NetworkResourceKind::Github),
+                        "GitHub credential overlay requires the github network resource"
+                    );
+                    let matching = repositories
+                        .iter()
+                        .filter_map(|repository| repository.remote.as_deref())
+                        .filter(|remote| remote_host(remote).as_deref() == Some(&github.host))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        !matching.is_empty(),
+                        "GitHub overlay '{}' has no matching repository remote",
+                        overlay.name
+                    );
+                    serde_json::json!({
+                        "host": github.host,
+                        "api_base_url": github.api_base_url,
+                        "access": github.access,
+                        "network_resource": github.network_resource,
+                        "credential_provider": github.credential_provider,
+                        "credential_target": github.credential_target,
+                        "authenticated": github.authenticated,
+                        "private_repositories": github.private_repositories,
+                        "repository_remotes": matching,
+                    })
+                } else {
+                    overlay.config.clone()
+                };
             Ok(AuthorizedOverlay {
                 name: overlay.name.clone(),
                 provider: overlay.provider.clone(),
-                config: serde_json::to_string(&overlay.config)?,
+                config: serde_json::to_string(&config)?,
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     overlays.sort();
+    let mut github_hosts = std::collections::BTreeSet::new();
+    for overlay in &overlays {
+        if overlay.provider == "github" {
+            let binding: protocol::GithubOverlayBinding = serde_json::from_str(&overlay.config)?;
+            ensure!(
+                github_hosts.insert(binding.host),
+                "multiple GitHub overlays target the same host"
+            );
+        }
+    }
     Ok(overlays)
 }
 
 fn authorized_credential_providers(
     deployment: &config::ValidatedDeployment,
     runner: &config::ResolvedRunnerProfile,
+    overlays: &[String],
 ) -> anyhow::Result<Vec<AuthorizedCredentialProvider>> {
     let configured = configured_credential_providers(deployment)?;
-    let mut descriptors = runner
+    let mut names = runner
         .credential_providers
         .iter()
+        .map(|required| required.name.clone())
+        .collect::<Vec<_>>();
+    if let Some(registry) = &deployment.overlay_registry {
+        for name in overlays {
+            let overlay = registry
+                .overlays
+                .iter()
+                .find(|overlay| overlay.name == *name)
+                .with_context(|| format!("selected overlay '{name}' is not installed"))?;
+            if let Some(github) = overlay.github_config().map_err(anyhow::Error::msg)? {
+                names.push(github.credential_provider);
+            }
+        }
+    }
+    names.sort();
+    ensure!(
+        !names.windows(2).any(|pair| pair[0] == pair[1]),
+        "credential provider selected more than once"
+    );
+    let mut descriptors = names
+        .iter()
         .map(|required| {
-            let provider = configured.get(&required.name).with_context(|| {
-                format!(
-                    "required credential provider '{}' is unavailable",
-                    required.name
-                )
+            let provider = configured.get(required).with_context(|| {
+                format!("required credential provider '{}' is unavailable", required)
             })?;
             authorized_credential_provider(provider)
         })
@@ -3169,6 +3250,26 @@ fn authorized_credential_provider(
                 safety_margin_secs.to_string(),
             )]),
         ),
+        CredentialProvider::GithubToken {
+            host,
+            api_base_url,
+            access,
+            command,
+            args,
+            target,
+            ..
+        } => (
+            format!("{command}:{}", args.join("\u{0}")),
+            Some(command.clone()),
+            args.clone(),
+            Some("must remain valid through authorized deadline".to_string()),
+            access.clone(),
+            BTreeMap::from([
+                ("host".to_string(), host.clone()),
+                ("api_base_url".to_string(), api_base_url.clone()),
+                ("target".to_string(), target.clone()),
+            ]),
+        ),
     };
     Ok(AuthorizedCredentialProvider {
         name: provider.name().to_string(),
@@ -3186,9 +3287,11 @@ fn authorized_credential_provider(
 fn validate_credential_descriptors(
     deployment: &config::ValidatedDeployment,
     runner: &config::ResolvedRunnerProfile,
+    overlays: &[String],
 ) -> anyhow::Result<()> {
     let configured = configured_credential_providers(deployment)?;
-    for descriptor in &runner.credential_providers {
+    let authorized = authorized_credential_providers(deployment, runner, overlays)?;
+    for descriptor in &authorized {
         let provider = configured.get(&descriptor.name).with_context(|| {
             format!(
                 "required credential provider '{}' is unavailable",
@@ -3204,6 +3307,12 @@ fn validate_credential_descriptors(
         );
     }
     Ok(())
+}
+
+fn remote_host(remote: &str) -> Option<String> {
+    url::Url::parse(remote)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
 }
 
 fn attended_config_digest(deployment: &config::ValidatedDeployment) -> anyhow::Result<String> {
@@ -3712,19 +3821,7 @@ fn canonical_runtime(
 }
 
 fn approved_roots(local_agent: &serde_json::Value) -> anyhow::Result<ApprovedRoots> {
-    let roots = local_agent
-        .get("approved_repository_roots")
-        .and_then(serde_json::Value::as_array)
-        .context("local-agent config requires approved_repository_roots")?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(PathBuf::from)
-                .context("approved root must be a string")
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    ApprovedRoots::new(roots)
+    ApprovedRoots::new(config::root_registry(local_agent).map_err(anyhow::Error::msg)?)
 }
 
 fn bundle_network_policy(

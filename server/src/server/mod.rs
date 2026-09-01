@@ -770,6 +770,13 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         std::fs::write(
             root.join("local-agent.json"),
             r#"{
+                "root_registry": {
+                    "roots": [{
+                        "identity": "test",
+                        "path": "/roots/test",
+                        "roles": ["workspace_ro"]
+                    }]
+                },
                 "default_agent": {
                     "kind": "generic",
                     "command": "true",

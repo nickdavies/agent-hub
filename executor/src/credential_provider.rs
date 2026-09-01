@@ -65,6 +65,26 @@ pub enum CredentialProvider {
         host_auth_path: String,
         safety_margin_secs: u64,
     },
+    /// Resolve one exact GitHub host token for a reviewed attended overlay.
+    #[serde(rename = "github-token")]
+    GithubToken {
+        name: String,
+        host: String,
+        api_base_url: String,
+        access: String,
+        command: String,
+        args: Vec<String>,
+        target: String,
+    },
+}
+
+struct ResolvedGithubToken {
+    provider: String,
+    host: String,
+    api_base_url: String,
+    access: String,
+    target: String,
+    token: String,
 }
 
 /// Resolved credentials ready for Docker injection
@@ -75,6 +95,7 @@ pub struct ResolvedCredentials {
     pub temp_files: Vec<PathBuf>,
     pub redaction_values: Vec<String>,
     pub source_identities: BTreeMap<String, PrivateFileIdentity>,
+    github_tokens: Vec<ResolvedGithubToken>,
 }
 
 impl std::fmt::Debug for ResolvedCredentials {
@@ -113,6 +134,7 @@ impl CredentialProvider {
             Self::Command { name, .. } => name,
             Self::KubeconfigFilter { name, .. } => name,
             Self::OpencodeChatgptOauth { name, .. } => name,
+            Self::GithubToken { name, .. } => name,
         }
     }
 
@@ -123,6 +145,7 @@ impl CredentialProvider {
             Self::Command { .. } => "command",
             Self::KubeconfigFilter { .. } => "kubeconfig-filter",
             Self::OpencodeChatgptOauth { .. } => "opencode-chatgpt-oauth",
+            Self::GithubToken { .. } => "github-token",
         }
     }
 
@@ -147,6 +170,7 @@ impl CredentialProvider {
             Self::OpencodeChatgptOauth { .. } => {
                 vec!["/opencode/data/opencode/auth.json".to_string()]
             }
+            Self::GithubToken { target, .. } => vec![target.clone()],
         };
         targets.sort();
         targets.dedup();
@@ -299,7 +323,65 @@ impl CredentialProvider {
                 credential_dir,
                 cancellation,
             ),
+            Self::GithubToken {
+                name,
+                host,
+                api_base_url,
+                access,
+                command,
+                args,
+                target,
+            } => {
+                let timeout_secs = credential_command_timeout(valid_through)?;
+                let output = super::execute_output_journalled_inherited_environment(
+                    Path::new(command),
+                    args,
+                    &super::Deadline::new(Some(timeout_secs))?,
+                    cancellation,
+                    "credential_command",
+                    &format!("provider:{name}"),
+                    super::JournalledEffect::ReadOnly,
+                    "GitHub credential command",
+                )
+                .await?;
+                anyhow::ensure!(output.status.success(), "GitHub credential command failed");
+                let token = String::from_utf8(output.stdout)
+                    .context("GitHub credential command output is not UTF-8")?
+                    .trim()
+                    .to_string();
+                anyhow::ensure!(
+                    !token.is_empty() && !token.chars().any(char::is_control),
+                    "GitHub credential command returned an invalid token"
+                );
+                Ok(ResolvedCredentials {
+                    redaction_values: vec![token.clone()],
+                    github_tokens: vec![ResolvedGithubToken {
+                        provider: name.clone(),
+                        host: host.clone(),
+                        api_base_url: api_base_url.clone(),
+                        access: access.clone(),
+                        target: target.clone(),
+                        token,
+                    }],
+                    ..Default::default()
+                })
+            }
         }
+    }
+}
+
+fn credential_command_timeout(valid_through: Option<SystemTime>) -> anyhow::Result<u64> {
+    match valid_through {
+        Some(valid_through) => {
+            let remaining = valid_through
+                .duration_since(SystemTime::now())
+                .context("credential command authorized deadline expired")?;
+            Ok(remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+                .clamp(1, 300))
+        }
+        None => Ok(300),
     }
 }
 
@@ -427,9 +509,154 @@ pub async fn resolve_all_for_job(
         merged.temp_files.extend(creds.temp_files);
         merged.redaction_values.extend(creds.redaction_values);
         merged.source_identities.extend(creds.source_identities);
+        merged.github_tokens.extend(creds.github_tokens);
     }
+    materialize_github_credentials(&mut merged, credential_dir, cancellation)?;
     cancellation.check()?;
     Ok(merged)
+}
+
+fn materialize_github_credentials(
+    credentials: &mut ResolvedCredentials,
+    credential_dir: Option<&Path>,
+    cancellation: &ExecutionCancellationContext,
+) -> anyhow::Result<()> {
+    if credentials.github_tokens.is_empty() {
+        return Ok(());
+    }
+    let credential_dir =
+        credential_dir.context("job credential directory is required for GitHub credentials")?;
+    let runtime = credential_dir.join("github-runtime");
+    std::fs::create_dir(&runtime).context("create GitHub credential runtime directory")?;
+    set_private_directory(&runtime)?;
+    let tokens = runtime.join("tokens");
+    let gh = runtime.join("gh");
+    std::fs::create_dir(&tokens)?;
+    std::fs::create_dir(&gh)?;
+    set_private_directory(&tokens)?;
+    set_private_directory(&gh)?;
+
+    credentials
+        .github_tokens
+        .sort_by(|left, right| left.host.cmp(&right.host));
+    let mut hosts = BTreeMap::new();
+    let mut token_owners = BTreeMap::new();
+    for github in &credentials.github_tokens {
+        anyhow::ensure!(
+            matches!(
+                (github.host.as_str(), github.api_base_url.as_str()),
+                ("github.com", "https://api.github.com")
+                    | ("github.snooguts.net", "https://github.snooguts.net/api/v3")
+            ) && matches!(github.access.as_str(), "read" | "read_write"),
+            "GitHub credential host, API, or access is not canonical"
+        );
+        anyhow::ensure!(
+            hosts.insert(github.host.clone(), github).is_none(),
+            "multiple GitHub credentials target host '{}'",
+            github.host
+        );
+        if let Some(existing) = token_owners.insert(github.token.clone(), github.host.clone()) {
+            anyhow::bail!(
+                "GitHub hosts '{existing}' and '{}' resolved to the same token",
+                github.host
+            );
+        }
+        anyhow::ensure!(
+            github.provider == format!("github:{}:{}", github.host, github.access)
+                && github.target == format!("/agent-hub/github/tokens/{}", github.host),
+            "GitHub credential identity or target is not exact"
+        );
+        let token_path = tokens.join(&github.host);
+        write_secret_file(&token_path, github.token.as_bytes(), cancellation)?;
+        credentials.temp_files.push(token_path);
+    }
+
+    let mut askpass = String::from("#!/bin/sh\nset -eu\ncase \"$1\" in\n");
+    askpass.push_str("*Username*|*username*) printf '%s\\n' x-access-token ;;\n");
+    for host in hosts.keys() {
+        askpass.push_str(&format!(
+            "*'{host}'*|*\"{host}\"*|*{host}*) exec /bin/cat '/agent-hub/github/tokens/{host}' ;;\n"
+        ));
+    }
+    askpass.push_str("*) exit 1 ;;\nesac\n");
+    let askpass_path = runtime.join("askpass");
+    write_private_executable(&askpass_path, askpass.as_bytes())?;
+
+    let gitconfig = runtime.join("gitconfig");
+    write_secret_file(
+        &gitconfig,
+        b"[credential]\n\thelper =\n\tuseHttpPath = true\n[core]\n\taskPass = /agent-hub/github/askpass\n",
+        cancellation,
+    )?;
+    let mut hosts_yaml = String::new();
+    for github in hosts.values() {
+        hosts_yaml.push_str(&format!(
+            "{}:\n    git_protocol: https\n    oauth_token: {}\n    user: x-access-token\n",
+            github.host, github.token
+        ));
+    }
+    let hosts_path = gh.join("hosts.yml");
+    write_secret_file(&hosts_path, hosts_yaml.as_bytes(), cancellation)?;
+    credentials
+        .temp_files
+        .extend([askpass_path, gitconfig, hosts_path]);
+    credentials.file_mounts.push((
+        runtime.to_string_lossy().into_owned(),
+        "/agent-hub/github".to_string(),
+        true,
+    ));
+    credentials.env_vars.extend([
+        (
+            "GIT_CONFIG_GLOBAL".to_string(),
+            "/agent-hub/github/gitconfig".to_string(),
+        ),
+        (
+            "GIT_ASKPASS".to_string(),
+            "/agent-hub/github/askpass".to_string(),
+        ),
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        (
+            "GH_CONFIG_DIR".to_string(),
+            "/agent-hub/github/gh".to_string(),
+        ),
+        (
+            "GOPRIVATE".to_string(),
+            hosts.keys().cloned().collect::<Vec<_>>().join(","),
+        ),
+    ]);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("private GitHub credential directories require Unix permissions")
+}
+
+#[cfg(unix)]
+fn write_private_executable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_executable(_path: &Path, _bytes: &[u8]) -> anyhow::Result<()> {
+    anyhow::bail!("private GitHub credential scripts require Unix permissions")
 }
 
 fn validate_provider_targets(providers: &[CredentialProvider]) -> anyhow::Result<()> {
@@ -520,6 +747,7 @@ fn resolve_opencode_chatgpt_oauth(
         temp_files: vec![auth_path],
         redaction_values: vec![access.to_string()],
         source_identities: BTreeMap::new(),
+        github_tokens: Vec::new(),
     })
 }
 
@@ -1004,6 +1232,189 @@ mod tests {
                     .is_err()
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn github_provider(name: &str, host: &str, access: &str, command: &Path) -> CredentialProvider {
+        CredentialProvider::GithubToken {
+            name: name.into(),
+            host: host.into(),
+            api_base_url: if host == "github.com" {
+                "https://api.github.com".into()
+            } else {
+                format!("https://{host}/api/v3")
+            },
+            access: access.into(),
+            command: command.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            target: format!("/agent-hub/github/tokens/{host}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn github_credentials_are_host_isolated_and_private_go_uses_direct_git() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-github-credential-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let command_com = root.join("token-com");
+        let command_enterprise = root.join("token-enterprise");
+        write_private_executable(&command_com, b"#!/bin/sh\nprintf synthetic-com-token\n").unwrap();
+        write_private_executable(
+            &command_enterprise,
+            b"#!/bin/sh\nprintf synthetic-enterprise-token\n",
+        )
+        .unwrap();
+        let credential_dir = root.join("credentials");
+        std::fs::create_dir(&credential_dir).unwrap();
+        let cancellation = cancellation(&root);
+        let resolved = resolve_all_for_job(
+            &[
+                github_provider("github:github.com:read", "github.com", "read", &command_com),
+                github_provider(
+                    "github:github.snooguts.net:read_write",
+                    "github.snooguts.net",
+                    "read_write",
+                    &command_enterprise,
+                ),
+            ],
+            Some(SystemTime::now() + Duration::from_secs(60)),
+            Some(&credential_dir),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.file_mounts.len(), 1);
+        assert!(
+            resolved
+                .env_vars
+                .values()
+                .all(|value| !value.contains("synthetic-"))
+        );
+        assert_eq!(
+            resolved.env_vars["GOPRIVATE"],
+            "github.com,github.snooguts.net"
+        );
+        let runtime = credential_dir.join("github-runtime");
+        let askpass = runtime.join("askpass");
+        let askpass_contents = std::fs::read_to_string(&askpass).unwrap();
+        for (host, expected) in [
+            ("github.com", "synthetic-com-token"),
+            ("github.snooguts.net", "synthetic-enterprise-token"),
+        ] {
+            assert!(askpass_contents.contains(&format!("tokens/{host}")));
+            assert_eq!(
+                std::fs::read_to_string(runtime.join("tokens").join(host)).unwrap(),
+                expected
+            );
+        }
+
+        let source = root.join("module-source");
+        let bare = root.join("module.git");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("go.mod"),
+            "module github.com/private/module\n\ngo 1.23\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("module.go"),
+            "package module\nconst Value = 1\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["add", "go.mod", "module.go"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            vec!["tag", "v0.0.1"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&source)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(
+            std::process::Command::new("git")
+                .args(["clone", "--bare", "-q"])
+                .arg(&source)
+                .arg(&bare)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let gitconfig = runtime.join("gitconfig");
+        use std::io::Write as _;
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&gitconfig)
+            .unwrap();
+        writeln!(
+            config,
+            "[url \"file://{}\"]\n\tinsteadOf = https://github.com/private/module",
+            bare.display()
+        )
+        .unwrap();
+        let consumer = root.join("consumer");
+        std::fs::create_dir(&consumer).unwrap();
+        std::fs::write(consumer.join("go.mod"), "module consumer\n\ngo 1.23\n").unwrap();
+        let status = std::process::Command::new("go")
+            .current_dir(&consumer)
+            .args(["mod", "download", "github.com/private/module@v0.0.1"])
+            .env("GOPRIVATE", &resolved.env_vars["GOPRIVATE"])
+            .env("GONOSUMDB", &resolved.env_vars["GOPRIVATE"])
+            .env("GOPROXY", "direct")
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn github_credentials_reject_shared_tokens_across_hosts() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-github-shared-token-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let command = root.join("token");
+        write_private_executable(&command, b"#!/bin/sh\nprintf shared-synthetic-token\n").unwrap();
+        let credential_dir = root.join("credentials");
+        std::fs::create_dir(&credential_dir).unwrap();
+        let error = resolve_all_for_job(
+            &[
+                github_provider("github:github.com:read", "github.com", "read", &command),
+                github_provider(
+                    "github:github.snooguts.net:read",
+                    "github.snooguts.net",
+                    "read",
+                    &command,
+                ),
+            ],
+            None,
+            Some(&credential_dir),
+            &cancellation(&root),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:#}").contains("shared-synthetic-token"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

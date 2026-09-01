@@ -17,7 +17,7 @@ struct LocalTriageConfig {
     #[serde(default)]
     triage_repos: Vec<String>,
     #[serde(default)]
-    approved_repository_roots: Vec<String>,
+    root_registry: crate::RootRegistryConfig,
     #[serde(default)]
     triage_mounts: Vec<LocalTriageMount>,
 }
@@ -87,10 +87,7 @@ pub fn validate_triage_repository_snapshots(
         .as_ref()
         .filter(|discovery| discovery.enabled);
     let Some(_discovery) = discovery else {
-        if local.triage_repos.is_empty()
-            && local.approved_repository_roots.is_empty()
-            && local.triage_mounts.is_empty()
-        {
+        if local.triage_repos.is_empty() && local.triage_mounts.is_empty() {
             return Ok(Vec::new());
         }
         return Err(
@@ -98,20 +95,28 @@ pub fn validate_triage_repository_snapshots(
         );
     };
     if local.triage_repos.is_empty()
-        || local.approved_repository_roots.is_empty()
+        || local.root_registry.roots.is_empty()
         || local.triage_mounts.is_empty()
     {
         return Err(
-            "active repo discovery requires non-empty explicit triage_repos and approved_repository_roots"
+            "active repo discovery requires non-empty explicit triage_repos and root_registry"
                 .to_string(),
         );
     }
 
     let approved_roots = local
-        .approved_repository_roots
+        .root_registry
+        .roots
         .iter()
-        .map(|root| canonicalize_configured_path(root, "approved repository root"))
+        .filter(|root| {
+            root.roles.contains(&crate::RootRole::ContextRo)
+                && root.roles.contains(&crate::RootRole::GitMetadata)
+        })
+        .map(|root| canonicalize_configured_path(&root.path, "approved repository root"))
         .collect::<Result<Vec<_>, _>>()?;
+    if approved_roots.is_empty() {
+        return Err("triage requires a root with context_ro and git_metadata roles".to_string());
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(std::fs::canonicalize)
@@ -291,7 +296,7 @@ mod tests {
             config.join("local-agent.json"),
             serde_json::to_vec(&serde_json::json!({
                 "triage_repos":[first.clone(), second.clone()],
-                "approved_repository_roots":[repos],
+                "root_registry":{"roots":[{"identity":"repos","path":repos,"roles":["context_ro","git_metadata"]}]},
                 "default_agent":{"kind":"generic","command":"true"},
                 "triage_mounts":[
                     {"host_path":first.clone(),"container_path":"/repos/agent-hub","read_only":true},

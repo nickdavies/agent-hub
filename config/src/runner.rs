@@ -11,7 +11,7 @@ pub const OPENCODE_PROJECT_CONFIG_ALIASES: &[&str] = &[
     ".opencode/opencode.jsonc",
 ];
 pub const DURABLE_OPENCODE_PATH: &str =
-    "/usr/local/go/bin:/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    "/usr/local/go/bin:/opt/rust/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerProfilesConfig {
@@ -426,6 +426,9 @@ impl RunnerProfilesConfig {
                 if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
                     validate_exact_nonempty(value, &format!("credential provider '{name}' {key}"))?;
                 }
+            }
+            if provider_type == "github-token" {
+                validate_github_token_provider(name, object)?;
             }
         }
         let mut bridge_names = BTreeSet::new();
@@ -1051,6 +1054,7 @@ fn credential_descriptor(
             .collect(),
         "kubeconfig-filter" => string_target(object, "container_path"),
         "opencode-chatgpt-oauth" => vec!["/opencode/data/opencode/auth.json".to_string()],
+        "github-token" => string_target(object, "target"),
         other => {
             return Err(format!(
                 "credential provider '{configured_name}' has unsupported type '{other}'"
@@ -1064,6 +1068,58 @@ fn credential_descriptor(
         provider_type: provider_type.to_string(),
         targets,
     })
+}
+
+fn validate_github_token_provider(
+    name: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let exact_keys = BTreeSet::from([
+        "type",
+        "name",
+        "host",
+        "api_base_url",
+        "access",
+        "command",
+        "args",
+        "target",
+    ]);
+    if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != exact_keys {
+        return Err(format!(
+            "GitHub credential provider '{name}' has noncanonical fields"
+        ));
+    }
+    let string = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("GitHub credential provider '{name}' has invalid {key}"))
+    };
+    let host = protocol::canonical_github_host(string("host")?)
+        .ok_or_else(|| format!("GitHub credential provider '{name}' has invalid host"))?;
+    let api = protocol::canonical_github_api_base_for_host(&host, string("api_base_url")?)
+        .ok_or_else(|| format!("GitHub credential provider '{name}' has invalid API base URL"))?;
+    let access = string("access")?;
+    if !matches!(access, "read" | "read_write")
+        || name != format!("github:{host}:{access}")
+        || string("name")? != name
+        || string("host")? != host
+        || string("api_base_url")? != api
+        || string("target")? != format!("/agent-hub/github/tokens/{host}")
+        || string("command")? != "gh"
+        || object.get("args").and_then(serde_json::Value::as_array)
+            != Some(&vec![
+                serde_json::json!("auth"),
+                serde_json::json!("token"),
+                serde_json::json!("--hostname"),
+                serde_json::json!(host),
+            ])
+    {
+        return Err(format!(
+            "GitHub credential provider '{name}' is not bound to one exact host and access class"
+        ));
+    }
+    Ok(())
 }
 
 fn trusted_mounts_for_kind(kind: ManagedRunnerKind) -> Vec<TrustedMountDescriptor> {
@@ -1358,6 +1414,41 @@ fn default_managed_agent_runner() -> ManagedRunnerSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_credential_provider_requires_exact_host_access_command_and_target() {
+        let valid = serde_json::json!({
+            "type":"github-token",
+            "name":"github:github.com:read_write",
+            "host":"github.com",
+            "api_base_url":"https://api.github.com",
+            "access":"read_write",
+            "command":"gh",
+            "args":["auth","token","--hostname","github.com"],
+            "target":"/agent-hub/github/tokens/github.com"
+        });
+        validate_github_token_provider("github:github.com:read_write", valid.as_object().unwrap())
+            .unwrap();
+        for mutation in ["host", "access", "target", "args", "extra"] {
+            let mut invalid = valid.clone();
+            match mutation {
+                "host" => invalid["host"] = serde_json::json!("github.snooguts.net"),
+                "access" => invalid["access"] = serde_json::json!("admin"),
+                "target" => invalid["target"] = serde_json::json!("GITHUB_TOKEN"),
+                "args" => invalid["args"] = serde_json::json!(["auth", "token"]),
+                "extra" => invalid["extra"] = serde_json::json!(true),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_github_token_provider(
+                    "github:github.com:read_write",
+                    invalid.as_object().unwrap(),
+                )
+                .is_err(),
+                "accepted mutation {mutation}"
+            );
+        }
+    }
 
     #[test]
     fn host_approvals_are_strict_host_only_and_no_auth_remains_valid() {

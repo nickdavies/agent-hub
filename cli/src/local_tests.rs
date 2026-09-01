@@ -28,13 +28,29 @@ fn initialize_repository(path: &std::path::Path) {
     ]);
 }
 
+fn approved_root(identity: &str, path: &std::path::Path) -> ApprovedRoots {
+    ApprovedRoots::new(config::RootRegistryConfig {
+        roots: vec![config::RootConfig {
+            identity: identity.into(),
+            path: path.to_string_lossy().into_owned(),
+            roles: vec![
+                config::RootRole::WorkspaceRo,
+                config::RootRole::WorkspaceRw,
+                config::RootRole::ContextRo,
+                config::RootRole::GitMetadata,
+            ],
+        }],
+    })
+    .unwrap()
+}
+
 #[test]
 fn mount_resolution_is_repeatable_and_rejects_reserved_shadowing() {
     let temp =
         std::env::temp_dir().join(format!("agent-hub-attended-paths-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp);
     initialize_repository(&temp.join("repo"));
-    let roots = ApprovedRoots::new(vec![temp.clone()]).unwrap();
+    let roots = approved_root("test", &temp);
     let requested = vec![RequestedWorkspace {
         alias: "primary".into(),
         path: temp.join("repo"),
@@ -65,7 +81,8 @@ fn context_roots_must_be_read_only_and_approved() {
     let root =
         std::env::temp_dir().join(format!("agent-hub-attended-context-{}", std::process::id()));
     initialize_repository(&root.join("workspace"));
-    let roots = ApprovedRoots::new(vec![root.clone(), "/home/nick.davies/code".into()]).unwrap();
+    std::fs::create_dir_all(root.join("context/child")).unwrap();
+    let roots = approved_root("test", &root);
     let workspaces = vec![RequestedWorkspace {
         alias: "primary".into(),
         path: root.join("workspace"),
@@ -73,7 +90,7 @@ fn context_roots_must_be_read_only_and_approved() {
     }];
     let contexts = vec![RequestedContextRoot {
         alias: "code".into(),
-        path: "/home/nick.davies/code".into(),
+        path: root.join("context"),
         access: WorkspaceAccess::ReadOnly,
     }];
     let resolved = resolve_mounts(&roots, &workspaces, &contexts, "primary").unwrap();
@@ -84,7 +101,7 @@ fn context_roots_must_be_read_only_and_approved() {
     );
     let contexts = vec![RequestedContextRoot {
         alias: "code-child".into(),
-        path: "/home/nick.davies/code/achilles".into(),
+        path: root.join("context/child"),
         access: WorkspaceAccess::ReadOnly,
     }];
     assert!(resolve_mounts(&roots, &workspaces, &contexts, "primary").is_ok());
@@ -98,7 +115,7 @@ fn mount_resolution_rejects_implicit_modes_symlinks_and_overlap() {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(root.join("first/child")).unwrap();
-    let roots = ApprovedRoots::new(vec![root.clone()]).unwrap();
+    let roots = approved_root("test", &root);
     let context = RequestedContextRoot {
         alias: "reference".into(),
         path: root.join("first"),
@@ -156,7 +173,7 @@ fn multi_workspace_git_state_binds_exact_roots_refs_access_and_dirty_paths() {
     std::fs::write(alpha.join("tracked.txt"), "dirty\n").unwrap();
     std::fs::write(alpha.join("untracked.txt"), "dirty\n").unwrap();
 
-    let roots = ApprovedRoots::new(vec![root.clone()]).unwrap();
+    let roots = approved_root("test", &root);
     let resolved = resolve_mounts(
         &roots,
         &[

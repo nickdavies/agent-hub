@@ -243,7 +243,7 @@ fn write_config(root: &Path, workspace: &Path) {
         serde_json::to_vec(&serde_json::json!({
             "default_agent":{"kind":"generic","command":"true"},
             "triage_repos":[workspace],
-            "approved_repository_roots":[workspace.parent().unwrap()],
+            "root_registry":{"roots":[{"identity":"workspace","path":workspace.parent().unwrap(),"roles":["workspace_ro","workspace_rw","context_ro","git_metadata"]}]},
             "triage_mounts":[{"host_path":workspace,"container_path":"/repos/workspace","read_only":true}],
         }))
         .unwrap(),

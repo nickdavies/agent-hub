@@ -4,12 +4,21 @@ use std::process::Command;
 
 use anyhow::{Context, ensure};
 pub use protocol::WorkspaceAccess;
-use protocol::{ContextRootSpec, RepositoryMountSpec, RepositoryState, WorkspaceSpec};
+use protocol::{
+    ContextRootSpec, RepositoryMountSpec, RepositoryState, ResolvedRoot, RootRole, WorkspaceSpec,
+};
 
 const RESERVED_ALIASES: &[&str] = &["artifacts", "config", "context", "opencode", "output"];
 
 #[derive(Debug, Clone)]
-pub struct ApprovedRoots(Vec<PathBuf>);
+pub struct ApprovedRoots(Vec<ApprovedRoot>);
+
+#[derive(Debug, Clone)]
+struct ApprovedRoot {
+    identity: String,
+    path: PathBuf,
+    roles: BTreeSet<RootRole>,
+}
 
 #[derive(Debug, Clone)]
 pub struct RequestedWorkspace {
@@ -27,6 +36,7 @@ pub struct RequestedContextRoot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMounts {
+    pub roots: Vec<ResolvedRoot>,
     pub workspaces: Vec<WorkspaceSpec>,
     pub context_roots: Vec<ContextRootSpec>,
     pub repositories: Vec<RepositoryMountSpec>,
@@ -35,36 +45,54 @@ pub struct ResolvedMounts {
 }
 
 impl ApprovedRoots {
-    pub fn new(roots: Vec<PathBuf>) -> anyhow::Result<Self> {
+    pub fn new(registry: config::RootRegistryConfig) -> anyhow::Result<Self> {
+        let roots = registry.roots;
         ensure!(!roots.is_empty(), "approved roots must not be empty");
         let mut canonical = roots
             .into_iter()
             .map(|root| {
-                let root = std::fs::canonicalize(&root)
-                    .with_context(|| format!("canonicalize approved root {}", root.display()))?;
+                let configured = PathBuf::from(&root.path);
+                let canonical = std::fs::canonicalize(&configured).with_context(|| {
+                    format!("canonicalize approved root {}", configured.display())
+                })?;
                 ensure!(
-                    root.is_dir(),
-                    "approved root '{}' is not a directory",
-                    root.display()
+                    canonical == configured,
+                    "approved root '{}' resolves through a symlink or noncanonical component",
+                    configured.display()
                 );
-                ensure!(root != Path::new("/"), "filesystem root cannot be approved");
-                Ok(root)
+                ensure!(
+                    canonical.is_dir(),
+                    "approved root '{}' is not a directory",
+                    canonical.display()
+                );
+                ensure!(
+                    canonical != Path::new("/"),
+                    "filesystem root cannot be approved"
+                );
+                Ok(ApprovedRoot {
+                    identity: root.identity,
+                    path: canonical,
+                    roles: root.roles.into_iter().map(protocol_root_role).collect(),
+                })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        canonical.sort();
-        canonical.dedup();
+        canonical.sort_by(|left, right| left.path.cmp(&right.path));
         for pair in canonical.windows(2) {
             ensure!(
-                !pair[1].starts_with(&pair[0]),
+                !pair[1].path.starts_with(&pair[0].path),
                 "approved roots overlap: '{}' and '{}'",
-                pair[0].display(),
-                pair[1].display()
+                pair[0].path.display(),
+                pair[1].path.display()
             );
         }
         Ok(Self(canonical))
     }
 
-    fn resolve(&self, requested: &Path) -> anyhow::Result<PathBuf> {
+    fn resolve(
+        &self,
+        requested: &Path,
+        role: RootRole,
+    ) -> anyhow::Result<(&ApprovedRoot, PathBuf)> {
         ensure_canonical_input_path(requested)?;
         let path = std::fs::canonicalize(requested)
             .with_context(|| format!("canonicalize requested path {}", requested.display()))?;
@@ -73,12 +101,41 @@ impl ApprovedRoots {
             "requested path '{}' is not a directory",
             path.display()
         );
+        let root = self
+            .0
+            .iter()
+            .find(|root| path.starts_with(&root.path))
+            .with_context(|| {
+                format!(
+                    "requested path '{}' is outside approved roots",
+                    path.display()
+                )
+            })?;
         ensure!(
-            self.0.iter().any(|root| path.starts_with(root)),
-            "requested path '{}' is outside approved roots",
-            path.display()
+            root.roles.contains(&role),
+            "requested path '{}' is not authorized for root role '{}'",
+            path.display(),
+            root_role_name(role)
         );
-        Ok(path)
+        Ok((root, path))
+    }
+}
+
+fn protocol_root_role(role: config::RootRole) -> RootRole {
+    match role {
+        config::RootRole::WorkspaceRo => RootRole::WorkspaceRo,
+        config::RootRole::WorkspaceRw => RootRole::WorkspaceRw,
+        config::RootRole::ContextRo => RootRole::ContextRo,
+        config::RootRole::GitMetadata => RootRole::GitMetadata,
+    }
+}
+
+fn root_role_name(role: RootRole) -> &'static str {
+    match role {
+        RootRole::WorkspaceRo => "workspace_ro",
+        RootRole::WorkspaceRw => "workspace_rw",
+        RootRole::ContextRo => "context_ro",
+        RootRole::GitMetadata => "git_metadata",
     }
 }
 
@@ -105,16 +162,16 @@ pub fn resolve_mounts(
             "duplicate mount alias '{}'",
             requested.alias
         );
-        let host = roots.resolve(&requested.path)?;
-        ensure!(
-            !is_read_only_context_namespace(&host),
-            "{} is restricted to read-only context mounts",
-            host.display()
-        );
+        let role = match requested.access {
+            WorkspaceAccess::ReadOnly => RootRole::WorkspaceRo,
+            WorkspaceAccess::ReadWrite => RootRole::WorkspaceRw,
+        };
+        let (root, host) = roots.resolve(&requested.path, role)?;
         reject_host_overlap(&hosts, &host)?;
         hosts.push(host.clone());
         let container_path = format!("/workspace/{}", requested.alias);
         workspaces.push(WorkspaceSpec {
+            root_identity: root.identity.clone(),
             alias: requested.alias.clone(),
             host_path: path_string(&host)?,
             container_path: container_path.clone(),
@@ -126,6 +183,11 @@ pub fn resolve_mounts(
             &container_path,
             requested.access,
         )?;
+        ensure!(
+            root.roles.contains(&RootRole::GitMetadata),
+            "workspace '{}' is a Git repository but its root lacks git_metadata authority",
+            host.display()
+        );
         repositories.push(RepositoryMountSpec {
             workspace_alias: requested.alias.clone(),
             repository_root: path_string(&host)?,
@@ -165,15 +227,11 @@ pub fn resolve_mounts(
             "duplicate mount alias '{}'",
             requested.alias
         );
-        let host = roots.resolve(&requested.path)?;
-        ensure!(
-            host.to_str()
-                .is_some_and(protocol::is_canonical_context_root_path),
-            "context roots must be /home/nick.davies/code, /home/nick.davies/oss, or descendants"
-        );
+        let (root, host) = roots.resolve(&requested.path, RootRole::ContextRo)?;
         reject_host_overlap(&hosts, &host)?;
         hosts.push(host.clone());
         context_roots.push(ContextRootSpec {
+            root_identity: root.identity.clone(),
             alias: requested.alias.clone(),
             host_path: path_string(&host)?,
             container_path: format!("/context/{}", requested.alias),
@@ -183,7 +241,26 @@ pub fn resolve_mounts(
     context_roots.sort();
     repositories.sort();
     git_views.sort();
+    let mut resolved_roots = roots
+        .0
+        .iter()
+        .filter(|root| {
+            workspaces
+                .iter()
+                .any(|mount| mount.root_identity == root.identity)
+                || context_roots
+                    .iter()
+                    .any(|mount| mount.root_identity == root.identity)
+        })
+        .map(|root| ResolvedRoot {
+            identity: root.identity.clone(),
+            host_path: path_string(&root.path).expect("validated root paths are UTF-8"),
+            roles: root.roles.iter().copied().collect(),
+        })
+        .collect::<Vec<_>>();
+    resolved_roots.sort();
     Ok(ResolvedMounts {
+        roots: resolved_roots,
         workspaces,
         context_roots,
         repositories,
@@ -230,13 +307,6 @@ fn ensure_canonical_input_path(path: &Path) -> anyhow::Result<()> {
         path.display()
     );
     Ok(())
-}
-
-fn is_read_only_context_namespace(path: &Path) -> bool {
-    ["code", "oss"]
-        .iter()
-        .filter_map(|alias| protocol::canonical_context_root_path(alias))
-        .any(|root| path.starts_with(root))
 }
 
 fn reject_host_overlap(existing: &[PathBuf], candidate: &Path) -> anyhow::Result<()> {

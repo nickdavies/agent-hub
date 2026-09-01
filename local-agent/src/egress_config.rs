@@ -37,7 +37,7 @@ pub struct LocalAgentConfig {
     #[serde(default)]
     pub triage_repos: Vec<String>,
     #[serde(default)]
-    pub approved_repository_roots: Vec<PathBuf>,
+    pub root_registry: agent_hub_config::RootRegistryConfig,
     #[serde(default)]
     pub triage_mounts: Vec<ManagedRunnerFileMount>,
     /// Hosts the local-agent treats as "GitHub-shaped" when parsing repo URLs
@@ -67,7 +67,7 @@ impl Default for LocalAgentConfig {
             managed_runners: HashMap::new(),
             mcp_bridges: Vec::new(),
             triage_repos: Vec::new(),
-            approved_repository_roots: Vec::new(),
+            root_registry: agent_hub_config::RootRegistryConfig::default(),
             triage_mounts: Vec::new(),
             github_hosts: Vec::new(),
             github_api_base_urls: HashMap::new(),
@@ -856,12 +856,8 @@ fn normalize_config(config: &mut LocalAgentConfig) -> anyhow::Result<()> {
         .map(|entry| entry.trim().to_string())
         .filter(|entry| !entry.is_empty())
         .collect();
-    config.approved_repository_roots = config
-        .approved_repository_roots
-        .iter()
-        .filter(|root| !root.as_os_str().is_empty())
-        .cloned()
-        .collect();
+    agent_hub_config::root_registry(&serde_json::json!({"root_registry": config.root_registry}))
+        .map_err(anyhow::Error::msg)?;
     for mount in &mut config.triage_mounts {
         mount.host_path = mount.host_path.trim().to_string();
         mount.container_path = mount.container_path.trim().to_string();
@@ -974,6 +970,16 @@ mod tests {
     use super::*;
     use crate::mcp_bridge::{McpBridgeConfig, McpEndpoint};
 
+    fn add_root_registry(config: &mut LocalAgentConfig) {
+        config.root_registry = agent_hub_config::RootRegistryConfig {
+            roots: vec![agent_hub_config::RootConfig {
+                identity: "test".into(),
+                path: "/roots/test".into(),
+                roles: vec![agent_hub_config::RootRole::WorkspaceRo],
+            }],
+        };
+    }
+
     #[test]
     fn explicit_default_runner_ids_fail_when_unavailable() {
         let mut config = LocalAgentConfig::default();
@@ -1015,6 +1021,7 @@ mod tests {
     #[test]
     fn proxy_declared_volume_contract_requires_exact_log_and_spool_set() {
         let mut valid = LocalAgentConfig::default();
+        add_root_registry(&mut valid);
         valid.egress.preflight_image = Some("test".to_string());
         normalize_config(&mut valid).unwrap();
         assert_eq!(
@@ -1031,6 +1038,7 @@ mod tests {
             ],
         ] {
             let mut invalid = LocalAgentConfig::default();
+            add_root_registry(&mut invalid);
             invalid.egress.preflight_image = Some("test".to_string());
             invalid.egress.proxy.declared_volumes = volumes;
             assert!(normalize_config(&mut invalid).is_err());
@@ -1051,6 +1059,7 @@ mod tests {
         let local = serde_json::json!({
             "installation_id":"test-installation",
             "config_identity":"test-config",
+            "root_registry":{"roots":[{"identity":"test","path":"/roots/test","roles":["workspace_ro"]}]},
             "egress":{"preflight_image":"test-preflight"},
             "default_agent":{"kind":"generic","command":"true"}
         });
@@ -1203,6 +1212,7 @@ mod tests {
     #[test]
     fn local_agent_config_requires_a_preflight_image() {
         let mut config = LocalAgentConfig::default();
+        add_root_registry(&mut config);
         assert!(normalize_config(&mut config).is_err());
 
         config.egress.preflight_image = Some(" job-code:locked ".to_string());

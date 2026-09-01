@@ -45,7 +45,6 @@ pub fn is_canonical_context_root_path(path: &str) -> bool {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AttendedAuthorizationRequestV1 {
@@ -138,6 +137,7 @@ pub struct AttendedExecutionSpec {
     pub approved: ApprovedExecutionSpec,
     pub credential_providers: Vec<AuthorizedCredentialProvider>,
     pub overlays: Vec<AuthorizedOverlay>,
+    pub roots: Vec<ResolvedRoot>,
     pub workspaces: Vec<WorkspaceSpec>,
     pub context_roots: Vec<ContextRootSpec>,
     pub repositories: Vec<RepositoryMountSpec>,
@@ -150,6 +150,20 @@ pub struct AuthorizedOverlay {
     pub name: String,
     pub provider: String,
     pub config: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GithubOverlayBinding {
+    pub host: String,
+    pub api_base_url: String,
+    pub access: String,
+    pub network_resource: String,
+    pub credential_provider: String,
+    pub credential_target: String,
+    pub authenticated: bool,
+    pub private_repositories: bool,
+    pub repository_remotes: Vec<String>,
 }
 
 impl std::ops::Deref for AttendedExecutionSpec {
@@ -182,7 +196,27 @@ pub struct AuthorizedCredentialProvider {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
+pub struct ResolvedRoot {
+    pub identity: String,
+    pub host_path: String,
+    pub roles: Vec<RootRole>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RootRole {
+    WorkspaceRo,
+    WorkspaceRw,
+    ContextRo,
+    GitMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceSpec {
+    pub root_identity: String,
     pub alias: String,
     pub host_path: String,
     pub container_path: String,
@@ -244,6 +278,7 @@ pub struct GitViewSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct ContextRootSpec {
+    pub root_identity: String,
     pub alias: String,
     pub host_path: String,
     pub container_path: String,
@@ -577,6 +612,36 @@ impl AttendedAuthorizationRequestV1 {
         self.execution.repositories.sort();
         self.execution.credential_providers.sort();
         self.execution.overlays.sort();
+        for root in &mut self.execution.roots {
+            root.roles.sort();
+            if root.roles.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(format!("root '{}' has duplicate roles", root.identity));
+            }
+        }
+        self.execution.roots.sort();
+        reject_duplicate_by(
+            &self.execution.roots,
+            |item| &item.identity,
+            "root identity",
+        )?;
+        reject_duplicate_by(&self.execution.roots, |item| &item.host_path, "root path")?;
+        for (index, left) in self.execution.roots.iter().enumerate() {
+            validate_alias(&left.identity)?;
+            validate_absolute_path(&left.host_path, "root")?;
+            if left.roles.is_empty()
+                || left.roles.contains(&RootRole::WorkspaceRw)
+                    && !left.roles.contains(&RootRole::WorkspaceRo)
+            {
+                return Err(format!("root '{}' has invalid roles", left.identity));
+            }
+            for right in self.execution.roots.iter().skip(index + 1) {
+                if path_contains(&left.host_path, &right.host_path)
+                    || path_contains(&right.host_path, &left.host_path)
+                {
+                    return Err("attended root registry paths overlap".into());
+                }
+            }
+        }
         reject_duplicate_by(
             &self.execution.workspaces,
             |item| &item.alias,
@@ -593,11 +658,89 @@ impl AttendedAuthorizationRequestV1 {
         {
             return Err("attended overlay descriptors do not match proposal selectors".into());
         }
+        let mut github_overlay_credentials = BTreeSet::new();
+        let mut github_overlay_hosts = BTreeSet::new();
+        for overlay in &self.execution.overlays {
+            if overlay.provider != "github" {
+                continue;
+            }
+            let binding: GithubOverlayBinding = serde_json::from_str(&overlay.config)
+                .map_err(|error| format!("invalid GitHub overlay binding: {error}"))?;
+            let host = crate::canonical_github_host(&binding.host)
+                .ok_or_else(|| "GitHub overlay host is invalid".to_string())?;
+            let api = crate::canonical_github_api_base_for_host(&host, &binding.api_base_url)
+                .ok_or_else(|| "GitHub overlay API base URL is invalid".to_string())?;
+            let bound_remotes = binding
+                .repository_remotes
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let matching_remotes = self
+                .execution
+                .repositories
+                .iter()
+                .filter_map(|repository| repository.remote.as_ref())
+                .filter(|remote| remote_host(remote).as_deref() == Some(host.as_str()))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let credential = self
+                .execution
+                .credential_providers
+                .iter()
+                .find(|provider| provider.name == binding.credential_provider);
+            if host != binding.host
+                || api != binding.api_base_url
+                || !matches!(binding.access.as_str(), "read" | "read_write")
+                || binding.network_resource != "github"
+                || !binding.authenticated
+                || !binding.private_repositories
+                || overlay.name != format!("github:{host}:{}", binding.access)
+                || binding.credential_provider != overlay.name
+                || binding.credential_target != format!("/agent-hub/github/tokens/{host}")
+                || binding.repository_remotes.is_empty()
+                || bound_remotes.len() != binding.repository_remotes.len()
+                || bound_remotes != matching_remotes
+                || !binding
+                    .repository_remotes
+                    .iter()
+                    .all(|remote| remote_host(remote).as_deref() == Some(host.as_str()))
+                || !self
+                    .proposal
+                    .network_resources
+                    .contains(&NetworkResourceKind::Github)
+                || credential.is_none_or(|provider| {
+                    provider.provider_type != "github-token"
+                        || provider.access != binding.access
+                        || provider.targets != [binding.credential_target.clone()]
+                        || provider.constraints.get("host") != Some(&binding.host)
+                        || provider.constraints.get("api_base_url") != Some(&binding.api_base_url)
+                        || provider.constraints.get("target") != Some(&binding.credential_target)
+                })
+            {
+                return Err("GitHub overlay binding is not exact".into());
+            }
+            if !github_overlay_credentials.insert(binding.credential_provider) {
+                return Err("duplicate GitHub overlay credential binding".into());
+            }
+            if !github_overlay_hosts.insert(binding.host) {
+                return Err("multiple GitHub overlays bind the same host".into());
+            }
+        }
         reject_duplicate_by(
             &self.execution.credential_providers,
             |item| &item.name,
             "credential provider",
         )?;
+        let github_credentials = self
+            .execution
+            .credential_providers
+            .iter()
+            .filter(|provider| provider.provider_type == "github-token")
+            .map(|provider| provider.name.clone())
+            .collect::<BTreeSet<_>>();
+        if github_credentials != github_overlay_credentials {
+            return Err("GitHub credentials and authenticated overlays differ".into());
+        }
         reject_duplicate_by(
             &self.execution.context_roots,
             |item| &item.alias,
@@ -619,8 +762,13 @@ impl AttendedAuthorizationRequestV1 {
             }
             validate_alias(&context.alias)?;
             validate_absolute_path(&context.host_path, "context root")?;
-            if !is_canonical_context_root_path(&context.host_path) {
-                return Err("attended context roots are limited to /home/nick.davies/code and /home/nick.davies/oss".into());
+            let root = resolved_root_for_mount(
+                &self.execution.roots,
+                &context.root_identity,
+                &context.host_path,
+            )?;
+            if !root.roles.contains(&RootRole::ContextRo) {
+                return Err("attended context root lacks context_ro authority".into());
             }
             if context.container_path != format!("/context/{}", context.alias) {
                 return Err("attended context mount destination is not canonical".into());
@@ -629,6 +777,18 @@ impl AttendedAuthorizationRequestV1 {
         for workspace in &self.execution.workspaces {
             validate_alias(&workspace.alias)?;
             validate_absolute_path(&workspace.host_path, "workspace")?;
+            let root = resolved_root_for_mount(
+                &self.execution.roots,
+                &workspace.root_identity,
+                &workspace.host_path,
+            )?;
+            let required = match workspace.access {
+                WorkspaceAccess::ReadOnly => RootRole::WorkspaceRo,
+                WorkspaceAccess::ReadWrite => RootRole::WorkspaceRw,
+            };
+            if !root.roles.contains(&required) {
+                return Err("attended workspace exceeds its resolved root role".into());
+            }
             if workspace.container_path != format!("/workspace/{}", workspace.alias) {
                 return Err("attended workspace mount destination is not canonical".into());
             }
@@ -670,6 +830,15 @@ impl AttendedAuthorizationRequestV1 {
             {
                 return Err("attended repository mount differs from its workspace".into());
             }
+            let root = self
+                .execution
+                .roots
+                .iter()
+                .find(|root| root.identity == workspace.root_identity)
+                .expect("workspace root was validated");
+            if repository.starting.head.is_some() && !root.roles.contains(&RootRole::GitMetadata) {
+                return Err("attended repository metadata lacks git_metadata authority".into());
+            }
             if repository.starting.detached != repository.starting.branch.is_none()
                 && repository.starting.head.is_some()
             {
@@ -689,6 +858,36 @@ impl AttendedAuthorizationRequestV1 {
             canonical_bytes: bytes,
         })
     }
+}
+
+fn resolved_root_for_mount<'a>(
+    roots: &'a [ResolvedRoot],
+    identity: &str,
+    path: &str,
+) -> Result<&'a ResolvedRoot, String> {
+    let root = roots
+        .iter()
+        .find(|root| root.identity == identity)
+        .ok_or_else(|| format!("unknown resolved root identity '{identity}'"))?;
+    if !path_contains(&root.host_path, path) {
+        return Err(format!(
+            "path '{path}' is outside resolved root '{identity}'"
+        ));
+    }
+    Ok(root)
+}
+
+fn path_contains(root: &str, path: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn remote_host(remote: &str) -> Option<String> {
+    url::Url::parse(remote)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
 }
 
 impl AttendedAuthorizationRequestV2 {

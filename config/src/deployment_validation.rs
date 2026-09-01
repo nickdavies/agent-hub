@@ -105,6 +105,59 @@ pub struct ValidatedOverlay {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GithubOverlayConfig {
+    pub host: String,
+    pub api_base_url: String,
+    pub access: GithubOverlayAccess,
+    pub network_resource: String,
+    pub credential_provider: String,
+    pub credential_target: String,
+    pub authenticated: bool,
+    pub private_repositories: bool,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubOverlayAccess {
+    Read,
+    ReadWrite,
+}
+
+impl ValidatedOverlay {
+    pub fn github_config(&self) -> Result<Option<GithubOverlayConfig>, String> {
+        if self.provider != "github" {
+            return Ok(None);
+        }
+        let config: GithubOverlayConfig = serde_json::from_value(self.config.clone())
+            .map_err(|error| format!("invalid GitHub overlay '{}': {error}", self.name))?;
+        let host = protocol::canonical_github_host(&config.host)
+            .ok_or_else(|| format!("GitHub overlay '{}' has invalid host", self.name))?;
+        let api = protocol::canonical_github_api_base_for_host(&host, &config.api_base_url)
+            .ok_or_else(|| format!("GitHub overlay '{}' has invalid API base URL", self.name))?;
+        let access = match config.access {
+            GithubOverlayAccess::Read => "read",
+            GithubOverlayAccess::ReadWrite => "read_write",
+        };
+        if host != config.host
+            || api != config.api_base_url
+            || config.network_resource != "github"
+            || !config.authenticated
+            || !config.private_repositories
+            || self.name != format!("github:{host}:{access}")
+            || config.credential_provider != self.name
+            || config.credential_target != format!("/agent-hub/github/tokens/{host}")
+        {
+            return Err(format!(
+                "GitHub overlay '{}' is not an exact authenticated capability",
+                self.name
+            ));
+        }
+        Ok(Some(config))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValidatedOverlayRegistry {
     pub file: CapturedAuthoritativeFile,
@@ -263,6 +316,7 @@ pub fn validate_authoritative_config_root(root: &Path) -> Result<ValidatedDeploy
             .map_err(|error| format!("failed to read {}: {error}", local_path.display()))?,
     )
     .map_err(|error| format!("failed to parse {}: {error}", local_path.display()))?;
+    crate::root_registry(&local)?;
     let triage_mounts = validate_triage_repository_snapshots(&system_toml, &local)?;
     let runners: RunnerProfilesConfig = serde_json::from_value(local.clone())
         .map_err(|error| format!("failed to parse runner profiles: {error}"))?;
@@ -327,6 +381,7 @@ pub fn validate_authoritative_config_root(root: &Path) -> Result<ValidatedDeploy
                 if !names.insert(overlay.name.clone()) {
                     return Err(format!("duplicate overlay '{}'", overlay.name));
                 }
+                overlay.github_config()?;
             }
             authoritative_paths.insert(file.relative_path.clone());
             Ok(ValidatedOverlayRegistry {
@@ -563,6 +618,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn github_overlay_rejects_host_target_and_auth_ambiguity() {
+        let valid = serde_json::json!({
+            "host":"github.com",
+            "api_base_url":"https://api.github.com",
+            "access":"read",
+            "network_resource":"github",
+            "credential_provider":"github:github.com:read",
+            "credential_target":"/agent-hub/github/tokens/github.com",
+            "authenticated":true,
+            "private_repositories":true
+        });
+        let overlay = |config| ValidatedOverlay {
+            name: "github:github.com:read".into(),
+            provider: "github".into(),
+            config,
+            description: None,
+        };
+        overlay(valid.clone()).github_config().unwrap().unwrap();
+        for (field, value) in [
+            ("host", serde_json::json!("github.snooguts.net")),
+            ("credential_target", serde_json::json!("GITHUB_TOKEN")),
+            ("authenticated", serde_json::json!(false)),
+            ("private_repositories", serde_json::json!(false)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(overlay(invalid).github_config().is_err());
+        }
+        let mut unknown = valid;
+        unknown["unknown"] = serde_json::json!(true);
+        assert!(overlay(unknown).github_config().is_err());
+    }
+
+    #[test]
     fn captured_policy_bytes_objects_and_digests_resist_toctou_replacement() {
         let root =
             std::env::temp_dir().join(format!("policy-snapshot-toctou-{}", std::process::id()));
@@ -577,6 +666,7 @@ mod tests {
         std::fs::write(
             root.join("local-agent.json"),
             serde_json::to_vec(&serde_json::json!({
+                "root_registry":{"roots":[{"identity":"test","path":"/roots/test","roles":["workspace_ro"]}]},
                 "default_agent":{"kind":"generic","command":"true"}
             }))
             .unwrap(),
@@ -652,6 +742,7 @@ mod tests {
         std::fs::write(
             root.join("local-agent.json"),
             serde_json::to_vec(&serde_json::json!({
+                "root_registry":{"roots":[{"identity":"test","path":"/roots/test","roles":["workspace_ro"]}]},
                 "default_agent":{"kind":"generic","command":"true"}
             }))
             .unwrap(),

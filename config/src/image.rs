@@ -50,6 +50,7 @@ pub fn job_code_preflight_docker_args(
         "--env=XDG_CONFIG_HOME=/home/agent/.config".to_string(),
         "--env=XDG_DATA_HOME=/home/agent/.local/share".to_string(),
         "--env=XDG_STATE_HOME=/home/agent/.local/state".to_string(),
+        format!("--env=PATH={}", crate::runner::DURABLE_OPENCODE_PATH),
         format!("--env=AGENT_HUB_EXPECTED_UID={runtime_uid}"),
         format!("--env=AGENT_HUB_EXPECTED_GID={runtime_gid}"),
         format!("--env=AGENT_HUB_EXPECTED_IMAGE_IDENTITY={image}"),
