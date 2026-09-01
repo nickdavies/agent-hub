@@ -313,6 +313,15 @@ pub struct AttendedLifecycleContract {
     pub preserve_workspace_on_failure: bool,
     pub cancellation_requires_owner: bool,
     pub cleanup_is_explicit: bool,
+    pub retry: AttendedRetryConstraints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedRetryConstraints {
+    pub max_attempts: u32,
+    pub max_prelaunch_retries: u32,
+    pub max_provider_unavailable_retries: u32,
 }
 
 impl Default for AttendedLifecycleContract {
@@ -321,6 +330,11 @@ impl Default for AttendedLifecycleContract {
             preserve_workspace_on_failure: true,
             cancellation_requires_owner: true,
             cleanup_is_explicit: true,
+            retry: AttendedRetryConstraints {
+                max_attempts: 3,
+                max_prelaunch_retries: 2,
+                max_provider_unavailable_retries: 1,
+            },
         }
     }
 }

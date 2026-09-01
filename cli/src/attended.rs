@@ -48,6 +48,13 @@ const HOST_ONLY_APPROVAL_ENVIRONMENT: [&str; 4] = [
     "AGENT_HUB_APPROVALS_TOKEN",
 ];
 
+fn attended_fault(boundary: &str) -> anyhow::Result<()> {
+    if std::env::var("AGENT_HUB_ATTENDED_FAULT").as_deref() == Ok(boundary) {
+        anyhow::bail!("injected attended fault at {boundary}");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ProposalInput {
     pub config_root: PathBuf,
@@ -107,8 +114,8 @@ struct RelayEpochState {
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Preparing,
-    ConsumingAuthorization,
-    ReadyToLaunch,
+    LaunchPending,
+    Consumed,
     Running,
     Succeeded,
     Failed,
@@ -116,6 +123,37 @@ pub enum RunStatus {
     TimedOut,
     CleanupFailed,
     Cleaned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchState {
+    Proposed,
+    Authorized,
+    Preparing,
+    LaunchPending,
+    Consumed,
+    Running,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryClass {
+    Prelaunch,
+    ProviderServiceUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptLineage {
+    pub attempt_id: String,
+    pub run_id: String,
+    pub state: LaunchState,
+    pub retry_class: Option<RetryClass>,
+    pub retry_eligible: bool,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +171,12 @@ pub(crate) struct AuthorizationRecord {
     pub artifact: AttendedAuthorizationArtifact,
     pub authorization_path: String,
     pub authorized_at: DateTime<Utc>,
+    pub authorization_id: String,
+    pub receipt_id: String,
+    pub domain: String,
+    pub state: LaunchState,
+    pub attempts: Vec<AttemptLineage>,
+    pub active_attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +189,16 @@ pub(crate) struct RevalidatedAuthorization {
 #[serde(deny_unknown_fields)]
 pub struct RunRecord {
     pub id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub attempt_number: u32,
+    pub parent_attempt_id: Option<String>,
+    pub attempt_ancestry: Vec<String>,
+    pub authorization_id: String,
+    pub receipt_id: String,
     pub authorization_digest: String,
+    pub owner_nonce: String,
+    pub launch_state: LaunchState,
     pub status: RunStatus,
     pub container_name: String,
     pub ownership: BTreeMap<String, String>,
@@ -159,6 +212,23 @@ pub struct RunRecord {
     pub process_status: Option<RunStatus>,
     #[serde(default)]
     pub permission_outcome: Option<PermissionOutcome>,
+    pub retry_class: Option<RetryClass>,
+    pub retry_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RunOwnerMarker {
+    run_id: String,
+    attempt_id: String,
+    authorization_id: String,
+    receipt_id: String,
+    authorization_digest: String,
+    nonce: String,
+    uid: u32,
+    gid: u32,
+    mode: String,
+    ancestry: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -576,10 +646,14 @@ pub async fn run(
             .map_err(anyhow::Error::msg)?;
     let relay_endpoint = resolve_host_relay_endpoint(&deployment, relay_override).await?;
     let _lock = store.lock(&lock_path(&digest))?;
-    let authorized: AuthorizationRecord = store.read_json(&authorized_path)?;
+    let mut authorized: AuthorizationRecord = store.read_json(&authorized_path)?;
     ensure!(
         authorized.artifact == supplied && authorized.authorization_path == supplied_path,
         "authorized artifact does not match supplied artifact"
+    );
+    ensure!(
+        authorized.domain == "attended",
+        "authorization receipt domain mismatch"
     );
     let runner: config::ResolvedRunnerProfile =
         serde_json::from_value(request.execution.behavior.runner_profile.clone())?;
@@ -595,104 +669,163 @@ pub async fn run(
     verify_tool_approval(request.proposal.tool_approval, Some(&relay_endpoint))?;
     let docker_path =
         which::which("docker").context("Docker CLI is required for attended execution")?;
-    let id = digest[..24].to_string();
-    let container_name = format!("agent-hub-attended-{id}");
+    if let Some(active) = authorized.active_attempt_id.clone() {
+        let mut active_record: RunRecord = store.read_json(&run_record_path(&active))?;
+        let active_dir = store.path(&PathBuf::from("runs").join(&active_record.id))?;
+        let expected = owner_marker_for_record(&active_record);
+        if active_dir.exists() {
+            verify_run_owner_marker(&active_dir, &expected)?;
+            recover_owned_run_resources(
+                &docker_path,
+                &active_dir,
+                &active_record.id,
+                &active_record.container_name,
+                &active_record.ownership,
+                Some(&relay_endpoint),
+                &expected,
+            )
+            .await
+            .context("reconcile interrupted attended attempt")?;
+        }
+        ensure!(
+            authorized
+                .attempts
+                .last()
+                .is_some_and(|attempt| attempt.attempt_id == active),
+            "authorization active attempt does not match receipt lineage"
+        );
+        let previous = authorized.attempts.last_mut().expect("checked above");
+        previous.state = LaunchState::Terminal;
+        let prelaunch = active_record.launch_state == LaunchState::Preparing;
+        previous.retry_class = prelaunch.then_some(RetryClass::Prelaunch);
+        previous.retry_eligible = prelaunch;
+        previous.finished_at = Some(Utc::now());
+        authorized.active_attempt_id = None;
+        authorized.state = if prelaunch {
+            LaunchState::Authorized
+        } else {
+            LaunchState::Terminal
+        };
+        active_record.launch_state = LaunchState::Terminal;
+        active_record.status = RunStatus::Failed;
+        active_record.retry_class = previous.retry_class.clone();
+        active_record.retry_eligible = prelaunch;
+        active_record.finished_at = Some(Utc::now());
+        active_record.error = Some(if prelaunch {
+            "interrupted prelaunch attempt was fully reconciled".into()
+        } else {
+            "interrupted attempt reached launch_pending; authorization consumed fail-closed".into()
+        });
+        store.replace_json(&run_record_path(&active), &active_record)?;
+        store.replace_json(&authorized_path, &authorized)?;
+        ensure!(prelaunch, "attended authorization was consumed fail-closed");
+    }
+    let retry = &request.lifecycle.retry;
+    ensure!(
+        authorized.attempts.len() < retry.max_attempts as usize,
+        "attended authorization exhausted its reviewed attempt limit"
+    );
+    if let Some(previous) = authorized.attempts.last() {
+        ensure!(
+            previous.retry_eligible,
+            "attended authorization was already consumed"
+        );
+    }
+    ensure!(
+        authorized
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.retry_class == Some(RetryClass::Prelaunch))
+            .count()
+            <= retry.max_prelaunch_retries as usize,
+        "attended authorization exhausted its reviewed prelaunch retry limit"
+    );
+    ensure!(
+        authorized
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.retry_class == Some(RetryClass::ProviderServiceUnavailable))
+            .count()
+            <= retry.max_provider_unavailable_retries as usize,
+        "attended authorization exhausted its reviewed provider retry limit"
+    );
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let owner_nonce = uuid::Uuid::new_v4().to_string();
+    let attempt_ancestry = authorized
+        .attempts
+        .iter()
+        .map(|attempt| attempt.attempt_id.clone())
+        .collect::<Vec<_>>();
+    let parent_attempt_id = attempt_ancestry.last().cloned();
+    let attempt_number = u32::try_from(authorized.attempts.len() + 1)?;
+    let id = run_id.clone();
+    let container_name = format!("agent-hub-attended-{}", &attempt_id[..8]);
     let run_dir = store.path(&PathBuf::from("runs").join(&id))?;
     let ownership = BTreeMap::from([
         (
             "agent-hub.reddit.com/attended-digest".to_string(),
             digest.clone(),
         ),
-        ("agent-hub.reddit.com/attended-run".to_string(), id.clone()),
+        (
+            "agent-hub.reddit.com/attended-run".to_string(),
+            run_id.clone(),
+        ),
+        (
+            "agent-hub.reddit.com/attended-attempt".to_string(),
+            attempt_id.clone(),
+        ),
+        (
+            "agent-hub.reddit.com/attended-authorization".to_string(),
+            authorized.authorization_id.clone(),
+        ),
+        (
+            "agent-hub.reddit.com/attended-receipt".to_string(),
+            authorized.receipt_id.clone(),
+        ),
+        (
+            "agent-hub.reddit.com/attended-nonce".to_string(),
+            owner_nonce.clone(),
+        ),
     ]);
-    let mut record = match store.read_json::<RunRecord>(&run_record_path(&id)) {
-        Ok(mut record) => {
-            ensure!(
-                record.authorization_digest == digest,
-                "attended execution record has the wrong authorization digest"
-            );
-            if record.status == RunStatus::Running {
-                let docker = DockerCli::new(
-                    which::which("docker")
-                        .context("Docker CLI is required to recover attended execution state")?,
-                );
-                match docker
-                    .inspect_ownership(&record.container_name, Duration::from_secs(10))
-                    .await?
-                {
-                    Some(actual) => {
-                        ensure!(
-                            actual == record.ownership,
-                            "running attended container ownership does not exactly match its journal"
-                        );
-                        anyhow::bail!("attended authorization is already running");
-                    }
-                    None => {
-                        let recovery = recover_owned_run_resources(
-                            &docker_path,
-                            &run_dir,
-                            &id,
-                            &container_name,
-                            &ownership,
-                            Some(&relay_endpoint),
-                        )
-                        .await;
-                        record.status = if recovery.is_ok() {
-                            RunStatus::Failed
-                        } else {
-                            RunStatus::CleanupFailed
-                        };
-                        record.finished_at = Some(Utc::now());
-                        record.error = Some(match recovery {
-                            Ok(()) => {
-                                "execution was interrupted after crossing the launch boundary"
-                                    .into()
-                            }
-                            Err(error) => format!(
-                                "execution was interrupted after crossing the launch boundary; recovery cleanup failed: {error:#}"
-                            ),
-                        });
-                        store.replace_json(&run_record_path(&id), &record)?;
-                        anyhow::bail!("attended execution was interrupted after launch");
-                    }
-                }
-            }
-            ensure!(
-                matches!(
-                    record.status,
-                    RunStatus::Preparing
-                        | RunStatus::ConsumingAuthorization
-                        | RunStatus::ReadyToLaunch
-                ),
-                "attended authorization was already consumed"
-            );
-            record
-        }
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            let record = RunRecord {
-                id: id.clone(),
-                authorization_digest: digest.clone(),
-                status: RunStatus::Preparing,
-                container_name: container_name.clone(),
-                ownership: ownership.clone(),
-                started_at: Utc::now(),
-                finished_at: None,
-                exit_code: None,
-                error: None,
-                execution_status: None,
-                process_status: None,
-                permission_outcome: None,
-            };
-            store.create_json(&run_record_path(&id), &record)?;
-            record
-        }
-        Err(error) => return Err(error),
+    let mut record = RunRecord {
+        id: id.clone(),
+        run_id: run_id.clone(),
+        attempt_id: attempt_id.clone(),
+        attempt_number,
+        parent_attempt_id,
+        attempt_ancestry,
+        authorization_id: authorized.authorization_id.clone(),
+        receipt_id: authorized.receipt_id.clone(),
+        authorization_digest: digest.clone(),
+        owner_nonce,
+        launch_state: LaunchState::Preparing,
+        status: RunStatus::Preparing,
+        container_name: container_name.clone(),
+        ownership: ownership.clone(),
+        started_at: Utc::now(),
+        finished_at: None,
+        exit_code: None,
+        error: None,
+        execution_status: None,
+        process_status: None,
+        permission_outcome: None,
+        retry_class: None,
+        retry_eligible: false,
     };
-    prepare_consumption(store, &mut record, &digest, |_| Ok(()))?;
+    authorized.active_attempt_id = Some(attempt_id.clone());
+    authorized.attempts.push(AttemptLineage {
+        attempt_id,
+        run_id,
+        state: LaunchState::Preparing,
+        retry_class: None,
+        retry_eligible: false,
+        started_at: record.started_at,
+        finished_at: None,
+    });
+    store.create_json(&run_record_path(&id), &record)?;
+    store.replace_json(&authorized_path, &authorized)?;
+    attended_fault("preparing")?;
 
     let mut captured_execution_outcome = None;
     let mut captured_process_status = None;
@@ -775,34 +908,17 @@ pub async fn run(
         )
     }
     .map_err(anyhow::Error::msg)?;
+    attended_fault("preflight_complete")?;
     let runs_dir = run_dir.parent().context("run directory has no parent")?;
     if !runs_dir.exists() {
         std::fs::create_dir(runs_dir)?;
         set_private_directory(runs_dir)?;
         sync_directory_and_parent(runs_dir)?;
     }
-    if run_dir.exists() {
-        let metadata = std::fs::symlink_metadata(&run_dir)?;
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "attended run directory is not a real directory"
-        );
-        recover_owned_run_resources(
-            &docker_path,
-            &run_dir,
-            &id,
-            &container_name,
-            &ownership,
-            Some(&relay_endpoint),
-        )
-        .await
-        .context("reconcile interrupted attended run before retry")?;
-        std::fs::remove_dir_all(&run_dir)?;
-        File::open(runs_dir)?.sync_all()?;
-    }
-        std::fs::create_dir(&run_dir)?;
-        set_private_directory(&run_dir)?;
-        sync_directory_and_parent(&run_dir)?;
+        ensure!(!run_dir.exists(), "fresh attended run directory already exists");
+        let owner_marker = owner_marker_for_record(&record);
+        create_owned_run_directory(&run_dir, &owner_marker)?;
+        attended_fault("owner_published")?;
         let bundle_dir = run_dir.join("config");
         let data_dir = run_dir.join("data");
         let state_dir = run_dir.join("state");
@@ -848,7 +964,8 @@ pub async fn run(
         let mut materialized_git_views = None;
         let operation = async {
         if request.proposal.tool_approval == ToolApprovalMode::Dippy {
-            let run_epoch = uuid::Uuid::new_v4();
+            let run_epoch = uuid::Uuid::parse_str(&record.owner_nonce)
+                .context("attended attempt nonce is not a UUID")?;
             let relay_socket = host_relay_socket_location(run_epoch)?;
             let network_digest = protocol::attended_network_digest(&serde_json::json!({
                 "class": request.proposal.network_class,
@@ -1156,14 +1273,47 @@ pub async fn run(
                 runtime_uid,
                 runtime_gid,
             )?;
-            let args = plan.materialize_args()?;
-            ensure!(
-                !cancellation.requested(),
-                "execution was cancelled before launch"
-            );
-            record.status = RunStatus::Running;
-            store.replace_json(&run_record_path(&id), &record)?;
-            let process_result = execute_process(ExecutionRequest {
+             let args = plan.materialize_args()?;
+             ensure!(
+                 !cancellation.requested(),
+                 "execution was cancelled before launch"
+             );
+             attended_fault("preparing_complete")?;
+             record.launch_state = LaunchState::LaunchPending;
+             record.status = RunStatus::LaunchPending;
+             store.replace_json(&run_record_path(&id), &record)?;
+             update_authorization_attempt_state(
+                 store,
+                 &authorized_path,
+                 &mut authorized,
+                 &record.attempt_id,
+                 LaunchState::LaunchPending,
+             )?;
+             attended_fault("launch_pending")?;
+             authorized.state = LaunchState::Consumed;
+             update_authorization_attempt_state(
+                 store,
+                 &authorized_path,
+                 &mut authorized,
+                 &record.attempt_id,
+                 LaunchState::Consumed,
+             )?;
+             attended_fault("consumed")?;
+             record.launch_state = LaunchState::Consumed;
+             record.status = RunStatus::Consumed;
+             store.replace_json(&run_record_path(&id), &record)?;
+             record.launch_state = LaunchState::Running;
+             record.status = RunStatus::Running;
+             store.replace_json(&run_record_path(&id), &record)?;
+             update_authorization_attempt_state(
+                 store,
+                 &authorized_path,
+                 &mut authorized,
+                 &record.attempt_id,
+                 LaunchState::Running,
+             )?;
+             attended_fault("running")?;
+             let process_result = execute_process(ExecutionRequest {
                 command: docker_path.clone(),
                 args,
                 current_dir: run_dir.clone(),
@@ -1180,8 +1330,13 @@ pub async fn run(
                 },
                 effects: Some(effects.clone()),
                 operation_identity: Some(format!(
-                    "container={container_name};digest={digest};image={image_identity}"
-                )),
+                    "container={container_name};digest={digest};authorization={};receipt={};attempt={};run={};nonce={};image={image_identity}",
+                    record.authorization_id,
+                    record.receipt_id,
+                    record.attempt_id,
+                    record.run_id,
+                    record.owner_nonce,
+                 )),
             })
             .await?;
             captured_process_status = Some(run_status_for_execution_status(&process_result.status));
@@ -1402,14 +1557,14 @@ pub async fn run(
         if let Some(effects) = &effects {
             effects.settle_process_helpers().await?;
         }
-        let mut docker = DockerCli::new(docker_path);
+        let mut docker = DockerCli::new(&docker_path);
         if let Some(effects) = effects {
             docker = docker.with_effects(effects);
         }
         docker
             .remove_owned(
                 &container_name,
-                &DockerOwnership::new(ownership)?,
+                &DockerOwnership::new(ownership.clone())?,
                 PRIMARY_CLEANUP_TIMEOUT,
             )
             .await
@@ -1424,7 +1579,33 @@ pub async fn run(
             None => container_error,
         });
     }
-    let cleanup_complete = cleanup_evidence.complete();
+    let prelaunch_reconciliation =
+        if record.launch_state == LaunchState::Preparing && run_dir.exists() {
+            recover_owned_run_resources(
+                &docker_path,
+                &run_dir,
+                &id,
+                &container_name,
+                &ownership,
+                Some(&relay_endpoint),
+                &owner_marker_for_record(&record),
+            )
+            .await
+        } else {
+            Ok(())
+        };
+    if let Err(error) = &prelaunch_reconciliation {
+        record.status = RunStatus::CleanupFailed;
+        let cleanup_error = format!("prelaunch reconciliation failed: {error:#}");
+        record.error = Some(match record.error.take() {
+            Some(existing) => format!("{existing}; {cleanup_error}"),
+            None => cleanup_error,
+        });
+    }
+    let cleanup_complete = cleanup_evidence.complete() && prelaunch_reconciliation.is_ok();
+    if cleanup_complete {
+        attended_fault("cleanup_complete")?;
+    }
     let output_result: anyhow::Result<()> = (|| {
         if run_dir.is_dir() {
             let result_path = run_dir.join(&request.output.result);
@@ -1530,7 +1711,63 @@ pub async fn run(
             }
         }
     }
+    let prelaunch_retry = record.launch_state == LaunchState::Preparing
+        && cleanup_complete
+        && verify_execution_inputs(&request).is_ok();
+    let provider_retry = record.launch_state == LaunchState::Running
+        && cleanup_complete
+        && provider_unavailable_retry_evidence(&record, &run_dir, &request)?;
+    record.retry_class = if prelaunch_retry {
+        Some(RetryClass::Prelaunch)
+    } else if provider_retry {
+        Some(RetryClass::ProviderServiceUnavailable)
+    } else {
+        None
+    };
+    record.retry_eligible = match record.retry_class {
+        Some(RetryClass::Prelaunch) => {
+            authorized
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.retry_class == Some(RetryClass::Prelaunch))
+                .count()
+                < request.lifecycle.retry.max_prelaunch_retries as usize
+        }
+        Some(RetryClass::ProviderServiceUnavailable) => {
+            authorized
+                .attempts
+                .iter()
+                .filter(|attempt| {
+                    attempt.retry_class == Some(RetryClass::ProviderServiceUnavailable)
+                })
+                .count()
+                < request.lifecycle.retry.max_provider_unavailable_retries as usize
+        }
+        None => false,
+    } && authorized.attempts.len()
+        < request.lifecycle.retry.max_attempts as usize;
+    record.launch_state = LaunchState::Terminal;
+    let lineage = authorized
+        .attempts
+        .last_mut()
+        .context("authorization receipt lost its active attempt")?;
+    ensure!(
+        lineage.attempt_id == record.attempt_id
+            && authorized.active_attempt_id.as_deref() == Some(record.attempt_id.as_str()),
+        "authorization receipt active attempt mismatch"
+    );
+    lineage.state = LaunchState::Terminal;
+    lineage.retry_class = record.retry_class.clone();
+    lineage.retry_eligible = record.retry_eligible;
+    lineage.finished_at = record.finished_at;
+    authorized.active_attempt_id = None;
+    authorized.state = if record.retry_eligible {
+        LaunchState::Authorized
+    } else {
+        LaunchState::Terminal
+    };
     store.replace_json(&run_record_path(&id), &record)?;
+    store.replace_json(&authorized_path, &authorized)?;
     Ok(record)
 }
 
@@ -1672,8 +1909,8 @@ pub async fn cancel(store: &StateStore, id: &str) -> anyhow::Result<()> {
         matches!(
             record.status,
             RunStatus::Preparing
-                | RunStatus::ConsumingAuthorization
-                | RunStatus::ReadyToLaunch
+                | RunStatus::LaunchPending
+                | RunStatus::Consumed
                 | RunStatus::Running
         ),
         "only an active execution can be cancelled"
@@ -1683,6 +1920,7 @@ pub async fn cancel(store: &StateStore, id: &str) -> anyhow::Result<()> {
         &serde_json::json!({"requested_at": Utc::now()}),
     )?;
     let run_dir = store.path(&PathBuf::from("runs").join(id))?;
+    verify_run_owner_marker(&run_dir, &owner_marker_for_record(&record))?;
     let effects = if run_dir.join("effects").exists() {
         Some(agent_hub_executor::ExecutionCancellationContext::new(
             &run_dir.join("effects"),
@@ -1710,8 +1948,8 @@ pub async fn cancel(store: &StateStore, id: &str) -> anyhow::Result<()> {
         if !matches!(
             current.status,
             RunStatus::Preparing
-                | RunStatus::ConsumingAuthorization
-                | RunStatus::ReadyToLaunch
+                | RunStatus::LaunchPending
+                | RunStatus::Consumed
                 | RunStatus::Running
         ) {
             return Ok(());
@@ -1734,8 +1972,8 @@ pub async fn cleanup(
         !matches!(
             record.status,
             RunStatus::Preparing
-                | RunStatus::ConsumingAuthorization
-                | RunStatus::ReadyToLaunch
+                | RunStatus::LaunchPending
+                | RunStatus::Consumed
                 | RunStatus::Running
         ),
         "execution cannot be cleaned in its current state"
@@ -1745,6 +1983,7 @@ pub async fn cleanup(
     }
     let docker = which::which("docker")?;
     let run_dir = store.path(&PathBuf::from("runs").join(id))?;
+    let owner_marker = owner_marker_for_record(&record);
     let cleanup_result = recover_owned_run_resources(
         &docker,
         &run_dir,
@@ -1752,6 +1991,7 @@ pub async fn cleanup(
         &record.container_name,
         &record.ownership,
         Some(&relay_endpoint),
+        &owner_marker,
     )
     .await
     .and_then(|()| {
@@ -1793,7 +2033,9 @@ async fn recover_owned_run_resources(
     container_name: &str,
     ownership: &BTreeMap<String, String>,
     relay_endpoint: Option<&RelayEndpoint>,
+    owner_marker: &RunOwnerMarker,
 ) -> anyhow::Result<()> {
+    verify_run_owner_marker(run_dir, owner_marker)?;
     let mut failures = Vec::new();
     let effects = if run_dir.join("effects").exists() {
         Some(agent_hub_executor::ExecutionCancellationContext::new(
@@ -1834,7 +2076,9 @@ async fn recover_owned_run_resources(
     {
         failures.push(format!("egress: {error:#}"));
     }
-    if let Some(effects) = &effects {
+    if let Some(effects) = &effects
+        && run_dir.join("approval-relay-epoch.json").exists()
+    {
         let result = match relay_endpoint {
             Some(endpoint) => {
                 let relay_state = verify_recovery_relay_endpoint(run_dir, endpoint)?;
@@ -2076,6 +2320,91 @@ fn verify_mount_filesystem_identity(
 ) -> anyhow::Result<()> {
     verify_execution_inputs(request)
         .context("revalidate attended filesystem identity immediately before launch")
+}
+
+fn provider_unavailable_retry_evidence(
+    record: &RunRecord,
+    run_dir: &Path,
+    request: &AttendedAuthorizationRequestV2,
+) -> anyhow::Result<bool> {
+    let stderr = read_optional_bounded(
+        &run_dir.join("stderr.log"),
+        request.output.limits.stderr_bytes,
+    )?;
+    let failure = format!(
+        "{}\n{}",
+        record.error.as_deref().unwrap_or_default(),
+        String::from_utf8_lossy(&stderr)
+    );
+    let service_unavailable = failure.contains("ServiceUnavailable")
+        || failure.contains("service unavailable")
+        || failure.contains("503");
+    if !service_unavailable {
+        return Ok(false);
+    }
+    for path in [
+        run_dir.join("stdout.log"),
+        run_dir.join(&request.output.transcript),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Ok(false),
+        }
+    }
+    let ledger_path = run_dir.join("supervision-transitions.jsonl");
+    let ledger = match std::fs::read_to_string(&ledger_path) {
+        Ok(ledger) => ledger,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for line in ledger.lines().filter(|line| !line.trim().is_empty()) {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .context("invalid host supervision ledger while proving retry eligibility")?;
+        if value.get("transition").and_then(serde_json::Value::as_str) != Some("plugin_ready") {
+            return Ok(false);
+        }
+    }
+    for repository in &request.execution.repositories {
+        if crate::local::repository_state(Path::new(&repository.repository_root))?
+            != repository.starting
+        {
+            return Ok(false);
+        }
+    }
+    Ok(provider_retry_proofs_complete(
+        service_unavailable,
+        false,
+        false,
+        false,
+        true,
+    ))
+}
+
+fn provider_retry_proofs_complete(
+    service_unavailable: bool,
+    assistant_result: bool,
+    tool_result: bool,
+    workspace_delta: bool,
+    cleanup_complete: bool,
+) -> bool {
+    service_unavailable && !assistant_result && !tool_result && !workspace_delta && cleanup_complete
+}
+
+fn read_optional_bounded(path: &Path, limit: u64) -> anyhow::Result<Vec<u8>> {
+    match File::open(path) {
+        Ok(file) => {
+            ensure!(
+                file.metadata()?.len() <= limit,
+                "retry evidence exceeds reviewed output limit"
+            );
+            let mut bytes = Vec::new();
+            file.take(limit).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn bundle_environment(
@@ -3101,40 +3430,6 @@ fn ensure_unique_resources(resources: &[NetworkResourceKind]) -> anyhow::Result<
     Ok(())
 }
 
-fn prepare_consumption<F>(
-    store: &StateStore,
-    record: &mut RunRecord,
-    digest: &str,
-    mut durable_point: F,
-) -> anyhow::Result<()>
-where
-    F: FnMut(&'static str) -> anyhow::Result<()>,
-{
-    if record.status == RunStatus::Preparing {
-        record.status = RunStatus::ConsumingAuthorization;
-        store.replace_json(&run_record_path(&record.id), record)?;
-        durable_point("consumption_pending")?;
-    }
-    if record.status == RunStatus::ConsumingAuthorization {
-        let consumed = authorization_path("consumed", digest);
-        if !store.path(&consumed)?.exists() {
-            store.create_json(
-                &consumed,
-                &serde_json::json!({"digest": digest, "consumed_at": Utc::now()}),
-            )?;
-        }
-        durable_point("authorization_consumed")?;
-        record.status = RunStatus::ReadyToLaunch;
-        store.replace_json(&run_record_path(&record.id), record)?;
-        durable_point("ready_to_launch")?;
-    }
-    ensure!(
-        record.status == RunStatus::ReadyToLaunch,
-        "execution journal cannot be recovered from its current state"
-    );
-    Ok(())
-}
-
 fn selector_resources(selector: &str) -> anyhow::Result<Vec<NetworkResourceKind>> {
     let resources = match selector {
         "none" => vec![],
@@ -3222,6 +3517,91 @@ fn authorization_path(state: &str, digest: &str) -> PathBuf {
         .join(format!("{digest}.json"))
 }
 
+fn update_authorization_attempt_state(
+    store: &StateStore,
+    path: &Path,
+    authorization: &mut AuthorizationRecord,
+    attempt_id: &str,
+    state: LaunchState,
+) -> anyhow::Result<()> {
+    let attempt = authorization
+        .attempts
+        .last_mut()
+        .context("authorization receipt has no active attempt")?;
+    ensure!(
+        authorization.active_attempt_id.as_deref() == Some(attempt_id)
+            && attempt.attempt_id == attempt_id,
+        "authorization receipt active attempt mismatch"
+    );
+    attempt.state = state;
+    store.replace_json(path, authorization)
+}
+
+fn owner_marker_for_record(record: &RunRecord) -> RunOwnerMarker {
+    let mut ancestry = vec![record.authorization_id.clone(), record.receipt_id.clone()];
+    ancestry.extend(record.attempt_ancestry.clone());
+    RunOwnerMarker {
+        run_id: record.run_id.clone(),
+        attempt_id: record.attempt_id.clone(),
+        authorization_id: record.authorization_id.clone(),
+        receipt_id: record.receipt_id.clone(),
+        authorization_digest: record.authorization_digest.clone(),
+        nonce: record.owner_nonce.clone(),
+        #[cfg(unix)]
+        uid: unsafe { libc::geteuid() },
+        #[cfg(not(unix))]
+        uid: 0,
+        #[cfg(unix)]
+        gid: unsafe { libc::getegid() },
+        #[cfg(not(unix))]
+        gid: 0,
+        mode: "attended".into(),
+        ancestry,
+    }
+}
+
+fn verify_run_owner_marker(run_dir: &Path, expected: &RunOwnerMarker) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(run_dir)
+        .with_context(|| format!("inspect attended run directory {}", run_dir.display()))?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "attended run directory is not a real directory"
+    );
+    let marker_path = run_dir.join("owner.json");
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    );
+    let marker: RunOwnerMarker = serde_json::from_reader(
+        options
+            .open(&marker_path)
+            .with_context(|| format!("open run owner marker {}", marker_path.display()))?,
+    )?;
+    ensure!(
+        marker == *expected,
+        "attended run owner marker does not exactly match the execution journal"
+    );
+    Ok(())
+}
+
+fn create_owned_run_directory(run_dir: &Path, marker: &RunOwnerMarker) -> anyhow::Result<()> {
+    ensure!(!run_dir.exists(), "attended run directory already exists");
+    let parent = run_dir.parent().context("run directory has no parent")?;
+    let staging = parent.join(format!(".owner-{}", marker.nonce));
+    std::fs::create_dir(&staging)?;
+    set_private_directory(&staging)?;
+    write_new_private_durable(
+        &staging.join("owner.json"),
+        &serde_json::to_vec_pretty(marker)?,
+    )?;
+    std::fs::rename(&staging, run_dir)?;
+    File::open(parent)?.sync_all()?;
+    verify_run_owner_marker(run_dir, marker)
+}
+
 fn lock_path(digest: &str) -> PathBuf {
     PathBuf::from("locks").join(format!("{digest}.lock"))
 }
@@ -3235,7 +3615,7 @@ fn cancel_path(id: &str) -> PathBuf {
 
 fn validate_id(id: &str) -> anyhow::Result<()> {
     ensure!(
-        id.len() == 24 && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        uuid::Uuid::parse_str(id).is_ok(),
         "invalid attended execution ID"
     );
     Ok(())
@@ -3290,6 +3670,19 @@ fn write_private_durable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     );
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    set_private_file(path)?;
+    file.sync_all()?;
+    File::open(path.parent().context("attended output has no parent")?)?.sync_all()?;
+    Ok(())
+}
+
+fn write_new_private_durable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(path)?;
@@ -3510,13 +3903,12 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::{
         AbortTask, AttendedExecutionOutcome, FinalizationError, RelayEndpoint, RelayEpochState,
-        RunRecord, RunStatus, attended_execution_outcome, merge_execution_cleanup,
-        network_class_within_ceiling, prepare_consumption, resolve_network_resources,
+        RunOwnerMarker, attended_execution_outcome, merge_execution_cleanup,
+        network_class_within_ceiling, provider_retry_proofs_complete, resolve_network_resources,
         selector_resources, serialize_pretty_bounded, verify_exact_relay_mount,
         verify_host_only_approval_environment, verify_recovery_relay_endpoint,
-        verify_tool_approval,
+        verify_run_owner_marker, verify_tool_approval, write_new_private_durable,
     };
-    use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
     use anyhow::Context as _;
     use chrono::Utc;
@@ -4618,57 +5010,70 @@ grep -qx 'ready\|ready\.' real-llm.log
     }
 
     #[test]
-    fn consumption_journal_recovers_after_every_durable_crash_point() {
-        for crash_point in [
-            "consumption_pending",
-            "authorization_consumed",
-            "ready_to_launch",
-        ] {
-            let root = std::env::temp_dir().join(format!(
-                "agent-hub-consumption-journal-{}",
-                uuid::Uuid::new_v4()
-            ));
-            let store = StateStore::open(root.clone()).unwrap();
-            let digest = "a".repeat(64);
-            let mut record = RunRecord {
-                id: digest[..24].to_string(),
-                authorization_digest: digest.clone(),
-                status: RunStatus::Preparing,
-                container_name: "container".into(),
-                ownership: BTreeMap::from([("owner".into(), "value".into())]),
-                started_at: Utc::now(),
-                finished_at: None,
-                exit_code: None,
-                error: None,
-                execution_status: None,
-                process_status: None,
-                permission_outcome: None,
-            };
-            store
-                .create_json(&super::run_record_path(&record.id), &record)
-                .unwrap();
-            assert!(
-                prepare_consumption(&store, &mut record, &digest, |point| {
-                    if point == crash_point {
-                        anyhow::bail!("injected crash at {point}");
-                    }
-                    Ok(())
-                })
-                .is_err()
-            );
-            let mut recovered: RunRecord = store
-                .read_json(&super::run_record_path(&record.id))
-                .unwrap();
-            prepare_consumption(&store, &mut recovered, &digest, |_| Ok(())).unwrap();
-            assert_eq!(recovered.status, RunStatus::ReadyToLaunch);
-            assert!(
-                store
-                    .path(&super::authorization_path("consumed", &digest))
-                    .unwrap()
-                    .is_file()
-            );
-            std::fs::remove_dir_all(root).unwrap();
-        }
+    fn run_owner_marker_must_match_before_reconciliation() {
+        let root =
+            std::env::temp_dir().join(format!("agent-hub-run-owner-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        super::set_private_directory(&root).unwrap();
+        let marker = RunOwnerMarker {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            authorization_id: uuid::Uuid::new_v4().to_string(),
+            receipt_id: uuid::Uuid::new_v4().to_string(),
+            authorization_digest: "a".repeat(64),
+            nonce: uuid::Uuid::new_v4().to_string(),
+            #[cfg(unix)]
+            uid: unsafe { libc::geteuid() },
+            #[cfg(not(unix))]
+            uid: 0,
+            #[cfg(unix)]
+            gid: unsafe { libc::getegid() },
+            #[cfg(not(unix))]
+            gid: 0,
+            mode: "attended".into(),
+            ancestry: vec!["authorization".into(), "receipt".into()],
+        };
+        write_new_private_durable(
+            &root.join("owner.json"),
+            &serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        verify_run_owner_marker(&root, &marker).unwrap();
+        let mut mismatched = marker.clone();
+        mismatched.nonce = uuid::Uuid::new_v4().to_string();
+        assert!(verify_run_owner_marker(&root, &mismatched).is_err());
+        assert!(root.join("owner.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_503_retry_requires_every_host_proof() {
+        assert!(provider_retry_proofs_complete(
+            true, false, false, false, true
+        ));
+        assert!(!provider_retry_proofs_complete(
+            false, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn assistant_or_first_tool_result_forbids_provider_retry() {
+        assert!(!provider_retry_proofs_complete(
+            true, true, false, false, true
+        ));
+        assert!(!provider_retry_proofs_complete(
+            true, false, true, false, true
+        ));
+    }
+
+    #[test]
+    fn workspace_delta_or_cleanup_failure_forbids_provider_retry() {
+        assert!(!provider_retry_proofs_complete(
+            true, false, false, true, true
+        ));
+        assert!(!provider_retry_proofs_complete(
+            true, false, false, false, false
+        ));
     }
 
     #[test]

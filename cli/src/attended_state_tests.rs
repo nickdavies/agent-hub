@@ -49,7 +49,7 @@ fn state_rejects_non_private_existing_root() {
 fn fresh_state_creates_runs_parent_and_bounds_artifact_reads() {
     let root = temp_root("bounded-read");
     let state = StateStore::open(root.join("state")).unwrap();
-    let id = "a".repeat(24);
+    let id = uuid::Uuid::new_v4().to_string();
     state
         .ensure_directory(std::path::Path::new("runs"))
         .unwrap();

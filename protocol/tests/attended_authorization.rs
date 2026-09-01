@@ -249,6 +249,22 @@ fn canonicalization_normalizes_set_order_and_has_attended_domain() {
 }
 
 #[test]
+fn reviewed_retry_constraints_are_canonical_capability_bytes() {
+    let artifact = request_v2().canonical_artifact().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&artifact.canonical_bytes).unwrap();
+    assert_eq!(value["lifecycle"]["retry"]["max_attempts"], 3);
+    assert_eq!(value["lifecycle"]["retry"]["max_prelaunch_retries"], 2);
+    assert_eq!(
+        value["lifecycle"]["retry"]["max_provider_unavailable_retries"],
+        1
+    );
+
+    let mut changed = request_v2();
+    changed.lifecycle.retry.max_attempts = 4;
+    assert!(changed.canonical_artifact().is_err());
+}
+
+#[test]
 fn strict_dto_and_cross_domain_artifacts_are_rejected() {
     let artifact = request().canonical_artifact().unwrap();
     let mut json: serde_json::Value = serde_json::from_slice(&artifact.canonical_bytes).unwrap();

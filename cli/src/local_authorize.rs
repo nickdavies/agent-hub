@@ -23,6 +23,12 @@ pub(crate) async fn authorize(
                 artifact: revalidated.artifact,
                 authorization_path: revalidated.authorization_path,
                 authorized_at: Utc::now(),
+                authorization_id: uuid::Uuid::new_v4().to_string(),
+                receipt_id: uuid::Uuid::new_v4().to_string(),
+                domain: "attended".into(),
+                state: crate::attended::LaunchState::Authorized,
+                attempts: Vec::new(),
+                active_attempt_id: None,
             },
         )
         .context("authorization already exists or was replayed")

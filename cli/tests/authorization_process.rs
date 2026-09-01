@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 const IMAGE_TAG: &str = "agent-hub/job-code:2026-08-27";
 
 #[test]
-fn authorization_is_cross_process_single_use_and_precedes_runtime_side_effects() {
+fn authorization_retries_preflight_and_fences_concurrent_attempts() {
     let root = temp_root();
     let config = root.join("config");
     let workspace = root.join("workspace");
@@ -106,8 +106,37 @@ fn authorization_is_cross_process_single_use_and_precedes_runtime_side_effects()
     assert_success(&authorize);
     std::fs::remove_file(&docker_marker).unwrap();
 
-    let executed = invoke(&root, &fake_bin, &state, &run_args, None);
+    std::fs::write(root.join("fail-preflight-once"), "fail").unwrap();
+    let preflight_failure = invoke(&root, &fake_bin, &state, &run_args, None);
+    assert!(!preflight_failure.status.success());
+    let first: serde_json::Value = serde_json::from_slice(&preflight_failure.stdout).unwrap();
+    assert_eq!(first["launch_state"], "terminal");
+    assert_eq!(first["retry_class"], "prelaunch");
+    assert_eq!(first["retry_eligible"], true);
+
+    std::fs::write(root.join("slow-launch"), "slow").unwrap();
+    let (executed, duplicate) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| invoke(&root, &fake_bin, &state, &run_args, None));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let duplicate = invoke(&root, &fake_bin, &state, &run_args, None);
+        (first.join().unwrap(), duplicate)
+    });
     assert_success(&executed);
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already consumed"));
+    let second: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
+    assert_eq!(first["authorization_id"], second["authorization_id"]);
+    assert_eq!(first["receipt_id"], second["receipt_id"]);
+    assert_ne!(first["attempt_id"], second["attempt_id"]);
+    assert_ne!(first["run_id"], second["run_id"]);
+    assert_eq!(first["attempt_number"], 1);
+    assert_eq!(second["attempt_number"], 2);
+    assert_eq!(second["parent_attempt_id"], first["attempt_id"]);
+    assert_eq!(second["attempt_ancestry"][0], first["attempt_id"]);
+    assert_eq!(
+        first["authorization_digest"],
+        second["authorization_digest"]
+    );
     assert!(docker_marker.exists());
     let replay = invoke(&root, &fake_bin, &state, &run_args, None);
     assert!(!replay.status.success());
@@ -245,10 +274,13 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
     std::fs::write(
         path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) cat '{}' ;; *) printf 'executed\\n' ;; esac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then sleep 1; fi; printf 'executed\\n' ;; esac\n",
             marker.display(),
             "a".repeat(64),
+            root.join("fail-preflight-once").display(),
+            root.join("fail-preflight-once").display(),
             report_path.display(),
+            root.join("slow-launch").display(),
         ),
     )
     .unwrap();
