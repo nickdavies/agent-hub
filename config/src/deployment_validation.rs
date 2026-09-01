@@ -137,7 +137,12 @@ impl ValidatedOverlay {
         let api = protocol::canonical_github_api_base_for_host(&host, &config.api_base_url)
             .ok_or_else(|| format!("GitHub overlay '{}' has invalid API base URL", self.name))?;
         let access = match config.access {
-            GithubOverlayAccess::Read => "read",
+            GithubOverlayAccess::Read => {
+                return Err(format!(
+                    "GitHub overlay '{}' claims read-only access without server-enforced attenuation",
+                    self.name
+                ));
+            }
             GithubOverlayAccess::ReadWrite => "read_write",
         };
         if host != config.host
@@ -618,24 +623,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn github_overlay_rejects_host_target_and_auth_ambiguity() {
+    fn github_overlay_requires_honest_read_write_access() {
         let valid = serde_json::json!({
             "host":"github.com",
             "api_base_url":"https://api.github.com",
-            "access":"read",
+            "access":"read_write",
             "network_resource":"github",
-            "credential_provider":"github:github.com:read",
+            "credential_provider":"github:github.com:read_write",
             "credential_target":"/agent-hub/github/tokens/github.com",
             "authenticated":true,
             "private_repositories":true
         });
         let overlay = |config| ValidatedOverlay {
-            name: "github:github.com:read".into(),
+            name: "github:github.com:read_write".into(),
             provider: "github".into(),
             config,
             description: None,
         };
         overlay(valid.clone()).github_config().unwrap().unwrap();
+        let mut read = valid.clone();
+        read["access"] = serde_json::json!("read");
+        assert!(overlay(read).github_config().is_err());
         for (field, value) in [
             ("host", serde_json::json!("github.snooguts.net")),
             ("credential_target", serde_json::json!("GITHUB_TOKEN")),
@@ -680,7 +688,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             root.join("environments/test/environment.toml"),
-            "[environment]\nname='test'\ndescription='test'\nimage='agent-hub/job-code:2026-08-27'\nnetwork_policy='none'\napproval_mode='auto'\n",
+            "[environment]\nname='test'\ndescription='test'\nimage='agent-hub/job-code:2026-09-01'\nnetwork_policy='none'\napproval_mode='auto'\n",
         )
         .unwrap();
         std::fs::write(

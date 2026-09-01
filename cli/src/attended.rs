@@ -146,7 +146,7 @@ pub enum RetryClass {
     ProviderServiceUnavailable,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptLineage {
     pub attempt_id: String,
@@ -156,6 +156,15 @@ pub struct AttemptLineage {
     pub retry_eligible: bool,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingAttempt {
+    authorization_digest: String,
+    authorization_id: String,
+    record: RunRecord,
+    lineage: AttemptLineage,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -295,16 +304,16 @@ fn result_schema_v3() -> String {
     RESULT_SCHEMA_V3.to_string()
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CleanupCheck {
-    status: &'static str,
+    status: String,
     error: Option<String>,
 }
 
 impl CleanupCheck {
     fn not_applicable() -> Self {
         Self {
-            status: "not_applicable",
+            status: "not_applicable".into(),
             error: None,
         }
     }
@@ -312,22 +321,22 @@ impl CleanupCheck {
     fn from_result(result: &anyhow::Result<()>) -> Self {
         match result {
             Ok(()) => Self {
-                status: "verified_absent",
+                status: "verified_absent".into(),
                 error: None,
             },
             Err(error) => Self {
-                status: "failed",
+                status: "failed".into(),
                 error: Some(format!("{error:#}")),
             },
         }
     }
 
     fn complete(&self) -> bool {
-        matches!(self.status, "verified_absent" | "not_applicable")
+        matches!(self.status.as_str(), "verified_absent" | "not_applicable")
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AttendedCleanupEvidence {
     process: CleanupCheck,
     container: CleanupCheck,
@@ -543,11 +552,7 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         approval_bundle,
         output: AttendedOutputContract::default(),
         lifecycle: AttendedLifecycleContract::default(),
-        retry: protocol::AttendedRetryConstraints {
-            max_attempts: 3,
-            max_prelaunch_retries: 2,
-            max_provider_unavailable_retries: 1,
-        },
+        retry: protocol::AttendedRetryConstraints::for_mode(tool_approval),
     }
     .canonical_artifact()
     .map_err(anyhow::Error::msg)
@@ -787,8 +792,14 @@ pub async fn run(
     verify_tool_approval(request.proposal.tool_approval, Some(&relay_endpoint))?;
     let docker_path =
         which::which("docker").context("Docker CLI is required for attended execution")?;
+    reconcile_pending_attempts(store, &authorized_path, &mut authorized)?;
     if let Some(active) = authorized.active_attempt_id.clone() {
-        let mut active_record: RunRecord = store.read_json(&run_record_path(&active))?;
+        let active_run_id = active_attempt_run_id(&authorized, &active)?;
+        let mut active_record: RunRecord = store.read_json(&run_record_path(active_run_id))?;
+        ensure!(
+            active_record.attempt_id == active && active_record.run_id == active_run_id,
+            "authorization active attempt resolves to the wrong execution record"
+        );
         let active_dir = store.path(&PathBuf::from("runs").join(&active_record.id))?;
         let expected = owner_marker_for_record(&active_record);
         if active_dir.exists() {
@@ -805,14 +816,11 @@ pub async fn run(
             .await
             .context("reconcile interrupted attended attempt")?;
         }
-        ensure!(
-            authorized
-                .attempts
-                .last()
-                .is_some_and(|attempt| attempt.attempt_id == active),
-            "authorization active attempt does not match receipt lineage"
-        );
-        let previous = authorized.attempts.last_mut().expect("checked above");
+        let previous = authorized
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.attempt_id == active)
+            .expect("active lineage was checked above");
         previous.state = LaunchState::Terminal;
         let prelaunch = active_record.launch_state == LaunchState::Preparing;
         previous.retry_class = prelaunch.then_some(RetryClass::Prelaunch);
@@ -834,21 +842,21 @@ pub async fn run(
         } else {
             "interrupted attempt reached launch_pending; authorization consumed fail-closed".into()
         });
-        store.replace_json(&run_record_path(&active), &active_record)?;
+        store.replace_json(&run_record_path(&active_record.run_id), &active_record)?;
         store.replace_json(&authorized_path, &authorized)?;
         ensure!(prelaunch, "attended authorization was consumed fail-closed");
     }
     let retry = &request.retry;
-    ensure!(
-        authorized.attempts.len() < retry.max_attempts as usize,
-        "attended authorization exhausted its reviewed attempt limit"
-    );
     if let Some(previous) = authorized.attempts.last() {
         ensure!(
             previous.retry_eligible,
             "attended authorization was already consumed"
         );
     }
+    ensure!(
+        authorized.attempts.len() < retry.max_attempts as usize,
+        "attended authorization exhausted its reviewed attempt limit"
+    );
     ensure!(
         authorized
             .attempts
@@ -937,18 +945,29 @@ pub async fn run(
         retry_class: None,
         retry_eligible: false,
     };
-    authorized.active_attempt_id = Some(attempt_id.clone());
-    authorized.attempts.push(AttemptLineage {
-        attempt_id,
-        run_id,
+    let lineage = AttemptLineage {
+        attempt_id: attempt_id.clone(),
+        run_id: run_id.clone(),
         state: LaunchState::Preparing,
         retry_class: None,
         retry_eligible: false,
         started_at: record.started_at,
         finished_at: None,
-    });
+    };
+    let pending = PendingAttempt {
+        authorization_digest: digest.clone(),
+        authorization_id: authorized.authorization_id.clone(),
+        record: record.clone(),
+        lineage: lineage.clone(),
+    };
+    store.create_json(&attempt_journal_path(&id), &pending)?;
+    attended_fault("attempt_journaled")?;
     store.create_json(&run_record_path(&id), &record)?;
+    attended_fault("execution_record_published")?;
+    authorized.active_attempt_id = Some(attempt_id);
+    authorized.attempts.push(lineage);
     store.replace_json(&authorized_path, &authorized)?;
+    attended_fault("attempt_lineage_published")?;
     attended_fault("preparing")?;
 
     let mut captured_execution_outcome = None;
@@ -1573,15 +1592,15 @@ pub async fn run(
         };
         let credential_check = match (&credential_cleanup, &credential_effect_cleanup) {
             (CleanupStatus::Complete, Ok(())) => CleanupCheck {
-                status: "verified_absent",
+                status: "verified_absent".into(),
                 error: None,
             },
             (CleanupStatus::Failed(error), _) => CleanupCheck {
-                status: "failed",
+                status: "failed".into(),
                 error: Some(error.clone()),
             },
             (CleanupStatus::Complete, Err(error)) => CleanupCheck {
-                status: "failed",
+                status: "failed".into(),
                 error: Some(format!("{error:#}")),
             },
         };
@@ -1656,7 +1675,7 @@ pub async fn run(
             if error.downcast_ref::<FinalizationError>().is_some() {
                 if cleanup_evidence.complete() {
                     cleanup_evidence.effects = CleanupCheck {
-                        status: "failed",
+                        status: "failed".into(),
                         error: Some(format!("{error:#}")),
                     };
                 }
@@ -1900,7 +1919,8 @@ pub async fn run(
     record.launch_state = LaunchState::Terminal;
     let lineage = authorized
         .attempts
-        .last_mut()
+        .iter_mut()
+        .find(|attempt| attempt.attempt_id == record.attempt_id)
         .context("authorization receipt lost its active attempt")?;
     ensure!(
         lineage.attempt_id == record.attempt_id
@@ -2042,6 +2062,17 @@ struct CleanupReceiptPayload {
     artifacts: serde_json::Value,
     repositories: serde_json::Value,
     cleanup: serde_json::Value,
+    cleanup_evidence: AttendedCleanupEvidence,
+    host_ledger: HostLedgerSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostLedgerSummary {
+    present: bool,
+    entry_count: u64,
+    byte_count: u64,
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2391,6 +2422,49 @@ pub async fn cleanup(
         ),
         "execution cannot be cleaned in its current state"
     );
+    if !run_dir.exists() {
+        let journal: PendingAttempt = store.read_json(&attempt_journal_path(id))?;
+        ensure!(
+            record.launch_state == LaunchState::Terminal
+                && record.retry_class == Some(RetryClass::Prelaunch)
+                && journal.record.run_id == record.run_id
+                && journal.record.attempt_id == record.attempt_id
+                && journal.record.launch_state == LaunchState::Preparing,
+            "missing runtime directory has no no-resource journal proof"
+        );
+        record.status = RunStatus::Cleaned;
+        record.cleanup_outcome = CleanupOutcome::Succeeded;
+        record.finished_at = Some(Utc::now());
+        let cleanup_evidence = AttendedCleanupEvidence::default();
+        let cleanup_document = serde_json::json!({
+            "schema": "attended_cleanup_result_v1",
+            "outcome": "succeeded",
+            "cleaned_at": record.finished_at,
+            "error": null,
+            "containment": &cleanup_evidence,
+            "journal_proof": {
+                "kind": "prelaunch_no_resources",
+                "attempt_id": record.attempt_id,
+                "run_id": record.run_id,
+                "owner_marker_published": false
+            }
+        });
+        let payload = CleanupReceiptPayload {
+            record: record.clone(),
+            owner: owner_marker_for_record(&record),
+            result: serde_json::to_value(&record)?,
+            artifacts: serde_json::json!({
+                "schema": "attended_artifact_summary_v1",
+                "runtime_artifacts": "not_created"
+            }),
+            repositories: serde_json::json!([]),
+            cleanup: cleanup_document,
+            cleanup_evidence,
+            host_ledger: HostLedgerSummary::default(),
+        };
+        publish_cleanup_receipt(store, id, &record, payload)?;
+        return Ok(record);
+    }
     let docker = which::which("docker")?;
     let owner_marker = owner_marker_for_record(&record);
     let containment = recover_owned_run_resources(
@@ -2415,17 +2489,27 @@ pub async fn cleanup(
     record.status = RunStatus::Cleaned;
     record.cleanup_outcome = CleanupOutcome::Succeeded;
     let result_document = serde_json::to_value(&record)?;
-    let artifacts_document = store
-        .read_json::<serde_json::Value>(&PathBuf::from("runs").join(id).join("artifacts.json"))?;
+    let artifacts_document = runtime_artifact_summary(&run_dir)?;
     let repositories_document = store.read_json::<serde_json::Value>(
         &PathBuf::from("runs").join(id).join("repositories.json"),
+    )?;
+    let execution_cleanup = store
+        .read_json::<serde_json::Value>(&PathBuf::from("runs").join(id).join("cleanup.json"))?;
+    let cleanup_evidence: AttendedCleanupEvidence = serde_json::from_value(
+        execution_cleanup
+            .get("containment")
+            .cloned()
+            .context("cleanup document has no detailed containment evidence")?,
     )?;
     let cleanup_document = serde_json::json!({
         "schema": "attended_cleanup_result_v1",
         "outcome": "succeeded",
         "cleaned_at": record.finished_at,
         "error": null,
+        "execution_cleanup": execution_cleanup,
+        "containment": &cleanup_evidence,
     });
+    let host_ledger = host_ledger_summary(&run_dir.join("supervision-transitions.jsonl"))?;
     let payload = CleanupReceiptPayload {
         record: record.clone(),
         owner: owner_marker,
@@ -2433,6 +2517,8 @@ pub async fn cleanup(
         artifacts: artifacts_document,
         repositories: repositories_document,
         cleanup: cleanup_document,
+        cleanup_evidence,
+        host_ledger,
     };
     let receipt = CleanupReceipt {
         schema: CLEANUP_RECEIPT_SCHEMA_V1.into(),
@@ -2460,6 +2546,87 @@ pub async fn cleanup(
     publish_pending_receipt(store, id, &pending_path)?;
     store.replace_json(&run_record_path(id), &record)?;
     Ok(record)
+}
+
+fn publish_cleanup_receipt(
+    store: &StateStore,
+    id: &str,
+    record: &RunRecord,
+    payload: CleanupReceiptPayload,
+) -> anyhow::Result<()> {
+    let pending = pending_receipt_path(id);
+    let pending_path = store.path(&pending)?;
+    let receipt = CleanupReceipt {
+        schema: CLEANUP_RECEIPT_SCHEMA_V1.into(),
+        run_id: id.into(),
+        authorization_digest: record.authorization_digest.clone(),
+        cleaned_at: record
+            .finished_at
+            .context("cleanup finish time is absent")?,
+        checksum: receipt_checksum(&payload)?,
+        payload,
+    };
+    store.create_json(&pending, &receipt)?;
+    publish_pending_receipt(store, id, &pending_path)?;
+    store.replace_json(&run_record_path(id), record)
+}
+
+fn runtime_artifact_summary(run_dir: &Path) -> anyhow::Result<serde_json::Value> {
+    let mut artifacts = serde_json::Map::new();
+    for name in [
+        "stdout.log",
+        "stderr.log",
+        "transcript.jsonl",
+        "result.json",
+        "artifacts.json",
+        "repositories.json",
+        "cleanup.json",
+    ] {
+        let path = run_dir.join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                artifacts.insert(
+                    name.into(),
+                    serde_json::json!({
+                        "byte_count": bytes.len(),
+                        "sha256": protocol::sha256_hex(&bytes),
+                    }),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(serde_json::json!({
+        "schema": "attended_artifact_summary_v1",
+        "artifacts": artifacts,
+    }))
+}
+
+fn host_ledger_summary(path: &Path) -> anyhow::Result<HostLedgerSummary> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HostLedgerSummary::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        bytes.len() <= 16_777_216,
+        "host ledger exceeds receipt evidence limit"
+    );
+    let text = std::str::from_utf8(&bytes).context("host ledger is not UTF-8")?;
+    let mut entry_count = 0;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        serde_json::from_str::<serde_json::Value>(line).context("host ledger entry is invalid")?;
+        entry_count += 1;
+    }
+    Ok(HostLedgerSummary {
+        present: true,
+        entry_count,
+        byte_count: bytes.len() as u64,
+        sha256: Some(protocol::sha256_hex(&bytes)),
+    })
 }
 
 async fn recover_owned_run_resources(
@@ -2786,29 +2953,6 @@ fn provider_unavailable_retry_evidence(
     if !service_unavailable {
         return Ok(false);
     }
-    for path in [
-        run_dir.join("stdout.log"),
-        run_dir.join(&request.output.transcript),
-    ] {
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Ok(false),
-        }
-    }
-    let ledger_path = run_dir.join("supervision-transitions.jsonl");
-    let ledger = match std::fs::read_to_string(&ledger_path) {
-        Ok(ledger) => ledger,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    for line in ledger.lines().filter(|line| !line.trim().is_empty()) {
-        let value: serde_json::Value = serde_json::from_str(line)
-            .context("invalid host supervision ledger while proving retry eligibility")?;
-        if value.get("transition").and_then(serde_json::Value::as_str) != Some("plugin_ready") {
-            return Ok(false);
-        }
-    }
     for repository in &request.execution.repositories {
         if crate::local::repository_state(Path::new(&repository.repository_root))?
             != repository.starting
@@ -2816,13 +2960,116 @@ fn provider_unavailable_retry_evidence(
             return Ok(false);
         }
     }
+    let evidence_complete = match request.proposal.tool_approval {
+        ToolApprovalMode::Dippy => supervised_provider_retry_evidence(run_dir)?,
+        ToolApprovalMode::Auto => automatic_provider_retry_evidence(record, run_dir, request)?,
+    };
     Ok(provider_retry_proofs_complete(
         service_unavailable,
         false,
         false,
         false,
-        true,
+        evidence_complete,
     ))
+}
+
+fn supervised_provider_retry_evidence(run_dir: &Path) -> anyhow::Result<bool> {
+    let ledger =
+        match read_optional_bounded(&run_dir.join("supervision-transitions.jsonl"), 16_777_216) {
+            Ok(ledger) if !ledger.is_empty() => ledger,
+            Ok(_) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+    let ledger = std::str::from_utf8(&ledger).context("host supervision ledger is not UTF-8")?;
+    let mut transitions = 0;
+    for line in ledger.lines().filter(|line| !line.trim().is_empty()) {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .context("invalid host supervision ledger while proving retry eligibility")?;
+        if value.get("transition").and_then(serde_json::Value::as_str) != Some("plugin_ready") {
+            return Ok(false);
+        }
+        transitions += 1;
+    }
+    Ok(transitions == 1)
+}
+
+fn automatic_provider_retry_evidence(
+    record: &RunRecord,
+    run_dir: &Path,
+    request: &AttendedAuthorizationRequestV3,
+) -> anyhow::Result<bool> {
+    if run_dir.join("supervision-transitions.jsonl").exists()
+        || record.process_outcome != ProcessOutcome::Failed
+        || record.process_status != Some(RunStatus::Failed)
+    {
+        return Ok(false);
+    }
+    let stdout = read_optional_bounded(
+        &run_dir.join("stdout.log"),
+        request.output.limits.stdout_bytes,
+    )?;
+    let stderr = read_optional_bounded(
+        &run_dir.join("stderr.log"),
+        request.output.limits.stderr_bytes,
+    )?;
+    let transcript = read_optional_bounded(
+        &run_dir.join(&request.output.transcript),
+        request.output.limits.transcript_bytes,
+    )?;
+    let Some((transcript_stdout, transcript_stderr)) = verified_transcript_streams(&transcript)?
+    else {
+        return Ok(false);
+    };
+    if transcript_stdout != stdout || transcript_stderr != stderr {
+        return Ok(false);
+    }
+    for line in String::from_utf8(stdout)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let event: serde_json::Value = match serde_json::from_str(line) {
+            Ok(event) => event,
+            Err(_) => return Ok(false),
+        };
+        if matches!(
+            event.get("type").and_then(serde_json::Value::as_str),
+            Some("text" | "tool_use" | "tool_result" | "assistant" | "result")
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn verified_transcript_streams(transcript: &[u8]) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let transcript = std::str::from_utf8(transcript).context("host transcript is not UTF-8")?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for line in transcript.lines().filter(|line| !line.trim().is_empty()) {
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        let Some(stream) = value.get("stream").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(text) = value.get("line").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let Some(partial) = value.get("partial").and_then(serde_json::Value::as_bool) else {
+            return Ok(None);
+        };
+        let output = match stream {
+            "stdout" => &mut stdout,
+            "stderr" => &mut stderr,
+            _ => return Ok(None),
+        };
+        output.extend_from_slice(text.as_bytes());
+        if !partial {
+            output.push(b'\n');
+        }
+    }
+    Ok(Some((stdout, stderr)))
 }
 
 fn provider_retry_proofs_complete(
@@ -4278,7 +4525,8 @@ fn update_authorization_attempt_state(
 ) -> anyhow::Result<()> {
     let attempt = authorization
         .attempts
-        .last_mut()
+        .iter_mut()
+        .find(|attempt| attempt.attempt_id == attempt_id)
         .context("authorization receipt has no active attempt")?;
     ensure!(
         authorization.active_attempt_id.as_deref() == Some(attempt_id)
@@ -4287,6 +4535,92 @@ fn update_authorization_attempt_state(
     );
     attempt.state = state;
     store.replace_json(path, authorization)
+}
+
+fn reconcile_pending_attempts(
+    store: &StateStore,
+    authorization_path: &Path,
+    authorization: &mut AuthorizationRecord,
+) -> anyhow::Result<()> {
+    let mut pending = store
+        .list_json::<PendingAttempt>(Path::new("attempt-journals"))?
+        .into_iter()
+        .filter(|attempt| {
+            attempt.authorization_digest == authorization.artifact.digest
+                && attempt.authorization_id == authorization.authorization_id
+                && !authorization
+                    .attempts
+                    .iter()
+                    .any(|lineage| lineage.attempt_id == attempt.lineage.attempt_id)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        pending.len() <= 1,
+        "authorization has multiple unpublished pending attempts"
+    );
+    let Some(pending) = pending.pop() else {
+        return Ok(());
+    };
+    ensure!(
+        pending.record.attempt_id == pending.lineage.attempt_id
+            && pending.record.run_id == pending.lineage.run_id
+            && pending.record.id == pending.lineage.run_id
+            && pending.record.authorization_id == authorization.authorization_id
+            && pending.record.authorization_digest == authorization.artifact.digest
+            && pending.record.launch_state == LaunchState::Preparing
+            && pending.lineage.state == LaunchState::Preparing,
+        "pending attempt journal is inconsistent"
+    );
+    let record_path = run_record_path(&pending.record.run_id);
+    match store.read_json::<RunRecord>(&record_path) {
+        Ok(record) => ensure!(
+            record.run_id == pending.record.run_id
+                && record.attempt_id == pending.record.attempt_id
+                && record.authorization_id == pending.record.authorization_id
+                && record.authorization_digest == pending.record.authorization_digest,
+            "pending attempt execution record is inconsistent"
+        ),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            store.create_json(&record_path, &pending.record)?;
+        }
+        Err(error) => return Err(error),
+    }
+    ensure!(
+        authorization.active_attempt_id.is_none(),
+        "unpublished pending attempt conflicts with an active attempt"
+    );
+    ensure!(
+        pending.record.attempt_number == u32::try_from(authorization.attempts.len() + 1)?,
+        "pending attempt number does not extend receipt lineage"
+    );
+    authorization.active_attempt_id = Some(pending.lineage.attempt_id.clone());
+    authorization.attempts.push(pending.lineage);
+    authorization.state = LaunchState::Preparing;
+    store.replace_json(authorization_path, authorization)
+}
+
+fn active_attempt_run_id<'a>(
+    authorization: &'a AuthorizationRecord,
+    attempt_id: &str,
+) -> anyhow::Result<&'a str> {
+    let mut matches = authorization
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.attempt_id == attempt_id);
+    let run_id = matches
+        .next()
+        .context("authorization active attempt is absent from receipt lineage")?
+        .run_id
+        .as_str();
+    ensure!(
+        matches.next().is_none(),
+        "authorization active attempt is duplicated in receipt lineage"
+    );
+    Ok(run_id)
 }
 
 fn owner_marker_for_record(record: &RunRecord) -> RunOwnerMarker {
@@ -4360,6 +4694,10 @@ fn lock_path(digest: &str) -> PathBuf {
 
 fn run_record_path(id: &str) -> PathBuf {
     PathBuf::from("executions").join(format!("{id}.json"))
+}
+
+fn attempt_journal_path(id: &str) -> PathBuf {
+    PathBuf::from("attempt-journals").join(format!("{id}.json"))
 }
 
 fn receipt_path(id: &str) -> PathBuf {
@@ -5908,6 +6246,47 @@ grep -qx 'ready\|ready\.' real-llm.log
     }
 
     #[test]
+    fn supervised_provider_retry_uses_only_the_bounded_host_ledger() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-provider-ledger-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let ledger = root.join("supervision-transitions.jsonl");
+        std::fs::write(&ledger, "{\"transition\":\"plugin_ready\"}\n").unwrap();
+        assert!(super::supervised_provider_retry_evidence(&root).unwrap());
+        let summary = super::host_ledger_summary(&ledger).unwrap();
+        assert_eq!(summary.entry_count, 1);
+        assert_eq!(
+            summary.byte_count,
+            std::fs::metadata(&ledger).unwrap().len()
+        );
+        assert!(summary.sha256.is_some());
+        std::fs::write(
+            &ledger,
+            "{\"transition\":\"plugin_ready\"}\n{\"transition\":\"tool_result\"}\n",
+        )
+        .unwrap();
+        assert!(!super::supervised_provider_retry_evidence(&root).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn automatic_provider_transcript_must_be_complete_and_event_free() {
+        let transcript = b"{\"timestamp\":\"now\",\"stream\":\"stderr\",\"line\":\"503 service unavailable\",\"partial\":false}\n";
+        let (stdout, stderr) = super::verified_transcript_streams(transcript)
+            .unwrap()
+            .unwrap();
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"503 service unavailable\n");
+        assert!(
+            super::verified_transcript_streams(b"{\"stream\":\"stdout\"}\n")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn assistant_or_first_tool_result_forbids_provider_retry() {
         assert!(!provider_retry_proofs_complete(
             true, true, false, false, true
@@ -6130,6 +6509,150 @@ grep -qx 'ready\|ready\.' real-llm.log
     }
 
     #[test]
+    fn pending_attempt_publication_recovers_at_each_transaction_boundary() {
+        for execution_record_published in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "agent-hub-pending-attempt-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let store = StateStore::open(root.clone()).unwrap();
+            let mut record = terminal_record();
+            record.id = record.run_id.clone();
+            record.launch_state = super::LaunchState::Preparing;
+            record.status = RunStatus::Preparing;
+            record.finished_at = None;
+            record.retry_class = None;
+            record.retry_eligible = false;
+            let lineage = super::AttemptLineage {
+                attempt_id: record.attempt_id.clone(),
+                run_id: record.run_id.clone(),
+                state: super::LaunchState::Preparing,
+                retry_class: None,
+                retry_eligible: false,
+                started_at: record.started_at,
+                finished_at: None,
+            };
+            let pending = super::PendingAttempt {
+                authorization_digest: record.authorization_digest.clone(),
+                authorization_id: record.authorization_id.clone(),
+                record: record.clone(),
+                lineage: lineage.clone(),
+            };
+            store
+                .create_json(&super::attempt_journal_path(&record.run_id), &pending)
+                .unwrap();
+            if execution_record_published {
+                store
+                    .create_json(&super::run_record_path(&record.run_id), &record)
+                    .unwrap();
+            }
+            let artifact = protocol::AttendedAuthorizationArtifact {
+                version: protocol::ATTENDED_AUTHORIZATION_VERSION_V3,
+                digest: record.authorization_digest.clone(),
+                canonical_bytes: vec![],
+            };
+            let mut authorization = super::AuthorizationRecord {
+                authorization_id: record.authorization_id.clone(),
+                artifact,
+                authorization_path: "/authorization.json".into(),
+                authorized_at: Utc::now(),
+                receipt_id: record.receipt_id.clone(),
+                domain: "attended".into(),
+                state: super::LaunchState::Authorized,
+                attempts: vec![],
+                active_attempt_id: None,
+            };
+            let authorization_path = std::path::PathBuf::from("authorizations/test.json");
+            store
+                .create_json(&authorization_path, &authorization)
+                .unwrap();
+            super::reconcile_pending_attempts(&store, &authorization_path, &mut authorization)
+                .unwrap();
+            assert_eq!(
+                super::active_attempt_run_id(&authorization, &record.attempt_id).unwrap(),
+                record.run_id
+            );
+            assert!(
+                store
+                    .read_json::<RunRecord>(&super::run_record_path(&record.run_id))
+                    .is_ok()
+            );
+            assert_ne!(record.attempt_id, record.run_id);
+            assert!(
+                store
+                    .read_json::<RunRecord>(&super::run_record_path(&record.attempt_id))
+                    .is_err()
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prelaunch_journal_proves_no_resource_cleanup_without_owner_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-no-resource-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = StateStore::open(root.clone()).unwrap();
+        let mut record = terminal_record();
+        record.id = record.run_id.clone();
+        record.launch_state = super::LaunchState::Terminal;
+        record.status = RunStatus::Failed;
+        record.retry_class = Some(super::RetryClass::Prelaunch);
+        record.retry_eligible = true;
+        let pending = super::PendingAttempt {
+            authorization_digest: record.authorization_digest.clone(),
+            authorization_id: record.authorization_id.clone(),
+            record: RunRecord {
+                launch_state: super::LaunchState::Preparing,
+                status: RunStatus::Preparing,
+                finished_at: None,
+                retry_class: None,
+                retry_eligible: false,
+                ..record.clone()
+            },
+            lineage: super::AttemptLineage {
+                attempt_id: record.attempt_id.clone(),
+                run_id: record.run_id.clone(),
+                state: super::LaunchState::Preparing,
+                retry_class: None,
+                retry_eligible: false,
+                started_at: record.started_at,
+                finished_at: None,
+            },
+        };
+        store
+            .create_json(&super::attempt_journal_path(&record.id), &pending)
+            .unwrap();
+        store
+            .create_json(&super::run_record_path(&record.id), &record)
+            .unwrap();
+
+        let cleaned = super::cleanup(
+            &store,
+            &record.id,
+            RelayEndpoint {
+                server_url: "https://approvals.example".into(),
+                token: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleaned.status, RunStatus::Cleaned);
+        let receipt = super::read_receipt(&store, &record.id).unwrap();
+        assert_eq!(
+            receipt.payload.cleanup["journal_proof"]["kind"],
+            "prelaunch_no_resources"
+        );
+        assert_eq!(
+            receipt.payload.artifacts["runtime_artifacts"],
+            "not_created"
+        );
+        assert!(!serde_json::to_string(&receipt).unwrap().contains("/runs/"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn execution_and_cleanup_outcomes_are_independent_and_typed() {
         let mut record = terminal_record();
         for (process, expected) in [
@@ -6182,6 +6705,8 @@ grep -qx 'ready\|ready\.' real-llm.log
             artifacts: serde_json::json!({"schema":"attended_artifacts_v1"}),
             repositories: serde_json::json!([]),
             cleanup: serde_json::json!({"schema":"attended_cleanup_result_v1","outcome":"succeeded"}),
+            cleanup_evidence: super::AttendedCleanupEvidence::default(),
+            host_ledger: super::HostLedgerSummary::default(),
         };
         let receipt = super::CleanupReceipt {
             schema: super::CLEANUP_RECEIPT_SCHEMA_V1.into(),

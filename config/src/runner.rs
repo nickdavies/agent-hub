@@ -1100,7 +1100,7 @@ fn validate_github_token_provider(
     let api = protocol::canonical_github_api_base_for_host(&host, string("api_base_url")?)
         .ok_or_else(|| format!("GitHub credential provider '{name}' has invalid API base URL"))?;
     let access = string("access")?;
-    if !matches!(access, "read" | "read_write")
+    if access != "read_write"
         || name != format!("github:{host}:{access}")
         || string("name")? != name
         || string("host")? != host
@@ -1429,6 +1429,13 @@ mod tests {
         });
         validate_github_token_provider("github:github.com:read_write", valid.as_object().unwrap())
             .unwrap();
+        let mut read = valid.clone();
+        read["name"] = serde_json::json!("github:github.com:read");
+        read["access"] = serde_json::json!("read");
+        assert!(
+            validate_github_token_provider("github:github.com:read", read.as_object().unwrap())
+                .is_err()
+        );
         for mutation in ["host", "access", "target", "args", "extra"] {
             let mut invalid = valid.clone();
             match mutation {

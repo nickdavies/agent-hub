@@ -152,7 +152,7 @@ fn request() -> AttendedAuthorizationRequestV1 {
 fn with_github_overlay(
     mut request: AttendedAuthorizationRequestV1,
 ) -> AttendedAuthorizationRequestV1 {
-    let name = "github:github.com:read".to_string();
+    let name = "github:github.com:read_write".to_string();
     request.proposal.overlays = vec![name.clone()];
     request.execution.overlays = vec![protocol::AuthorizedOverlay {
         name: name.clone(),
@@ -160,7 +160,7 @@ fn with_github_overlay(
         config: serde_json::to_string(&protocol::GithubOverlayBinding {
             host: "github.com".into(),
             api_base_url: "https://api.github.com".into(),
-            access: "read".into(),
+            access: "read_write".into(),
             network_resource: "github".into(),
             credential_provider: name.clone(),
             credential_target: "/agent-hub/github/tokens/github.com".into(),
@@ -178,8 +178,15 @@ fn with_github_overlay(
         args: vec!["auth".into(), "token".into()],
         validity: None,
         targets: vec!["/agent-hub/github/tokens/github.com".into()],
-        access: "read".into(),
-        constraints: BTreeMap::new(),
+        access: "read_write".into(),
+        constraints: BTreeMap::from([
+            ("host".into(), "github.com".into()),
+            ("api_base_url".into(), "https://api.github.com".into()),
+            (
+                "target".into(),
+                "/agent-hub/github/tokens/github.com".into(),
+            ),
+        ]),
     }];
     request.execution.behavior.allow_remote_credentials = true;
     request.execution.repositories[1].remote = Some("https://github.com/example/zeta.git".into());
@@ -190,8 +197,8 @@ fn with_github_overlay(
 fn github_credentials_require_matching_network_and_host() {
     let github = with_github_overlay(request());
     let mut without_network = request_v3();
-    without_network.proposal = github.proposal;
-    without_network.execution = github.execution;
+    without_network.proposal = github.proposal.clone();
+    without_network.execution = github.execution.clone();
     assert!(without_network.clone().normalize().is_err());
 
     let mut host_mismatch = without_network;
@@ -211,6 +218,46 @@ fn github_credentials_require_matching_network_and_host() {
     binding.repository_remotes = vec!["https://github.snooguts.net/example/zeta.git".into()];
     host_mismatch.execution.overlays[0].config = serde_json::to_string(&binding).unwrap();
     assert!(host_mismatch.normalize().is_err());
+
+    let mut valid = request_v3();
+    valid.proposal = github.proposal;
+    valid.execution = github.execution;
+    valid
+        .proposal
+        .network_resources
+        .push(protocol::NetworkResourceKind::Github);
+    valid.execution.runtime.environment.network_resources = Some(
+        protocol::NetworkResourceRequest::Resources(valid.proposal.network_resources.clone()),
+    );
+    for view in &mut valid.git_views {
+        let repository = valid
+            .execution
+            .repositories
+            .iter_mut()
+            .find(|repository| repository.workspace_alias == view.workspace_alias)
+            .unwrap();
+        repository.starting.head = Some(view.head.clone());
+        repository.starting.reference = view.reference.clone();
+        repository.starting.branch = view
+            .reference
+            .as_deref()
+            .and_then(|reference| reference.strip_prefix("refs/heads/"))
+            .map(str::to_string);
+        repository.starting.detached = view.reference.is_none();
+        view.remote = repository.remote.clone();
+    }
+    let normalized = valid.clone().normalize();
+    assert!(normalized.is_ok(), "{normalized:?}");
+    valid.proposal.overlays[0] = "github:github.com:read".into();
+    valid.execution.overlays[0].name = "github:github.com:read".into();
+    let mut binding: protocol::GithubOverlayBinding =
+        serde_json::from_str(&valid.execution.overlays[0].config).unwrap();
+    binding.access = "read".into();
+    binding.credential_provider = "github:github.com:read".into();
+    valid.execution.overlays[0].config = serde_json::to_string(&binding).unwrap();
+    valid.execution.credential_providers[0].name = "github:github.com:read".into();
+    valid.execution.credential_providers[0].access = "read".into();
+    assert!(valid.normalize().is_err());
 }
 
 fn request_v2() -> AttendedAuthorizationRequestV2 {
@@ -311,7 +358,7 @@ fn request_v3() -> protocol::AttendedAuthorizationRequestV3 {
         lifecycle: request.lifecycle,
         retry: protocol::AttendedRetryConstraints {
             max_attempts: 3,
-            max_prelaunch_retries: 2,
+            max_prelaunch_retries: 1,
             max_provider_unavailable_retries: 1,
         },
     }
@@ -339,16 +386,55 @@ fn canonicalization_normalizes_set_order_and_has_attended_domain() {
 }
 
 #[test]
+fn pre_v3_canonical_artifacts_are_frozen_literal_fixtures() {
+    const V1: &[u8] = br#"{"execution":{"behavior":{"allow_remote_credentials":false,"args":["run"],"command":"/usr/local/bin/opencode","env":{},"execution_context":{},"execution_kind":"agent","primary_repo":null,"primary_repo_branch":null,"prompt":{"system":null,"user":"Fix the test"},"runner_profile":{"args":["run"],"command":"/usr/local/bin/opencode"},"triage":false},"config_digest":"config-digest","config_provenance":{"system.toml":"digest"},"config_root":"/config","context_roots":[{"alias":"code","container_path":"/context/code","host_path":"/home/nick.davies/code"}],"credential_providers":[],"environment_bundle_digest":"env-digest","overlays":[],"pids_limit":512,"primary_workspace":"zeta","repositories":[{"access":"read_only","mount_path":"/workspace/alpha","remote":null,"repository_root":"/work/alpha","starting":{"branch":null,"detached":false,"dirty_paths":[],"head":null,"reference":null},"workspace_alias":"alpha"},{"access":"read_write","mount_path":"/workspace/zeta","remote":"git@github.com:example/zeta.git","repository_root":"/work/zeta","starting":{"branch":"main","detached":false,"dirty_paths":[],"head":"0123456789abcdef","reference":"refs/heads/main"},"workspace_alias":"zeta"}],"runtime":{"approval_rules":null,"environment":{"container_image":"registry.example/job-code:locked","cpu_limit":null,"execution_mode":"docker","file_mounts":[],"filesystem":null,"memory_limit":null,"network_resources":{"resources":["npm_registry","pypi_registry"]},"tier":"docker","timeout_secs":3600,"toolchains":[]},"github_capabilities":[],"permissions":{"auto_approve_tools":[],"aws_access":null,"can_access_network":false,"can_read_workspace":true,"can_run_shell":true,"can_write_workspace":true,"escalate_tools":[],"kubernetes_access":null,"tier":"docker_default"},"repos":[],"runtime_version":"v2"},"workspaces":[{"access":"read_only","alias":"alpha","container_path":"/workspace/alpha","host_path":"/work/alpha"},{"access":"read_write","alias":"zeta","container_path":"/workspace/zeta","host_path":"/work/zeta"}]},"lifecycle":{"cancellation_requires_owner":true,"cleanup_is_explicit":true,"preserve_workspace_on_failure":true},"output":{"artifacts":"artifacts.json","cleanup":"cleanup.json","limits":{"artifact_bytes":4194304,"stderr_bytes":16777216,"stdout_bytes":16777216,"transcript_bytes":33554432},"repositories":"repositories.json","result":"result.json","transcript":"transcript.jsonl"},"proposal":{"environment":"development","image_family":"job-code","image_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","image_tag":"registry.example/job-code:locked","network_class":"build","network_resources":["npm_registry","pypi_registry"],"overlays":[],"prompt":"Fix the test","prompt_digest":"67c477ce630a643bd64fd6f54fba454140b5c8e0e4c572fafd111b123daa4217","timeout_secs":3600,"tool_approval":"auto"},"version":"attended_authorization_request_v1"}"#;
+    const V2: &[u8] = br#"{"approval_bundle":null,"approval_bundle_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","execution":{"behavior":{"allow_remote_credentials":false,"args":["run"],"command":"/usr/local/bin/opencode","env":{},"execution_context":{},"execution_kind":"agent","primary_repo":null,"primary_repo_branch":null,"prompt":{"system":null,"user":"Fix the test"},"runner_profile":{"args":["run"],"command":"/usr/local/bin/opencode"},"triage":false},"config_digest":"config-digest","config_provenance":{"system.toml":"digest"},"config_root":"/config","context_roots":[{"alias":"code","container_path":"/context/code","host_path":"/home/nick.davies/code"}],"credential_providers":[],"environment_bundle_digest":"env-digest","overlays":[],"pids_limit":512,"primary_workspace":"zeta","repositories":[{"access":"read_only","mount_path":"/workspace/alpha","remote":null,"repository_root":"/work/alpha","starting":{"branch":null,"detached":false,"dirty_paths":[],"head":null,"reference":null},"workspace_alias":"alpha"},{"access":"read_write","mount_path":"/workspace/zeta","remote":"git@github.com:example/zeta.git","repository_root":"/work/zeta","starting":{"branch":"main","detached":false,"dirty_paths":[],"head":"0123456789abcdef","reference":"refs/heads/main"},"workspace_alias":"zeta"}],"runtime":{"approval_rules":null,"environment":{"container_image":"registry.example/job-code:locked","cpu_limit":null,"execution_mode":"docker","file_mounts":[],"filesystem":null,"memory_limit":null,"network_resources":{"resources":["npm_registry","pypi_registry"]},"tier":"docker","timeout_secs":3600,"toolchains":[]},"github_capabilities":[],"permissions":{"auto_approve_tools":[],"aws_access":null,"can_access_network":false,"can_read_workspace":true,"can_run_shell":true,"can_write_workspace":true,"escalate_tools":[],"kubernetes_access":null,"tier":"docker_default"},"repos":[],"runtime_version":"v2"},"workspaces":[{"access":"read_only","alias":"alpha","container_path":"/workspace/alpha","host_path":"/work/alpha"},{"access":"read_write","alias":"zeta","container_path":"/workspace/zeta","host_path":"/work/zeta"}]},"lifecycle":{"cancellation_requires_owner":true,"cleanup_is_explicit":true,"preserve_workspace_on_failure":true},"output":{"artifacts":"artifacts.json","cleanup":"cleanup.json","limits":{"artifact_bytes":4194304,"stderr_bytes":16777216,"stdout_bytes":16777216,"transcript_bytes":33554432},"repositories":"repositories.json","result":"result.json","transcript":"transcript.jsonl"},"proposal":{"environment":"development","image_family":"job-code","image_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","image_tag":"registry.example/job-code:locked","network_class":"build","network_resources":["npm_registry","pypi_registry"],"overlays":[],"prompt":"Fix the test","prompt_digest":"67c477ce630a643bd64fd6f54fba454140b5c8e0e4c572fafd111b123daa4217","timeout_secs":3600,"tool_approval":"auto"},"version":"attended_authorization_request_v2"}"#;
+
+    let v1 = request().canonical_artifact().unwrap();
+    assert_eq!(v1.canonical_bytes, V1);
+    assert_eq!(
+        v1.digest,
+        "5fc477638a33d59107ad81c3c5439c256ca649e9f2549a401302fb0ca3c9beb0"
+    );
+    let v2 = request_v2().canonical_artifact().unwrap();
+    assert_eq!(v2.canonical_bytes, V2);
+    assert_eq!(
+        v2.digest,
+        "3a5024ecdc219770bf830bbcfed7c493f383481383216deabea702aef37c24fa"
+    );
+}
+
+#[test]
 fn reviewed_retry_constraints_are_canonical_capability_bytes() {
     let artifact = request_v3().canonical_artifact().unwrap();
     let value: serde_json::Value = serde_json::from_slice(&artifact.canonical_bytes).unwrap();
     assert_eq!(value["retry"]["max_attempts"], 3);
-    assert_eq!(value["retry"]["max_prelaunch_retries"], 2);
+    assert_eq!(value["retry"]["max_prelaunch_retries"], 1);
     assert_eq!(value["retry"]["max_provider_unavailable_retries"], 1);
 
     let mut changed = request_v3();
     changed.retry.max_attempts = 4;
     assert!(changed.canonical_artifact().is_err());
+
+    let mut supervised = request_v3();
+    supervised.proposal.tool_approval = ToolApprovalMode::Dippy;
+    supervised.approval_bundle = Some(protocol::AttendedApprovalBundleIdentity {
+        name: "code-supervised".into(),
+        digest: "a".repeat(64),
+        protocol: protocol::APPROVAL_BUNDLE_PROTOCOL.into(),
+        manifest_sha256: "2".repeat(64),
+        gateway_commit: "b".repeat(40),
+        gateway_archive_sha256: "c".repeat(64),
+        plugin_sha256: "d".repeat(64),
+        dippy_commit: "e".repeat(40),
+        dippy_archive_sha256: "f".repeat(64),
+        dippy_wheel_sha256: "1".repeat(64),
+    });
+    supervised.retry = protocol::AttendedRetryConstraints::for_mode(ToolApprovalMode::Dippy);
+    let value: serde_json::Value =
+        serde_json::from_slice(&supervised.canonical_artifact().unwrap().canonical_bytes).unwrap();
+    assert_eq!(value["retry"]["max_attempts"], 4);
+    assert_eq!(value["retry"]["max_prelaunch_retries"], 2);
 }
 
 #[test]

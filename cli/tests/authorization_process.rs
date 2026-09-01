@@ -2,7 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const IMAGE_TAG: &str = "agent-hub/job-code:2026-08-27";
+const IMAGE_TAG: &str = "agent-hub/job-code:2026-09-01";
 
 #[test]
 fn authorization_retries_preflight_and_fences_concurrent_attempts() {
@@ -128,6 +128,14 @@ fn authorization_retries_preflight_and_fences_concurrent_attempts() {
     assert_eq!(first["retry_class"], "prelaunch");
     assert_eq!(first["retry_eligible"], true);
 
+    std::fs::write(root.join("provider-503-once"), "fail").unwrap();
+    let provider_failure = invoke(&root, &fake_bin, &state, &run_args, None);
+    assert!(!provider_failure.status.success());
+    let second: serde_json::Value = serde_json::from_slice(&provider_failure.stdout).unwrap();
+    assert_eq!(second["launch_state"], "terminal");
+    assert_eq!(second["retry_class"], "provider_service_unavailable");
+    assert_eq!(second["retry_eligible"], true);
+
     std::fs::write(root.join("slow-launch"), "slow").unwrap();
     let (executed, duplicate) = std::thread::scope(|scope| {
         let first = scope.spawn(|| invoke(&root, &fake_bin, &state, &run_args, None));
@@ -138,19 +146,21 @@ fn authorization_retries_preflight_and_fences_concurrent_attempts() {
     assert_success(&executed);
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already consumed"));
-    let second: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
-    assert_eq!(first["authorization_id"], second["authorization_id"]);
-    assert_eq!(first["receipt_id"], second["receipt_id"]);
+    let third: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
+    assert_eq!(first["authorization_id"], third["authorization_id"]);
+    assert_eq!(first["receipt_id"], third["receipt_id"]);
     assert_ne!(first["attempt_id"], second["attempt_id"]);
+    assert_ne!(second["attempt_id"], third["attempt_id"]);
     assert_ne!(first["run_id"], second["run_id"]);
+    assert_ne!(second["run_id"], third["run_id"]);
     assert_eq!(first["attempt_number"], 1);
     assert_eq!(second["attempt_number"], 2);
+    assert_eq!(third["attempt_number"], 3);
     assert_eq!(second["parent_attempt_id"], first["attempt_id"]);
     assert_eq!(second["attempt_ancestry"][0], first["attempt_id"]);
-    assert_eq!(
-        first["authorization_digest"],
-        second["authorization_digest"]
-    );
+    assert_eq!(third["parent_attempt_id"], second["attempt_id"]);
+    assert_eq!(third["attempt_ancestry"][1], second["attempt_id"]);
+    assert_eq!(first["authorization_digest"], third["authorization_digest"]);
     assert!(docker_marker.exists());
     let replay = invoke(&root, &fake_bin, &state, &run_args, None);
     assert!(!replay.status.success());
@@ -302,13 +312,15 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
     std::fs::write(
         path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then sleep 1; fi; printf '%s\\n' '{}' ;; esac\n",
+             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then rm '{}'; printf '503 service unavailable\\n' >&2; exit 75; fi; if [ -f '{}' ]; then sleep 1; fi; printf '%s\\n' '{}' ;; esac\n",
             marker.display(),
             "a".repeat(64),
             root.join("fail-preflight-once").display(),
             root.join("fail-preflight-once").display(),
-            report_path.display(),
-            root.join("slow-launch").display(),
+             report_path.display(),
+            root.join("provider-503-once").display(),
+            root.join("provider-503-once").display(),
+             root.join("slow-launch").display(),
             result_event,
         ),
     )

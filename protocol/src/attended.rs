@@ -360,6 +360,23 @@ pub struct AttendedRetryConstraints {
     pub max_provider_unavailable_retries: u32,
 }
 
+impl AttendedRetryConstraints {
+    pub fn for_mode(mode: ToolApprovalMode) -> Self {
+        match mode {
+            ToolApprovalMode::Auto => Self {
+                max_attempts: 3,
+                max_prelaunch_retries: 1,
+                max_provider_unavailable_retries: 1,
+            },
+            ToolApprovalMode::Dippy => Self {
+                max_attempts: 4,
+                max_prelaunch_retries: 2,
+                max_provider_unavailable_retries: 1,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentResultV1 {
@@ -786,7 +803,7 @@ fn validate_github_capabilities(
             .find(|provider| provider.name == binding.credential_provider);
         if host != binding.host
             || api != binding.api_base_url
-            || !matches!(binding.access.as_str(), "read" | "read_write")
+            || binding.access != "read_write"
             || binding.network_resource != "github"
             || !binding.authenticated
             || !binding.private_repositories
@@ -947,13 +964,7 @@ impl AttendedAuthorizationRequestV3 {
         self.approval_bundle = normalized.approval_bundle;
         self.output = normalized.output;
         self.lifecycle = normalized.lifecycle;
-        if self.retry
-            != (AttendedRetryConstraints {
-                max_attempts: 3,
-                max_prelaunch_retries: 2,
-                max_provider_unavailable_retries: 1,
-            })
-        {
+        if self.retry != AttendedRetryConstraints::for_mode(self.proposal.tool_approval) {
             return Err("attended retry constraints differ from the reviewed contract".into());
         }
         for root in &mut self.roots {

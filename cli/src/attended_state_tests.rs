@@ -219,7 +219,7 @@ fn request() -> AttendedAuthorizationRequestV3 {
         lifecycle: AttendedLifecycleContract::default(),
         retry: protocol::AttendedRetryConstraints {
             max_attempts: 3,
-            max_prelaunch_retries: 2,
+            max_prelaunch_retries: 1,
             max_provider_unavailable_retries: 1,
         },
     }
