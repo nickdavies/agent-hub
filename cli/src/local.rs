@@ -30,6 +30,7 @@ pub struct ResolvedMounts {
     pub workspaces: Vec<WorkspaceSpec>,
     pub context_roots: Vec<ContextRootSpec>,
     pub repositories: Vec<RepositoryMountSpec>,
+    pub git_views: Vec<protocol::GitViewSpec>,
     pub primary_workspace: String,
 }
 
@@ -96,6 +97,7 @@ pub fn resolve_mounts(
     let mut hosts = Vec::new();
     let mut workspaces = Vec::new();
     let mut repositories = Vec::new();
+    let mut git_views = Vec::new();
     for requested in requested_workspaces {
         validate_alias(&requested.alias)?;
         ensure!(
@@ -118,12 +120,31 @@ pub fn resolve_mounts(
             container_path: container_path.clone(),
             access: requested.access,
         });
-        repositories.push(repository_spec(
+        let git_view = crate::git_view::inspect_git_view(
             &requested.alias,
             &host,
             &container_path,
             requested.access,
-        )?);
+        )?;
+        repositories.push(RepositoryMountSpec {
+            workspace_alias: requested.alias.clone(),
+            repository_root: path_string(&host)?,
+            mount_path: container_path,
+            remote: git_view.remote.clone(),
+            access: requested.access,
+            starting: RepositoryState {
+                head: Some(git_view.head.clone()),
+                reference: git_view.reference.clone(),
+                branch: git_view
+                    .reference
+                    .as_deref()
+                    .and_then(|reference| reference.strip_prefix("refs/heads/"))
+                    .map(str::to_string),
+                detached: git_view.reference.is_none(),
+                dirty_paths: repository_state(&host)?.dirty_paths,
+            },
+        });
+        git_views.push(git_view);
     }
     ensure!(
         workspaces
@@ -161,10 +182,12 @@ pub fn resolve_mounts(
     workspaces.sort();
     context_roots.sort();
     repositories.sort();
+    git_views.sort();
     Ok(ResolvedMounts {
         workspaces,
         context_roots,
         repositories,
+        git_views,
         primary_workspace: primary_workspace.to_string(),
     })
 }
@@ -228,60 +251,7 @@ fn reject_host_overlap(existing: &[PathBuf], candidate: &Path) -> anyhow::Result
     Ok(())
 }
 
-fn repository_spec(
-    alias: &str,
-    root: &Path,
-    mount_path: &str,
-    access: WorkspaceAccess,
-) -> anyhow::Result<RepositoryMountSpec> {
-    let git = |args: &[&str]| -> Option<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .ok()?;
-        if output.status.success() {
-            Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
-        } else {
-            None
-        }
-    };
-    let git_root = git(&["rev-parse", "--show-toplevel"]);
-    ensure!(
-        git_root
-            .as_deref()
-            .is_none_or(|git_root| Some(git_root) == root.to_str()),
-        "workspace '{}' must be the exact Git repository root",
-        root.display()
-    );
-    let is_git_root = git_root.as_deref() == root.to_str();
-    let starting = if is_git_root {
-        repository_state(root)?
-    } else {
-        RepositoryState {
-            head: None,
-            reference: None,
-            branch: None,
-            detached: false,
-            dirty_paths: Vec::new(),
-        }
-    };
-    Ok(RepositoryMountSpec {
-        workspace_alias: alias.to_string(),
-        repository_root: path_string(root)?,
-        mount_path: mount_path.to_string(),
-        remote: is_git_root
-            .then(|| git(&["remote", "get-url", "origin"]))
-            .flatten()
-            .map(|remote| canonical_remote_identity(&remote))
-            .transpose()?,
-        access,
-        starting,
-    })
-}
-
-fn canonical_remote_identity(remote: &str) -> anyhow::Result<String> {
+pub(crate) fn canonical_remote_identity(remote: &str) -> anyhow::Result<String> {
     ensure!(
         !remote.is_empty() && !remote.chars().any(char::is_control),
         "repository remote identity is empty or contains control characters"
@@ -331,6 +301,16 @@ fn canonical_remote_identity(remote: &str) -> anyhow::Result<String> {
 pub fn repository_state(root: &Path) -> anyhow::Result<RepositoryState> {
     let output = |args: &[&str]| -> anyhow::Result<std::process::Output> {
         Command::new("git")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", "/nonexistent-agent-hub-git-home")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
             .arg("-C")
             .arg(root)
             .args(args)

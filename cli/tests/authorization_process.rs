@@ -14,7 +14,7 @@ fn authorization_is_cross_process_single_use_and_precedes_runtime_side_effects()
     let docker_marker = root.join("docker.calls");
     let fake_bin = root.join("bin");
     std::fs::create_dir(&workspace).unwrap();
-    std::fs::create_dir(workspace.join(".git")).unwrap();
+    initialize_repository(&workspace);
     std::fs::create_dir(&fake_bin).unwrap();
     write_config(&config, &workspace);
     write_fake_docker(&fake_bin.join("docker"), &docker_marker, &workspace, &root);
@@ -113,6 +113,31 @@ fn authorization_is_cross_process_single_use_and_precedes_runtime_side_effects()
     assert!(!replay.status.success());
     assert!(String::from_utf8_lossy(&replay.stderr).contains("already consumed"));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn initialize_repository(path: &Path) {
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(path.join("tracked.txt"), "tracked\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&[
+        "-c",
+        "user.name=Agent Hub Test",
+        "-c",
+        "user.email=agent-hub@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    ]);
 }
 
 fn invoke(

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::attended::{DIPPY_SELECTOR_PREFIX, read_artifact_bounded, render_proposal};
 use crate::state::StateStore;
 use protocol::{
-    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2, ApprovedExecutionSpec,
-    AttendedAuthorizationRequestV2, AttendedExecutionSpec, AttendedLifecycleContract,
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ApprovedExecutionSpec,
+    AttendedAuthorizationRequestV3, AttendedExecutionSpec, AttendedLifecycleContract,
     AttendedOutputContract, AttendedProposal, CanonicalRuntimeSpec, ExecutionMode,
     PlannedEnvironmentSpec, PlannedEnvironmentTier, PlannedPermissionSet, PlannedPermissionTier,
     ResolvedAuthorizationBehavior, ToolApprovalMode,
@@ -71,9 +71,9 @@ fn fresh_state_creates_runs_parent_and_bounds_artifact_reads() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-fn request() -> AttendedAuthorizationRequestV2 {
-    AttendedAuthorizationRequestV2 {
-        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2.into(),
+fn request() -> AttendedAuthorizationRequestV3 {
+    AttendedAuthorizationRequestV3 {
+        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3.into(),
         proposal: AttendedProposal {
             environment: "development".into(),
             image_family: "job-code".into(),
@@ -162,15 +162,46 @@ fn request() -> AttendedAuthorizationRequestV2 {
                 remote: None,
                 access: protocol::WorkspaceAccess::ReadWrite,
                 starting: protocol::RepositoryState {
-                    head: None,
-                    reference: None,
-                    branch: None,
+                    head: Some("1".repeat(40)),
+                    reference: Some("refs/heads/main".into()),
+                    branch: Some("main".into()),
                     detached: false,
                     dirty_paths: vec![],
                 },
             }],
             primary_workspace: "primary".into(),
         },
+        git_views: vec![protocol::GitViewSpec {
+            workspace_alias: "primary".into(),
+            repository_type: protocol::GitRepositoryType::Standalone,
+            workspace_path: "/work/repo".into(),
+            workspace_container_path: "/workspace/primary".into(),
+            git_dir: protocol::HostDirectoryIdentity {
+                canonical_path: "/work/repo/.git".into(),
+                device: 1,
+                inode: 2,
+            },
+            common_dir: protocol::HostDirectoryIdentity {
+                canonical_path: "/work/repo/.git".into(),
+                device: 1,
+                inode: 2,
+            },
+            object_stores: vec![protocol::GitObjectStoreSpec {
+                identity: protocol::HostDirectoryIdentity {
+                    canonical_path: "/work/repo/.git/objects".into(),
+                    device: 1,
+                    inode: 3,
+                },
+                container_path: "/agent-hub/git/views/primary/objects/0".into(),
+            }],
+            head: "1".repeat(40),
+            reference: Some("refs/heads/main".into()),
+            index_sha256: Some("2".repeat(64)),
+            remote: None,
+            access: protocol::WorkspaceAccess::ReadWrite,
+            pointer_container_path: "/workspace/primary/.git".into(),
+            git_dir_container_path: "/agent-hub/git/views/primary/git".into(),
+        }],
         approval_bundle_digest: "a".repeat(64),
         approval_bundle: None,
         output: AttendedOutputContract::default(),

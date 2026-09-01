@@ -162,6 +162,71 @@ fn request_v2() -> AttendedAuthorizationRequestV2 {
     }
 }
 
+fn request_v3() -> protocol::AttendedAuthorizationRequestV3 {
+    let mut request = request_v2();
+    let git_views = request
+        .execution
+        .workspaces
+        .iter()
+        .map(|workspace| protocol::GitViewSpec {
+            workspace_alias: workspace.alias.clone(),
+            repository_type: protocol::GitRepositoryType::Standalone,
+            workspace_path: workspace.host_path.clone(),
+            workspace_container_path: workspace.container_path.clone(),
+            git_dir: protocol::HostDirectoryIdentity {
+                canonical_path: format!("{}/.git", workspace.host_path),
+                device: 1,
+                inode: 2,
+            },
+            common_dir: protocol::HostDirectoryIdentity {
+                canonical_path: format!("{}/.git", workspace.host_path),
+                device: 1,
+                inode: 2,
+            },
+            object_stores: vec![protocol::GitObjectStoreSpec {
+                identity: protocol::HostDirectoryIdentity {
+                    canonical_path: format!("{}/.git/objects", workspace.host_path),
+                    device: 1,
+                    inode: 3,
+                },
+                container_path: format!("/agent-hub/git/views/{}/objects/0", workspace.alias),
+            }],
+            head: "1".repeat(40),
+            reference: Some("refs/heads/main".into()),
+            index_sha256: Some("2".repeat(64)),
+            remote: None,
+            access: workspace.access,
+            pointer_container_path: format!("{}/.git", workspace.container_path),
+            git_dir_container_path: format!("/agent-hub/git/views/{}/git", workspace.alias),
+        })
+        .collect::<Vec<_>>();
+    for repository in &mut request.execution.repositories {
+        let view = git_views
+            .iter()
+            .find(|view| view.workspace_alias == repository.workspace_alias)
+            .unwrap();
+        repository.remote = view.remote.clone();
+        repository.starting.head = Some(view.head.clone());
+        repository.starting.reference = view.reference.clone();
+        repository.starting.branch = view
+            .reference
+            .as_deref()
+            .and_then(|reference| reference.strip_prefix("refs/heads/"))
+            .map(str::to_string);
+        repository.starting.detached = view.reference.is_none();
+    }
+    protocol::AttendedAuthorizationRequestV3 {
+        version: protocol::ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3.into(),
+        proposal: request.proposal,
+        execution: request.execution,
+        git_views,
+        approval_bundle_digest: request.approval_bundle_digest,
+        approval_bundle: request.approval_bundle,
+        output: request.output,
+        lifecycle: request.lifecycle,
+    }
+}
+
 #[test]
 fn attended_authorization_requires_a_positive_bounded_deadline() {
     for timeout in [None, Some(0), Some(86_401)] {
@@ -272,6 +337,23 @@ fn attended_v2_constructs_a_canonical_supervised_artifact_and_rejects_tampering(
     assert!(request.canonical_artifact().is_err());
     request.approval_bundle = None;
     assert!(request.canonical_artifact().is_err());
+}
+
+#[test]
+fn attended_v3_binds_isolated_git_views_without_accepting_v1_or_v2_domains() {
+    let v1 = request().canonical_artifact().unwrap();
+    let v2 = request_v2().canonical_artifact().unwrap();
+    let v3 = request_v3().canonical_artifact().unwrap();
+    assert_eq!(v3.version, protocol::ATTENDED_AUTHORIZATION_VERSION_V3);
+    assert!(v3.verify().is_err());
+    assert!(v3.verify_v2().is_err());
+    assert_eq!(v3.verify_v3().unwrap(), request_v3().normalize().unwrap());
+    assert_eq!(v1, request().canonical_artifact().unwrap());
+    assert_eq!(v2, request_v2().canonical_artifact().unwrap());
+
+    let mut changed = request_v3();
+    changed.git_views[0].index_sha256 = Some("3".repeat(64));
+    assert_ne!(changed.canonical_artifact().unwrap().digest, v3.digest);
 }
 
 #[test]

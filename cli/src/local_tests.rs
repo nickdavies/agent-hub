@@ -2,12 +2,38 @@ use crate::local::{
     ApprovedRoots, RequestedContextRoot, RequestedWorkspace, WorkspaceAccess, resolve_mounts,
 };
 
+fn initialize_repository(path: &std::path::Path) {
+    std::fs::create_dir_all(path).unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(path.join("tracked.txt"), "starting\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&[
+        "-c",
+        "user.name=Agent Hub Test",
+        "-c",
+        "user.email=agent-hub@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    ]);
+}
+
 #[test]
 fn mount_resolution_is_repeatable_and_rejects_reserved_shadowing() {
     let temp =
         std::env::temp_dir().join(format!("agent-hub-attended-paths-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp);
-    std::fs::create_dir_all(temp.join("repo/.git")).unwrap();
+    initialize_repository(&temp.join("repo"));
     let roots = ApprovedRoots::new(vec![temp.clone()]).unwrap();
     let requested = vec![RequestedWorkspace {
         alias: "primary".into(),
@@ -38,7 +64,7 @@ fn mount_resolution_is_repeatable_and_rejects_reserved_shadowing() {
 fn context_roots_must_be_read_only_and_approved() {
     let root =
         std::env::temp_dir().join(format!("agent-hub-attended-context-{}", std::process::id()));
-    std::fs::create_dir_all(root.join("workspace")).unwrap();
+    initialize_repository(&root.join("workspace"));
     let roots = ApprovedRoots::new(vec![root.clone(), "/home/nick.davies/code".into()]).unwrap();
     let workspaces = vec![RequestedWorkspace {
         alias: "primary".into(),
@@ -113,8 +139,8 @@ fn multi_workspace_git_state_binds_exact_roots_refs_access_and_dirty_paths() {
     ));
     let alpha = root.join("alpha");
     let zeta = root.join("zeta");
-    std::fs::create_dir_all(&alpha).unwrap();
-    std::fs::create_dir_all(&zeta).unwrap();
+    initialize_repository(&alpha);
+    initialize_repository(&zeta);
     for repository in [&alpha, &zeta] {
         let git = |args: &[&str]| {
             let status = std::process::Command::new("git")
@@ -125,19 +151,7 @@ fn multi_workspace_git_state_binds_exact_roots_refs_access_and_dirty_paths() {
                 .unwrap();
             assert!(status.success());
         };
-        git(&["init", "-q", "-b", "main"]);
-        std::fs::write(repository.join("tracked.txt"), "starting\n").unwrap();
-        git(&["add", "tracked.txt"]);
-        git(&[
-            "-c",
-            "user.name=Agent Hub Test",
-            "-c",
-            "user.email=agent-hub@example.com",
-            "commit",
-            "-q",
-            "-m",
-            "initial",
-        ]);
+        git(&["status", "--short"]);
     }
     std::fs::write(alpha.join("tracked.txt"), "dirty\n").unwrap();
     std::fs::write(alpha.join("untracked.txt"), "dirty\n").unwrap();

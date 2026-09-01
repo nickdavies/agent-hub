@@ -17,8 +17,8 @@ use agent_hub_executor::{
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use protocol::{
-    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2, ApprovedExecutionSpec,
-    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV2,
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ApprovedExecutionSpec,
+    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV3,
     AttendedExecutionSpec, AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
     AuthorizedCredentialProvider, AuthorizedOverlay, CanonicalRuntimeSpec, ExecutionMode,
     NetworkResourceKind, NetworkResourceRequest, PlannedEnvironmentTier, PromptRef,
@@ -369,8 +369,8 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             }))
             .map_err(anyhow::Error::msg)?,
         );
-    AttendedAuthorizationRequestV2 {
-        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2.to_string(),
+    AttendedAuthorizationRequestV3 {
+        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3.to_string(),
         proposal: AttendedProposal {
             environment: input.environment,
             image_family: input.image_family,
@@ -401,6 +401,7 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             repositories: mounts.repositories,
             primary_workspace: mounts.primary_workspace,
         },
+        git_views: mounts.git_views,
         approval_bundle_digest,
         approval_bundle,
         output: AttendedOutputContract::default(),
@@ -414,7 +415,7 @@ pub fn render_proposal(
     path: &Path,
     artifact: &AttendedAuthorizationArtifact,
 ) -> anyhow::Result<String> {
-    let request = artifact.verify_v2().map_err(anyhow::Error::msg)?;
+    let request = artifact.verify_v3().map_err(anyhow::Error::msg)?;
     let canonical_path = std::fs::canonicalize(path)
         .with_context(|| format!("canonicalize authorization path {}", path.display()))?;
     let approval_bundle = request.approval_bundle.as_ref().map_or_else(
@@ -435,8 +436,24 @@ pub fn render_proposal(
             )
         },
     );
+    let git_capabilities = request
+        .git_views
+        .iter()
+        .map(|view| {
+            format!(
+                "{}: isolated read-only Git metadata ({:?}), workspace content {:?}, HEAD {}, ref {}, remote {}",
+                view.workspace_alias,
+                view.repository_type,
+                view.access,
+                view.head,
+                view.reference.as_deref().unwrap_or("detached"),
+                view.remote.as_deref().unwrap_or("none"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(format!(
-        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nTimeout seconds: {}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
+        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nTimeout seconds: {}\nGit capability:\n{}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
         request.proposal.environment,
         request.proposal.image_family,
         request.proposal.image_tag,
@@ -447,6 +464,7 @@ pub fn render_proposal(
         approval_bundle,
         request.proposal.overlays.join(","),
         request.proposal.timeout_secs,
+        git_capabilities,
         request.proposal.prompt_digest,
         request.proposal.prompt,
         artifact.digest,
@@ -475,7 +493,7 @@ pub(crate) async fn revalidate_authorization(
     selectors: AuthorizationSelectors<'_>,
 ) -> anyhow::Result<RevalidatedAuthorization> {
     let (artifact, original_authorization_path) = read_authorization_file(path)?;
-    let request = artifact.verify_v2().map_err(anyhow::Error::msg)?;
+    let request = artifact.verify_v3().map_err(anyhow::Error::msg)?;
     verify_authorization_selectors(&request, &artifact, &selectors)?;
     verify_execution_inputs(&request)?;
     let docker =
@@ -495,7 +513,7 @@ pub(crate) async fn revalidate_authorization(
 }
 
 fn verify_authorization_selectors(
-    request: &AttendedAuthorizationRequestV2,
+    request: &AttendedAuthorizationRequestV3,
     artifact: &AttendedAuthorizationArtifact,
     selectors: &AuthorizationSelectors<'_>,
 ) -> anyhow::Result<()> {
@@ -541,7 +559,7 @@ pub async fn run(
     relay_override: RelayEndpointOverride,
 ) -> anyhow::Result<RunRecord> {
     let (supplied, supplied_path) = read_authorization_file(artifact_path)?;
-    let request = supplied.verify_v2().map_err(anyhow::Error::msg)?;
+    let request = supplied.verify_v3().map_err(anyhow::Error::msg)?;
     let digest = supplied.digest.clone();
     verify_authorization_selectors(&request, &supplied, &selectors)?;
     let authorized_path = authorization_path("records", &digest);
@@ -827,6 +845,7 @@ pub async fn run(
         let mut credential_cleanup = TemporaryCredentialCleanup(Vec::new());
         let mut prepared_egress = None;
         let mut attended_relay = None;
+        let mut materialized_git_views = None;
         let operation = async {
         if request.proposal.tool_approval == ToolApprovalMode::Dippy {
             let run_epoch = uuid::Uuid::new_v4();
@@ -916,6 +935,14 @@ pub async fn run(
             &project_config_mask_dir,
             &request.execution.workspaces,
         )?);
+        let git_views = crate::git_view::materialize_git_views(
+            &run_dir,
+            &request.git_views,
+            &effects,
+        )?;
+        mounts.extend(git_views.mounts.iter().cloned());
+        mounts.push(git_views.home_mount.clone());
+        materialized_git_views = Some(git_views);
         mounts.push(DockerMount::new(
             &bundle_dir,
             "/opencode/config/opencode",
@@ -953,6 +980,18 @@ pub async fn run(
                 environment.insert(name.clone(), value.clone()).is_none(),
                 "trusted OpenCode environment conflicts with authorized variable '{name}'"
             );
+        }
+        for (name, value) in [
+            ("HOME", "/agent-hub/git/home"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/agent-hub/git/home/.gitconfig"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_PAGER", "cat"),
+            ("PAGER", "cat"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+        ] {
+            environment.insert(name.into(), value.into());
         }
         verify_host_only_approval_environment(&environment)?;
         if let Some(relay) = &attended_relay {
@@ -1223,6 +1262,16 @@ pub async fn run(
         let containment_absent = relay_cleanup.is_ok() && helper_cleanup.is_ok()
             && primary_cleanup.is_ok()
             && egress_cleanup.is_ok();
+        let git_view_cleanup = if containment_absent {
+            match materialized_git_views.take() {
+                Some(views) => views.cleanup(&effects),
+                None => crate::git_view::recover_git_views(&run_dir, &effects),
+            }
+        } else {
+            Err(anyhow::anyhow!(
+                "Git view cleanup blocked until process, container, helper, and egress absence is proven"
+            ))
+        };
         let credential_effect_cleanup = if containment_absent {
             effects.reconcile_owned_credentials(&data_dir, Some(&runtime_data_dir))
         } else {
@@ -1251,10 +1300,15 @@ pub async fn run(
                 error: Some(format!("{error:#}")),
             },
         };
-        let effect_cleanup = match (&credential_effect_cleanup, &runtime_data_cleanup) {
-            (Ok(()), Ok(())) => effects.finalize(),
-            (Err(error), _) => Err(anyhow::anyhow!("credential effects: {error:#}")),
-            (_, Err(error)) => Err(anyhow::anyhow!("runtime-data effects: {error:#}")),
+        let effect_cleanup = match (
+            &credential_effect_cleanup,
+            &runtime_data_cleanup,
+            &git_view_cleanup,
+        ) {
+            (Ok(()), Ok(()), Ok(())) => effects.finalize(),
+            (Err(error), _, _) => Err(anyhow::anyhow!("credential effects: {error:#}")),
+            (_, Err(error), _) => Err(anyhow::anyhow!("runtime-data effects: {error:#}")),
+            (_, _, Err(error)) => Err(anyhow::anyhow!("Git view effects: {error:#}")),
         };
         captured_cleanup_evidence = Some(AttendedCleanupEvidence {
             process: CleanupCheck::from_result(&helper_cleanup),
@@ -1804,6 +1858,9 @@ async fn recover_owned_run_resources(
         let data_dir = run_dir.join("data");
         let runtime_data_dir = data_dir.join("opencode");
         if failures.is_empty() {
+            if let Err(error) = crate::git_view::recover_git_views(run_dir, effects) {
+                failures.push(format!("Git view effects: {error:#}"));
+            }
             if let Err(error) =
                 effects.reconcile_owned_credentials(&data_dir, Some(&runtime_data_dir))
             {
@@ -1856,7 +1913,7 @@ fn verify_recovery_relay_endpoint(
     Ok(state)
 }
 
-fn verify_execution_inputs(request: &AttendedAuthorizationRequestV2) -> anyhow::Result<()> {
+fn verify_execution_inputs(request: &AttendedAuthorizationRequestV3) -> anyhow::Result<()> {
     let config_root = Path::new(&request.execution.config_root);
     ensure!(
         std::fs::canonicalize(config_root)? == config_root,
@@ -1958,6 +2015,7 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV2) -> anyhow::
             workspaces: request.execution.workspaces.clone(),
             context_roots: request.execution.context_roots.clone(),
             repositories: request.execution.repositories.clone(),
+            git_views: request.git_views.clone(),
             primary_workspace: request.execution.primary_workspace.clone(),
         },
         &request.proposal.network_resources,
@@ -2006,14 +2064,15 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV2) -> anyhow::
     ensure!(
         resolved.workspaces == request.execution.workspaces
             && resolved.context_roots == request.execution.context_roots
-            && resolved.repositories == request.execution.repositories,
+            && resolved.repositories == request.execution.repositories
+            && resolved.git_views == request.git_views,
         "workspace or repository identity changed after authorization"
     );
     Ok(())
 }
 
 fn verify_mount_filesystem_identity(
-    request: &AttendedAuthorizationRequestV2,
+    request: &AttendedAuthorizationRequestV3,
 ) -> anyhow::Result<()> {
     verify_execution_inputs(request)
         .context("revalidate attended filesystem identity immediately before launch")
@@ -2072,7 +2131,7 @@ async fn resolve_attended_credentials(
 }
 
 fn validate_credential_runtime_conflicts(
-    request: &AttendedAuthorizationRequestV2,
+    request: &AttendedAuthorizationRequestV3,
     runner: &config::ResolvedRunnerProfile,
 ) -> anyhow::Result<()> {
     let mut environment = request
@@ -2084,6 +2143,20 @@ fn validate_credential_runtime_conflicts(
         .collect::<std::collections::BTreeSet<_>>();
     environment.extend(runner.opencode.trusted_env.keys().cloned());
     environment.insert("AGENT_PROMPT_USER_PATH".to_string());
+    environment.extend(
+        [
+            "HOME",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_PAGER",
+            "PAGER",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_NO_REPLACE_OBJECTS",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
     if !request.proposal.network_resources.is_empty() {
         environment.extend(
             [
@@ -2125,6 +2198,16 @@ fn validate_credential_runtime_conflicts(
         .into_iter()
         .map(str::to_string),
     );
+    mounts.insert("/agent-hub/git/home".to_string());
+    for view in &request.git_views {
+        mounts.insert(view.pointer_container_path.clone());
+        mounts.insert(view.git_dir_container_path.clone());
+        mounts.extend(
+            view.object_stores
+                .iter()
+                .map(|store| store.container_path.clone()),
+        );
+    }
 
     for provider in &request.execution.credential_providers {
         for target in &provider.targets {
@@ -2170,7 +2253,7 @@ fn project_config_mask_mounts(
 }
 
 fn verify_materialized_credential_identities(
-    request: &AttendedAuthorizationRequestV2,
+    request: &AttendedAuthorizationRequestV3,
     credentials: &agent_hub_executor::credential_provider::ResolvedCredentials,
 ) -> anyhow::Result<()> {
     for (name, identity) in &credentials.source_identities {
@@ -2788,7 +2871,7 @@ struct AttendedEgressPreparation<'a> {
 
 async fn prepare_execution_egress(
     deployment: &config::ValidatedDeployment,
-    request: &AttendedAuthorizationRequestV2,
+    request: &AttendedAuthorizationRequestV3,
     docker: &Path,
     deadline: &Deadline,
     preparation: AttendedEgressPreparation<'_>,
@@ -3290,7 +3373,7 @@ fn sync_private_tree(root: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn runtime_identity(request: &AttendedAuthorizationRequestV2) -> anyhow::Result<(u32, u32)> {
+fn runtime_identity(request: &AttendedAuthorizationRequestV3) -> anyhow::Result<(u32, u32)> {
     use std::os::unix::fs::MetadataExt;
 
     let path = request
@@ -3397,7 +3480,7 @@ fn verify_host_only_approval_environment(
 }
 
 #[cfg(not(unix))]
-fn runtime_identity(_request: &AttendedAuthorizationRequestV2) -> anyhow::Result<(u32, u32)> {
+fn runtime_identity(_request: &AttendedAuthorizationRequestV3) -> anyhow::Result<(u32, u32)> {
     anyhow::bail!("attended job-code preflight requires Unix ownership metadata")
 }
 

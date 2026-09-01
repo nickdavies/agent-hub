@@ -2,6 +2,7 @@ mod attended;
 mod attended_relay;
 mod build;
 mod client;
+mod git_view;
 mod local;
 mod local_authorize;
 mod review;

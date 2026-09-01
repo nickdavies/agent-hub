@@ -14,10 +14,13 @@ pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION: &str = "attended_authorization
 pub const ATTENDED_AUTHORIZATION_VERSION: u32 = 1;
 pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2: &str = "attended_authorization_request_v2";
 pub const ATTENDED_AUTHORIZATION_VERSION_V2: u32 = 2;
+pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3: &str = "attended_authorization_request_v3";
+pub const ATTENDED_AUTHORIZATION_VERSION_V3: u32 = 3;
 pub const APPROVAL_BUNDLE_PROTOCOL: &str = "attended_approval_bundle_v1";
 pub const APPROVED_EXECUTION_PIDS_LIMIT: u32 = 512;
 const ATTENDED_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:attended-authorization:v1\0";
 const ATTENDED_AUTHORIZATION_DOMAIN_V2: &[u8] = b"agent-hub:attended-authorization:v2\0";
+const ATTENDED_AUTHORIZATION_DOMAIN_V3: &[u8] = b"agent-hub:attended-authorization:v3\0";
 
 pub fn canonical_context_root_path(alias: &str) -> Option<&'static str> {
     match alias {
@@ -38,6 +41,10 @@ pub fn is_canonical_context_root_path(path: &str) -> bool {
         })
 }
 
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AttendedAuthorizationRequestV1 {
@@ -54,6 +61,19 @@ pub struct AttendedAuthorizationRequestV2 {
     pub version: String,
     pub proposal: AttendedProposal,
     pub execution: AttendedExecutionSpec,
+    pub approval_bundle_digest: String,
+    pub approval_bundle: Option<AttendedApprovalBundleIdentity>,
+    pub output: AttendedOutputContract,
+    pub lifecycle: AttendedLifecycleContract,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedAuthorizationRequestV3 {
+    pub version: String,
+    pub proposal: AttendedProposal,
+    pub execution: AttendedExecutionSpec,
+    pub git_views: Vec<GitViewSpec>,
     pub approval_bundle_digest: String,
     pub approval_bundle: Option<AttendedApprovalBundleIdentity>,
     pub output: AttendedOutputContract,
@@ -175,6 +195,49 @@ pub struct WorkspaceSpec {
 pub enum WorkspaceAccess {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRepositoryType {
+    Standalone,
+    Linked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct HostDirectoryIdentity {
+    pub canonical_path: String,
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct GitObjectStoreSpec {
+    pub identity: HostDirectoryIdentity,
+    pub container_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct GitViewSpec {
+    pub workspace_alias: String,
+    pub repository_type: GitRepositoryType,
+    pub workspace_path: String,
+    pub workspace_container_path: String,
+    pub git_dir: HostDirectoryIdentity,
+    pub common_dir: HostDirectoryIdentity,
+    pub object_stores: Vec<GitObjectStoreSpec>,
+    pub head: String,
+    pub reference: Option<String>,
+    pub index_sha256: Option<String>,
+    pub remote: Option<String>,
+    pub access: WorkspaceAccess,
+    pub pointer_container_path: String,
+    pub git_dir_container_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
@@ -625,6 +688,119 @@ impl AttendedAuthorizationRequestV2 {
     }
 }
 
+impl AttendedAuthorizationRequestV3 {
+    pub fn normalize(mut self) -> Result<Self, String> {
+        if self.version != ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3 {
+            return Err(format!(
+                "unsupported attended authorization schema {}",
+                self.version
+            ));
+        }
+        let normalized = AttendedAuthorizationRequestV2 {
+            version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2.into(),
+            proposal: self.proposal,
+            execution: self.execution,
+            approval_bundle_digest: self.approval_bundle_digest,
+            approval_bundle: self.approval_bundle,
+            output: self.output,
+            lifecycle: self.lifecycle,
+        }
+        .normalize()?;
+        self.proposal = normalized.proposal;
+        self.execution = normalized.execution;
+        self.approval_bundle_digest = normalized.approval_bundle_digest;
+        self.approval_bundle = normalized.approval_bundle;
+        self.output = normalized.output;
+        self.lifecycle = normalized.lifecycle;
+        self.git_views.sort();
+        reject_duplicate_by(
+            &self.git_views,
+            |view| &view.workspace_alias,
+            "Git view workspace alias",
+        )?;
+        let workspace_aliases = self
+            .execution
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.alias.as_str())
+            .collect::<BTreeSet<_>>();
+        let git_aliases = self
+            .git_views
+            .iter()
+            .map(|view| view.workspace_alias.as_str())
+            .collect::<BTreeSet<_>>();
+        if workspace_aliases != git_aliases {
+            return Err("attended Git views do not exactly match the workspace set".into());
+        }
+        for view in &self.git_views {
+            let workspace = self
+                .execution
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.alias == view.workspace_alias)
+                .expect("Git view and workspace alias sets match");
+            if view.workspace_path != workspace.host_path
+                || view.workspace_container_path != workspace.container_path
+                || view.access != workspace.access
+            {
+                return Err("attended Git view differs from its workspace capability".into());
+            }
+            let repository = self
+                .execution
+                .repositories
+                .iter()
+                .find(|repository| repository.workspace_alias == view.workspace_alias)
+                .expect("repository and workspace alias sets match");
+            if repository.remote != view.remote
+                || repository.starting.head.as_deref() != Some(view.head.as_str())
+                || repository.starting.reference != view.reference
+                || repository.starting.detached != view.reference.is_none()
+            {
+                return Err("attended Git view differs from its reviewed repository state".into());
+            }
+            validate_absolute_path(&view.git_dir.canonical_path, "Git directory")?;
+            validate_absolute_path(&view.common_dir.canonical_path, "Git common directory")?;
+            if view.pointer_container_path != format!("{}/.git", workspace.container_path)
+                || view.git_dir_container_path
+                    != format!("/agent-hub/git/views/{}/git", workspace.alias)
+            {
+                return Err("attended Git view container paths are not canonical".into());
+            }
+            if !is_lower_hex(&view.head, 40)
+                || view
+                    .index_sha256
+                    .as_ref()
+                    .is_some_and(|digest| !is_lower_hex(digest, 64))
+            {
+                return Err("attended Git view has an invalid captured digest".into());
+            }
+            if view.object_stores.is_empty() {
+                return Err("attended Git view has no object store".into());
+            }
+            for (index, store) in view.object_stores.iter().enumerate() {
+                validate_absolute_path(&store.identity.canonical_path, "Git object store")?;
+                if store.container_path
+                    != format!("/agent-hub/git/views/{}/objects/{index}", workspace.alias)
+                {
+                    return Err("attended Git object-store path is not canonical".into());
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    pub fn canonical_artifact(&self) -> Result<AttendedAuthorizationArtifact, String> {
+        let normalized = self.clone().normalize()?;
+        let bytes =
+            canonical_json_bytes(serde_json::to_value(normalized).map_err(|e| e.to_string())?)?;
+        Ok(AttendedAuthorizationArtifact {
+            version: ATTENDED_AUTHORIZATION_VERSION_V3,
+            digest: sha256_hex_with_domain(ATTENDED_AUTHORIZATION_DOMAIN_V3, &bytes),
+            canonical_bytes: bytes,
+        })
+    }
+}
+
 fn is_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -679,6 +855,29 @@ impl AttendedAuthorizationArtifact {
             return Err("attended authorization digest mismatch".into());
         }
         let parsed: AttendedAuthorizationRequestV2 = serde_json::from_slice(&self.canonical_bytes)
+            .map_err(|e| format!("invalid attended authorization: {e}"))?;
+        let normalized = parsed.normalize()?;
+        let canonical =
+            canonical_json_bytes(serde_json::to_value(&normalized).map_err(|e| e.to_string())?)?;
+        if canonical != self.canonical_bytes {
+            return Err("attended authorization payload is not canonical".into());
+        }
+        Ok(normalized)
+    }
+
+    pub fn verify_v3(&self) -> Result<AttendedAuthorizationRequestV3, String> {
+        if self.version != ATTENDED_AUTHORIZATION_VERSION_V3 {
+            return Err(format!(
+                "unsupported attended authorization version {}",
+                self.version
+            ));
+        }
+        let expected =
+            sha256_hex_with_domain(ATTENDED_AUTHORIZATION_DOMAIN_V3, &self.canonical_bytes);
+        if self.digest != expected {
+            return Err("attended authorization digest mismatch".into());
+        }
+        let parsed: AttendedAuthorizationRequestV3 = serde_json::from_slice(&self.canonical_bytes)
             .map_err(|e| format!("invalid attended authorization: {e}"))?;
         let normalized = parsed.normalize()?;
         let canonical =
