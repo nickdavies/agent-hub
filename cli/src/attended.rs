@@ -18,11 +18,12 @@ use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use protocol::{
     ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ApprovedExecutionSpec,
-    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV3,
-    AttendedExecutionSpec, AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
-    AuthorizedCredentialProvider, AuthorizedOverlay, CanonicalRuntimeSpec, ExecutionMode,
-    NetworkResourceKind, NetworkResourceRequest, PlannedEnvironmentTier, PromptRef,
-    ResolvedAuthorizationBehavior, ToolApprovalMode, WorkspaceAccess,
+    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV2,
+    AttendedAuthorizationRequestV3, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedOutputContract, AttendedProposal, AuthorizedCredentialProvider, AuthorizedOverlay,
+    CanonicalRuntimeSpec, ExecutionMode, NetworkResourceKind, NetworkResourceRequest,
+    PlannedEnvironmentTier, PromptRef, ResolvedAuthorizationBehavior, ToolApprovalMode,
+    WorkspaceAccess,
     canonical_environment_for_execution, canonical_permissions_for_environment,
     default_approval_rules_for_tier,
 };
@@ -38,6 +39,8 @@ use crate::local::{
 use crate::state::StateStore;
 
 pub const DIPPY_SELECTOR_PREFIX: &str = "agent-hub local authorize";
+pub const RESULT_SCHEMA_V3: &str = "attended_result_v3";
+const CLEANUP_RECEIPT_SCHEMA_V1: &str = "attended_cleanup_receipt_v1";
 const PRIMARY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(70);
 const ATTENDED_CLEANUP_TIMEOUT_SECS: u64 = 150;
 const CANCELLATION_TERMINAL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -137,7 +140,7 @@ pub enum LaunchState {
     Terminal,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryClass {
     Prelaunch,
@@ -159,19 +162,65 @@ pub struct AttemptLineage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionOutcome {
+    #[default]
+    NotApplicable,
     NoDenials,
     Denied,
     Cancelled,
     ReadinessFailed,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessOutcome {
+    #[default]
+    NotStarted,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    OutputLimitExceeded,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOutcome {
+    #[default]
+    NotProduced,
+    Succeeded,
+    Incomplete,
+    Missing,
+    Malformed,
+    Contradictory,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionOutcome {
+    #[default]
+    Pending,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupOutcome {
+    #[default]
+    Pending,
+    Succeeded,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuthorizationRecord {
+    pub authorization_id: String,
     pub artifact: AttendedAuthorizationArtifact,
     pub authorization_path: String,
     pub authorized_at: DateTime<Utc>,
-    pub authorization_id: String,
     pub receipt_id: String,
     pub domain: String,
     pub state: LaunchState,
@@ -188,6 +237,8 @@ pub(crate) struct RevalidatedAuthorization {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunRecord {
+    #[serde(default = "result_schema_v3")]
+    pub schema: String,
     pub id: String,
     pub run_id: String,
     pub attempt_id: String,
@@ -211,7 +262,17 @@ pub struct RunRecord {
     #[serde(default)]
     pub process_status: Option<RunStatus>,
     #[serde(default)]
-    pub permission_outcome: Option<PermissionOutcome>,
+    pub permission_outcome: PermissionOutcome,
+    #[serde(default)]
+    pub process_outcome: ProcessOutcome,
+    #[serde(default)]
+    pub agent_outcome: AgentOutcome,
+    #[serde(default)]
+    pub execution_outcome: ExecutionOutcome,
+    #[serde(default)]
+    pub cleanup_outcome: CleanupOutcome,
+    #[serde(default)]
+    pub agent_final: Option<protocol::AgentResultV1>,
     pub retry_class: Option<RetryClass>,
     pub retry_eligible: bool,
 }
@@ -229,6 +290,10 @@ struct RunOwnerMarker {
     gid: u32,
     mode: String,
     ancestry: Vec<String>,
+}
+
+fn result_schema_v3() -> String {
+    RESULT_SCHEMA_V3.to_string()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -311,6 +376,7 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         "attended prompt must not be empty"
     );
     ensure_unique_resources(&input.network_resources)?;
+    let prompt = prompt_with_result_contract(&input.prompt);
     let config_root = std::fs::canonicalize(&input.config_root)
         .with_context(|| format!("canonicalize config root {}", input.config_root.display()))?;
     let deployment =
@@ -407,10 +473,8 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         &Cancellation::never(),
     )
     .await?;
-    let prompt_digest = protocol::sha256_hex_with_domain(
-        b"agent-hub:attended-prompt:v1\0",
-        input.prompt.as_bytes(),
-    );
+    let prompt_digest =
+        protocol::sha256_hex_with_domain(b"agent-hub:attended-prompt:v1\0", prompt.as_bytes());
     let policy_environment = network_policy_environment(&deployment, &input.network_class)?;
     let behavior = ResolvedAuthorizationBehavior {
         execution_kind: "agent".to_string(),
@@ -420,7 +484,7 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
         env: policy_environment,
         prompt: Some(PromptRef {
             system: None,
-            user: input.prompt.clone(),
+            user: prompt.clone(),
         }),
         primary_repo: None,
         primary_repo_branch: None,
@@ -452,7 +516,7 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             overlays,
             timeout_secs: input.timeout_secs,
             prompt_digest,
-            prompt: input.prompt,
+            prompt,
         },
         execution: AttendedExecutionSpec {
             config_root: path_string(&config_root)?,
@@ -479,6 +543,12 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
     }
     .canonical_artifact()
     .map_err(anyhow::Error::msg)
+}
+
+fn prompt_with_result_contract(prompt: &str) -> String {
+    format!(
+        "{prompt}\n\nYour terminal response MUST be exactly one JSON object matching this schema. Use OpenCode StructuredOutput when available; otherwise emit the object as the final response. Do not wrap it in Markdown. A complete result cannot contain blockers or failed acceptance results.\n{{\"schema\":\"agent_result_v1\",\"complete\":true|false,\"summary\":\"non-empty summary\",\"acceptance_results\":[{{\"criterion\":\"criterion\",\"passed\":true|false,\"evidence\":\"non-empty evidence\"}}],\"blockers\":[\"blocker\"],\"artifact_references\":[{{\"path\":\"path\",\"description\":\"non-empty description\"}}]}}\n"
+    )
 }
 
 pub fn render_proposal(
@@ -789,6 +859,7 @@ pub async fn run(
         ),
     ]);
     let mut record = RunRecord {
+        schema: result_schema_v3(),
         id: id.clone(),
         run_id: run_id.clone(),
         attempt_id: attempt_id.clone(),
@@ -809,7 +880,12 @@ pub async fn run(
         error: None,
         execution_status: None,
         process_status: None,
-        permission_outcome: None,
+        permission_outcome: PermissionOutcome::NotApplicable,
+        process_outcome: ProcessOutcome::NotStarted,
+        agent_outcome: AgentOutcome::NotProduced,
+        execution_outcome: ExecutionOutcome::Pending,
+        cleanup_outcome: CleanupOutcome::Pending,
+        agent_final: None,
         retry_class: None,
         retry_eligible: false,
     };
@@ -1340,6 +1416,10 @@ pub async fn run(
             })
             .await?;
             captured_process_status = Some(run_status_for_execution_status(&process_result.status));
+            record.process_outcome = process_outcome(&process_result.status);
+            if let ExecutionStatus::Exited(code) = process_result.status {
+                record.exit_code = Some(code);
+            }
             Ok(process_result)
         }
         .await;
@@ -1376,6 +1456,19 @@ pub async fn run(
         }
         let execution_outcome = attended_execution_outcome(&operation, run_cancelled);
         captured_execution_outcome = Some(execution_outcome.clone());
+        let parsed_agent = parse_agent_result_from_opencode(&run_dir.join("stdout.log"));
+        record.agent_outcome = parsed_agent.outcome;
+        record.agent_final = parsed_agent.result;
+        if execution_outcome == AttendedExecutionOutcome::Succeeded
+            && record.agent_outcome != AgentOutcome::Succeeded
+        {
+            operation = Err(anyhow::anyhow!(
+                "agent terminal result is {:?}: {}",
+                record.agent_outcome,
+                parsed_agent.error.unwrap_or_else(|| "non-success terminal result".into())
+            ));
+            captured_execution_outcome = Some(AttendedExecutionOutcome::Failed);
+        }
         drop(poll);
         if !run_cancelled {
             relay_cleanup = match &mut attended_relay {
@@ -1544,7 +1637,8 @@ pub async fn run(
         record.execution_status = Some(record.status.clone());
     }
     record.process_status = captured_process_status;
-    record.permission_outcome = captured_permission_outcome;
+    record.permission_outcome =
+        captured_permission_outcome.unwrap_or(PermissionOutcome::NotApplicable);
     let outer_container_cleanup = async {
         let effects = if run_dir.join("effects").exists() {
             Some(agent_hub_executor::ExecutionCancellationContext::new(
@@ -1603,6 +1697,21 @@ pub async fn run(
         });
     }
     let cleanup_complete = cleanup_evidence.complete() && prelaunch_reconciliation.is_ok();
+    record.cleanup_outcome = if cleanup_complete {
+        CleanupOutcome::Succeeded
+    } else {
+        CleanupOutcome::Failed
+    };
+    record.execution_outcome = execution_outcome_from_record(&record);
+    if record.status != RunStatus::CleanupFailed {
+        record.status = match record.execution_outcome {
+            ExecutionOutcome::Pending => record.status,
+            ExecutionOutcome::Succeeded => RunStatus::Succeeded,
+            ExecutionOutcome::Failed => RunStatus::Failed,
+            ExecutionOutcome::Cancelled => RunStatus::Cancelled,
+            ExecutionOutcome::TimedOut => RunStatus::TimedOut,
+        };
+    }
     if cleanup_complete {
         attended_fault("cleanup_complete")?;
     }
@@ -1646,11 +1755,13 @@ pub async fn run(
                 request.output.limits.artifact_bytes,
             )?;
             let artifact_manifest = serde_json::json!({
+                "schema": "attended_artifacts_v1",
                 "stdout": "stdout.log",
                 "stderr": "stderr.log",
                 "transcript": request.output.transcript,
                 "result": request.output.result,
                 "repositories": request.output.repositories,
+                "cleanup": request.output.cleanup,
             });
             write_private_durable_bounded(
                 &artifacts_path,
@@ -1661,8 +1772,9 @@ pub async fn run(
                 request.output.limits.artifact_bytes,
             )?;
             let cleanup_document = serde_json::json!({
-                "status": if cleanup_complete { "complete" } else { "cleanup_failed" },
-                "error": &record.error,
+                "schema": "attended_cleanup_result_v1",
+                "outcome": if cleanup_complete { "succeeded" } else { "failed" },
+                "error": if cleanup_complete { None } else { record.error.as_ref() },
                 "containment": &cleanup_evidence,
             });
             write_private_durable_bounded(
@@ -1834,12 +1946,24 @@ fn relay_endpoint_identity(value: &str, has_token: bool) -> anyhow::Result<Relay
 }
 
 pub fn list(store: &StateStore) -> anyhow::Result<Vec<RunRecord>> {
-    store.list_json(Path::new("executions"))
+    store
+        .list_json(Path::new("executions"))
+        .map(|records| records.into_iter().map(normalize_legacy_record).collect())
 }
 
 pub fn status(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> {
     validate_id(id)?;
-    store.read_json(&run_record_path(id))
+    match store.read_json(&run_record_path(id)) {
+        Ok(record) => Ok(normalize_legacy_record(record)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(read_receipt(store, id)?.payload.record)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn artifact_relative(id: &str, name: &str) -> anyhow::Result<PathBuf> {
@@ -1849,7 +1973,10 @@ fn artifact_relative(id: &str, name: &str) -> anyhow::Result<PathBuf> {
             "stdout.log",
             "stderr.log",
             "transcript.jsonl",
-            "result.json"
+            "result.json",
+            "artifacts.json",
+            "repositories.json",
+            "cleanup.json"
         ]
         .contains(&name),
         "unknown attended artifact"
@@ -1859,11 +1986,71 @@ fn artifact_relative(id: &str, name: &str) -> anyhow::Result<PathBuf> {
 
 #[derive(Debug, Serialize)]
 pub struct BoundedArtifact {
+    pub path: String,
     pub content: String,
     pub limit_bytes: u64,
     pub returned_bytes: u64,
     pub total_bytes: u64,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupReceiptPayload {
+    record: RunRecord,
+    result: serde_json::Value,
+    artifacts: serde_json::Value,
+    repositories: serde_json::Value,
+    cleanup: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupReceipt {
+    schema: String,
+    run_id: String,
+    authorization_digest: String,
+    cleaned_at: DateTime<Utc>,
+    payload: CleanupReceiptPayload,
+    checksum: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ParsedDocument {
+    pub reference: BoundedArtifactReference,
+    pub document: Option<serde_json::Value>,
+    pub parse_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BoundedArtifactReference {
+    pub path: String,
+    pub available: bool,
+    pub limit_bytes: u64,
+    pub returned_bytes: u64,
+    pub total_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalResult {
+    pub schema: &'static str,
+    pub run_id: String,
+    pub agent_final: Option<protocol::AgentResultV1>,
+    pub process_outcome: ProcessOutcome,
+    pub agent_outcome: AgentOutcome,
+    pub execution_outcome: ExecutionOutcome,
+    pub permission_outcome: PermissionOutcome,
+    pub cleanup_outcome: CleanupOutcome,
+    pub exit_code: Option<i32>,
+    pub paths: BTreeMap<String, String>,
+    pub result: ParsedDocument,
+    pub artifacts: ParsedDocument,
+    pub repositories: ParsedDocument,
+    pub cleanup: ParsedDocument,
+    pub stdout: BoundedArtifactReference,
+    pub stderr: BoundedArtifactReference,
+    pub transcript: BoundedArtifactReference,
 }
 
 pub fn read_artifact_bounded(
@@ -1879,6 +2066,7 @@ pub fn read_artifact_bounded(
     let (bytes, total_bytes) = store.read_limited(&artifact_relative(id, name)?, limit_bytes)?;
     let returned_bytes = bytes.len() as u64;
     Ok(BoundedArtifact {
+        path: artifact_path_string(store, id, name)?,
         content: String::from_utf8_lossy(&bytes).into_owned(),
         limit_bytes,
         returned_bytes,
@@ -1887,18 +2075,180 @@ pub fn read_artifact_bounded(
     })
 }
 
+pub fn local_result(store: &StateStore, id: &str, limit_bytes: u64) -> anyhow::Result<LocalResult> {
+    let record = status(store, id)?;
+    let result = read_document_bounded(store, id, "result.json", limit_bytes)?;
+    let artifacts = read_document_bounded(store, id, "artifacts.json", limit_bytes)?;
+    let repositories = read_document_bounded(store, id, "repositories.json", limit_bytes)?;
+    let cleanup = read_document_bounded(store, id, "cleanup.json", limit_bytes)?;
+    let stdout = artifact_reference(store, id, "stdout.log", limit_bytes)?;
+    let stderr = artifact_reference(store, id, "stderr.log", limit_bytes)?;
+    let transcript = artifact_reference(store, id, "transcript.jsonl", limit_bytes)?;
+    let paths = BTreeMap::from([
+        (
+            "run".into(),
+            store
+                .path(&PathBuf::from("runs").join(id))?
+                .display()
+                .to_string(),
+        ),
+        (
+            "receipt".into(),
+            store.path(&receipt_path(id))?.display().to_string(),
+        ),
+        ("result".into(), result.reference.path.clone()),
+        ("artifacts".into(), artifacts.reference.path.clone()),
+        ("repositories".into(), repositories.reference.path.clone()),
+        ("cleanup".into(), cleanup.reference.path.clone()),
+    ]);
+    Ok(LocalResult {
+        schema: "local_result_v1",
+        run_id: id.to_string(),
+        agent_final: record.agent_final.clone(),
+        process_outcome: record.process_outcome.clone(),
+        agent_outcome: record.agent_outcome.clone(),
+        execution_outcome: record.execution_outcome.clone(),
+        permission_outcome: record.permission_outcome.clone(),
+        cleanup_outcome: record.cleanup_outcome.clone(),
+        exit_code: record.exit_code,
+        paths,
+        result,
+        artifacts,
+        repositories,
+        cleanup,
+        stdout,
+        stderr,
+        transcript,
+    })
+}
+
+pub fn read_document_bounded(
+    store: &StateStore,
+    id: &str,
+    name: &str,
+    limit_bytes: u64,
+) -> anyhow::Result<ParsedDocument> {
+    ensure!(
+        (1..=16_777_216).contains(&limit_bytes),
+        "artifact read limit is out of bounds"
+    );
+    ensure!(
+        matches!(
+            name,
+            "result.json" | "artifacts.json" | "repositories.json" | "cleanup.json"
+        ),
+        "unknown attended document"
+    );
+    let run_relative = PathBuf::from("runs").join(id).join(name);
+    let (bytes, total, path) = match store.read_limited(&run_relative, limit_bytes) {
+        Ok((bytes, total)) => (bytes, total, store.path(&run_relative)?),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let receipt = read_receipt(store, id)?;
+            let value = match name {
+                "result.json" => receipt.payload.result,
+                "artifacts.json" => receipt.payload.artifacts,
+                "repositories.json" => receipt.payload.repositories,
+                "cleanup.json" => receipt.payload.cleanup,
+                _ => unreachable!(),
+            };
+            let encoded = serde_json::to_vec_pretty(&value)?;
+            let total = encoded.len() as u64;
+            (
+                encoded.into_iter().take(limit_bytes as usize).collect(),
+                total,
+                store.path(&receipt_path(id))?,
+            )
+        }
+        Err(error) => return Err(error),
+    };
+    let returned = bytes.len() as u64;
+    let truncated = returned < total;
+    let (document, parse_error) = if truncated {
+        (None, Some("document was truncated before parsing".into()))
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(document) => (Some(document), None),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    };
+    Ok(ParsedDocument {
+        reference: BoundedArtifactReference {
+            path: path.display().to_string(),
+            available: true,
+            limit_bytes,
+            returned_bytes: returned,
+            total_bytes: total,
+            truncated,
+        },
+        document,
+        parse_error,
+    })
+}
+
+fn artifact_reference(
+    store: &StateStore,
+    id: &str,
+    name: &str,
+    limit: u64,
+) -> anyhow::Result<BoundedArtifactReference> {
+    let relative = artifact_relative(id, name)?;
+    let path = store.path(&relative)?;
+    match store.read_limited(&relative, limit) {
+        Ok((bytes, total)) => Ok(BoundedArtifactReference {
+            path: path.display().to_string(),
+            available: true,
+            limit_bytes: limit,
+            returned_bytes: bytes.len() as u64,
+            total_bytes: total,
+            truncated: (bytes.len() as u64) < total,
+        }),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(BoundedArtifactReference {
+                path: path.display().to_string(),
+                available: false,
+                limit_bytes: limit,
+                returned_bytes: 0,
+                total_bytes: 0,
+                truncated: false,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn artifact_path_string(store: &StateStore, id: &str, name: &str) -> anyhow::Result<String> {
+    Ok(store
+        .path(&artifact_relative(id, name)?)?
+        .display()
+        .to_string())
+}
+
 pub fn ensure_successful_outcome(record: &RunRecord) -> anyhow::Result<()> {
     ensure!(
-        !matches!(
-            record.status,
-            RunStatus::Failed
-                | RunStatus::Cancelled
-                | RunStatus::TimedOut
-                | RunStatus::CleanupFailed
-        ),
-        "local run {} has non-success outcome {:?}",
+        record.execution_outcome == ExecutionOutcome::Succeeded
+            && record.cleanup_outcome == CleanupOutcome::Succeeded,
+        "local run {} has execution outcome {:?} and cleanup outcome {:?}",
         record.id,
-        record.status
+        record.execution_outcome,
+        record.cleanup_outcome,
+    );
+    Ok(())
+}
+
+pub fn ensure_cleanup_successful(record: &RunRecord) -> anyhow::Result<()> {
+    ensure!(
+        record.cleanup_outcome == CleanupOutcome::Succeeded,
+        "local cleanup {} has outcome {:?}",
+        record.id,
+        record.cleanup_outcome,
     );
     Ok(())
 }
@@ -1967,6 +2317,29 @@ pub async fn cleanup(
     id: &str,
     relay_endpoint: RelayEndpoint,
 ) -> anyhow::Result<RunRecord> {
+    validate_id(id)?;
+    let _lock = store.lock(&PathBuf::from("locks").join(format!("cleanup-{id}.lock")))?;
+    match read_receipt(store, id) {
+        Ok(receipt) => return Ok(receipt.payload.record),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+    let run_dir = store.path(&PathBuf::from("runs").join(id))?;
+    let pending = pending_receipt_path(id);
+    let pending_path = store.path(&pending)?;
+    if pending_path.exists() && !run_dir.exists() {
+        let receipt: CleanupReceipt = store.read_json(&pending)?;
+        verify_receipt(&receipt, id)?;
+        publish_pending_receipt(store, id, &pending_path)?;
+        store.replace_json(&run_record_path(id), &receipt.payload.record)?;
+        return Ok(receipt.payload.record);
+    }
+    if pending_path.exists() {
+        std::fs::remove_file(&pending_path)?;
+    }
     let mut record = status(store, id)?;
     ensure!(
         !matches!(
@@ -1978,13 +2351,9 @@ pub async fn cleanup(
         ),
         "execution cannot be cleaned in its current state"
     );
-    if record.status == RunStatus::Cleaned {
-        return Ok(record);
-    }
     let docker = which::which("docker")?;
-    let run_dir = store.path(&PathBuf::from("runs").join(id))?;
     let owner_marker = owner_marker_for_record(&record);
-    let cleanup_result = recover_owned_run_resources(
+    let containment = recover_owned_run_resources(
         &docker,
         &run_dir,
         id,
@@ -1993,35 +2362,61 @@ pub async fn cleanup(
         Some(&relay_endpoint),
         &owner_marker,
     )
-    .await
-    .and_then(|()| {
-        let parent = run_dir.parent().context("run directory has no parent")?;
-        match std::fs::remove_dir_all(&run_dir) {
-            Ok(()) => File::open(parent)?.sync_all()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Ok(())
-    });
+    .await;
     record.finished_at = Some(Utc::now());
-    match cleanup_result {
-        Ok(()) => {
-            record.status = match record.execution_status.clone() {
-                Some(RunStatus::Succeeded) | None if record.status == RunStatus::Succeeded => {
-                    RunStatus::Cleaned
-                }
-                Some(status) => status,
-                None => RunStatus::Failed,
-            };
-            if matches!(record.status, RunStatus::Succeeded | RunStatus::Cleaned) {
-                record.error = None;
-            }
-        }
-        Err(error) => {
-            record.status = RunStatus::CleanupFailed;
-            record.error = Some(format!("{error:#}"));
-        }
+    if let Err(error) = containment {
+        record.status = RunStatus::CleanupFailed;
+        record.cleanup_outcome = CleanupOutcome::Failed;
+        record.error = Some(format!("{error:#}"));
+        store.replace_json(&run_record_path(id), &record)?;
+        return Ok(record);
     }
+
+    record.status = RunStatus::Cleaned;
+    record.cleanup_outcome = CleanupOutcome::Succeeded;
+    let result_document = serde_json::to_value(&record)?;
+    let artifacts_document = store
+        .read_json::<serde_json::Value>(&PathBuf::from("runs").join(id).join("artifacts.json"))?;
+    let repositories_document = store.read_json::<serde_json::Value>(
+        &PathBuf::from("runs").join(id).join("repositories.json"),
+    )?;
+    let cleanup_document = serde_json::json!({
+        "schema": "attended_cleanup_result_v1",
+        "outcome": "succeeded",
+        "cleaned_at": record.finished_at,
+        "error": null,
+    });
+    let payload = CleanupReceiptPayload {
+        record: record.clone(),
+        result: result_document,
+        artifacts: artifacts_document,
+        repositories: repositories_document,
+        cleanup: cleanup_document,
+    };
+    let receipt = CleanupReceipt {
+        schema: CLEANUP_RECEIPT_SCHEMA_V1.into(),
+        run_id: id.into(),
+        authorization_digest: record.authorization_digest.clone(),
+        cleaned_at: record.finished_at.expect("cleanup finish time is set"),
+        checksum: receipt_checksum(&payload)?,
+        payload,
+    };
+    store.create_json(&pending, &receipt)?;
+    let parent = run_dir.parent().context("run directory has no parent")?;
+    let removal = match std::fs::remove_dir_all(&run_dir) {
+        Ok(()) => File::open(parent)?.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = removal {
+        let _ = std::fs::remove_file(&pending_path);
+        record.status = RunStatus::CleanupFailed;
+        record.cleanup_outcome = CleanupOutcome::Failed;
+        record.error = Some(format!("runtime payload cleanup failed: {error}"));
+        store.replace_json(&run_record_path(id), &record)?;
+        return Ok(record);
+    }
+    publish_pending_receipt(store, id, &pending_path)?;
     store.replace_json(&run_record_path(id), &record)?;
     Ok(record)
 }
@@ -2927,6 +3322,205 @@ fn attended_config_provenance(
 
 struct TemporaryCredentialCleanup(Vec<PathBuf>);
 
+struct ParsedAgentResult {
+    outcome: AgentOutcome,
+    result: Option<protocol::AgentResultV1>,
+    error: Option<String>,
+}
+
+fn parse_agent_result_from_opencode(path: &Path) -> ParsedAgentResult {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ParsedAgentResult {
+                outcome: AgentOutcome::Missing,
+                result: None,
+                error: Some("OpenCode stdout is missing".into()),
+            };
+        }
+        Err(error) => {
+            return ParsedAgentResult {
+                outcome: AgentOutcome::Malformed,
+                result: None,
+                error: Some(format!("read OpenCode stdout: {error}")),
+            };
+        }
+    };
+    let output = match std::str::from_utf8(&bytes) {
+        Ok(output) => output,
+        Err(error) => {
+            return ParsedAgentResult {
+                outcome: AgentOutcome::Malformed,
+                result: None,
+                error: Some(format!("OpenCode stdout is not UTF-8: {error}")),
+            };
+        }
+    };
+    parse_agent_result_events(output)
+}
+
+fn parse_agent_result_events(output: &str) -> ParsedAgentResult {
+    let mut structured = Vec::new();
+    let mut final_text = None;
+    for (index, line) in output.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = match serde_json::from_str(line) {
+            Ok(event) => event,
+            Err(error) => {
+                return ParsedAgentResult {
+                    outcome: AgentOutcome::Malformed,
+                    result: None,
+                    error: Some(format!(
+                        "OpenCode event {} is malformed: {error}",
+                        index + 1
+                    )),
+                };
+            }
+        };
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("tool_use") => {
+                let part = &event["part"];
+                let tool = part.get("tool").and_then(serde_json::Value::as_str);
+                if tool.is_some_and(|tool| {
+                    matches!(
+                        tool,
+                        "StructuredOutput" | "structured_output" | "structuredoutput"
+                    )
+                }) && part["state"]["status"] == "completed"
+                {
+                    structured.push(part["state"]["input"].clone());
+                }
+            }
+            Some("text") => {
+                if let Some(text) = event["part"]["text"].as_str() {
+                    final_text = Some(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let values = if structured.is_empty() {
+        let Some(text) = final_text else {
+            return ParsedAgentResult {
+                outcome: AgentOutcome::Missing,
+                result: None,
+                error: Some("OpenCode emitted no StructuredOutput or final text".into()),
+            };
+        };
+        match serde_json::from_str(&text) {
+            Ok(value) => vec![value],
+            Err(error) => {
+                return ParsedAgentResult {
+                    outcome: AgentOutcome::Malformed,
+                    result: None,
+                    error: Some(format!(
+                        "OpenCode final text is not an AgentResultV1 object: {error}"
+                    )),
+                };
+            }
+        }
+    } else {
+        if let Some(text) = final_text
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            structured.push(value);
+        }
+        structured
+    };
+
+    let mut parsed = Vec::new();
+    for value in values {
+        let result = match serde_json::from_value::<protocol::AgentResultV1>(value) {
+            Ok(result) => result,
+            Err(error) => {
+                return ParsedAgentResult {
+                    outcome: AgentOutcome::Malformed,
+                    result: None,
+                    error: Some(format!("agent terminal envelope is malformed: {error}")),
+                };
+            }
+        };
+        if result.complete
+            && (!result.blockers.is_empty()
+                || result
+                    .acceptance_results
+                    .iter()
+                    .any(|acceptance| !acceptance.passed))
+        {
+            return ParsedAgentResult {
+                outcome: AgentOutcome::Contradictory,
+                result: Some(result),
+                error: Some(
+                    "complete result contains blockers or failed acceptance results".into(),
+                ),
+            };
+        }
+        if let Err(error) = result.validate() {
+            return ParsedAgentResult {
+                outcome: AgentOutcome::Malformed,
+                result: Some(result),
+                error: Some(error),
+            };
+        }
+        parsed.push(result);
+    }
+    let result = parsed.pop().expect("at least one terminal candidate");
+    if parsed.iter().any(|candidate| candidate != &result) {
+        return ParsedAgentResult {
+            outcome: AgentOutcome::Contradictory,
+            result: Some(result),
+            error: Some("OpenCode emitted contradictory terminal envelopes".into()),
+        };
+    }
+    ParsedAgentResult {
+        outcome: if result.complete {
+            AgentOutcome::Succeeded
+        } else {
+            AgentOutcome::Incomplete
+        },
+        result: Some(result),
+        error: None,
+    }
+}
+
+fn process_outcome(status: &ExecutionStatus) -> ProcessOutcome {
+    match status {
+        ExecutionStatus::Exited(0) => ProcessOutcome::Succeeded,
+        ExecutionStatus::Exited(_) => ProcessOutcome::Failed,
+        ExecutionStatus::Cancelled => ProcessOutcome::Cancelled,
+        ExecutionStatus::TimedOut => ProcessOutcome::TimedOut,
+        ExecutionStatus::OutputLimitExceeded => ProcessOutcome::OutputLimitExceeded,
+    }
+}
+
+fn execution_outcome_from_record(record: &RunRecord) -> ExecutionOutcome {
+    match record.process_outcome {
+        _ if record.permission_outcome == PermissionOutcome::Cancelled => {
+            ExecutionOutcome::Cancelled
+        }
+        ProcessOutcome::Cancelled => ExecutionOutcome::Cancelled,
+        ProcessOutcome::TimedOut => ExecutionOutcome::TimedOut,
+        ProcessOutcome::Succeeded
+            if record.agent_outcome == AgentOutcome::Succeeded
+                && !matches!(
+                    record.permission_outcome,
+                    PermissionOutcome::Denied
+                        | PermissionOutcome::Cancelled
+                        | PermissionOutcome::ReadinessFailed
+                ) =>
+        {
+            ExecutionOutcome::Succeeded
+        }
+        ProcessOutcome::NotStarted if record.status == RunStatus::Cancelled => {
+            ExecutionOutcome::Cancelled
+        }
+        _ => ExecutionOutcome::Failed,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttendedExecutionOutcome {
     Succeeded,
@@ -3608,6 +4202,99 @@ fn lock_path(digest: &str) -> PathBuf {
 
 fn run_record_path(id: &str) -> PathBuf {
     PathBuf::from("executions").join(format!("{id}.json"))
+}
+
+fn receipt_path(id: &str) -> PathBuf {
+    PathBuf::from("receipts").join(format!("{id}.json"))
+}
+
+fn pending_receipt_path(id: &str) -> PathBuf {
+    PathBuf::from("receipts").join(format!(".{id}.pending.json"))
+}
+
+fn normalize_legacy_record(mut record: RunRecord) -> RunRecord {
+    record.schema = result_schema_v3();
+    if record.process_outcome == ProcessOutcome::NotStarted {
+        record.process_outcome = match record.process_status.as_ref() {
+            Some(RunStatus::Succeeded) => ProcessOutcome::Succeeded,
+            Some(RunStatus::Cancelled) => ProcessOutcome::Cancelled,
+            Some(RunStatus::TimedOut) => ProcessOutcome::TimedOut,
+            Some(RunStatus::Failed | RunStatus::CleanupFailed) => ProcessOutcome::Failed,
+            _ => ProcessOutcome::NotStarted,
+        };
+    }
+    if record.execution_outcome == ExecutionOutcome::Pending
+        && !matches!(
+            record.status,
+            RunStatus::Preparing
+                | RunStatus::LaunchPending
+                | RunStatus::Consumed
+                | RunStatus::Running
+        )
+    {
+        record.execution_outcome = match record.execution_status.as_ref().unwrap_or(&record.status)
+        {
+            RunStatus::Succeeded | RunStatus::Cleaned => ExecutionOutcome::Succeeded,
+            RunStatus::Cancelled => ExecutionOutcome::Cancelled,
+            RunStatus::TimedOut => ExecutionOutcome::TimedOut,
+            _ => ExecutionOutcome::Failed,
+        };
+    }
+    if record.cleanup_outcome == CleanupOutcome::Pending {
+        record.cleanup_outcome = match record.status {
+            RunStatus::CleanupFailed => CleanupOutcome::Failed,
+            RunStatus::Succeeded
+            | RunStatus::Failed
+            | RunStatus::Cancelled
+            | RunStatus::TimedOut
+            | RunStatus::Cleaned => CleanupOutcome::Succeeded,
+            _ => CleanupOutcome::Pending,
+        };
+    }
+    record
+}
+
+fn receipt_checksum(payload: &CleanupReceiptPayload) -> anyhow::Result<String> {
+    Ok(protocol::sha256_hex_with_domain(
+        b"agent-hub:attended-cleanup-receipt:v1\0",
+        &serde_json::to_vec(payload)?,
+    ))
+}
+
+fn read_receipt(store: &StateStore, id: &str) -> anyhow::Result<CleanupReceipt> {
+    let receipt: CleanupReceipt = store.read_json(&receipt_path(id))?;
+    verify_receipt(&receipt, id)?;
+    Ok(receipt)
+}
+
+fn verify_receipt(receipt: &CleanupReceipt, id: &str) -> anyhow::Result<()> {
+    ensure!(
+        receipt.schema == CLEANUP_RECEIPT_SCHEMA_V1,
+        "unsupported cleanup receipt schema"
+    );
+    ensure!(receipt.run_id == id, "cleanup receipt run ID mismatch");
+    ensure!(
+        receipt.authorization_digest == receipt.payload.record.authorization_digest,
+        "cleanup receipt authorization mismatch"
+    );
+    ensure!(
+        receipt.checksum == receipt_checksum(&receipt.payload)?,
+        "cleanup receipt checksum mismatch"
+    );
+    Ok(())
+}
+
+fn publish_pending_receipt(
+    store: &StateStore,
+    id: &str,
+    pending_path: &Path,
+) -> anyhow::Result<()> {
+    let receipt_path = store.path(&receipt_path(id))?;
+    std::fs::hard_link(pending_path, &receipt_path)
+        .with_context(|| format!("publish immutable cleanup receipt for {id}"))?;
+    std::fs::remove_file(pending_path)?;
+    File::open(receipt_path.parent().context("receipt has no parent")?)?.sync_all()?;
+    Ok(())
 }
 fn cancel_path(id: &str) -> PathBuf {
     PathBuf::from("cancellations").join(format!("{id}.json"))
@@ -5163,5 +5850,170 @@ grep -qx 'ready\|ready\.' real-llm.log
         )
         .unwrap_err();
         assert!(cleanup.downcast_ref::<FinalizationError>().is_some());
+    }
+
+    fn terminal_event(result: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "text",
+            "part": {
+                "text": serde_json::to_string(&result).unwrap()
+            }
+        })
+        .to_string()
+    }
+
+    fn complete_agent_result() -> serde_json::Value {
+        serde_json::json!({
+            "schema": "agent_result_v1",
+            "complete": true,
+            "summary": "done",
+            "acceptance_results": [{"criterion":"tests", "passed":true, "evidence":"passed"}],
+            "blockers": [],
+            "artifact_references": [{"path":"result.json", "description":"result"}]
+        })
+    }
+
+    #[test]
+    fn exit_zero_requires_complete_agent_terminal_envelope() {
+        let complete = super::parse_agent_result_events(&terminal_event(complete_agent_result()));
+        assert_eq!(complete.outcome, super::AgentOutcome::Succeeded);
+
+        let mut incomplete = complete_agent_result();
+        incomplete["complete"] = serde_json::json!(false);
+        assert_eq!(
+            super::parse_agent_result_events(&terminal_event(incomplete)).outcome,
+            super::AgentOutcome::Incomplete
+        );
+        assert_eq!(
+            super::parse_agent_result_events("").outcome,
+            super::AgentOutcome::Missing
+        );
+        assert_eq!(
+            super::parse_agent_result_events("not-json").outcome,
+            super::AgentOutcome::Malformed
+        );
+        let mut contradictory = complete_agent_result();
+        contradictory["blockers"] = serde_json::json!(["blocked"]);
+        assert_eq!(
+            super::parse_agent_result_events(&terminal_event(contradictory)).outcome,
+            super::AgentOutcome::Contradictory
+        );
+    }
+
+    #[test]
+    fn opencode_1_18_18_structured_result_fixture_is_accepted() {
+        let output = include_str!("../tests/fixtures/opencode-1.18.18-structured-result.jsonl");
+        let parsed = super::parse_agent_result_events(output);
+        assert_eq!(parsed.outcome, super::AgentOutcome::Succeeded);
+        assert_eq!(
+            parsed.result.unwrap().summary,
+            "Implemented and verified the requested lifecycle."
+        );
+    }
+
+    fn terminal_record() -> RunRecord {
+        RunRecord {
+            schema: super::result_schema_v3(),
+            id: "a".repeat(24),
+            authorization_digest: "a".repeat(64),
+            status: RunStatus::Succeeded,
+            container_name: "container".into(),
+            ownership: BTreeMap::new(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            exit_code: Some(0),
+            error: None,
+            execution_status: Some(RunStatus::Succeeded),
+            process_status: Some(RunStatus::Succeeded),
+            permission_outcome: super::PermissionOutcome::NoDenials,
+            process_outcome: super::ProcessOutcome::Succeeded,
+            agent_outcome: super::AgentOutcome::Succeeded,
+            execution_outcome: super::ExecutionOutcome::Succeeded,
+            cleanup_outcome: super::CleanupOutcome::Succeeded,
+            agent_final: serde_json::from_value(complete_agent_result()).ok(),
+        }
+    }
+
+    #[test]
+    fn execution_and_cleanup_outcomes_are_independent_and_typed() {
+        let mut record = terminal_record();
+        for (process, expected) in [
+            (
+                super::ProcessOutcome::Cancelled,
+                super::ExecutionOutcome::Cancelled,
+            ),
+            (
+                super::ProcessOutcome::TimedOut,
+                super::ExecutionOutcome::TimedOut,
+            ),
+        ] {
+            record.process_outcome = process;
+            assert_eq!(super::execution_outcome_from_record(&record), expected);
+        }
+        record = terminal_record();
+        record.permission_outcome = super::PermissionOutcome::Denied;
+        assert_eq!(
+            super::execution_outcome_from_record(&record),
+            super::ExecutionOutcome::Failed
+        );
+        record.permission_outcome = super::PermissionOutcome::Cancelled;
+        assert_eq!(
+            super::execution_outcome_from_record(&record),
+            super::ExecutionOutcome::Cancelled
+        );
+
+        record = terminal_record();
+        record.execution_outcome = super::ExecutionOutcome::Failed;
+        assert!(super::ensure_successful_outcome(&record).is_err());
+        assert!(super::ensure_cleanup_successful(&record).is_ok());
+        record.execution_outcome = super::ExecutionOutcome::Succeeded;
+        record.cleanup_outcome = super::CleanupOutcome::Failed;
+        assert!(super::ensure_successful_outcome(&record).is_err());
+        assert!(super::ensure_cleanup_successful(&record).is_err());
+    }
+
+    #[test]
+    fn retained_receipt_is_private_bounded_and_readable_without_runtime_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-retained-receipt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = StateStore::open(root.clone()).unwrap();
+        let record = terminal_record();
+        let payload = super::CleanupReceiptPayload {
+            record: record.clone(),
+            result: serde_json::to_value(&record).unwrap(),
+            artifacts: serde_json::json!({"schema":"attended_artifacts_v1"}),
+            repositories: serde_json::json!([]),
+            cleanup: serde_json::json!({"schema":"attended_cleanup_result_v1","outcome":"succeeded"}),
+        };
+        let receipt = super::CleanupReceipt {
+            schema: super::CLEANUP_RECEIPT_SCHEMA_V1.into(),
+            run_id: record.id.clone(),
+            authorization_digest: record.authorization_digest.clone(),
+            cleaned_at: Utc::now(),
+            checksum: super::receipt_checksum(&payload).unwrap(),
+            payload,
+        };
+        store
+            .create_json(&super::receipt_path(&record.id), &receipt)
+            .unwrap();
+        let result = super::local_result(&store, &record.id, 64).unwrap();
+        assert!(result.result.reference.truncated);
+        assert!(!result.stdout.available);
+        assert_eq!(
+            super::status(&store, &record.id).unwrap().exit_code,
+            Some(0)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(store.path(&super::receipt_path(&record.id)).unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

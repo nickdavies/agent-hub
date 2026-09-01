@@ -1347,7 +1347,7 @@ fn default_managed_agent_runner() -> ManagedRunnerSpec {
         command: "/usr/bin/sh".to_string(),
         args: vec![
             "-lc".to_string(),
-            "if [ -f \"$AGENT_PROMPT_USER_PATH\" ]; then /usr/local/bin/opencode run < \"$AGENT_PROMPT_USER_PATH\"; else /usr/local/bin/opencode run; fi".to_string(),
+            "if [ -f \"$AGENT_PROMPT_USER_PATH\" ]; then /usr/local/bin/opencode run --format json < \"$AGENT_PROMPT_USER_PATH\"; else /usr/local/bin/opencode run --format json; fi".to_string(),
         ],
         container_image: None,
         file_mounts: Vec::new(),

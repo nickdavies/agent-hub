@@ -207,6 +207,27 @@ enum LocalCommand {
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
         limit_bytes: u64,
     },
+    /// Print the bounded artifact manifest
+    Artifacts {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
+        limit_bytes: u64,
+    },
+    /// Print the bounded repository result document
+    Repositories {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
+        limit_bytes: u64,
+    },
+    /// Print the bounded cleanup result document
+    CleanupResult {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
+        limit_bytes: u64,
+    },
     /// Cancel an owned running execution
     Cancel {
         #[arg(long)]
@@ -345,7 +366,7 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             authorization,
             digest,
         } => {
-            local_authorize::authorize(
+            let receipt = local_authorize::authorize(
                 &state_store()?,
                 &authorization,
                 AuthorizationSelectors {
@@ -360,6 +381,7 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
                 },
             )
             .await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
         LocalCommand::List => {
             println!(
@@ -397,17 +419,64 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             run_id,
             limit_bytes,
         } => {
-            let record = attended::status(&state_store()?, &run_id)?;
+            let store = state_store()?;
+            let record = attended::status(&store, &run_id)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&attended::read_artifact_bounded(
-                    &state_store()?,
+                serde_json::to_string_pretty(&attended::local_result(
+                    &store,
                     &run_id,
-                    "result.json",
                     limit_bytes
                 )?)?
             );
             attended::ensure_successful_outcome(&record)?;
+        }
+        LocalCommand::Artifacts {
+            run_id,
+            limit_bytes,
+        } => {
+            let store = state_store()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&attended::read_document_bounded(
+                    &store,
+                    &run_id,
+                    "artifacts.json",
+                    limit_bytes
+                )?)?
+            );
+        }
+        LocalCommand::Repositories {
+            run_id,
+            limit_bytes,
+        } => {
+            let store = state_store()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&attended::read_document_bounded(
+                    &store,
+                    &run_id,
+                    "repositories.json",
+                    limit_bytes
+                )?)?
+            );
+        }
+        LocalCommand::CleanupResult {
+            run_id,
+            limit_bytes,
+        } => {
+            let store = state_store()?;
+            let record = attended::status(&store, &run_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&attended::read_document_bounded(
+                    &store,
+                    &run_id,
+                    "cleanup.json",
+                    limit_bytes
+                )?)?
+            );
+            attended::ensure_cleanup_successful(&record)?;
         }
         LocalCommand::Cancel { run_id } => {
             attended::cancel(&state_store()?, &run_id).await?;
@@ -430,7 +499,7 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&record)?);
-            attended::ensure_successful_outcome(&record)?;
+            attended::ensure_cleanup_successful(&record)?;
         }
     }
     Ok(())
@@ -710,5 +779,21 @@ mod attended_cli_tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["agent-hub", "local", "authorize", "--help"]).is_err());
+    }
+
+    #[test]
+    fn result_document_commands_have_stable_cli_shapes() {
+        for command in ["result", "artifacts", "repositories", "cleanup-result"] {
+            let parsed = Cli::try_parse_from([
+                "agent-hub",
+                "local",
+                command,
+                "--run-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                "--limit-bytes",
+                "4096",
+            ]);
+            assert!(parsed.is_ok(), "failed to parse local {command}");
+        }
     }
 }

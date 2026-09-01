@@ -28,17 +28,18 @@ pub use approval::{
     ExtraContext, HookEventName, KnownHookEvent, RequestType,
 };
 pub use attended::{
-    APPROVAL_BUNDLE_PROTOCOL, APPROVED_EXECUTION_PIDS_LIMIT,
+    AGENT_RESULT_V1_SCHEMA, APPROVAL_BUNDLE_PROTOCOL, APPROVED_EXECUTION_PIDS_LIMIT,
     ATTENDED_AUTHORIZATION_REQUEST_VERSION, ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2,
     ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ATTENDED_AUTHORIZATION_VERSION,
     ATTENDED_AUTHORIZATION_VERSION_V2, ATTENDED_AUTHORIZATION_VERSION_V3, ApprovedExecutionSpec,
-    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1,
-    AttendedAuthorizationRequestV2, AttendedAuthorizationRequestV3, AttendedExecutionSpec,
-    AttendedLifecycleContract, AttendedOutputContract, AttendedOutputLimits, AttendedProposal,
-    AuthorizedCredentialProvider, AuthorizedOverlay, ContextRootSpec, GitObjectStoreSpec,
-    GitRepositoryType, GitViewSpec, HostDirectoryIdentity, RepositoryMountSpec, RepositoryState,
-    ToolApprovalMode, WorkspaceAccess, WorkspaceSpec, canonical_context_root_path,
-    is_canonical_context_root_path, sha256_hex, sha256_hex_with_domain,
+    AgentAcceptanceResult, AgentArtifactReference, AgentResultV1, AttendedApprovalBundleIdentity,
+    AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1, AttendedAuthorizationRequestV2,
+    AttendedAuthorizationRequestV3, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedOutputContract, AttendedOutputLimits, AttendedProposal, AuthorizedCredentialProvider,
+    AuthorizedOverlay, ContextRootSpec, GitObjectStoreSpec, GitRepositoryType, GitViewSpec,
+    HostDirectoryIdentity, RepositoryMountSpec, RepositoryState, ToolApprovalMode, WorkspaceAccess,
+    WorkspaceSpec, canonical_context_root_path, is_canonical_context_root_path, sha256_hex,
+    sha256_hex_with_domain,
 };
 pub use attended_gateway::{
     ATTENDED_GATEWAY_ACK_VERSION, ATTENDED_GATEWAY_DECISION_VERSION,

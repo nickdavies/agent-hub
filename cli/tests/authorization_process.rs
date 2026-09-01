@@ -104,6 +104,20 @@ fn authorization_retries_preflight_and_fences_concurrent_attempts() {
         None,
     );
     assert_success(&authorize);
+    let receipt: serde_json::Value = serde_json::from_slice(&authorize.stdout).unwrap();
+    assert_eq!(receipt["schema"], "attended_authorization_receipt_v1");
+    assert_eq!(receipt["digest"], digest);
+    assert_eq!(receipt["retry_eligible"], true);
+    assert!(
+        receipt["authorization_id"]
+            .as_str()
+            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+    );
+    assert!(
+        receipt["canonical_run_command"]
+            .as_str()
+            .is_some_and(|command| command == format!("agent-hub {}", run_args.join(" ")))
+    );
     std::fs::remove_file(&docker_marker).unwrap();
 
     std::fs::write(root.join("fail-preflight-once"), "fail").unwrap();
@@ -271,16 +285,31 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
     );
     let report_path = root.join("preflight.json");
     std::fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+    let result_event = serde_json::json!({
+        "type": "text",
+        "part": {
+            "text": serde_json::json!({
+                "schema": "agent_result_v1",
+                "complete": true,
+                "summary": "executed",
+                "acceptance_results": [],
+                "blockers": [],
+                "artifact_references": []
+            }).to_string()
+        }
+    })
+    .to_string();
     std::fs::write(
         path,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then sleep 1; fi; printf 'executed\\n' ;; esac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then sleep 1; fi; printf '%s\\n' '{}' ;; esac\n",
             marker.display(),
             "a".repeat(64),
             root.join("fail-preflight-once").display(),
             root.join("fail-preflight-once").display(),
             report_path.display(),
             root.join("slow-launch").display(),
+            result_event,
         ),
     )
     .unwrap();

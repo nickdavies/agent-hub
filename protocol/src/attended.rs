@@ -18,6 +18,7 @@ pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3: &str = "attended_authorizat
 pub const ATTENDED_AUTHORIZATION_VERSION_V3: u32 = 3;
 pub const APPROVAL_BUNDLE_PROTOCOL: &str = "attended_approval_bundle_v1";
 pub const APPROVED_EXECUTION_PIDS_LIMIT: u32 = 512;
+pub const AGENT_RESULT_V1_SCHEMA: &str = "agent_result_v1";
 const ATTENDED_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:attended-authorization:v1\0";
 const ATTENDED_AUTHORIZATION_DOMAIN_V2: &[u8] = b"agent-hub:attended-authorization:v2\0";
 const ATTENDED_AUTHORIZATION_DOMAIN_V3: &[u8] = b"agent-hub:attended-authorization:v3\0";
@@ -322,6 +323,71 @@ pub struct AttendedRetryConstraints {
     pub max_attempts: u32,
     pub max_prelaunch_retries: u32,
     pub max_provider_unavailable_retries: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResultV1 {
+    pub schema: String,
+    pub complete: bool,
+    pub summary: String,
+    pub acceptance_results: Vec<AgentAcceptanceResult>,
+    pub blockers: Vec<String>,
+    pub artifact_references: Vec<AgentArtifactReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentAcceptanceResult {
+    pub criterion: String,
+    pub passed: bool,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentArtifactReference {
+    pub path: String,
+    pub description: String,
+}
+
+impl AgentResultV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != AGENT_RESULT_V1_SCHEMA {
+            return Err(format!("unsupported agent result schema {}", self.schema));
+        }
+        if self.summary.trim().is_empty() {
+            return Err("agent result summary must not be empty".into());
+        }
+        if self
+            .acceptance_results
+            .iter()
+            .any(|result| result.criterion.trim().is_empty() || result.evidence.trim().is_empty())
+        {
+            return Err("agent acceptance results require criterion and evidence".into());
+        }
+        if self
+            .blockers
+            .iter()
+            .any(|blocker| blocker.trim().is_empty())
+        {
+            return Err("agent result blockers must not be empty strings".into());
+        }
+        if self.artifact_references.iter().any(|reference| {
+            reference.path.trim().is_empty() || reference.description.trim().is_empty()
+        }) {
+            return Err("agent artifact references require path and description".into());
+        }
+        if self.complete
+            && (!self.blockers.is_empty()
+                || self.acceptance_results.iter().any(|result| !result.passed))
+        {
+            return Err(
+                "complete agent result contradicts blockers or failed acceptance results".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for AttendedLifecycleContract {
