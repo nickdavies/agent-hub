@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -37,6 +37,8 @@ pub struct RequestedContextRoot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedMounts {
     pub roots: Vec<ResolvedRoot>,
+    pub workspace_root_identities: BTreeMap<String, String>,
+    pub context_root_identities: BTreeMap<String, String>,
     pub workspaces: Vec<WorkspaceSpec>,
     pub context_roots: Vec<ContextRootSpec>,
     pub repositories: Vec<RepositoryMountSpec>,
@@ -155,6 +157,7 @@ pub fn resolve_mounts(
     let mut workspaces = Vec::new();
     let mut repositories = Vec::new();
     let mut git_views = Vec::new();
+    let mut workspace_root_identities = BTreeMap::new();
     for requested in requested_workspaces {
         validate_alias(&requested.alias)?;
         ensure!(
@@ -171,12 +174,12 @@ pub fn resolve_mounts(
         hosts.push(host.clone());
         let container_path = format!("/workspace/{}", requested.alias);
         workspaces.push(WorkspaceSpec {
-            root_identity: root.identity.clone(),
             alias: requested.alias.clone(),
             host_path: path_string(&host)?,
             container_path: container_path.clone(),
             access: requested.access,
         });
+        workspace_root_identities.insert(requested.alias.clone(), root.identity.clone());
         let git_view = crate::git_view::inspect_git_view(
             &requested.alias,
             &host,
@@ -216,6 +219,7 @@ pub fn resolve_mounts(
         primary_workspace
     );
     let mut context_roots = Vec::new();
+    let mut context_root_identities = BTreeMap::new();
     for requested in requested_contexts {
         ensure!(
             requested.access == WorkspaceAccess::ReadOnly,
@@ -231,11 +235,11 @@ pub fn resolve_mounts(
         reject_host_overlap(&hosts, &host)?;
         hosts.push(host.clone());
         context_roots.push(ContextRootSpec {
-            root_identity: root.identity.clone(),
             alias: requested.alias.clone(),
             host_path: path_string(&host)?,
             container_path: format!("/context/{}", requested.alias),
         });
+        context_root_identities.insert(requested.alias.clone(), root.identity.clone());
     }
     workspaces.sort();
     context_roots.sort();
@@ -247,10 +251,10 @@ pub fn resolve_mounts(
         .filter(|root| {
             workspaces
                 .iter()
-                .any(|mount| mount.root_identity == root.identity)
+                .any(|mount| workspace_root_identities[&mount.alias] == root.identity)
                 || context_roots
                     .iter()
-                    .any(|mount| mount.root_identity == root.identity)
+                    .any(|mount| context_root_identities[&mount.alias] == root.identity)
         })
         .map(|root| ResolvedRoot {
             identity: root.identity.clone(),
@@ -261,6 +265,8 @@ pub fn resolve_mounts(
     resolved_roots.sort();
     Ok(ResolvedMounts {
         roots: resolved_roots,
+        workspace_root_identities,
+        context_root_identities,
         workspaces,
         context_roots,
         repositories,

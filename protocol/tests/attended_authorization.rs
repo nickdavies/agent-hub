@@ -93,32 +93,14 @@ fn request() -> AttendedAuthorizationRequestV1 {
             },
             credential_providers: vec![],
             overlays: vec![],
-            roots: vec![
-                ResolvedRoot {
-                    identity: "work".into(),
-                    host_path: "/work".into(),
-                    roles: vec![
-                        RootRole::WorkspaceRo,
-                        RootRole::WorkspaceRw,
-                        RootRole::GitMetadata,
-                    ],
-                },
-                ResolvedRoot {
-                    identity: "code".into(),
-                    host_path: "/home/nick.davies/code".into(),
-                    roles: vec![RootRole::ContextRo],
-                },
-            ],
             workspaces: vec![
                 WorkspaceSpec {
-                    root_identity: "work".into(),
                     alias: "zeta".into(),
                     host_path: "/work/zeta".into(),
                     container_path: "/workspace/zeta".into(),
                     access: WorkspaceAccess::ReadWrite,
                 },
                 WorkspaceSpec {
-                    root_identity: "work".into(),
                     alias: "alpha".into(),
                     host_path: "/work/alpha".into(),
                     container_path: "/workspace/alpha".into(),
@@ -126,7 +108,6 @@ fn request() -> AttendedAuthorizationRequestV1 {
                 },
             ],
             context_roots: vec![ContextRootSpec {
-                root_identity: "code".into(),
                 alias: "code".into(),
                 host_path: "/home/nick.davies/code".into(),
                 container_path: "/context/code".into(),
@@ -207,10 +188,13 @@ fn with_github_overlay(
 
 #[test]
 fn github_credentials_require_matching_network_and_host() {
-    let without_network = with_github_overlay(request());
-    assert!(without_network.normalize().is_err());
+    let github = with_github_overlay(request());
+    let mut without_network = request_v3();
+    without_network.proposal = github.proposal;
+    without_network.execution = github.execution;
+    assert!(without_network.clone().normalize().is_err());
 
-    let mut host_mismatch = with_github_overlay(request());
+    let mut host_mismatch = without_network;
     host_mismatch
         .proposal
         .network_resources
@@ -299,11 +283,37 @@ fn request_v3() -> protocol::AttendedAuthorizationRequestV3 {
         version: protocol::ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3.into(),
         proposal: request.proposal,
         execution: request.execution,
+        roots: vec![
+            ResolvedRoot {
+                identity: "work".into(),
+                host_path: "/work".into(),
+                roles: vec![
+                    RootRole::WorkspaceRo,
+                    RootRole::WorkspaceRw,
+                    RootRole::GitMetadata,
+                ],
+            },
+            ResolvedRoot {
+                identity: "code".into(),
+                host_path: "/home/nick.davies/code".into(),
+                roles: vec![RootRole::ContextRo],
+            },
+        ],
+        workspace_root_identities: BTreeMap::from([
+            ("alpha".into(), "work".into()),
+            ("zeta".into(), "work".into()),
+        ]),
+        context_root_identities: BTreeMap::from([("code".into(), "code".into())]),
         git_views,
         approval_bundle_digest: request.approval_bundle_digest,
         approval_bundle: request.approval_bundle,
         output: request.output,
         lifecycle: request.lifecycle,
+        retry: protocol::AttendedRetryConstraints {
+            max_attempts: 3,
+            max_prelaunch_retries: 2,
+            max_provider_unavailable_retries: 1,
+        },
     }
 }
 
@@ -330,17 +340,14 @@ fn canonicalization_normalizes_set_order_and_has_attended_domain() {
 
 #[test]
 fn reviewed_retry_constraints_are_canonical_capability_bytes() {
-    let artifact = request_v2().canonical_artifact().unwrap();
+    let artifact = request_v3().canonical_artifact().unwrap();
     let value: serde_json::Value = serde_json::from_slice(&artifact.canonical_bytes).unwrap();
-    assert_eq!(value["lifecycle"]["retry"]["max_attempts"], 3);
-    assert_eq!(value["lifecycle"]["retry"]["max_prelaunch_retries"], 2);
-    assert_eq!(
-        value["lifecycle"]["retry"]["max_provider_unavailable_retries"],
-        1
-    );
+    assert_eq!(value["retry"]["max_attempts"], 3);
+    assert_eq!(value["retry"]["max_prelaunch_retries"], 2);
+    assert_eq!(value["retry"]["max_provider_unavailable_retries"], 1);
 
-    let mut changed = request_v2();
-    changed.lifecycle.retry.max_attempts = 4;
+    let mut changed = request_v3();
+    changed.retry.max_attempts = 4;
     assert!(changed.canonical_artifact().is_err());
 }
 
@@ -450,6 +457,20 @@ fn attended_v3_binds_isolated_git_views_without_accepting_v1_or_v2_domains() {
     let mut changed = request_v3();
     changed.git_views[0].index_sha256 = Some("3".repeat(64));
     assert_ne!(changed.canonical_artifact().unwrap().digest, v3.digest);
+
+    let mut registry_context = request_v3();
+    registry_context.execution.context_roots[0].host_path = "/reference/code".into();
+    registry_context
+        .roots
+        .iter_mut()
+        .find(|root| root.identity == "code")
+        .unwrap()
+        .host_path = "/reference".into();
+    assert!(registry_context.canonical_artifact().is_ok());
+
+    let mut legacy_context = request_v2();
+    legacy_context.execution.context_roots[0].host_path = "/reference/code".into();
+    assert!(legacy_context.canonical_artifact().is_err());
 }
 
 #[test]

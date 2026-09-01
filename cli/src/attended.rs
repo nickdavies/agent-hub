@@ -19,11 +19,10 @@ use chrono::{DateTime, Utc};
 use protocol::{
     ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ApprovedExecutionSpec,
     AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV3,
-    AttendedExecutionSpec, AttendedLifecycleContract,
-    AttendedOutputContract, AttendedProposal, AuthorizedCredentialProvider, AuthorizedOverlay,
-    CanonicalRuntimeSpec, ExecutionMode, NetworkResourceKind, NetworkResourceRequest,
-    PlannedEnvironmentTier, PromptRef, ResolvedAuthorizationBehavior, ToolApprovalMode,
-    WorkspaceAccess,
+    AttendedExecutionSpec, AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
+    AuthorizedCredentialProvider, AuthorizedOverlay, CanonicalRuntimeSpec, ExecutionMode,
+    NetworkResourceKind, NetworkResourceRequest, PlannedEnvironmentTier, PromptRef,
+    ResolvedAuthorizationBehavior, ToolApprovalMode, WorkspaceAccess,
     canonical_environment_for_execution, canonical_permissions_for_environment,
     default_approval_rules_for_tier,
 };
@@ -531,17 +530,24 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
             },
             credential_providers,
             overlays: overlay_descriptors,
-            roots: mounts.roots,
             workspaces: mounts.workspaces,
             context_roots: mounts.context_roots,
             repositories: mounts.repositories,
             primary_workspace: mounts.primary_workspace,
         },
+        roots: mounts.roots,
+        workspace_root_identities: mounts.workspace_root_identities,
+        context_root_identities: mounts.context_root_identities,
         git_views: mounts.git_views,
         approval_bundle_digest,
         approval_bundle,
         output: AttendedOutputContract::default(),
         lifecycle: AttendedLifecycleContract::default(),
+        retry: protocol::AttendedRetryConstraints {
+            max_attempts: 3,
+            max_prelaunch_retries: 2,
+            max_provider_unavailable_retries: 1,
+        },
     }
     .canonical_artifact()
     .map_err(anyhow::Error::msg)
@@ -594,8 +600,25 @@ pub fn render_proposal(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let root_capabilities = request
+        .roots
+        .iter()
+        .map(|root| {
+            format!(
+                "{}: {} ({})",
+                root.identity,
+                root.host_path,
+                root.roles
+                    .iter()
+                    .map(|role| format!("{role:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(format!(
-        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nOverlay bindings: {}\nTimeout seconds: {}\nGit capability:\n{}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
+        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nOverlay bindings: {}\nTimeout seconds: {}\nRoot capabilities:\n{}\nWorkspace root identities: {}\nContext root identities: {}\nGit capability:\n{}\nRetry limits: attempts={}, prelaunch={}, provider-unavailable={}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
         request.proposal.environment,
         request.proposal.image_family,
         request.proposal.image_tag,
@@ -613,7 +636,23 @@ pub fn render_proposal(
             .collect::<Vec<_>>()
             .join(","),
         request.proposal.timeout_secs,
+        root_capabilities,
+        request
+            .workspace_root_identities
+            .iter()
+            .map(|(alias, identity)| format!("{alias}={identity}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        request
+            .context_root_identities
+            .iter()
+            .map(|(alias, identity)| format!("{alias}={identity}"))
+            .collect::<Vec<_>>()
+            .join(","),
         git_capabilities,
+        request.retry.max_attempts,
+        request.retry.max_prelaunch_retries,
+        request.retry.max_provider_unavailable_retries,
         request.proposal.prompt_digest,
         request.proposal.prompt,
         artifact.digest,
@@ -799,7 +838,7 @@ pub async fn run(
         store.replace_json(&authorized_path, &authorized)?;
         ensure!(prelaunch, "attended authorization was consumed fail-closed");
     }
-    let retry = &request.lifecycle.retry;
+    let retry = &request.retry;
     ensure!(
         authorized.attempts.len() < retry.max_attempts as usize,
         "attended authorization exhausted its reviewed attempt limit"
@@ -1183,18 +1222,7 @@ pub async fn run(
                 "trusted OpenCode environment conflicts with authorized variable '{name}'"
             );
         }
-        for (name, value) in [
-            ("HOME", "/agent-hub/git/home"),
-            ("GIT_CONFIG_NOSYSTEM", "1"),
-            ("GIT_CONFIG_GLOBAL", "/agent-hub/git/home/.gitconfig"),
-            ("GIT_OPTIONAL_LOCKS", "0"),
-            ("GIT_PAGER", "cat"),
-            ("PAGER", "cat"),
-            ("GIT_TERMINAL_PROMPT", "0"),
-            ("GIT_NO_REPLACE_OBJECTS", "1"),
-        ] {
-            environment.insert(name.into(), value.into());
-        }
+        apply_git_runtime_environment(&mut environment)?;
         verify_host_only_approval_environment(&environment)?;
         if let Some(relay) = &attended_relay {
             relay.verify_for_mount()?;
@@ -1855,7 +1883,7 @@ pub async fn run(
                 .iter()
                 .filter(|attempt| attempt.retry_class == Some(RetryClass::Prelaunch))
                 .count()
-                < request.lifecycle.retry.max_prelaunch_retries as usize
+                < request.retry.max_prelaunch_retries as usize
         }
         Some(RetryClass::ProviderServiceUnavailable) => {
             authorized
@@ -1865,11 +1893,10 @@ pub async fn run(
                     attempt.retry_class == Some(RetryClass::ProviderServiceUnavailable)
                 })
                 .count()
-                < request.lifecycle.retry.max_provider_unavailable_retries as usize
+                < request.retry.max_provider_unavailable_retries as usize
         }
         None => false,
-    } && authorized.attempts.len()
-        < request.lifecycle.retry.max_attempts as usize;
+    } && authorized.attempts.len() < request.retry.max_attempts as usize;
     record.launch_state = LaunchState::Terminal;
     let lineage = authorized
         .attempts
@@ -2010,6 +2037,7 @@ pub struct BoundedArtifact {
 #[serde(deny_unknown_fields)]
 struct CleanupReceiptPayload {
     record: RunRecord,
+    owner: RunOwnerMarker,
     result: serde_json::Value,
     artifacts: serde_json::Value,
     repositories: serde_json::Value,
@@ -2400,6 +2428,7 @@ pub async fn cleanup(
     });
     let payload = CleanupReceiptPayload {
         record: record.clone(),
+        owner: owner_marker,
         result: result_document,
         artifacts: artifacts_document,
         repositories: repositories_document,
@@ -2663,7 +2692,9 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV3) -> anyhow::
     let expected_runtime = canonical_runtime(
         &environment,
         &ResolvedMounts {
-            roots: request.execution.roots.clone(),
+            roots: request.roots.clone(),
+            workspace_root_identities: request.workspace_root_identities.clone(),
+            context_root_identities: request.context_root_identities.clone(),
             workspaces: request.execution.workspaces.clone(),
             context_roots: request.execution.context_roots.clone(),
             repositories: request.execution.repositories.clone(),
@@ -2890,6 +2921,7 @@ fn validate_credential_runtime_conflicts(
         [
             "HOME",
             "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_SYSTEM",
             "GIT_CONFIG_GLOBAL",
             "GIT_OPTIONAL_LOCKS",
             "GIT_PAGER",
@@ -2965,6 +2997,35 @@ fn validate_credential_runtime_conflicts(
                     "credential target '{target}' conflicts with an authorized environment variable"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+fn apply_git_runtime_environment(environment: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
+    ensure!(
+        !environment.contains_key("GIT_CONFIG_NOSYSTEM"),
+        "generated Git environment cannot disable the isolated system config"
+    );
+    environment
+        .entry("GIT_CONFIG_GLOBAL".into())
+        .or_insert_with(|| "/agent-hub/git/home/.gitconfig".into());
+    for (name, value) in [
+        ("GIT_CONFIG_SYSTEM", "/agent-hub/git/home/.gitconfig"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("GIT_PAGER", "cat"),
+        ("PAGER", "cat"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ] {
+        match environment.entry(name.into()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value.into());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => ensure!(
+                entry.get() == value,
+                "generated Git environment conflicts with authorized variable '{name}'"
+            ),
         }
     }
     Ok(())
@@ -4375,6 +4436,10 @@ fn verify_receipt(receipt: &CleanupReceipt, id: &str) -> anyhow::Result<()> {
         "cleanup receipt authorization mismatch"
     );
     ensure!(
+        receipt.payload.owner == owner_marker_for_record(&receipt.payload.record),
+        "cleanup receipt owner marker mismatch"
+    );
+    ensure!(
         receipt.checksum == receipt_checksum(&receipt.payload)?,
         "cleanup receipt checksum mismatch"
     );
@@ -4687,12 +4752,14 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::{
         AbortTask, AttendedExecutionOutcome, FinalizationError, RelayEndpoint, RelayEpochState,
-        RunOwnerMarker, attended_execution_outcome, merge_execution_cleanup,
-        network_class_within_ceiling, provider_retry_proofs_complete, resolve_network_resources,
-        selector_resources, serialize_pretty_bounded, verify_exact_relay_mount,
-        verify_host_only_approval_environment, verify_recovery_relay_endpoint,
-        verify_run_owner_marker, verify_tool_approval, write_new_private_durable,
+        RunOwnerMarker, RunRecord, RunStatus, apply_git_runtime_environment,
+        attended_execution_outcome, merge_execution_cleanup, network_class_within_ceiling,
+        provider_retry_proofs_complete, resolve_network_resources, selector_resources,
+        serialize_pretty_bounded, verify_exact_relay_mount, verify_host_only_approval_environment,
+        verify_recovery_relay_endpoint, verify_run_owner_marker, verify_tool_approval,
+        write_new_private_durable,
     };
+    use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
     use anyhow::Context as _;
     use chrono::Utc;
@@ -5861,6 +5928,26 @@ grep -qx 'ready\|ready\.' real-llm.log
     }
 
     #[test]
+    fn isolated_git_view_and_scoped_github_config_coexist() {
+        let mut environment = BTreeMap::from([
+            (
+                "GIT_CONFIG_GLOBAL".into(),
+                "/agent-hub/github/gitconfig".into(),
+            ),
+            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+        ]);
+        apply_git_runtime_environment(&mut environment).unwrap();
+        assert_eq!(
+            environment["GIT_CONFIG_GLOBAL"],
+            "/agent-hub/github/gitconfig"
+        );
+        assert_eq!(
+            environment["GIT_CONFIG_SYSTEM"],
+            "/agent-hub/git/home/.gitconfig"
+        );
+    }
+
+    #[test]
     fn attended_finally_aggregates_later_and_cleanup_failures() {
         let error = merge_execution_cleanup::<()>(
             Err(anyhow::anyhow!("materialization failed")),
@@ -6011,8 +6098,17 @@ grep -qx 'ready\|ready\.' real-llm.log
     fn terminal_record() -> RunRecord {
         RunRecord {
             schema: super::result_schema_v3(),
-            id: "a".repeat(24),
+            id: uuid::Uuid::new_v4().to_string(),
+            run_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            attempt_number: 1,
+            parent_attempt_id: None,
+            attempt_ancestry: vec![],
+            authorization_id: uuid::Uuid::new_v4().to_string(),
+            receipt_id: uuid::Uuid::new_v4().to_string(),
             authorization_digest: "a".repeat(64),
+            owner_nonce: uuid::Uuid::new_v4().to_string(),
+            launch_state: super::LaunchState::Terminal,
             status: RunStatus::Succeeded,
             container_name: "container".into(),
             ownership: BTreeMap::new(),
@@ -6028,6 +6124,8 @@ grep -qx 'ready\|ready\.' real-llm.log
             execution_outcome: super::ExecutionOutcome::Succeeded,
             cleanup_outcome: super::CleanupOutcome::Succeeded,
             agent_final: serde_json::from_value(complete_agent_result()).ok(),
+            retry_class: None,
+            retry_eligible: false,
         }
     }
 
@@ -6079,6 +6177,7 @@ grep -qx 'ready\|ready\.' real-llm.log
         let record = terminal_record();
         let payload = super::CleanupReceiptPayload {
             record: record.clone(),
+            owner: super::owner_marker_for_record(&record),
             result: serde_json::to_value(&record).unwrap(),
             artifacts: serde_json::json!({"schema":"attended_artifacts_v1"}),
             repositories: serde_json::json!([]),

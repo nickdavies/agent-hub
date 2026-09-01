@@ -148,16 +148,7 @@ fn request() -> AttendedAuthorizationRequestV3 {
             },
             credential_providers: vec![],
             overlays: vec![],
-            roots: vec![protocol::ResolvedRoot {
-                identity: "work".into(),
-                host_path: "/work".into(),
-                roles: vec![
-                    protocol::RootRole::WorkspaceRo,
-                    protocol::RootRole::WorkspaceRw,
-                ],
-            }],
             workspaces: vec![protocol::WorkspaceSpec {
-                root_identity: "work".into(),
                 alias: "primary".into(),
                 host_path: "/work/repo".into(),
                 container_path: "/workspace/primary".into(),
@@ -180,6 +171,17 @@ fn request() -> AttendedAuthorizationRequestV3 {
             }],
             primary_workspace: "primary".into(),
         },
+        roots: vec![protocol::ResolvedRoot {
+            identity: "work".into(),
+            host_path: "/work".into(),
+            roles: vec![
+                protocol::RootRole::WorkspaceRo,
+                protocol::RootRole::WorkspaceRw,
+                protocol::RootRole::GitMetadata,
+            ],
+        }],
+        workspace_root_identities: BTreeMap::from([("primary".into(), "work".into())]),
+        context_root_identities: BTreeMap::new(),
         git_views: vec![protocol::GitViewSpec {
             workspace_alias: "primary".into(),
             repository_type: protocol::GitRepositoryType::Standalone,
@@ -215,6 +217,11 @@ fn request() -> AttendedAuthorizationRequestV3 {
         approval_bundle: None,
         output: AttendedOutputContract::default(),
         lifecycle: AttendedLifecycleContract::default(),
+        retry: protocol::AttendedRetryConstraints {
+            max_attempts: 3,
+            max_prelaunch_retries: 2,
+            max_provider_unavailable_retries: 1,
+        },
     }
 }
 
