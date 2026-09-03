@@ -43,6 +43,7 @@ not expose propose/authorize or receipt/digest bypass arguments.
 
 The canonical Rust contracts are `AgentHubRunIntentV1`,
 `AgentHubRunResolvedV1`, and `AgentHubRunDecisionV1`. The generated public
-intent schema is `provider-plugins/opencode/generated/AgentHubRunIntentV1.schema.json`.
+schemas and TypeScript definitions for all three contracts are under
+`provider-plugins/opencode/generated`.
 Actual OpenCode host-tool registration belongs in the host configuration
 repository and must be added only after cross-repository integration.

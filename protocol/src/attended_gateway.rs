@@ -436,6 +436,7 @@ mod tests {
             canonical_args_digest: opencode_match_input_digest(&input).unwrap(),
             approval: ApprovalRequest {
                 id: String::new(),
+                request_digest: None,
                 session_id: crate::SessionId::new("session"),
                 session_display_name: "Attended".into(),
                 cwd: "/workspace/main".into(),
@@ -487,6 +488,7 @@ mod tests {
             canonical_args_digest: opencode_match_input_digest(&input).unwrap(),
             approval: ApprovalRequest {
                 id: String::new(),
+                request_digest: None,
                 session_id: crate::SessionId::new("session"),
                 session_display_name: "Attended".into(),
                 cwd: "/workspace/main".into(),

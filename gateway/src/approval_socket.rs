@@ -317,6 +317,7 @@ mod tests {
             canonical_args_digest: protocol::opencode_match_input_digest(&tool_input).unwrap(),
             approval: ApprovalRequest {
                 id: "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
+                request_digest: None,
                 session_id: SessionId::new("golden"),
                 session_display_name: "Golden".into(),
                 cwd: "/workspace".into(),

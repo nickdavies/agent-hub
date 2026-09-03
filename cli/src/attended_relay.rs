@@ -2443,6 +2443,7 @@ mod tests {
             canonical_args_digest: protocol::opencode_match_input_digest(&tool_input).unwrap(),
             approval: ApprovalRequest {
                 id: request_id,
+                request_digest: None,
                 session_id: SessionId::new("attended-test"),
                 session_display_name: "Attended test".into(),
                 cwd: "/workspace/main".into(),

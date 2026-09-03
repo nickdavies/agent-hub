@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentHubRunDecisionV1",
+  "description": "Versioned gateway decision. Every request binding is echoed and validated by\nthe host before the private receipt is created.",
+  "type": "object",
+  "properties": {
+    "approval_id": {
+      "type": "string"
+    },
+    "authority": {
+      "$ref": "#/$defs/AgentHubRunDecisionAuthority"
+    },
+    "canonical_digest": {
+      "type": "string"
+    },
+    "decided_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "decision": {
+      "$ref": "#/$defs/AgentHubRunDecision"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "invocation_id": {
+      "type": "string"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request_digest": {
+      "type": "string"
+    },
+    "schema": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "invocation_id",
+    "canonical_digest",
+    "request_digest",
+    "decision",
+    "authority",
+    "approval_id",
+    "decided_at",
+    "expires_at"
+  ],
+  "$defs": {
+    "AgentHubRunDecision": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "AgentHubRunDecisionAuthority": {
+      "type": "string",
+      "enum": [
+        "automatic",
+        "human"
+      ]
+    }
+  }
+}

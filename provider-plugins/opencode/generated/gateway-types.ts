@@ -5,6 +5,26 @@
 //   cargo run -p protocol --bin generate_schemas -- provider-plugins/opencode/generated
 //   bun run generate-types.ts
 
+export type AgentHubRunDecisionAuthority = "automatic" | "human"
+export type AgentHubRunDecision = "allow" | "deny"
+
+/**
+ * Versioned gateway decision. Every request binding is echoed and validated by
+ * the host before the private receipt is created.
+ */
+export interface AgentHubRunDecisionV1 {
+  approval_id: string
+  authority: AgentHubRunDecisionAuthority
+  canonical_digest: string
+  decided_at: string
+  decision: AgentHubRunDecision
+  expires_at: string
+  invocation_id: string
+  reason?: string | null
+  request_digest: string
+  schema: string
+}
+
 export type AgentHubRunImageFamily = "job-code"
 export type AgentHubRunNetworkClass = "none" | "llm-only" | "build" | "guarded-web"
 export type NetworkResourceKind =
@@ -58,6 +78,24 @@ export interface AgentHubRunWorkspaceV1 {
   access: WorkspaceAccess
   alias: string
   path: string
+}
+
+/**
+ * Exact canonical execution submitted to the gateway.
+ */
+export interface AgentHubRunResolvedV1 {
+  canonical_digest: string
+  canonical_execution: AttendedAuthorizationArtifact
+  expires_at: string
+  invocation_id: string
+  request_digest: string
+  requested_at: string
+  schema: string
+}
+export interface AttendedAuthorizationArtifact {
+  canonical_bytes: string
+  digest: string
+  version: number
 }
 
 /**

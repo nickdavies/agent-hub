@@ -402,7 +402,11 @@ fn agent_hub_run_receipts_bind_decision_digest_invocation_and_expiry() {
             request_digest: request.request_digest.clone(),
             decision,
             authority,
-            approval_id: uuid::Uuid::new_v4().to_string(),
+            approval_id: if authority == protocol::AgentHubRunDecisionAuthority::Automatic {
+                invocation.clone()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            },
             reason: None,
             decided_at: now,
             expires_at: request.expires_at,

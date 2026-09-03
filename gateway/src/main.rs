@@ -152,6 +152,8 @@ struct SupervisionArgs {
 enum RunError {
     /// Hard failure — bad input, config error, etc. Agent should deny.
     FailClosed(String),
+    /// The approval authority did not produce a decision.
+    ServerUnreachable(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -173,6 +175,13 @@ impl ApprovalFlowError {
             message: None,
         }
     }
+
+    fn into_run_error(self) -> RunError {
+        RunError::ServerUnreachable(match self {
+            Self::Timeout => "approval timed out".to_string(),
+            Self::Pipeline(reason) => reason,
+        })
+    }
 }
 
 #[tokio::main]
@@ -191,23 +200,23 @@ async fn main() -> ExitCode {
 #[derive(Debug)]
 struct GatewayResolution {
     output: HookOutput,
-    authority: protocol::AgentHubRunDecisionAuthority,
+    approval_id: Option<Uuid>,
 }
 
 async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
-    if !(1..=600).contains(&args.timeout) {
+    if !(1..=protocol::AGENT_HUB_RUN_MAX_APPROVAL_TIMEOUT_SECS).contains(&args.timeout) {
         eprintln!("agent-hub-gateway: agent_hub_run timeout is outside the supported range");
         return ExitCode::from(2);
     }
     let mut input = Vec::new();
     if let Err(error) = std::io::stdin()
-        .take(protocol::ATTENDED_GATEWAY_MAX_FRAME_BYTES as u64 + 1)
+        .take(protocol::AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES as u64 + 1)
         .read_to_end(&mut input)
     {
         eprintln!("agent-hub-gateway: failed to read agent_hub_run request: {error}");
         return ExitCode::from(2);
     }
-    if input.len() > protocol::ATTENDED_GATEWAY_MAX_FRAME_BYTES {
+    if input.len() > protocol::AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES {
         eprintln!("agent-hub-gateway: agent_hub_run request exceeds limit");
         return ExitCode::from(2);
     }
@@ -245,6 +254,15 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let now = chrono::Utc::now();
+    let expires_in = match (permission.expires_at - now).to_std() {
+        Ok(expires_in) => expires_in,
+        Err(_) => {
+            eprintln!("agent-hub-gateway: agent_hub_run request has expired");
+            return ExitCode::from(2);
+        }
+    };
+    let deadline = tokio::time::Instant::now() + expires_in.min(Duration::from_secs(args.timeout));
     let approval = ApprovalArgs {
         claude: false,
         cursor: false,
@@ -264,9 +282,11 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
     };
     match run(
         &approval,
-        "opencode",
+        "agent-hub-host-launch",
         &event,
         &expand_tilde(&approval.config),
+        Some(&permission.canonical_digest),
+        Some(deadline),
     )
     .await
     {
@@ -276,27 +296,57 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
                 DecisionStatus::Denied | DecisionStatus::DeniedWithReason(_) => {
                     protocol::AgentHubRunDecision::Deny
                 }
+                DecisionStatus::TimedOut | DecisionStatus::PipelineError => {
+                    eprintln!("agent-hub-gateway: approval authority returned no decision");
+                    return ExitCode::from(1);
+                }
             };
             let reason = match resolution.output.status {
                 DecisionStatus::DeniedWithReason(reason) => Some(reason),
                 _ => resolution.output.message,
             };
-            println!(
-                "{}",
-                serde_json::to_string(&protocol::AgentHubRunDecisionV1 {
-                    schema: protocol::AGENT_HUB_RUN_DECISION_SCHEMA_V1.into(),
-                    invocation_id: permission.invocation_id.clone(),
-                    canonical_digest: permission.canonical_digest.clone(),
-                    request_digest: permission.request_digest.clone(),
-                    decision,
-                    authority: resolution.authority,
-                    approval_id: permission.invocation_id.clone(),
-                    reason,
-                    decided_at: chrono::Utc::now(),
-                    expires_at: permission.expires_at,
-                })
-                .expect("gateway decision serializes")
-            );
+            let decided_at = chrono::Utc::now();
+            let response = protocol::AgentHubRunDecisionV1 {
+                schema: protocol::AGENT_HUB_RUN_DECISION_SCHEMA_V1.into(),
+                invocation_id: permission.invocation_id.clone(),
+                canonical_digest: permission.canonical_digest.clone(),
+                request_digest: permission.request_digest.clone(),
+                decision,
+                authority: if resolution.approval_id.is_some() {
+                    protocol::AgentHubRunDecisionAuthority::Human
+                } else {
+                    protocol::AgentHubRunDecisionAuthority::Automatic
+                },
+                approval_id: resolution
+                    .approval_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| permission.invocation_id.clone()),
+                reason,
+                decided_at,
+                expires_at: permission.expires_at,
+            };
+            if let Err(error) = response.validate(&permission, decided_at) {
+                eprintln!("agent-hub-gateway: invalid agent_hub_run decision: {error}");
+                return ExitCode::from(2);
+            }
+            let encoded = match serde_json::to_vec(&response) {
+                Ok(encoded)
+                    if encoded.len() <= protocol::AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES =>
+                {
+                    encoded
+                }
+                Ok(_) => {
+                    eprintln!("agent-hub-gateway: agent_hub_run response exceeds output limit");
+                    return ExitCode::from(2);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "agent-hub-gateway: failed to serialize agent_hub_run response: {error}"
+                    );
+                    return ExitCode::from(2);
+                }
+            };
+            print!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
             ExitCode::SUCCESS
         }
         Err(RunError::ServerUnreachable(error)) => {
@@ -483,7 +533,7 @@ where
 
     let config_path = expand_tilde(&args.config);
 
-    match run(&args, provider_name, &event, &config_path).await {
+    match run(&args, provider_name, &event, &config_path, None, None).await {
         Ok(resolution) => {
             let decision = resolution.output;
             eprintln!(
@@ -500,6 +550,12 @@ where
         Err(RunError::FailClosed(e)) => {
             eprintln!("agent-hub-gateway: {e}");
             ExitCode::from(2)
+        }
+        Err(RunError::ServerUnreachable(e)) => {
+            eprintln!("agent-hub-gateway: {e}");
+            let decision = ApprovalFlowError::Pipeline(e).into_output();
+            print!("{}", format_output(&event, &decision));
+            ExitCode::SUCCESS
         }
     }
 }
@@ -574,6 +630,8 @@ async fn run(
     provider_name: &str,
     event: &ToolHookEvent,
     config_path: &str,
+    request_digest: Option<&str>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<GatewayResolution, RunError> {
     if args.approval_socket.is_some() {
         let raw_digest = protocol::opencode_raw_args_digest(event.tool_call.raw_input())
@@ -669,6 +727,7 @@ async fn run(
 
     // Act on the decision.
     let remote_decision = matches!(&hook_decision, HookDecision::Ask(_));
+    let mut approval_id = None;
     let output = match hook_decision {
         HookDecision::Allow => {
             eprintln!("[info] allowing tool={}", event.tool_call.tool_name());
@@ -697,8 +756,14 @@ async fn run(
                 event.tool_call.tool_name()
             );
             let extra = collect_extra(&event.tool_call, delegate_reason.as_deref());
-            match escalate_to_server(args, provider_name, event, extra).await {
-                Ok(output) => output,
+            match escalate_to_server(args, provider_name, event, extra, request_digest, deadline)
+                .await
+            {
+                Ok((output, id)) => {
+                    approval_id = id;
+                    output
+                }
+                Err(error) if request_digest.is_some() => return Err(error.into_run_error()),
                 Err(error) => error.into_output(),
             }
         }
@@ -720,6 +785,7 @@ async fn run(
                     Some(protocol::AttendedGatewayTransitionKind::LocalDeny)
                 }
             }
+            DecisionStatus::TimedOut | DecisionStatus::PipelineError => None,
         };
         if let Some(transition) = transition {
             report_execution_transition(args, event, transition).await?;
@@ -728,11 +794,7 @@ async fn run(
 
     Ok(GatewayResolution {
         output,
-        authority: if remote_decision {
-            protocol::AgentHubRunDecisionAuthority::Human
-        } else {
-            protocol::AgentHubRunDecisionAuthority::Automatic
-        },
+        approval_id,
     })
 }
 
@@ -828,7 +890,9 @@ async fn escalate_to_server(
     provider_name: &str,
     event: &ToolHookEvent,
     extra: Option<ExtraContext>,
-) -> Result<HookOutput, ApprovalFlowError> {
+    request_digest: Option<&str>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(HookOutput, Option<Uuid>), ApprovalFlowError> {
     let context = ApprovalContext {
         workspace_roots: event.workspace_roots.clone(),
         hook_event_name: event.hook_event_name.clone().into(),
@@ -842,6 +906,7 @@ async fn escalate_to_server(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let request = ApprovalRequest {
         id: request_id,
+        request_digest: request_digest.map(str::to_owned),
         session_id: event.session_id.clone(),
         session_display_name: event.session_display_name.clone(),
         cwd: event.cwd.clone(),
@@ -896,19 +961,22 @@ async fn escalate_to_server(
         )
         .await
         .map_err(ApprovalFlowError::Pipeline)?;
-        return Ok(match decision.decision {
-            protocol::AttendedGatewayDecisionKind::Allow => HookOutput {
-                status: DecisionStatus::Approved,
-                message: decision.reason,
+        return Ok((
+            match decision.decision {
+                protocol::AttendedGatewayDecisionKind::Allow => HookOutput {
+                    status: DecisionStatus::Approved,
+                    message: decision.reason,
+                },
+                protocol::AttendedGatewayDecisionKind::Deny => HookOutput {
+                    status: decision
+                        .reason
+                        .map(DecisionStatus::DeniedWithReason)
+                        .unwrap_or(DecisionStatus::Denied),
+                    message: None,
+                },
             },
-            protocol::AttendedGatewayDecisionKind::Deny => HookOutput {
-                status: decision
-                    .reason
-                    .map(DecisionStatus::DeniedWithReason)
-                    .unwrap_or(DecisionStatus::Denied),
-                message: None,
-            },
-        });
+            None,
+        ));
     }
 
     let server = args.server.as_deref().ok_or_else(|| {
@@ -930,27 +998,40 @@ async fn escalate_to_server(
     } else {
         register
     };
+    let register_timeout = deadline
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .unwrap_or(Duration::from_secs(10))
+        .min(Duration::from_secs(10));
+    if register_timeout.is_zero() {
+        return Err(ApprovalFlowError::Timeout);
+    }
     let register_resp = register
         .json(&request)
-        .timeout(Duration::from_secs(10))
+        .timeout(register_timeout)
         .send()
         .await
         .map_err(|e| ApprovalFlowError::Pipeline(format!("failed to register approval: {e}")))?;
 
     if !register_resp.status().is_success() {
+        let status = register_resp.status();
         eprintln!(
             "[error] server returned {} for approval registration",
-            register_resp.status()
+            status
         );
-        return Err(ApprovalFlowError::Pipeline(format!(
-            "server returned {} for approval registration",
-            register_resp.status()
-        )));
+        let message = format!("server returned {status} for approval registration");
+        return Err(ApprovalFlowError::Pipeline(message));
     }
 
-    let approval: ApprovalResponse = register_resp.json().await.map_err(|e| {
-        ApprovalFlowError::Pipeline(format!("failed to parse approval response: {e}"))
-    })?;
+    let response_timeout = deadline
+        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .unwrap_or(Duration::from_secs(10));
+    if response_timeout.is_zero() {
+        return Err(ApprovalFlowError::Timeout);
+    }
+    let approval: ApprovalResponse = tokio::time::timeout(response_timeout, register_resp.json())
+        .await
+        .map_err(|_| ApprovalFlowError::Timeout)?
+        .map_err(|e| ApprovalFlowError::Pipeline(format!("failed to parse approval response: {e}")))?;
 
     if matches!(approval.status, ApprovalStatus::Pending) {
         // Fall through to long-poll below
@@ -959,11 +1040,12 @@ async fn escalate_to_server(
             "[info] approval immediately resolved: status={:?}",
             approval.status
         );
-        return Ok(status_to_output(&approval.status));
+        return Ok((status_to_output(&approval.status), Some(approval.id)));
     }
 
     // Long-poll until resolved or global timeout
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
+    let deadline =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(args.timeout));
     let wait_url = http::endpoint(&base, &format!("api/v1/approvals/{}/wait", approval.id))
         .map_err(ApprovalFlowError::Pipeline)?;
 
@@ -975,7 +1057,7 @@ async fn escalate_to_server(
     let cancel_url = http::endpoint(&base, &format!("api/v1/approvals/{}/resolve", approval.id))
         .map_err(ApprovalFlowError::Pipeline)?;
 
-    tokio::select! {
+    let output = tokio::select! {
         result = poll_for_decision(&client, wait_url.as_str(), token, deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal, cancelling approval {}", approval.id);
@@ -993,7 +1075,8 @@ async fn escalate_to_server(
                 .await;
             Err(ApprovalFlowError::Pipeline("aborted by signal".to_string()))
         }
-    }
+    }?;
+    Ok((output, Some(approval.id)))
 }
 
 /// Long-poll the server until the approval is resolved or the global timeout expires.
@@ -1024,7 +1107,7 @@ async fn poll_for_decision(
         let resp = await_approval_deadline(
             deadline,
             last_wait_was_healthy,
-            wait.timeout(Duration::from_secs(60)).send(),
+            wait.timeout(remaining.min(Duration::from_secs(60))).send(),
         )
         .await?;
 
@@ -1069,9 +1152,14 @@ async fn poll_for_decision(
             continue;
         }
 
-        let body = await_approval_deadline(deadline, last_wait_was_healthy, resp.text()).await?;
+        let body = await_approval_deadline(deadline, last_wait_was_healthy, resp.bytes()).await?;
         let body = match body {
-            Ok(b) => b,
+            Ok(body) if body.len() <= protocol::AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES => body,
+            Ok(_) => {
+                return Err(ApprovalFlowError::Pipeline(
+                    "approval wait response exceeds limit".to_string(),
+                ));
+            }
             Err(e) => {
                 eprintln!(
                     "[warn] failed to read wait response body (attempt {attempt}, retrying in 2s): {e}"
@@ -1087,11 +1175,11 @@ async fn poll_for_decision(
             }
         };
 
-        let wait: ApprovalWaitResponse = match serde_json::from_str(&body) {
+        let wait: ApprovalWaitResponse = match serde_json::from_slice(&body) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!(
-                    "[warn] failed to parse wait response (attempt {attempt}, retrying in 2s): {e} — body: {body}"
+                    "[warn] failed to parse bounded wait response (attempt {attempt}, retrying in 2s): {e}"
                 );
                 last_wait_was_healthy = false;
                 await_approval_deadline(
@@ -1113,7 +1201,9 @@ async fn poll_for_decision(
                 )));
             }
             last_wait_was_healthy = true;
-            let secs_remaining = remaining.as_secs();
+            let secs_remaining = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_secs();
             eprintln!(
                 "[info] approval still pending (attempt {attempt}, {secs_remaining}s remaining)"
             );
@@ -1336,13 +1426,10 @@ mod agent_hub_run_gateway_tests {
         for (action, approved) in [("allow", true), ("deny", false)] {
             let (root, config) = config(action);
             let args = args("http://127.0.0.1:1".into(), config.display().to_string());
-            let resolution = run(&args, "opencode", &event(), &args.config)
+            let resolution = run(&args, "opencode", &event(), &args.config, None, None)
                 .await
                 .unwrap();
-            assert_eq!(
-                resolution.authority,
-                protocol::AgentHubRunDecisionAuthority::Automatic
-            );
+            assert_eq!(resolution.approval_id, None);
             assert_eq!(
                 matches!(resolution.output.status, DecisionStatus::Approved),
                 approved
@@ -1377,13 +1464,10 @@ mod agent_hub_run_gateway_tests {
         });
         let (root, config) = config("ask");
         let args = args(format!("http://{address}"), config.display().to_string());
-        let resolution = run(&args, "opencode", &event(), &args.config)
+        let resolution = run(&args, "opencode", &event(), &args.config, None, None)
             .await
             .unwrap();
-        assert_eq!(
-            resolution.authority,
-            protocol::AgentHubRunDecisionAuthority::Human
-        );
+        assert!(resolution.approval_id.is_some());
         assert!(matches!(resolution.output.status, DecisionStatus::Approved));
         server.await.unwrap();
         std::fs::remove_dir_all(root).unwrap();

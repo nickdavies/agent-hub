@@ -16,6 +16,10 @@ pub const AGENT_HUB_RUN_MAX_PROMPT_BYTES: usize = 1_000_000;
 pub const AGENT_HUB_RUN_MAX_MOUNTS: usize = 32;
 pub const AGENT_HUB_RUN_MAX_SELECTORS: usize = 32;
 pub const AGENT_HUB_RUN_MAX_TIMEOUT_SECS: u64 = 86_400;
+pub const AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES: usize = 1024 * 1024;
+pub const AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES: usize = 64 * 1024;
+pub const AGENT_HUB_RUN_MAX_REASON_BYTES: usize = 4096;
+pub const AGENT_HUB_RUN_MAX_APPROVAL_TIMEOUT_SECS: u64 = 600;
 const RESOLVED_DOMAIN: &[u8] = b"agent-hub:agent-hub-run-resolved:v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"agent-hub:agent-hub-run-receipt:v1\0";
 
@@ -217,8 +221,11 @@ impl AgentHubRunResolvedV1 {
         if self.schema != AGENT_HUB_RUN_RESOLVED_SCHEMA_V1 {
             return Err("unsupported agent_hub_run resolved schema".into());
         }
-        uuid::Uuid::parse_str(&self.invocation_id)
+        let invocation_id = uuid::Uuid::parse_str(&self.invocation_id)
             .map_err(|_| "agent_hub_run invocation ID is not a UUID".to_string())?;
+        if invocation_id.to_string() != self.invocation_id {
+            return Err("agent_hub_run invocation ID is not canonical".into());
+        }
         validate_digest(&self.canonical_digest)?;
         validate_digest(&self.request_digest)?;
         if self.requested_at > now || self.expires_at <= now || self.expires_at <= self.requested_at
@@ -325,19 +332,28 @@ impl AgentHubRunDecisionV1 {
         {
             return Err("agent_hub_run gateway decision binding mismatch".into());
         }
-        uuid::Uuid::parse_str(&self.approval_id)
+        let approval_id = uuid::Uuid::parse_str(&self.approval_id)
             .map_err(|_| "agent_hub_run approval ID is not a UUID".to_string())?;
+        if approval_id.to_string() != self.approval_id {
+            return Err("agent_hub_run approval ID is not canonical".into());
+        }
         validate_digest(&self.canonical_digest)?;
         validate_digest(&self.request_digest)?;
         if self.decided_at < request.requested_at
             || self.decided_at > now
             || self.expires_at <= now
+            || self.decided_at >= self.expires_at
             || self
                 .reason
                 .as_ref()
-                .is_some_and(|reason| reason.len() > 4096)
+                .is_some_and(|reason| reason.len() > AGENT_HUB_RUN_MAX_REASON_BYTES)
         {
             return Err("agent_hub_run gateway decision timestamps are invalid or expired".into());
+        }
+        if self.authority == AgentHubRunDecisionAuthority::Automatic
+            && self.approval_id != request.invocation_id
+        {
+            return Err("agent_hub_run automatic decision approval ID is invalid".into());
         }
         Ok(())
     }
@@ -388,10 +404,16 @@ impl AgentHubRunReceiptV1 {
         {
             return Err("agent_hub_run receipt binding mismatch or expired".into());
         }
-        uuid::Uuid::parse_str(&self.decision.invocation_id)
+        let invocation_id = uuid::Uuid::parse_str(&self.decision.invocation_id)
             .map_err(|_| "agent_hub_run invocation ID is not a UUID".to_string())?;
-        uuid::Uuid::parse_str(&self.decision.approval_id)
+        if invocation_id.to_string() != self.decision.invocation_id {
+            return Err("agent_hub_run invocation ID is not canonical".into());
+        }
+        let approval_id = uuid::Uuid::parse_str(&self.decision.approval_id)
             .map_err(|_| "agent_hub_run approval ID is not a UUID".to_string())?;
+        if approval_id.to_string() != self.decision.approval_id {
+            return Err("agent_hub_run approval ID is not canonical".into());
+        }
         validate_digest(&self.decision.canonical_digest)?;
         validate_digest(&self.decision.request_digest)?;
         if self.decision.decided_at >= self.decision.expires_at
@@ -399,9 +421,14 @@ impl AgentHubRunReceiptV1 {
                 .decision
                 .reason
                 .as_ref()
-                .is_some_and(|reason| reason.len() > 4096)
+                .is_some_and(|reason| reason.len() > AGENT_HUB_RUN_MAX_REASON_BYTES)
         {
             return Err("agent_hub_run receipt decision fields are invalid".into());
+        }
+        if self.decision.authority == AgentHubRunDecisionAuthority::Automatic
+            && self.decision.approval_id != self.decision.invocation_id
+        {
+            return Err("agent_hub_run automatic receipt approval ID is invalid".into());
         }
         let expected = sha256_hex_with_domain(
             RECEIPT_DOMAIN,

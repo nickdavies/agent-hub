@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentHubRunResolvedV1",
+  "description": "Exact canonical execution submitted to the gateway.",
+  "type": "object",
+  "properties": {
+    "canonical_digest": {
+      "type": "string"
+    },
+    "canonical_execution": {
+      "$ref": "#/$defs/AttendedAuthorizationArtifact"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "invocation_id": {
+      "type": "string"
+    },
+    "request_digest": {
+      "type": "string"
+    },
+    "requested_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "schema": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "invocation_id",
+    "canonical_digest",
+    "request_digest",
+    "canonical_execution",
+    "requested_at",
+    "expires_at"
+  ],
+  "$defs": {
+    "AttendedAuthorizationArtifact": {
+      "type": "object",
+      "properties": {
+        "canonical_bytes": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "digest",
+        "canonical_bytes"
+      ]
+    }
+  }
+}

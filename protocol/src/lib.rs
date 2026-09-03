@@ -64,6 +64,8 @@ pub use gateway::{
 pub use hooks::{NotificationPayload, SessionEndPayload, StatusReport, StopPayload};
 pub use host_run::{
     AGENT_HUB_RUN_DECISION_SCHEMA_V1, AGENT_HUB_RUN_INTENT_SCHEMA_V1,
+    AGENT_HUB_RUN_MAX_APPROVAL_TIMEOUT_SECS, AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES,
+    AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES, AGENT_HUB_RUN_MAX_REASON_BYTES,
     AGENT_HUB_RUN_PERMISSION_NAME, AGENT_HUB_RUN_RESOLVED_SCHEMA_V1, AgentHubRunContextRootV1,
     AgentHubRunDecision, AgentHubRunDecisionAuthority, AgentHubRunDecisionV1,
     AgentHubRunImageFamily, AgentHubRunIntentSchema, AgentHubRunIntentV1, AgentHubRunNetworkClass,

@@ -4,171 +4,6 @@ use std::process::{Command, Output};
 
 const IMAGE_TAG: &str = "agent-hub/job-code:2026-09-01";
 
-/*
-fn authorization_retries_preflight_and_fences_concurrent_attempts() {
-    let root = temp_root();
-    let config = root.join("config");
-    let workspace = root.join("workspace");
-    let state = root.join("state");
-    let authorization = root.join("authorization.json");
-    let docker_marker = root.join("docker.calls");
-    let fake_bin = root.join("bin");
-    std::fs::create_dir(&workspace).unwrap();
-    initialize_repository(&workspace);
-    std::fs::create_dir(&fake_bin).unwrap();
-    write_config(&config, &workspace);
-    write_fake_docker(&fake_bin.join("docker"), &docker_marker, &workspace, &root);
-
-    let proposal = invoke(
-        &root,
-        &fake_bin,
-        &state,
-        &[
-            "local",
-            "propose",
-            "--config-root",
-            config.to_str().unwrap(),
-            "--environment",
-            "test",
-            "--image-family",
-            "job-code",
-            "--network-class",
-            "none",
-            "--tool-approval",
-            "auto",
-            "--workspace",
-            &format!("primary={}:rw", workspace.display()),
-            "--primary-workspace",
-            "primary",
-            "--timeout-secs",
-            "30",
-            "--prompt-stdin",
-            "--output",
-            authorization.to_str().unwrap(),
-        ],
-        Some("Return success"),
-    );
-    assert_success(&proposal);
-    let stdout = String::from_utf8(proposal.stdout).unwrap();
-    let digest = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("Authorization digest: "))
-        .unwrap();
-    std::fs::remove_file(&docker_marker).unwrap();
-
-    let run_args = [
-        "local",
-        "run",
-        "--environment",
-        "test",
-        "--image-family",
-        "job-code",
-        "--network-class",
-        "none",
-        "--tool-approval",
-        "auto",
-        "--timeout-secs",
-        "30",
-        "--authorization",
-        authorization.to_str().unwrap(),
-        "--digest",
-        digest,
-    ];
-    let unauthorized = invoke(&root, &fake_bin, &state, &run_args, None);
-    assert!(!unauthorized.status.success());
-    assert!(!docker_marker.exists(), "unauthorized run invoked Docker");
-    assert!(!state.exists(), "unauthorized run created attended state");
-
-    let authorize = invoke(
-        &root,
-        &fake_bin,
-        &state,
-        &[
-            "local",
-            "authorize",
-            "--environment",
-            "test",
-            "--image-family",
-            "job-code",
-            "--network-class",
-            "none",
-            "--tool-approval",
-            "auto",
-            "--timeout-secs",
-            "30",
-            "--authorization",
-            authorization.to_str().unwrap(),
-            "--digest",
-            digest,
-        ],
-        None,
-    );
-    assert_success(&authorize);
-    let receipt: serde_json::Value = serde_json::from_slice(&authorize.stdout).unwrap();
-    assert_eq!(receipt["schema"], "attended_authorization_receipt_v1");
-    assert_eq!(receipt["digest"], digest);
-    assert_eq!(receipt["retry_eligible"], true);
-    assert!(
-        receipt["authorization_id"]
-            .as_str()
-            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
-    );
-    assert!(
-        receipt["canonical_run_command"]
-            .as_str()
-            .is_some_and(|command| command == format!("agent-hub {}", run_args.join(" ")))
-    );
-    std::fs::remove_file(&docker_marker).unwrap();
-
-    std::fs::write(root.join("fail-preflight-once"), "fail").unwrap();
-    let preflight_failure = invoke(&root, &fake_bin, &state, &run_args, None);
-    assert!(!preflight_failure.status.success());
-    let first: serde_json::Value = serde_json::from_slice(&preflight_failure.stdout).unwrap();
-    assert_eq!(first["launch_state"], "terminal");
-    assert_eq!(first["retry_class"], "prelaunch");
-    assert_eq!(first["retry_eligible"], true);
-
-    std::fs::write(root.join("provider-503-once"), "fail").unwrap();
-    let provider_failure = invoke(&root, &fake_bin, &state, &run_args, None);
-    assert!(!provider_failure.status.success());
-    let second: serde_json::Value = serde_json::from_slice(&provider_failure.stdout).unwrap();
-    assert_eq!(second["launch_state"], "terminal");
-    assert_eq!(second["retry_class"], "provider_service_unavailable");
-    assert_eq!(second["retry_eligible"], true);
-
-    std::fs::write(root.join("slow-launch"), "slow").unwrap();
-    let (executed, duplicate) = std::thread::scope(|scope| {
-        let first = scope.spawn(|| invoke(&root, &fake_bin, &state, &run_args, None));
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let duplicate = invoke(&root, &fake_bin, &state, &run_args, None);
-        (first.join().unwrap(), duplicate)
-    });
-    assert_success(&executed);
-    assert!(!duplicate.status.success());
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already consumed"));
-    let third: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
-    assert_eq!(first["authorization_id"], third["authorization_id"]);
-    assert_eq!(first["receipt_id"], third["receipt_id"]);
-    assert_ne!(first["attempt_id"], second["attempt_id"]);
-    assert_ne!(second["attempt_id"], third["attempt_id"]);
-    assert_ne!(first["run_id"], second["run_id"]);
-    assert_ne!(second["run_id"], third["run_id"]);
-    assert_eq!(first["attempt_number"], 1);
-    assert_eq!(second["attempt_number"], 2);
-    assert_eq!(third["attempt_number"], 3);
-    assert_eq!(second["parent_attempt_id"], first["attempt_id"]);
-    assert_eq!(second["attempt_ancestry"][0], first["attempt_id"]);
-    assert_eq!(third["parent_attempt_id"], second["attempt_id"]);
-    assert_eq!(third["attempt_ancestry"][1], second["attempt_id"]);
-    assert_eq!(first["authorization_digest"], third["authorization_digest"]);
-    assert!(docker_marker.exists());
-    let replay = invoke(&root, &fake_bin, &state, &run_args, None);
-    assert!(!replay.status.success());
-    assert!(String::from_utf8_lossy(&replay.stderr).contains("already consumed"));
-    std::fs::remove_dir_all(root).unwrap();
-}
-*/
-
 #[test]
 fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() {
     let root = temp_root();
@@ -215,7 +50,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         "context_roots":[],
         "primary_workspace":"primary"
     });
-    let args = ["local", "agent-hub-run", "--request-stdin"];
+    let args = ["local", "run", "--request-stdin"];
 
     let alternate_host_config = host_dir.join("alternate-host-run.json");
     std::fs::copy(host_dir.join("host-run.json"), &alternate_host_config).unwrap();
@@ -237,6 +72,15 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         String::from_utf8_lossy(&untrusted.stderr).contains("trusted host configuration identity")
     );
     assert!(!state.exists());
+
+    for invalid_decision in ["allow automatic wrong", "allow automatic expired"] {
+        std::fs::write(&decision, invalid_decision).unwrap();
+        let rejected = invoke(&root, &fake_bin, &state, &args, Some(&launch.to_string()));
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+        assert!(!state.exists());
+        assert!(!docker_marker.exists());
+    }
 
     std::fs::write(&decision, "deny automatic").unwrap();
     let denied = invoke(&root, &fake_bin, &state, &args, Some(&launch.to_string()));
@@ -464,7 +308,7 @@ fn write_fake_run_gateway(path: &Path, decision: &Path, state: &Path, docker_mar
     std::fs::write(
         path,
         format!(
-            "#!/bin/sh\n[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; d,a=open(\"{}\").read().split(); print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":r[\"canonical_digest\"],\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":r[\"invocation_id\"],\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":r[\"expires_at\"]}}))'\n",
+            "#!/bin/sh\n[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; p=open(\"{}\").read().split(); d,a=p[:2]; mode=p[2] if len(p)>2 else \"\"; digest=\"0\"*64 if mode==\"wrong\" else r[\"canonical_digest\"]; expiry=\"2000-01-01T00:00:00Z\" if mode==\"expired\" else r[\"expires_at\"]; approval=\"018f0f21-76c0-7b37-a446-31f82a5e7601\" if a==\"human\" else r[\"invocation_id\"]; print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":digest,\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":approval,\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":expiry}}))'\n",
             state.display(),
             state.display(),
             decision.display(),

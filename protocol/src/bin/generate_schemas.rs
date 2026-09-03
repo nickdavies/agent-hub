@@ -44,8 +44,10 @@ fn main() {
     write_schema::<protocol::OpenCodeHookOutput>(&out_dir, "OpenCodeHookOutput");
     write_schema::<protocol::OpenCodeTool>(&out_dir, "OpenCodeTool");
 
-    // -- Host-owned one-step launch tool --
+    // -- Host-owned one-step launch contracts --
     write_schema::<protocol::AgentHubRunIntentV1>(&out_dir, "AgentHubRunIntentV1");
+    write_schema::<protocol::AgentHubRunResolvedV1>(&out_dir, "AgentHubRunResolvedV1");
+    write_schema::<protocol::AgentHubRunDecisionV1>(&out_dir, "AgentHubRunDecisionV1");
 
     // -- Status reporting types --
     write_schema::<protocol::StatusReport>(&out_dir, "StatusReport");

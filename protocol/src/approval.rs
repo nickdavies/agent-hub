@@ -206,6 +206,10 @@ impl ApprovalStatus {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRequest {
     pub id: String,
+    /// Optional producer digest for response binding and review. Servers must
+    /// compare the canonical full request when enforcing idempotency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
     pub session_id: SessionId,
     pub session_display_name: String,
     pub cwd: String,
