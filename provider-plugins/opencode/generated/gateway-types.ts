@@ -5,6 +5,61 @@
 //   cargo run -p protocol --bin generate_schemas -- provider-plugins/opencode/generated
 //   bun run generate-types.ts
 
+export type AgentHubRunImageFamily = "job-code"
+export type AgentHubRunNetworkClass = "none" | "llm-only" | "build" | "guarded-web"
+export type NetworkResourceKind =
+  | "llm"
+  | "github"
+  | "go_registry"
+  | "crates_registry"
+  | "pypi_registry"
+  | "npm_registry"
+  | "guarded_web"
+export type AgentHubRunIntentSchema = "agent_hub_run_intent_v1"
+export type AgentHubRunToolApproval = "auto" | "dippy"
+export type WorkspaceAccess = "read_only" | "read_write"
+
+/**
+ * Public tool input. It contains requested capabilities only; config identity,
+ * image identity, provider commands, and gateway transport are host-owned.
+ */
+export interface AgentHubRunIntentV1 {
+  /**
+   * @maxItems 32
+   */
+  context_roots?: AgentHubRunContextRootV1[]
+  environment: string
+  image_family: AgentHubRunImageFamily
+  network_class: AgentHubRunNetworkClass
+  /**
+   * @maxItems 32
+   */
+  network_resources?: NetworkResourceKind[]
+  /**
+   * @maxItems 32
+   */
+  overlays?: string[]
+  primary_workspace: string
+  prompt: string
+  schema: AgentHubRunIntentSchema
+  timeout_secs: number
+  tool_approval: AgentHubRunToolApproval
+  /**
+   * @minItems 1
+   * @maxItems 32
+   */
+  workspaces: [AgentHubRunWorkspaceV1, ...AgentHubRunWorkspaceV1[]]
+}
+export interface AgentHubRunContextRootV1 {
+  alias: string
+  path: string
+}
+export interface AgentHubRunWorkspaceV1 {
+  access: WorkspaceAccess
+  alias: string
+  path: string
+}
+
 /**
  * Opaque session identifier.
  *

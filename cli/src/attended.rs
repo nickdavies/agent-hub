@@ -37,6 +37,7 @@ use crate::local::{
 };
 use crate::state::StateStore;
 
+#[cfg(test)]
 pub const DIPPY_SELECTOR_PREFIX: &str = "agent-hub local authorize";
 pub const RESULT_SCHEMA_V3: &str = "attended_result_v3";
 const CLEANUP_RECEIPT_SCHEMA_V1: &str = "attended_cleanup_receipt_v1";
@@ -234,12 +235,8 @@ pub(crate) struct AuthorizationRecord {
     pub state: LaunchState,
     pub attempts: Vec<AttemptLineage>,
     pub active_attempt_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RevalidatedAuthorization {
-    pub artifact: AttendedAuthorizationArtifact,
-    pub authorization_path: String,
+    #[serde(default)]
+    pub decision_receipt: Option<protocol::AgentHubRunReceiptV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,7 +375,18 @@ struct BundleNetworkPolicy {
     name: String,
 }
 
-pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuthorizationArtifact> {
+/// Prepare canonical V3 execution bytes from a trusted host image identity.
+pub(crate) async fn prepare_canonical_execution(
+    input: ProposalInput,
+    image_identity: String,
+) -> anyhow::Result<AttendedAuthorizationArtifact> {
+    build_proposal_resolved(input, image_identity).await
+}
+
+async fn build_proposal_resolved(
+    input: ProposalInput,
+    image_id: String,
+) -> anyhow::Result<AttendedAuthorizationArtifact> {
     ensure!(
         !input.prompt.is_empty(),
         "attended prompt must not be empty"
@@ -473,15 +481,6 @@ pub async fn build_proposal(input: ProposalInput) -> anyhow::Result<AttendedAuth
     )?;
     validate_credential_descriptors(&deployment, &runner, &overlays)?;
     let credential_providers = authorized_credential_providers(&deployment, &runner, &overlays)?;
-    let docker =
-        which::which("docker").context("Docker CLI is required to resolve the reviewed image")?;
-    let image_id = inspect_image_identity(
-        &docker,
-        &environment.image,
-        &Deadline::new(Some(30))?,
-        &Cancellation::never(),
-    )
-    .await?;
     let prompt_digest =
         protocol::sha256_hex_with_domain(b"agent-hub:attended-prompt:v1\0", prompt.as_bytes());
     let policy_environment = network_policy_environment(&deployment, &input.network_class)?;
@@ -564,6 +563,7 @@ fn prompt_with_result_contract(prompt: &str) -> String {
     )
 }
 
+#[cfg(test)]
 pub fn render_proposal(
     path: &Path,
     artifact: &AttendedAuthorizationArtifact,
@@ -681,30 +681,6 @@ pub fn render_proposal(
     ))
 }
 
-pub(crate) async fn revalidate_authorization(
-    path: &Path,
-    selectors: AuthorizationSelectors<'_>,
-) -> anyhow::Result<RevalidatedAuthorization> {
-    let (artifact, original_authorization_path) = read_authorization_file(path)?;
-    let request = artifact.verify_v3().map_err(anyhow::Error::msg)?;
-    verify_authorization_selectors(&request, &artifact, &selectors)?;
-    verify_execution_inputs(&request)?;
-    let docker =
-        which::which("docker").context("Docker CLI is required to authorize attended execution")?;
-    let current_image = inspect_image_identity(
-        &docker,
-        &request.proposal.image_tag,
-        &Deadline::new(Some(30))?,
-        &Cancellation::never(),
-    )
-    .await?;
-    verify_image_identity(&request.proposal.image_id, &current_image)?;
-    Ok(RevalidatedAuthorization {
-        artifact,
-        authorization_path: original_authorization_path,
-    })
-}
-
 fn verify_authorization_selectors(
     request: &AttendedAuthorizationRequestV3,
     artifact: &AttendedAuthorizationArtifact,
@@ -748,6 +724,7 @@ fn verify_authorization_selectors(
 pub async fn run(
     store: &StateStore,
     artifact_path: &Path,
+    authorization_key: Option<&str>,
     selectors: AuthorizationSelectors<'_>,
     relay_override: RelayEndpointOverride,
 ) -> anyhow::Result<RunRecord> {
@@ -755,7 +732,8 @@ pub async fn run(
     let request = supplied.verify_v3().map_err(anyhow::Error::msg)?;
     let digest = supplied.digest.clone();
     verify_authorization_selectors(&request, &supplied, &selectors)?;
-    let authorized_path = authorization_path("records", &digest);
+    let authorization_key = authorization_key.unwrap_or(&digest);
+    let authorized_path = authorization_path("records", authorization_key);
     let authorized: AuthorizationRecord = store
         .read_json(&authorized_path)
         .context("attended authorization has not been approved")?;
@@ -768,16 +746,30 @@ pub async fn run(
         config::validate_authoritative_config_root(Path::new(&request.execution.config_root))
             .map_err(anyhow::Error::msg)?;
     let relay_endpoint = resolve_host_relay_endpoint(&deployment, relay_override).await?;
-    let _lock = store.lock(&lock_path(&digest))?;
+    let _lock = store.lock(&lock_path(authorization_key))?;
     let mut authorized: AuthorizationRecord = store.read_json(&authorized_path)?;
     ensure!(
         authorized.artifact == supplied && authorized.authorization_path == supplied_path,
         "authorized artifact does not match supplied artifact"
     );
     ensure!(
-        authorized.domain == "attended",
+        matches!(authorized.domain.as_str(), "attended" | "agent_hub_run"),
         "authorization receipt domain mismatch"
     );
+    if authorized.domain == "agent_hub_run" {
+        let receipt = authorized
+            .decision_receipt
+            .as_ref()
+            .context("agent_hub_run authorization has no decision receipt")?;
+        receipt
+            .verify_binding(&authorized.authorization_id, &digest, Utc::now())
+            .map_err(anyhow::Error::msg)?;
+        ensure!(
+            receipt.decision() == protocol::AgentHubRunDecision::Allow
+                && receipt.receipt_id() == authorized.receipt_id,
+            "agent_hub_run authorization is not bound to an allow receipt"
+        );
+    }
     let runner: config::ResolvedRunnerProfile =
         serde_json::from_value(request.execution.behavior.runner_profile.clone())?;
     ensure!(
@@ -4479,6 +4471,7 @@ fn network_request(resources: &[NetworkResourceKind]) -> NetworkResourceRequest 
     }
 }
 
+#[cfg(test)]
 fn resource_list(resources: &[NetworkResourceKind]) -> String {
     if resources.is_empty() {
         "none".to_string()
@@ -4491,6 +4484,7 @@ fn resource_list(resources: &[NetworkResourceKind]) -> String {
     }
 }
 
+#[cfg(test)]
 fn repeated_selector_args(name: &str, values: impl IntoIterator<Item = String>) -> String {
     values
         .into_iter()
@@ -4498,6 +4492,7 @@ fn repeated_selector_args(name: &str, values: impl IntoIterator<Item = String>) 
         .collect()
 }
 
+#[cfg(test)]
 fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value
@@ -6561,6 +6556,7 @@ grep -qx 'ready\|ready\.' real-llm.log
                 state: super::LaunchState::Authorized,
                 attempts: vec![],
                 active_attempt_id: None,
+                decision_receipt: None,
             };
             let authorization_path = std::path::PathBuf::from("authorizations/test.json");
             store

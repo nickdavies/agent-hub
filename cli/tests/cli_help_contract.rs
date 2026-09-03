@@ -25,27 +25,17 @@ fn executable_local_help_has_the_complete_command_contract() {
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
     for command in [
-        "propose",
-        "authorize",
-        "run",
-        "list",
-        "status",
-        "logs",
-        "result",
-        "cancel",
-        "cleanup",
+        "run", "inspect", "list", "status", "logs", "result", "cancel", "cleanup",
     ] {
         assert!(stdout.contains(command), "missing command {command}");
     }
-    assert!(stdout.contains("agent-hub local propose --config-root"));
-    assert!(stdout.contains("agent-hub local authorize --environment"));
-    assert!(stdout.contains("agent-hub local run --environment"));
-    let unwrapped = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(unwrapped.contains(
-        "--network-class build --network-resource llm --tool-approval dippy --timeout-secs 3600 --authorization"
-    ));
     assert!(
-        stdout
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("propose "))
+    );
+    assert!(
+        !stdout
             .lines()
             .any(|line| line.trim_start().starts_with("authorize "))
     );
@@ -58,25 +48,23 @@ fn executable_local_help_has_the_complete_command_contract() {
 }
 
 #[test]
-fn executable_propose_help_has_only_stdin_prompt_input_and_exact_review_flags() {
-    let help = agent_hub(&["local", "propose", "--help"]);
+fn executable_run_help_exposes_one_step_structured_input_without_bypasses() {
+    let help = agent_hub(&["local", "run", "--help"]);
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
-    for flag in [
-        "--environment",
-        "--image-family",
-        "--network-class",
-        "--network-resource",
-        "--tool-approval",
-        "--overlay",
-        "--workspace",
-        "--primary-workspace",
-        "--context-root",
-        "--timeout-secs",
-        "--prompt-stdin",
-    ] {
-        assert!(stdout.contains(flag), "missing proposal flag {flag}");
+    for flag in ["--request-stdin", "--approvals-server"] {
+        assert!(stdout.contains(flag), "missing one-step run flag {flag}");
     }
-    assert!(!stdout.contains("--prompt-file"));
-    assert!(!stdout.contains("--prompt <"));
+    for forbidden in [
+        "--authorization",
+        "--digest",
+        "--allow",
+        "--bypass",
+        "--skip-approval",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "unexpected bypass/legacy flag {forbidden}"
+        );
+    }
 }

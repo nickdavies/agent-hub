@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentHubRunIntentV1",
+  "description": "Public tool input. It contains requested capabilities only; config identity,\nimage identity, provider commands, and gateway transport are host-owned.",
+  "type": "object",
+  "properties": {
+    "context_roots": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AgentHubRunContextRootV1"
+      },
+      "maxItems": 32
+    },
+    "environment": {
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
+    },
+    "image_family": {
+      "$ref": "#/$defs/AgentHubRunImageFamily"
+    },
+    "network_class": {
+      "$ref": "#/$defs/AgentHubRunNetworkClass"
+    },
+    "network_resources": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/NetworkResourceKind"
+      },
+      "maxItems": 32
+    },
+    "overlays": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 32
+    },
+    "primary_workspace": {
+      "type": "string",
+      "maxLength": 63,
+      "minLength": 1
+    },
+    "prompt": {
+      "type": "string",
+      "maxLength": 1000000,
+      "minLength": 1
+    },
+    "schema": {
+      "$ref": "#/$defs/AgentHubRunIntentSchema"
+    },
+    "timeout_secs": {
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 86400,
+      "minimum": 1
+    },
+    "tool_approval": {
+      "$ref": "#/$defs/AgentHubRunToolApproval"
+    },
+    "workspaces": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentHubRunWorkspaceV1"
+      },
+      "maxItems": 32,
+      "minItems": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "environment",
+    "image_family",
+    "network_class",
+    "tool_approval",
+    "timeout_secs",
+    "prompt",
+    "workspaces",
+    "primary_workspace"
+  ],
+  "$defs": {
+    "AgentHubRunContextRootV1": {
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string",
+          "maxLength": 63,
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "alias",
+        "path"
+      ]
+    },
+    "AgentHubRunImageFamily": {
+      "type": "string",
+      "enum": [
+        "job-code"
+      ]
+    },
+    "AgentHubRunIntentSchema": {
+      "type": "string",
+      "enum": [
+        "agent_hub_run_intent_v1"
+      ]
+    },
+    "AgentHubRunNetworkClass": {
+      "type": "string",
+      "enum": [
+        "none",
+        "llm-only",
+        "build",
+        "guarded-web"
+      ]
+    },
+    "AgentHubRunToolApproval": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "dippy"
+      ]
+    },
+    "AgentHubRunWorkspaceV1": {
+      "type": "object",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/WorkspaceAccess"
+        },
+        "alias": {
+          "type": "string",
+          "maxLength": 63,
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "alias",
+        "path",
+        "access"
+      ]
+    },
+    "NetworkResourceKind": {
+      "type": "string",
+      "enum": [
+        "llm",
+        "github",
+        "go_registry",
+        "crates_registry",
+        "pypi_registry",
+        "npm_registry",
+        "guarded_web"
+      ]
+    },
+    "WorkspaceAccess": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "read_write"
+      ]
+    }
+  }
+}

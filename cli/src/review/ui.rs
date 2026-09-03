@@ -1123,7 +1123,11 @@ fn truncate_str(s: &str, max_width: usize) -> String {
     if s.len() <= max_width {
         return s.to_string();
     }
-    let end = s.floor_char_boundary(max_width.saturating_sub(1));
+    let target = max_width.saturating_sub(1).min(s.len());
+    let end = (0..=target)
+        .rev()
+        .find(|index| s.is_char_boundary(*index))
+        .unwrap_or(0);
     format!("{}\u{2026}", &s[..end])
 }
 

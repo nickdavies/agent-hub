@@ -3,8 +3,8 @@ mod attended_relay;
 mod build;
 mod client;
 mod git_view;
+mod host_run;
 mod local;
-mod local_authorize;
 mod review;
 mod state;
 mod validate;
@@ -16,14 +16,14 @@ mod attended_state_tests;
 mod local_tests;
 
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
-use protocol::NetworkResourceKind;
-
-use crate::attended::{AuthorizationSelectors, ProposalInput};
+#[cfg(test)]
 use crate::local::{RequestedContextRoot, RequestedWorkspace, WorkspaceAccess};
 use crate::state::StateStore;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "agent-hub", version, about = "Agent Hub CLI")]
@@ -36,7 +36,7 @@ struct Cli {
 enum Commands {
     /// Run locally authorized agents
     #[command(
-        after_help = "Examples:\n  agent-hub local propose --config-root /config --environment code-supervised --image-family job-code --network-class build --network-resource llm --tool-approval dippy --workspace primary=/workspace/repo:rw --primary-workspace primary --context-root code=/home/nick.davies/code:ro --timeout-secs 3600 --prompt-stdin --output /secure/authorization.json < /secure/prompt\n  agent-hub local authorize --environment code-supervised --image-family job-code --network-class build --network-resource llm --tool-approval dippy --timeout-secs 3600 --authorization /secure/authorization.json --digest DIGEST\n  agent-hub local run --environment code-supervised --image-family job-code --network-class build --network-resource llm --tool-approval dippy --timeout-secs 3600 --authorization /secure/authorization.json --digest DIGEST"
+        after_help = "Examples:\n  agent-hub local run --request-stdin < agent-hub-run.json\n  agent-hub local inspect --request-stdin < agent-hub-run.json"
     )]
     Local {
         #[command(subcommand)]
@@ -106,83 +106,31 @@ enum BuildTarget {
 
 #[derive(Subcommand)]
 enum LocalCommand {
-    /// Create a deterministic attended authorization proposal
-    Propose {
-        #[arg(long, env = "CONFIG_ROOT")]
-        config_root: PathBuf,
-        #[arg(long)]
-        environment: String,
-        #[arg(long, value_parser = ["job-code"])]
-        image_family: String,
-        #[arg(long, value_parser = ["none", "llm-only", "build", "guarded-web"])]
-        network_class: String,
-        #[arg(long = "network-resource")]
-        network_resources: Vec<NetworkResourceKind>,
-        #[arg(long, value_parser = ["auto", "dippy"])]
-        tool_approval: String,
-        #[arg(long = "overlay")]
-        overlays: Vec<String>,
-        #[arg(long = "workspace", value_parser = parse_workspace, required = true)]
-        workspaces: Vec<RequestedWorkspace>,
-        #[arg(long = "context-root", value_parser = parse_context_root)]
-        context_roots: Vec<RequestedContextRoot>,
-        #[arg(long, value_parser = validate_cli_alias)]
-        primary_workspace: String,
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
-        timeout_secs: u64,
-        /// Read proposal transport from stdin; the prompt is persisted in the private authorization
+    /// Host-owned one-step prepare, approve, and execute path (structured JSON on stdin)
+    #[command(name = "run", alias = "agent-hub-run")]
+    AgentHubRun {
         #[arg(long, action = clap::ArgAction::SetTrue, required = true)]
-        prompt_stdin: bool,
+        request_stdin: bool,
+        /// Explicit host config; automatic rules require the trusted default identity
         #[arg(long)]
-        output: PathBuf,
-    },
-    /// Persist a one-use approval receipt after complete revalidation
-    Authorize {
-        #[arg(long)]
-        environment: String,
-        #[arg(long, value_parser = ["job-code"])]
-        image_family: String,
-        #[arg(long, value_parser = ["none", "llm-only", "build", "guarded-web"])]
-        network_class: String,
-        #[arg(long = "network-resource")]
-        network_resources: Vec<NetworkResourceKind>,
-        #[arg(long, value_parser = ["auto", "dippy"])]
-        tool_approval: String,
-        #[arg(long = "overlay")]
-        overlays: Vec<String>,
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
-        timeout_secs: u64,
-        #[arg(long)]
-        authorization: PathBuf,
-        #[arg(long)]
-        digest: String,
-    },
-    /// Consume an authorization and execute it in the foreground
-    Run {
-        #[arg(long)]
-        environment: String,
-        #[arg(long, value_parser = ["job-code"])]
-        image_family: String,
-        #[arg(long, value_parser = ["none", "llm-only", "build", "guarded-web"])]
-        network_class: String,
-        #[arg(long = "network-resource")]
-        network_resources: Vec<NetworkResourceKind>,
-        #[arg(long, value_parser = ["auto", "dippy"])]
-        tool_approval: String,
-        #[arg(long = "overlay")]
-        overlays: Vec<String>,
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86_400))]
-        timeout_secs: u64,
-        #[arg(long)]
-        authorization: PathBuf,
-        #[arg(long)]
-        digest: String,
-        /// Host-only approvals endpoint; never passed to the sandbox
-        #[arg(long, env = "AGENT_HUB_SERVER")]
-        approvals_server: Option<String>,
-        /// Host-only bearer credential; never passed to the sandbox
+        host_config: Option<PathBuf>,
+        #[arg(
+            long,
+            env = "AGENT_HUB_SERVER",
+            default_value = "http://localhost:8080"
+        )]
+        approvals_server: String,
         #[arg(long, env = "AGENT_HUB_TOKEN")]
         approvals_token: Option<String>,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=600))]
+        approval_timeout_secs: u64,
+    },
+    /// Debug canonical preparation without requesting permission or executing
+    Inspect {
+        #[arg(long, action = clap::ArgAction::SetTrue, required = true)]
+        request_stdin: bool,
+        #[arg(long)]
+        host_config: Option<PathBuf>,
     },
     /// List local attended executions
     List,
@@ -285,103 +233,45 @@ fn main() -> anyhow::Result<()> {
 
 async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
     match command {
-        LocalCommand::Propose {
-            config_root,
-            environment,
-            image_family,
-            network_class,
-            network_resources,
-            tool_approval,
-            overlays,
-            workspaces,
-            context_roots,
-            primary_workspace,
-            timeout_secs,
-            prompt_stdin: _,
-            output,
-        } => {
-            let mut prompt = String::new();
-            std::io::stdin().read_to_string(&mut prompt)?;
-            let artifact = attended::build_proposal(ProposalInput {
-                config_root,
-                environment,
-                image_family,
-                network_class,
-                network_resources,
-                tool_approval,
-                overlays,
-                timeout_secs,
-                prompt,
-                workspaces,
-                context_roots,
-                primary_workspace,
-            })
-            .await?;
-            write_new_private_json(&output, &artifact)?;
-            print!("{}", attended::render_proposal(&output, &artifact)?);
-        }
-        LocalCommand::Run {
-            environment,
-            image_family,
-            network_class,
-            network_resources,
-            tool_approval,
-            overlays,
-            timeout_secs,
-            authorization,
-            digest,
+        LocalCommand::AgentHubRun {
+            request_stdin: _,
+            host_config,
             approvals_server,
             approvals_token,
+            approval_timeout_secs,
         } => {
-            let record = attended::run(
+            let intent = read_host_run_request()?;
+            let trusted_host_config = host_run::default_host_config()?;
+            let output = host_run::run(
                 &state_store()?,
-                &authorization,
-                AuthorizationSelectors {
-                    digest: &digest,
-                    environment: &environment,
-                    image_family: &image_family,
-                    network_class: &network_class,
-                    network_resources: &network_resources,
-                    tool_approval: &tool_approval,
-                    overlays: &overlays,
-                    timeout_secs,
-                },
-                attended::RelayEndpointOverride {
-                    server_url: approvals_server,
-                    token: approvals_token.map(protocol::Secret::new),
+                intent,
+                host_run::HostRunOptions {
+                    host_config: host_config.unwrap_or_else(|| trusted_host_config.clone()),
+                    trusted_host_config,
+                    approvals_server,
+                    approvals_token: approvals_token.map(protocol::Secret::new),
+                    approval_timeout_secs,
                 },
             )
             .await?;
-            println!("{}", serde_json::to_string_pretty(&record)?);
-            attended::ensure_successful_outcome(&record)?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            anyhow::ensure!(
+                output.receipt.decision() == protocol::AgentHubRunDecision::Allow,
+                "agent_hub_run was denied: {}",
+                output.receipt.reason().unwrap_or("denied by policy")
+            );
+            attended::ensure_successful_outcome(output.run.as_ref().expect("allow has run"))?;
         }
-        LocalCommand::Authorize {
-            environment,
-            image_family,
-            network_class,
-            network_resources,
-            tool_approval,
-            overlays,
-            timeout_secs,
-            authorization,
-            digest,
+        LocalCommand::Inspect {
+            request_stdin: _,
+            host_config,
         } => {
-            let receipt = local_authorize::authorize(
-                &state_store()?,
-                &authorization,
-                AuthorizationSelectors {
-                    digest: &digest,
-                    environment: &environment,
-                    image_family: &image_family,
-                    network_class: &network_class,
-                    network_resources: &network_resources,
-                    tool_approval: &tool_approval,
-                    overlays: &overlays,
-                    timeout_secs,
-                },
-            )
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            let config = match host_config {
+                Some(path) => path,
+                None => host_run::default_host_config()?,
+            };
+            let artifact = host_run::inspect(read_host_run_request()?, &config).await?;
+            println!("{}", serde_json::to_string_pretty(&artifact)?);
         }
         LocalCommand::List => {
             println!(
@@ -505,6 +395,18 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_host_run_request() -> anyhow::Result<protocol::AgentHubRunIntentV1> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(protocol::ATTENDED_GATEWAY_MAX_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= protocol::ATTENDED_GATEWAY_MAX_FRAME_BYTES,
+        "agent_hub_run request exceeds limit"
+    );
+    serde_json::from_slice(&bytes).map_err(Into::into)
+}
+
 fn state_store() -> anyhow::Result<StateStore> {
     let root = match std::env::var_os("AGENT_HUB_ATTENDED_STATE") {
         Some(root) => PathBuf::from(root),
@@ -516,6 +418,7 @@ fn state_store() -> anyhow::Result<StateStore> {
     StateStore::open(root)
 }
 
+#[cfg(test)]
 fn parse_workspace(value: &str) -> Result<RequestedWorkspace, String> {
     let (alias, raw) = value
         .split_once('=')
@@ -539,6 +442,7 @@ fn parse_workspace(value: &str) -> Result<RequestedWorkspace, String> {
     })
 }
 
+#[cfg(test)]
 fn parse_context_root(value: &str) -> Result<RequestedContextRoot, String> {
     let (alias, raw) = value
         .split_once('=')
@@ -558,6 +462,7 @@ fn parse_context_root(value: &str) -> Result<RequestedContextRoot, String> {
     })
 }
 
+#[cfg(test)]
 fn validate_cli_alias(alias: &str) -> Result<String, String> {
     if alias.is_empty()
         || alias.len() > 63
@@ -573,6 +478,7 @@ fn validate_cli_alias(alias: &str) -> Result<String, String> {
     Ok(alias.to_string())
 }
 
+#[cfg(test)]
 fn validate_cli_mount_path(path: &str) -> Result<(), String> {
     if path.is_empty()
         || !Path::new(path).is_absolute()
@@ -584,35 +490,6 @@ fn validate_cli_mount_path(path: &str) -> Result<(), String> {
             "mount path must be a non-empty canonical absolute path without delimiters".into(),
         );
     }
-    Ok(())
-}
-
-fn write_new_private_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    use std::io::Write as _;
-    anyhow::ensure!(
-        !path.as_os_str().is_empty(),
-        "authorization output path is empty"
-    );
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("authorization output has no parent"))?;
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    anyhow::ensure!(
-        parent.is_dir(),
-        "authorization output parent does not exist"
-    );
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(path)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -633,7 +510,25 @@ mod attended_cli_tests {
     }
 
     #[test]
-    fn proposal_prompt_contract_has_only_explicit_stdin() {
+    fn legacy_commands_and_bypass_flags_are_rejected() {
+        assert!(Cli::try_parse_from(["agent-hub", "local", "propose", "--help"]).is_err());
+        assert!(Cli::try_parse_from(["agent-hub", "local", "authorize", "--help"]).is_err());
+        for flag in [
+            "--authorization",
+            "--digest",
+            "--allow",
+            "--bypass",
+            "--skip-approval",
+        ] {
+            assert!(
+                Cli::try_parse_from(["agent-hub", "local", "run", "--request-stdin", flag, "x"])
+                    .is_err()
+            );
+        }
+    }
+
+    /*
+    fn obsolete_proposal_contract() {
         let valid = vec![
             "agent-hub",
             "local",
@@ -721,8 +616,7 @@ mod attended_cli_tests {
         );
     }
 
-    #[test]
-    fn run_contract_has_exact_ordered_selectors_authorization_and_digest() {
+    fn obsolete_run_contract() {
         let valid = vec![
             "agent-hub",
             "local",
@@ -780,6 +674,7 @@ mod attended_cli_tests {
         );
         assert!(Cli::try_parse_from(["agent-hub", "local", "authorize", "--help"]).is_err());
     }
+    */
 
     #[test]
     fn result_document_commands_have_stable_cli_shapes() {

@@ -46,6 +46,20 @@ enum Command {
     Question(question::QuestionArgs),
     /// Report a strict host-supervision transition (reads transition JSON from stdin)
     Supervision(SupervisionArgs),
+    /// Resolve the host-owned one-step launch permission (reads structured JSON from stdin)
+    AgentHubRunResolved(AgentHubRunResolvedArgs),
+}
+
+#[derive(Args)]
+struct AgentHubRunResolvedArgs {
+    #[arg(long, env = "AGENT_HUB_SERVER")]
+    server: String,
+    #[arg(long, env = "AGENT_HUB_TOKEN")]
+    token: Option<Secret>,
+    #[arg(long, default_value = "600")]
+    timeout: u64,
+    #[arg(long, default_value = "~/.config/agent-hub/agent-hub-permissions.json")]
+    config: String,
 }
 
 #[derive(Args)]
@@ -134,6 +148,7 @@ struct SupervisionArgs {
 
 // --- Entrypoint ---
 
+#[derive(Debug)]
 enum RunError {
     /// Hard failure — bad input, config error, etc. Agent should deny.
     FailClosed(String),
@@ -169,6 +184,129 @@ async fn main() -> ExitCode {
         Command::StatusReport(args) => run_status_report(args).await,
         Command::Question(args) => question::run(args).await,
         Command::Supervision(args) => run_supervision(args).await,
+        Command::AgentHubRunResolved(args) => run_agent_hub_run_resolved(args).await,
+    }
+}
+
+#[derive(Debug)]
+struct GatewayResolution {
+    output: HookOutput,
+    authority: protocol::AgentHubRunDecisionAuthority,
+}
+
+async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
+    if !(1..=600).contains(&args.timeout) {
+        eprintln!("agent-hub-gateway: agent_hub_run timeout is outside the supported range");
+        return ExitCode::from(2);
+    }
+    let mut input = Vec::new();
+    if let Err(error) = std::io::stdin()
+        .take(protocol::ATTENDED_GATEWAY_MAX_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut input)
+    {
+        eprintln!("agent-hub-gateway: failed to read agent_hub_run request: {error}");
+        return ExitCode::from(2);
+    }
+    if input.len() > protocol::ATTENDED_GATEWAY_MAX_FRAME_BYTES {
+        eprintln!("agent-hub-gateway: agent_hub_run request exceeds limit");
+        return ExitCode::from(2);
+    }
+    let hook: protocol::OpenCodeHookInput = match serde_json::from_slice(&input) {
+        Ok(hook) => hook,
+        Err(error) => {
+            eprintln!("agent-hub-gateway: invalid agent_hub_run request: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let raw = &hook.tool_input;
+    let permission = serde_json::from_value::<protocol::AgentHubRunResolvedV1>(raw.clone());
+    if hook.tool.to_string() != protocol::AGENT_HUB_RUN_PERMISSION_NAME
+        || hook.tool_match_input.as_ref() != Some(raw)
+        || !matches!(
+            permission.as_ref(),
+            Ok(request) if request.validate(chrono::Utc::now()).is_ok()
+        )
+    {
+        eprintln!("agent-hub-gateway: invalid canonical agent_hub_run_resolved payload");
+        return ExitCode::from(2);
+    }
+    let permission = permission.expect("validated above");
+    let expected_hook = permission
+        .gateway_event()
+        .expect("validated request has an event");
+    if serde_json::to_value(&hook).ok() != serde_json::to_value(expected_hook).ok() {
+        eprintln!("agent-hub-gateway: agent_hub_run gateway event binding mismatch");
+        return ExitCode::from(2);
+    }
+    let event = match hook.try_into() {
+        Ok(event) => event,
+        Err(error) => {
+            eprintln!("agent-hub-gateway: failed to normalize agent_hub_run request: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let approval = ApprovalArgs {
+        claude: false,
+        cursor: false,
+        opencode: true,
+        server: Some(args.server),
+        token: args.token,
+        approval_mode: None,
+        approval_socket: None,
+        approval_binding: None,
+        approval_deadline: None,
+        call_id: None,
+        request_id: Some(permission.invocation_id.clone()),
+        raw_args_digest: None,
+        canonical_args_digest: None,
+        timeout: args.timeout,
+        config: args.config,
+    };
+    match run(
+        &approval,
+        "opencode",
+        &event,
+        &expand_tilde(&approval.config),
+    )
+    .await
+    {
+        Ok(resolution) => {
+            let decision = match resolution.output.status {
+                DecisionStatus::Approved => protocol::AgentHubRunDecision::Allow,
+                DecisionStatus::Denied | DecisionStatus::DeniedWithReason(_) => {
+                    protocol::AgentHubRunDecision::Deny
+                }
+            };
+            let reason = match resolution.output.status {
+                DecisionStatus::DeniedWithReason(reason) => Some(reason),
+                _ => resolution.output.message,
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&protocol::AgentHubRunDecisionV1 {
+                    schema: protocol::AGENT_HUB_RUN_DECISION_SCHEMA_V1.into(),
+                    invocation_id: permission.invocation_id.clone(),
+                    canonical_digest: permission.canonical_digest.clone(),
+                    request_digest: permission.request_digest.clone(),
+                    decision,
+                    authority: resolution.authority,
+                    approval_id: permission.invocation_id.clone(),
+                    reason,
+                    decided_at: chrono::Utc::now(),
+                    expires_at: permission.expires_at,
+                })
+                .expect("gateway decision serializes")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(RunError::ServerUnreachable(error)) => {
+            eprintln!("agent-hub-gateway: {error}");
+            ExitCode::from(1)
+        }
+        Err(RunError::FailClosed(error)) => {
+            eprintln!("agent-hub-gateway: {error}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -346,7 +484,8 @@ where
     let config_path = expand_tilde(&args.config);
 
     match run(&args, provider_name, &event, &config_path).await {
-        Ok(decision) => {
+        Ok(resolution) => {
+            let decision = resolution.output;
             eprintln!(
                 "[info] final decision for tool={}: {:?}",
                 event.tool_call.tool_name(),
@@ -435,7 +574,7 @@ async fn run(
     provider_name: &str,
     event: &ToolHookEvent,
     config_path: &str,
-) -> Result<HookOutput, RunError> {
+) -> Result<GatewayResolution, RunError> {
     if args.approval_socket.is_some() {
         let raw_digest = protocol::opencode_raw_args_digest(event.tool_call.raw_input())
             .map_err(RunError::FailClosed)?;
@@ -506,6 +645,11 @@ async fn run(
             hd
         }
         ConfigAction::Delegation(ref command) => {
+            if event.tool_call.tool_name() == protocol::AGENT_HUB_RUN_PERMISSION_NAME {
+                return Err(RunError::FailClosed(
+                    "agent_hub_run does not accept configured delegate commands".to_string(),
+                ));
+            }
             eprintln!(
                 "[info] delegating tool={} to: {}",
                 event.tool_call.tool_name(),
@@ -582,7 +726,14 @@ async fn run(
         }
     }
 
-    Ok(output)
+    Ok(GatewayResolution {
+        output,
+        authority: if remote_decision {
+            protocol::AgentHubRunDecisionAuthority::Human
+        } else {
+            protocol::AgentHubRunDecisionAuthority::Automatic
+        },
+    })
 }
 
 async fn report_execution_transition(
@@ -1034,31 +1185,6 @@ async fn shutdown_signal() {
             .expect("failed to install ctrl+c handler");
     }
 }
-fn status_to_output(status: &ApprovalStatus) -> HookOutput {
-    match status {
-        ApprovalStatus::Approved { message } => HookOutput {
-            status: DecisionStatus::Approved,
-            message: message.clone(),
-        },
-        ApprovalStatus::Denied { reason } => HookOutput {
-            status: if reason.is_empty() {
-                DecisionStatus::Denied
-            } else {
-                DecisionStatus::DeniedWithReason(reason.clone())
-            },
-            message: None,
-        },
-        ApprovalStatus::Cancelled => HookOutput {
-            status: DecisionStatus::PipelineError,
-            message: None,
-        },
-        ApprovalStatus::Pending => HookOutput {
-            status: DecisionStatus::PipelineError,
-            message: None,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,5 +1279,113 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ApprovalFlowError::Pipeline(_))));
+
+#[cfg(test)]
+mod agent_hub_run_gateway_tests {
+    use super::*;
+
+    fn event() -> ToolHookEvent {
+        protocol::OpenCodeHookInput {
+            session_id: protocol::SessionId::new("host-run-test"),
+            tool: protocol::OpenCodeTool::Unknown(protocol::AGENT_HUB_RUN_PERMISSION_NAME.into()),
+            tool_input: serde_json::json!({"canonical_digest":"a".repeat(64)}),
+            tool_match_input: Some(serde_json::json!({"canonical_digest":"a".repeat(64)})),
+            cwd: "/workspace".into(),
+            workspace_roots: Some(vec!["/workspace".into()]),
+            hook_event_name: "agent_hub_run.host.before".into(),
+            session_title: Some("host run".into()),
+        }
+        .try_into()
+        .unwrap()
+    }
+
+    fn args(server: String, config: String) -> ApprovalArgs {
+        ApprovalArgs {
+            claude: false,
+            cursor: false,
+            opencode: true,
+            server: Some(server),
+            token: None,
+            approval_mode: None,
+            approval_socket: None,
+            approval_binding: None,
+            approval_deadline: None,
+            call_id: None,
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
+            raw_args_digest: None,
+            canonical_args_digest: None,
+            timeout: 2,
+            config,
+        }
+    }
+
+    fn config(action: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("gateway-host-run-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("permissions.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"version":1,"default":action,"rules":[]}).to_string(),
+        )
+        .unwrap();
+        (root, path)
+    }
+
+    #[tokio::test]
+    async fn automatic_allow_and_deny_are_terminal_gateway_decisions() {
+        for (action, approved) in [("allow", true), ("deny", false)] {
+            let (root, config) = config(action);
+            let args = args("http://127.0.0.1:1".into(), config.display().to_string());
+            let resolution = run(&args, "opencode", &event(), &args.config)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolution.authority,
+                protocol::AgentHubRunDecisionAuthority::Automatic
+            );
+            assert_eq!(
+                matches!(resolution.output.status, DecisionStatus::Approved),
+                approved
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_is_resolved_by_human_path_before_returning() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut bytes = vec![0; 65_536];
+            let count = stream.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..count]);
+            assert!(request.starts_with("POST /api/v1/hooks/approval "));
+            let body = serde_json::json!({
+                "id": uuid::Uuid::new_v4(),
+                "type": "approved",
+                "message": "human approved"
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let (root, config) = config("ask");
+        let args = args(format!("http://{address}"), config.display().to_string());
+        let resolution = run(&args, "opencode", &event(), &args.config)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolution.authority,
+            protocol::AgentHubRunDecisionAuthority::Human
+        );
+        assert!(matches!(resolution.output.status, DecisionStatus::Approved));
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

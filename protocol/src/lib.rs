@@ -12,6 +12,7 @@ pub mod attended_gateway;
 pub mod config;
 pub mod gateway;
 pub mod hooks;
+pub mod host_run;
 pub mod job_events;
 pub mod orchestration;
 pub mod presence;
@@ -61,6 +62,13 @@ pub use gateway::{
     OpenCodeHookOutput, OpenCodeTool, PermissionDecision,
 };
 pub use hooks::{NotificationPayload, SessionEndPayload, StatusReport, StopPayload};
+pub use host_run::{
+    AGENT_HUB_RUN_DECISION_SCHEMA_V1, AGENT_HUB_RUN_INTENT_SCHEMA_V1,
+    AGENT_HUB_RUN_PERMISSION_NAME, AGENT_HUB_RUN_RESOLVED_SCHEMA_V1, AgentHubRunContextRootV1,
+    AgentHubRunDecision, AgentHubRunDecisionAuthority, AgentHubRunDecisionV1,
+    AgentHubRunImageFamily, AgentHubRunIntentSchema, AgentHubRunIntentV1, AgentHubRunNetworkClass,
+    AgentHubRunReceiptV1, AgentHubRunResolvedV1, AgentHubRunToolApproval, AgentHubRunWorkspaceV1,
+};
 pub use job_events::{JOB_EVENT_SCHEMA_NAME, JobEvent, JobEventKind};
 pub use orchestration::{
     AGENT_CONTEXT_SCHEMA_NAME, AGENT_CONTEXT_SCHEMA_VERSION, AGENT_OUTPUT_SCHEMA_NAME,

@@ -365,6 +365,112 @@ fn request_v3() -> protocol::AttendedAuthorizationRequestV3 {
 }
 
 #[test]
+fn agent_hub_run_receipts_bind_decision_digest_invocation_and_expiry() {
+    let artifact = request_v3().canonical_artifact().unwrap();
+    let now = chrono::Utc::now();
+    let invocation = uuid::Uuid::new_v4().to_string();
+    let request = protocol::AgentHubRunResolvedV1::new(
+        invocation.clone(),
+        artifact.clone(),
+        now,
+        now + chrono::Duration::minutes(5),
+    )
+    .unwrap();
+
+    for (decision, authority) in [
+        (
+            protocol::AgentHubRunDecision::Allow,
+            protocol::AgentHubRunDecisionAuthority::Automatic,
+        ),
+        (
+            protocol::AgentHubRunDecision::Allow,
+            protocol::AgentHubRunDecisionAuthority::Human,
+        ),
+        (
+            protocol::AgentHubRunDecision::Deny,
+            protocol::AgentHubRunDecisionAuthority::Automatic,
+        ),
+        (
+            protocol::AgentHubRunDecision::Deny,
+            protocol::AgentHubRunDecisionAuthority::Human,
+        ),
+    ] {
+        let decision_record = protocol::AgentHubRunDecisionV1 {
+            schema: protocol::AGENT_HUB_RUN_DECISION_SCHEMA_V1.into(),
+            invocation_id: invocation.clone(),
+            canonical_digest: artifact.digest.clone(),
+            request_digest: request.request_digest.clone(),
+            decision,
+            authority,
+            approval_id: uuid::Uuid::new_v4().to_string(),
+            reason: None,
+            decided_at: now,
+            expires_at: request.expires_at,
+        };
+        let receipt =
+            protocol::AgentHubRunReceiptV1::issue(&request, decision_record, now).unwrap();
+        assert!(receipt.verify(&request, now).is_ok());
+        let mut wrong_invocation = request.clone();
+        wrong_invocation.invocation_id = uuid::Uuid::new_v4().to_string();
+        assert!(receipt.verify(&wrong_invocation, now).is_err());
+        let mut wrong_digest = request.clone();
+        wrong_digest.canonical_digest = "0".repeat(64);
+        assert!(receipt.verify(&wrong_digest, now).is_err());
+        assert!(
+            receipt
+                .verify(&request, now + chrono::Duration::minutes(6))
+                .is_err()
+        );
+
+        let mut tampered = serde_json::to_value(&receipt).unwrap();
+        tampered["canonical_digest"] = serde_json::Value::String("f".repeat(64));
+        let tampered: protocol::AgentHubRunReceiptV1 = serde_json::from_value(tampered).unwrap();
+        assert!(tampered.verify(&request, now).is_err());
+    }
+}
+
+#[test]
+fn agent_hub_run_public_intent_excludes_host_owned_fields_and_enforces_bounds() {
+    let base = serde_json::json!({
+        "schema":"agent_hub_run_intent_v1",
+        "environment":"code-auto",
+        "image_family":"job-code",
+        "network_class":"build",
+        "network_resources":["llm"],
+        "tool_approval":"auto",
+        "overlays":[],
+        "timeout_secs":60,
+        "prompt":"test",
+        "workspaces":[{"alias":"source","path":"/workspace/source","access":"read_write"}],
+        "context_roots":[],
+        "primary_workspace":"source"
+    });
+    let intent: protocol::AgentHubRunIntentV1 = serde_json::from_value(base.clone()).unwrap();
+    intent.validate_shape().unwrap();
+    for field in [
+        "config_root",
+        "image_digest",
+        "provider_command",
+        "gateway_path",
+    ] {
+        let mut value = base.clone();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(field.into(), serde_json::json!("untrusted"));
+        assert!(serde_json::from_value::<protocol::AgentHubRunIntentV1>(value).is_err());
+    }
+    let mut zero_timeout = intent.clone();
+    zero_timeout.timeout_secs = 0;
+    assert!(zero_timeout.validate_shape().is_err());
+    let mut duplicate = intent;
+    duplicate
+        .network_resources
+        .push(protocol::NetworkResourceKind::Llm);
+    assert!(duplicate.validate_shape().is_err());
+}
+
+#[test]
 fn attended_authorization_requires_a_positive_bounded_deadline() {
     for timeout in [None, Some(0), Some(86_401)] {
         let mut invalid = request();

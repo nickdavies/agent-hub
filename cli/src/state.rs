@@ -67,6 +67,32 @@ impl StateStore {
         Ok(())
     }
 
+    /// Atomically publishes immutable content, or verifies that an existing
+    /// object has exactly the same serialized bytes.
+    pub(crate) fn create_or_verify_json<T: Serialize>(
+        &self,
+        relative: &Path,
+        value: &T,
+    ) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec_pretty(value)?;
+        match self.create_json(relative, value) {
+            Ok(()) => Ok(()),
+            Err(create_error) => {
+                let path = self.checked_path(relative)?;
+                let mut existing = Vec::new();
+                open_owned_file(&path)
+                    .with_context(|| format!("{create_error:#}"))?
+                    .read_to_end(&mut existing)?;
+                ensure!(
+                    existing == bytes,
+                    "immutable state object differs: {}",
+                    path.display()
+                );
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn lock(&self, relative: &Path) -> anyhow::Result<StateLock> {
         self.ensure_root()?;
         let path = self.checked_path(relative)?;

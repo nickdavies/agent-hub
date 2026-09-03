@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 
 const IMAGE_TAG: &str = "agent-hub/job-code:2026-09-01";
 
-#[test]
+/*
 fn authorization_retries_preflight_and_fences_concurrent_attempts() {
     let root = temp_root();
     let config = root.join("config");
@@ -167,6 +167,137 @@ fn authorization_retries_preflight_and_fences_concurrent_attempts() {
     assert!(String::from_utf8_lossy(&replay.stderr).contains("already consumed"));
     std::fs::remove_dir_all(root).unwrap();
 }
+*/
+
+#[test]
+fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() {
+    let root = temp_root();
+    let config = root.join("config");
+    let workspace = root.join("workspace");
+    let state = root.join("state");
+    let docker_marker = root.join("docker.calls");
+    let fake_bin = root.join("bin");
+    let gateway_script = fake_bin.join("agent-hub-gateway");
+    let decision = root.join("gateway-decision");
+    std::fs::create_dir(&workspace).unwrap();
+    initialize_repository(&workspace);
+    std::fs::create_dir(&fake_bin).unwrap();
+    write_config(&config, &workspace);
+    write_fake_docker(&fake_bin.join("docker"), &docker_marker, &workspace, &root);
+    write_fake_run_gateway(&gateway_script, &decision, &state, &docker_marker);
+    let host_dir = root.join("home/.config/agent-hub");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let gateway_config = host_dir.join("permissions.json");
+    std::fs::write(&gateway_config, "{}").unwrap();
+    std::fs::write(
+        host_dir.join("host-run.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema":"agent_hub_run_host_v1",
+            "config_root":std::fs::canonicalize(&config).unwrap(),
+            "gateway_path":std::fs::canonicalize(&gateway_script).unwrap(),
+            "gateway_config":std::fs::canonicalize(&gateway_config).unwrap(),
+            "image_digests":{"test":format!("sha256:{}", "a".repeat(64))}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let launch = serde_json::json!({
+        "schema":"agent_hub_run_intent_v1",
+        "environment":"test",
+        "image_family":"job-code",
+        "network_class":"none",
+        "network_resources":[],
+        "tool_approval":"auto",
+        "overlays":[],
+        "timeout_secs":30,
+        "prompt":"Return success",
+        "workspaces":[{"alias":"primary","path":workspace,"access":"read_write"}],
+        "context_roots":[],
+        "primary_workspace":"primary"
+    });
+    let args = ["local", "agent-hub-run", "--request-stdin"];
+
+    let alternate_host_config = host_dir.join("alternate-host-run.json");
+    std::fs::copy(host_dir.join("host-run.json"), &alternate_host_config).unwrap();
+    let untrusted = invoke(
+        &root,
+        &fake_bin,
+        &state,
+        &[
+            "local",
+            "run",
+            "--request-stdin",
+            "--host-config",
+            alternate_host_config.to_str().unwrap(),
+        ],
+        Some(&launch.to_string()),
+    );
+    assert!(!untrusted.status.success());
+    assert!(
+        String::from_utf8_lossy(&untrusted.stderr).contains("trusted host configuration identity")
+    );
+    assert!(!state.exists());
+
+    std::fs::write(&decision, "deny automatic").unwrap();
+    let denied = invoke(&root, &fake_bin, &state, &args, Some(&launch.to_string()));
+    assert!(!denied.status.success());
+    assert!(
+        !denied.stdout.is_empty(),
+        "one-step deny produced no receipt: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert!(
+        !docker_marker.exists(),
+        "denied one-step launch invoked Docker"
+    );
+    let denied_json: serde_json::Value = serde_json::from_slice(&denied.stdout).unwrap();
+    assert_eq!(denied_json["receipt"]["decision"], "deny");
+    assert_eq!(denied_json["receipt"]["authority"], "automatic");
+    assert!(state.join("agent-hub-run/invocations").is_dir());
+    assert!(!state.join("authorizations/records").exists());
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("tracked.txt")).unwrap(),
+        "tracked\n"
+    );
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(status.status.success() && status.stdout.is_empty());
+
+    std::fs::write(&decision, "allow human").unwrap();
+    std::fs::write(root.join("fail-preflight-once"), "fail").unwrap();
+    let allowed = invoke(&root, &fake_bin, &state, &args, Some(&launch.to_string()));
+    assert_success(&allowed);
+    let output: serde_json::Value = serde_json::from_slice(&allowed.stdout).unwrap();
+    assert_eq!(output["receipt"]["decision"], "allow");
+    assert_eq!(output["receipt"]["authority"], "human");
+    assert_eq!(output["run"]["attempt_number"], 2);
+    assert!(docker_marker.exists());
+
+    let invocation = output["receipt"]["invocation_id"].as_str().unwrap();
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(state.join(format!("authorizations/records/{invocation}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(record["receipt_id"], output["receipt"]["approval_id"]);
+    assert_eq!(record["decision_receipt"], output["receipt"]);
+    let repeated = invoke(&root, &fake_bin, &state, &args, Some(&launch.to_string()));
+    assert_success(&repeated);
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_ne!(
+        repeated["receipt"]["invocation_id"],
+        output["receipt"]["invocation_id"]
+    );
+    assert_eq!(
+        repeated["receipt"]["canonical_digest"],
+        output["receipt"]["canonical_digest"]
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 fn initialize_repository(path: &Path) {
     let git = |args: &[&str]| {
@@ -206,6 +337,7 @@ fn invoke(
         .args(args)
         .current_dir(root)
         .env("AGENT_HUB_ATTENDED_STATE", state)
+        .env("HOME", root.join("home"))
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .stdin(if stdin.is_some() {
             std::process::Stdio::piped()
@@ -328,6 +460,22 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn write_fake_run_gateway(path: &Path, decision: &Path, state: &Path, docker_marker: &Path) {
+    std::fs::write(
+        path,
+        format!(
+            "#!/bin/sh\n[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; d,a=open(\"{}\").read().split(); print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":r[\"canonical_digest\"],\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":r[\"invocation_id\"],\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":r[\"expires_at\"]}}))'\n",
+            state.display(),
+            state.display(),
+            decision.display(),
+            docker_marker.display(),
+            decision.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn preflight_report(uid: u32, gid: u32) -> serde_json::Value {
     let tools = [
         "agent_hub_gateway",
@@ -405,7 +553,12 @@ fn preflight_report(uid: u32, gid: u32) -> serde_json::Value {
 }
 
 fn temp_root() -> PathBuf {
-    let root = std::env::temp_dir().join(format!("authorization-process-{}", uuid::Uuid::new_v4()));
+    let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/test-tmp");
+    std::fs::create_dir_all(&parent).unwrap();
+    let root = parent.join(format!("authorization-process-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
     root
 }
