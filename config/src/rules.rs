@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use strum::Display;
 
 use protocol::{Tool, expand_tool_group};
@@ -36,6 +37,18 @@ struct RuleJson {
     /// Tilde (~) is expanded and roots are lexically normalized at load time. Paths need not
     /// exist, and symlinks are not resolved through the filesystem.
     in_cwds: Option<Vec<String>>,
+    /// If set, rule only matches tool inputs containing this object recursively.
+    #[serde(default, deserialize_with = "deserialize_optional_input")]
+    input: Option<Map<String, Value>>,
+}
+
+fn deserialize_optional_input<'de, D>(
+    deserializer: D,
+) -> Result<Option<Map<String, Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Map::deserialize(deserializer).map(Some)
 }
 
 // --- Compiled config types ---
@@ -133,6 +146,7 @@ pub(crate) struct Rule {
     pub(crate) in_workspace: Option<bool>,
     pub(crate) in_paths: Option<Vec<String>>,
     pub(crate) in_cwds: Option<Vec<String>>,
+    pub(crate) input: Option<Map<String, Value>>,
     pub(crate) source_json: String,
 }
 
@@ -301,6 +315,7 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
                 .in_paths
                 .map(|paths| paths.into_iter().map(|p| expand_tilde(&p)).collect()),
             in_cwds,
+            input: raw_rule.input,
             source_json,
         });
     }
@@ -342,10 +357,12 @@ fn validate_tool_config_dto(config: &ToolConfigJson) -> Result<(), String> {
                 return Err(format!("rule {number} has invalid '{name}'"));
             }
         }
-        if rule.in_paths.as_ref().is_some_and(|paths| {
-            paths.is_empty() || paths.iter().any(|path| path.trim().is_empty())
-        }) {
-            return Err(format!("rule {number} has invalid 'in_paths'"));
+        for (name, paths) in [("in_paths", &rule.in_paths), ("in_cwds", &rule.in_cwds)] {
+            if paths.as_ref().is_some_and(|paths| {
+                paths.is_empty() || paths.iter().any(|path| path.trim().is_empty())
+            }) {
+                return Err(format!("rule {number} has invalid '{name}'"));
+            }
         }
     }
     Ok(())
@@ -355,6 +372,24 @@ pub fn resolve_action(
     config: &ToolConfig,
     tool: &Tool,
     resolved_args: &[String],
+    cwd: Option<&str>,
+    workspace_roots: Option<&[String]>,
+) -> ConfigAction {
+    resolve_action_with_input(
+        config,
+        tool,
+        resolved_args,
+        &Value::Null,
+        cwd,
+        workspace_roots,
+    )
+}
+
+pub fn resolve_action_with_input(
+    config: &ToolConfig,
+    tool: &Tool,
+    resolved_args: &[String],
+    input: &Value,
     cwd: Option<&str>,
     workspace_roots: Option<&[String]>,
 ) -> ConfigAction {
@@ -396,6 +431,12 @@ pub fn resolve_action(
             if !is_in_workspace(cwd, in_cwds) {
                 continue;
             }
+        }
+
+        if let Some(expected) = &rule.input
+            && !input_object_is_subset(expected, input)
+        {
+            continue;
         }
 
         if let Some(required) = rule.in_workspace {
@@ -441,6 +482,24 @@ pub fn resolve_action(
     }
     eprintln!("agent-hub-gateway: [debug] no rule matched, using default");
     default_to_resolved(&config.default)
+}
+
+fn input_object_is_subset(expected: &Map<String, Value>, actual: &Value) -> bool {
+    let Some(actual) = actual.as_object() else {
+        return false;
+    };
+    expected.iter().all(|(key, expected_value)| {
+        actual
+            .get(key)
+            .is_some_and(|actual_value| input_value_matches(expected_value, actual_value))
+    })
+}
+
+fn input_value_matches(expected: &Value, actual: &Value) -> bool {
+    match expected {
+        Value::Object(expected) => input_object_is_subset(expected, actual),
+        _ => expected == actual,
+    }
 }
 
 pub fn default_to_resolved(default: &DefaultAction) -> ConfigAction {
@@ -623,6 +682,7 @@ mod tests {
             in_workspace: None,
             in_paths: None,
             in_cwds: None,
+            input: None,
             source_json: String::new(),
         }
     }
@@ -638,6 +698,20 @@ mod tests {
             in_workspace: None,
             in_paths: None,
             in_cwds: None,
+            input: None,
+            source_json: String::new(),
+        }
+    }
+
+    fn make_input_rule(entry: &str, input: Value, action: ResolvedAction) -> Rule {
+        Rule {
+            matchers: vec![parse_tool_entry(entry).unwrap()],
+            action,
+            message: None,
+            in_workspace: None,
+            in_paths: None,
+            in_cwds: None,
+            input: Some(input.as_object().unwrap().clone()),
             source_json: String::new(),
         }
     }
@@ -657,6 +731,7 @@ mod tests {
             in_workspace,
             in_paths: None,
             in_cwds: None,
+            input: None,
             source_json: String::new(),
         }
     }
@@ -732,6 +807,284 @@ mod tests {
         assert!(matches!(
             resolve_action_by_name(&config, "Write", &[], None, None),
             ConfigAction::Decision(ConfigDecision::Deny(_))
+        ));
+    }
+
+    #[test]
+    fn custom_tool_input_matches_recursive_object_subset() {
+        let config = make_config(
+            vec![make_input_rule(
+                "custom_tool",
+                serde_json::json!({
+                    "request": {"mode": "safe", "options": {"retries": 2}},
+                    "targets": ["one", "two"]
+                }),
+                ResolvedAction::Allow,
+            )],
+            DefaultAction::Deny,
+        );
+        let actual = serde_json::json!({
+            "targets": ["one", "two"],
+            "request": {
+                "options": {"trace": true, "retries": 2},
+                "mode": "safe",
+                "runtime_only": "allowed"
+            },
+            "top_level_extra": true
+        });
+
+        assert!(matches!(
+            resolve_action_with_input(
+                &config,
+                &Tool::Unknown("custom_tool".to_string()),
+                &[],
+                &actual,
+                Some("/workspace"),
+                None,
+            ),
+            ConfigAction::Decision(ConfigDecision::Allow)
+        ));
+    }
+
+    #[test]
+    fn input_subset_property_requires_every_expected_key_at_each_object_level() {
+        let values = [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(["one", "two"]),
+            serde_json::json!({"leaf": "value"}),
+        ];
+
+        for expected_mask in 0_u8..16 {
+            let mut expected_nested = Map::new();
+            for (index, value) in values.iter().enumerate() {
+                if expected_mask & (1 << index) != 0 {
+                    expected_nested.insert(format!("key-{index}"), value.clone());
+                }
+            }
+            let expected = serde_json::json!({"nested": expected_nested});
+
+            for actual_mask in 0_u8..16 {
+                let mut actual_nested = Map::new();
+                for (index, value) in values.iter().enumerate().rev() {
+                    if actual_mask & (1 << index) != 0 {
+                        actual_nested.insert(format!("key-{index}"), value.clone());
+                    }
+                }
+                actual_nested.insert("extra".to_string(), serde_json::json!("ignored"));
+                let actual = serde_json::json!({
+                    "top-level-extra": true,
+                    "nested": actual_nested
+                });
+
+                assert_eq!(
+                    input_object_is_subset(expected.as_object().unwrap(), &actual),
+                    expected_mask & actual_mask == expected_mask,
+                    "expected mask {expected_mask:04b}, actual mask {actual_mask:04b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_subset_ignores_object_order_but_requires_exact_arrays_and_scalars() {
+        let expected: Value = serde_json::from_str(
+            r#"{"object":{"first":1,"second":2},"array":[{"first":1}],"scalar":1}"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{"scalar":1,"array":[{"first":1}],"object":{"second":2,"extra":3,"first":1}}"#,
+        )
+        .unwrap();
+
+        assert!(input_object_is_subset(
+            expected.as_object().unwrap(),
+            &reordered
+        ));
+
+        for actual in [
+            serde_json::json!({"object": {"first": 1, "second": 2}, "array": [{"first": 1, "extra": 2}], "scalar": 1}),
+            serde_json::json!({"object": {"first": 1, "second": 2}, "array": [{"first": 1}, {"first": 1}], "scalar": 1}),
+            serde_json::json!({"object": {"first": 1, "second": 2}, "array": [{"first": 1}], "scalar": 1.0}),
+            serde_json::json!({"object": {"first": 1, "second": 2}, "array": [{"first": 1}], "scalar": "1"}),
+        ] {
+            assert!(!input_object_is_subset(
+                expected.as_object().unwrap(),
+                &actual
+            ));
+        }
+    }
+
+    #[test]
+    fn input_subset_rejects_missing_nested_and_non_exact_values() {
+        let config = make_config(
+            vec![make_input_rule(
+                "custom_tool",
+                serde_json::json!({
+                    "request": {"mode": "safe"},
+                    "targets": ["one", "two"],
+                    "enabled": true
+                }),
+                ResolvedAction::Allow,
+            )],
+            DefaultAction::Deny,
+        );
+        let tool = Tool::Unknown("custom_tool".to_string());
+
+        for actual in [
+            serde_json::json!({"targets": ["one", "two"], "enabled": true}),
+            serde_json::json!({"request": {}, "targets": ["one", "two"], "enabled": true}),
+            serde_json::json!({"request": {"mode": "unsafe"}, "targets": ["one", "two"], "enabled": true}),
+            serde_json::json!({"request": {"mode": "safe"}, "targets": ["two", "one"], "enabled": true}),
+            serde_json::json!({"request": {"mode": "safe"}, "targets": ["one", "two"], "enabled": 1}),
+            serde_json::json!(["not", "an", "object"]),
+        ] {
+            assert!(matches!(
+                resolve_action_with_input(&config, &tool, &[], &actual, None, None),
+                ConfigAction::Decision(ConfigDecision::Deny(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn input_rules_preserve_first_match_order() {
+        let config = make_config(
+            vec![
+                make_input_rule(
+                    "custom_tool",
+                    serde_json::json!({"operation": "delete"}),
+                    ResolvedAction::Deny,
+                ),
+                make_input_rule(
+                    "custom_tool",
+                    serde_json::json!({"operation": "delete", "confirmed": true}),
+                    ResolvedAction::Allow,
+                ),
+            ],
+            DefaultAction::Ask,
+        );
+
+        assert!(matches!(
+            resolve_action_with_input(
+                &config,
+                &Tool::Unknown("custom_tool".to_string()),
+                &[],
+                &serde_json::json!({"operation": "delete", "confirmed": true}),
+                None,
+                None,
+            ),
+            ConfigAction::Decision(ConfigDecision::Deny(_))
+        ));
+    }
+
+    #[test]
+    fn input_cwd_and_path_conditions_are_all_required() {
+        let mut rule = make_input_rule(
+            "Read(**/*.rs)",
+            serde_json::json!({"encoding": "utf-8"}),
+            ResolvedAction::Allow,
+        );
+        rule.in_paths = Some(vec!["/workspace/project".to_string()]);
+        rule.in_cwds = Some(vec!["/workspace/project".to_string()]);
+        let config = make_config(vec![rule], DefaultAction::Deny);
+        let tool = Tool::Read;
+        let input = serde_json::json!({"path": "src/main.rs", "encoding": "utf-8"});
+
+        assert!(matches!(
+            resolve_action_with_input(
+                &config,
+                &tool,
+                &["/workspace/project/src/main.rs".to_string()],
+                &input,
+                Some("/workspace/project"),
+                None,
+            ),
+            ConfigAction::Decision(ConfigDecision::Allow)
+        ));
+        assert!(matches!(
+            resolve_action_with_input(
+                &config,
+                &tool,
+                &["/workspace/project/src/main.rs".to_string()],
+                &input,
+                Some("/workspace/other"),
+                None,
+            ),
+            ConfigAction::Decision(ConfigDecision::Deny(_))
+        ));
+        assert!(matches!(
+            resolve_action_with_input(
+                &config,
+                &tool,
+                &["/workspace/other/src/main.rs".to_string()],
+                &input,
+                Some("/workspace/project"),
+                None,
+            ),
+            ConfigAction::Decision(ConfigDecision::Deny(_))
+        ));
+    }
+
+    #[test]
+    fn in_cwds_requires_a_normalized_directory_boundary_match() {
+        let mut rule = make_rule(&["custom_tool"], ResolvedAction::Allow);
+        rule.in_cwds = Some(vec!["/workspace/project".to_string()]);
+        let config = make_config(vec![rule], DefaultAction::Deny);
+        let tool = Tool::Unknown("custom_tool".to_string());
+
+        for cwd in [
+            Some("/workspace/project"),
+            Some("/workspace/project/subdirectory/../nested"),
+        ] {
+            assert!(matches!(
+                resolve_action_with_input(&config, &tool, &[], &serde_json::json!({}), cwd, None,),
+                ConfigAction::Decision(ConfigDecision::Allow)
+            ));
+        }
+
+        for cwd in [None, Some("/workspace/project-other")] {
+            assert!(matches!(
+                resolve_action_with_input(&config, &tool, &[], &serde_json::json!({}), cwd, None,),
+                ConfigAction::Decision(ConfigDecision::Deny(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn old_rule_json_remains_valid() {
+        let config: ToolConfigJson = serde_json::from_str(
+            r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"allow"}]}"#,
+        )
+        .unwrap();
+
+        validate_tool_config_dto(&config).unwrap();
+        assert!(config.rules[0].input.is_none());
+        assert!(config.rules[0].in_cwds.is_none());
+    }
+
+    #[test]
+    fn resolve_action_without_input_preserves_rules_without_input() {
+        let config = make_config(
+            vec![
+                make_input_rule(
+                    "custom_tool",
+                    serde_json::json!({"operation": "safe"}),
+                    ResolvedAction::Deny,
+                ),
+                make_rule(&["custom_tool"], ResolvedAction::Allow),
+            ],
+            DefaultAction::Deny,
+        );
+
+        assert!(matches!(
+            resolve_action(
+                &config,
+                &Tool::Unknown("custom_tool".to_string()),
+                &[],
+                None,
+                None,
+            ),
+            ConfigAction::Decision(ConfigDecision::Allow)
         ));
     }
 
@@ -989,6 +1342,7 @@ mod tests {
                     in_workspace: None,
                     in_paths: None,
                     in_cwds: None,
+                    input: None,
                     source_json: String::new(),
                 },
                 make_rule(&["Read", "Write"], ResolvedAction::Allow),
@@ -1395,6 +1749,7 @@ mod tests {
             in_workspace: None,
             in_paths: Some(dirs.iter().map(|s| s.to_string()).collect()),
             in_cwds: None,
+            input: None,
             source_json: String::new(),
         }
     }
@@ -1561,6 +1916,7 @@ mod tests {
                 in_workspace: Some(true),
                 in_paths: Some(vec!["/home/user/oss".to_string()]),
                 in_cwds: None,
+                input: None,
                 source_json: String::new(),
             }],
             DefaultAction::Ask,
@@ -1609,6 +1965,7 @@ mod tests {
                 in_workspace: None,
                 in_paths: Some(vec![expanded.clone()]),
                 in_cwds: None,
+                input: None,
                 source_json: String::new(),
             }],
             DefaultAction::Ask,

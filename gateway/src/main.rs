@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use config::{ConfigAction, expand_tilde, load_tool_config, resolve_action};
+use config::{ConfigAction, expand_tilde, load_tool_config, resolve_action_with_input};
 use protocol::{
     ApprovalContext, ApprovalRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
     ExtraContext, RequestType, Secret, StatusReport,
@@ -487,10 +487,11 @@ async fn run(
         }
     }
 
-    let action = resolve_action(
+    let action = resolve_action_with_input(
         &config,
         &tool,
         &resolved_args,
+        event.tool_call.raw_input(),
         Some(&event.cwd),
         Some(&event.workspace_roots),
     );

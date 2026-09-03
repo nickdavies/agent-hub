@@ -9,6 +9,88 @@ use protocol::{AttendedGatewayDecisionKind, AttendedGatewayRequestV1};
 use serde_json::Value;
 use uuid::Uuid;
 
+fn run_host_custom_tool(config: &std::path::Path, tool_input: &Value) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hub-gateway"))
+        .env_clear()
+        .args([
+            "approval",
+            "--opencode",
+            "--server",
+            "http://127.0.0.1:1",
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = serde_json::json!({
+        "session_id": "custom-input",
+        "tool_name": "custom_tool",
+        "tool_input": tool_input,
+        "cwd": "/workspace/project"
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(&payload).unwrap().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn opencode_custom_tool_raw_input_reaches_structural_matcher() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("permissions.json");
+    std::fs::write(
+        &config,
+        r#"{
+            "version": 1,
+            "default": "deny",
+            "rules": [{
+                "tools": ["custom_tool"],
+                "in_cwds": ["/workspace/project"],
+                "input": {"request": {"mode": "safe"}, "targets": ["one", "two"]},
+                "action": "allow"
+            }]
+        }"#,
+    )
+    .unwrap();
+
+    let matching = run_host_custom_tool(
+        &config,
+        &serde_json::json!({
+            "targets": ["one", "two"],
+            "request": {"trace": true, "mode": "safe"},
+            "runtime_extra": true
+        }),
+    );
+    assert!(
+        matching.status.success(),
+        "gateway failed: {}",
+        String::from_utf8_lossy(&matching.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&matching.stdout).unwrap(),
+        serde_json::json!({"allowed": true})
+    );
+
+    let mismatching = run_host_custom_tool(
+        &config,
+        &serde_json::json!({
+            "targets": ["two", "one"],
+            "request": {"mode": "safe"}
+        }),
+    );
+    assert!(mismatching.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&mismatching.stdout).unwrap(),
+        serde_json::json!({"allowed": false, "reason": "denied by policy"})
+    );
+}
+
 #[test]
 #[ignore = "requires a real read-only bind; covered by the Docker interoperability fixture"]
 fn real_gateway_cli_exchanges_one_framed_relay_decision() {
@@ -118,6 +200,11 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
         r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"allow","command":"true"}]}"#,
         r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"ask","message":"bad"}]}"#,
         r#"{"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"delegate"}]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["custom"],"input":[],"action":"allow"}]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["custom"],"input":"value","action":"allow"}]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["custom"],"input":null,"action":"allow"}]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["custom"],"in_cwds":[],"action":"allow"}]}"#,
+        r#"{"version":1,"default":"ask","rules":[{"tools":["custom"],"in_cwds":[""],"action":"allow"}]}"#,
     ] {
         let config = dir.path().join(Uuid::new_v4().to_string());
         let request_id = Uuid::new_v4().to_string();
@@ -165,6 +252,8 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
                 || stderr.contains("unsupported version")
                 || stderr.contains("invalid action/command")
                 || stderr.contains("message outside")
+                || stderr.contains("invalid 'in_cwds'")
+                || stderr.contains("invalid type")
         );
     }
 }
