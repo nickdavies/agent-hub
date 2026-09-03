@@ -164,6 +164,8 @@ pub struct AttendedApprovalReviewContext {
 pub struct Approval {
     pub id: Uuid,
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
     pub session_id: SessionId,
     pub session_display_name: String,
     pub project: String,
@@ -241,6 +243,7 @@ pub struct ApprovalWaitResponse {
 
 /// POST /api/v1/approvals/{id}/resolve — request body.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalResolveRequest {
     pub decision: ApprovalDecision,
     pub message: Option<String>,

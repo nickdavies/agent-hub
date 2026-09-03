@@ -18,6 +18,10 @@
         #deny-inline input { margin: 0; }
         #deny-inline button { margin: 0; white-space: nowrap; }
         .view-toggle { font-size: 0.85rem; float: right; }
+        .launch-review-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr)); gap: 0.75rem; }
+        .launch-review-section { border: 1px solid var(--pico-muted-border-color); border-radius: var(--pico-border-radius); padding: 0.75rem; min-width: 0; }
+        .launch-review-section h5 { margin: 0 0 0.4rem; }
+        .launch-review-section pre { margin: 0; max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
     </style>
 </head>
 <body>
@@ -41,12 +45,12 @@
 <main class="container">
     <article>
         <header>
-            <h3 id="tool-name">{{ approval.tool }}</h3>
-            <p id="meta">Project: <strong>{{ approval.project }}</strong> · {{ approval.session_display_name }} · <code>{{ approval.provider }}</code></p>
+            <h3 id="tool-name">{{ review.approval.tool }}</h3>
+            <p id="meta">Project: <strong>{{ review.approval.project }}</strong> · {{ review.approval.session_display_name }} · <code>{{ review.approval.provider }}</code></p>
         </header>
 
         <div id="context-section">
-        {% if let Some(extra) = approval.context.extra.as_ref() %}
+        {% if let Some(extra) = review.approval.context.extra.as_ref() %}
         <details open>
             <summary>Context</summary>
             <pre><code>{{ extra }}</code></pre>
@@ -54,13 +58,24 @@
         {% endif %}
         </div>
 
-        <h4>Tool Input <a href="#" class="view-toggle" id="view-toggle" onclick="toggleView(); return false;">show raw</a></h4>
+        <h4>Review <a href="#" class="view-toggle" id="view-toggle" onclick="toggleView(); return false;">show full record</a></h4>
 
-        <div id="smart-view" class="smart-view"></div>
-        <pre id="raw-view" style="display:none"><code>{{ tool_input_pretty }}</code></pre>
+        <div id="smart-view" class="smart-view">
+        {% if let Some(launch) = review.launch_review.as_ref() %}
+            <div id="agent-hub-run-resolved" class="launch-review-grid">
+            {% for section in launch.sections %}
+                <section class="launch-review-section" data-section="{{ section.id }}">
+                    <h5>{{ section.title }}</h5>
+                    <pre><code>{{ section.value }}</code></pre>
+                </section>
+            {% endfor %}
+            </div>
+        {% endif %}
+        </div>
+        <pre id="raw-view" style="display:none" aria-label="Full approval record"><code>{{ review.raw_record }}</code></pre>
 
         <p id="status-line">Status:
-            {% match approval.status %}
+            {% match review.approval.status %}
             {% when crate::server::approvals::ApprovalStatus::Pending %}
                 <mark>Pending</mark>
             {% when crate::server::approvals::ApprovalStatus::Approved with { message } %}
@@ -73,7 +88,7 @@
         </p>
 
         <div id="action-buttons">
-        {% if readwrite && !approval.status.is_resolved() %}
+        {% if readwrite && !review.approval.status.is_resolved() %}
         <hr>
         <div class="grid">
             <button onclick="doApprove()">Approve</button>
@@ -111,9 +126,12 @@
 (function() {
     const READWRITE = {{ readwrite }};
     const POLL_MS = 2000;
-    const approvalId = '{{ approval.id }}';
+    const MAX_RAW_STRING_CHARS = 65536;
+    const MAX_RAW_ARRAY_ITEMS = 256;
+    const approvalId = '{{ review.approval.id }}';
+    const FOCUSED_LAUNCH_REVIEW = {{ review.launch_review.is_some() }};
     let rawMode = false;
-    let resolved = {{ approval.status.is_resolved() }};
+    let resolved = {{ review.approval.status.is_resolved() }};
 
     // --- Smart formatting ---
     function formatSmartView(input) {
@@ -141,13 +159,15 @@
 
     // Initial smart view render
     const initialData = JSON.parse(document.getElementById('approval-data').textContent);
-    document.getElementById('smart-view').innerHTML = formatSmartView(initialData.tool_input);
+    if (!FOCUSED_LAUNCH_REVIEW) {
+        document.getElementById('smart-view').innerHTML = formatSmartView(initialData.tool_input);
+    }
 
     window.toggleView = function() {
         rawMode = !rawMode;
         document.getElementById('smart-view').style.display = rawMode ? 'none' : 'block';
         document.getElementById('raw-view').style.display = rawMode ? 'block' : 'none';
-        document.getElementById('view-toggle').textContent = rawMode ? 'show smart' : 'show raw';
+        document.getElementById('view-toggle').textContent = rawMode ? 'show review' : 'show full record';
     };
 
     // --- Polling ---
@@ -181,9 +201,30 @@
         document.getElementById('status-line').innerHTML = statusHtml;
 
         // Update raw view
-        const pretty = JSON.stringify(approval.tool_input, null, 2);
+        const pretty = JSON.stringify(boundRawValue(approval), null, 2);
         document.querySelector('#raw-view code').textContent = pretty;
-        document.getElementById('smart-view').innerHTML = formatSmartView(approval.tool_input);
+        if (!FOCUSED_LAUNCH_REVIEW) {
+            document.getElementById('smart-view').innerHTML = formatSmartView(approval.tool_input);
+        }
+    }
+
+    function boundRawValue(value) {
+        if (typeof value === 'string') {
+            return value.length > MAX_RAW_STRING_CHARS
+                ? value.slice(0, MAX_RAW_STRING_CHARS) + '\n… (truncated)'
+                : value;
+        }
+        if (Array.isArray(value)) {
+            const bounded = value.slice(0, MAX_RAW_ARRAY_ITEMS).map(boundRawValue);
+            if (value.length > MAX_RAW_ARRAY_ITEMS) {
+                bounded.push('… (' + (value.length - MAX_RAW_ARRAY_ITEMS) + ' more items)');
+            }
+            return bounded;
+        }
+        if (value && typeof value === 'object') {
+            return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, boundRawValue(item)]));
+        }
+        return value;
     }
 
     function onResolved() {

@@ -13,6 +13,7 @@ pub mod presence;
 pub mod pushover;
 pub mod questions;
 pub mod repo_discovery;
+pub mod review;
 pub mod scm;
 pub mod session_views;
 pub(crate) use session_views::resolve_effective_status;
@@ -189,6 +190,10 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
             .route("/hooks/approval", post(hooks::approval::<N>))
             .route("/hooks/question", post(hooks::question::<N>))
             .route("/approvals/pending", get(handle_list_pending::<N>))
+            .route(
+                "/approvals/pending/reviews",
+                get(handle_list_pending_reviews::<N>),
+            )
             .route("/approvals/{id}", get(handle_get_approval::<N>))
             .route("/approvals/{id}/wait", get(handle_approval_wait::<N>))
             .route(
@@ -352,6 +357,20 @@ async fn handle_list_pending<N: Notifier>(
     Json(state.approvals.list_pending().await)
 }
 
+async fn handle_list_pending_reviews<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
+) -> Result<Json<Vec<review::ApprovalReview>>, AppError> {
+    state
+        .approvals
+        .list_pending()
+        .await
+        .into_iter()
+        .map(review::ApprovalReview::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+        .map_err(AppError::InvalidApprovalRequest)
+}
+
 /// GET /api/v1/approvals/{id} — get a single approval by ID.
 async fn handle_get_approval<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
@@ -414,6 +433,9 @@ async fn handle_approval_resolve<N: Notifier>(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(req): Json<ApprovalResolveRequest>,
 ) -> Result<Json<approvals::Approval>, AppError> {
+    if state.config.approval_mode != ApprovalFeatureMode::Readwrite {
+        return Err(AppError::ApprovalReadonly);
+    }
     let new_status = match req.decision {
         ApprovalDecision::Approve => ApprovalStatus::Approved {
             message: req.message,
@@ -880,6 +902,15 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         app.clone().oneshot(req).await.unwrap()
     }
 
+    async fn post_json_result(app: &Router, path: &str, body: &str) -> (AxumStatus, String) {
+        let response = post_json_response(app, path, body).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
     async fn post_json_response_with_worker_session(
         app: &Router,
         path: &str,
@@ -941,6 +972,46 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         app.clone().oneshot(req).await.unwrap()
     }
 
+    fn launch_request(id: &str, prompt: &str) -> String {
+        let canonical: protocol::AttendedAuthorizationRequestV3 = serde_json::from_slice(
+            include_bytes!("../../../protocol/tests/fixtures/attended_authorization_v3.json"),
+        )
+        .unwrap();
+        let requested_at = "2026-01-01T00:00:00Z".parse().unwrap();
+        let resolved = protocol::AgentHubRunResolvedV1::new(
+            "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
+            canonical.canonical_artifact().unwrap(),
+            requested_at,
+            "2099-01-01T00:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        let request = protocol::ApprovalRequest {
+            id: id.into(),
+            request_digest: Some(resolved.canonical_digest.clone()),
+            session_id: protocol::SessionId::new("launch-session"),
+            session_display_name: prompt.into(),
+            cwd: "/workspace/repo".into(),
+            tool: serde_json::from_value(serde_json::json!("agent_hub_run_resolved")).unwrap(),
+            tool_input: serde_json::to_value(resolved).unwrap(),
+            provider: "agent-hub-host-launch".into(),
+            request_type: protocol::RequestType::ToolUse,
+            context: protocol::ApprovalContext {
+                workspace_roots: vec!["/workspace/repo".into()],
+                hook_event_name: "agent_hub_run.host.before".to_string().into(),
+                extra: None,
+                attended: None,
+            },
+        };
+        serde_json::to_string(&request).unwrap()
+    }
+
+    async fn create_launch(app: &Router, id: &str, prompt: &str) -> serde_json::Value {
+        let (status, body) =
+            post_json_result(app, "/api/v1/hooks/approval", &launch_request(id, prompt)).await;
+        assert_eq!(status, AxumStatus::OK, "launch create failed: {body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
     /// Helper: GET a path and return (status_code, body_string).
     async fn get_json(app: &Router, path: &str) -> (AxumStatus, String) {
         let req = Request::builder()
@@ -984,21 +1055,17 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
 
     #[tokio::test]
     async fn mobile_approval_queue_requires_web_auth() {
-        let config = ServerConfig {
-            auth_mode: AuthMode::Token,
-            tokens: vec![Token {
+        let mut state = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        let config = Arc::make_mut(&mut state.config);
+        config.auth_mode = AuthMode::Token;
+        config.tokens = vec![Token {
                 label: "test".into(),
                 secret: protocol::Secret::new("secret"),
-            }],
-            listen_addr: "127.0.0.1:0".into(),
-            presence_ttl_secs: 120,
-            session_ttl_secs: 7200,
-            notification_delay_secs: 0,
-            approval_mode: ApprovalFeatureMode::Readwrite,
-            base_url: Some("http://localhost:8080".into()),
-            default_approval_mode: SessionApprovalMode::Remote,
-        };
-        let app = router(AppState::new(config, NullNotifier, None));
+            }];
+        let app = router(state);
 
         let request = Request::builder()
             .uri("/approvals/queue")
@@ -1008,6 +1075,341 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
 
         assert_eq!(response.status(), AxumStatus::TEMPORARY_REDIRECT);
         assert_eq!(response.headers()["location"], "/auth/login");
+    }
+
+    #[tokio::test]
+    async fn launch_create_get_resolve_and_wait_use_existing_approval_api() {
+        let app = test_app();
+        let created = create_launch(&app, "launch-api-1", "Build the release").await;
+        let id = created["id"].as_str().unwrap();
+        assert_eq!(created["type"], "pending");
+
+        let (status, record) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
+        assert_eq!(status, AxumStatus::OK);
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["request_id"], "launch-api-1");
+        assert_eq!(
+            record["request_digest"],
+            record["tool_input"]["canonical_digest"]
+        );
+        assert_eq!(record["tool_input"]["schema"], "agent_hub_run_resolved_v1");
+
+        let (status, _) = post_json_result(
+            &app,
+            &format!("/api/v1/approvals/{id}/resolve"),
+            r#"{"decision":"approve","message":"reviewed"}"#,
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+
+        let (status, waited) = get_json(&app, &format!("/api/v1/approvals/{id}/wait")).await;
+        assert_eq!(status, AxumStatus::OK);
+        let waited: serde_json::Value = serde_json::from_str(&waited).unwrap();
+        assert_eq!(waited["type"], "approved");
+        assert_eq!(waited["message"], "reviewed");
+
+        let cancelled = create_launch(&app, "launch-api-cancel", "Cancel this run").await;
+        let cancelled_id = cancelled["id"].as_str().unwrap();
+        let (status, cancelled) = post_json_result(
+            &app,
+            &format!("/api/v1/approvals/{cancelled_id}/resolve"),
+            r#"{"decision":"cancel"}"#,
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+        let cancelled: serde_json::Value = serde_json::from_str(&cancelled).unwrap();
+        assert_eq!(cancelled["status"]["type"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_id_requires_same_canonical_payload() {
+        let app = test_app();
+        let first = create_launch(&app, "launch-idempotent", "same prompt").await;
+
+        // Re-encoding through Value changes insignificant source formatting and
+        // may change object-key order, but the typed canonical payload is equal.
+        let reordered = serde_json::to_string_pretty(
+            &serde_json::from_str::<serde_json::Value>(&launch_request(
+                "launch-idempotent",
+                "same prompt",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let (status, retry) = post_json_result(&app, "/api/v1/hooks/approval", &reordered).await;
+        assert_eq!(status, AxumStatus::OK);
+        let retry: serde_json::Value = serde_json::from_str(&retry).unwrap();
+        assert_eq!(retry["id"], first["id"]);
+
+        let (status, conflict) = post_json_result(
+            &app,
+            "/api/v1/hooks/approval",
+            &launch_request("launch-idempotent", "changed prompt"),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::CONFLICT);
+        assert!(conflict.contains("launch-idempotent"));
+
+        let (_, pending) = get_json(&app, "/api/v1/approvals/pending").await;
+        let pending: Vec<serde_json::Value> = serde_json::from_str(&pending).unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_equivalent_registrations_create_one_approval() {
+        let app = test_app();
+        let mut registrations = Vec::new();
+        for _ in 0..16 {
+            let app = app.clone();
+            registrations.push(tokio::spawn(async move {
+                post_json_result(
+                    &app,
+                    "/api/v1/hooks/approval",
+                    &launch_request("launch-concurrent", "same prompt"),
+                )
+                .await
+            }));
+        }
+        let mut approval_id = None;
+        for registration in registrations {
+            let (status, body) = registration.await.unwrap();
+            assert_eq!(status, AxumStatus::OK);
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(approval_id.as_ref().is_none_or(|id| id == &body["id"]));
+            approval_id = Some(body["id"].clone());
+        }
+        let (_, pending) = get_json(&app, "/api/v1/approvals/pending").await;
+        let pending: Vec<serde_json::Value> = serde_json::from_str(&pending).unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_idempotency_survives_state_restore() {
+        let original_state = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        let original_app = router(original_state.clone());
+        let first = create_launch(&original_app, "launch-restored", "persist me").await;
+        let snapshot = original_state.snapshot().await;
+
+        let restored_state = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        restored_state.restore(snapshot).await;
+        let restored_app = router(restored_state);
+        let retry = create_launch(&restored_app, "launch-restored", "persist me").await;
+        assert_eq!(retry["id"], first["id"]);
+
+        let (status, _) = post_json_result(
+            &restored_app,
+            "/api/v1/hooks/approval",
+            &launch_request("launch-restored", "not the same"),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn legacy_pending_restore_adopts_one_matching_retry_then_becomes_strict() {
+        let original = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        let original_app = router(original.clone());
+        let created = create_launch(&original_app, "legacy-retry", "legacy prompt").await;
+        let snapshot = original.snapshot().await;
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        let current = value["pending_approvals"][0].take();
+        value["pending_approvals"][0] = current["approval"].clone();
+        value["pending_approvals"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("request_digest");
+
+        let restored = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        restored
+            .restore(serde_json::from_value(value).unwrap())
+            .await;
+        let app = router(restored);
+        let retry = create_launch(&app, "legacy-retry", "legacy prompt").await;
+        assert_eq!(retry["id"], created["id"]);
+        let (status, _) = post_json_result(
+            &app,
+            "/api/v1/hooks/approval",
+            &launch_request("legacy-retry", "changed after adoption"),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn conflicting_registration_has_no_session_side_effects() {
+        let app = test_app();
+        create_launch(&app, "side-effect-conflict", "original").await;
+        let mut conflict: serde_json::Value =
+            serde_json::from_str(&launch_request("side-effect-conflict", "changed")).unwrap();
+        conflict["session_id"] = "unregistered-conflict-session".into();
+        conflict["session_display_name"] = "must not be cached".into();
+        let (status, _) = post_json_result(
+            &app,
+            "/api/v1/hooks/approval",
+            &serde_json::to_string(&conflict).unwrap(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::CONFLICT);
+        let (_, sessions) = get_json(&app, "/api/v1/sessions").await;
+        assert!(!sessions.contains("unregistered-conflict-session"));
+        assert!(!sessions.contains("must not be cached"));
+    }
+
+    #[tokio::test]
+    async fn readonly_mode_rejects_resolve_api_without_changing_status() {
+        let app = test_app_with_mode(ApprovalFeatureMode::Readonly);
+        let created = create_launch(&app, "readonly", "inspect only").await;
+        let id = created["id"].as_str().unwrap();
+        let (status, _) = post_json_result(
+            &app,
+            &format!("/api/v1/approvals/{id}/resolve"),
+            r#"{"decision":"approve","message":null}"#,
+        )
+        .await;
+        assert_eq!(status, AxumStatus::FORBIDDEN);
+        let (_, record) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["status"]["type"], "pending");
+    }
+
+    #[tokio::test]
+    async fn strict_launch_and_approval_schemas_reject_unknown_fields() {
+        let app = test_app();
+        let mut outer: serde_json::Value =
+            serde_json::from_str(&launch_request("unknown-outer", "prompt")).unwrap();
+        outer["unexpected"] = true.into();
+        let status = post_json(
+            &app,
+            "/api/v1/hooks/approval",
+            &serde_json::to_string(&outer).unwrap(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::UNPROCESSABLE_ENTITY);
+
+        let mut launch: serde_json::Value =
+            serde_json::from_str(&launch_request("unknown-launch", "prompt")).unwrap();
+        launch["tool_input"]["unexpected"] = true.into();
+        let status = post_json(
+            &app,
+            "/api/v1/hooks/approval",
+            &serde_json::to_string(&launch).unwrap(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn launch_review_detail_snapshot_is_focused_and_raw_is_full_record() {
+        let app = test_app();
+        let created = create_launch(&app, "launch-ui-1", "Build the release").await;
+        let id = created["id"].as_str().unwrap();
+        let (status, body) = get_json(&app, &format!("/approvals/{id}")).await;
+        assert_eq!(status, AxumStatus::OK);
+
+        let section_snapshot: Vec<&str> = [
+            "policy",
+            "digests",
+            "expiry",
+            "prompt",
+            "workspaces",
+            "git-views",
+            "image",
+            "network",
+            "credentials",
+            "limits",
+            "output-ids",
+        ]
+        .into_iter()
+        .filter(|section| body.contains(&format!("data-section=\"{section}\"")))
+        .collect();
+        assert_eq!(
+            section_snapshot,
+            vec![
+                "policy",
+                "digests",
+                "expiry",
+                "prompt",
+                "workspaces",
+                "git-views",
+                "image",
+                "network",
+                "credentials",
+                "limits",
+                "output-ids"
+            ]
+        );
+        assert!(body.contains("id=\"agent-hub-run-resolved\""));
+        assert!(body.contains("aria-label=\"Full approval record\""));
+        assert!(body.contains("request_id"));
+        assert!(body.contains("launch-ui-1"));
+        assert!(body.contains("status"));
+
+        let (status, queue) = get_json(&app, "/api/v1/approvals/pending/reviews").await;
+        assert_eq!(status, AxumStatus::OK);
+        let queue: serde_json::Value = serde_json::from_str(&queue).unwrap();
+        assert_eq!(queue[0]["approval"]["id"], created["id"]);
+        assert_eq!(queue[0]["launch_review"]["sections"][0]["id"], "policy");
+        assert!(
+            queue[0]["raw_record"]
+                .as_str()
+                .unwrap()
+                .contains("request_digest")
+        );
+        assert!(queue[0]["raw_record"].as_str().unwrap().contains("status"));
+    }
+
+    #[tokio::test]
+    async fn launch_review_bounds_values_and_escapes_script_payloads() {
+        let app = test_app();
+        let attack = "</script><script>window.pwned=true</script>";
+        let long_tail = format!("{attack}{}UNRENDERED_TAIL", "x".repeat(5000));
+        let mut request: serde_json::Value =
+            serde_json::from_str(&launch_request("launch-hostile", &long_tail)).unwrap();
+        request["session_display_name"] = attack.into();
+        let (status, created) = post_json_result(
+            &app,
+            "/api/v1/hooks/approval",
+            &serde_json::to_string(&request).unwrap(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let id = created["id"].as_str().unwrap();
+        let (_, body) = get_json(&app, &format!("/approvals/{id}")).await;
+
+        assert!(body.contains("… (truncated)"));
+        assert!(!body.contains("UNRENDERED_TAIL</code>"));
+        assert!(!body.contains(attack));
+        assert!(body.contains("window.pwned=true"));
+        assert!(body.contains(r"\u003c/script\u003e\u003cscript\u003ewindow.pwned=true"));
+    }
+
+    #[tokio::test]
+    async fn generic_approval_detail_keeps_generic_renderer() {
+        let app = test_app();
+        let body = launch_request("generic-ui", "plain")
+            .replace("agent_hub_run_resolved", "custom_generic_tool");
+        let (_, created) = post_json_result(&app, "/api/v1/hooks/approval", &body).await;
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let (_, detail) = get_json(
+            &app,
+            &format!("/approvals/{}", created["id"].as_str().unwrap()),
+        )
+        .await;
+        assert!(!detail.contains("id=\"agent-hub-run-resolved\""));
+        assert!(detail.contains("formatSmartView(initialData.tool_input)"));
     }
 
     // ---------------------------------------------------------------

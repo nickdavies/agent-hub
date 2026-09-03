@@ -64,7 +64,7 @@ impl SessionRegistry {
         cwd: &str,
         editor_type: Option<Provider>,
     ) -> String {
-        let project = extract_project_name(cwd);
+        let project = project_name(cwd);
         let mut sessions = self.sessions.write().await;
         let now = Instant::now();
         let default_mode = self.default_approval_mode;
@@ -266,7 +266,7 @@ impl SessionRegistry {
 }
 
 /// Extract project name from cwd (last path component).
-fn extract_project_name(cwd: &str) -> String {
+pub(crate) fn project_name(cwd: &str) -> String {
     Path::new(cwd)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -279,9 +279,9 @@ mod tests {
 
     #[test]
     fn test_extract_project_name() {
-        assert_eq!(extract_project_name("/home/nick/workspaces/myapp"), "myapp");
-        assert_eq!(extract_project_name("/"), "/");
-        assert_eq!(extract_project_name("relative/path"), "path");
+        assert_eq!(project_name("/home/nick/workspaces/myapp"), "myapp");
+        assert_eq!(project_name("/"), "/");
+        assert_eq!(project_name("relative/path"), "path");
     }
 
     // ---------------------------------------------------------------

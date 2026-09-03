@@ -12,6 +12,18 @@ pub enum AppError {
     #[error("approval not found: {0}")]
     ApprovalNotFound(String),
 
+    #[error("approval request conflict: {0}")]
+    ApprovalConflict(String),
+
+    #[error("approval request exceeds the canonical payload limit")]
+    ApprovalRequestTooLarge,
+
+    #[error("invalid approval request: {0}")]
+    InvalidApprovalRequest(String),
+
+    #[error("approval resolution is disabled in read-only mode")]
+    ApprovalReadonly,
+
     #[error("question not found: {0}")]
     QuestionNotFound(String),
 
@@ -47,6 +59,10 @@ impl IntoResponse for AppError {
         let status = match &self {
             AppError::SessionNotFound(_) => StatusCode::NOT_FOUND,
             AppError::ApprovalNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::ApprovalConflict(_) => StatusCode::CONFLICT,
+            AppError::ApprovalRequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            AppError::InvalidApprovalRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::ApprovalReadonly => StatusCode::FORBIDDEN,
             AppError::QuestionNotFound(_) => StatusCode::NOT_FOUND,
             AppError::WorkflowNotFound(_) => StatusCode::NOT_FOUND,
             AppError::WorkItemNotFound(_) => StatusCode::NOT_FOUND,

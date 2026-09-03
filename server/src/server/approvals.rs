@@ -8,12 +8,14 @@ use tracing::info;
 use uuid::Uuid;
 
 // Re-export protocol types so existing `use super::approvals::X` imports work.
-pub use protocol::{Approval, ApprovalContext, ApprovalStatus};
+pub use protocol::{Approval, ApprovalStatus};
 
-use protocol::SessionId;
+use protocol::{ApprovalRequest, SessionId};
 
 struct ApprovalEntry {
     approval: Approval,
+    /// Bounded stable JSON encoding of the complete typed request.
+    canonical_request: Option<Box<str>>,
     tx: watch::Sender<ApprovalStatus>,
     /// Tracks when a gateway last polled `/wait` for this approval.
     /// `None` means no poll has occurred yet (freshly registered).
@@ -29,15 +31,31 @@ pub struct ApprovalRegistry {
 }
 
 pub struct RegisterApproval {
-    pub request_id: String,
-    pub session_id: SessionId,
-    pub session_display_name: String,
+    pub request: ApprovalRequest,
     pub project: String,
-    pub tool: protocol::Tool,
-    pub tool_input: serde_json::Value,
-    pub provider: String,
-    pub request_type: protocol::RequestType,
-    pub context: ApprovalContext,
+    pub canonical_request: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RegisterApprovalError {
+    #[error("request_id already exists with a different canonical request")]
+    Conflict,
+}
+
+pub struct RegisterApprovalOutcome {
+    pub approval: Approval,
+    pub created: bool,
+}
+
+/// Persistence envelope. The legacy variant keeps existing state files readable.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ApprovalSnapshot {
+    Current {
+        approval: Approval,
+        canonical_request: String,
+    },
+    Legacy(Approval),
 }
 
 impl ApprovalRegistry {
@@ -49,31 +67,55 @@ impl ApprovalRegistry {
         }
     }
 
-    /// Register a new approval or return existing one if request_id matches.
-    pub async fn register(&self, params: RegisterApproval) -> Approval {
-        // Idempotency: if request_id already registered, return existing
+    /// Register a new approval, or return the existing approval only when the
+    /// request ID and canonical request bytes both match.
+    pub async fn register(
+        &self,
+        params: RegisterApproval,
+    ) -> Result<RegisterApprovalOutcome, RegisterApprovalError> {
+        // Keep all indexes locked through comparison and insertion so no
+        // observer can see a partially registered approval.
+        let mut by_req = self.by_request_id.write().await;
+        let mut entries = self.entries.write().await;
+        let mut by_sess = self.by_session_id.write().await;
+        if let Some(&existing_id) = by_req.get(&params.request.id)
+            && let Some(entry) = entries.get_mut(&existing_id)
         {
-            let by_req = self.by_request_id.read().await;
-            if let Some(&existing_id) = by_req.get(&params.request_id) {
-                let entries = self.entries.read().await;
-                if let Some(entry) = entries.get(&existing_id) {
-                    return entry.approval.clone();
+            if let Some(existing) = &entry.canonical_request {
+                if entry.approval.request_digest != params.request.request_digest
+                    || existing.as_ref() != params.canonical_request
+                {
+                    return Err(RegisterApprovalError::Conflict);
                 }
+            } else if legacy_request_matches(&entry.approval, &params.request, &params.project) {
+                // Legacy snapshots did not retain cwd or canonical request
+                // bytes. A retry matching every retained field adopts the
+                // complete request so subsequent retries are strict.
+                entry.approval.request_digest = params.request.request_digest.clone();
+                entry.canonical_request = Some(params.canonical_request.into_boxed_str());
+            } else {
+                return Err(RegisterApprovalError::Conflict);
             }
+            return Ok(RegisterApprovalOutcome {
+                approval: entry.approval.clone(),
+                created: false,
+            });
         }
 
         let id = Uuid::new_v4();
+        let request = params.request;
         let approval = Approval {
             id,
-            request_id: params.request_id.clone(),
-            session_id: params.session_id.clone(),
-            session_display_name: params.session_display_name,
+            request_id: request.id.clone(),
+            request_digest: request.request_digest,
+            session_id: request.session_id.clone(),
+            session_display_name: request.session_display_name,
             project: params.project,
-            tool: params.tool,
-            tool_input: params.tool_input,
-            provider: params.provider,
-            request_type: params.request_type,
-            context: params.context,
+            tool: request.tool,
+            tool_input: request.tool_input,
+            provider: request.provider,
+            request_type: request.request_type,
+            context: request.context,
             created_at: Utc::now(),
             status: ApprovalStatus::Pending,
         };
@@ -81,25 +123,23 @@ impl ApprovalRegistry {
         let (tx, _rx) = watch::channel(ApprovalStatus::Pending);
         let entry = ApprovalEntry {
             approval: approval.clone(),
+            canonical_request: Some(params.canonical_request.into_boxed_str()),
             tx,
             last_polled_at: None,
         };
 
-        {
-            let mut entries = self.entries.write().await;
-            entries.insert(id, entry);
-        }
-        {
-            let mut by_req = self.by_request_id.write().await;
-            by_req.insert(params.request_id, id);
-        }
-        {
-            let mut by_sess = self.by_session_id.write().await;
-            by_sess.entry(params.session_id).or_default().insert(id);
-        }
+        entries.insert(id, entry);
+        by_req.insert(approval.request_id.clone(), id);
+        by_sess
+            .entry(approval.session_id.clone())
+            .or_default()
+            .insert(id);
 
         info!(approval_id = %id, "approval registered");
-        approval
+        Ok(RegisterApprovalOutcome {
+            approval,
+            created: true,
+        })
     }
 
     /// Get an approval by id.
@@ -125,7 +165,7 @@ impl ApprovalRegistry {
         }
         entry.approval.status = status.clone();
         // Notify all watchers
-        let _ = entry.tx.send(status);
+        entry.tx.send_replace(status);
         Some(entry.approval.clone())
     }
 
@@ -143,8 +183,8 @@ impl ApprovalRegistry {
 
     /// Returns the first (oldest) pending approval for the given session, if any.
     pub async fn first_pending_for_session(&self, session_id: &SessionId) -> Option<Approval> {
-        let by_session = self.by_session_id.read().await;
         let entries = self.entries.read().await;
+        let by_session = self.by_session_id.read().await;
         by_session.get(session_id).and_then(|ids| {
             ids.iter()
                 .filter_map(|id| entries.get(id))
@@ -216,24 +256,39 @@ impl ApprovalRegistry {
     }
 
     /// Export pending approvals for persistence, sorted by creation time.
-    pub async fn snapshot(&self) -> Vec<Approval> {
+    pub async fn snapshot(&self) -> Vec<ApprovalSnapshot> {
         let entries = self.entries.read().await;
-        let mut pending: Vec<Approval> = entries
+        let mut pending: Vec<&ApprovalEntry> = entries
             .values()
             .filter(|e| !e.approval.status.is_resolved())
-            .map(|e| e.approval.clone())
             .collect();
-        pending.sort_by_key(|a| a.created_at);
+        pending.sort_by_key(|e| e.approval.created_at);
         pending
+            .into_iter()
+            .map(|entry| match &entry.canonical_request {
+                Some(canonical_request) => ApprovalSnapshot::Current {
+                    approval: entry.approval.clone(),
+                    canonical_request: canonical_request.to_string(),
+                },
+                None => ApprovalSnapshot::Legacy(entry.approval.clone()),
+            })
+            .collect()
     }
 
     /// Restore approvals from persisted state.
-    pub async fn restore(&self, approvals: Vec<Approval>) {
-        let mut entries = self.entries.write().await;
+    pub async fn restore(&self, approvals: Vec<ApprovalSnapshot>) {
         let mut by_req = self.by_request_id.write().await;
+        let mut entries = self.entries.write().await;
         let mut by_sess = self.by_session_id.write().await;
 
-        for approval in approvals {
+        for snapshot in approvals {
+            let (approval, canonical_request) = match snapshot {
+                ApprovalSnapshot::Current {
+                    approval,
+                    canonical_request,
+                } => (approval, Some(canonical_request.into_boxed_str())),
+                ApprovalSnapshot::Legacy(approval) => (approval, None),
+            };
             if approval.status.is_resolved() {
                 continue;
             }
@@ -246,6 +301,7 @@ impl ApprovalRegistry {
                 id,
                 ApprovalEntry {
                     approval,
+                    canonical_request,
                     tx,
                     last_polled_at: None,
                 },
@@ -255,4 +311,16 @@ impl ApprovalRegistry {
             info!(approval_id = %id, "approval restored");
         }
     }
+}
+
+fn legacy_request_matches(approval: &Approval, request: &ApprovalRequest, project: &str) -> bool {
+    approval.request_id == request.id
+        && approval.session_id == request.session_id
+        && approval.session_display_name == request.session_display_name
+        && approval.project == project
+        && approval.tool == request.tool
+        && approval.tool_input == request.tool_input
+        && approval.provider == request.provider
+        && approval.request_type == request.request_type
+        && approval.context == request.context
 }

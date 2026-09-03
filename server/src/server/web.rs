@@ -18,6 +18,7 @@ use super::config::ApprovalFeatureMode;
 use super::notifier::Notifier;
 use super::oauth;
 use super::orchestration::{GithubPrLifecycleState, GithubPrState, MergeReadiness};
+use super::review::ApprovalReview;
 use super::task_adapter::{
     HumanActionKind, TaskHumanAction, task_from_work_item_with_valid_next_events,
 };
@@ -62,12 +63,23 @@ struct DashboardTemplate {
 #[template(path = "approval_detail.html")]
 struct ApprovalDetailTemplate {
     email: String,
-    approval: Approval,
-    tool_input_pretty: String,
+    review: ApprovalReview,
     approval_json: String,
     readwrite: bool,
     has_auth: bool,
     approvals_enabled: bool,
+}
+
+/// JSON embedded in a raw-text script element must not contain a literal
+/// `</script>` (or browser-significant `<`, `>`, and `&` characters).
+fn script_safe_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "{}".to_owned())
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 #[derive(Template)]
@@ -414,17 +426,21 @@ pub async fn approval_detail<N: Notifier>(
         None => return (StatusCode::NOT_FOUND, "Approval not found").into_response(),
     };
 
-    let tool_input_pretty =
-        serde_json::to_string_pretty(&approval.tool_input).unwrap_or_else(|_| "{}".to_string());
-    let approval_json = serde_json::to_string(&approval).unwrap_or_else(|_| "{}".to_string());
+    let approval_json = script_safe_json(&approval);
+    let review = match ApprovalReview::new(approval) {
+        Ok(review) => review,
+        Err(error) => {
+            tracing::error!("invalid stored approval review: {error}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid approval record").into_response();
+        }
+    };
     let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
     let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
 
     into_html_response(ApprovalDetailTemplate {
         email,
-        approval,
-        tool_input_pretty,
+        review,
         approval_json,
         readwrite,
         has_auth,

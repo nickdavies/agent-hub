@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use protocol::{
-    Approval, NotifyConfig, PresenceState, Provider, SessionId, SessionNotifyConfig, SessionStatus,
+    NotifyConfig, PresenceState, Provider, SessionId, SessionNotifyConfig, SessionStatus,
 };
+
+use super::approvals::ApprovalSnapshot;
 
 /// Serializable snapshot of server state that survives restarts.
 #[derive(Serialize, Deserialize)]
@@ -16,7 +18,7 @@ pub struct PersistedState {
     pub notify_config: Option<NotifyConfig>,
     pub presence: Option<PresenceState>,
     #[serde(default)]
-    pub pending_approvals: Vec<Approval>,
+    pub pending_approvals: Vec<ApprovalSnapshot>,
 }
 
 /// A single session's persisted data (excludes last_seen which is runtime-only).

@@ -179,56 +179,71 @@ pub async fn notification<N: Notifier>(
 pub async fn approval<N: Notifier>(
     State(state): State<AppState<N>>,
     Json(req): Json<ApprovalRequest>,
-) -> Json<ApprovalResponse> {
-    let project = state
-        .sessions
-        .get_or_register(&req.session_id, &req.cwd, None)
-        .await;
-
-    // Cache the display name on the session (it arrives with every approval request)
-    if !req.session_display_name.is_empty() {
-        state
-            .sessions
-            .set_display_name(&req.session_id, req.session_display_name.clone())
-            .await;
+) -> Result<Json<ApprovalResponse>, crate::error::AppError> {
+    super::review::validate_request(&req)
+        .map_err(crate::error::AppError::InvalidApprovalRequest)?;
+    // Serialize the typed request, rather than the original HTTP bytes, so JSON
+    // whitespace and object-key ordering do not affect retry semantics.
+    const MAX_CANONICAL_REQUEST_BYTES: usize = 1024 * 1024;
+    let canonical_request = serde_json::to_string(&req).map_err(|error| {
+        crate::error::AppError::Config(format!("could not canonicalize approval request: {error}"))
+    })?;
+    if canonical_request.len() > MAX_CANONICAL_REQUEST_BYTES {
+        return Err(crate::error::AppError::ApprovalRequestTooLarge);
     }
+    let request_id = req.id.clone();
+    let session_id = req.session_id.clone();
+    let session_display_name = req.session_display_name.clone();
+    let cwd = req.cwd.clone();
+    let project = super::sessions::project_name(&req.cwd);
 
-    let approval = state
+    let outcome = state
         .approvals
         .register(approvals::RegisterApproval {
-            request_id: req.id,
-            session_id: req.session_id,
-            session_display_name: req.session_display_name,
-            project: project.clone(),
-            tool: req.tool.clone(),
-            tool_input: req.tool_input.clone(),
-            provider: req.provider,
-            request_type: req.request_type,
-            context: req.context,
+            request: req,
+            project,
+            canonical_request,
         })
-        .await;
+        .await
+        .map_err(|_| crate::error::AppError::ApprovalConflict(request_id))?;
+    let approval = outcome.approval;
+
+    if outcome.created {
+        state
+            .sessions
+            .get_or_register(&session_id, &cwd, None)
+            .await;
+        if !session_display_name.is_empty() {
+            state
+                .sessions
+                .set_display_name(&session_id, session_display_name)
+                .await;
+        }
+    }
 
     // Send push notification with link if pending and base_url configured
-    if !approval.status.is_resolved()
+    if outcome.created
+        && !approval.status.is_resolved()
         && let Some(base_url) = &state.config.base_url
     {
         let url = format!("{}/approvals/{}", base_url, approval.id);
         let notifier = Arc::clone(&state.notifier);
         let title = "Agent Hub (approval)".to_string();
         let message = format!(
-            "[{project}] {} — {}",
-            req.tool,
-            truncate_input(&req.tool_input)
+            "[{}] {} — {}",
+            approval.project,
+            approval.tool,
+            truncate_input(&approval.tool_input)
         );
         tokio::spawn(async move {
             fire_and_forget(&*notifier, &title, &message, Some(&url)).await;
         });
     }
 
-    Json(ApprovalResponse {
+    Ok(Json(ApprovalResponse {
         id: approval.id,
         status: approval.status,
-    })
+    }))
 }
 
 fn truncate_input(input: &serde_json::Value) -> String {
