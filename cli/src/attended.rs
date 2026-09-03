@@ -6520,6 +6520,57 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    static ATTENDED_FAULT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    struct ScopedAttendedFault {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ScopedAttendedFault {
+        fn set(value: &str) -> Self {
+            let lock = ATTENDED_FAULT_ENV_LOCK.lock().unwrap();
+            let previous = std::env::var_os("AGENT_HUB_ATTENDED_FAULT");
+            unsafe { std::env::set_var("AGENT_HUB_ATTENDED_FAULT", value) };
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ScopedAttendedFault {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("AGENT_HUB_ATTENDED_FAULT", value) },
+                None => unsafe { std::env::remove_var("AGENT_HUB_ATTENDED_FAULT") },
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DisarmableIntegrationRootCleanup(Option<PathBuf>);
+
+    #[cfg(target_os = "linux")]
+    impl DisarmableIntegrationRootCleanup {
+        fn disarm(&mut self) {
+            self.0 = None;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DisarmableIntegrationRootCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
     #[test]
     fn supervised_tool_approval_requires_host_relay_endpoint() {
         verify_tool_approval(protocol::ToolApprovalMode::Auto, None).unwrap();
@@ -6626,6 +6677,384 @@ mod tests {
     #[ignore = "requires AGENT_HUB_ATTENDED_OPENCODE_INTEGRATION=1 and tester-managed Docker cleanup"]
     async fn real_docker_attended_opencode_reaches_model_initialization() {
         run_real_docker_attended_opencode_startup().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires explicitly approved real github.snooguts.net credentials, two existing linked worktrees, canonical attended config, and Docker cleanup consent"]
+    async fn real_docker_attended_v3_private_go_multi_worktree_host_proof() {
+        run_real_docker_attended_v3_private_go_multi_worktree_host_proof()
+            .await
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_real_docker_attended_v3_private_go_multi_worktree_host_proof() -> anyhow::Result<()>
+    {
+        use crate::local::{RequestedWorkspace, WorkspaceAccess};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (name, purpose) in [
+            (
+                "AGENT_HUB_ATTENDED_PRIVATE_GO_INTEGRATION",
+                "enable this destructive-proof test",
+            ),
+            (
+                "AGENT_HUB_ATTENDED_PRIVATE_GO_REAL_CREDENTIALS",
+                "permit execution of the configured gh credential command",
+            ),
+            (
+                "AGENT_HUB_ATTENDED_PRIVATE_GO_ALLOW_CLEANUP",
+                "permit removal of test-owned Docker and attended runtime resources",
+            ),
+        ] {
+            anyhow::ensure!(
+                std::env::var(name).as_deref() == Ok("1"),
+                "{name}=1 is required to {purpose}"
+            );
+        }
+        let config_root =
+            std::fs::canonicalize(std::env::var("AGENT_HUB_ATTENDED_PRIVATE_GO_CONFIG_ROOT")?)?;
+        let primary = std::fs::canonicalize(std::env::var(
+            "AGENT_HUB_ATTENDED_PRIVATE_GO_PRIMARY_WORKTREE",
+        )?)?;
+        let sibling = std::fs::canonicalize(std::env::var(
+            "AGENT_HUB_ATTENDED_PRIVATE_GO_SIBLING_WORKTREE",
+        )?)?;
+        let state_root =
+            std::fs::canonicalize(std::env::var("AGENT_HUB_ATTENDED_PRIVATE_GO_STATE_PARENT")?)?
+                .join(format!(
+                    "attended-private-go-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+        let mut cleanup_root = DisarmableIntegrationRootCleanup(Some(state_root.clone()));
+        let operation = async {
+        let environment = std::env::var("AGENT_HUB_ATTENDED_PRIVATE_GO_ENVIRONMENT")?;
+        let image_family = std::env::var("AGENT_HUB_ATTENDED_PRIVATE_GO_IMAGE_FAMILY")?;
+        let network_class = std::env::var("AGENT_HUB_ATTENDED_PRIVATE_GO_NETWORK_CLASS")?;
+        let module = std::env::var("AGENT_HUB_ATTENDED_PRIVATE_GO_MODULE")?;
+        anyhow::ensure!(
+            module.starts_with("github.snooguts.net/"),
+            "the host proof module must be on github.snooguts.net"
+        );
+
+        let git_output = |tree: &std::path::Path, args: &[&str]| -> anyhow::Result<String> {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(tree)
+                .args(args)
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(String::from_utf8(output.stdout)?.trim().to_string())
+        };
+        let primary_git = git_output(&primary, &["rev-parse", "--git-dir"])?;
+        let sibling_git = git_output(&sibling, &["rev-parse", "--git-dir"])?;
+        anyhow::ensure!(
+            primary_git != ".git" && sibling_git != ".git",
+            "both supplied repositories must be linked worktrees"
+        );
+        let sibling_head = git_output(&sibling, &["rev-parse", "HEAD"])?;
+        let sibling_status = git_output(&sibling, &["status", "--porcelain=v1"])?;
+
+        let prompt = format!(
+            "This is the attended V3 private-Go host proof. In /workspace/primary, fetch the existing private module {module} with GOPROXY=direct, then run gofmt on all project Go files, go test ./..., go vet ./..., and go build ./.... Record git status --short, git diff, and git rev-parse HEAD. Read the same Git facts from /workspace/sibling, prove it is read-only by making no changes there, and verify its sentinel content. Do not commit, checkout, branch, add, reset, clean, or otherwise mutate Git metadata. Finish with one complete agent_result_v1 object whose acceptance evidence names each command."
+        );
+        let overlay = "github:github.snooguts.net:read_write".to_string();
+        let artifact = super::build_proposal(super::ProposalInput {
+            config_root,
+            environment: environment.clone(),
+            image_family: image_family.clone(),
+            network_class: network_class.clone(),
+            network_resources: vec![NetworkResourceKind::Github],
+            tool_approval: "auto".into(),
+            overlays: vec![overlay.clone()],
+            timeout_secs: 900,
+            prompt,
+            workspaces: vec![
+                RequestedWorkspace {
+                    alias: "primary".into(),
+                    path: primary.clone(),
+                    access: WorkspaceAccess::ReadWrite,
+                },
+                RequestedWorkspace {
+                    alias: "sibling".into(),
+                    path: sibling.clone(),
+                    access: WorkspaceAccess::ReadOnly,
+                },
+            ],
+            context_roots: Vec::new(),
+            primary_workspace: "primary".into(),
+        })
+        .await?;
+        let request = artifact.verify_v3().map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(request.proposal.network_resources == [NetworkResourceKind::Github]);
+        anyhow::ensure!(request.proposal.overlays == [overlay.clone()]);
+        anyhow::ensure!(request.git_views.len() == 2);
+        anyhow::ensure!(request.git_views.iter().all(|view| {
+            view.repository_type == protocol::GitRepositoryType::Linked
+                && view.object_stores.len() == 1
+        }));
+        let binding: protocol::GithubOverlayBinding = serde_json::from_str(
+            &request
+                .execution
+                .overlays
+                .iter()
+                .find(|candidate| candidate.name == overlay)
+                .context("exact GitHub overlay is absent")?
+                .config,
+        )?;
+        anyhow::ensure!(
+            binding.host == "github.snooguts.net"
+                && binding.api_base_url == "https://github.snooguts.net/api/v3"
+                && binding.access == "read_write"
+                && binding.network_resource == "github"
+                && binding.credential_provider == overlay
+                && binding.credential_target
+                    == "/agent-hub/github/tokens/github.snooguts.net"
+                && binding.authenticated
+                && binding.private_repositories,
+            "GitHub host/network/credential binding is not exact"
+        );
+        let provider = request
+            .execution
+            .credential_providers
+            .iter()
+            .find(|candidate| candidate.name == overlay)
+            .context("exact GitHub credential provider is absent")?;
+        let credential_target = "/agent-hub/github/tokens/github.snooguts.net";
+        anyhow::ensure!(
+            provider.provider_type == "github-token"
+                && provider.command.as_deref() == Some("gh")
+                && provider.args == ["auth", "token", "--hostname", "github.snooguts.net"]
+                && provider.targets == [credential_target]
+                && provider.access == "read_write"
+                && provider.constraints.get("host").map(String::as_str)
+                    == Some("github.snooguts.net")
+                && provider.constraints.get("api_base_url").map(String::as_str)
+                    == Some("https://github.snooguts.net/api/v3")
+                && provider.constraints.get("target").map(String::as_str)
+                    == Some(credential_target),
+            "real GitHub credential provider command, args, target, host, or access is not exact"
+        );
+        let gh_status = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new("gh")
+                .args(["auth", "status", "--hostname", "github.snooguts.net"])
+                .env("GH_PROMPT_DISABLED", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output(),
+        )
+        .await
+        .context("gh auth status timed out")??;
+        anyhow::ensure!(
+            gh_status.status.success(),
+            "noninteractive gh auth status failed: {}",
+            String::from_utf8_lossy(&gh_status.stderr)
+        );
+        let canonical_module = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new("go")
+                .arg("list")
+                .arg("-m")
+                .arg("-f={{.Path}}")
+                .arg(&module)
+                .current_dir(&primary)
+                .env("GOTOOLCHAIN", "local")
+                .env("GOPROXY", "off")
+                .output(),
+        )
+        .await
+        .context("canonical Go module validation timed out")??;
+        anyhow::ensure!(
+            canonical_module.status.success()
+                && String::from_utf8(canonical_module.stdout)?.trim() == module,
+            "private Go module is not an exact canonical requirement: {}",
+            String::from_utf8_lossy(&canonical_module.stderr)
+        );
+        let primary_common = git_output(&primary, &["rev-parse", "--git-common-dir"])?;
+        let sibling_common = git_output(&sibling, &["rev-parse", "--git-common-dir"])?;
+        let resolve_common = |tree: &std::path::Path, value: &str| {
+            let path = PathBuf::from(value);
+            std::fs::canonicalize(if path.is_absolute() { path } else { tree.join(path) })
+        };
+        let primary_common = resolve_common(&primary, &primary_common)?;
+        let sibling_common = resolve_common(&sibling, &sibling_common)?;
+        anyhow::ensure!(primary_common == sibling_common, "worktrees do not share one common Git directory");
+        fn metadata_snapshot(path: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, Vec<u8>)>> {
+            fn visit(root: &std::path::Path, path: &std::path::Path, values: &mut Vec<(PathBuf, Vec<u8>)>) -> anyhow::Result<()> {
+                let mut entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+                entries.sort_by_key(std::fs::DirEntry::file_name);
+                for entry in entries {
+                    let path = entry.path();
+                    let metadata = std::fs::symlink_metadata(&path)?;
+                    anyhow::ensure!(!metadata.file_type().is_symlink(), "common Git metadata contains a symlink");
+                    if metadata.is_dir() {
+                        visit(root, &path, values)?;
+                    } else {
+                        values.push((path.strip_prefix(root)?.to_path_buf(), std::fs::read(path)?));
+                    }
+                }
+                Ok(())
+            }
+            let mut values = Vec::new();
+            visit(path, path, &mut values)?;
+            Ok(values)
+        }
+        let common_metadata = metadata_snapshot(&primary_common)?;
+
+        std::fs::create_dir(&state_root)?;
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700))?;
+        let store = StateStore::open(state_root.clone())?;
+        let authorization_path = state_root.join("authorization.json");
+        super::write_new_private_durable(
+            &authorization_path,
+            &serde_json::to_vec_pretty(&artifact)?,
+        )?;
+        let selected_resources = vec![NetworkResourceKind::Github];
+        let selected_overlays = vec![overlay.clone()];
+        let selectors = || super::AuthorizationSelectors {
+            digest: &artifact.digest,
+            environment: &environment,
+            image_family: &image_family,
+            network_class: &network_class,
+            network_resources: &selected_resources,
+            tool_approval: "auto",
+            overlays: &selected_overlays,
+            timeout_secs: 900,
+        };
+        crate::local_authorize::authorize(&store, &authorization_path, selectors()).await?;
+
+        // Prove the reviewed one-shot authorization survives exactly one fully
+        // reconciled transient failure before any agent/container launch.
+        let transient = {
+            let _fault = ScopedAttendedFault::set("preparing");
+            super::run(
+                &store,
+                &authorization_path,
+                selectors(),
+                super::RelayEndpointOverride {
+                    server_url: None,
+                    token: None,
+                },
+            )
+            .await
+        };
+        anyhow::ensure!(
+            transient.is_err(),
+            "injected pre-agent fault unexpectedly completed"
+        );
+
+        let completed = super::run(
+            &store,
+            &authorization_path,
+            selectors(),
+            super::RelayEndpointOverride {
+                server_url: None,
+                token: None,
+            },
+        )
+        .await?;
+        let transient = super::list(&store)?
+            .into_iter()
+            .find(|record| record.id != completed.id)
+            .context("reconciled transient attempt is absent")?;
+        let transient_id = transient.id.clone();
+        let transient_container_name = transient.container_name.clone();
+        anyhow::ensure!(
+            transient.retry_class == Some(super::RetryClass::Prelaunch)
+                && transient.retry_eligible,
+            "transient pre-agent failure was not safely retryable"
+        );
+        let transient = super::cleanup(
+            &store,
+            &transient.id,
+            super::RelayEndpoint {
+                server_url: "http://127.0.0.1".into(),
+                token: None,
+            },
+        )
+        .await?;
+        anyhow::ensure!(transient.cleanup_outcome == super::CleanupOutcome::Succeeded);
+        let transient_receipt = super::read_receipt(&store, &transient.id)?;
+        anyhow::ensure!(
+            transient_receipt.payload.cleanup["journal_proof"]["kind"]
+                == "prelaunch_no_resources"
+        );
+        anyhow::ensure!(
+            completed.process_outcome == super::ProcessOutcome::Succeeded
+                && completed.agent_outcome == super::AgentOutcome::Succeeded
+                && completed.execution_outcome == super::ExecutionOutcome::Succeeded
+                && completed.agent_final.as_ref().is_some_and(|result| result.complete),
+            "attended host proof did not produce a structured complete result: {:?}",
+            completed.error
+        );
+        // The parser contract also explicitly distinguishes a valid incomplete
+        // terminal envelope; incomplete output is never retryable success.
+        let incomplete_event = serde_json::json!({
+            "type":"text",
+            "part":{"text":serde_json::json!({
+                "schema":"agent_result_v1","complete":false,"summary":"blocked",
+                "acceptance_results":[],"blockers":["fixture blocker"],
+                "artifact_references":[]
+            }).to_string()}
+        })
+        .to_string();
+        anyhow::ensure!(
+            super::parse_agent_result_events(&incomplete_event).outcome
+                == super::AgentOutcome::Incomplete
+        );
+
+        let completed = super::cleanup(
+            &store,
+            &completed.id,
+            super::RelayEndpoint {
+                server_url: "http://127.0.0.1".into(),
+                token: None,
+            },
+        )
+        .await?;
+        anyhow::ensure!(completed.cleanup_outcome == super::CleanupOutcome::Succeeded);
+        let receipt = super::read_receipt(&store, &completed.id)?;
+        anyhow::ensure!(receipt.payload.cleanup_evidence.complete());
+        for id in [&transient_id, &completed.id] {
+            anyhow::ensure!(!store.path(&PathBuf::from("runs").join(id))?.exists(), "attended run directory leaked: {id}");
+        }
+        for name in [&transient_container_name, &completed.container_name] {
+            let inspect = tokio::process::Command::new("docker")
+                .args(["container", "inspect", name])
+                .output()
+                .await?;
+            let stderr = String::from_utf8_lossy(&inspect.stderr).to_ascii_lowercase();
+            anyhow::ensure!(
+                !inspect.status.success()
+                    && (stderr.contains("no such container") || stderr.contains("no such object")),
+                "attended container absence was not proven exactly for {name}: {}",
+                String::from_utf8_lossy(&inspect.stderr)
+            );
+            let by_name = tokio::process::Command::new("docker")
+                .args(["ps", "-aq", "--filter", &format!("name=^/{name}$")])
+                .output()
+                .await?;
+            anyhow::ensure!(
+                by_name.status.success() && by_name.stdout.iter().all(u8::is_ascii_whitespace),
+                "attended container remains discoverable by name: {name}"
+            );
+        }
+        anyhow::ensure!(git_output(&sibling, &["rev-parse", "HEAD"])? == sibling_head);
+        anyhow::ensure!(git_output(&sibling, &["status", "--porcelain=v1"])? == sibling_status);
+        anyhow::ensure!(metadata_snapshot(&primary_common)? == common_metadata, "shared Git metadata changed during attended proof");
+
+        Ok(())
+        }
+        .await;
+        if operation.is_err() {
+            cleanup_root.disarm();
+        }
+        operation
     }
 
     #[cfg(target_os = "linux")]

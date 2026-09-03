@@ -225,3 +225,91 @@ fn multi_workspace_git_state_binds_exact_roots_refs_access_and_dirty_paths() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn two_linked_worktrees_share_objects_but_bind_isolated_git_views_and_state() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-hub-attended-linked-worktrees-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let repository = root.join("repository");
+    let primary = root.join("primary");
+    let sibling = root.join("sibling");
+    initialize_repository(&repository);
+    let git = |working_tree: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(working_tree)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "attended-primary",
+            primary.to_str().unwrap(),
+        ],
+    );
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "attended-sibling",
+            sibling.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(primary.join("tracked.txt"), "primary dirty\n").unwrap();
+
+    let resolved = resolve_mounts(
+        &approved_root("linked", &root),
+        &[
+            RequestedWorkspace {
+                alias: "primary".into(),
+                path: primary.clone(),
+                access: WorkspaceAccess::ReadWrite,
+            },
+            RequestedWorkspace {
+                alias: "sibling".into(),
+                path: sibling.clone(),
+                access: WorkspaceAccess::ReadOnly,
+            },
+        ],
+        &[],
+        "primary",
+    )
+    .unwrap();
+
+    assert_eq!(resolved.git_views.len(), 2);
+    assert!(resolved.git_views.iter().all(|view| {
+        view.repository_type == protocol::GitRepositoryType::Linked && view.object_stores.len() == 1
+    }));
+    assert_eq!(
+        resolved.git_views[0].object_stores[0].identity,
+        resolved.git_views[1].object_stores[0].identity
+    );
+    assert_ne!(resolved.git_views[0].git_dir, resolved.git_views[1].git_dir);
+    assert_eq!(resolved.repositories[0].workspace_alias, "primary");
+    assert_eq!(
+        resolved.repositories[0].starting.dirty_paths,
+        ["tracked.txt"]
+    );
+    assert_eq!(resolved.repositories[1].workspace_alias, "sibling");
+    assert!(resolved.repositories[1].starting.dirty_paths.is_empty());
+    assert_eq!(resolved.workspaces[0].access, WorkspaceAccess::ReadWrite);
+    assert_eq!(resolved.workspaces[1].access, WorkspaceAccess::ReadOnly);
+
+    std::fs::remove_dir_all(root).unwrap();
+}

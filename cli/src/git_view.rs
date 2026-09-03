@@ -1020,6 +1020,673 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires AGENT_HUB_PRIVATE_GO_DOCKER_INTEGRATION=1, cleanup consent, and a pinned local image and Go version with sh/git/python3/go"]
+    fn real_docker_private_go_two_linked_worktree_fixture() {
+        run_real_docker_private_go_two_linked_worktree_fixture().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_real_docker_private_go_two_linked_worktree_fixture() -> anyhow::Result<()> {
+        use agent_hub_executor::credential_provider::{CredentialProvider, resolve_all_for_job};
+        use agent_hub_executor::{DockerExecutionPlan, DockerOwnership, NetworkMode};
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        anyhow::ensure!(
+            std::env::var("AGENT_HUB_PRIVATE_GO_DOCKER_INTEGRATION").as_deref() == Ok("1"),
+            "AGENT_HUB_PRIVATE_GO_DOCKER_INTEGRATION=1 is required"
+        );
+        anyhow::ensure!(
+            std::env::var("AGENT_HUB_PRIVATE_GO_ALLOW_CLEANUP").as_deref() == Ok("1"),
+            "AGENT_HUB_PRIVATE_GO_ALLOW_CLEANUP=1 is required"
+        );
+        let image_reference = std::env::var("AGENT_HUB_PRIVATE_GO_TEST_IMAGE")?;
+        let go_version = std::env::var("AGENT_HUB_PRIVATE_GO_TEST_GO_VERSION")?;
+        anyhow::ensure!(
+            image_reference.contains("@sha256:") || image_reference.starts_with("sha256:"),
+            "AGENT_HUB_PRIVATE_GO_TEST_IMAGE must be an immutable digest reference"
+        );
+        anyhow::ensure!(
+            go_version.starts_with("go1.") && !go_version.chars().any(char::is_whitespace),
+            "AGENT_HUB_PRIVATE_GO_TEST_GO_VERSION must be an exact go1.x version"
+        );
+        let docker = PathBuf::from("docker");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "agent-hub-private-go-docker-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+        std::fs::create_dir(&root)?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        let namespace = uuid::Uuid::new_v4().simple().to_string();
+        let network = format!("agent-hub-private-go-{namespace}");
+        let origin = format!("agent-hub-private-go-origin-{namespace}");
+        let job = format!("agent-hub-private-go-job-{namespace}");
+        let fixture_label = "agent-hub.reddit.com/private-go-fixture";
+        let token = format!("synthetic-private-go-{namespace}");
+        let token_path = root.join("fixture-token");
+        std::fs::write(&token_path, &token)?;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
+
+        let command = |args: &[String]| -> anyhow::Result<std::process::Output> {
+            Ok(Command::new(&docker).args(args).output()?)
+        };
+        let docker_ok =
+            |args: &[String], operation: &str| -> anyhow::Result<std::process::Output> {
+                let output = command(args)?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "{operation}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(output)
+            };
+        let image_inspect = command(&[
+            "image".into(),
+            "inspect".into(),
+            "--format={{.Id}}".into(),
+            image_reference.clone(),
+        ])?;
+        anyhow::ensure!(
+            image_inspect.status.success(),
+            "inspect fixture image: {}",
+            String::from_utf8_lossy(&image_inspect.stderr)
+        );
+        let image_identity = String::from_utf8(image_inspect.stdout)?.trim().to_string();
+        docker_ok(
+            &[
+                "network".into(),
+                "create".into(),
+                "--internal".into(),
+                "--label".into(),
+                format!("{fixture_label}={namespace}"),
+                network.clone(),
+            ],
+            "create fixture network",
+        )?;
+        struct FixtureCleanup {
+            docker: PathBuf,
+            network: String,
+            origin: String,
+            job: String,
+            armed: bool,
+        }
+        impl FixtureCleanup {
+            fn disarm(&mut self) {
+                self.armed = false;
+            }
+        }
+        impl Drop for FixtureCleanup {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let _ = Command::new(&self.docker)
+                    .args(["rm", "-f", &self.job])
+                    .output();
+                let _ = Command::new(&self.docker)
+                    .args(["rm", "-f", &self.origin])
+                    .output();
+                let _ = Command::new(&self.docker)
+                    .args(["network", "rm", &self.network])
+                    .output();
+            }
+        }
+        let mut cleanup = FixtureCleanup {
+            docker: docker.clone(),
+            network: network.clone(),
+            origin: origin.clone(),
+            job: job.clone(),
+            armed: true,
+        };
+
+        let operation = (|| -> anyhow::Result<()> {
+            let deterministic_git = |tree: &Path, args: &[&str]| -> anyhow::Result<String> {
+                let output = Command::new("git")
+                    .arg("-C")
+                    .arg(tree)
+                    .args(args)
+                    .env("GIT_AUTHOR_NAME", "Agent Hub Test")
+                    .env("GIT_AUTHOR_EMAIL", "agent-hub@example.com")
+                    .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+                    .env("GIT_COMMITTER_NAME", "Agent Hub Test")
+                    .env("GIT_COMMITTER_EMAIL", "agent-hub@example.com")
+                    .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(String::from_utf8(output.stdout)?.trim().to_string())
+            };
+            let source = root.join("source");
+            std::fs::create_dir(&source)?;
+            deterministic_git(&source, &["init", "-q", "-b", "main"])?;
+            std::fs::write(source.join("seed"), "seed\n")?;
+            deterministic_git(&source, &["add", "seed"])?;
+            deterministic_git(&source, &["commit", "-q", "-m", "seed"])?;
+            let primary = root.join("primary");
+            let sibling = root.join("sibling");
+            deterministic_git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "fixture-primary",
+                    primary.to_str().unwrap(),
+                ],
+            )?;
+            deterministic_git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "fixture-sibling",
+                    sibling.to_str().unwrap(),
+                ],
+            )?;
+            std::fs::write(sibling.join("sentinel.txt"), "sibling-isolated\n")?;
+            deterministic_git(&sibling, &["add", "sentinel.txt"])?;
+            deterministic_git(&sibling, &["commit", "-q", "-m", "sibling sentinel"])?;
+            std::fs::write(
+                primary.join("go.mod"),
+                "module example.com/agent-hub/private-go-consumer\n\ngo 1.23\n\nrequire github.snooguts.net/private/module.git v0.0.1\n",
+            )?;
+            std::fs::write(
+                primary.join("main.go"),
+                "package main\nimport private \"github.snooguts.net/private/module.git\"\nfunc main(){println(private.Value)}\n",
+            )?;
+            deterministic_git(&primary, &["add", "go.mod", "main.go"])?;
+            deterministic_git(&primary, &["commit", "-q", "-m", "consumer"])?;
+            let primary_head = deterministic_git(&primary, &["rev-parse", "HEAD"])?;
+            let sibling_head = deterministic_git(&sibling, &["rev-parse", "HEAD"])?;
+            let sibling_before = std::fs::read(sibling.join("sentinel.txt"))?;
+
+            let module_source = root.join("module-source");
+            std::fs::create_dir(&module_source)?;
+            deterministic_git(&module_source, &["init", "-q", "-b", "main"])?;
+            std::fs::write(
+                module_source.join("go.mod"),
+                "module github.snooguts.net/private/module.git\n\ngo 1.23\n",
+            )?;
+            std::fs::write(
+                module_source.join("module.go"),
+                "package module\nconst Value = 42\n",
+            )?;
+            deterministic_git(&module_source, &["add", "go.mod", "module.go"])?;
+            deterministic_git(&module_source, &["commit", "-q", "-m", "private module"])?;
+            deterministic_git(&module_source, &["tag", "v0.0.1"])?;
+            let http_root = root.join("http");
+            std::fs::create_dir(&http_root)?;
+            let bare = http_root.join("private/module");
+            std::fs::create_dir_all(bare.parent().unwrap())?;
+            let clone = std::process::Command::new("git")
+                .args(["clone", "--bare", "-q"])
+                .arg(&module_source)
+                .arg(&bare)
+                .status()?;
+            anyhow::ensure!(clone.success(), "create bare module fixture");
+            deterministic_git(&bare, &["update-server-info"])?;
+            let common_metadata_before = metadata_snapshot(&source.join(".git"));
+            let evidence = root.join("origin.log");
+            std::fs::write(&evidence, b"")?;
+            let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/private_go_http_origin.py");
+            let origin_output = docker_ok(
+                &[
+                    "run".into(),
+                    "-d".into(),
+                    "--name".into(),
+                    origin.clone(),
+                    "--label".into(),
+                    format!("{fixture_label}={namespace}"),
+                    format!("--network={network}"),
+                    "--network-alias=github.snooguts.net".into(),
+                    "--read-only".into(),
+                    "--security-opt=no-new-privileges".into(),
+                    "--cap-drop=ALL".into(),
+                    "--tmpfs=/tmp:rw,nosuid,nodev,size=16m".into(),
+                    "--user".into(),
+                    format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                        libc::getegid()
+                    }),
+                    format!(
+                        "--mount=type=bind,src={},dst=/git,readonly",
+                        http_root.display()
+                    ),
+                    format!(
+                        "--mount=type=bind,src={},dst=/evidence.log",
+                        evidence.display()
+                    ),
+                    format!(
+                        "--mount=type=bind,src={},dst=/origin.py,readonly",
+                        fixture.display()
+                    ),
+                    format!(
+                        "--mount=type=bind,src={},dst=/fixture-token,readonly",
+                        token_path.display()
+                    ),
+                    "-e=FIXTURE_GIT_ROOT=/git".into(),
+                    "-e=FIXTURE_EVIDENCE=/evidence.log".into(),
+                    "-e=FIXTURE_TOKEN_FILE=/fixture-token".into(),
+                    "--entrypoint=python3".into(),
+                    image_reference.clone(),
+                    "/origin.py".into(),
+                ],
+                "start authenticated Git HTTP fixture",
+            )?;
+            anyhow::ensure!(
+                !origin_output
+                    .stdout
+                    .windows(token.len())
+                    .any(|bytes| bytes == token.as_bytes())
+                    && !origin_output
+                        .stderr
+                        .windows(token.len())
+                        .any(|bytes| bytes == token.as_bytes()),
+                "synthetic token escaped through origin startup output"
+            );
+            let ready_args = [
+                "exec".to_string(),
+                origin.clone(),
+                "python3".into(),
+                "-c".into(),
+                "import socket; socket.create_connection(('127.0.0.1', 8080), 1).close()".into(),
+            ];
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let output = command(&ready_args)?;
+                anyhow::ensure!(
+                    !output
+                        .stdout
+                        .windows(token.len())
+                        .any(|bytes| bytes == token.as_bytes())
+                        && !output
+                            .stderr
+                            .windows(token.len())
+                            .any(|bytes| bytes == token.as_bytes()),
+                    "synthetic token escaped through readiness output"
+                );
+                if output.status.success() {
+                    break;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "authenticated origin did not become ready within 10 seconds"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            let run_dir = root.join("run");
+            let credentials_dir = run_dir.join("credentials");
+            std::fs::create_dir_all(&credentials_dir)?;
+            let effects =
+                ExecutionCancellationContext::new(&run_dir.join("effects"), Cancellation::never())?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let provider = CredentialProvider::GithubToken {
+                name: "github:github.snooguts.net:read_write".into(),
+                host: "github.snooguts.net".into(),
+                api_base_url: "https://github.snooguts.net/api/v3".into(),
+                access: "read_write".into(),
+                command: "/bin/cat".into(),
+                args: vec![token_path.to_string_lossy().into_owned()],
+                target: "/agent-hub/github/tokens/github.snooguts.net".into(),
+            };
+            match &provider {
+                CredentialProvider::GithubToken {
+                    name,
+                    host,
+                    api_base_url,
+                    access,
+                    command,
+                    args,
+                    target,
+                } => anyhow::ensure!(
+                    name == "github:github.snooguts.net:read_write"
+                        && host == "github.snooguts.net"
+                        && api_base_url == "https://github.snooguts.net/api/v3"
+                        && access == "read_write"
+                        && command == "/bin/cat"
+                        && args == &[token_path.to_string_lossy().into_owned()]
+                        && target == "/agent-hub/github/tokens/github.snooguts.net",
+                    "synthetic GitHub provider is not exact"
+                ),
+                _ => anyhow::bail!("synthetic GitHub provider has the wrong type"),
+            }
+            let credentials = runtime.block_on(resolve_all_for_job(
+                &[provider],
+                Some(std::time::SystemTime::now() + std::time::Duration::from_secs(120)),
+                Some(&credentials_dir),
+                &effects,
+            ))?;
+            anyhow::ensure!(credentials.env_vars["GOPRIVATE"] == "github.snooguts.net");
+            let specs = vec![
+                inspect_git_view(
+                    "primary",
+                    &primary,
+                    "/workspace/primary",
+                    WorkspaceAccess::ReadWrite,
+                )?,
+                inspect_git_view(
+                    "sibling",
+                    &sibling,
+                    "/workspace/sibling",
+                    WorkspaceAccess::ReadOnly,
+                )?,
+            ];
+            anyhow::ensure!(
+                specs
+                    .iter()
+                    .all(|view| view.repository_type == GitRepositoryType::Linked)
+            );
+            let views = materialize_git_views(&run_dir, &specs, &effects)?;
+            anyhow::ensure!(views.mounts.iter().all(|mount| mount.read_only));
+            let mut mounts = vec![
+                DockerMount::new(&primary, "/workspace/primary", false)?,
+                DockerMount::new(&sibling, "/workspace/sibling", true)?,
+            ];
+            mounts.extend(views.mounts.iter().cloned());
+            mounts.push(views.home_mount.clone());
+            let material = credentials.material()?;
+            mounts.extend(material.mounts);
+            let mut environment: BTreeMap<String, String> = material.environment;
+            environment.extend([
+                ("HOME".into(), "/tmp/home".into()),
+                (
+                    "GIT_CONFIG_SYSTEM".into(),
+                    "/agent-hub/git/home/.gitconfig".into(),
+                ),
+                ("GIT_CONFIG_NOSYSTEM".into(), "0".into()),
+                ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
+                ("GONOSUMDB".into(), "github.snooguts.net".into()),
+                ("GOINSECURE".into(), "github.snooguts.net".into()),
+                ("GOPROXY".into(), "direct".into()),
+                ("GOTOOLCHAIN".into(), "local".into()),
+                ("GOMODCACHE".into(), "/tmp/go-mod".into()),
+                ("EXPECTED_GO_VERSION".into(), go_version.clone()),
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                (
+                    "GIT_CONFIG_KEY_0".into(),
+                    "url.http://github.snooguts.net:8080/.insteadOf".into(),
+                ),
+                (
+                    "GIT_CONFIG_VALUE_0".into(),
+                    "https://github.snooguts.net/".into(),
+                ),
+            ]);
+            let script = format!(
+                r#"set -eu
+mkdir -p "$HOME"
+test "$GOPRIVATE" = github.snooguts.net
+test "$GONOSUMDB" = github.snooguts.net
+test "$GOINSECURE" = github.snooguts.net
+test "$GOPROXY" = direct
+test "$GOTOOLCHAIN" = local
+test "$GOMODCACHE" = /tmp/go-mod
+test "$(go env GOVERSION)" = "$EXPECTED_GO_VERSION"
+test "$(go list -m)" = example.com/agent-hub/private-go-consumer
+git ls-remote https://github.snooguts.net/private/module refs/tags/v0.0.1 >/dev/null
+test "$(git rev-parse HEAD)" = '{primary_head}'
+test -z "$(git status --short)"
+test "$(git -C /workspace/sibling rev-parse HEAD)" = '{sibling_head}'
+test -z "$(git -C /workspace/sibling status --short)"
+test -z "$(git -C /workspace/sibling diff)"
+test "$(cat /workspace/sibling/sentinel.txt)" = sibling-isolated
+! touch /workspace/sibling/forbidden
+! git branch forbidden
+go mod download github.snooguts.net/private/module.git@v0.0.1
+gofmt -w main.go
+go test ./...
+go vet ./...
+go build ./...
+test -x private-go-consumer
+rm private-go-consumer
+test "$(git rev-parse HEAD)" = '{primary_head}'
+"#
+            );
+            let plan = DockerExecutionPlan {
+                image_identity,
+                container_name: job.clone(),
+                entrypoint: "sh".into(),
+                command_args: vec!["-ceu".into(), script],
+                mounts,
+                environment,
+                network: NetworkMode::Named(network.clone()),
+                dns: Vec::new(),
+                extra_hosts: Vec::new(),
+                ownership: DockerOwnership::new(BTreeMap::from([(
+                    fixture_label.into(),
+                    namespace.clone(),
+                )]))?,
+                user: format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                    libc::getegid()
+                }),
+                workdir: Some("/workspace/primary".into()),
+                memory_limit: "2g".into(),
+                cpu_limit: "2".into(),
+                pids_limit: 256,
+                read_only: true,
+                tmpfs: vec!["/tmp:rw,nosuid,nodev,size=512m".into()],
+            };
+            let plan_debug = format!("{plan:?}");
+            anyhow::ensure!(
+                !plan_debug.contains(&token),
+                "synthetic token escaped into Docker plan"
+            );
+            anyhow::ensure!(
+                plan.environment
+                    .values()
+                    .all(|value| !value.contains(&token)),
+                "synthetic token escaped into Docker environment"
+            );
+            let plan_args = plan.materialize_args()?;
+            anyhow::ensure!(
+                plan_args.iter().all(|arg| !arg.contains(&token)),
+                "synthetic token escaped into Docker argv"
+            );
+            let output = command(&plan_args)?;
+            anyhow::ensure!(
+                !output
+                    .stdout
+                    .windows(token.len())
+                    .any(|bytes| bytes == token.as_bytes())
+                    && !output
+                        .stderr
+                        .windows(token.len())
+                        .any(|bytes| bytes == token.as_bytes()),
+                "synthetic token escaped through job output"
+            );
+            anyhow::ensure!(
+                output.status.success(),
+                "job failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            anyhow::ensure!(git(&primary, &["rev-parse", "HEAD"]) == primary_head);
+            anyhow::ensure!(git(&sibling, &["rev-parse", "HEAD"]) == sibling_head);
+            anyhow::ensure!(std::fs::read(sibling.join("sentinel.txt"))? == sibling_before);
+            anyhow::ensure!(
+                std::fs::read_to_string(primary.join("main.go"))?
+                    == "package main\n\nimport private \"github.snooguts.net/private/module.git\"\n\nfunc main() { println(private.Value) }\n",
+                "gofmt output was not exact"
+            );
+            let go_sum = std::fs::read_to_string(primary.join("go.sum"))?;
+            let go_sum_lines = go_sum.lines().collect::<Vec<_>>();
+            anyhow::ensure!(
+                go_sum_lines.len() == 2
+                    && go_sum_lines[0]
+                        .starts_with("github.snooguts.net/private/module.git v0.0.1 h1:")
+                    && go_sum_lines[1]
+                        .starts_with("github.snooguts.net/private/module.git v0.0.1/go.mod h1:"),
+                "go.sum changes were not exact: {go_sum:?}"
+            );
+            anyhow::ensure!(
+                git(&primary, &["status", "--short"]) == "M main.go\n?? go.sum",
+                "primary formatted/go.sum changes were not exact"
+            );
+            anyhow::ensure!(
+                metadata_snapshot(&source.join(".git")) == common_metadata_before,
+                "shared Git metadata changed"
+            );
+            let log = std::fs::read_to_string(&evidence)?;
+            anyhow::ensure!(log.contains("authorized GET /private/module/"));
+            anyhow::ensure!(!log.contains(&token));
+            views.cleanup(&effects)?;
+            effects.reconcile_owned_credentials(&credentials_dir, None)?;
+            std::fs::remove_dir_all(&credentials_dir)?;
+            effects.finalize()?;
+            fn ensure_tree_has_no_token(path: &Path, token: &[u8]) -> anyhow::Result<()> {
+                for entry in std::fs::read_dir(path)? {
+                    let path = entry?.path();
+                    let metadata = std::fs::symlink_metadata(&path)?;
+                    anyhow::ensure!(
+                        !metadata.file_type().is_symlink(),
+                        "fixture contains an unexpected symlink: {}",
+                        path.display()
+                    );
+                    if metadata.is_dir() {
+                        ensure_tree_has_no_token(&path, token)?;
+                    } else {
+                        let bytes = std::fs::read(&path)?;
+                        anyhow::ensure!(
+                            !bytes
+                                .windows(token.len())
+                                .any(|candidate| candidate == token),
+                            "synthetic token escaped into {}",
+                            path.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            std::fs::remove_file(&token_path)?;
+            ensure_tree_has_no_token(&run_dir, token.as_bytes())?;
+            ensure_tree_has_no_token(&primary, token.as_bytes())?;
+            ensure_tree_has_no_token(&sibling, token.as_bytes())?;
+            ensure_tree_has_no_token(&module_source, token.as_bytes())?;
+            ensure_tree_has_no_token(&http_root, token.as_bytes())?;
+            std::fs::remove_dir_all(&run_dir)?;
+            anyhow::ensure!(!run_dir.exists(), "fixture run directory leaked");
+            Ok(())
+        })();
+
+        let strict_cleanup = (|| -> anyhow::Result<()> {
+            for (kind, name) in [
+                ("container", &job),
+                ("container", &origin),
+                ("network", &network),
+            ] {
+                let remove_args = if kind == "container" {
+                    vec!["rm".into(), "-f".into(), name.clone()]
+                } else {
+                    vec!["network".into(), "rm".into(), name.clone()]
+                };
+                let removed = command(&remove_args)?;
+                if !removed.status.success() {
+                    let stderr = String::from_utf8_lossy(&removed.stderr).to_ascii_lowercase();
+                    let not_found = if kind == "container" {
+                        stderr.contains("no such container")
+                    } else {
+                        stderr.contains("no such network")
+                            || stderr.contains("network ") && stderr.contains(" not found")
+                    };
+                    anyhow::ensure!(
+                        not_found,
+                        "remove fixture {kind} {name} failed: {}",
+                        String::from_utf8_lossy(&removed.stderr)
+                    );
+                }
+                let absent = command(&[kind.into(), "inspect".into(), name.clone()])?;
+                anyhow::ensure!(!absent.status.success(), "fixture leaked {kind} {name}");
+                let stderr = String::from_utf8_lossy(&absent.stderr).to_ascii_lowercase();
+                anyhow::ensure!(
+                    if kind == "container" {
+                        stderr.contains("no such container") || stderr.contains("no such object")
+                    } else {
+                        stderr.contains("no such network")
+                            || stderr.contains("network ") && stderr.contains(" not found")
+                    },
+                    "fixture {kind} absence was ambiguous: {}",
+                    String::from_utf8_lossy(&absent.stderr)
+                );
+            }
+            let containers_by_label = command(&[
+                "ps".into(),
+                "-aq".into(),
+                "--filter".into(),
+                format!("label={fixture_label}={namespace}"),
+            ])?;
+            let containers_by_name = command(&[
+                "ps".into(),
+                "-aq".into(),
+                "--filter".into(),
+                format!("name=^/({job}|{origin})$"),
+            ])?;
+            let networks_by_label = command(&[
+                "network".into(),
+                "ls".into(),
+                "-q".into(),
+                "--filter".into(),
+                format!("label={fixture_label}={namespace}"),
+            ])?;
+            let networks_by_name = command(&[
+                "network".into(),
+                "ls".into(),
+                "-q".into(),
+                "--filter".into(),
+                format!("name=^{network}$"),
+            ])?;
+            for (description, output) in [
+                ("container label", containers_by_label),
+                ("container name", containers_by_name),
+                ("network label", networks_by_label),
+                ("network name", networks_by_name),
+            ] {
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Docker {description} absence query failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                anyhow::ensure!(
+                    output.stdout.iter().all(u8::is_ascii_whitespace),
+                    "fixture resources remain by {description}"
+                );
+            }
+            Ok(())
+        })();
+        match (operation, strict_cleanup) {
+            (Ok(()), Ok(())) => {
+                std::fs::remove_dir_all(&root)?;
+                anyhow::ensure!(!root.exists(), "fixture root leaked");
+                cleanup.disarm();
+                Ok(())
+            }
+            (Err(error), Ok(())) => {
+                Err(error.context(format!("fixture state preserved at {}", root.display())))
+            }
+            (Ok(()), Err(error)) => {
+                Err(error.context(format!("fixture state preserved at {}", root.display())))
+            }
+            (Err(operation), Err(cleanup_error)) => Err(operation.context(format!(
+                "cleanup also failed ({cleanup_error:#}); fixture state preserved at {}",
+                root.display()
+            ))),
+        }
+    }
+
     fn metadata_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         fn visit(root: &Path, path: &Path, output: &mut Vec<(PathBuf, Vec<u8>)>) {
             let mut entries = std::fs::read_dir(path)
