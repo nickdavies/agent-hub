@@ -61,6 +61,14 @@
     "tool_approval": {
       "$ref": "#/$defs/AgentHubRunToolApproval"
     },
+    "workspace_export_root": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4096,
+      "minLength": 1
+    },
     "workspaces": {
       "type": "array",
       "items": {

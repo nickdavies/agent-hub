@@ -37,8 +37,6 @@ use crate::local::{
 };
 use crate::state::StateStore;
 
-#[cfg(test)]
-pub const DIPPY_SELECTOR_PREFIX: &str = "agent-hub local authorize";
 pub const RESULT_SCHEMA_V3: &str = "attended_result_v3";
 pub const RESULT_SCHEMA_V4: &str = "attended_result_v4";
 const LOCAL_RESULT_SCHEMA_V2: &str = "local_result_v2";
@@ -712,129 +710,6 @@ fn omit_workspace_export_paths(
     state
         .dirty_paths
         .retain(|path| path != ".agent-hub/runs" && !path.starts_with(".agent-hub/runs/"));
-}
-
-#[cfg(test)]
-pub fn render_proposal(
-    path: &Path,
-    artifact: &AttendedAuthorizationArtifact,
-) -> anyhow::Result<String> {
-    let request = artifact.verify_v3().map_err(anyhow::Error::msg)?;
-    let canonical_path = std::fs::canonicalize(path)
-        .with_context(|| format!("canonicalize authorization path {}", path.display()))?;
-    let approval_bundle = request.approval_bundle.as_ref().map_or_else(
-        || "Approval bundle: none (automatic)\n".to_string(),
-        |bundle| {
-            format!(
-                "Approval bundle name: {}\nApproval bundle protocol: {}\nApproval bundle digest: {}\nApproval manifest SHA-256: {}\nGateway commit: {}\nGateway archive SHA-256: {}\nPlugin SHA-256: {}\nDippy commit: {}\nDippy archive SHA-256: {}\nDippy wheel SHA-256: {}\n",
-                bundle.name,
-                bundle.protocol,
-                bundle.digest,
-                bundle.manifest_sha256,
-                bundle.gateway_commit,
-                bundle.gateway_archive_sha256,
-                bundle.plugin_sha256,
-                bundle.dippy_commit,
-                bundle.dippy_archive_sha256,
-                bundle.dippy_wheel_sha256,
-            )
-        },
-    );
-    let git_capabilities = request
-        .git_views
-        .iter()
-        .map(|view| {
-            format!(
-                "{}: isolated read-only Git metadata ({:?}), workspace content {:?}, HEAD {}, ref {}, remote {}",
-                view.workspace_alias,
-                view.repository_type,
-                view.access,
-                view.head,
-                view.reference.as_deref().unwrap_or("detached"),
-                view.remote.as_deref().unwrap_or("none"),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let root_capabilities = request
-        .roots
-        .iter()
-        .map(|root| {
-            format!(
-                "{}: {} ({})",
-                root.identity,
-                root.host_path,
-                root.roles
-                    .iter()
-                    .map(|role| format!("{role:?}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(format!(
-        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nOverlay bindings: {}\nTimeout seconds: {}\nWorkspace export root: {}\nRoot capabilities:\n{}\nWorkspace root identities: {}\nContext root identities: {}\nGit capability:\n{}\nRetry limits: attempts={}, prelaunch={}, provider-unavailable={}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
-        request.proposal.environment,
-        request.proposal.image_family,
-        request.proposal.image_tag,
-        request.proposal.image_id,
-        request.proposal.network_class,
-        resource_list(&request.proposal.network_resources),
-        tool_approval_name(request.proposal.tool_approval),
-        approval_bundle,
-        request.proposal.overlays.join(","),
-        request
-            .execution
-            .overlays
-            .iter()
-            .map(|overlay| format!("{}={}", overlay.name, overlay.config))
-            .collect::<Vec<_>>()
-            .join(","),
-        request.proposal.timeout_secs,
-        request
-            .workspace_export
-            .as_ref()
-            .map(|export| export.root.as_str())
-            .unwrap_or("none"),
-        root_capabilities,
-        request
-            .workspace_root_identities
-            .iter()
-            .map(|(alias, identity)| format!("{alias}={identity}"))
-            .collect::<Vec<_>>()
-            .join(","),
-        request
-            .context_root_identities
-            .iter()
-            .map(|(alias, identity)| format!("{alias}={identity}"))
-            .collect::<Vec<_>>()
-            .join(","),
-        git_capabilities,
-        request.retry.max_attempts,
-        request.retry.max_prelaunch_retries,
-        request.retry.max_provider_unavailable_retries,
-        request.proposal.prompt_digest,
-        request.proposal.prompt,
-        artifact.digest,
-        DIPPY_SELECTOR_PREFIX,
-        shell_word(&request.proposal.environment),
-        shell_word(&request.proposal.image_family),
-        shell_word(&request.proposal.network_class),
-        repeated_selector_args(
-            "network-resource",
-            request
-                .proposal
-                .network_resources
-                .iter()
-                .map(ToString::to_string)
-        ),
-        tool_approval_name(request.proposal.tool_approval),
-        repeated_selector_args("overlay", request.proposal.overlays.iter().cloned()),
-        request.proposal.timeout_secs,
-        shell_word(&path_string(&canonical_path)?),
-        artifact.digest,
-    ))
 }
 
 fn verify_authorization_selectors(
@@ -5531,40 +5406,6 @@ fn network_request(resources: &[NetworkResourceKind]) -> NetworkResourceRequest 
     }
 }
 
-#[cfg(test)]
-fn resource_list(resources: &[NetworkResourceKind]) -> String {
-    if resources.is_empty() {
-        "none".to_string()
-    } else {
-        resources
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-}
-
-#[cfg(test)]
-fn repeated_selector_args(name: &str, values: impl IntoIterator<Item = String>) -> String {
-    values
-        .into_iter()
-        .map(|value| format!(" --{name} {}", shell_word(&value)))
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) fn shell_word(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-._/:@".contains(&byte))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
 fn authorization_path(state: &str, digest: &str) -> PathBuf {
     PathBuf::from("authorizations")
         .join(state)
@@ -6520,57 +6361,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    static ATTENDED_FAULT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(target_os = "linux")]
-    struct ScopedAttendedFault {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl ScopedAttendedFault {
-        fn set(value: &str) -> Self {
-            let lock = ATTENDED_FAULT_ENV_LOCK.lock().unwrap();
-            let previous = std::env::var_os("AGENT_HUB_ATTENDED_FAULT");
-            unsafe { std::env::set_var("AGENT_HUB_ATTENDED_FAULT", value) };
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for ScopedAttendedFault {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var("AGENT_HUB_ATTENDED_FAULT", value) },
-                None => unsafe { std::env::remove_var("AGENT_HUB_ATTENDED_FAULT") },
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    struct DisarmableIntegrationRootCleanup(Option<PathBuf>);
-
-    #[cfg(target_os = "linux")]
-    impl DisarmableIntegrationRootCleanup {
-        fn disarm(&mut self) {
-            self.0 = None;
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for DisarmableIntegrationRootCleanup {
-        fn drop(&mut self) {
-            if let Some(path) = &self.0 {
-                let _ = std::fs::remove_dir_all(path);
-            }
-        }
-    }
-
     #[test]
     fn supervised_tool_approval_requires_host_relay_endpoint() {
         verify_tool_approval(protocol::ToolApprovalMode::Auto, None).unwrap();
@@ -6679,7 +6469,7 @@ mod tests {
         run_real_docker_attended_opencode_startup().await.unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any())]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires explicitly approved real github.snooguts.net credentials, two existing linked worktrees, canonical attended config, and Docker cleanup consent"]
     async fn real_docker_attended_v3_private_go_multi_worktree_host_proof() {
@@ -6688,7 +6478,7 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any())]
     async fn run_real_docker_attended_v3_private_go_multi_worktree_host_proof() -> anyhow::Result<()>
     {
         use crate::local::{RequestedWorkspace, WorkspaceAccess};
@@ -8996,6 +8786,7 @@ grep -qx 'ready\|ready\.' real-llm.log
         assert!(super::ensure_document_complete(&document).is_err());
 
         let mut record = terminal_record();
+        record.run_id = uuid::Uuid::new_v4().to_string();
         assert!(super::normalize_record(record.clone()).is_err());
         record.run_id = record.id.clone();
         record.schema = "attended_result_v99".into();
@@ -9081,7 +8872,7 @@ grep -qx 'ready\|ready\.' real-llm.log
             .join("\n");
         assert_eq!(
             result_keys,
-            "agent_final\nagent_outcome\nartifacts\ncleanup\ncleanup_outcome\nexecution_outcome\nexit_code\npaths\npermission_outcome\nprocess_outcome\nrepositories\nresult\nrun_id\nschema\nstderr\nstdout\ntranscript"
+            "agent_final\nagent_outcome\nartifacts\ncleanup\ncleanup_outcome\nerror\nexecution_outcome\nexit_code\nlaunch_state\npaths\npermission_outcome\nprocess_outcome\nrepositories\nresult\nresult_outcome\nretry_class\nretry_eligible\nrun_id\nschema\nstatus\nstderr\nstdout\ntranscript"
         );
         assert_eq!(
             result.paths["receipt"],
@@ -9120,6 +8911,8 @@ grep -qx 'ready\|ready\.' real-llm.log
         let mut cleaned = stale.clone();
         cleaned.status = RunStatus::Cleaned;
         cleaned.cleanup_outcome = super::CleanupOutcome::Succeeded;
+        let cleaned_at = Utc::now();
+        cleaned.finished_at = Some(cleaned_at);
         let payload = super::CleanupReceiptPayload {
             record: cleaned.clone(),
             owner: super::owner_marker_for_record(&cleaned),
@@ -9134,7 +8927,7 @@ grep -qx 'ready\|ready\.' real-llm.log
             schema: super::CLEANUP_RECEIPT_SCHEMA_V1.into(),
             run_id: cleaned.id.clone(),
             authorization_digest: cleaned.authorization_digest.clone(),
-            cleaned_at: Utc::now(),
+            cleaned_at,
             checksum: super::receipt_checksum(&payload).unwrap(),
             payload,
         };

@@ -64,6 +64,7 @@ export interface AgentHubRunIntentV1 {
   schema: AgentHubRunIntentSchema
   timeout_secs: number
   tool_approval: AgentHubRunToolApproval
+  workspace_export_root?: string | null
   /**
    * @minItems 1
    * @maxItems 32
