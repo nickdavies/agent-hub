@@ -143,6 +143,204 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(feature = "test-fault-hooks")]
+#[test]
+fn split_launch_state_writes_recover_across_process_restarts() {
+    for boundary in [
+        "launch_pending_record_published",
+        "consumption_lineage_published",
+        "running_record_published",
+        "terminal_record_published",
+    ] {
+        let root = temp_root();
+        let config = root.join("config");
+        let workspace = root.join("workspace");
+        let state = root.join("state");
+        let authorization = root.join("authorization.json");
+        let fake_bin = root.join("bin");
+        std::fs::create_dir(&workspace).unwrap();
+        initialize_repository(&workspace);
+        std::fs::create_dir(&fake_bin).unwrap();
+        write_config(&config, &workspace);
+        write_fake_docker(
+            &fake_bin.join("docker"),
+            &root.join("docker.calls"),
+            &workspace,
+            &root,
+        );
+        let proposal = invoke(
+            &root,
+            &fake_bin,
+            &state,
+            &[
+                "local",
+                "propose",
+                "--config-root",
+                config.to_str().unwrap(),
+                "--environment",
+                "test",
+                "--image-family",
+                "job-code",
+                "--network-class",
+                "none",
+                "--tool-approval",
+                "auto",
+                "--workspace",
+                &format!("primary={}:rw", workspace.display()),
+                "--primary-workspace",
+                "primary",
+                "--timeout-secs",
+                "30",
+                "--prompt-stdin",
+                "--output",
+                authorization.to_str().unwrap(),
+            ],
+            Some("Return success"),
+        );
+        assert_success(&proposal);
+        let proposal_stdout = String::from_utf8(proposal.stdout).unwrap();
+        let digest = proposal_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("Authorization digest: "))
+            .unwrap();
+        let authorize = invoke(
+            &root,
+            &fake_bin,
+            &state,
+            &[
+                "local",
+                "authorize",
+                "--environment",
+                "test",
+                "--image-family",
+                "job-code",
+                "--network-class",
+                "none",
+                "--tool-approval",
+                "auto",
+                "--timeout-secs",
+                "30",
+                "--authorization",
+                authorization.to_str().unwrap(),
+                "--digest",
+                digest,
+            ],
+            None,
+        );
+        assert_success(&authorize);
+        let run_args = [
+            "local",
+            "run",
+            "--environment",
+            "test",
+            "--image-family",
+            "job-code",
+            "--network-class",
+            "none",
+            "--tool-approval",
+            "auto",
+            "--timeout-secs",
+            "30",
+            "--authorization",
+            authorization.to_str().unwrap(),
+            "--digest",
+            digest,
+        ];
+        let interrupted = invoke_with_env(
+            &root,
+            &fake_bin,
+            &state,
+            &run_args,
+            None,
+            Some(("AGENT_HUB_TEST_ATTENDED_FAULT", boundary)),
+        );
+        assert!(
+            !interrupted.status.success(),
+            "fault {boundary} did not interrupt execution"
+        );
+        assert!(String::from_utf8_lossy(&interrupted.stderr).contains(boundary));
+
+        let run_id = only_json_stem(&state.join("executions"));
+        let restarted = invoke(&root, &fake_bin, &state, &run_args, None);
+        assert!(!restarted.status.success());
+        let status = invoke(
+            &root,
+            &fake_bin,
+            &state,
+            &["local", "status", "--run-id", &run_id],
+            None,
+        );
+        let record: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(
+            record["launch_state"],
+            "terminal",
+            "boundary {boundary}; restart stderr={}; record={record:#}",
+            String::from_utf8_lossy(&restarted.stderr)
+        );
+        let authorization_record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                state
+                    .join("authorizations/records")
+                    .join(format!("{digest}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(authorization_record["active_attempt_id"].is_null());
+        assert_eq!(authorization_record["attempts"][0]["state"], "terminal");
+        if boundary == "terminal_record_published" {
+            assert_success(&status);
+            assert_eq!(record["status"], "succeeded");
+            assert!(String::from_utf8_lossy(&restarted.stderr).contains("already consumed"));
+            let published: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(state.join("runs").join(&run_id).join("result.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(published["launch_state"], "terminal");
+            assert_eq!(published["attempt_id"], record["attempt_id"]);
+        } else {
+            assert_eq!(record["status"], "failed");
+            assert!(
+                record["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("authorization consumed fail-closed")
+            );
+            assert!(String::from_utf8_lossy(&restarted.stderr).contains("consumed fail-closed"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(feature = "test-fault-hooks")]
+fn only_json_stem(path: &Path) -> String {
+    let entries = std::fs::read_dir(path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
+    entries[0]
+        .path()
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !path.is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn initialize_repository(path: &Path) {
     let git = |args: &[&str]| {
         let status = Command::new("git")
@@ -175,6 +373,17 @@ fn invoke(
     args: &[&str],
     stdin: Option<&str>,
 ) -> Output {
+    invoke_with_env(root, fake_bin, state, args, stdin, None)
+}
+
+fn invoke_with_env(
+    root: &Path,
+    fake_bin: &Path,
+    state: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    environment: Option<(&str, &str)>,
+) -> Output {
     use std::io::Write as _;
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-hub"));
     command
@@ -190,6 +399,9 @@ fn invoke(
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some((name, value)) = environment {
+        command.env(name, value);
+    }
     let mut child = command.spawn().unwrap();
     if let Some(stdin) = stdin {
         child
@@ -288,7 +500,7 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
     std::fs::write(
         path,
         format!(
-             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then rm '{}'; printf '503 service unavailable\\n' >&2; exit 75; fi; if [ -f '{}' ]; then sleep 1; fi; printf '%s\\n' '{}' ;; esac\n",
+             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\nif [ \"$1 $2\" = 'network inspect' ]; then printf '%s\\n' 'No such network' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then rm '{}'; printf '%s\\n' '{}'; printf 'Error: Service Unavailable\\n' >&2; exit 75; fi; if [ -f '{}' ]; then printf 'entered\\n' > '{}'; sync '{}'; sleep 1; fi; printf '%s\\n' '{}' ;; esac\n",
             marker.display(),
             "a".repeat(64),
             root.join("fail-preflight-once").display(),
@@ -296,7 +508,22 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
              report_path.display(),
             root.join("provider-503-once").display(),
             root.join("provider-503-once").display(),
+            serde_json::json!({
+                "type": "error",
+                "timestamp": 1788220800000_u64,
+                "sessionID": "session-1",
+                "error": {
+                    "name": "APIError",
+                    "data": {
+                        "message": "Error: Service Unavailable",
+                        "statusCode": 503,
+                        "isRetryable": true
+                    }
+                }
+            }),
              root.join("slow-launch").display(),
+            root.join("docker-entered").display(),
+            root.join("docker-entered").display(),
             result_event,
         ),
     )
