@@ -1,0 +1,14 @@
+{
+  "agent_outcome": "succeeded",
+  "cleanup_outcome": "succeeded",
+  "error": "attended result publication failed: attended artifact exceeded reviewed limit of 1 bytes",
+  "execution_outcome": "succeeded",
+  "exit_code": 0,
+  "launch_state": "terminal",
+  "permission_outcome": "no_denials",
+  "process_outcome": "succeeded",
+  "result_outcome": "failed",
+  "retry_eligible": false,
+  "schema": "attended_result_v4",
+  "status": "failed"
+}

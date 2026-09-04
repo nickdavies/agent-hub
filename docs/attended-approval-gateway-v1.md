@@ -136,7 +136,30 @@ sandbox disconnect cancels its remote request.
 
 ## Authorization compatibility
 
-The relay bundle is bound by `attended_authorization_request_v2` and attended
-artifact version 2 under domain `agent-hub:attended-authorization:v2\0`. The V1
-request shape, artifact version, canonical bytes, and
-`agent-hub:attended-authorization:v1\0` parser remain unchanged.
+The relay bundle and typed output/lifecycle contracts are bound by
+`attended_authorization_request_v3` and attended artifact version 3 under
+domain `agent-hub:attended-authorization:v3\0`. The V1 and V2 request shapes,
+artifact versions, canonical bytes, and domain parsers remain unchanged.
+
+## Operator result guide
+
+`agent-hub local status --run-id UUID` prints the persisted execution record.
+Persisted `attended_result_v3` records remain byte-shape compatible and do not
+contain `result_outcome`; readers report their result evidence as `unknown`.
+New records use `attended_result_v4`, where `result_outcome` is
+`pending`, `succeeded`, or `failed`. A legacy terminal status or exit code is
+not evidence that result publication succeeded.
+
+`agent-hub local result --run-id UUID` prints a `local_result_v2` aggregate with
+the normalized lifecycle fields and bounded parsed copies of `result.json`,
+`artifacts.json`, `repositories.json`, and `cleanup.json`. The individual
+documents are available through `local artifacts`, `local repositories`, and
+`local cleanup-result`. All four commands accept `--limit-bytes` from 1 through
+16,777,216 inclusive and default to 1,048,576.
+
+Result commands print the available JSON before returning a nonzero status for
+a failed, unknown, truncated, unavailable, or malformed result. This preserves
+diagnostic evidence for operators without allowing output inspection to imply
+success. After explicit cleanup removes the runtime directory, the same
+version-aware normalization and document validation applies to the immutable
+cleanup receipt.

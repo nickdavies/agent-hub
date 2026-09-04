@@ -1,0 +1,14 @@
+{
+  "agent_outcome": "succeeded",
+  "cleanup_outcome": "succeeded",
+  "error": "execution failed",
+  "execution_outcome": "failed",
+  "exit_code": 0,
+  "launch_state": "terminal",
+  "permission_outcome": "no_denials",
+  "process_outcome": "succeeded",
+  "result_outcome": "failed",
+  "retry_eligible": false,
+  "schema": "attended_result_v4",
+  "status": "failed"
+}

@@ -40,6 +40,8 @@ use crate::state::StateStore;
 #[cfg(test)]
 pub const DIPPY_SELECTOR_PREFIX: &str = "agent-hub local authorize";
 pub const RESULT_SCHEMA_V3: &str = "attended_result_v3";
+pub const RESULT_SCHEMA_V4: &str = "attended_result_v4";
+const LOCAL_RESULT_SCHEMA_V2: &str = "local_result_v2";
 const CLEANUP_RECEIPT_SCHEMA_V1: &str = "attended_cleanup_receipt_v1";
 const PRIMARY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(70);
 const ATTENDED_CLEANUP_TIMEOUT_SECS: u64 = 150;
@@ -225,6 +227,16 @@ pub enum ExecutionOutcome {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ResultOutcome {
+    #[default]
+    Unknown,
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CleanupOutcome {
     #[default]
     Pending,
@@ -283,6 +295,8 @@ pub struct RunRecord {
     pub agent_outcome: AgentOutcome,
     #[serde(default)]
     pub execution_outcome: ExecutionOutcome,
+    #[serde(default, skip_serializing_if = "result_outcome_unknown")]
+    pub result_outcome: ResultOutcome,
     #[serde(default)]
     pub cleanup_outcome: CleanupOutcome,
     #[serde(default)]
@@ -308,6 +322,14 @@ struct RunOwnerMarker {
 
 fn result_schema_v3() -> String {
     RESULT_SCHEMA_V3.to_string()
+}
+
+fn result_schema_current() -> String {
+    RESULT_SCHEMA_V4.to_string()
+}
+
+fn result_outcome_unknown(outcome: &ResultOutcome) -> bool {
+    *outcome == ResultOutcome::Unknown
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -968,7 +990,7 @@ pub async fn run(
         ),
     ]);
     let mut record = RunRecord {
-        schema: result_schema_v3(),
+        schema: result_schema_current(),
         id: id.clone(),
         run_id: run_id.clone(),
         attempt_id: attempt_id.clone(),
@@ -993,6 +1015,7 @@ pub async fn run(
         process_outcome: ProcessOutcome::NotStarted,
         agent_outcome: AgentOutcome::NotProduced,
         execution_outcome: ExecutionOutcome::Pending,
+        result_outcome: ResultOutcome::Pending,
         cleanup_outcome: CleanupOutcome::Pending,
         agent_final: None,
         retry_class: None,
@@ -1850,7 +1873,6 @@ pub async fn run(
     }
     let output_result: anyhow::Result<()> = (|| {
         if run_dir.is_dir() {
-            let result_path = run_dir.join(&request.output.result);
             let artifacts_path = run_dir.join(&request.output.artifacts);
             let repositories_path = run_dir.join(&request.output.repositories);
             let cleanup_path = run_dir.join(&request.output.cleanup);
@@ -1882,11 +1904,6 @@ pub async fn run(
                 &serialize_pretty_bounded(&repositories, request.output.limits.artifact_bytes)?,
                 request.output.limits.artifact_bytes,
             )?;
-            write_private_durable_bounded(
-                &result_path,
-                &serialize_pretty_bounded(&record, request.output.limits.artifact_bytes)?,
-                request.output.limits.artifact_bytes,
-            )?;
             let artifact_manifest = serde_json::json!({
                 "schema": "attended_artifacts_v1",
                 "stdout": "stdout.log",
@@ -1915,11 +1932,13 @@ pub async fn run(
                 &serialize_pretty_bounded(&cleanup_document, request.output.limits.artifact_bytes)?,
                 request.output.limits.artifact_bytes,
             )?;
+            record.result_outcome = ResultOutcome::Succeeded;
         }
         Ok(())
     })();
     let output_finalized = output_result.is_ok();
     if let Err(error) = output_result {
+        record.result_outcome = ResultOutcome::Failed;
         if record.status != RunStatus::CleanupFailed {
             record.status = RunStatus::Failed;
             if record.execution_status.is_none() {
@@ -1958,10 +1977,12 @@ pub async fn run(
         }
     }
     let prelaunch_retry = record.launch_state == LaunchState::Preparing
+        && record.result_outcome != ResultOutcome::Failed
         && cleanup_complete
         && !store.path(&cancel_path(&id))?.exists()
         && verify_execution_inputs(&request).is_ok();
     let provider_retry = record.launch_state == LaunchState::Running
+        && record.result_outcome != ResultOutcome::Failed
         && cleanup_complete
         && output_finalized
         && provider_unavailable_retry_evidence(&record, &run_dir, &request)?;
@@ -1998,27 +2019,14 @@ pub async fn run(
         None => false,
     };
     record.launch_state = LaunchState::Terminal;
-    let terminal_result = if run_dir.is_dir() {
-        serialize_pretty_bounded(&record, request.output.limits.artifact_bytes).and_then(|bytes| {
-            write_private_durable_bounded(
-                &run_dir.join(&request.output.result),
-                &bytes,
-                request.output.limits.artifact_bytes,
-            )
-        })
+    if run_dir.is_dir() {
+        publish_terminal_result(
+            &mut record,
+            &run_dir.join(&request.output.result),
+            request.output.limits.artifact_bytes,
+        );
     } else {
-        Ok(())
-    };
-    if let Err(error) = terminal_result {
-        record.status = RunStatus::Failed;
-        record.execution_outcome = ExecutionOutcome::Failed;
-        record.retry_class = None;
-        record.retry_eligible = false;
-        let finalization = format!("terminal result publication failed: {error:#}");
-        record.error = Some(match record.error.take() {
-            Some(existing) => format!("{existing}; {finalization}"),
-            None => finalization,
-        });
+        record.result_outcome = ResultOutcome::Failed;
     }
     let lineage = authorized
         .attempts
@@ -2113,24 +2121,14 @@ pub fn list(store: &StateStore) -> anyhow::Result<Vec<RunRecord>> {
     store
         .list_json::<RunRecord>(Path::new("executions"))?
         .into_iter()
-        .map(|record| match read_receipt(store, &record.id) {
-            Ok(receipt) => Ok(receipt.payload.record),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                Ok(normalize_legacy_record(record))
-            }
-            Err(error) => Err(error),
-        })
+        .map(|record| status(store, &record.id))
         .collect()
 }
 
 pub fn status(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> {
     validate_id(id)?;
     match read_receipt(store, id) {
-        Ok(receipt) => return Ok(receipt.payload.record),
+        Ok(receipt) => return normalize_record(receipt.payload.record),
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -2138,14 +2136,7 @@ pub fn status(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> {
         Err(error) => return Err(error),
     }
     match store.read_json(&run_record_path(id)) {
-        Ok(record) => Ok(normalize_legacy_record(record)),
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(read_receipt(store, id)?.payload.record)
-        }
+        Ok(record) => normalize_record(record),
         Err(error) => Err(error),
     }
 }
@@ -2232,13 +2223,19 @@ pub struct BoundedArtifactReference {
 pub struct LocalResult {
     pub schema: &'static str,
     pub run_id: String,
+    pub launch_state: LaunchState,
+    pub status: RunStatus,
+    pub error: Option<String>,
     pub agent_final: Option<protocol::AgentResultV1>,
     pub process_outcome: ProcessOutcome,
     pub agent_outcome: AgentOutcome,
     pub execution_outcome: ExecutionOutcome,
+    pub result_outcome: ResultOutcome,
     pub permission_outcome: PermissionOutcome,
     pub cleanup_outcome: CleanupOutcome,
     pub exit_code: Option<i32>,
+    pub retry_class: Option<RetryClass>,
+    pub retry_eligible: bool,
     pub paths: BTreeMap<String, String>,
     pub result: ParsedDocument,
     pub artifacts: ParsedDocument,
@@ -2298,15 +2295,21 @@ pub fn local_result(store: &StateStore, id: &str, limit_bytes: u64) -> anyhow::R
         ("cleanup".into(), cleanup.reference.path.clone()),
     ]);
     Ok(LocalResult {
-        schema: "local_result_v1",
+        schema: LOCAL_RESULT_SCHEMA_V2,
         run_id: id.to_string(),
+        launch_state: record.launch_state.clone(),
+        status: record.status.clone(),
+        error: record.error.clone(),
         agent_final: record.agent_final.clone(),
         process_outcome: record.process_outcome.clone(),
         agent_outcome: record.agent_outcome.clone(),
         execution_outcome: record.execution_outcome.clone(),
+        result_outcome: record.result_outcome.clone(),
         permission_outcome: record.permission_outcome.clone(),
         cleanup_outcome: record.cleanup_outcome.clone(),
         exit_code: record.exit_code,
+        retry_class: record.retry_class.clone(),
+        retry_eligible: record.retry_eligible,
         paths,
         result,
         artifacts,
@@ -2324,6 +2327,7 @@ pub fn read_document_bounded(
     name: &str,
     limit_bytes: u64,
 ) -> anyhow::Result<ParsedDocument> {
+    validate_id(id)?;
     ensure!(
         (1..=16_777_216).contains(&limit_bytes),
         "artifact read limit is out of bounds"
@@ -2336,14 +2340,36 @@ pub fn read_document_bounded(
         "unknown attended document"
     );
     let run_relative = PathBuf::from("runs").join(id).join(name);
+    let run_path = store.path(&run_relative)?;
     let (bytes, total, path) = match store.read_limited(&run_relative, limit_bytes) {
-        Ok((bytes, total)) => (bytes, total, store.path(&run_relative)?),
+        Ok((bytes, total)) => (bytes, total, run_path.clone()),
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
         {
-            let receipt = read_receipt(store, id)?;
+            let receipt = match read_receipt(store, id) {
+                Ok(receipt) => receipt,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok(ParsedDocument {
+                        reference: BoundedArtifactReference {
+                            path: run_path.display().to_string(),
+                            available: false,
+                            limit_bytes,
+                            returned_bytes: 0,
+                            total_bytes: 0,
+                            truncated: false,
+                        },
+                        document: None,
+                        parse_error: Some("document is unavailable".into()),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             let value = match name {
                 "result.json" => receipt.payload.result,
                 "artifacts.json" => receipt.payload.artifacts,
@@ -2351,7 +2377,8 @@ pub fn read_document_bounded(
                 "cleanup.json" => receipt.payload.cleanup,
                 _ => unreachable!(),
             };
-            let encoded = serde_json::to_vec_pretty(&value)?;
+            let encoded = serialize_pretty_bounded(&value, 16_777_216)
+                .context("retained cleanup receipt document exceeds read bound")?;
             let total = encoded.len() as u64;
             (
                 encoded.into_iter().take(limit_bytes as usize).collect(),
@@ -2383,6 +2410,29 @@ pub fn read_document_bounded(
         document,
         parse_error,
     })
+}
+
+pub fn ensure_document_complete(document: &ParsedDocument) -> anyhow::Result<()> {
+    ensure!(
+        document.reference.available
+            && !document.reference.truncated
+            && document.document.is_some()
+            && document.parse_error.is_none(),
+        "attended document {} is unavailable, truncated, or malformed: {}",
+        document.reference.path,
+        document
+            .parse_error
+            .as_deref()
+            .unwrap_or("no parsed document")
+    );
+    Ok(())
+}
+
+pub fn ensure_local_result_documents(result: &LocalResult) -> anyhow::Result<()> {
+    ensure_document_complete(&result.result)?;
+    ensure_document_complete(&result.artifacts)?;
+    ensure_document_complete(&result.repositories)?;
+    ensure_document_complete(&result.cleanup)
 }
 
 fn artifact_reference(
@@ -2430,10 +2480,12 @@ fn artifact_path_string(store: &StateStore, id: &str, name: &str) -> anyhow::Res
 pub fn ensure_successful_outcome(record: &RunRecord) -> anyhow::Result<()> {
     ensure!(
         record.execution_outcome == ExecutionOutcome::Succeeded
+            && record.result_outcome == ResultOutcome::Succeeded
             && record.cleanup_outcome == CleanupOutcome::Succeeded,
-        "local run {} has execution outcome {:?} and cleanup outcome {:?}",
+        "local run {} has execution outcome {:?}, result outcome {:?}, and cleanup outcome {:?}",
         record.id,
         record.execution_outcome,
+        record.result_outcome,
         record.cleanup_outcome,
     );
     Ok(())
@@ -2524,7 +2576,7 @@ pub async fn cleanup(
     validate_id(id)?;
     let _lock = store.lock(&PathBuf::from("locks").join(format!("cleanup-{id}.lock")))?;
     match read_receipt(store, id) {
-        Ok(receipt) => return Ok(receipt.payload.record),
+        Ok(receipt) => return normalize_record(receipt.payload.record),
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -2546,7 +2598,7 @@ pub async fn cleanup(
         }
         publish_pending_receipt(store, id, &pending_path)?;
         store.replace_json(&run_record_path(id), &receipt.payload.record)?;
-        return Ok(receipt.payload.record);
+        return normalize_record(receipt.payload.record);
     }
     ensure!(
         !matches!(
@@ -2604,8 +2656,9 @@ pub async fn cleanup(
             owner: owner_marker_for_record(&record),
             result: serde_json::to_value(&record)?,
             artifacts: serde_json::json!({
-                "schema": "attended_artifact_summary_v1",
-                "runtime_artifacts": "not_created"
+                "schema": "attended_artifacts_v1",
+                "available": false,
+                "reason": "prelaunch_no_resources"
             }),
             repositories: serde_json::json!([]),
             cleanup: cleanup_document,
@@ -2613,7 +2666,7 @@ pub async fn cleanup(
             host_ledger: HostLedgerSummary::default(),
         };
         publish_cleanup_receipt(store, id, &record, payload)?;
-        return Ok(record);
+        return status(store, id);
     }
     let docker = which::which("docker")?;
     let owner_marker = owner_marker_for_record(&record);
@@ -2703,7 +2756,7 @@ pub async fn cleanup(
     }
     publish_pending_receipt(store, id, &pending_path)?;
     store.replace_json(&run_record_path(id), &record)?;
-    Ok(record)
+    status(store, id)
 }
 
 fn publish_cleanup_receipt(
@@ -2779,16 +2832,26 @@ fn read_optional_json_document(
 }
 
 fn host_ledger_summary(path: &Path) -> anyhow::Result<HostLedgerSummary> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    const HOST_LEDGER_LIMIT: u64 = 16_777_216;
+
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(HostLedgerSummary::default());
         }
         Err(error) => return Err(error.into()),
     };
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "host ledger is not a regular file");
     ensure!(
-        bytes.len() <= 16_777_216,
+        metadata.len() <= HOST_LEDGER_LIMIT,
         "host ledger exceeds receipt evidence limit"
+    );
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len())?);
+    file.take(HOST_LEDGER_LIMIT + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 == metadata.len(),
+        "host ledger changed while collecting receipt evidence"
     );
     let text = std::str::from_utf8(&bytes).context("host ledger is not UTF-8")?;
     let mut entry_count = 0;
@@ -4094,6 +4157,8 @@ fn parse_agent_result_events(output: &str) -> ParsedAgentResult {
     } else {
         if let Some(text) = final_text
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+            && value.get("schema").and_then(serde_json::Value::as_str)
+                == Some(protocol::AGENT_RESULT_V1_SCHEMA)
         {
             structured.push(value);
         }
@@ -5091,8 +5156,22 @@ fn pending_receipt_path(id: &str) -> PathBuf {
     PathBuf::from("receipts").join(format!(".{id}.pending.json"))
 }
 
-fn normalize_legacy_record(mut record: RunRecord) -> RunRecord {
-    record.schema = result_schema_v3();
+fn normalize_record(mut record: RunRecord) -> anyhow::Result<RunRecord> {
+    validate_record_ids(&record)?;
+    match record.schema.as_str() {
+        RESULT_SCHEMA_V3 => ensure!(
+            record.result_outcome == ResultOutcome::Unknown,
+            "attended result v3 cannot contain result outcome evidence"
+        ),
+        RESULT_SCHEMA_V4 => {
+            ensure!(
+                record.result_outcome != ResultOutcome::Unknown,
+                "attended result v4 is missing result outcome evidence"
+            );
+            return Ok(record);
+        }
+        _ => anyhow::bail!("unsupported attended result schema {}", record.schema),
+    }
     if record.process_outcome == ProcessOutcome::NotStarted {
         record.process_outcome = match record.process_status.as_ref() {
             Some(RunStatus::Succeeded) => ProcessOutcome::Succeeded,
@@ -5130,7 +5209,7 @@ fn normalize_legacy_record(mut record: RunRecord) -> RunRecord {
             _ => CleanupOutcome::Pending,
         };
     }
-    record
+    Ok(record)
 }
 
 fn receipt_checksum(payload: &CleanupReceiptPayload) -> anyhow::Result<String> {
@@ -5154,16 +5233,44 @@ fn verify_receipt(receipt: &CleanupReceipt, id: &str) -> anyhow::Result<()> {
     ensure!(receipt.run_id == id, "cleanup receipt run ID mismatch");
     ensure!(
         receipt.payload.record.id == id && receipt.payload.record.run_id == id,
-        "cleanup receipt execution ID mismatch"
+        "cleanup receipt record run ID mismatch"
     );
+    normalize_record(receipt.payload.record.clone())
+        .context("unsupported cleanup receipt result record")?;
     ensure!(
         receipt.payload.record.status == RunStatus::Cleaned
+            && receipt.payload.record.launch_state == LaunchState::Terminal
             && receipt.payload.record.cleanup_outcome == CleanupOutcome::Succeeded,
-        "cleanup receipt does not retain a successful cleaned record"
+        "cleanup receipt does not contain a successfully cleaned terminal record"
+    );
+    ensure!(
+        receipt.payload.cleanup_evidence.complete(),
+        "cleanup receipt containment evidence is incomplete"
     );
     ensure!(
         receipt.payload.record.finished_at == Some(receipt.cleaned_at),
-        "cleanup receipt finish time mismatch"
+        "cleanup receipt completion time mismatch"
+    );
+    ensure!(
+        receipt.payload.result == serde_json::to_value(&receipt.payload.record)?,
+        "cleanup receipt retained result does not match its record"
+    );
+    ensure!(
+        receipt
+            .payload
+            .cleanup
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            == Some("succeeded"),
+        "cleanup receipt document outcome mismatch"
+    );
+    let cleaned_at = serde_json::to_value(receipt.cleaned_at)?;
+    ensure!(
+        receipt
+            .payload
+            .cleanup
+            .get("cleaned_at")
+            .is_none_or(|value| value == &cleaned_at),
     );
     ensure!(
         receipt.authorization_digest == receipt.payload.record.authorization_digest,
@@ -5207,6 +5314,7 @@ fn publish_pending_receipt(
     id: &str,
     pending_path: &Path,
 ) -> anyhow::Result<()> {
+    set_immutable_receipt_permissions(pending_path)?;
     let receipt_path = store.path(&receipt_path(id))?;
     let parent = receipt_path.parent().context("receipt has no parent")?;
     if receipt_path.exists() {
@@ -5231,14 +5339,56 @@ fn publish_pending_receipt(
     File::open(parent)?.sync_all()?;
     Ok(())
 }
+
+#[cfg(unix)]
+fn set_immutable_receipt_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))?;
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_immutable_receipt_permissions(path: &Path) -> anyhow::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(path, permissions)?;
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
 fn cancel_path(id: &str) -> PathBuf {
     PathBuf::from("cancellations").join(format!("{id}.json"))
 }
 
 fn validate_id(id: &str) -> anyhow::Result<()> {
+    let parsed = uuid::Uuid::parse_str(id).context("invalid attended execution ID")?;
     ensure!(
-        uuid::Uuid::parse_str(id).is_ok(),
-        "invalid attended execution ID"
+        parsed.hyphenated().to_string() == id,
+        "attended execution ID must be canonical lowercase hyphenated UUID"
+    );
+    Ok(())
+}
+
+fn validate_record_ids(record: &RunRecord) -> anyhow::Result<()> {
+    for (name, id) in [
+        ("id", record.id.as_str()),
+        ("run_id", record.run_id.as_str()),
+        ("attempt_id", record.attempt_id.as_str()),
+        ("authorization_id", record.authorization_id.as_str()),
+        ("receipt_id", record.receipt_id.as_str()),
+        ("owner_nonce", record.owner_nonce.as_str()),
+    ] {
+        validate_id(id).with_context(|| format!("attended result has invalid {name}"))?;
+    }
+    if let Some(parent_attempt_id) = &record.parent_attempt_id {
+        validate_id(parent_attempt_id).context("attended result has invalid parent_attempt_id")?;
+    }
+    for attempt_id in &record.attempt_ancestry {
+        validate_id(attempt_id).context("attended result has invalid attempt_ancestry")?;
+    }
+    ensure!(
+        record.id == record.run_id,
+        "attended result ID does not match its run ID"
     );
     Ok(())
 }
@@ -5344,6 +5494,29 @@ fn serialize_pretty_bounded<T: Serialize>(value: &T, limit: u64) -> anyhow::Resu
     let mut bytes = Vec::with_capacity(usize::try_from(counter.written)?);
     serde_json::to_writer_pretty(&mut bytes, value)?;
     Ok(bytes)
+}
+
+fn publish_terminal_result(record: &mut RunRecord, path: &Path, limit: u64) {
+    if record.result_outcome != ResultOutcome::Failed {
+        record.result_outcome = ResultOutcome::Succeeded;
+    }
+    let publication = attended_fault("result_publication")
+        .and_then(|()| serialize_pretty_bounded(record, limit))
+        .and_then(|bytes| write_private_durable_bounded(path, &bytes, limit));
+    if let Err(error) = publication {
+        record.result_outcome = ResultOutcome::Failed;
+        record.status = RunStatus::Failed;
+        record.retry_class = None;
+        record.retry_eligible = false;
+        let publication_error = format!("attended result publication failed: {error:#}");
+        record.error = Some(match record.error.take() {
+            Some(existing) => format!("{existing}; {publication_error}"),
+            None => publication_error,
+        });
+        if let Ok(bytes) = serialize_pretty_bounded(record, limit) {
+            let _ = write_private_durable_bounded(path, &bytes, limit);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -6994,6 +7167,17 @@ grep -qx 'ready\|ready\.' real-llm.log
         .to_string()
     }
 
+    fn structured_event(tool: &str, result: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "tool_use",
+            "part": {
+                "tool": tool,
+                "state": {"status": "completed", "input": result}
+            }
+        })
+        .to_string()
+    }
+
     fn complete_agent_result() -> serde_json::Value {
         serde_json::json!({
             "schema": "agent_result_v1",
@@ -7043,10 +7227,58 @@ grep -qx 'ready\|ready\.' real-llm.log
         );
     }
 
+    #[test]
+    fn opencode_structured_output_result_matrix_is_typed() {
+        for alias in ["StructuredOutput", "structured_output", "structuredoutput"] {
+            let parsed =
+                super::parse_agent_result_events(&structured_event(alias, complete_agent_result()));
+            assert_eq!(parsed.outcome, super::AgentOutcome::Succeeded);
+        }
+
+        let mut incomplete = complete_agent_result();
+        incomplete["complete"] = serde_json::json!(false);
+        incomplete["blockers"] = serde_json::json!(["follow-up required"]);
+        assert_eq!(
+            super::parse_agent_result_events(&structured_event("StructuredOutput", incomplete))
+                .outcome,
+            super::AgentOutcome::Incomplete
+        );
+
+        let mut conflicting = complete_agent_result();
+        conflicting["summary"] = serde_json::json!("different");
+        let events = format!(
+            "{}\n{}",
+            structured_event("StructuredOutput", complete_agent_result()),
+            structured_event("StructuredOutput", conflicting)
+        );
+        assert_eq!(
+            super::parse_agent_result_events(&events).outcome,
+            super::AgentOutcome::Contradictory
+        );
+
+        let mut malformed = complete_agent_result();
+        malformed["unexpected"] = serde_json::json!(true);
+        assert_eq!(
+            super::parse_agent_result_events(&structured_event("StructuredOutput", malformed))
+                .outcome,
+            super::AgentOutcome::Malformed
+        );
+
+        let events = format!(
+            "{}\n{}",
+            structured_event("StructuredOutput", complete_agent_result()),
+            serde_json::json!({"type":"text", "part":{"text":"{\"message\":\"ordinary text JSON\"}"}})
+        );
+        assert_eq!(
+            super::parse_agent_result_events(&events).outcome,
+            super::AgentOutcome::Succeeded
+        );
+    }
+
     fn terminal_record() -> RunRecord {
         let run_id = uuid::Uuid::new_v4().to_string();
         RunRecord {
-            schema: super::result_schema_v3(),
+            schema: super::result_schema_current(),
             id: run_id.clone(),
             run_id,
             attempt_id: uuid::Uuid::new_v4().to_string(),
@@ -7071,6 +7303,7 @@ grep -qx 'ready\|ready\.' real-llm.log
             process_outcome: super::ProcessOutcome::Succeeded,
             agent_outcome: super::AgentOutcome::Succeeded,
             execution_outcome: super::ExecutionOutcome::Succeeded,
+            result_outcome: super::ResultOutcome::Succeeded,
             cleanup_outcome: super::CleanupOutcome::Succeeded,
             agent_final: serde_json::from_value(complete_agent_result()).ok(),
             retry_class: None,
@@ -7301,9 +7534,10 @@ grep -qx 'ready\|ready\.' real-llm.log
             "prelaunch_no_resources"
         );
         assert_eq!(
-            receipt.payload.artifacts["runtime_artifacts"],
-            "not_created"
+            receipt.payload.artifacts["reason"],
+            "prelaunch_no_resources"
         );
+        assert_eq!(receipt.payload.artifacts["schema"], "attended_artifacts_v1");
         assert!(!serde_json::to_string(&receipt).unwrap().contains("/runs/"));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -7335,68 +7569,193 @@ grep -qx 'ready\|ready\.' real-llm.log
             super::execution_outcome_from_record(&record),
             super::ExecutionOutcome::Cancelled
         );
+        record.permission_outcome = super::PermissionOutcome::ReadinessFailed;
+        assert_eq!(
+            super::execution_outcome_from_record(&record),
+            super::ExecutionOutcome::Failed
+        );
+
+        for (status, expected) in [
+            (
+                agent_hub_executor::ExecutionStatus::Exited(0),
+                super::ProcessOutcome::Succeeded,
+            ),
+            (
+                agent_hub_executor::ExecutionStatus::Exited(7),
+                super::ProcessOutcome::Failed,
+            ),
+            (
+                agent_hub_executor::ExecutionStatus::Cancelled,
+                super::ProcessOutcome::Cancelled,
+            ),
+            (
+                agent_hub_executor::ExecutionStatus::TimedOut,
+                super::ProcessOutcome::TimedOut,
+            ),
+            (
+                agent_hub_executor::ExecutionStatus::OutputLimitExceeded,
+                super::ProcessOutcome::OutputLimitExceeded,
+            ),
+        ] {
+            assert_eq!(super::process_outcome(&status), expected);
+        }
 
         record = terminal_record();
         record.execution_outcome = super::ExecutionOutcome::Failed;
         assert!(super::ensure_successful_outcome(&record).is_err());
         assert!(super::ensure_cleanup_successful(&record).is_ok());
         record.execution_outcome = super::ExecutionOutcome::Succeeded;
+        record.result_outcome = super::ResultOutcome::Failed;
+        record.exit_code = Some(0);
+        assert!(super::ensure_successful_outcome(&record).is_err());
+        record.result_outcome = super::ResultOutcome::Succeeded;
         record.cleanup_outcome = super::CleanupOutcome::Failed;
         assert!(super::ensure_successful_outcome(&record).is_err());
         assert!(super::ensure_cleanup_successful(&record).is_err());
     }
 
-    #[tokio::test]
-    async fn pending_receipt_resumes_runtime_deletion_and_publication_idempotently() {
+    fn outcome_snapshot(record: &RunRecord) -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": record.schema,
+            "launch_state": record.launch_state,
+            "status": record.status,
+            "error": record.error,
+            "exit_code": record.exit_code,
+            "permission_outcome": record.permission_outcome,
+            "process_outcome": record.process_outcome,
+            "agent_outcome": record.agent_outcome,
+            "execution_outcome": record.execution_outcome,
+            "result_outcome": record.result_outcome,
+            "cleanup_outcome": record.cleanup_outcome,
+            "retry_eligible": record.retry_eligible,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn literal_v3_records_remain_unmodified_and_have_no_result_evidence() {
+        let fixtures = [
+            include_str!("../tests/fixtures/attended-result-v3-legacy.json"),
+            include_str!("../tests/fixtures/attended-result-v3-legacy-status-only.json"),
+        ];
+        for fixture in fixtures {
+            let record: RunRecord = serde_json::from_str(fixture).unwrap();
+            assert_eq!(record.schema, super::RESULT_SCHEMA_V3);
+            assert_eq!(record.result_outcome, super::ResultOutcome::Unknown);
+            assert!(
+                !serde_json::to_value(&record)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .contains_key("result_outcome")
+            );
+
+            let normalized = super::normalize_record(record).unwrap();
+            assert_eq!(normalized.result_outcome, super::ResultOutcome::Unknown);
+            assert!(super::ensure_successful_outcome(&normalized).is_err());
+        }
+
+        let mut record: RunRecord = serde_json::from_str(fixtures[0]).unwrap();
+        record.result_outcome = super::ResultOutcome::Succeeded;
+        assert!(super::normalize_record(record).is_err());
+    }
+
+    #[test]
+    fn attended_v4_success_and_failure_snapshots_are_stable() {
+        let record = terminal_record();
+        assert_eq!(
+            outcome_snapshot(&record).trim(),
+            include_str!("../tests/fixtures/attended-result-v4-success.json").trim()
+        );
+
+        let mut failed = record;
+        failed.status = RunStatus::Failed;
+        failed.error = Some("execution failed".into());
+        failed.execution_outcome = super::ExecutionOutcome::Failed;
+        failed.result_outcome = super::ResultOutcome::Failed;
+        assert_eq!(
+            outcome_snapshot(&failed).trim(),
+            include_str!("../tests/fixtures/attended-result-v4-failure.json").trim()
+        );
+    }
+
+    #[test]
+    fn result_publication_fault_is_typed_and_fails_closed() {
         let root = std::env::temp_dir().join(format!(
-            "agent-hub-pending-receipt-{}",
+            "agent-hub-result-publication-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut record = terminal_record();
+        super::publish_terminal_result(&mut record, &root.join("result.json"), 1);
+        assert_eq!(
+            outcome_snapshot(&record).trim(),
+            include_str!("../tests/fixtures/attended-result-v4-publication-fault.json").trim()
+        );
+        assert!(super::ensure_successful_outcome(&record).is_err());
+        assert!(!root.join("result.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_list_cleanup_and_receipts_share_version_aware_normalization() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-result-receipt-parity-{}",
             uuid::Uuid::new_v4()
         ));
         let store = StateStore::open(root.clone()).unwrap();
-        let mut current = terminal_record();
-        current.status = RunStatus::Failed;
-        current.execution_outcome = super::ExecutionOutcome::Failed;
+        let cleaned_at = Utc::now();
+        let mut record: RunRecord = serde_json::from_str(include_str!(
+            "../tests/fixtures/attended-result-v3-legacy-status-only.json"
+        ))
+        .unwrap();
+        record.cleanup_outcome = super::CleanupOutcome::Succeeded;
+        record.finished_at = Some(cleaned_at);
         store
-            .create_json(&super::run_record_path(&current.id), &current)
+            .create_json(&super::run_record_path(&record.id), &record)
             .unwrap();
-        let run_dir = store
-            .path(&PathBuf::from("runs").join(&current.id))
-            .unwrap();
-        store
-            .ensure_directory(std::path::Path::new("runs"))
-            .unwrap();
-        let owner = super::owner_marker_for_record(&current);
-        super::create_owned_run_directory(&run_dir, &owner).unwrap();
+        let live = super::status(&store, &record.id).unwrap();
 
-        let mut cleaned = current.clone();
-        cleaned.status = RunStatus::Cleaned;
-        cleaned.cleanup_outcome = super::CleanupOutcome::Succeeded;
-        cleaned.finished_at = Some(Utc::now());
+        let mut receipt_record = record.clone();
+        receipt_record.status = RunStatus::Cleaned;
         let payload = super::CleanupReceiptPayload {
-            record: cleaned.clone(),
-            owner,
-            result: serde_json::to_value(&cleaned).unwrap(),
-            artifacts: serde_json::json!({"schema":"attended_artifact_summary_v1"}),
+            record: receipt_record.clone(),
+            owner: super::owner_marker_for_record(&receipt_record),
+            result: serde_json::to_value(&receipt_record).unwrap(),
+            artifacts: serde_json::json!({"schema":"attended_artifacts_v1"}),
             repositories: serde_json::json!([]),
-            cleanup: serde_json::json!({"schema":"attended_cleanup_result_v1"}),
-            cleanup_evidence: super::AttendedCleanupEvidence::verified_absent(),
+            cleanup: serde_json::json!({
+                "schema":"attended_cleanup_result_v1",
+                "outcome":"succeeded",
+                "cleaned_at": cleaned_at,
+            }),
+            cleanup_evidence: super::AttendedCleanupEvidence::default(),
             host_ledger: super::HostLedgerSummary::default(),
         };
         let receipt = super::CleanupReceipt {
             schema: super::CLEANUP_RECEIPT_SCHEMA_V1.into(),
-            run_id: cleaned.id.clone(),
-            authorization_digest: cleaned.authorization_digest.clone(),
-            cleaned_at: cleaned.finished_at.unwrap(),
+            run_id: record.id.clone(),
+            authorization_digest: record.authorization_digest.clone(),
+            cleaned_at,
             checksum: super::receipt_checksum(&payload).unwrap(),
             payload,
         };
         store
-            .create_json(&super::pending_receipt_path(&cleaned.id), &receipt)
+            .create_json(&super::receipt_path(&record.id), &receipt)
             .unwrap();
-
-        let resumed = super::cleanup(
+        let retained = super::status(&store, &record.id).unwrap();
+        assert_eq!(live.status, RunStatus::Succeeded);
+        assert_eq!(retained.status, RunStatus::Cleaned);
+        assert_eq!(live.process_outcome, retained.process_outcome);
+        assert_eq!(live.execution_outcome, retained.execution_outcome);
+        assert_eq!(live.cleanup_outcome, retained.cleanup_outcome);
+        assert_eq!(retained.result_outcome, super::ResultOutcome::Unknown);
+        let listed = super::list(&store).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, RunStatus::Cleaned);
+        let cleaned = super::cleanup(
             &store,
-            &cleaned.id,
+            &record.id,
             RelayEndpoint {
                 server_url: "https://approvals.example".into(),
                 token: None,
@@ -7404,67 +7763,33 @@ grep -qx 'ready\|ready\.' real-llm.log
         )
         .await
         .unwrap();
-        assert_eq!(resumed.status, RunStatus::Cleaned);
-        assert!(!run_dir.exists());
-        assert!(super::read_receipt(&store, &cleaned.id).is_ok());
-        store
-            .replace_json(&super::run_record_path(&current.id), &current)
-            .unwrap();
-        assert_eq!(
-            super::status(&store, &cleaned.id).unwrap().status,
-            RunStatus::Cleaned
-        );
-        let pending_path = store
-            .path(&super::pending_receipt_path(&cleaned.id))
-            .unwrap();
-        store
-            .create_json(&super::pending_receipt_path(&cleaned.id), &receipt)
-            .unwrap();
-        super::publish_pending_receipt(&store, &cleaned.id, &pending_path).unwrap();
-        assert!(!pending_path.exists());
-        let repeated = super::cleanup(
-            &store,
-            &cleaned.id,
-            RelayEndpoint {
-                server_url: "https://approvals.example".into(),
-                token: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(repeated.attempt_id, cleaned.attempt_id);
+        assert_eq!(cleaned.status, RunStatus::Cleaned);
+        assert_eq!(cleaned.result_outcome, super::ResultOutcome::Unknown);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn retained_receipt_rejects_cross_run_and_time_rebinding() {
-        let record = terminal_record();
-        let payload = super::CleanupReceiptPayload {
-            record: record.clone(),
-            owner: super::owner_marker_for_record(&record),
-            result: serde_json::to_value(&record).unwrap(),
-            artifacts: serde_json::json!({}),
-            repositories: serde_json::json!([]),
-            cleanup: serde_json::json!({}),
-            cleanup_evidence: super::AttendedCleanupEvidence::verified_absent(),
-            host_ledger: super::HostLedgerSummary::default(),
+    fn malformed_documents_and_unknown_record_schemas_fail_closed() {
+        let document = super::ParsedDocument {
+            reference: super::BoundedArtifactReference {
+                path: "result.json".into(),
+                available: true,
+                limit_bytes: 1,
+                returned_bytes: 1,
+                total_bytes: 2,
+                truncated: true,
+            },
+            document: None,
+            parse_error: Some("document was truncated before parsing".into()),
         };
-        let mut receipt = super::CleanupReceipt {
-            schema: super::CLEANUP_RECEIPT_SCHEMA_V1.into(),
-            run_id: record.id.clone(),
-            authorization_digest: record.authorization_digest.clone(),
-            cleaned_at: record.finished_at.unwrap(),
-            checksum: super::receipt_checksum(&payload).unwrap(),
-            payload,
-        };
-        assert!(super::verify_receipt(&receipt, &record.id).is_err());
-        receipt.payload.record.status = RunStatus::Cleaned;
-        receipt.payload.record.cleanup_outcome = super::CleanupOutcome::Succeeded;
-        receipt.checksum = super::receipt_checksum(&receipt.payload).unwrap();
-        assert!(super::verify_receipt(&receipt, &record.id).is_ok());
-        receipt.cleaned_at = Utc::now() + chrono::Duration::seconds(1);
-        assert!(super::verify_receipt(&receipt, &record.id).is_err());
-        assert!(super::verify_receipt(&receipt, &uuid::Uuid::new_v4().to_string()).is_err());
+        assert!(super::ensure_document_complete(&document).is_err());
+
+        let mut record = terminal_record();
+        assert!(super::normalize_record(record.clone()).is_err());
+        record.run_id = record.id.clone();
+        record.schema = "attended_result_v99".into();
+        assert!(super::normalize_record(record).is_err());
+        assert!(super::validate_id("00000000000000000000000000000000").is_err());
     }
 
     #[test]
@@ -7474,9 +7799,15 @@ grep -qx 'ready\|ready\.' real-llm.log
             uuid::Uuid::new_v4()
         ));
         let store = StateStore::open(root.clone()).unwrap();
+        let cleaned_at = Utc::now();
         let mut record = terminal_record();
+        record.run_id = record.id.clone();
         record.status = RunStatus::Cleaned;
-        record.cleanup_outcome = super::CleanupOutcome::Succeeded;
+        record.finished_at = Some(cleaned_at);
+        store
+            .create_json(&super::run_record_path(&record.id), &record)
+            .unwrap();
+        let live = super::status(&store, &record.id).unwrap();
         let payload = super::CleanupReceiptPayload {
             record: record.clone(),
             owner: super::owner_marker_for_record(&record),
@@ -7491,13 +7822,25 @@ grep -qx 'ready\|ready\.' real-llm.log
             schema: super::CLEANUP_RECEIPT_SCHEMA_V1.into(),
             run_id: record.id.clone(),
             authorization_digest: record.authorization_digest.clone(),
-            cleaned_at: record.finished_at.unwrap(),
+            cleaned_at,
             checksum: super::receipt_checksum(&payload).unwrap(),
             payload,
         };
+        let mut mismatched = receipt.clone();
+        mismatched.payload.record.run_id = uuid::Uuid::new_v4().to_string();
+        mismatched.checksum = super::receipt_checksum(&mismatched.payload).unwrap();
+        assert!(super::verify_receipt(&mismatched, &record.id).is_err());
+        let mut incomplete = receipt.clone();
+        incomplete.payload.record.cleanup_outcome = super::CleanupOutcome::Failed;
+        incomplete.checksum = super::receipt_checksum(&incomplete.payload).unwrap();
+        assert!(super::verify_receipt(&incomplete, &record.id).is_err());
         store
-            .create_json(&super::receipt_path(&record.id), &receipt)
+            .create_json(&super::pending_receipt_path(&record.id), &receipt)
             .unwrap();
+        let pending = store
+            .path(&super::pending_receipt_path(&record.id))
+            .unwrap();
+        super::publish_pending_receipt(&store, &record.id, &pending).unwrap();
         let result = super::local_result(&store, &record.id, 64).unwrap();
         assert!(result.result.reference.truncated);
         assert!(!result.stdout.available);
@@ -7505,6 +7848,18 @@ grep -qx 'ready\|ready\.' real-llm.log
             super::status(&store, &record.id).unwrap().exit_code,
             Some(0)
         );
+        let aggregate = super::local_result(&store, &record.id, 1_048_576).unwrap();
+        let retained = super::status(&store, &record.id).unwrap();
+        assert_eq!(live.result_outcome, retained.result_outcome);
+        assert_eq!(live.execution_outcome, retained.execution_outcome);
+        assert_eq!(live.cleanup_outcome, retained.cleanup_outcome);
+        assert_eq!(aggregate.status, RunStatus::Cleaned);
+        assert_eq!(aggregate.result_outcome, super::ResultOutcome::Succeeded);
+        assert_eq!(
+            aggregate.artifacts.document.as_ref().unwrap()["schema"],
+            "attended_artifacts_v1"
+        );
+        super::ensure_local_result_documents(&aggregate).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -7512,7 +7867,7 @@ grep -qx 'ready\|ready\.' real-llm.log
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o077, 0);
+            assert_eq!(mode & 0o777, 0o400);
         }
         std::fs::remove_dir_all(root).unwrap();
     }

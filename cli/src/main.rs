@@ -311,14 +311,9 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
         } => {
             let store = state_store()?;
             let record = attended::status(&store, &run_id)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&attended::local_result(
-                    &store,
-                    &run_id,
-                    limit_bytes
-                )?)?
-            );
+            let result = attended::local_result(&store, &run_id, limit_bytes)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            attended::ensure_local_result_documents(&result)?;
             attended::ensure_successful_outcome(&record)?;
         }
         LocalCommand::Artifacts {
@@ -326,30 +321,20 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             limit_bytes,
         } => {
             let store = state_store()?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&attended::read_document_bounded(
-                    &store,
-                    &run_id,
-                    "artifacts.json",
-                    limit_bytes
-                )?)?
-            );
+            let document =
+                attended::read_document_bounded(&store, &run_id, "artifacts.json", limit_bytes)?;
+            println!("{}", serde_json::to_string_pretty(&document)?);
+            attended::ensure_document_complete(&document)?;
         }
         LocalCommand::Repositories {
             run_id,
             limit_bytes,
         } => {
             let store = state_store()?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&attended::read_document_bounded(
-                    &store,
-                    &run_id,
-                    "repositories.json",
-                    limit_bytes
-                )?)?
-            );
+            let document =
+                attended::read_document_bounded(&store, &run_id, "repositories.json", limit_bytes)?;
+            println!("{}", serde_json::to_string_pretty(&document)?);
+            attended::ensure_document_complete(&document)?;
         }
         LocalCommand::CleanupResult {
             run_id,
@@ -357,15 +342,10 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
         } => {
             let store = state_store()?;
             let record = attended::status(&store, &run_id)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&attended::read_document_bounded(
-                    &store,
-                    &run_id,
-                    "cleanup.json",
-                    limit_bytes
-                )?)?
-            );
+            let document =
+                attended::read_document_bounded(&store, &run_id, "cleanup.json", limit_bytes)?;
+            println!("{}", serde_json::to_string_pretty(&document)?);
+            attended::ensure_document_complete(&document)?;
             attended::ensure_cleanup_successful(&record)?;
         }
         LocalCommand::Cancel { run_id } => {
