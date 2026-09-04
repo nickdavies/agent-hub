@@ -138,8 +138,11 @@ sandbox disconnect cancels its remote request.
 
 The relay bundle and typed output/lifecycle contracts are bound by
 `attended_authorization_request_v3` and attended artifact version 3 under
-domain `agent-hub:attended-authorization:v3\0`. The V1 and V2 request shapes,
-artifact versions, canonical bytes, and domain parsers remain unchanged.
+domain `agent-hub:attended-authorization:v3\0`. V3 also binds approved roots,
+workspace/context-root identities, isolated Git views, retry limits, and the
+optional non-authoritative workspace export contract. The V1 and V2 request
+shapes, artifact versions, canonical bytes, and domain parsers remain
+unchanged.
 
 ## Operator result guide
 
@@ -163,3 +166,6 @@ diagnostic evidence for operators without allowing output inspection to imply
 success. After explicit cleanup removes the runtime directory, the same
 version-aware normalization and document validation applies to the immutable
 cleanup receipt.
+
+See [Attended V3 operator guide](attended-v3-operator-guide.md) for the complete
+operator command and result lifecycle.

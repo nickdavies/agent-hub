@@ -80,8 +80,18 @@ pub struct AttendedAuthorizationRequestV3 {
     pub approval_bundle_digest: String,
     pub approval_bundle: Option<AttendedApprovalBundleIdentity>,
     pub output: AttendedOutputContract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_export: Option<AttendedWorkspaceExportContract>,
     pub lifecycle: AttendedLifecycleContract,
     pub retry: AttendedRetryConstraints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedWorkspaceExportContract {
+    pub root: String,
+    pub workspace_alias: String,
+    pub workspace_identity: HostDirectoryIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -964,6 +974,27 @@ impl AttendedAuthorizationRequestV3 {
         self.approval_bundle = normalized.approval_bundle;
         self.output = normalized.output;
         self.lifecycle = normalized.lifecycle;
+        if let Some(export) = &self.workspace_export {
+            validate_absolute_path(&export.root, "workspace export root")?;
+            let matches = self
+                .execution
+                .workspaces
+                .iter()
+                .filter(|workspace| {
+                    workspace.access == WorkspaceAccess::ReadWrite
+                        && workspace.alias == export.workspace_alias
+                        && workspace.host_path == export.workspace_identity.canonical_path
+                        && Path::new(&export.root)
+                            == Path::new(&workspace.host_path).join(".agent-hub/runs")
+                })
+                .count();
+            if matches != 1 {
+                return Err(
+                    "workspace export root must be exactly .agent-hub/runs under one reviewed read-write workspace"
+                        .into(),
+                );
+            }
+        }
         if self.retry != AttendedRetryConstraints::for_mode(self.proposal.tool_approval) {
             return Err("attended retry constraints differ from the reviewed contract".into());
         }

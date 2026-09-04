@@ -203,11 +203,28 @@ fn resolve_intent(
     _config: &HostConfig,
 ) -> anyhow::Result<AgentHubRunIntentV1> {
     intent.validate_shape().map_err(anyhow::Error::msg)?;
+    let export_workspace = intent.workspace_export_root.as_ref().and_then(|root| {
+        intent
+            .workspaces
+            .iter()
+            .find(|workspace| Path::new(root) == Path::new(&workspace.path).join(".agent-hub/runs"))
+            .map(|workspace| workspace.alias.clone())
+    });
     for item in &mut intent.workspaces {
         item.path = canonical_directory(&item.path)?;
     }
     for item in &mut intent.context_roots {
         item.path = canonical_directory(&item.path)?;
+    }
+    if let Some(alias) = export_workspace {
+        let workspace = intent
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.alias == alias)
+            .context("workspace export workspace disappeared during resolution")?;
+        intent.workspace_export_root = Some(path_string(
+            &Path::new(&workspace.path).join(".agent-hub/runs"),
+        )?);
     }
     intent.validate_shape().map_err(anyhow::Error::msg)?;
     Ok(intent)
@@ -294,6 +311,7 @@ fn proposal_input(intent: &AgentHubRunIntentV1, config: &HostConfig) -> Proposal
             })
             .collect(),
         primary_workspace: intent.primary_workspace.clone(),
+        workspace_export_root: intent.workspace_export_root.as_deref().map(PathBuf::from),
     }
 }
 

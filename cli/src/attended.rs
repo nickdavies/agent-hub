@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,10 +20,10 @@ use protocol::{
     ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ApprovedExecutionSpec,
     AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV3,
     AttendedExecutionSpec, AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
-    AuthorizedCredentialProvider, AuthorizedOverlay, CanonicalRuntimeSpec, ExecutionMode,
-    NetworkResourceKind, NetworkResourceRequest, PlannedEnvironmentTier, PromptRef,
-    ResolvedAuthorizationBehavior, ToolApprovalMode, WorkspaceAccess,
-    canonical_environment_for_execution, canonical_permissions_for_environment,
+    AttendedWorkspaceExportContract, AuthorizedCredentialProvider, AuthorizedOverlay,
+    CanonicalRuntimeSpec, ExecutionMode, NetworkResourceKind, NetworkResourceRequest,
+    PlannedEnvironmentTier, PromptRef, ResolvedAuthorizationBehavior, ToolApprovalMode,
+    WorkspaceAccess, canonical_environment_for_execution, canonical_permissions_for_environment,
     default_approval_rules_for_tier,
 };
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,7 @@ pub struct ProposalInput {
     pub workspaces: Vec<RequestedWorkspace>,
     pub context_roots: Vec<RequestedContextRoot>,
     pub primary_workspace: String,
+    pub workspace_export_root: Option<PathBuf>,
 }
 
 pub struct AuthorizationSelectors<'a> {
@@ -303,6 +304,22 @@ pub struct RunRecord {
     pub agent_final: Option<protocol::AgentResultV1>,
     pub retry_class: Option<RetryClass>,
     pub retry_eligible: bool,
+    #[serde(default)]
+    pub workspace_export: Option<WorkspaceExportStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceExportStatus {
+    pub root: String,
+    pub run_path: String,
+    pub workspace_alias: String,
+    pub workspace_identity: protocol::HostDirectoryIdentity,
+    pub state: String,
+    pub error: Option<String>,
+    pub authoritative: bool,
+    #[serde(default)]
+    files: BTreeMap<String, WorkspaceExportFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -475,23 +492,47 @@ async fn build_proposal_resolved(
     );
     let mut overlays = input.overlays;
     overlays.sort();
-    ensure!(
-        !overlays.windows(2).any(|items| items[0] == items[1]),
-        "duplicate overlay selector"
-    );
-    ensure!(
-        overlays
-            .iter()
-            .all(|overlay| environment.allowed_overlays.contains(overlay)),
-        "requested overlay is not allowed by the environment"
-    );
+    if let Some(duplicate) = overlays
+        .windows(2)
+        .find(|items| items[0] == items[1])
+        .map(|items| &items[0])
+    {
+        anyhow::bail!("overlay selector '{duplicate}' was provided more than once");
+    }
+    if let Some(disallowed) = overlays
+        .iter()
+        .find(|overlay| !environment.allowed_overlays.contains(overlay))
+    {
+        anyhow::bail!(
+            "overlay selector '{disallowed}' is not allowed by environment '{}'; allowed overlays: {}",
+            input.environment,
+            if environment.allowed_overlays.is_empty() {
+                "none".to_string()
+            } else {
+                environment.allowed_overlays.join(", ")
+            }
+        );
+    }
     let approved_roots = approved_roots(&deployment.local_agent)?;
-    let mounts = resolve_mounts(
+    let mut mounts = resolve_mounts(
         &approved_roots,
         &input.workspaces,
         &input.context_roots,
         &input.primary_workspace,
     )?;
+    let workspace_export = resolve_workspace_export_contract(
+        input.workspace_export_root.as_deref(),
+        &mounts.workspaces,
+    )?;
+    if let Some(export) = &workspace_export {
+        for repository in &mut mounts.repositories {
+            omit_workspace_export_paths(
+                &mut repository.starting,
+                &repository.workspace_alias,
+                export,
+            );
+        }
+    }
     let network = bundle_network_policy(bundle)?;
     ensure!(
         network.name == environment.network_policy,
@@ -597,6 +638,7 @@ async fn build_proposal_resolved(
         approval_bundle_digest,
         approval_bundle,
         output: AttendedOutputContract::default(),
+        workspace_export,
         lifecycle: AttendedLifecycleContract::default(),
         retry: protocol::AttendedRetryConstraints::for_mode(tool_approval),
     }
@@ -608,6 +650,68 @@ fn prompt_with_result_contract(prompt: &str) -> String {
     format!(
         "{prompt}\n\nYour terminal response MUST be exactly one JSON object matching this schema. Use OpenCode StructuredOutput when available; otherwise emit the object as the final response. Do not wrap it in Markdown. A complete result cannot contain blockers or failed acceptance results.\n{{\"schema\":\"agent_result_v1\",\"complete\":true|false,\"summary\":\"non-empty summary\",\"acceptance_results\":[{{\"criterion\":\"criterion\",\"passed\":true|false,\"evidence\":\"non-empty evidence\"}}],\"blockers\":[\"blocker\"],\"artifact_references\":[{{\"path\":\"path\",\"description\":\"non-empty description\"}}]}}\n"
     )
+}
+
+fn resolve_workspace_export_contract(
+    requested: Option<&Path>,
+    workspaces: &[protocol::WorkspaceSpec],
+) -> anyhow::Result<Option<AttendedWorkspaceExportContract>> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    ensure!(
+        requested.is_absolute(),
+        "workspace export root must be absolute"
+    );
+    ensure!(
+        requested.components().all(|component| matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )),
+        "workspace export root must not contain path escapes or noncanonical components"
+    );
+    let mut matches = workspaces.iter().filter(|workspace| {
+        workspace.access == WorkspaceAccess::ReadWrite
+            && requested == Path::new(&workspace.host_path).join(".agent-hub/runs")
+    });
+    let workspace = matches.next().context(
+        "workspace export root must be exactly .agent-hub/runs under a reviewed read-write workspace",
+    )?;
+    ensure!(
+        matches.next().is_none(),
+        "workspace export root overlaps multiple reviewed workspaces"
+    );
+    let workspace_alias = workspace.alias.clone();
+    let workspace_path = Path::new(&workspace.host_path);
+    for path in [workspace_path.join(".agent-hub"), requested.to_path_buf()] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "workspace export path '{}' must be a real directory",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        }
+    }
+    Ok(Some(AttendedWorkspaceExportContract {
+        root: path_string(requested)?,
+        workspace_alias,
+        workspace_identity: crate::git_view::directory_identity(workspace_path)?,
+    }))
+}
+
+fn omit_workspace_export_paths(
+    state: &mut protocol::RepositoryState,
+    workspace_alias: &str,
+    export: &AttendedWorkspaceExportContract,
+) {
+    if workspace_alias != export.workspace_alias {
+        return;
+    }
+    state
+        .dirty_paths
+        .retain(|path| path != ".agent-hub/runs" && !path.starts_with(".agent-hub/runs/"));
 }
 
 #[cfg(test)]
@@ -670,7 +774,7 @@ pub fn render_proposal(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!(
-        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nOverlay bindings: {}\nTimeout seconds: {}\nRoot capabilities:\n{}\nWorkspace root identities: {}\nContext root identities: {}\nGit capability:\n{}\nRetry limits: attempts={}, prelaunch={}, provider-unavailable={}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
+        "Environment: {}\nImage family: {}\nImage tag: {}\nImage ID: {}\nNetwork class: {}\nNetwork resources: {}\nTool approval: {}\n{}Overlays: {}\nOverlay bindings: {}\nTimeout seconds: {}\nWorkspace export root: {}\nRoot capabilities:\n{}\nWorkspace root identities: {}\nContext root identities: {}\nGit capability:\n{}\nRetry limits: attempts={}, prelaunch={}, provider-unavailable={}\nPrompt digest: {}\nPrompt:\n{}\n\nAuthorization digest: {}\nAuthorize:\n{} --environment {} --image-family {} --network-class {}{} --tool-approval {}{} --timeout-secs {} --authorization {} --digest {}\n",
         request.proposal.environment,
         request.proposal.image_family,
         request.proposal.image_tag,
@@ -688,6 +792,11 @@ pub fn render_proposal(
             .collect::<Vec<_>>()
             .join(","),
         request.proposal.timeout_secs,
+        request
+            .workspace_export
+            .as_ref()
+            .map(|export| export.root.as_str())
+            .unwrap_or("none"),
         root_capabilities,
         request
             .workspace_root_identities
@@ -788,6 +897,12 @@ pub async fn run(
         authorized.artifact == supplied && authorized.authorization_path == supplied_path,
         "authorized artifact does not match supplied artifact"
     );
+    if let Some(previous) = authorized.attempts.last() {
+        ensure!(
+            previous.retry_eligible,
+            "attended authorization was already consumed"
+        );
+    }
     verify_execution_inputs(&request)?;
     let deployment =
         config::validate_authoritative_config_root(Path::new(&request.execution.config_root))
@@ -961,6 +1076,19 @@ pub async fn run(
     let parent_attempt_id = attempt_ancestry.last().cloned();
     let attempt_number = u32::try_from(authorized.attempts.len() + 1)?;
     let id = run_id.clone();
+    let workspace_export = request.workspace_export.as_ref().map(|export| {
+        let run_path = Path::new(&export.root).join(&run_id);
+        WorkspaceExportStatus {
+            root: export.root.clone(),
+            run_path: run_path.display().to_string(),
+            workspace_alias: export.workspace_alias.clone(),
+            workspace_identity: export.workspace_identity.clone(),
+            state: "pending".into(),
+            error: None,
+            authoritative: false,
+            files: BTreeMap::new(),
+        }
+    });
     let container_name = format!("agent-hub-attended-{}", &attempt_id[..8]);
     let run_dir = store.path(&PathBuf::from("runs").join(&id))?;
     let ownership = BTreeMap::from([
@@ -1020,6 +1148,7 @@ pub async fn run(
         agent_final: None,
         retry_class: None,
         retry_eligible: false,
+        workspace_export,
     };
     let lineage = AttemptLineage {
         attempt_id: attempt_id.clone(),
@@ -1051,6 +1180,16 @@ pub async fn run(
     let mut captured_process_status = None;
     let mut captured_permission_outcome = None;
     let mut captured_cleanup_evidence = None;
+    let host_redaction_values = relay_endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.token.as_ref())
+        .map(|token| vec![token.expose().to_string()])
+        .unwrap_or_default();
+    let mut export_redaction_values = request
+        .execution
+        .credential_providers
+        .is_empty()
+        .then(|| host_redaction_values.clone());
     let result = async {
     let cancel_marker = store.path(&cancel_path(&id))?;
     let cancelled_before_preflight = cancel_marker.exists();
@@ -1258,6 +1397,13 @@ pub async fn run(
         verify_materialized_credential_identities(&request, &credentials)?;
         let credential_material = credentials.material()?;
         let redaction_values = credential_material.redaction_values.clone();
+        export_redaction_values = Some(
+            redaction_values
+                .iter()
+                .cloned()
+                .chain(host_redaction_values.iter().cloned())
+                .collect(),
+        );
         let mut mounts = request
             .execution
             .workspaces
@@ -1879,7 +2025,16 @@ pub async fn run(
             let mut repositories = Vec::new();
             for repository in &request.execution.repositories {
                 let ending = if repository.starting.head.is_some() {
-                    crate::local::repository_state(Path::new(&repository.repository_root))?
+                    let mut state =
+                        crate::local::repository_state(Path::new(&repository.repository_root))?;
+                    if let Some(export) = &request.workspace_export {
+                        omit_workspace_export_paths(
+                            &mut state,
+                            &repository.workspace_alias,
+                            export,
+                        );
+                    }
+                    state
                 } else {
                     repository.starting.clone()
                 };
@@ -2048,6 +2203,14 @@ pub async fn run(
     } else {
         LaunchState::Terminal
     };
+    publish_workspace_export(
+        &mut record,
+        &run_dir,
+        &request.output.limits,
+        export_redaction_values.as_deref(),
+        false,
+        cleanup_complete,
+    );
     store.replace_json(&run_record_path(&id), &record)?;
     attended_fault("terminal_record_published")?;
     store.replace_json(&authorized_path, &authorized)?;
@@ -2128,15 +2291,22 @@ pub fn list(store: &StateStore) -> anyhow::Result<Vec<RunRecord>> {
 pub fn status(store: &StateStore, id: &str) -> anyhow::Result<RunRecord> {
     validate_id(id)?;
     match read_receipt(store, id) {
-        Ok(receipt) => return normalize_record(receipt.payload.record),
+        Ok(receipt) => {
+            let record = normalize_record(receipt.payload.record)?;
+            validate_run_record(&record, id)?;
+            Ok(record)
+        }
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
-        Err(error) => return Err(error),
-    }
-    match store.read_json(&run_record_path(id)) {
-        Ok(record) => normalize_record(record),
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let record = store
+                .read_json(&run_record_path(id))
+                .and_then(normalize_record)?;
+            validate_run_record(&record, id)?;
+            Ok(record)
+        }
         Err(error) => Err(error),
     }
 }
@@ -2219,6 +2389,530 @@ pub struct BoundedArtifactReference {
     pub truncated: bool,
 }
 
+#[derive(Serialize)]
+struct WorkspaceExportManifest {
+    schema: &'static str,
+    run_id: String,
+    authoritative: bool,
+    trusted: bool,
+    finalized_after_cleanup: bool,
+    files: BTreeMap<String, WorkspaceExportFile>,
+    omitted: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceExportFile {
+    bytes: u64,
+    sha256: String,
+    truncated: bool,
+}
+
+fn publish_workspace_export(
+    record: &mut RunRecord,
+    run_dir: &Path,
+    limits: &protocol::AttendedOutputLimits,
+    redaction_values: Option<&[String]>,
+    preserve_manifest_files: bool,
+    finalized_after_cleanup: bool,
+) {
+    let Some(export) = record.workspace_export.as_mut() else {
+        return;
+    };
+    if record.retry_eligible {
+        export.state = "deferred_for_retry".into();
+        export.error = None;
+        return;
+    }
+    export.state = if finalized_after_cleanup {
+        "finalized"
+    } else {
+        "published"
+    }
+    .into();
+    export.error = None;
+    let published = publish_workspace_export_inner(
+        record,
+        run_dir,
+        limits,
+        redaction_values,
+        preserve_manifest_files,
+        finalized_after_cleanup,
+    );
+    let export = record
+        .workspace_export
+        .as_mut()
+        .expect("workspace export remains configured");
+    match published {
+        Ok(files) => export.files = files,
+        Err(error) => {
+            export.state = "failed".into();
+            export.error = Some(format!("workspace export failed: {error:#}"));
+        }
+    }
+}
+
+fn publish_workspace_export_inner(
+    record: &RunRecord,
+    run_dir: &Path,
+    limits: &protocol::AttendedOutputLimits,
+    redaction_values: Option<&[String]>,
+    preserve_manifest_files: bool,
+    finalized_after_cleanup: bool,
+) -> anyhow::Result<BTreeMap<String, WorkspaceExportFile>> {
+    let export = record
+        .workspace_export
+        .as_ref()
+        .context("workspace export is not configured")?;
+    ensure!(
+        !export.authoritative,
+        "workspace export cannot be authoritative"
+    );
+    let directory = open_workspace_export_directory(
+        &protocol::AttendedWorkspaceExportContract {
+            root: export.root.clone(),
+            workspace_alias: export.workspace_alias.clone(),
+            workspace_identity: export.workspace_identity.clone(),
+        },
+        &record.run_id,
+    )?;
+    let status = serde_json::json!({
+        "schema": "attended_workspace_status_v1",
+        "run_id": record.run_id,
+        "attempt_number": record.attempt_number,
+        "launch_state": record.launch_state,
+        "status": record.status,
+        "started_at": record.started_at,
+        "finished_at": record.finished_at,
+        "exit_code": record.exit_code,
+        "permission_outcome": record.permission_outcome,
+        "process_outcome": record.process_outcome,
+        "agent_outcome": record.agent_outcome,
+        "execution_outcome": record.execution_outcome,
+        "cleanup_outcome": record.cleanup_outcome,
+        "retry_class": record.retry_class,
+        "retry_eligible": record.retry_eligible,
+        "authoritative": false,
+        "trusted": false,
+    });
+    let cleanup = serde_json::json!({
+        "schema": "attended_workspace_cleanup_summary_v1",
+        "run_id": record.run_id,
+        "cleanup_outcome": record.cleanup_outcome,
+        "finished_at": record.finished_at,
+        "authoritative": false,
+        "trusted": false,
+    });
+    let mut outputs = BTreeMap::<String, (Vec<u8>, bool)>::new();
+    let mut omitted = BTreeMap::new();
+    outputs.insert(
+        "status.json".into(),
+        (
+            serialize_pretty_bounded(&status, limits.artifact_bytes)?,
+            false,
+        ),
+    );
+    outputs.insert(
+        "cleanup.json".into(),
+        (
+            serialize_pretty_bounded(&cleanup, limits.artifact_bytes)?,
+            false,
+        ),
+    );
+    match redaction_values {
+        Some(redactions) if redactions.iter().all(|value| !value.is_empty()) => {
+            for (source, target, limit) in [
+                ("stdout.log", "stdout.log", limits.stdout_bytes),
+                ("stderr.log", "stderr.log", limits.stderr_bytes),
+                (
+                    "transcript.jsonl",
+                    "transcript.jsonl",
+                    limits.transcript_bytes,
+                ),
+            ] {
+                if let Some((bytes, truncated)) = read_export_source(&run_dir.join(source), limit)?
+                {
+                    if truncated {
+                        omitted.insert(target.into(), "source_exceeds_reviewed_bound".into());
+                    } else {
+                        let redacted = redact_exact_values(&bytes, redactions);
+                        if redacted.len() as u64 <= limit {
+                            outputs.insert(target.into(), (redacted, false));
+                        } else {
+                            omitted.insert(target.into(), "redacted_output_exceeds_bound".into());
+                        }
+                    }
+                }
+            }
+            if let Some(result) = &record.agent_final {
+                let bytes = serialize_pretty_bounded(result, limits.artifact_bytes)?;
+                let redacted = redact_exact_values(&bytes, redactions);
+                if redacted.len() as u64 <= limits.artifact_bytes {
+                    outputs.insert("agent-result.json".into(), (redacted, false));
+                } else {
+                    omitted.insert(
+                        "agent-result.json".into(),
+                        "redacted_output_exceeds_bound".into(),
+                    );
+                }
+            }
+            for (source, target) in [
+                ("repositories.json", "repositories.json"),
+                ("artifacts.json", "artifacts.json"),
+            ] {
+                if let Some(value) = read_export_json(&run_dir.join(source), limits.artifact_bytes)?
+                {
+                    let bytes =
+                        serialize_pretty_bounded(&scrub_export_json(value), limits.artifact_bytes)?;
+                    let redacted = redact_exact_values(&bytes, redactions);
+                    if redacted.len() as u64 <= limits.artifact_bytes {
+                        outputs.insert(target.into(), (redacted, false));
+                    } else {
+                        omitted.insert(target.into(), "redacted_output_exceeds_bound".into());
+                    }
+                }
+            }
+        }
+        _ => {
+            for name in [
+                "stdout.log",
+                "stderr.log",
+                "transcript.jsonl",
+                "agent-result.json",
+                "repositories.json",
+                "artifacts.json",
+            ] {
+                omitted.insert(name.into(), "redaction_proof_unavailable".into());
+            }
+        }
+    }
+    let mut files = if preserve_manifest_files {
+        export.files.clone()
+    } else {
+        BTreeMap::new()
+    };
+    remove_workspace_export_file(&directory, "manifest.json")?;
+    for &name in workspace_export_allowlist() {
+        if name != "manifest.json" && !outputs.contains_key(name) && !files.contains_key(name) {
+            remove_workspace_export_file(&directory, name)?;
+        }
+    }
+    for (name, (bytes, truncated)) in outputs {
+        write_workspace_export_file(&directory, &name, &bytes)?;
+        files.insert(
+            name,
+            WorkspaceExportFile {
+                bytes: bytes.len() as u64,
+                sha256: protocol::sha256_hex(&bytes),
+                truncated,
+            },
+        );
+    }
+    let manifest = WorkspaceExportManifest {
+        schema: "attended_workspace_export_manifest_v1",
+        run_id: record.run_id.clone(),
+        authoritative: false,
+        trusted: false,
+        finalized_after_cleanup,
+        files: files.clone(),
+        omitted,
+    };
+    write_workspace_export_file(
+        &directory,
+        "manifest.json",
+        &serialize_pretty_bounded(&manifest, limits.artifact_bytes)?,
+    )?;
+    Ok(files)
+}
+
+fn redact_exact_values(bytes: &[u8], redactions: &[String]) -> Vec<u8> {
+    let mut redactions = redactions
+        .iter()
+        .map(String::as_bytes)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if let Some(value) = redactions
+            .iter()
+            .find(|value| bytes[offset..].starts_with(value))
+        {
+            output.extend_from_slice(b"[REDACTED]");
+            offset += value.len();
+        } else {
+            output.push(bytes[offset]);
+            offset += 1;
+        }
+    }
+    output
+}
+
+fn workspace_export_allowlist() -> &'static [&'static str] {
+    &[
+        "status.json",
+        "stdout.log",
+        "stderr.log",
+        "transcript.jsonl",
+        "agent-result.json",
+        "repositories.json",
+        "artifacts.json",
+        "cleanup.json",
+        "manifest.json",
+    ]
+}
+
+fn read_export_source(path: &Path, limit: u64) -> anyhow::Result<Option<(Vec<u8>, bool)>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    );
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+    };
+    ensure!(
+        file.metadata()?.is_file(),
+        "workspace export source is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    let total = file.metadata()?.len();
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(Some((bytes, total > limit)))
+}
+
+fn read_export_json(path: &Path, limit: u64) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some((bytes, truncated)) = read_export_source(path, limit)? else {
+        return Ok(None);
+    };
+    ensure!(
+        !truncated,
+        "workspace export JSON source exceeds its reviewed bound"
+    );
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn scrub_export_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .filter(|(key, _)| !export_key_is_private(key))
+                .map(|(key, value)| (key, scrub_export_json(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(scrub_export_json).collect())
+        }
+        value => value,
+    }
+}
+
+fn export_key_is_private(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "credential",
+        "token",
+        "secret",
+        "effect",
+        "owner",
+        "receipt",
+        "authorization",
+        "ownership",
+    ]
+    .iter()
+    .any(|private| key.contains(private))
+}
+
+#[cfg(unix)]
+fn open_workspace_export_directory(
+    contract: &protocol::AttendedWorkspaceExportContract,
+    run_id: &str,
+) -> anyhow::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+
+    validate_id(run_id)?;
+    let root = Path::new(&contract.root);
+    let workspace = Path::new(&contract.workspace_identity.canonical_path);
+    ensure!(
+        root == workspace.join(".agent-hub/runs"),
+        "workspace export root is outside the reserved .agent-hub/runs location"
+    );
+    let workspace_fd = open_absolute_directory_nofollow(workspace)?;
+    let metadata = workspace_fd.metadata()?;
+    ensure!(
+        metadata.dev() == contract.workspace_identity.device
+            && metadata.ino() == contract.workspace_identity.inode,
+        "workspace export workspace identity changed after authorization"
+    );
+    let open_child = |parent: &File, name: &str| -> anyhow::Result<File> {
+        let name = std::ffi::CString::new(name)?;
+        let mkdir = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if mkdir != 0 {
+            let error = std::io::Error::last_os_error();
+            ensure!(
+                error.kind() == std::io::ErrorKind::AlreadyExists,
+                "create workspace export directory: {error}"
+            );
+        }
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("open workspace export directory");
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    };
+    let agent_hub = open_child(&workspace_fd, ".agent-hub")?;
+    let runs = open_child(&agent_hub, "runs")?;
+    let run = open_child(&runs, run_id)?;
+    Ok(run)
+}
+
+#[cfg(not(unix))]
+fn open_workspace_export_directory(
+    _contract: &protocol::AttendedWorkspaceExportContract,
+    _run_id: &str,
+) -> anyhow::Result<File> {
+    anyhow::bail!("safe workspace export requires Unix no-follow directory operations")
+}
+
+#[cfg(unix)]
+fn open_absolute_directory_nofollow(path: &Path) -> anyhow::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    ensure!(
+        path.is_absolute(),
+        "workspace identity path must be absolute"
+    );
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        let component = std::ffi::CString::new(component.as_encoded_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("open workspace path component in {}", path.display()));
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn write_workspace_export_file(directory: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd as _};
+
+    ensure!(
+        name.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-.".contains(&byte)),
+        "workspace export filename is not canonical"
+    );
+    let temporary = format!(".{name}.tmp-{}", uuid::Uuid::new_v4());
+    let temporary = std::ffi::CString::new(temporary)?;
+    let name = std::ffi::CString::new(name)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("create workspace export file");
+    }
+    struct TemporaryFile<'a> {
+        directory: &'a File,
+        name: std::ffi::CString,
+        published: bool,
+    }
+    impl Drop for TemporaryFile<'_> {
+        fn drop(&mut self) {
+            if !self.published {
+                unsafe {
+                    libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0);
+                }
+            }
+        }
+    }
+    let mut temporary_guard = TemporaryFile {
+        directory,
+        name: temporary,
+        published: false,
+    };
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let renamed = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temporary_guard.name.as_ptr(),
+            directory.as_raw_fd(),
+            name.as_ptr(),
+        )
+    };
+    if renamed != 0 {
+        return Err(std::io::Error::last_os_error()).context("publish workspace export file");
+    }
+    temporary_guard.published = true;
+    directory.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_workspace_export_file(directory: &File, name: &str) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let name = std::ffi::CString::new(name)?;
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        directory.sync_all()?;
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error).context("remove stale workspace export file")
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_workspace_export_file(_directory: &File, _name: &str) -> anyhow::Result<()> {
+    anyhow::bail!("safe workspace export requires Unix atomic directory operations")
+}
+
+#[cfg(not(unix))]
+fn write_workspace_export_file(
+    _directory: &File,
+    _name: &str,
+    _bytes: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::bail!("safe workspace export requires Unix atomic directory operations")
+}
+
 #[derive(Debug, Serialize)]
 pub struct LocalResult {
     pub schema: &'static str,
@@ -2277,7 +2971,7 @@ pub fn local_result(store: &StateStore, id: &str, limit_bytes: u64) -> anyhow::R
     let stdout = artifact_reference(store, id, "stdout.log", limit_bytes)?;
     let stderr = artifact_reference(store, id, "stderr.log", limit_bytes)?;
     let transcript = artifact_reference(store, id, "transcript.jsonl", limit_bytes)?;
-    let paths = BTreeMap::from([
+    let mut paths = BTreeMap::from([
         (
             "run".into(),
             store
@@ -2294,6 +2988,9 @@ pub fn local_result(store: &StateStore, id: &str, limit_bytes: u64) -> anyhow::R
         ("repositories".into(), repositories.reference.path.clone()),
         ("cleanup".into(), cleanup.reference.path.clone()),
     ]);
+    if let Some(export) = &record.workspace_export {
+        paths.insert("workspace_export".into(), export.run_path.clone());
+    }
     Ok(LocalResult {
         schema: LOCAL_RESULT_SCHEMA_V2,
         run_id: id.to_string(),
@@ -2576,7 +3273,12 @@ pub async fn cleanup(
     validate_id(id)?;
     let _lock = store.lock(&PathBuf::from("locks").join(format!("cleanup-{id}.lock")))?;
     match read_receipt(store, id) {
-        Ok(receipt) => return normalize_record(receipt.payload.record),
+        Ok(receipt) => {
+            // Repair the convenience execution index if cleanup previously
+            // crashed after publishing its immutable receipt.
+            store.replace_json(&run_record_path(id), &receipt.payload.record)?;
+            return normalize_record(receipt.payload.record);
+        }
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -2665,6 +3367,11 @@ pub async fn cleanup(
             cleanup_evidence,
             host_ledger: HostLedgerSummary::default(),
         };
+        let limits = AttendedOutputContract::default().limits;
+        publish_workspace_export(&mut record, &run_dir, &limits, None, true, true);
+        let mut payload = payload;
+        payload.record = record.clone();
+        payload.result = serde_json::to_value(&record)?;
         publish_cleanup_receipt(store, id, &record, payload)?;
         return status(store, id);
     }
@@ -2731,6 +3438,11 @@ pub async fn cleanup(
         cleanup_evidence,
         host_ledger,
     };
+    let limits = AttendedOutputContract::default().limits;
+    publish_workspace_export(&mut record, &run_dir, &limits, None, true, true);
+    let mut payload = payload;
+    payload.record = record.clone();
+    payload.result = serde_json::to_value(&record)?;
     let receipt = CleanupReceipt {
         schema: CLEANUP_RECEIPT_SCHEMA_V1.into(),
         run_id: id.into(),
@@ -2755,6 +3467,7 @@ pub async fn cleanup(
         return Ok(record);
     }
     publish_pending_receipt(store, id, &pending_path)?;
+    attended_fault("cleanup_receipt_published")?;
     store.replace_json(&run_record_path(id), &record)?;
     status(store, id)
 }
@@ -2779,6 +3492,7 @@ fn publish_cleanup_receipt(
     };
     store.create_json(&pending, &receipt)?;
     publish_pending_receipt(store, id, &pending_path)?;
+    attended_fault("cleanup_receipt_published")?;
     store.replace_json(&run_record_path(id), record)
 }
 
@@ -3148,18 +3862,37 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV3) -> anyhow::
             access: WorkspaceAccess::ReadOnly,
         })
         .collect::<Vec<_>>();
-    let resolved = resolve_mounts(
+    let mut resolved = resolve_mounts(
         &approved,
         &workspaces,
         &contexts,
         &request.execution.primary_workspace,
     )?;
+    if let Some(export) = &request.workspace_export {
+        for repository in &mut resolved.repositories {
+            omit_workspace_export_paths(
+                &mut repository.starting,
+                &repository.workspace_alias,
+                export,
+            );
+        }
+    }
     ensure!(
         resolved.workspaces == request.execution.workspaces
             && resolved.context_roots == request.execution.context_roots
             && resolved.repositories == request.execution.repositories
             && resolved.git_views == request.git_views,
         "workspace or repository identity changed after authorization"
+    );
+    ensure!(
+        resolve_workspace_export_contract(
+            request
+                .workspace_export
+                .as_ref()
+                .map(|export| Path::new(&export.root)),
+            &resolved.workspaces,
+        )? == request.workspace_export,
+        "workspace export root identity changed after authorization"
     );
     Ok(())
 }
@@ -3193,9 +3926,11 @@ fn provider_unavailable_retry_evidence(
         return Ok(false);
     }
     for repository in &request.execution.repositories {
-        if crate::local::repository_state(Path::new(&repository.repository_root))?
-            != repository.starting
-        {
+        let mut state = crate::local::repository_state(Path::new(&repository.repository_root))?;
+        if let Some(export) = &request.workspace_export {
+            omit_workspace_export_paths(&mut state, &repository.workspace_alias, export);
+        }
+        if state != repository.starting {
             return Ok(false);
         }
     }
@@ -4818,7 +5553,7 @@ fn repeated_selector_args(name: &str, values: impl IntoIterator<Item = String>) 
 }
 
 #[cfg(test)]
-fn shell_word(value: &str) -> String {
+pub(crate) fn shell_word(value: &str) -> String {
     if !value.is_empty()
         && value
             .bytes()
@@ -5231,6 +5966,7 @@ fn verify_receipt(receipt: &CleanupReceipt, id: &str) -> anyhow::Result<()> {
         "unsupported cleanup receipt schema"
     );
     ensure!(receipt.run_id == id, "cleanup receipt run ID mismatch");
+    validate_run_record(&receipt.payload.record, id)?;
     ensure!(
         receipt.payload.record.id == id && receipt.payload.record.run_id == id,
         "cleanup receipt record run ID mismatch"
@@ -5393,6 +6129,44 @@ fn validate_record_ids(record: &RunRecord) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_run_record(record: &RunRecord, expected_run_id: &str) -> anyhow::Result<()> {
+    validate_record_ids(record)?;
+    ensure!(
+        record.id == expected_run_id && record.run_id == expected_run_id,
+        "execution record identity does not match requested run ID"
+    );
+    ensure!(
+        usize::try_from(record.attempt_number)? == record.attempt_ancestry.len() + 1,
+        "execution attempt number must equal ancestry length plus one"
+    );
+    let mut ancestry = std::collections::BTreeSet::new();
+    for ancestor in &record.attempt_ancestry {
+        validate_id(ancestor).context("execution attempt ancestry contains an invalid UUID")?;
+        ensure!(
+            ancestry.insert(ancestor),
+            "execution attempt ancestry contains a duplicate UUID"
+        );
+        ensure!(
+            ancestor != &record.attempt_id,
+            "execution attempt ancestry contains the current attempt"
+        );
+    }
+    match &record.parent_attempt_id {
+        Some(parent) => {
+            validate_id(parent).context("execution parent_attempt_id is invalid")?;
+            ensure!(
+                record.attempt_ancestry.last() == Some(parent),
+                "execution parent attempt must be the final ancestry entry"
+            );
+        }
+        None => ensure!(
+            record.attempt_ancestry.is_empty(),
+            "execution without a parent attempt must not have ancestry"
+        ),
+    }
+    Ok(())
+}
+
 fn path_string(path: &Path) -> anyhow::Result<String> {
     path.to_str()
         .map(str::to_string)
@@ -5405,6 +6179,13 @@ fn read_authorization_file(path: &Path) -> anyhow::Result<(AttendedAuthorization
 
     ensure!(path.is_absolute(), "authorization path must be absolute");
     ensure!(!path.as_os_str().is_empty(), "authorization path is empty");
+    let canonical_path = std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalize authorization {}", path.display()))?;
+    ensure!(
+        canonical_path == path,
+        "authorization path must be canonical; use '{}'",
+        canonical_path.display()
+    );
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -5425,7 +6206,7 @@ fn read_authorization_file(path: &Path) -> anyhow::Result<(AttendedAuthorization
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let artifact = serde_json::from_slice(&bytes)?;
-    Ok((artifact, path_string(path)?))
+    Ok((artifact, path_string(&canonical_path)?))
 }
 
 #[cfg(not(unix))]
@@ -7308,6 +8089,7 @@ grep -qx 'ready\|ready\.' real-llm.log
             agent_final: serde_json::from_value(complete_agent_result()).ok(),
             retry_class: None,
             retry_eligible: false,
+            workspace_export: None,
         }
     }
 
@@ -7860,6 +8642,26 @@ grep -qx 'ready\|ready\.' real-llm.log
             "attended_artifacts_v1"
         );
         super::ensure_local_result_documents(&aggregate).unwrap();
+        let result_json = serde_json::to_value(&result).unwrap();
+        let result_keys = result_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            result_keys,
+            "agent_final\nagent_outcome\nartifacts\ncleanup\ncleanup_outcome\nexecution_outcome\nexit_code\npaths\npermission_outcome\nprocess_outcome\nrepositories\nresult\nrun_id\nschema\nstderr\nstdout\ntranscript"
+        );
+        assert_eq!(
+            result.paths["receipt"],
+            store
+                .path(&super::receipt_path(&record.id))
+                .unwrap()
+                .display()
+                .to_string()
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -7869,6 +8671,397 @@ grep -qx 'ready\|ready\.' real-llm.log
                 .mode();
             assert_eq!(mode & 0o777, 0o400);
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_cleanup_receipt_wins_over_stale_execution_index() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-receipt-authority-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = StateStore::open(root.clone()).unwrap();
+        let mut stale = terminal_record();
+        stale.status = RunStatus::CleanupFailed;
+        stale.cleanup_outcome = super::CleanupOutcome::Failed;
+        store
+            .create_json(&super::run_record_path(&stale.id), &stale)
+            .unwrap();
+
+        let mut cleaned = stale.clone();
+        cleaned.status = RunStatus::Cleaned;
+        cleaned.cleanup_outcome = super::CleanupOutcome::Succeeded;
+        let payload = super::CleanupReceiptPayload {
+            record: cleaned.clone(),
+            owner: super::owner_marker_for_record(&cleaned),
+            result: serde_json::to_value(&cleaned).unwrap(),
+            artifacts: serde_json::json!({"schema":"attended_artifact_summary_v1"}),
+            repositories: serde_json::json!([]),
+            cleanup: serde_json::json!({"schema":"attended_cleanup_result_v1","outcome":"succeeded"}),
+            cleanup_evidence: super::AttendedCleanupEvidence::default(),
+            host_ledger: super::HostLedgerSummary::default(),
+        };
+        let receipt = super::CleanupReceipt {
+            schema: super::CLEANUP_RECEIPT_SCHEMA_V1.into(),
+            run_id: cleaned.id.clone(),
+            authorization_digest: cleaned.authorization_digest.clone(),
+            cleaned_at: Utc::now(),
+            checksum: super::receipt_checksum(&payload).unwrap(),
+            payload,
+        };
+        store
+            .create_json(&super::receipt_path(&cleaned.id), &receipt)
+            .unwrap();
+
+        assert_eq!(
+            super::status(&store, &cleaned.id).unwrap().status,
+            RunStatus::Cleaned
+        );
+        assert_eq!(super::list(&store).unwrap()[0].status, RunStatus::Cleaned);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_record_uuid_lineage_is_strict_and_actionable() {
+        let mut record = terminal_record();
+        assert!(super::validate_run_record(&record, &record.run_id).is_ok());
+
+        record.attempt_ancestry = vec![uuid::Uuid::new_v4().to_string()];
+        record.attempt_number = 2;
+        let error = super::validate_run_record(&record, &record.run_id).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("execution without a parent attempt must not have ancestry")
+        );
+
+        record.parent_attempt_id = record.attempt_ancestry.last().cloned();
+        record.attempt_number = 1;
+        let error = super::validate_run_record(&record, &record.run_id).unwrap_err();
+        assert!(format!("{error:#}").contains("must equal ancestry length plus one"));
+        record.attempt_number = 2;
+        assert!(super::validate_run_record(&record, &record.run_id).is_ok());
+        record.attempt_ancestry.push(record.attempt_id.clone());
+        record.attempt_number = 3;
+        record.parent_attempt_id = Some(record.attempt_id.clone());
+        let error = super::validate_run_record(&record, &record.run_id).unwrap_err();
+        assert!(format!("{error:#}").contains("contains the current attempt"));
+    }
+
+    fn configure_workspace_export(record: &mut RunRecord, workspace: &std::path::Path) -> PathBuf {
+        let export_root = workspace.join(".agent-hub/runs");
+        let export_run = export_root.join(&record.run_id);
+        record.workspace_export = Some(super::WorkspaceExportStatus {
+            root: export_root.display().to_string(),
+            run_path: export_run.display().to_string(),
+            workspace_alias: "primary".into(),
+            workspace_identity: crate::git_view::directory_identity(workspace).unwrap(),
+            state: "pending".into(),
+            error: None,
+            authoritative: false,
+            files: BTreeMap::new(),
+        });
+        export_run
+    }
+
+    #[test]
+    fn workspace_export_is_bounded_redacted_atomic_and_retained() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-workspace-export-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let run_dir = root.join("private-run");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("stdout.log"), b"credential-value output").unwrap();
+        std::fs::write(run_dir.join("stderr.log"), b"oversized stderr").unwrap();
+        std::fs::write(run_dir.join("transcript.jsonl"), b"{}\n").unwrap();
+        std::fs::write(
+            run_dir.join("repositories.json"),
+            br#"[{"workspace_alias":"primary","token":"must-not-export"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("artifacts.json"),
+            br#"{"schema":"attended_artifacts_v1","credentials":"must-not-export"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("cleanup.json"),
+            br#"{"outcome":"succeeded","effects":{"secret":"must-not-export"}}"#,
+        )
+        .unwrap();
+        std::fs::write(run_dir.join("credentials.json"), b"must-not-export").unwrap();
+
+        let mut record = terminal_record();
+        record.agent_final.as_mut().unwrap().summary = "credential-value result".into();
+        let export_run = configure_workspace_export(&mut record, &workspace);
+        let limits = protocol::AttendedOutputLimits {
+            stdout_bytes: 64,
+            stderr_bytes: 4,
+            transcript_bytes: 64,
+            artifact_bytes: 16_384,
+        };
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &limits,
+            Some(&["credential-value".into()]),
+            false,
+            true,
+        );
+        assert_eq!(record.workspace_export.as_ref().unwrap().state, "finalized");
+        assert_eq!(
+            std::fs::read(export_run.join("stdout.log")).unwrap(),
+            b"[REDACTED] output"
+        );
+        assert!(!export_run.join("stderr.log").exists());
+        assert!(!export_run.join("credentials.json").exists());
+        let all_exported = std::fs::read_dir(&export_run)
+            .unwrap()
+            .flat_map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        let all_exported = String::from_utf8_lossy(&all_exported);
+        assert!(!all_exported.contains("must-not-export"));
+        assert!(!all_exported.contains("credential-value"));
+        assert!(!all_exported.contains("owner_nonce"));
+        assert!(!all_exported.contains("authorization_digest"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(export_run.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["authoritative"], false);
+        assert_eq!(manifest["trusted"], false);
+        assert_eq!(manifest["files"]["stdout.log"]["truncated"], false);
+        assert_eq!(
+            manifest["omitted"]["stderr.log"],
+            "source_exceeds_reviewed_bound"
+        );
+
+        std::fs::remove_dir_all(&run_dir).unwrap();
+        assert!(export_run.join("manifest.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absent_workspace_export_has_no_workspace_side_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-no-workspace-export-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let run_dir = root.join("private-run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut record = terminal_record();
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &protocol::AttendedOutputContract::default().limits,
+            None,
+            false,
+            true,
+        );
+        assert!(record.workspace_export.is_none());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_export_omits_unprovable_output_and_removes_stale_allowlisted_files() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-workspace-export-omitted-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let run_dir = root.join("private-run");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("stdout.log"), b"unproven free text").unwrap();
+        let mut record = terminal_record();
+        let export_run = configure_workspace_export(&mut record, &workspace);
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &protocol::AttendedOutputContract::default().limits,
+            Some(&[]),
+            false,
+            true,
+        );
+        assert!(export_run.join("stdout.log").is_file());
+
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &protocol::AttendedOutputContract::default().limits,
+            None,
+            false,
+            true,
+        );
+        assert!(!export_run.join("stdout.log").exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(export_run.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["omitted"]["stdout.log"],
+            "redaction_proof_unavailable"
+        );
+        assert!(manifest["files"].get("stdout.log").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_export_rejects_symlink_tampering_without_changing_run_outcome() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-workspace-export-tamper-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        let run_dir = root.join("private-run");
+        std::fs::create_dir_all(workspace.join(".agent-hub/runs")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut record = terminal_record();
+        symlink(
+            &outside,
+            workspace.join(".agent-hub/runs").join(&record.run_id),
+        )
+        .unwrap();
+        configure_workspace_export(&mut record, &workspace);
+        let outcome = record.execution_outcome.clone();
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &protocol::AttendedOutputContract::default().limits,
+            Some(&[]),
+            false,
+            true,
+        );
+        assert_eq!(record.execution_outcome, outcome);
+        assert_eq!(record.workspace_export.as_ref().unwrap().state, "failed");
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_export_rejects_symlinked_workspace_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-workspace-export-ancestor-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let real_parent = root.join("real");
+        let workspace = real_parent.join("workspace");
+        let linked_parent = root.join("linked");
+        let run_dir = root.join("private-run");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+        let linked_workspace = linked_parent.join("workspace");
+        let mut record = terminal_record();
+        configure_workspace_export(&mut record, &linked_workspace);
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &protocol::AttendedOutputContract::default().limits,
+            Some(&[]),
+            false,
+            true,
+        );
+        assert_eq!(record.workspace_export.as_ref().unwrap().state, "failed");
+        assert!(!workspace.join(".agent-hub").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_export_unlinks_temporary_file_when_atomic_replace_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-workspace-export-temp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let run_dir = root.join("private-run");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut record = terminal_record();
+        let export_run = configure_workspace_export(&mut record, &workspace);
+        std::fs::create_dir_all(export_run.join("status.json")).unwrap();
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &protocol::AttendedOutputContract::default().limits,
+            Some(&[]),
+            false,
+            true,
+        );
+        assert_eq!(record.workspace_export.as_ref().unwrap().state, "failed");
+        assert!(!std::fs::read_dir(&export_run).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_export_atomic_publish_survives_concurrent_workspace_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-workspace-export-concurrent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let run_dir = root.join("private-run");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("stdout.log"), b"complete output").unwrap();
+        let mut record = terminal_record();
+        let export_run = configure_workspace_export(&mut record, &workspace);
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &protocol::AttendedOutputContract::default().limits,
+            Some(&[]),
+            false,
+            true,
+        );
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let target = export_run.join("status.json");
+        let writer = std::thread::spawn(move || {
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::write(&target, b"workspace writer");
+            }
+        });
+        for _ in 0..20 {
+            super::publish_workspace_export(
+                &mut record,
+                &run_dir,
+                &protocol::AttendedOutputContract::default().limits,
+                Some(&[]),
+                false,
+                true,
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        super::publish_workspace_export(
+            &mut record,
+            &run_dir,
+            &protocol::AttendedOutputContract::default().limits,
+            Some(&[]),
+            false,
+            true,
+        );
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(export_run.join("status.json")).unwrap(),
+        )
+        .unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

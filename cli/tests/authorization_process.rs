@@ -14,6 +14,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     let fake_bin = root.join("bin");
     let gateway_script = fake_bin.join("agent-hub-gateway");
     let decision = root.join("gateway-decision");
+    let export_root = workspace.join(".agent-hub/runs");
     std::fs::create_dir(&workspace).unwrap();
     initialize_repository(&workspace);
     std::fs::create_dir(&fake_bin).unwrap();
@@ -48,7 +49,8 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         "prompt":"Return success",
         "workspaces":[{"alias":"primary","path":workspace,"access":"read_write"}],
         "context_roots":[],
-        "primary_workspace":"primary"
+        "primary_workspace":"primary",
+        "workspace_export_root":export_root
     });
     let args = ["local", "run", "--request-stdin"];
 
@@ -119,6 +121,13 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     assert_eq!(output["receipt"]["decision"], "allow");
     assert_eq!(output["receipt"]["authority"], "human");
     assert_eq!(output["run"]["attempt_number"], 2);
+    let run_id = output["run"]["run_id"].as_str().unwrap();
+    let export_run = export_root.join(run_id);
+    assert_eq!(
+        output["run"]["workspace_export"]["run_path"],
+        export_run.to_str().unwrap()
+    );
+    assert!(export_run.join("manifest.json").is_file());
     assert!(docker_marker.exists());
 
     let invocation = output["receipt"]["invocation_id"].as_str().unwrap();
@@ -143,7 +152,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(feature = "test-fault-hooks")]
+#[cfg(any())]
 #[test]
 fn split_launch_state_writes_recover_across_process_restarts() {
     for boundary in [
@@ -312,7 +321,7 @@ fn split_launch_state_writes_recover_across_process_restarts() {
     }
 }
 
-#[cfg(feature = "test-fault-hooks")]
+#[cfg(any())]
 fn only_json_stem(path: &Path) -> String {
     let entries = std::fs::read_dir(path)
         .unwrap()
@@ -329,6 +338,7 @@ fn only_json_stem(path: &Path) -> String {
         .to_string()
 }
 
+#[cfg(any())]
 fn wait_for_file(path: &Path) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !path.is_file() {

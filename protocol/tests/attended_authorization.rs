@@ -355,6 +355,7 @@ fn request_v3() -> protocol::AttendedAuthorizationRequestV3 {
         approval_bundle_digest: request.approval_bundle_digest,
         approval_bundle: request.approval_bundle,
         output: request.output,
+        workspace_export: None,
         lifecycle: request.lifecycle,
         retry: protocol::AttendedRetryConstraints {
             max_attempts: 3,
@@ -451,6 +452,22 @@ fn agent_hub_run_public_intent_excludes_host_owned_fields_and_enforces_bounds() 
     });
     let intent: protocol::AgentHubRunIntentV1 = serde_json::from_value(base.clone()).unwrap();
     intent.validate_shape().unwrap();
+    assert!(
+        !serde_json::to_value(&intent)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("workspace_export_root")
+    );
+    let mut with_export = intent.clone();
+    with_export.workspace_export_root = Some("/workspace/source/.agent-hub/runs".into());
+    with_export.validate_shape().unwrap();
+    let mut invalid_export = with_export.clone();
+    invalid_export.workspace_export_root = Some("/workspace/source/output".into());
+    assert!(invalid_export.validate_shape().is_err());
+    let mut read_only_export = with_export;
+    read_only_export.workspaces[0].access = protocol::WorkspaceAccess::ReadOnly;
+    assert!(read_only_export.validate_shape().is_err());
     for field in [
         "config_root",
         "image_digest",
@@ -545,6 +562,47 @@ fn reviewed_retry_constraints_are_canonical_capability_bytes() {
         serde_json::from_slice(&supervised.canonical_artifact().unwrap().canonical_bytes).unwrap();
     assert_eq!(value["retry"]["max_attempts"], 4);
     assert_eq!(value["retry"]["max_prelaunch_retries"], 2);
+}
+
+#[test]
+fn attended_v3_binds_only_the_reserved_read_write_workspace_export_root() {
+    let mut request = request_v3();
+    request.workspace_export = Some(protocol::AttendedWorkspaceExportContract {
+        root: "/work/zeta/.agent-hub/runs".into(),
+        workspace_alias: "zeta".into(),
+        workspace_identity: protocol::HostDirectoryIdentity {
+            canonical_path: "/work/zeta".into(),
+            device: 1,
+            inode: 2,
+        },
+    });
+    let artifact = request.canonical_artifact().unwrap();
+    assert_eq!(
+        artifact.verify_v3().unwrap().workspace_export,
+        request.workspace_export
+    );
+
+    for root in [
+        "/work/alpha/output",
+        "/work/zeta/.agent-hub/runs/extra",
+        "/work/alpha/.agent-hub/runs",
+        "/work/zeta/.agent-hub/../runs",
+    ] {
+        let mut invalid = request_v3();
+        invalid.workspace_export = Some(protocol::AttendedWorkspaceExportContract {
+            root: root.into(),
+            workspace_alias: "zeta".into(),
+            workspace_identity: protocol::HostDirectoryIdentity {
+                canonical_path: "/work/zeta".into(),
+                device: 1,
+                inode: 2,
+            },
+        });
+        assert!(
+            invalid.canonical_artifact().is_err(),
+            "accepted export root {root}"
+        );
+    }
 }
 
 #[test]
@@ -667,6 +725,71 @@ fn attended_v3_binds_isolated_git_views_without_accepting_v1_or_v2_domains() {
     let mut legacy_context = request_v2();
     legacy_context.execution.context_roots[0].host_path = "/reference/code".into();
     assert!(legacy_context.canonical_artifact().is_err());
+}
+
+#[test]
+fn attended_v3_digest_snapshot_is_stable() {
+    let artifact = request_v3().canonical_artifact().unwrap();
+    let frozen_bytes = include_bytes!("fixtures/attended_authorization_v3.json");
+    assert_eq!(artifact.canonical_bytes, frozen_bytes);
+    assert_eq!(
+        artifact.digest,
+        "1c908dc42dd9f5f50530d3ab0fa2bda0b9753e656528b8c9d43fe0a24c3f9c06"
+    );
+    let frozen = AttendedAuthorizationArtifact {
+        version: protocol::ATTENDED_AUTHORIZATION_VERSION_V3,
+        digest: artifact.digest,
+        canonical_bytes: frozen_bytes.to_vec(),
+    };
+    assert_eq!(
+        frozen.verify_v3().unwrap(),
+        request_v3().normalize().unwrap()
+    );
+}
+
+#[test]
+fn structured_agent_result_validation_is_actionable() {
+    let valid = protocol::AgentResultV1 {
+        schema: protocol::AGENT_RESULT_V1_SCHEMA.into(),
+        complete: true,
+        summary: "All requested checks passed".into(),
+        acceptance_results: vec![protocol::AgentAcceptanceResult {
+            criterion: "tests pass".into(),
+            passed: true,
+            evidence: "cargo test".into(),
+        }],
+        blockers: vec![],
+        artifact_references: vec![protocol::AgentArtifactReference {
+            path: "target/report.json".into(),
+            description: "machine-readable report".into(),
+        }],
+    };
+    assert!(valid.validate().is_ok());
+
+    let mut invalid = valid.clone();
+    invalid.summary = " ".into();
+    assert_eq!(
+        invalid.validate().unwrap_err(),
+        "agent result summary must not be empty"
+    );
+    let mut invalid = valid.clone();
+    invalid.acceptance_results[0].evidence.clear();
+    assert_eq!(
+        invalid.validate().unwrap_err(),
+        "agent acceptance results require criterion and evidence"
+    );
+    let mut invalid = valid.clone();
+    invalid.blockers.push("blocked".into());
+    assert_eq!(
+        invalid.validate().unwrap_err(),
+        "complete agent result contradicts blockers or failed acceptance results"
+    );
+    let mut invalid = valid;
+    invalid.artifact_references[0].description.clear();
+    assert_eq!(
+        invalid.validate().unwrap_err(),
+        "agent artifact references require path and description"
+    );
 }
 
 #[test]

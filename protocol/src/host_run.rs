@@ -1,5 +1,7 @@
 //! Canonical protocol for a host-owned, one-step attended run.
 
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -51,6 +53,9 @@ pub struct AgentHubRunIntentV1 {
     pub context_roots: Vec<AgentHubRunContextRootV1>,
     #[schemars(length(min = 1, max = 63))]
     pub primary_workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 4096))]
+    pub workspace_export_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -156,6 +161,19 @@ impl AgentHubRunIntentV1 {
             validate_absolute_path(&item.path)?;
             if !aliases.insert(&item.alias) || !paths.insert(&item.path) {
                 return Err("agent_hub_run aliases and paths must be unique".into());
+            }
+        }
+        if let Some(export_root) = &self.workspace_export_root {
+            validate_absolute_path(export_root)?;
+            let matches = self.workspaces.iter().filter(|workspace| {
+                workspace.access == WorkspaceAccess::ReadWrite
+                    && Path::new(export_root) == Path::new(&workspace.path).join(".agent-hub/runs")
+            });
+            if matches.count() != 1 {
+                return Err(
+                    "workspace export root must be exactly .agent-hub/runs under one read-write workspace"
+                        .into(),
+                );
             }
         }
         if !self

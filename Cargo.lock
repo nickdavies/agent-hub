@@ -23,6 +23,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "shell-words",
  "similar",
  "tokio",
  "url",

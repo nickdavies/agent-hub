@@ -583,7 +583,7 @@ fn canonical_real_directory(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(canonical)
 }
 
-fn directory_identity(path: &Path) -> anyhow::Result<HostDirectoryIdentity> {
+pub(crate) fn directory_identity(path: &Path) -> anyhow::Result<HostDirectoryIdentity> {
     let metadata = std::fs::symlink_metadata(path)?;
     ensure!(metadata.is_dir(), "Git identity is not a directory");
     Ok(HostDirectoryIdentity {
@@ -593,7 +593,7 @@ fn directory_identity(path: &Path) -> anyhow::Result<HostDirectoryIdentity> {
     })
 }
 
-fn verify_directory_identity(identity: &HostDirectoryIdentity) -> anyhow::Result<()> {
+pub(crate) fn verify_directory_identity(identity: &HostDirectoryIdentity) -> anyhow::Result<()> {
     ensure!(
         directory_identity(Path::new(&identity.canonical_path))? == *identity,
         "Git host directory identity changed after authorization"

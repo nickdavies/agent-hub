@@ -136,12 +136,13 @@ enum LocalCommand {
     List,
     /// Show one execution record
     Status {
-        #[arg(long)]
+        /// Canonical run UUID printed by `local run` or `local list`
+        #[arg(long, value_parser = validate_run_id)]
         run_id: String,
     },
     /// Print an execution log
     Logs {
-        #[arg(long)]
+        #[arg(long, value_parser = validate_run_id)]
         run_id: String,
         #[arg(long, value_parser = ["stdout", "stderr", "transcript"], default_value = "transcript")]
         stream: String,
@@ -150,40 +151,40 @@ enum LocalCommand {
     },
     /// Print an execution result
     Result {
-        #[arg(long)]
+        #[arg(long, value_parser = validate_run_id)]
         run_id: String,
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
         limit_bytes: u64,
     },
     /// Print the bounded artifact manifest
     Artifacts {
-        #[arg(long)]
+        #[arg(long, value_parser = validate_run_id)]
         run_id: String,
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
         limit_bytes: u64,
     },
     /// Print the bounded repository result document
     Repositories {
-        #[arg(long)]
+        #[arg(long, value_parser = validate_run_id)]
         run_id: String,
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
         limit_bytes: u64,
     },
     /// Print the bounded cleanup result document
     CleanupResult {
-        #[arg(long)]
+        #[arg(long, value_parser = validate_run_id)]
         run_id: String,
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=16_777_216))]
         limit_bytes: u64,
     },
     /// Cancel an owned running execution
     Cancel {
-        #[arg(long)]
+        #[arg(long, value_parser = validate_run_id)]
         run_id: String,
     },
     /// Explicitly remove owned execution resources and artifacts
     Cleanup {
-        #[arg(long)]
+        #[arg(long, value_parser = validate_run_id)]
         run_id: String,
         /// Host-only approvals endpoint; never passed to the sandbox
         #[arg(
@@ -444,18 +445,40 @@ fn parse_context_root(value: &str) -> Result<RequestedContextRoot, String> {
 
 #[cfg(test)]
 fn validate_cli_alias(alias: &str) -> Result<String, String> {
-    if alias.is_empty()
-        || alias.len() > 63
-        || !alias
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    if alias.is_empty() || alias.len() > 63 {
+        return Err("mount alias must contain 1 to 63 bytes".into());
+    }
+    if !alias
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         || !alias.as_bytes()[0].is_ascii_alphanumeric()
         || !alias.as_bytes()[alias.len() - 1].is_ascii_alphanumeric()
-        || ["artifacts", "config", "context", "opencode", "output"].contains(&alias)
     {
-        return Err("mount alias is not canonical or is reserved".into());
+        return Err(
+            "mount alias must use lowercase ASCII letters or digits with hyphens only between alphanumeric characters"
+                .into(),
+        );
+    }
+    if ["artifacts", "config", "context", "opencode", "output"].contains(&alias) {
+        return Err(format!(
+            "mount alias '{alias}' is reserved; choose a different alias"
+        ));
     }
     Ok(alias.to_string())
+}
+
+fn validate_run_id(value: &str) -> Result<String, String> {
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| {
+        "run ID must be a canonical hyphenated UUID printed by `agent-hub local run` or `agent-hub local list`"
+            .to_string()
+    })?;
+    if parsed.hyphenated().to_string() != value {
+        return Err(
+            "run ID must use canonical lowercase hyphenated UUID form (for example 123e4567-e89b-12d3-a456-426614174000)"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[cfg(test)]
@@ -658,17 +681,25 @@ mod attended_cli_tests {
 
     #[test]
     fn result_document_commands_have_stable_cli_shapes() {
+        let run_id = "123e4567-e89b-12d3-a456-426614174000";
         for command in ["result", "artifacts", "repositories", "cleanup-result"] {
             let parsed = Cli::try_parse_from([
                 "agent-hub",
                 "local",
                 command,
                 "--run-id",
-                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                run_id,
                 "--limit-bytes",
                 "4096",
             ]);
             assert!(parsed.is_ok(), "failed to parse local {command}");
+        }
+
+        for invalid in ["not-a-uuid", "123e4567e89b12d3a456426614174000"] {
+            assert!(
+                Cli::try_parse_from(["agent-hub", "local", "artifacts", "--run-id", invalid,])
+                    .is_err()
+            );
         }
     }
 }

@@ -37,11 +37,11 @@ pub use attended::{
     AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1, AttendedAuthorizationRequestV2,
     AttendedAuthorizationRequestV3, AttendedExecutionSpec, AttendedLifecycleContract,
     AttendedOutputContract, AttendedOutputLimits, AttendedProposal, AttendedRetryConstraints,
-    AuthorizedCredentialProvider, AuthorizedOverlay, ContextRootSpec, GitObjectStoreSpec,
-    GitRepositoryType, GitViewSpec, GithubOverlayBinding, HostDirectoryIdentity,
-    RepositoryMountSpec, RepositoryState, ResolvedRoot, RootRole, ToolApprovalMode,
-    WorkspaceAccess, WorkspaceSpec, canonical_context_root_path, is_canonical_context_root_path,
-    sha256_hex, sha256_hex_with_domain,
+    AttendedWorkspaceExportContract, AuthorizedCredentialProvider, AuthorizedOverlay,
+    ContextRootSpec, GitObjectStoreSpec, GitRepositoryType, GitViewSpec, GithubOverlayBinding,
+    HostDirectoryIdentity, RepositoryMountSpec, RepositoryState, ResolvedRoot, RootRole,
+    ToolApprovalMode, WorkspaceAccess, WorkspaceSpec, canonical_context_root_path,
+    is_canonical_context_root_path, sha256_hex, sha256_hex_with_domain,
 };
 pub use attended_gateway::{
     ATTENDED_GATEWAY_ACK_VERSION, ATTENDED_GATEWAY_DECISION_VERSION,

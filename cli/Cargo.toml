@@ -27,3 +27,6 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 which = "7"
 libc = "0.2"
+
+[dev-dependencies]
+shell-words = "1"
