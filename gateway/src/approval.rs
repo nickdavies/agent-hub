@@ -18,12 +18,11 @@ pub(crate) fn status_to_output(status: &ApprovalStatus) -> HookOutput {
             message: None,
         },
         ApprovalStatus::Cancelled => HookOutput {
-            status: DecisionStatus::Denied,
+            status: DecisionStatus::PipelineError,
             message: None,
         },
         ApprovalStatus::Pending => HookOutput {
-            // Should not happen — but if we get here, deny as a safety net.
-            status: DecisionStatus::Denied,
+            status: DecisionStatus::PipelineError,
             message: None,
         },
     }

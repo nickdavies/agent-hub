@@ -24,9 +24,10 @@ pub mod tool_call;
 
 // Re-export the most commonly used types at the crate root for convenience.
 pub use approval::{
-    Approval, ApprovalContext, ApprovalDecision, ApprovalRequest, ApprovalResolveRequest,
-    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, AttendedApprovalReviewContext,
-    ExtraContext, HookEventName, KnownHookEvent, RequestType,
+    APPROVAL_WAITER_HEADER, Approval, ApprovalContext, ApprovalDecision, ApprovalRequest,
+    ApprovalResolveRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
+    ApprovalWaiterCancelRequest, AttendedApprovalReviewContext, ExtraContext, HookEventName,
+    KnownHookEvent, MAX_APPROVAL_WAITERS, RequestType,
 };
 pub use attended::{
     AGENT_RESULT_V1_SCHEMA, APPROVAL_BUNDLE_PROTOCOL, APPROVED_EXECUTION_PIDS_LIMIT,

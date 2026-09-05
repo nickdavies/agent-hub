@@ -53,6 +53,15 @@ The host performs these steps in order:
 4. Validate an `AgentHubRunDecisionV1` that echoes the schema, invocation UUID,
    canonical digest, request digest, authority, approval ID, decision timestamp,
    and expiry. `ask` is resolved by the gateway to a terminal human allow/deny.
+   Each gateway process supplies a canonical UUID in
+   `X-Agent-Hub-Waiter-Id` when registering and as the bounded `waiter_id`
+   query parameter while polling. On SIGTERM or SIGINT it posts the same UUID
+   to `/api/v1/approvals/{id}/waiters/cancel` and waits for the bounded server
+   confirmation before exiting. The server cancels the approval only after its
+   last registered waiter leaves, so equivalent invocation retries share the
+   decision without sharing cancellation. Reviewer cancellation through
+   `/resolve` remains global. Clients without waiter IDs retain the legacy
+   orphan-eviction behavior.
 5. Persist the authority-bound decision with a private domain-separated
    checksum under the invocation UUID. The checksum is local integrity
    evidence, not a gateway signature.
@@ -70,6 +79,8 @@ workspace writes, and agent startup occur only after a valid allow decision.
 The invocation-scoped resolved request may be journaled before the decision so
 an interrupted approval can be retried idempotently. This private recovery
 journal is not authorization and causes none of those capability side effects.
+Pending approvals survive a server restart, but active waiter memberships are
+transient and are re-established by registration or the next long poll.
 `local inspect` is a preparation-only diagnostic and cannot approve or execute.
 The public intent does not expose propose/authorize or receipt/digest bypass
 fields. SIGTERM and SIGINT request owned Agent Hub cancellation through the

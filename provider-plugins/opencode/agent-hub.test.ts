@@ -18,8 +18,8 @@ mock.module("fs", () => ({
 }))
 
 mock.module("@opencode-ai/sdk/v2", () => ({
-  createOpencodeClient: () => ({
-    question: {
+  OpencodeClient: class {
+    question = {
       reply: async (input: { requestID: string; directory: string; answers: string[][] }) => {
         questionReplies.push(input)
         return {}
@@ -28,8 +28,8 @@ mock.module("@opencode-ai/sdk/v2", () => ({
         questionRejections.push(input)
         return {}
       },
-    },
-  }),
+    }
+  },
 }))
 
 mock.module("child_process", () => ({
@@ -74,7 +74,7 @@ mock.module("child_process", () => ({
 
 async function loadPlugin() {
   const { default: plugin } = await import(`./agent-hub.ts?test=${Date.now()}-${Math.random()}`)
-  return plugin.server
+  return typeof plugin === "function" ? plugin : plugin.server
 }
 
 function pluginInput(directory: string) {
@@ -86,15 +86,6 @@ function pluginInput(directory: string) {
     directory,
     worktree: directory,
     serverUrl: new URL("http://localhost:4096"),
-  } as any
-}
-
-function arbitraryMcpPermission() {
-  return {
-    permission: "mcp_weather_lookup",
-    patterns: [],
-    metadata: {},
-    sessionID: "session-1",
   } as any
 }
 
@@ -243,13 +234,15 @@ describe("gateway cwd forwarding", () => {
     approvalPayloads = []
   })
 
-  test("forwards one absolute plugin directory unchanged for arbitrary MCP permission", async () => {
+  test("forwards one absolute plugin directory unchanged for arbitrary MCP tool", async () => {
     const server = await loadPlugin()
     const directory = "/home/user/project/./crates/.."
     const hooks = await server(pluginInput(directory))
-    const output = { status: "ask" as const }
 
-    await hooks["permission.ask"]!(arbitraryMcpPermission(), output)
+    await hooks["tool.execute.before"]!(
+      { sessionID: "session-1", callID: "call-1", tool: "mcp_weather_lookup" },
+      { args: {} },
+    )
 
     expect(approvalPayloads).toHaveLength(1)
     expect(approvalPayloads[0]?.tool_name).toBe("mcp_weather_lookup")

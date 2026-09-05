@@ -329,17 +329,17 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
         config: args.config,
     };
     let config_path = expand_tilde(&approval.config);
-    let resolution = tokio::select! {
-        result = run(
-            &approval,
-            "agent-hub-host-launch",
-            &event,
-            &config_path,
-            Some(&permission.canonical_digest),
-            Some(deadline),
-        ) => result,
-        _ = shutdown_signal() => Err(RunError::ServerUnreachable("aborted by signal".to_string())),
-    };
+    let waiter_id = Uuid::new_v4();
+    let resolution = run(
+        &approval,
+        "agent-hub-host-launch",
+        &event,
+        &config_path,
+        Some(&permission.canonical_digest),
+        Some(deadline),
+        Some(waiter_id),
+    )
+    .await;
     match resolution {
         Ok(resolution) => {
             let decision = match resolution.output.status {
@@ -584,7 +584,7 @@ where
 
     let config_path = expand_tilde(&args.config);
 
-    match run(&args, provider_name, &event, &config_path, None, None).await {
+    match run(&args, provider_name, &event, &config_path, None, None, None).await {
         Ok(resolution) => {
             let decision = resolution.output;
             eprintln!(
@@ -683,6 +683,7 @@ async fn run(
     config_path: &str,
     request_digest: Option<&str>,
     deadline: Option<tokio::time::Instant>,
+    waiter_id: Option<Uuid>,
 ) -> Result<GatewayResolution, RunError> {
     if args.approval_socket.is_some() {
         let raw_digest = protocol::opencode_raw_args_digest(event.tool_call.raw_input())
@@ -807,8 +808,16 @@ async fn run(
                 event.tool_call.tool_name()
             );
             let extra = collect_extra(&event.tool_call, delegate_reason.as_deref());
-            match escalate_to_server(args, provider_name, event, extra, request_digest, deadline)
-                .await
+            match escalate_to_server(
+                args,
+                provider_name,
+                event,
+                extra,
+                request_digest,
+                deadline,
+                waiter_id,
+            )
+            .await
             {
                 Ok((output, id)) => {
                     approval_id = id;
@@ -943,6 +952,7 @@ async fn escalate_to_server(
     extra: Option<ExtraContext>,
     request_digest: Option<&str>,
     deadline: Option<tokio::time::Instant>,
+    waiter_id: Option<Uuid>,
 ) -> Result<(HookOutput, Option<Uuid>), ApprovalFlowError> {
     let context = ApprovalContext {
         workspace_roots: event.workspace_roots.clone(),
@@ -985,11 +995,13 @@ async fn escalate_to_server(
         let run_deadline = args.approval_deadline.expect("transport validated");
         let timeout_deadline = chrono::Utc::now()
             + chrono::Duration::from_std(Duration::from_secs(args.timeout)).map_err(|error| {
-                ApprovalFlowError::Pipeline(format!("attended approval timeout is invalid: {error}"))
+                ApprovalFlowError::Pipeline(format!(
+                    "attended approval timeout is invalid: {error}"
+                ))
             })?;
         let deadline = run_deadline.min(timeout_deadline);
-        let tool_input_digest =
-            protocol::tool_input_digest(&request.tool_input).map_err(ApprovalFlowError::Pipeline)?;
+        let tool_input_digest = protocol::tool_input_digest(&request.tool_input)
+            .map_err(ApprovalFlowError::Pipeline)?;
         let attended_request = protocol::AttendedGatewayRequestV1 {
             version: protocol::ATTENDED_GATEWAY_REQUEST_VERSION.into(),
             binding,
@@ -1049,6 +1061,11 @@ async fn escalate_to_server(
     } else {
         register
     };
+    let register = if let Some(waiter_id) = waiter_id {
+        register.header(protocol::APPROVAL_WAITER_HEADER, waiter_id.to_string())
+    } else {
+        register
+    };
     let register_timeout = deadline
         .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
         .unwrap_or(Duration::from_secs(10))
@@ -1056,12 +1073,14 @@ async fn escalate_to_server(
     if register_timeout.is_zero() {
         return Err(ApprovalFlowError::Timeout);
     }
-    let register_resp = register
-        .json(&request)
-        .timeout(register_timeout)
-        .send()
-        .await
-        .map_err(|e| ApprovalFlowError::Pipeline(format!("failed to register approval: {e}")))?;
+    let register_resp = tokio::select! {
+        result = register.json(&request).timeout(register_timeout).send() => {
+            result.map_err(|e| ApprovalFlowError::Pipeline(format!("failed to register approval: {e}")))?
+        }
+        _ = shutdown_signal() => {
+            return Err(ApprovalFlowError::Pipeline("aborted by signal".to_string()));
+        }
+    };
 
     if !register_resp.status().is_success() {
         let status = register_resp.status();
@@ -1070,7 +1089,11 @@ async fn escalate_to_server(
             status
         );
         let message = format!("server returned {status} for approval registration");
-        return Err(ApprovalFlowError::Pipeline(message));
+        return if status.is_client_error() {
+            Err(ApprovalFlowError::FailClosed(message))
+        } else {
+            Err(ApprovalFlowError::Pipeline(message))
+        };
     }
 
     let response_timeout = deadline
@@ -1099,8 +1122,13 @@ async fn escalate_to_server(
     // Long-poll until resolved or global timeout
     let deadline =
         deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(args.timeout));
-    let wait_url = http::endpoint(&base, &format!("api/v1/approvals/{}/wait", approval.id))
+    let mut wait_url = http::endpoint(&base, &format!("api/v1/approvals/{}/wait", approval.id))
         .map_err(ApprovalFlowError::Pipeline)?;
+    if let Some(waiter_id) = waiter_id {
+        wait_url
+            .query_pairs_mut()
+            .append_pair("waiter_id", &waiter_id.to_string());
+    }
 
     eprintln!(
         "[info] waiting for approval (id={}, timeout={}s) — approve or deny in the web UI",
@@ -1113,23 +1141,81 @@ async fn escalate_to_server(
     let output = tokio::select! {
         result = poll_for_decision(&client, wait_url.as_str(), token, deadline, args.timeout) => result,
         _ = shutdown_signal() => {
-            eprintln!("[info] received shutdown signal, cancelling approval {}", approval.id);
-            // Best-effort cancel — don't let this block shutdown for long.
-            let cancel = client.post(cancel_url.as_str());
-            let cancel = if let Some(token) = token {
-                cancel.bearer_auth(token.expose())
+            eprintln!("[info] received shutdown signal while waiting for approval {}", approval.id);
+            if let Some(waiter_id) = waiter_id {
+                cancel_waiter(&client, &base, token, approval.id, waiter_id).await?;
+                eprintln!("[info] server confirmed cancellation for waiter {waiter_id}");
             } else {
-                cancel
-            };
-            let _ = cancel
-                .json(&serde_json::json!({"decision": "cancel"}))
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await;
+                let cancel = client.post(cancel_url.as_str());
+                let cancel = if let Some(token) = token {
+                    cancel.bearer_auth(token.expose())
+                } else {
+                    cancel
+                };
+                let _ = cancel
+                    .json(&serde_json::json!({"decision": "cancel"}))
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await;
+            }
             Err(ApprovalFlowError::Pipeline("aborted by signal".to_string()))
         }
     }?;
     Ok((output, Some(approval.id)))
+}
+
+async fn cancel_waiter(
+    client: &reqwest::Client,
+    base: &reqwest::Url,
+    token: Option<&Secret>,
+    approval_id: Uuid,
+    waiter_id: Uuid,
+) -> Result<(), ApprovalFlowError> {
+    let url = http::endpoint(
+        base,
+        &format!("api/v1/approvals/{approval_id}/waiters/cancel"),
+    )
+    .map_err(ApprovalFlowError::FailClosed)?;
+    let request = client
+        .post(url)
+        .json(&protocol::ApprovalWaiterCancelRequest {
+            waiter_id: waiter_id.to_string(),
+        });
+    let request = if let Some(token) = token {
+        request.bearer_auth(token.expose())
+    } else {
+        request
+    };
+    let response = request
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| {
+            ApprovalFlowError::Pipeline(format!("failed to cancel approval waiter: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(ApprovalFlowError::Pipeline(format!(
+            "server returned {} for approval waiter cancellation",
+            response.status()
+        )));
+    }
+    let body = read_bounded_response(
+        response,
+        Duration::from_secs(10),
+        "approval waiter cancellation",
+    )
+    .await?;
+    let confirmation: ApprovalResponse = serde_json::from_slice(&body).map_err(|error| {
+        ApprovalFlowError::Pipeline(format!(
+            "failed to parse approval waiter cancellation response: {error}"
+        ))
+    })?;
+    if confirmation.id != approval_id {
+        return Err(ApprovalFlowError::FailClosed(
+            "approval waiter cancellation response binding mismatch".to_string(),
+        ));
+    }
+    validate_approval_status(&confirmation.status)
 }
 
 /// Long-poll the server until the approval is resolved or the global timeout expires.
@@ -1464,6 +1550,8 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ApprovalFlowError::Pipeline(_))));
+    }
+}
 
 #[cfg(test)]
 mod agent_hub_run_gateway_tests {
@@ -1521,7 +1609,7 @@ mod agent_hub_run_gateway_tests {
         for (action, approved) in [("allow", true), ("deny", false)] {
             let (root, config) = config(action);
             let args = args("http://127.0.0.1:1".into(), config.display().to_string());
-            let resolution = run(&args, "opencode", &event(), &args.config, None, None)
+            let resolution = run(&args, "opencode", &event(), &args.config, None, None, None)
                 .await
                 .unwrap();
             assert_eq!(resolution.approval_id, None);
@@ -1559,7 +1647,7 @@ mod agent_hub_run_gateway_tests {
         });
         let (root, config) = config("ask");
         let args = args(format!("http://{address}"), config.display().to_string());
-        let resolution = run(&args, "opencode", &event(), &args.config, None, None)
+        let resolution = run(&args, "opencode", &event(), &args.config, None, None, None)
             .await
             .unwrap();
         assert!(resolution.approval_id.is_some());

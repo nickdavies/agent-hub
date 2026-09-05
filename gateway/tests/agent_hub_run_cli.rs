@@ -1,6 +1,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -85,6 +86,10 @@ fn config(dir: &tempfile::TempDir, action: &str) -> std::path::PathBuf {
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
+    read_http_request(stream).1
+}
+
+fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -106,13 +111,16 @@ fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
                 .strip_prefix("content-length: ")
                 .and_then(|value| value.parse::<usize>().ok())
         })
-        .unwrap();
+        .unwrap_or(0);
     while bytes.len() < header_end + content_length {
         let count = stream.read(&mut buffer).unwrap();
         assert_ne!(count, 0);
         bytes.extend_from_slice(&buffer[..count]);
     }
-    bytes[header_end..header_end + content_length].to_vec()
+    (
+        headers,
+        bytes[header_end..header_end + content_length].to_vec(),
+    )
 }
 
 fn respond(stream: &mut TcpStream, body: &Value) {
@@ -355,13 +363,46 @@ fn registration_body_and_decision_reason_are_bounded_before_use() {
 }
 
 #[test]
-fn sigint_aborts_a_pending_registration() {
+fn sigint_unregisters_the_waiter_and_awaits_server_confirmation() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let approval_id = Uuid::new_v4();
+    let wait_entered = Arc::new(AtomicBool::new(false));
+    let server_wait_entered = Arc::clone(&wait_entered);
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        read_http_body(&mut stream);
-        std::thread::sleep(Duration::from_secs(5));
+        let (registration, _) = read_http_request(&mut stream);
+        let waiter_header = registration
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("x-agent-hub-waiter-id: ")
+                    .map(str::to_owned)
+            })
+            .expect("registration waiter header");
+        Uuid::parse_str(&waiter_header).unwrap();
+        respond(&mut stream, &json!({"id": approval_id, "type": "pending"}));
+
+        let (mut wait_stream, _) = listener.accept().unwrap();
+        let (wait, _) = read_http_request(&mut wait_stream);
+        assert!(wait.starts_with(&format!(
+            "GET /api/v1/approvals/{approval_id}/wait?waiter_id={waiter_header} "
+        )));
+        server_wait_entered.store(true, Ordering::SeqCst);
+
+        let (mut cancel_stream, _) = listener.accept().unwrap();
+        let (cancel, body) = read_http_request(&mut cancel_stream);
+        assert!(cancel.starts_with(&format!(
+            "POST /api/v1/approvals/{approval_id}/waiters/cancel "
+        )));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["waiter_id"],
+            waiter_header
+        );
+        respond(
+            &mut cancel_stream,
+            &json!({"id": approval_id, "type": "cancelled"}),
+        );
     });
     let dir = tempfile::tempdir().unwrap();
     let request = request();
@@ -390,10 +431,18 @@ fn sigint_aborts_a_pending_registration() {
         .unwrap()
         .write_all(&serde_json::to_vec(&hook).unwrap())
         .unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !wait_entered.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gateway did not enter wait"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("aborted by signal"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("server confirmed cancellation"));
     server.join().unwrap();
 }

@@ -98,8 +98,8 @@ async fn proxy_question(
     let (client, base) = crate::http::authenticated_client(&args.server, args.token.is_some())
         .map_err(QuestionFlowError::Pipeline)?;
 
-    let register_url =
-        crate::http::endpoint(&base, "api/v1/hooks/question").map_err(QuestionFlowError::Pipeline)?;
+    let register_url = crate::http::endpoint(&base, "api/v1/hooks/question")
+        .map_err(QuestionFlowError::Pipeline)?;
     eprintln!(
         "[info] registering question: session={} questions={}",
         req.session_id,

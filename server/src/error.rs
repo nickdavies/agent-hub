@@ -18,6 +18,12 @@ pub enum AppError {
     #[error("approval request exceeds the canonical payload limit")]
     ApprovalRequestTooLarge,
 
+    #[error("approval has reached the active waiter limit")]
+    ApprovalWaitersFull,
+
+    #[error("invalid approval waiter ID")]
+    InvalidApprovalWaiter,
+
     #[error("invalid approval request: {0}")]
     InvalidApprovalRequest(String),
 
@@ -61,6 +67,8 @@ impl IntoResponse for AppError {
             AppError::ApprovalNotFound(_) => StatusCode::NOT_FOUND,
             AppError::ApprovalConflict(_) => StatusCode::CONFLICT,
             AppError::ApprovalRequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            AppError::ApprovalWaitersFull => StatusCode::TOO_MANY_REQUESTS,
+            AppError::InvalidApprovalWaiter => StatusCode::BAD_REQUEST,
             AppError::InvalidApprovalRequest(_) => StatusCode::BAD_REQUEST,
             AppError::ApprovalReadonly => StatusCode::FORBIDDEN,
             AppError::QuestionNotFound(_) => StatusCode::NOT_FOUND,

@@ -30,6 +30,8 @@ pub mod workflows;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::{DefaultBodyLimit, Query};
+use axum::http::HeaderMap;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -61,8 +63,9 @@ use workflows::WorkflowCatalog;
 
 // Import protocol types used directly in this module's handlers.
 use protocol::{
-    ApprovalDecision, ApprovalModeResponse, ApprovalResolveRequest, ApprovalWaitResponse,
-    ConfigResponse, QuestionDecision, QuestionResolveRequest, QuestionWaitResponse, SessionId,
+    ApprovalDecision, ApprovalModeResponse, ApprovalResolveRequest, ApprovalResponse,
+    ApprovalWaitResponse, ApprovalWaiterCancelRequest, ConfigResponse, QuestionDecision,
+    QuestionResolveRequest, QuestionWaitResponse, SessionId,
 };
 
 pub(super) const DEFAULT_WEB_HOME: &str = "/orchestration";
@@ -196,6 +199,10 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
             )
             .route("/approvals/{id}", get(handle_get_approval::<N>))
             .route("/approvals/{id}/wait", get(handle_approval_wait::<N>))
+            .route(
+                "/approvals/{id}/waiters/cancel",
+                post(handle_approval_waiter_cancel::<N>).layer(DefaultBodyLimit::max(128)),
+            )
             .route(
                 "/approvals/{id}/resolve",
                 post(handle_approval_resolve::<N>),
@@ -388,15 +395,19 @@ async fn handle_get_approval<N: Notifier>(
 async fn handle_approval_wait<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Query(query): Query<ApprovalWaitQuery>,
 ) -> Result<(axum::http::StatusCode, Json<ApprovalWaitResponse>), AppError> {
+    let waiter_id = query
+        .waiter_id
+        .as_deref()
+        .map(canonical_waiter_id)
+        .transpose()?;
     let mut rx = state
         .approvals
-        .subscribe(id)
+        .subscribe_waiter(id, waiter_id)
         .await
+        .map_err(|_| AppError::ApprovalWaitersFull)?
         .ok_or_else(|| AppError::ApprovalNotFound(id.to_string()))?;
-
-    // Record that the gateway is actively polling for this approval.
-    state.approvals.touch(id).await;
 
     // If already resolved, return immediately
     if rx.borrow().is_resolved() {
@@ -425,6 +436,52 @@ async fn handle_approval_wait<N: Notifier>(
             }),
         ))
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalWaitQuery {
+    waiter_id: Option<String>,
+}
+
+async fn handle_approval_waiter_cancel<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Json(req): Json<ApprovalWaiterCancelRequest>,
+) -> Result<Json<ApprovalResponse>, AppError> {
+    let waiter_id = canonical_waiter_id(&req.waiter_id)?;
+    let approval = state
+        .approvals
+        .cancel_waiter(id, waiter_id)
+        .await
+        .ok_or_else(|| AppError::ApprovalNotFound(id.to_string()))?;
+    Ok(Json(ApprovalResponse {
+        id: approval.id,
+        status: approval.status,
+    }))
+}
+
+fn approval_waiter_header(headers: &HeaderMap) -> Result<Option<Uuid>, AppError> {
+    headers
+        .get(protocol::APPROVAL_WAITER_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| AppError::InvalidApprovalWaiter)
+                .and_then(canonical_waiter_id)
+        })
+        .transpose()
+}
+
+fn canonical_waiter_id(value: &str) -> Result<Uuid, AppError> {
+    if value.len() != 36 {
+        return Err(AppError::InvalidApprovalWaiter);
+    }
+    let waiter_id = Uuid::parse_str(value).map_err(|_| AppError::InvalidApprovalWaiter)?;
+    if waiter_id.to_string() != value {
+        return Err(AppError::InvalidApprovalWaiter);
+    }
+    Ok(waiter_id)
 }
 
 /// POST /api/v1/approvals/{id}/resolve — approve/deny/cancel an approval.
@@ -836,12 +893,21 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         approval_mode: ApprovalFeatureMode,
         workflows_dir: std::path::PathBuf,
     ) -> AppState<NullNotifier> {
+        build_test_state_with_auth(approval_mode, workflows_dir, AuthMode::None, Vec::new())
+    }
+
+    fn build_test_state_with_auth(
+        approval_mode: ApprovalFeatureMode,
+        workflows_dir: std::path::PathBuf,
+        auth_mode: AuthMode,
+        tokens: Vec<Token>,
+    ) -> AppState<NullNotifier> {
         let task_dir =
             std::env::temp_dir().join(format!("ah-test-tasks-{}", uuid::Uuid::new_v4().simple()));
         let config_root = make_hermetic_config_root();
         let config = ServerConfig {
-            auth_mode: AuthMode::None,
-            tokens: vec![],
+            auth_mode,
+            tokens,
             listen_addr: "127.0.0.1:0".into(),
             presence_ttl_secs: 120,
             session_ttl_secs: 7200,
@@ -904,6 +970,27 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
 
     async fn post_json_result(app: &Router, path: &str, body: &str) -> (AxumStatus, String) {
         let response = post_json_response(app, path, body).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn post_json_result_with_waiter(
+        app: &Router,
+        path: &str,
+        body: &str,
+        waiter_id: &str,
+    ) -> (AxumStatus, String) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header(protocol::APPROVAL_WAITER_HEADER, waiter_id)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1012,6 +1099,23 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         serde_json::from_str(&body).unwrap()
     }
 
+    async fn create_launch_waiter(
+        app: &Router,
+        id: &str,
+        prompt: &str,
+        waiter_id: Uuid,
+    ) -> serde_json::Value {
+        let (status, body) = post_json_result_with_waiter(
+            app,
+            "/api/v1/hooks/approval",
+            &launch_request(id, prompt),
+            &waiter_id.to_string(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK, "launch create failed: {body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
     /// Helper: GET a path and return (status_code, body_string).
     async fn get_json(app: &Router, path: &str) -> (AxumStatus, String) {
         let req = Request::builder()
@@ -1055,16 +1159,15 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
 
     #[tokio::test]
     async fn mobile_approval_queue_requires_web_auth() {
-        let mut state = build_test_state(
+        let state = build_test_state_with_auth(
             ApprovalFeatureMode::Readwrite,
             make_hermetic_workflows_dir(),
-        );
-        let config = Arc::make_mut(&mut state.config);
-        config.auth_mode = AuthMode::Token;
-        config.tokens = vec![Token {
+            AuthMode::Token,
+            vec![Token {
                 label: "test".into(),
                 secret: protocol::Secret::new("secret"),
-            }];
+            }],
+        );
         let app = router(state);
 
         let request = Request::builder()
@@ -1183,6 +1286,204 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         let (_, pending) = get_json(&app, "/api/v1/approvals/pending").await;
         let pending: Vec<serde_json::Value> = serde_json::from_str(&pending).unwrap();
         assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn waiter_cancel_is_per_waiter_and_the_last_waiter_cancels() {
+        let app = test_app();
+        let first_waiter = Uuid::new_v4();
+        let second_waiter = Uuid::new_v4();
+        let created = create_launch_waiter(&app, "waiter-shared", "same", first_waiter).await;
+        let retry = create_launch_waiter(&app, "waiter-shared", "same", second_waiter).await;
+        assert_eq!(created["id"], retry["id"]);
+        let approval_id = created["id"].as_str().unwrap();
+
+        let (status, first_cancel) = post_json_result(
+            &app,
+            &format!("/api/v1/approvals/{approval_id}/waiters/cancel"),
+            &serde_json::json!({"waiter_id": first_waiter}).to_string(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&first_cancel).unwrap()["type"],
+            "pending"
+        );
+
+        let (status, second_cancel) = post_json_result(
+            &app,
+            &format!("/api/v1/approvals/{approval_id}/waiters/cancel"),
+            &serde_json::json!({"waiter_id": second_waiter}).to_string(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&second_cancel).unwrap()["type"],
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_waiter_cancel_is_immediately_terminal() {
+        let app = test_app();
+        let waiter_id = Uuid::new_v4();
+        let created = create_launch_waiter(&app, "waiter-unique", "same", waiter_id).await;
+        let (status, cancelled) = post_json_result(
+            &app,
+            &format!(
+                "/api/v1/approvals/{}/waiters/cancel",
+                created["id"].as_str().unwrap()
+            ),
+            &serde_json::json!({"waiter_id": waiter_id}).to_string(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+        assert_eq!(
+            serde_json::from_str::<Value>(&cancelled).unwrap()["type"],
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiter_ids_are_transient_across_restart_and_retry_reregisters() {
+        let original = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        let app = router(original.clone());
+        let old_waiter = Uuid::new_v4();
+        let created = create_launch_waiter(&app, "waiter-restart", "same", old_waiter).await;
+        let snapshot = original.snapshot().await;
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains(&old_waiter.to_string())
+        );
+
+        let restored = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        restored.restore(snapshot).await;
+        let app = router(restored);
+        let retry_waiter = Uuid::new_v4();
+        let retry = create_launch_waiter(&app, "waiter-restart", "same", retry_waiter).await;
+        assert_eq!(created["id"], retry["id"]);
+        let (_, cancelled) = post_json_result(
+            &app,
+            &format!(
+                "/api/v1/approvals/{}/waiters/cancel",
+                created["id"].as_str().unwrap()
+            ),
+            &serde_json::json!({"waiter_id": retry_waiter}).to_string(),
+        )
+        .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&cancelled).unwrap()["type"],
+            "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiter_header_query_body_and_cardinality_are_bounded() {
+        let app = test_app();
+        let request = launch_request("waiter-bounds", "same");
+        let (status, _) =
+            post_json_result_with_waiter(&app, "/api/v1/hooks/approval", &request, &"a".repeat(37))
+                .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST);
+
+        let first = Uuid::new_v4();
+        let created = create_launch_waiter(&app, "waiter-bounds", "same", first).await;
+        let approval_id = created["id"].as_str().unwrap();
+        let (status, _) = get_json(
+            &app,
+            &format!(
+                "/api/v1/approvals/{approval_id}/wait?waiter_id={}",
+                "a".repeat(37)
+            ),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST);
+
+        let (status, _) = post_json_result(
+            &app,
+            &format!("/api/v1/approvals/{approval_id}/waiters/cancel"),
+            &format!(r#"{{"waiter_id":"{}"}}"#, "a".repeat(256)),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::PAYLOAD_TOO_LARGE);
+
+        for _ in 1..protocol::MAX_APPROVAL_WAITERS {
+            let waiter = Uuid::new_v4();
+            let (status, _) = post_json_result_with_waiter(
+                &app,
+                "/api/v1/hooks/approval",
+                &request,
+                &waiter.to_string(),
+            )
+            .await;
+            assert_eq!(status, AxumStatus::OK);
+        }
+        let overflow = Uuid::new_v4();
+        let (status, _) = post_json_result_with_waiter(
+            &app,
+            "/api/v1/hooks/approval",
+            &request,
+            &overflow.to_string(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn abrupt_waiter_disconnect_uses_orphan_eviction_fallback() {
+        let state = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        let app = router(state.clone());
+        let created = create_launch_waiter(&app, "waiter-orphan", "same", Uuid::new_v4()).await;
+        let approval_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+        state.approvals.touch(approval_id).await;
+        assert_eq!(state.approvals.evict_orphaned(Duration::ZERO).await, 1);
+        assert!(matches!(
+            state.approvals.get(approval_id).await.unwrap().status,
+            ApprovalStatus::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiter_cancel_endpoint_requires_api_authentication() {
+        let mut state = build_test_state(
+            ApprovalFeatureMode::Readwrite,
+            make_hermetic_workflows_dir(),
+        );
+        let config = Arc::get_mut(&mut state.config).unwrap();
+        config.auth_mode = AuthMode::Token;
+        config.tokens = vec![config::Token {
+            label: "test".into(),
+            secret: protocol::Secret::new("waiter-secret"),
+        }];
+        let app = router(state);
+        let path = format!("/api/v1/approvals/{}/waiters/cancel", Uuid::new_v4());
+        let body = serde_json::json!({"waiter_id": Uuid::new_v4()}).to_string();
+        assert_eq!(
+            post_json(&app, &path, &body).await,
+            AxumStatus::UNAUTHORIZED
+        );
+
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer waiter-secret")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            AxumStatus::NOT_FOUND
+        );
     }
 
     #[tokio::test]

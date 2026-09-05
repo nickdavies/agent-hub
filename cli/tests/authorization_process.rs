@@ -316,6 +316,10 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
             .exists()
     );
     assert!(!docker_marker.exists());
+    assert!(
+        root.join("gateway-cancel-confirmed").is_file(),
+        "host returned before the gateway confirmed waiter cancellation"
+    );
     let gateway_pid = std::fs::read_to_string(root.join("gateway.pid"))
         .unwrap()
         .trim()
@@ -918,13 +922,18 @@ fn write_fake_run_gateway(path: &Path, decision: &Path, state: &Path, docker_mar
     std::fs::write(
         path,
         format!(
-            "#!/bin/sh\n[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; pending*) echo $$ > '{}'; printf entered > '{}';; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys,time; h=json.load(sys.stdin); r=h[\"tool_input\"]; p=open(\"{}\").read().split(); d,a=p[:2]; mode=p[2] if len(p)>2 else \"\"; time.sleep(60) if d==\"pending\" else None; digest=\"0\"*64 if mode==\"wrong\" else r[\"canonical_digest\"]; expiry=\"2000-01-01T00:00:00Z\" if mode==\"expired\" else r[\"expires_at\"]; approval=\"018f0f21-76c0-7b37-a446-31f82a5e7601\" if a==\"human\" else r[\"invocation_id\"]; print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":digest,\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":approval,\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":expiry}}))'\n",
+            "#!/bin/sh\n[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; pending*) echo $$ > '{}'; printf entered > '{}'; trap 'printf confirmed > \"{}\"; exit 1' TERM INT; while :; do sleep 1; done;; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; p=open(\"{}\").read().split(); d,a=p[:2]; mode=p[2] if len(p)>2 else \"\"; digest=\"0\"*64 if mode==\"wrong\" else r[\"canonical_digest\"]; expiry=\"2000-01-01T00:00:00Z\" if mode==\"expired\" else r[\"expires_at\"]; approval=\"018f0f21-76c0-7b37-a446-31f82a5e7601\" if a==\"human\" else r[\"invocation_id\"]; print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":digest,\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":approval,\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":expiry}}))'\n",
             state.display(),
             state.display(),
             decision.display(),
             docker_marker.display(),
             state.parent().unwrap().join("gateway.pid").display(),
             state.parent().unwrap().join("gateway-entered").display(),
+            state
+                .parent()
+                .unwrap()
+                .join("gateway-cancel-confirmed")
+                .display(),
             decision.display(),
         ),
     )

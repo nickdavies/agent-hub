@@ -20,6 +20,8 @@ struct ApprovalEntry {
     /// Tracks when a gateway last polled `/wait` for this approval.
     /// `None` means no poll has occurred yet (freshly registered).
     last_polled_at: Option<Instant>,
+    /// Process-scoped gateway waiters. These are intentionally not persisted.
+    active_waiters: HashSet<Uuid>,
 }
 
 pub struct ApprovalRegistry {
@@ -34,12 +36,15 @@ pub struct RegisterApproval {
     pub request: ApprovalRequest,
     pub project: String,
     pub canonical_request: String,
+    pub waiter_id: Option<Uuid>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterApprovalError {
     #[error("request_id already exists with a different canonical request")]
     Conflict,
+    #[error("approval has reached the active waiter limit")]
+    WaitersFull,
 }
 
 pub struct RegisterApprovalOutcome {
@@ -96,6 +101,9 @@ impl ApprovalRegistry {
             } else {
                 return Err(RegisterApprovalError::Conflict);
             }
+            if let Some(waiter_id) = params.waiter_id {
+                insert_waiter(entry, waiter_id)?;
+            }
             return Ok(RegisterApprovalOutcome {
                 approval: entry.approval.clone(),
                 created: false,
@@ -126,6 +134,7 @@ impl ApprovalRegistry {
             canonical_request: Some(params.canonical_request.into_boxed_str()),
             tx,
             last_polled_at: None,
+            active_waiters: params.waiter_id.into_iter().collect(),
         };
 
         entries.insert(id, entry);
@@ -150,9 +159,41 @@ impl ApprovalRegistry {
 
     /// Subscribe to status changes for an approval.
     /// Returns current status and a receiver for future changes.
+    #[allow(dead_code)]
     pub async fn subscribe(&self, id: Uuid) -> Option<watch::Receiver<ApprovalStatus>> {
         let entries = self.entries.read().await;
         entries.get(&id).map(|e| e.tx.subscribe())
+    }
+
+    /// Register a waiter and subscribe to status changes atomically.
+    pub async fn subscribe_waiter(
+        &self,
+        id: Uuid,
+        waiter_id: Option<Uuid>,
+    ) -> Result<Option<watch::Receiver<ApprovalStatus>>, RegisterApprovalError> {
+        let mut entries = self.entries.write().await;
+        let Some(entry) = entries.get_mut(&id) else {
+            return Ok(None);
+        };
+        if let Some(waiter_id) = waiter_id {
+            insert_waiter(entry, waiter_id)?;
+        }
+        entry.last_polled_at = Some(Instant::now());
+        Ok(Some(entry.tx.subscribe()))
+    }
+
+    /// Unregister one waiter, cancelling only when it was the final active waiter.
+    pub async fn cancel_waiter(&self, id: Uuid, waiter_id: Uuid) -> Option<Approval> {
+        let mut entries = self.entries.write().await;
+        let entry = entries.get_mut(&id)?;
+        if entry.approval.status.is_resolved() || !entry.active_waiters.remove(&waiter_id) {
+            return Some(entry.approval.clone());
+        }
+        if entry.active_waiters.is_empty() {
+            entry.approval.status = ApprovalStatus::Cancelled;
+            entry.tx.send_replace(ApprovalStatus::Cancelled);
+        }
+        Some(entry.approval.clone())
     }
 
     /// Resolve an approval (approve/deny/cancel).
@@ -216,6 +257,7 @@ impl ApprovalRegistry {
     }
 
     /// Record that a gateway polled for this approval (called from the wait handler).
+    #[allow(dead_code)]
     pub async fn touch(&self, id: Uuid) {
         let mut entries = self.entries.write().await;
         if let Some(entry) = entries.get_mut(&id) {
@@ -304,6 +346,7 @@ impl ApprovalRegistry {
                     canonical_request,
                     tx,
                     last_polled_at: None,
+                    active_waiters: HashSet::new(),
                 },
             );
             by_req.insert(request_id, id);
@@ -311,6 +354,16 @@ impl ApprovalRegistry {
             info!(approval_id = %id, "approval restored");
         }
     }
+}
+
+fn insert_waiter(entry: &mut ApprovalEntry, waiter_id: Uuid) -> Result<(), RegisterApprovalError> {
+    if !entry.active_waiters.contains(&waiter_id)
+        && entry.active_waiters.len() >= protocol::MAX_APPROVAL_WAITERS
+    {
+        return Err(RegisterApprovalError::WaitersFull);
+    }
+    entry.active_waiters.insert(waiter_id);
+    Ok(())
 }
 
 fn legacy_request_matches(approval: &Approval, request: &ApprovalRequest, project: &str) -> bool {

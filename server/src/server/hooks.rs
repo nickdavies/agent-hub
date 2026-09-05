@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -178,6 +178,7 @@ pub async fn notification<N: Notifier>(
 /// POST /api/v1/hooks/approval — register a pending approval request.
 pub async fn approval<N: Notifier>(
     State(state): State<AppState<N>>,
+    headers: HeaderMap,
     Json(req): Json<ApprovalRequest>,
 ) -> Result<Json<ApprovalResponse>, crate::error::AppError> {
     super::review::validate_request(&req)
@@ -196,6 +197,7 @@ pub async fn approval<N: Notifier>(
     let session_display_name = req.session_display_name.clone();
     let cwd = req.cwd.clone();
     let project = super::sessions::project_name(&req.cwd);
+    let waiter_id = super::approval_waiter_header(&headers)?;
 
     let outcome = state
         .approvals
@@ -203,9 +205,17 @@ pub async fn approval<N: Notifier>(
             request: req,
             project,
             canonical_request,
+            waiter_id,
         })
         .await
-        .map_err(|_| crate::error::AppError::ApprovalConflict(request_id))?;
+        .map_err(|error| match error {
+            approvals::RegisterApprovalError::Conflict => {
+                crate::error::AppError::ApprovalConflict(request_id)
+            }
+            approvals::RegisterApprovalError::WaitersFull => {
+                crate::error::AppError::ApprovalWaitersFull
+            }
+        })?;
     let approval = outcome.approval;
 
     if outcome.created {

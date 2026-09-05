@@ -549,22 +549,26 @@ async function callGatewayQuestion(
 // ---------------------------------------------------------------------------
 
 export function makePayload(
-    sessionId: string,
-    tool: OpenCodeTool,
-    rawArgs: Record<string, unknown>,
-    matchInput: Record<string, unknown>,
-    directory: string,
-    _worktree: string,
-    title?: string,
+  sessionId: string,
+  tool: OpenCodeTool,
+  rawArgs: Record<string, unknown>,
+  matchInputOrDirectory: Record<string, unknown> | string,
+  directoryOrWorktree: string,
+  _worktreeOrTitle?: string,
+  title?: string,
 ): OpenCodeHookInput {
+  const legacyCall = typeof matchInputOrDirectory === "string"
+  const directory = legacyCall ? matchInputOrDirectory : directoryOrWorktree
+  const matchInput = legacyCall ? undefined : matchInputOrDirectory
+  const sessionTitle = legacyCall ? _worktreeOrTitle : title
   return {
     session_id: sessionId,
     tool_name: tool,
     tool_input: rawArgs,
-    tool_match_input: matchInput,
+    ...(matchInput ? { tool_match_input: matchInput } : {}),
     cwd: directory,
     hook_event_name: "tool.execute.before",
-    session_title: title ?? null,
+    session_title: sessionTitle ?? null,
   }
 }
 

@@ -10,6 +10,9 @@ use crate::attended::AttendedApprovalBundleIdentity;
 use crate::sessions::SessionId;
 use crate::tool::Tool;
 
+pub const APPROVAL_WAITER_HEADER: &str = "x-agent-hub-waiter-id";
+pub const MAX_APPROVAL_WAITERS: usize = 32;
+
 // ===========================================================================
 // ExtraContext — typed review artifacts attached to approval requests
 // ===========================================================================
@@ -239,6 +242,13 @@ pub struct ApprovalResponse {
 pub struct ApprovalWaitResponse {
     #[serde(flatten)]
     pub status: ApprovalStatus,
+}
+
+/// POST /api/v1/approvals/{id}/waiters/cancel — unregister one gateway waiter.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalWaiterCancelRequest {
+    pub waiter_id: String,
 }
 
 /// POST /api/v1/approvals/{id}/resolve — request body.
