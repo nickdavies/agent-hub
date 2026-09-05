@@ -773,6 +773,14 @@ pub async fn run(
         "authorized artifact does not match supplied artifact"
     );
     if let Some(previous) = authorized.attempts.last() {
+        if authorized.domain == "agent_hub_run" && !previous.retry_eligible {
+            let record: RunRecord = store.read_json(&run_record_path(&previous.run_id))?;
+            ensure!(
+                record.launch_state == LaunchState::Terminal,
+                "terminal invocation lineage points to a non-terminal run"
+            );
+            return Ok(record);
+        }
         ensure!(
             previous.retry_eligible,
             "attended authorization was already consumed"
@@ -861,6 +869,9 @@ pub async fn run(
                 LaunchState::Terminal
             };
             store.replace_json(&authorized_path, &authorized)?;
+            if authorized.domain == "agent_hub_run" && !active_record.retry_eligible {
+                return Ok(active_record);
+            }
             ensure!(
                 active_record.retry_eligible,
                 "attended authorization was already consumed"
@@ -913,6 +924,14 @@ pub async fn run(
     }
     let retry = &request.retry;
     if let Some(previous) = authorized.attempts.last() {
+        if authorized.domain == "agent_hub_run" && !previous.retry_eligible {
+            let record: RunRecord = store.read_json(&run_record_path(&previous.run_id))?;
+            ensure!(
+                record.launch_state == LaunchState::Terminal,
+                "terminal invocation lineage points to a non-terminal run"
+            );
+            return Ok(record);
+        }
         ensure!(
             previous.retry_eligible,
             "attended authorization was already consumed"
@@ -1075,9 +1094,10 @@ pub async fn run(
         "execution was cancelled before preflight"
     );
     let poll_cancel_tx = cancel_tx.clone();
+    let polled_cancel_marker = cancel_marker.clone();
     let poll = AbortTask(tokio::spawn(async move {
         loop {
-            if cancel_marker.exists() {
+            if polled_cancel_marker.exists() {
                 let _ = poll_cancel_tx.send(true);
                 break;
             }
@@ -1591,7 +1611,8 @@ pub async fn run(
         }
         .await;
         let mut operation = operation;
-        let run_cancelled = cancellation.requested()
+        let run_cancelled = cancel_marker.exists()
+            || cancellation.requested()
             || matches!(&operation, Ok(result) if result.status == ExecutionStatus::Cancelled);
         let mut relay_cleanup = relay_cleanup_requirement(
             request.proposal.tool_approval,
@@ -4842,6 +4863,11 @@ fn process_outcome(status: &ExecutionStatus) -> ProcessOutcome {
 
 fn execution_outcome_from_record(record: &RunRecord) -> ExecutionOutcome {
     match record.process_outcome {
+        _ if record.status == RunStatus::Cancelled
+            || record.execution_status == Some(RunStatus::Cancelled) =>
+        {
+            ExecutionOutcome::Cancelled
+        }
         _ if record.permission_outcome == PermissionOutcome::Cancelled => {
             ExecutionOutcome::Cancelled
         }

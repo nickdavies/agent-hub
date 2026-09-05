@@ -23,6 +23,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use crate::local::{RequestedContextRoot, RequestedWorkspace, WorkspaceAccess};
 use crate::state::StateStore;
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -124,9 +125,19 @@ enum LocalCommand {
         approvals_token: Option<String>,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=600))]
         approval_timeout_secs: u64,
+        /// Stable internal invocation UUID for manual resume/reconciliation
+        #[arg(long)]
+        internal_invocation_id: Option<String>,
     },
     /// Debug canonical preparation without requesting permission or executing
     Inspect {
+        #[arg(long, action = clap::ArgAction::SetTrue, required = true)]
+        request_stdin: bool,
+        #[arg(long)]
+        host_config: Option<PathBuf>,
+    },
+    /// Preview trusted projection and matched rule without side effects
+    Preview {
         #[arg(long, action = clap::ArgAction::SetTrue, required = true)]
         request_stdin: bool,
         #[arg(long)]
@@ -240,28 +251,62 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             approvals_server,
             approvals_token,
             approval_timeout_secs,
+            internal_invocation_id,
         } => {
-            let intent = read_host_run_request()?;
-            let trusted_host_config = host_run::default_host_config()?;
-            let output = host_run::run(
-                &state_store()?,
-                intent,
-                host_run::HostRunOptions {
-                    host_config: host_config.unwrap_or_else(|| trusted_host_config.clone()),
-                    trusted_host_config,
-                    approvals_server,
-                    approvals_token: approvals_token.map(protocol::Secret::new),
-                    approval_timeout_secs,
-                },
-            )
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&output)?);
-            anyhow::ensure!(
-                output.receipt.decision() == protocol::AgentHubRunDecision::Allow,
-                "agent_hub_run was denied: {}",
-                output.receipt.reason().unwrap_or("denied by policy")
-            );
-            attended::ensure_successful_outcome(output.run.as_ref().expect("allow has run"))?;
+            let fallback_invocation_id = uuid::Uuid::new_v4().to_string();
+            let invocation_id = match host_invocation_id(internal_invocation_id.as_deref()) {
+                Ok(invocation_id) => invocation_id,
+                Err(error) => {
+                    return emit_host_run_output(host_run_failure_output(
+                        fallback_invocation_id,
+                        &error,
+                    ));
+                }
+            };
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let run = async {
+                let intent = read_host_run_request()?;
+                let trusted_host_config = host_run::default_host_config()?;
+                let store = state_store()?;
+                host_run::run(
+                    &store,
+                    intent,
+                    host_run::HostRunOptions {
+                        host_config: host_config.unwrap_or_else(|| trusted_host_config.clone()),
+                        trusted_host_config,
+                        approvals_server,
+                        approvals_token: approvals_token.map(protocol::Secret::new),
+                        approval_timeout_secs,
+                        invocation_id: invocation_id.clone(),
+                        cancellation: cancel_rx,
+                    },
+                )
+                .await
+            };
+            tokio::pin!(run);
+            #[cfg(unix)]
+            let outcome = tokio::select! {
+                outcome = &mut run => outcome,
+                signal = one_step_shutdown_signal() => {
+                    signal?;
+                    let _ = cancel_tx.send(true);
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(360),
+                        &mut run,
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(
+                        "agent_hub_run cancellation exceeded its terminal deadline"
+                    )))
+                }
+            };
+            #[cfg(not(unix))]
+            let outcome = run.await;
+            let output = match outcome {
+                Ok(output) => output,
+                Err(error) => host_run_failure_output(invocation_id.clone(), &error),
+            };
+            emit_host_run_output(output)?;
         }
         LocalCommand::Inspect {
             request_stdin: _,
@@ -273,6 +318,17 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             };
             let artifact = host_run::inspect(read_host_run_request()?, &config).await?;
             println!("{}", serde_json::to_string_pretty(&artifact)?);
+        }
+        LocalCommand::Preview {
+            request_stdin: _,
+            host_config,
+        } => {
+            let config = match host_config {
+                Some(path) => path,
+                None => host_run::default_host_config()?,
+            };
+            let preview = host_run::preview(read_host_run_request()?, &config).await?;
+            println!("{}", serde_json::to_string_pretty(&preview)?);
         }
         LocalCommand::List => {
             println!(
@@ -373,6 +429,117 @@ async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
             attended::ensure_cleanup_successful(&record)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn one_step_shutdown_signal() -> anyhow::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
+    Ok(())
+}
+
+fn host_invocation_id(explicit: Option<&str>) -> anyhow::Result<String> {
+    if let Some(explicit) = explicit {
+        let id = uuid::Uuid::parse_str(explicit).context("internal invocation ID is not a UUID")?;
+        anyhow::ensure!(
+            id.to_string() == explicit,
+            "internal invocation ID is not canonical"
+        );
+        return Ok(explicit.to_string());
+    }
+    let session = std::env::var("AGENT_HUB_TRUSTED_SESSION_ID").ok();
+    let call = std::env::var("AGENT_HUB_TRUSTED_TOOL_CALL_ID").ok();
+    match (session, call) {
+        (Some(session), Some(call)) if !session.is_empty() && !call.is_empty() => {
+            let digest = protocol::sha256_hex_with_domain(
+                b"agent-hub:trusted-one-step-invocation:v1\0",
+                format!("{}\0{}", session, call).as_bytes(),
+            );
+            let id = format!(
+                "{}-{}-{}-{}-{}",
+                &digest[0..8],
+                &digest[8..12],
+                &digest[12..16],
+                &digest[16..20],
+                &digest[20..32]
+            );
+            Ok(id)
+        }
+        (None, None) => Ok(uuid::Uuid::new_v4().to_string()),
+        _ => anyhow::bail!(
+            "trusted one-step invocation requires both session and tool-call identities"
+        ),
+    }
+}
+
+fn bounded_error(error: &anyhow::Error) -> String {
+    bounded_text(error.to_string())
+}
+
+fn bounded_text(mut message: String) -> String {
+    if message.len() > protocol::AGENT_HUB_RUN_MAX_REASON_BYTES {
+        let mut end = protocol::AGENT_HUB_RUN_MAX_REASON_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
+
+fn host_run_failure_output(
+    invocation_id: String,
+    error: &anyhow::Error,
+) -> protocol::AgentHubRunOutputV1 {
+    let message = bounded_error(error);
+    protocol::AgentHubRunOutputV1 {
+        schema: protocol::AGENT_HUB_RUN_OUTPUT_SCHEMA_V1.into(),
+        invocation_id,
+        approval_receipt: protocol::AgentHubRunApprovalReceiptV1::unavailable(message.clone()),
+        local_result_v2: serde_json::json!({
+            "schema": "local_result_v2",
+            "run_id": null,
+            "status": "failed",
+            "cleanup_outcome": "unknown"
+        }),
+        error: Some(message),
+    }
+}
+
+fn emit_host_run_output(mut output: protocol::AgentHubRunOutputV1) -> anyhow::Result<()> {
+    if let Err(error) = output.validate() {
+        output = host_run_failure_output(
+            output.invocation_id.clone(),
+            &anyhow::anyhow!("invalid agent_hub_run terminal output: {error}"),
+        );
+        output.validate().map_err(anyhow::Error::msg)?;
+    }
+    println!("{}", serde_json::to_string(&output)?);
+    if let Some(error) = output.error.as_deref() {
+        anyhow::bail!("{error}");
+    }
+    let receipt = output
+        .approval_receipt
+        .receipt
+        .as_ref()
+        .context("one-step output has no issued approval receipt")?;
+    anyhow::ensure!(
+        receipt.decision() == protocol::AgentHubRunDecision::Allow,
+        "agent_hub_run was denied: {}",
+        receipt.reason().unwrap_or("denied by policy")
+    );
+    anyhow::ensure!(
+        output.local_result_v2["execution_outcome"] == "succeeded"
+            && output.local_result_v2["result_outcome"] == "succeeded"
+            && output.local_result_v2["cleanup_outcome"] == "succeeded",
+        "agent_hub_run did not complete successfully"
+    );
     Ok(())
 }
 

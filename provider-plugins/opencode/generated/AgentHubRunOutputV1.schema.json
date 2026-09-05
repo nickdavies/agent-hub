@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentHubRunOutputV1",
+  "description": "Plugin-consumable terminal envelope. `local_result_v2` is deliberately a\nbounded JSON value so the CLI's established aggregate remains the source of\ntruth without coupling protocol compatibility to local storage internals.",
+  "type": "object",
+  "properties": {
+    "approval_receipt": {
+      "$ref": "#/$defs/AgentHubRunApprovalReceiptV1"
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4096,
+      "minLength": 1
+    },
+    "invocation_id": {
+      "type": "string"
+    },
+    "local_result_v2": true,
+    "schema": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "invocation_id",
+    "approval_receipt",
+    "local_result_v2"
+  ],
+  "$defs": {
+    "AgentHubRunApprovalReceiptStatus": {
+      "type": "string",
+      "enum": [
+        "issued",
+        "unavailable"
+      ]
+    },
+    "AgentHubRunApprovalReceiptV1": {
+      "description": "Stable approval evidence slot present on every one-step terminal envelope.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentHubRunReceiptV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/AgentHubRunApprovalReceiptStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "status"
+      ]
+    },
+    "AgentHubRunDecision": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "AgentHubRunDecisionAuthority": {
+      "type": "string",
+      "enum": [
+        "automatic",
+        "human"
+      ]
+    },
+    "AgentHubRunReceiptV1": {
+      "description": "Authority-bound gateway decision plus a private integrity checksum. The\nchecksum is local integrity evidence, not a gateway signature.",
+      "type": "object",
+      "properties": {
+        "approval_id": {
+          "type": "string"
+        },
+        "authority": {
+          "$ref": "#/$defs/AgentHubRunDecisionAuthority"
+        },
+        "canonical_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64
+        },
+        "checksum": {
+          "type": "string"
+        },
+        "decided_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decision": {
+          "$ref": "#/$defs/AgentHubRunDecision"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "invocation_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "request_digest": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64
+        },
+        "schema": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "invocation_id",
+        "canonical_digest",
+        "request_digest",
+        "decision",
+        "authority",
+        "approval_id",
+        "decided_at",
+        "expires_at",
+        "checksum"
+      ]
+    }
+  }
+}

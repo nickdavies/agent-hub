@@ -393,6 +393,17 @@ pub fn resolve_action_with_input(
     cwd: Option<&str>,
     workspace_roots: Option<&[String]>,
 ) -> ConfigAction {
+    resolve_action_with_input_and_rule(config, tool, resolved_args, input, cwd, workspace_roots).0
+}
+
+pub fn resolve_action_with_input_and_rule(
+    config: &ToolConfig,
+    tool: &Tool,
+    resolved_args: &[String],
+    input: &Value,
+    cwd: Option<&str>,
+    workspace_roots: Option<&[String]>,
+) -> (ConfigAction, Option<RuleSummary>) {
     let tool_name = tool.as_str();
     let is_path = tool.is_path_tool();
 
@@ -401,9 +412,12 @@ pub fn resolve_action_with_input(
     let resolved_paths: &[String] = if is_path { resolved_args } else { &[] };
 
     if resolved_paths.iter().any(|p| !p.starts_with('/')) {
-        return ConfigAction::Decision(ConfigDecision::Deny(Some(
-            "path-based tool arguments must be absolute paths".to_string(),
-        )));
+        return (
+            ConfigAction::Decision(ConfigDecision::Deny(Some(
+                "path-based tool arguments must be absolute paths".to_string(),
+            ))),
+            None,
+        );
     }
 
     // Pre-compute workspace membership (None if no paths or no workspace_roots).
@@ -470,7 +484,7 @@ pub fn resolve_action_with_input(
                 "agent-hub-gateway: [debug] matched rule[{i}]: {}",
                 rule.source_json
             );
-            return match &rule.action {
+            let action = match &rule.action {
                 ResolvedAction::Allow => ConfigAction::Decision(ConfigDecision::Allow),
                 ResolvedAction::Deny => {
                     ConfigAction::Decision(ConfigDecision::Deny(rule.message.clone()))
@@ -478,10 +492,24 @@ pub fn resolve_action_with_input(
                 ResolvedAction::Ask => ConfigAction::Decision(ConfigDecision::Ask),
                 ResolvedAction::Delegate(command) => ConfigAction::Delegation(command.clone()),
             };
+            return (
+                action,
+                Some(RuleSummary {
+                    index: i,
+                    tools: rule
+                        .matchers
+                        .iter()
+                        .map(|matcher| matcher.name.clone())
+                        .collect(),
+                    action: rule.action.action_kind(),
+                    command: rule.action.command().map(str::to_owned),
+                    source_json: rule.source_json.clone(),
+                }),
+            );
         }
     }
     eprintln!("agent-hub-gateway: [debug] no rule matched, using default");
-    default_to_resolved(&config.default)
+    (default_to_resolved(&config.default), None)
 }
 
 fn input_object_is_subset(expected: &Map<String, Value>, actual: &Value) -> bool {

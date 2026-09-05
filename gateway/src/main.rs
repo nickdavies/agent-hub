@@ -11,7 +11,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use config::{ConfigAction, expand_tilde, load_tool_config, resolve_action_with_input};
+use config::{
+    ConfigAction, expand_tilde, load_tool_config, resolve_action_with_input,
+    resolve_action_with_input_and_rule,
+};
 use protocol::{
     ApprovalContext, ApprovalRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
     ExtraContext, RequestType, Secret, StatusReport,
@@ -60,6 +63,9 @@ struct AgentHubRunResolvedArgs {
     timeout: u64,
     #[arg(long, default_value = "~/.config/agent-hub/agent-hub-permissions.json")]
     config: String,
+    /// Print the gateway-derived policy projection and matched action without approval
+    #[arg(long)]
+    preview: bool,
 }
 
 #[derive(Args)]
@@ -160,17 +166,18 @@ enum RunError {
 enum ApprovalFlowError {
     Timeout,
     Pipeline(String),
+    FailClosed(String),
 }
 
 impl ApprovalFlowError {
     fn into_output(self) -> HookOutput {
-        if let Self::Pipeline(reason) = &self {
+        if let Self::Pipeline(reason) | Self::FailClosed(reason) = &self {
             eprintln!("[error] approvals pipeline failed: {reason}");
         }
         HookOutput {
             status: match self {
                 Self::Timeout => DecisionStatus::TimedOut,
-                Self::Pipeline(_) => DecisionStatus::PipelineError,
+                Self::Pipeline(_) | Self::FailClosed(_) => DecisionStatus::PipelineError,
             },
             message: None,
         }
@@ -180,6 +187,7 @@ impl ApprovalFlowError {
         RunError::ServerUnreachable(match self {
             Self::Timeout => "approval timed out".to_string(),
             Self::Pipeline(reason) => reason,
+            Self::FailClosed(reason) => return RunError::FailClosed(reason),
         })
     }
 }
@@ -230,7 +238,6 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
     let raw = &hook.tool_input;
     let permission = serde_json::from_value::<protocol::AgentHubRunResolvedV1>(raw.clone());
     if hook.tool.to_string() != protocol::AGENT_HUB_RUN_PERMISSION_NAME
-        || hook.tool_match_input.as_ref() != Some(raw)
         || !matches!(
             permission.as_ref(),
             Ok(request) if request.validate(chrono::Utc::now()).is_ok()
@@ -247,13 +254,54 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
         eprintln!("agent-hub-gateway: agent_hub_run gateway event binding mismatch");
         return ExitCode::from(2);
     }
-    let event = match hook.try_into() {
+    let event: ToolHookEvent = match hook.try_into() {
         Ok(event) => event,
         Err(error) => {
             eprintln!("agent-hub-gateway: failed to normalize agent_hub_run request: {error}");
             return ExitCode::from(2);
         }
     };
+    if args.preview {
+        let config_path = expand_tilde(&args.config);
+        let config = match load_tool_config(&config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("agent-hub-gateway: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        let (action, matched_rule) = resolve_action_with_input_and_rule(
+            &config,
+            &event.tool_call.tool(),
+            &[],
+            event.tool_call.policy_input(),
+            Some(&event.cwd),
+            Some(&event.workspace_roots),
+        );
+        let matched_action = match action {
+            ConfigAction::Decision(config::ConfigDecision::Allow) => "allow",
+            ConfigAction::Decision(config::ConfigDecision::Deny(_)) => "deny",
+            ConfigAction::Decision(config::ConfigDecision::Ask) => "ask",
+            ConfigAction::Delegation(_) => "forbidden_delegate",
+        };
+        let output = serde_json::json!({
+            "schema": "agent_hub_run_policy_preview_v1",
+            "projection": permission.policy_projection,
+            "matched_action": matched_action,
+            "matched_rule": matched_rule.map(|rule| serde_json::json!({
+                "index": rule.index,
+                "tools": rule.tools,
+                "action": rule.action,
+            })),
+        });
+        let encoded = serde_json::to_vec(&output).expect("preview serializes");
+        if encoded.len() > protocol::AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES {
+            eprintln!("agent-hub-gateway: policy preview exceeds output limit");
+            return ExitCode::from(2);
+        }
+        print!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
+        return ExitCode::SUCCESS;
+    }
     let now = chrono::Utc::now();
     let expires_in = match (permission.expires_at - now).to_std() {
         Ok(expires_in) => expires_in,
@@ -280,16 +328,19 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
         timeout: args.timeout,
         config: args.config,
     };
-    match run(
-        &approval,
-        "agent-hub-host-launch",
-        &event,
-        &expand_tilde(&approval.config),
-        Some(&permission.canonical_digest),
-        Some(deadline),
-    )
-    .await
-    {
+    let config_path = expand_tilde(&approval.config);
+    let resolution = tokio::select! {
+        result = run(
+            &approval,
+            "agent-hub-host-launch",
+            &event,
+            &config_path,
+            Some(&permission.canonical_digest),
+            Some(deadline),
+        ) => result,
+        _ = shutdown_signal() => Err(RunError::ServerUnreachable("aborted by signal".to_string())),
+    };
+    match resolution {
         Ok(resolution) => {
             let decision = match resolution.output.status {
                 DecisionStatus::Approved => protocol::AgentHubRunDecision::Allow,
@@ -688,7 +739,7 @@ async fn run(
         &config,
         &tool,
         &resolved_args,
-        event.tool_call.raw_input(),
+        event.tool_call.policy_input(),
         Some(&event.cwd),
         Some(&event.workspace_roots),
     );
@@ -1028,10 +1079,12 @@ async fn escalate_to_server(
     if response_timeout.is_zero() {
         return Err(ApprovalFlowError::Timeout);
     }
-    let approval: ApprovalResponse = tokio::time::timeout(response_timeout, register_resp.json())
-        .await
-        .map_err(|_| ApprovalFlowError::Timeout)?
-        .map_err(|e| ApprovalFlowError::Pipeline(format!("failed to parse approval response: {e}")))?;
+    let body =
+        read_bounded_response(register_resp, response_timeout, "approval registration").await?;
+    let approval: ApprovalResponse = serde_json::from_slice(&body).map_err(|e| {
+        ApprovalFlowError::Pipeline(format!("failed to parse approval response: {e}"))
+    })?;
+    validate_approval_status(&approval.status)?;
 
     if matches!(approval.status, ApprovalStatus::Pending) {
         // Fall through to long-poll below
@@ -1152,15 +1205,13 @@ async fn poll_for_decision(
             continue;
         }
 
-        let body = await_approval_deadline(deadline, last_wait_was_healthy, resp.bytes()).await?;
-        let body = match body {
-            Ok(body) if body.len() <= protocol::AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES => body,
-            Ok(_) => {
-                return Err(ApprovalFlowError::Pipeline(
-                    "approval wait response exceeds limit".to_string(),
-                ));
-            }
-            Err(e) => {
+        let body_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if body_remaining.is_zero() {
+            return Err(deadline_error(last_wait_was_healthy));
+        }
+        let body = match read_bounded_response(resp, body_remaining, "approval wait").await {
+            Ok(body) => body,
+            Err(ApprovalFlowError::Pipeline(e)) => {
                 eprintln!(
                     "[warn] failed to read wait response body (attempt {attempt}, retrying in 2s): {e}"
                 );
@@ -1173,6 +1224,7 @@ async fn poll_for_decision(
                 .await?;
                 continue;
             }
+            Err(error) => return Err(error),
         };
 
         let wait: ApprovalWaitResponse = match serde_json::from_slice(&body) {
@@ -1191,6 +1243,7 @@ async fn poll_for_decision(
                 continue;
             }
         };
+        validate_approval_status(&wait.status)?;
 
         ensure_approval_before_deadline(deadline, last_wait_was_healthy)?;
 
@@ -1228,6 +1281,48 @@ fn deadline_error(last_wait_was_healthy: bool) -> ApprovalFlowError {
     } else {
         ApprovalFlowError::Pipeline("approval wait failed until the deadline".to_string())
     }
+}
+
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+    timeout: Duration,
+    label: &str,
+) -> Result<Vec<u8>, ApprovalFlowError> {
+    let read = async {
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            ApprovalFlowError::Pipeline(format!("failed to read {label} response: {error}"))
+        })? {
+            if body.len().saturating_add(chunk.len())
+                > protocol::AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES
+            {
+                return Err(ApprovalFlowError::FailClosed(format!(
+                    "{label} response exceeds limit"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    };
+    tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| ApprovalFlowError::Timeout)?
+}
+
+fn validate_approval_status(status: &ApprovalStatus) -> Result<(), ApprovalFlowError> {
+    let reason = match status {
+        ApprovalStatus::Approved { message } => message.as_deref(),
+        ApprovalStatus::Denied { reason } => Some(reason.as_str()),
+        ApprovalStatus::Pending | ApprovalStatus::Cancelled => None,
+    };
+    if reason.is_some_and(|reason| {
+        reason.is_empty() || reason.len() > protocol::AGENT_HUB_RUN_MAX_REASON_BYTES
+    }) {
+        return Err(ApprovalFlowError::FailClosed(
+            "approval response reason exceeds required bounds".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_approval_before_deadline(

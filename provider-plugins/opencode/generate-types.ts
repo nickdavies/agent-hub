@@ -74,6 +74,11 @@ function deduplicateDeclarations(tsBlocks: string[]): string {
             // Multi-line interface — skip until closing brace
             skipping = true
             skipDepth = 1
+          } else if (line.trimEnd().endsWith("=")) {
+            // Multi-line union alias — skip continuation lines through the
+            // blank separator emitted by json-schema-to-typescript.
+            skipping = true
+            skipDepth = -1
           }
           // Single-line type alias — just skip this line
           continue
@@ -82,6 +87,13 @@ function deduplicateDeclarations(tsBlocks: string[]): string {
       }
 
       if (skipping) {
+        if (skipDepth === -1) {
+          if (line.trim() === "") {
+            skipping = false
+            skipDepth = 0
+          }
+          continue
+        }
         for (const ch of line) {
           if (ch === "{") skipDepth++
           if (ch === "}") skipDepth--

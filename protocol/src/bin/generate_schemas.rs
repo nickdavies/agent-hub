@@ -47,7 +47,12 @@ fn main() {
     // -- Host-owned one-step launch contracts --
     write_schema::<protocol::AgentHubRunIntentV1>(&out_dir, "AgentHubRunIntentV1");
     write_schema::<protocol::AgentHubRunResolvedV1>(&out_dir, "AgentHubRunResolvedV1");
+    write_schema::<protocol::AgentHubRunPolicyProjectionV1>(
+        &out_dir,
+        "AgentHubRunPolicyProjectionV1",
+    );
     write_schema::<protocol::AgentHubRunDecisionV1>(&out_dir, "AgentHubRunDecisionV1");
+    write_schema::<protocol::AgentHubRunOutputV1>(&out_dir, "AgentHubRunOutputV1");
 
     // -- Status reporting types --
     write_schema::<protocol::StatusReport>(&out_dir, "StatusReport");

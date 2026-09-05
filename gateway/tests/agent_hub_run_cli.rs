@@ -26,6 +26,15 @@ fn request() -> AgentHubRunResolvedV1 {
 }
 
 fn invoke(config: &std::path::Path, server: &str, input: &Value) -> Output {
+    invoke_with_extra(config, server, input, &[])
+}
+
+fn invoke_with_extra(
+    config: &std::path::Path,
+    server: &str,
+    input: &Value,
+    extra: &[&str],
+) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hub-gateway"))
         .env_clear()
         .args([
@@ -37,6 +46,7 @@ fn invoke(config: &std::path::Path, server: &str, input: &Value) -> Output {
             "--timeout",
             "2",
         ])
+        .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -61,8 +71,7 @@ fn config(dir: &tempfile::TempDir, action: &str) -> std::path::PathBuf {
             "rules": [{
                 "tools": ["agent_hub_run_resolved"],
                 "input": {
-                    "schema": "agent_hub_run_resolved_v1",
-                    "canonical_execution": {"version": 3}
+                    "schema": "agent_hub_run_policy_projection_v1"
                 },
                 "action": action
             }]
@@ -179,13 +188,59 @@ fn ask_retries_identical_registration_and_preserves_wire_bindings() {
         approval.request_digest.as_deref(),
         Some(request.canonical_digest.as_str())
     );
+    assert_eq!(approval.tool_input, serde_json::to_value(&request).unwrap());
+}
+
+#[test]
+fn canonical_transport_is_compact_single_copy_and_within_budget() {
+    let request = request();
+    let hook = serde_json::to_vec(&request.gateway_event().unwrap()).unwrap();
+    assert!(hook.len() <= protocol::AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES);
+    let encoded = &request.canonical_execution.canonical_bytes_base64;
+    let text = String::from_utf8(hook).unwrap();
+    assert_eq!(text.matches(encoded).count(), 1);
+    let value: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
-        approval.tool_input["request_digest"],
-        request.request_digest
+        value["tool_match_input"],
+        serde_json::to_value(&request.policy_projection).unwrap()
     );
+    assert!(
+        value["tool_match_input"]
+            .get("canonical_execution")
+            .is_none()
+    );
+    let maximum_base64 = protocol::AGENT_HUB_RUN_MAX_CANONICAL_BYTES.div_ceil(3) * 4;
+    assert!(
+        maximum_base64 + 2 * protocol::AGENT_HUB_RUN_MAX_POLICY_PROJECTION_BYTES + 32 * 1024
+            < protocol::AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES,
+        "canonical, projection, and fixed envelope bounds must fit the 1 MiB wire budget"
+    );
+}
+
+#[test]
+fn policy_preview_returns_derived_projection_without_contacting_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = request();
+    let hook = serde_json::to_value(request.gateway_event().unwrap()).unwrap();
+    let output = invoke_with_extra(
+        &config(&dir, "allow"),
+        "http://127.0.0.1:9",
+        &hook,
+        &["--preview"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(preview["schema"], "agent_hub_run_policy_preview_v1");
+    assert_eq!(preview["matched_action"], "allow");
+    assert_eq!(preview["matched_rule"]["index"], 0);
+    assert_eq!(preview["matched_rule"]["action"], "allow");
     assert_eq!(
-        approval.tool_input["requested_at"],
-        serde_json::to_value(request.requested_at).unwrap()
+        preview["projection"],
+        serde_json::to_value(request.policy_projection).unwrap()
     );
 }
 
@@ -200,10 +255,99 @@ fn wrong_and_expired_bindings_fail_before_policy_decision() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
 
+    let mut wrong_projection = serde_json::to_value(request.gateway_event().unwrap()).unwrap();
+    wrong_projection["tool_match_input"]["network_class"] = "none".into();
+    let output = invoke(&allow, "http://127.0.0.1:9", &wrong_projection);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
     let mut expired = serde_json::to_value(request.gateway_event().unwrap()).unwrap();
     expired["tool_input"]["expires_at"] = "2000-01-01T00:00:00Z".into();
-    expired["tool_match_input"] = expired["tool_input"].clone();
     let output = invoke(&allow, "http://127.0.0.1:9", &expired);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn registration_body_and_decision_reason_are_bounded_before_use() {
+    let dir = tempfile::tempdir().unwrap();
+    for (body, expected) in [
+        (
+            vec![b'x'; protocol::AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES + 1],
+            "response exceeds limit",
+        ),
+        (
+            serde_json::to_vec(&json!({
+                "id": Uuid::new_v4(),
+                "type": "denied",
+                "reason": "x".repeat(protocol::AGENT_HUB_RUN_MAX_REASON_BYTES + 1)
+            }))
+            .unwrap(),
+            "reason exceeds required bounds",
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_body(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let request = request();
+        let hook = serde_json::to_value(request.gateway_event().unwrap()).unwrap();
+        let output = invoke(&config(&dir, "ask"), &format!("http://{address}"), &hook);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn sigint_aborts_a_pending_registration() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_body(&mut stream);
+        std::thread::sleep(Duration::from_secs(5));
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let request = request();
+    let hook = serde_json::to_value(request.gateway_event().unwrap()).unwrap();
+    let server_url = format!("http://{address}");
+    let config_path = config(&dir, "ask");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hub-gateway"))
+        .env_clear()
+        .args([
+            "agent-hub-run-resolved",
+            "--server",
+            &server_url,
+            "--config",
+            config_path.to_str().unwrap(),
+            "--timeout",
+            "10",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&hook).unwrap())
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("aborted by signal"));
+    server.join().unwrap();
 }

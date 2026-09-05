@@ -78,6 +78,7 @@ fn executable_local_help_has_the_complete_command_contract() {
         .filter(|line| {
             line.trim_start().starts_with("run ")
                 || line.trim_start().starts_with("inspect ")
+                || line.trim_start().starts_with("preview ")
                 || line.trim_start().starts_with("list ")
                 || line.trim_start().starts_with("status ")
                 || line.trim_start().starts_with("logs ")
@@ -93,7 +94,7 @@ fn executable_local_help_has_the_complete_command_contract() {
         .join("\n");
     assert_eq!(
         command_snapshot,
-        "run             Host-owned one-step prepare, approve, and execute path (structured JSON on stdin)\ninspect         Debug canonical preparation without requesting permission or executing\nlist            List local attended executions\nstatus          Show one execution record\nlogs            Print an execution log\nresult          Print an execution result\nartifacts       Print the bounded artifact manifest\nrepositories    Print the bounded repository result document\ncleanup-result  Print the bounded cleanup result document\ncancel          Cancel an owned running execution\ncleanup         Explicitly remove owned execution resources and artifacts"
+        "run             Host-owned one-step prepare, approve, and execute path (structured JSON on stdin)\ninspect         Debug canonical preparation without requesting permission or executing\npreview         Preview trusted projection and matched rule without side effects\nlist            List local attended executions\nstatus          Show one execution record\nlogs            Print an execution log\nresult          Print an execution result\nartifacts       Print the bounded artifact manifest\nrepositories    Print the bounded repository result document\ncleanup-result  Print the bounded cleanup result document\ncancel          Cancel an owned running execution\ncleanup         Explicitly remove owned execution resources and artifacts"
     );
 }
 

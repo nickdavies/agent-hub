@@ -11,7 +11,9 @@
       "$ref": "#/$defs/AgentHubRunDecisionAuthority"
     },
     "canonical_digest": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64
     },
     "decided_at": {
       "type": "string",
@@ -31,10 +33,14 @@
       "type": [
         "string",
         "null"
-      ]
+      ],
+      "maxLength": 4096,
+      "minLength": 1
     },
     "request_digest": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64
     },
     "schema": {
       "type": "string"

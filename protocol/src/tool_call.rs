@@ -135,6 +135,7 @@ pub struct MultiEditEntry {
 pub struct ToolCall {
     kind: ToolCallKind,
     raw: Value,
+    policy_input: Value,
 }
 
 impl ToolCall {
@@ -145,8 +146,13 @@ impl ToolCall {
         raw: Value,
         match_input: Option<Value>,
     ) -> Result<Self, ToolCallParseError> {
-        let kind = parse_kind(&tool, match_input.as_ref().unwrap_or(&raw))?;
-        Ok(Self { kind, raw })
+        let policy_input = match_input.unwrap_or_else(|| raw.clone());
+        let kind = parse_kind(&tool, &policy_input)?;
+        Ok(Self {
+            kind,
+            raw,
+            policy_input,
+        })
     }
 
     /// The canonical tool identity derived from the typed variant.
@@ -215,6 +221,11 @@ impl ToolCall {
     /// The original raw JSON blob from the provider (display/passthrough only).
     pub fn raw_input(&self) -> &Value {
         &self.raw
+    }
+
+    /// Host-derived input used for structural policy matching and review.
+    pub fn policy_input(&self) -> &Value {
+        &self.policy_input
     }
 
     /// The typed variant — all gateway logic should branch on this.

@@ -45,20 +45,374 @@ export type WorkspaceAccess = "read_only" | "read_write"
  */
 export interface AgentHubRunIntentV1 {
   /**
-   * @maxItems 32
+   * @maxItems 16
    */
-  context_roots?: AgentHubRunContextRootV1[]
+  context_roots?:
+    | []
+    | [AgentHubRunContextRootV1]
+    | [AgentHubRunContextRootV1, AgentHubRunContextRootV1]
+    | [AgentHubRunContextRootV1, AgentHubRunContextRootV1, AgentHubRunContextRootV1]
+    | [AgentHubRunContextRootV1, AgentHubRunContextRootV1, AgentHubRunContextRootV1, AgentHubRunContextRootV1]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
+    | [
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1,
+        AgentHubRunContextRootV1
+      ]
   environment: string
   image_family: AgentHubRunImageFamily
   network_class: AgentHubRunNetworkClass
   /**
-   * @maxItems 32
+   * @maxItems 16
    */
-  network_resources?: NetworkResourceKind[]
+  network_resources?:
+    | []
+    | [NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
   /**
-   * @maxItems 32
+   * @maxItems 16
    */
-  overlays?: string[]
+  overlays?:
+    | []
+    | [string]
+    | [string, string]
+    | [string, string, string]
+    | [string, string, string, string]
+    | [string, string, string, string, string]
+    | [string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string, string, string, string, string]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string
+      ]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string
+      ]
   primary_workspace: string
   prompt: string
   schema: AgentHubRunIntentSchema
@@ -67,9 +421,163 @@ export interface AgentHubRunIntentV1 {
   workspace_export_root?: string | null
   /**
    * @minItems 1
-   * @maxItems 32
+   * @maxItems 16
    */
-  workspaces: [AgentHubRunWorkspaceV1, ...AgentHubRunWorkspaceV1[]]
+  workspaces:
+    | [AgentHubRunWorkspaceV1]
+    | [AgentHubRunWorkspaceV1, AgentHubRunWorkspaceV1]
+    | [AgentHubRunWorkspaceV1, AgentHubRunWorkspaceV1, AgentHubRunWorkspaceV1]
+    | [AgentHubRunWorkspaceV1, AgentHubRunWorkspaceV1, AgentHubRunWorkspaceV1, AgentHubRunWorkspaceV1]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
+    | [
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1,
+        AgentHubRunWorkspaceV1
+      ]
 }
 export interface AgentHubRunContextRootV1 {
   alias: string
@@ -81,20 +589,765 @@ export interface AgentHubRunWorkspaceV1 {
   path: string
 }
 
+export type AgentHubRunApprovalReceiptStatus = "issued" | "unavailable"
+
+/**
+ * Plugin-consumable terminal envelope. `local_result_v2` is deliberately a
+ * bounded JSON value so the CLI's established aggregate remains the source of
+ * truth without coupling protocol compatibility to local storage internals.
+ */
+export interface AgentHubRunOutputV1 {
+  approval_receipt: AgentHubRunApprovalReceiptV1
+  error?: string | null
+  invocation_id: string
+  local_result_v2: unknown
+  schema: string
+}
+/**
+ * Stable approval evidence slot present on every one-step terminal envelope.
+ */
+export interface AgentHubRunApprovalReceiptV1 {
+  error?: string | null
+  receipt?: AgentHubRunReceiptV1 | null
+  schema: string
+  status: AgentHubRunApprovalReceiptStatus
+}
+/**
+ * Authority-bound gateway decision plus a private integrity checksum. The
+ * checksum is local integrity evidence, not a gateway signature.
+ */
+export interface AgentHubRunReceiptV1 {
+  approval_id: string
+  authority: AgentHubRunDecisionAuthority
+  canonical_digest: string
+  checksum: string
+  decided_at: string
+  decision: AgentHubRunDecision
+  expires_at: string
+  invocation_id: string
+  reason?: string | null
+  request_digest: string
+  schema: string
+}
+
+/**
+ * Strict policy surface derived from a verified canonical execution. Policy
+ * matching never receives the canonical transport or public intent fields.
+ */
+export interface AgentHubRunPolicyProjectionV1 {
+  /**
+   * @maxItems 64
+   */
+  capabilities: AgentHubRunCapabilityProjectionV1[]
+  /**
+   * @maxItems 16
+   */
+  context_roots:
+    | []
+    | [AgentHubRunRootProjectionV1]
+    | [AgentHubRunRootProjectionV1, AgentHubRunRootProjectionV1]
+    | [AgentHubRunRootProjectionV1, AgentHubRunRootProjectionV1, AgentHubRunRootProjectionV1]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+  environment: string
+  image_family: string
+  image_id: string
+  network_class: string
+  /**
+   * @maxItems 16
+   */
+  network_resources:
+    | []
+    | [NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+  output: AttendedOutputContract
+  /**
+   * @maxItems 16
+   */
+  overlays:
+    | []
+    | [AgentHubRunCapabilityProjectionV1]
+    | [AgentHubRunCapabilityProjectionV1, AgentHubRunCapabilityProjectionV1]
+    | [AgentHubRunCapabilityProjectionV1, AgentHubRunCapabilityProjectionV1, AgentHubRunCapabilityProjectionV1]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+    | [
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1,
+        AgentHubRunCapabilityProjectionV1
+      ]
+  prompt_digest: string
+  retry: AttendedRetryConstraints
+  review: AgentHubRunReviewProjectionV1
+  schema: string
+  timeout_secs: number
+  tool_approval: string
+  /**
+   * @minItems 1
+   * @maxItems 16
+   */
+  workspaces:
+    | [AgentHubRunRootProjectionV1]
+    | [AgentHubRunRootProjectionV1, AgentHubRunRootProjectionV1]
+    | [AgentHubRunRootProjectionV1, AgentHubRunRootProjectionV1, AgentHubRunRootProjectionV1]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+    | [
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1,
+        AgentHubRunRootProjectionV1
+      ]
+}
+export interface AgentHubRunCapabilityProjectionV1 {
+  access: string
+  name: string
+}
+export interface AgentHubRunRootProjectionV1 {
+  access: WorkspaceAccess
+  alias: string
+  path: string
+  root_identity: string
+}
+export interface AttendedOutputContract {
+  artifacts: string
+  cleanup: string
+  limits: AttendedOutputLimits
+  repositories: string
+  result: string
+  transcript: string
+}
+export interface AttendedOutputLimits {
+  artifact_bytes: number
+  stderr_bytes: number
+  stdout_bytes: number
+  transcript_bytes: number
+}
+export interface AttendedRetryConstraints {
+  max_attempts: number
+  max_prelaunch_retries: number
+  max_provider_unavailable_retries: number
+}
+export interface AgentHubRunReviewProjectionV1 {
+  approval_bundle_digest: string
+  config_digest: string
+  environment_bundle_digest: string
+  primary_workspace: string
+  workspace_export_root?: string | null
+}
+
 /**
  * Exact canonical execution submitted to the gateway.
  */
 export interface AgentHubRunResolvedV1 {
   canonical_digest: string
-  canonical_execution: AttendedAuthorizationArtifact
+  canonical_execution: AgentHubRunCanonicalArtifactV1
   expires_at: string
   invocation_id: string
+  policy_projection: AgentHubRunPolicyProjectionV1
   request_digest: string
   requested_at: string
   schema: string
 }
-export interface AttendedAuthorizationArtifact {
-  canonical_bytes: string
+export interface AgentHubRunCanonicalArtifactV1 {
+  canonical_bytes_base64: string
   digest: string
   version: number
 }

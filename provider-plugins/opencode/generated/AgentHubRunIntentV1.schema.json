@@ -10,7 +10,7 @@
       "items": {
         "$ref": "#/$defs/AgentHubRunContextRootV1"
       },
-      "maxItems": 32
+      "maxItems": 16
     },
     "environment": {
       "type": "string",
@@ -29,15 +29,17 @@
       "items": {
         "$ref": "#/$defs/NetworkResourceKind"
       },
-      "maxItems": 32
+      "maxItems": 16
     },
     "overlays": {
       "type": "array",
       "default": [],
       "items": {
-        "type": "string"
+        "type": "string",
+        "maxLength": 128,
+        "minLength": 1
       },
-      "maxItems": 32
+      "maxItems": 16
     },
     "primary_workspace": {
       "type": "string",
@@ -46,7 +48,7 @@
     },
     "prompt": {
       "type": "string",
-      "maxLength": 1000000,
+      "maxLength": 131072,
       "minLength": 1
     },
     "schema": {
@@ -66,7 +68,7 @@
         "string",
         "null"
       ],
-      "maxLength": 4096,
+      "maxLength": 1024,
       "minLength": 1
     },
     "workspaces": {
@@ -74,7 +76,7 @@
       "items": {
         "$ref": "#/$defs/AgentHubRunWorkspaceV1"
       },
-      "maxItems": 32,
+      "maxItems": 16,
       "minItems": 1
     }
   },
@@ -101,7 +103,7 @@
         },
         "path": {
           "type": "string",
-          "maxLength": 4096,
+          "maxLength": 1024,
           "minLength": 1
         }
       },
@@ -152,7 +154,7 @@
         },
         "path": {
           "type": "string",
-          "maxLength": 4096,
+          "maxLength": 1024,
           "minLength": 1
         }
       },

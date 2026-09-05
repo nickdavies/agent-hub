@@ -63,13 +63,19 @@ pub use gateway::{
 };
 pub use hooks::{NotificationPayload, SessionEndPayload, StatusReport, StopPayload};
 pub use host_run::{
-    AGENT_HUB_RUN_DECISION_SCHEMA_V1, AGENT_HUB_RUN_INTENT_SCHEMA_V1,
-    AGENT_HUB_RUN_MAX_APPROVAL_TIMEOUT_SECS, AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES,
-    AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES, AGENT_HUB_RUN_MAX_REASON_BYTES,
-    AGENT_HUB_RUN_PERMISSION_NAME, AGENT_HUB_RUN_RESOLVED_SCHEMA_V1, AgentHubRunContextRootV1,
-    AgentHubRunDecision, AgentHubRunDecisionAuthority, AgentHubRunDecisionV1,
-    AgentHubRunImageFamily, AgentHubRunIntentSchema, AgentHubRunIntentV1, AgentHubRunNetworkClass,
-    AgentHubRunReceiptV1, AgentHubRunResolvedV1, AgentHubRunToolApproval, AgentHubRunWorkspaceV1,
+    AGENT_HUB_RUN_APPROVAL_RECEIPT_SCHEMA_V1, AGENT_HUB_RUN_DECISION_SCHEMA_V1,
+    AGENT_HUB_RUN_INTENT_SCHEMA_V1, AGENT_HUB_RUN_MAX_APPROVAL_TIMEOUT_SECS,
+    AGENT_HUB_RUN_MAX_CANONICAL_BYTES, AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES,
+    AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES, AGENT_HUB_RUN_MAX_POLICY_PROJECTION_BYTES,
+    AGENT_HUB_RUN_MAX_REASON_BYTES, AGENT_HUB_RUN_OUTPUT_SCHEMA_V1, AGENT_HUB_RUN_PERMISSION_NAME,
+    AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V1, AGENT_HUB_RUN_RESOLVED_SCHEMA_V1,
+    AgentHubRunApprovalReceiptStatus, AgentHubRunApprovalReceiptV1, AgentHubRunCanonicalArtifactV1,
+    AgentHubRunCapabilityProjectionV1, AgentHubRunContextRootV1, AgentHubRunDecision,
+    AgentHubRunDecisionAuthority, AgentHubRunDecisionV1, AgentHubRunImageFamily,
+    AgentHubRunIntentSchema, AgentHubRunIntentV1, AgentHubRunNetworkClass, AgentHubRunOutputV1,
+    AgentHubRunPolicyProjectionV1, AgentHubRunReceiptV1, AgentHubRunResolvedV1,
+    AgentHubRunReviewProjectionV1, AgentHubRunRootProjectionV1, AgentHubRunToolApproval,
+    AgentHubRunWorkspaceV1,
 };
 pub use job_events::{JOB_EVENT_SCHEMA_NAME, JobEvent, JobEventKind};
 pub use orchestration::{

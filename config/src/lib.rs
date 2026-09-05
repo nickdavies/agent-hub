@@ -25,8 +25,9 @@ pub use environment_bundle::{
 };
 pub use image::{
     ImageBuildContext, ImageConfig, JOB_CODE_PREFLIGHT_PATH, JOB_CODE_TOOL_MANIFEST_PATH,
-    job_code_preflight_docker_args, job_code_tool_manifest_sha256, resolve_build_order, sha256_hex,
-    validate_job_code_preflight_report, validate_supervised_opencode_preflight_report,
+    SUPERVISED_OPENCODE_VERSION, job_code_preflight_docker_args, job_code_tool_manifest_sha256,
+    resolve_build_order, sha256_hex, validate_job_code_preflight_report,
+    validate_supervised_opencode_preflight_report,
 };
 pub use network_policy::{
     FlattenedPolicy, NetworkPolicyConfig, PolicyAllowRule, canonical_policy_hosts, flatten_policy,
@@ -35,7 +36,7 @@ pub use root_registry::{RootConfig, RootRegistryConfig, RootRole, root_registry}
 pub use rules::{
     ConfigAction, ConfigDecision, DefaultAction, RuleAction, RuleSummary, ToolConfig,
     default_to_resolved, load_tool_config, resolve_action, resolve_action_with_input,
-    validate_tool_config,
+    resolve_action_with_input_and_rule, validate_tool_config,
 };
 pub use runner::{
     CredentialProviderDescriptor, DURABLE_OPENCODE_PATH, HostApprovalsConfig,

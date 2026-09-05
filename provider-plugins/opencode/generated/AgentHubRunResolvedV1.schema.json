@@ -5,10 +5,12 @@
   "type": "object",
   "properties": {
     "canonical_digest": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64
     },
     "canonical_execution": {
-      "$ref": "#/$defs/AttendedAuthorizationArtifact"
+      "$ref": "#/$defs/AgentHubRunCanonicalArtifactV1"
     },
     "expires_at": {
       "type": "string",
@@ -17,8 +19,13 @@
     "invocation_id": {
       "type": "string"
     },
+    "policy_projection": {
+      "$ref": "#/$defs/AgentHubRunPolicyProjectionV1"
+    },
     "request_digest": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64
     },
     "requested_at": {
       "type": "string",
@@ -35,18 +42,22 @@
     "canonical_digest",
     "request_digest",
     "canonical_execution",
+    "policy_projection",
     "requested_at",
     "expires_at"
   ],
   "$defs": {
-    "AttendedAuthorizationArtifact": {
+    "AgentHubRunCanonicalArtifactV1": {
       "type": "object",
       "properties": {
-        "canonical_bytes": {
-          "type": "string"
+        "canonical_bytes_base64": {
+          "type": "string",
+          "maxLength": 699052
         },
         "digest": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64
         },
         "version": {
           "type": "integer",
@@ -58,7 +69,313 @@
       "required": [
         "version",
         "digest",
-        "canonical_bytes"
+        "canonical_bytes_base64"
+      ]
+    },
+    "AgentHubRunCapabilityProjectionV1": {
+      "type": "object",
+      "properties": {
+        "access": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "access"
+      ]
+    },
+    "AgentHubRunPolicyProjectionV1": {
+      "description": "Strict policy surface derived from a verified canonical execution. Policy\nmatching never receives the canonical transport or public intent fields.",
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentHubRunCapabilityProjectionV1"
+          },
+          "maxItems": 64
+        },
+        "context_roots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentHubRunRootProjectionV1"
+          },
+          "maxItems": 16
+        },
+        "environment": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "image_family": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "image_id": {
+          "type": "string",
+          "maxLength": 71,
+          "minLength": 71
+        },
+        "network_class": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 1
+        },
+        "network_resources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NetworkResourceKind"
+          },
+          "maxItems": 16
+        },
+        "output": {
+          "$ref": "#/$defs/AttendedOutputContract"
+        },
+        "overlays": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentHubRunCapabilityProjectionV1"
+          },
+          "maxItems": 16
+        },
+        "prompt_digest": {
+          "type": "string"
+        },
+        "retry": {
+          "$ref": "#/$defs/AttendedRetryConstraints"
+        },
+        "review": {
+          "$ref": "#/$defs/AgentHubRunReviewProjectionV1"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 86400,
+          "minimum": 1
+        },
+        "tool_approval": {
+          "type": "string",
+          "maxLength": 16,
+          "minLength": 1
+        },
+        "workspaces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentHubRunRootProjectionV1"
+          },
+          "maxItems": 16,
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "environment",
+        "image_family",
+        "image_id",
+        "network_class",
+        "network_resources",
+        "tool_approval",
+        "workspaces",
+        "context_roots",
+        "overlays",
+        "capabilities",
+        "timeout_secs",
+        "retry",
+        "output",
+        "prompt_digest",
+        "review"
+      ]
+    },
+    "AgentHubRunReviewProjectionV1": {
+      "type": "object",
+      "properties": {
+        "approval_bundle_digest": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "config_digest": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "environment_bundle_digest": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "primary_workspace": {
+          "type": "string",
+          "maxLength": 63,
+          "minLength": 1
+        },
+        "workspace_export_root": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1024,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "config_digest",
+        "environment_bundle_digest",
+        "approval_bundle_digest",
+        "primary_workspace"
+      ]
+    },
+    "AgentHubRunRootProjectionV1": {
+      "type": "object",
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/WorkspaceAccess"
+        },
+        "alias": {
+          "type": "string",
+          "maxLength": 63,
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "maxLength": 1024,
+          "minLength": 1
+        },
+        "root_identity": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "alias",
+        "path",
+        "access",
+        "root_identity"
+      ]
+    },
+    "AttendedOutputContract": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "string"
+        },
+        "cleanup": {
+          "type": "string"
+        },
+        "limits": {
+          "$ref": "#/$defs/AttendedOutputLimits"
+        },
+        "repositories": {
+          "type": "string"
+        },
+        "result": {
+          "type": "string"
+        },
+        "transcript": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "transcript",
+        "result",
+        "artifacts",
+        "repositories",
+        "cleanup",
+        "limits"
+      ]
+    },
+    "AttendedOutputLimits": {
+      "type": "object",
+      "properties": {
+        "artifact_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stderr_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stdout_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "transcript_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "stdout_bytes",
+        "stderr_bytes",
+        "transcript_bytes",
+        "artifact_bytes"
+      ]
+    },
+    "AttendedRetryConstraints": {
+      "type": "object",
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_prelaunch_retries": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_provider_unavailable_retries": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_attempts",
+        "max_prelaunch_retries",
+        "max_provider_unavailable_retries"
+      ]
+    },
+    "NetworkResourceKind": {
+      "type": "string",
+      "enum": [
+        "llm",
+        "github",
+        "go_registry",
+        "crates_registry",
+        "pypi_registry",
+        "npm_registry",
+        "guarded_web"
+      ]
+    },
+    "WorkspaceAccess": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "read_write"
       ]
     }
   }
