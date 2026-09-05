@@ -4723,6 +4723,14 @@ fn parse_agent_result_from_opencode(path: &Path) -> ParsedAgentResult {
 }
 
 fn parse_agent_result_events(output: &str) -> ParsedAgentResult {
+    let trimmed = output.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && value.get("schema").and_then(serde_json::Value::as_str)
+            == Some(protocol::AGENT_RESULT_V1_SCHEMA)
+    {
+        return parse_agent_result_values(vec![value]);
+    }
+
     let mut structured = Vec::new();
     let mut final_text = None;
     for (index, line) in output.lines().enumerate() {
@@ -4742,6 +4750,15 @@ fn parse_agent_result_events(output: &str) -> ParsedAgentResult {
                 };
             }
         };
+        if event.get("schema").and_then(serde_json::Value::as_str)
+            == Some(protocol::AGENT_RESULT_V1_SCHEMA)
+        {
+            return ParsedAgentResult {
+                outcome: AgentOutcome::Malformed,
+                result: None,
+                error: Some("OpenCode terminal document must be the only stdout document".into()),
+            };
+        }
         match event.get("type").and_then(serde_json::Value::as_str) {
             Some("tool_use") => {
                 let part = &event["part"];
@@ -4796,6 +4813,10 @@ fn parse_agent_result_events(output: &str) -> ParsedAgentResult {
         structured
     };
 
+    parse_agent_result_values(values)
+}
+
+fn parse_agent_result_values(values: Vec<serde_json::Value>) -> ParsedAgentResult {
     let mut parsed = Vec::new();
     for value in values {
         let result = match serde_json::from_value::<protocol::AgentResultV1>(value) {
@@ -8251,6 +8272,73 @@ grep -qx 'ready\|ready\.' real-llm.log
         assert_eq!(
             parsed.result.unwrap().summary,
             "Implemented and verified the requested lifecycle."
+        );
+    }
+
+    #[test]
+    fn opencode_1_18_18_plain_terminal_result_fixture_is_accepted() {
+        let output = include_str!("../tests/fixtures/opencode-1.18.18-plain-terminal-result.json");
+        let parsed = super::parse_agent_result_events(output);
+        assert_eq!(parsed.outcome, super::AgentOutcome::Succeeded);
+        assert_eq!(
+            parsed.result.unwrap().summary,
+            "All requested Git commands completed successfully; README.md and opencode.json have no working-tree changes."
+        );
+    }
+
+    #[test]
+    fn plain_terminal_result_must_be_the_only_stdout_document() {
+        let result = complete_agent_result().to_string();
+        for output in [
+            format!("log prefix {result}"),
+            format!("log prefix\n{result}"),
+            format!("{result}\n{result}"),
+        ] {
+            assert_eq!(
+                super::parse_agent_result_events(&output).outcome,
+                super::AgentOutcome::Malformed
+            );
+        }
+
+        let mut conflicting = complete_agent_result();
+        conflicting["summary"] = serde_json::json!("different");
+        assert_eq!(
+            super::parse_agent_result_events(&format!("{result}\n{conflicting}")).outcome,
+            super::AgentOutcome::Malformed
+        );
+
+        let embedded = serde_json::json!({
+            "type": "text",
+            "part": {"text": format!("log prefix\n{result}")}
+        });
+        assert_eq!(
+            super::parse_agent_result_events(&embedded.to_string()).outcome,
+            super::AgentOutcome::Malformed
+        );
+    }
+
+    #[test]
+    fn plain_terminal_result_preserves_strict_schema_and_complete_semantics() {
+        let mut incomplete = complete_agent_result();
+        incomplete["complete"] = serde_json::json!(false);
+        incomplete["blockers"] = serde_json::json!(["follow-up required"]);
+        assert_eq!(
+            super::parse_agent_result_events(&incomplete.to_string()).outcome,
+            super::AgentOutcome::Incomplete
+        );
+
+        let mut contradictory = complete_agent_result();
+        contradictory["blockers"] = serde_json::json!(["blocked"]);
+        assert_eq!(
+            super::parse_agent_result_events(&contradictory.to_string()).outcome,
+            super::AgentOutcome::Contradictory
+        );
+
+        let mut malformed = complete_agent_result();
+        malformed["unexpected"] = serde_json::json!(true);
+        assert_eq!(
+            super::parse_agent_result_events(&malformed.to_string()).outcome,
+            super::AgentOutcome::Malformed
         );
     }
 

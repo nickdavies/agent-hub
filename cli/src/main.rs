@@ -457,25 +457,28 @@ fn host_invocation_id(explicit: Option<&str>) -> anyhow::Result<String> {
     let call = std::env::var("AGENT_HUB_TRUSTED_TOOL_CALL_ID").ok();
     match (session, call) {
         (Some(session), Some(call)) if !session.is_empty() && !call.is_empty() => {
-            let digest = protocol::sha256_hex_with_domain(
-                b"agent-hub:trusted-one-step-invocation:v1\0",
-                format!("{}\0{}", session, call).as_bytes(),
-            );
-            let id = format!(
-                "{}-{}-{}-{}-{}",
-                &digest[0..8],
-                &digest[8..12],
-                &digest[12..16],
-                &digest[16..20],
-                &digest[20..32]
-            );
-            Ok(id)
+            Ok(trusted_host_invocation_id(&session, &call))
         }
         (None, None) => Ok(uuid::Uuid::new_v4().to_string()),
         _ => anyhow::bail!(
             "trusted one-step invocation requires both session and tool-call identities"
         ),
     }
+}
+
+fn trusted_host_invocation_id(session: &str, call: &str) -> String {
+    let digest = protocol::sha256_hex_with_domain(
+        b"agent-hub:trusted-one-step-invocation:v1\0",
+        format!("{session}\0{call}").as_bytes(),
+    );
+    let mut bytes = [0_u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .expect("SHA-256 digest is lowercase hexadecimal");
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
 }
 
 fn bounded_error(error: &anyhow::Error) -> String {
@@ -868,5 +871,27 @@ mod attended_cli_tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn trusted_host_invocation_ids_are_canonical_deterministic_v8_uuids() {
+        let first = trusted_host_invocation_id("session", "call");
+        assert_eq!(first, "22356e2a-8bf3-841c-a45a-4aaf1ab6c463");
+        assert_eq!(first, trusted_host_invocation_id("session", "call"));
+        assert_ne!(first, trusted_host_invocation_id("session", "other-call"));
+        assert_ne!(first, trusted_host_invocation_id("other-session", "call"));
+
+        let parsed = uuid::Uuid::parse_str(&first).unwrap();
+        assert_eq!(parsed.to_string(), first);
+        assert_eq!(first.as_bytes()[14], b'8');
+        assert!(matches!(first.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    #[test]
+    fn explicit_host_invocation_ids_remain_strictly_canonical() {
+        let canonical = "123e4567-e89b-42d3-a456-426614174000";
+        assert_eq!(host_invocation_id(Some(canonical)).unwrap(), canonical);
+        assert!(host_invocation_id(Some("123E4567-E89B-42D3-A456-426614174000")).is_err());
+        assert!(host_invocation_id(Some("123e4567e89b42d3a456426614174000")).is_err());
     }
 }
