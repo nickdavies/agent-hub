@@ -176,7 +176,7 @@ struct JobCodeToolManifest {
 impl JobCodeToolManifest {
     fn validate(&self) -> Result<(), String> {
         if self.schema != "agent-hub.job-code-tools.v3"
-            || self.image != "agent-hub/job-code:2026-09-01"
+            || self.image != "agent-hub/job-code:2026-09-04"
             || !is_debian_snapshot(&self.debian_snapshot)
             || self.runtime.rust_home != "/opt/rust"
             || self.runtime.rust_bin != "/opt/rust/bin"
@@ -506,7 +506,7 @@ mod tests {
         let valid = r#"
 [image]
 name = "job-code"
-tag = "agent-hub/job-code:2026-09-01"
+tag = "agent-hub/job-code:2026-09-04"
 description = "test"
 [image.build_contexts.agent-hub-source]
 type = "git"
@@ -782,7 +782,7 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             .collect::<serde_json::Map<_, _>>();
         let manifest = serde_json::json!({
             "schema":"agent-hub.job-code-tools.v3",
-            "image":"agent-hub/job-code:2026-09-01",
+            "image":"agent-hub/job-code:2026-09-04",
             "debian_snapshot":"20260824T000000Z",
             "runtime":{"rust_home":"/opt/rust","rust_bin":"/opt/rust/bin","cargo_home":"$HOME/.cargo"},
             "tools":tools,

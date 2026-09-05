@@ -2,7 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const IMAGE_TAG: &str = "agent-hub/job-code:2026-09-01";
+const IMAGE_TAG: &str = "agent-hub/job-code:2026-09-04";
 
 #[test]
 fn one_step_invalid_input_prints_a_bounded_failure_envelope_before_nonzero() {
