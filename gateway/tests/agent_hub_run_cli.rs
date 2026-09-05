@@ -7,18 +7,20 @@ use std::time::Duration;
 use chrono::Utc;
 use protocol::{
     AgentHubRunDecision, AgentHubRunDecisionAuthority, AgentHubRunDecisionV1,
-    AgentHubRunResolvedV1, AttendedAuthorizationArtifact,
+    AgentHubRunResolvedV1, AttendedAuthorizationRequestV3,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 fn request() -> AgentHubRunResolvedV1 {
-    let artifact: AttendedAuthorizationArtifact =
-        serde_json::from_slice(include_bytes!("attended-v3-artifact.json")).unwrap();
+    let request: AttendedAuthorizationRequestV3 = serde_json::from_slice(include_bytes!(
+        "../../protocol/tests/fixtures/attended_authorization_v3.json"
+    ))
+    .unwrap();
     let requested_at = Utc::now();
     AgentHubRunResolvedV1::new(
         Uuid::new_v4().to_string(),
-        artifact,
+        request.canonical_artifact().unwrap(),
         requested_at,
         requested_at + chrono::Duration::minutes(5),
     )
@@ -124,6 +126,15 @@ fn respond(stream: &mut TcpStream, body: &Value) {
     stream.write_all(&body).unwrap();
 }
 
+fn respond_status(stream: &mut TcpStream, status: &str, body: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+}
+
 #[test]
 fn structured_policy_allow_and_deny_return_bound_terminal_decisions() {
     let dir = tempfile::tempdir().unwrap();
@@ -189,6 +200,41 @@ fn ask_retries_identical_registration_and_preserves_wire_bindings() {
         Some(request.canonical_digest.as_str())
     );
     assert_eq!(approval.tool_input, serde_json::to_value(&request).unwrap());
+}
+
+#[test]
+fn conflicting_registration_fails_closed_without_retrying_or_waiting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let requests = Arc::new(Mutex::new(0));
+    let captured = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    *captured.lock().unwrap() += 1;
+                    read_http_body(&mut stream);
+                    respond_status(&mut stream, "409 Conflict", "request conflict");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let request = request();
+    let hook = serde_json::to_value(request.gateway_event().unwrap()).unwrap();
+    let output = invoke(&config(&dir, "ask"), &format!("http://{address}"), &hook);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("409 Conflict"));
+    server.join().unwrap();
+    assert_eq!(*requests.lock().unwrap(), 1);
 }
 
 #[test]

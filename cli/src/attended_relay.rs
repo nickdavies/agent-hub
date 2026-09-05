@@ -2512,6 +2512,7 @@ mod tests {
                     serde_json::to_vec(&Approval {
                         id: approval_id,
                         request_id,
+                        request_digest: None,
                         session_id: SessionId::new("attended-test"),
                         session_display_name: "Attended test".into(),
                         project: "main".into(),

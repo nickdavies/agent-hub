@@ -1092,6 +1092,8 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
             record["request_digest"],
             record["tool_input"]["canonical_digest"]
         );
+        assert!(record["tool_input"]["request_digest"].is_string());
+        assert_eq!(record["tool_input"]["requested_at"], "2026-01-01T00:00:00Z");
         assert_eq!(record["tool_input"]["schema"], "agent_hub_run_resolved_v1");
 
         let (status, _) = post_json_result(
@@ -1308,6 +1310,70 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         )
         .await;
         assert_eq!(status, AxumStatus::BAD_REQUEST);
+
+        for field in ["request_digest", "requested_at"] {
+            let mut launch: serde_json::Value =
+                serde_json::from_str(&launch_request("missing-launch-field", "prompt")).unwrap();
+            launch["tool_input"].as_object_mut().unwrap().remove(field);
+            let status = post_json(
+                &app,
+                "/api/v1/hooks/approval",
+                &serde_json::to_string(&launch).unwrap(),
+            )
+            .await;
+            assert_eq!(status, AxumStatus::BAD_REQUEST, "missing {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_launch_rejects_noncanonical_bindings_and_invalid_timestamps() {
+        let app = test_app();
+        let cases = [
+            (
+                "uppercase-digest",
+                "request_digest",
+                serde_json::json!("A".repeat(64)),
+            ),
+            (
+                "noncanonical-invocation",
+                "invocation_id",
+                serde_json::json!("018F0F21-76C0-7B37-A446-31F82A5E7602"),
+            ),
+            (
+                "future-request",
+                "requested_at",
+                serde_json::json!("2098-01-01T00:00:00Z"),
+            ),
+            (
+                "expired-request",
+                "expires_at",
+                serde_json::json!("2020-01-01T00:00:00Z"),
+            ),
+        ];
+        for (id, field, value) in cases {
+            let mut request: serde_json::Value =
+                serde_json::from_str(&launch_request(id, "prompt")).unwrap();
+            request["tool_input"][field] = value;
+            let status = post_json(
+                &app,
+                "/api/v1/hooks/approval",
+                &serde_json::to_string(&request).unwrap(),
+            )
+            .await;
+            assert_eq!(status, AxumStatus::BAD_REQUEST, "case {id}");
+        }
+
+        let mut request: serde_json::Value =
+            serde_json::from_str(&launch_request("empty-validity", "prompt")).unwrap();
+        request["tool_input"]["requested_at"] = "2099-01-01T00:00:00Z".into();
+        request["tool_input"]["expires_at"] = "2099-01-01T00:00:00Z".into();
+        let status = post_json(
+            &app,
+            "/api/v1/hooks/approval",
+            &serde_json::to_string(&request).unwrap(),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1321,7 +1387,7 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         let section_snapshot: Vec<&str> = [
             "policy",
             "digests",
-            "expiry",
+            "validity",
             "prompt",
             "workspaces",
             "git-views",
@@ -1339,7 +1405,7 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
             vec![
                 "policy",
                 "digests",
-                "expiry",
+                "validity",
                 "prompt",
                 "workspaces",
                 "git-views",
@@ -1355,12 +1421,16 @@ read_token_env = "SCM_TEST_INTEGRATION_READ_TOKEN"
         assert!(body.contains("request_id"));
         assert!(body.contains("launch-ui-1"));
         assert!(body.contains("status"));
+        assert!(body.contains("approval_request_digest"));
+        assert!(body.contains("resolved_request_digest"));
+        assert!(body.contains("requested_at"));
 
         let (status, queue) = get_json(&app, "/api/v1/approvals/pending/reviews").await;
         assert_eq!(status, AxumStatus::OK);
         let queue: serde_json::Value = serde_json::from_str(&queue).unwrap();
         assert_eq!(queue[0]["approval"]["id"], created["id"]);
         assert_eq!(queue[0]["launch_review"]["sections"][0]["id"], "policy");
+        assert_eq!(queue[0]["launch_review"]["sections"][2]["id"], "validity");
         assert!(
             queue[0]["raw_record"]
                 .as_str()

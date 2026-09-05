@@ -7371,6 +7371,7 @@ exit 0
                         let approval = Approval {
                             id,
                             request_id: request.id,
+                            request_digest: request.request_digest,
                             session_id: request.session_id,
                             session_display_name: request.session_display_name,
                             project: "primary".into(),
