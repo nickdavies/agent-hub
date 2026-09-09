@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (($# > 1)) || (($# == 1)) && [[ "$1" != "--dry-run" ]]; then
-    echo "usage: $0 [--dry-run]" >&2
+mode=deploy
+legacy_state=
+if (($# == 1)) && [[ "$1" == "--dry-run" ]]; then
+    mode=dry-run
+elif (($# == 2)) && [[ "$1" == "--validate-legacy-state" ]]; then
+    mode=validate-legacy-state
+    legacy_state="$2"
+elif (($# != 0)); then
+    echo "usage: $0 [--dry-run | --validate-legacy-state PATH]" >&2
     exit 2
 fi
 
@@ -23,6 +30,7 @@ workspace=
 staged_binary=
 staged_environment=
 staged_unit=
+validation_pid=
 
 cleanup() {
     local status=$?
@@ -30,6 +38,10 @@ cleanup() {
     [[ -z "$staged_binary" ]] || rm -f -- "$staged_binary" || status=1
     [[ -z "$staged_environment" ]] || rm -f -- "$staged_environment" || status=1
     [[ -z "$staged_unit" ]] || rm -f -- "$staged_unit" || status=1
+    if [[ -n "$validation_pid" ]]; then
+        kill -INT "$validation_pid" 2>/dev/null || true
+        wait "$validation_pid" 2>/dev/null || true
+    fi
     [[ -z "$workspace" ]] || rm -rf -- "$workspace" || status=1
     exit "$status"
 }
@@ -41,6 +53,19 @@ for command in cargo cmp git install mkdir mktemp mv rm sha256sum stat tar; do
         exit 1
     }
 done
+
+if [[ "$mode" == validate-legacy-state ]]; then
+    for command in chmod cp curl kill python3 sleep; do
+        command -v "$command" >/dev/null || {
+            echo "error: required validation command not found: $command" >&2
+            exit 1
+        }
+    done
+    if [[ ! -f "$legacy_state" || -L "$legacy_state" ]]; then
+        echo "error: legacy state must be a regular, non-symlink file: $legacy_state" >&2
+        exit 1
+    fi
+fi
 
 repo_root="$(git -C "$package_dir" rev-parse --show-toplevel)" || {
     echo "error: deployment package is not in a Git worktree" >&2
@@ -244,7 +269,7 @@ validate_cache_path "deployment cache" "$cache_root"
 
 echo "Deploying captured clean HEAD ${captured_head}"
 
-if [[ "${1:-}" == "--dry-run" ]]; then
+if [[ "$mode" == dry-run ]]; then
     echo "Would export HEAD ${captured_head} to a private workspace under ${cache_root}"
     echo "Would run: CARGO_TARGET_DIR=<private>/target cargo build --locked --release -p agent-hub-approvals-server"
     echo "Would atomically install <private>/target/release/agent-hub-approvals-server as ${dest_binary} and verify its SHA-256"
@@ -289,8 +314,53 @@ fi
 
 current_head="$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}')"
 if [[ "$current_head" != "$captured_head" ]] || ! worktree_is_clean; then
-    echo "error: original HEAD or worktree changed while building; refusing to install" >&2
+    echo "error: original HEAD or worktree changed while building; refusing to continue" >&2
     exit 1
+fi
+
+if [[ "$mode" == validate-legacy-state ]]; then
+    validation_state="${workspace}/server_data.json"
+    legacy_sha256="$(sha256 "$legacy_state")"
+    cp -- "$legacy_state" "$validation_state"
+    chmod 0600 "$validation_state"
+    port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+    AUTH_MODE=none APPROVAL_MODE=readwrite BASE_URL="http://127.0.0.1:${port}" \
+        LISTEN_ADDR="127.0.0.1:${port}" \
+        "$source_binary" serve noop local-file --path "$validation_state" \
+        >"${workspace}/validation.log" 2>&1 &
+    validation_pid=$!
+    ready=false
+    for _ in {1..100}; do
+        if curl --silent --fail "http://127.0.0.1:${port}/health" >/dev/null; then
+            ready=true
+            break
+        fi
+        if ! kill -0 "$validation_pid" 2>/dev/null; then
+            echo "error: copied legacy state failed to load; see ${workspace}/validation.log" >&2
+            exit 1
+        fi
+        sleep 0.05
+    done
+    if [[ "$ready" != true ]]; then
+        echo "error: copied legacy state did not become healthy" >&2
+        exit 1
+    fi
+    curl --silent --fail "http://127.0.0.1:${port}/approvals/queue" >/dev/null
+    curl --silent --fail "http://127.0.0.1:${port}/api/v1/sessions" >/dev/null
+    kill -INT "$validation_pid"
+    wait "$validation_pid"
+    validation_pid=
+    if [[ ! -f "$validation_state" || -L "$validation_state" ]]; then
+        echo "error: validation server did not save copied state as a regular file" >&2
+        exit 1
+    fi
+    if [[ "$(sha256 "$legacy_state")" != "$legacy_sha256" ]]; then
+        echo "error: source legacy state changed during validation" >&2
+        exit 1
+    fi
+    echo "Validated copied legacy state load, mobile queue, API, SIGINT stop, and save"
+    echo "Source legacy state was not modified: ${legacy_state}"
+    exit 0
 fi
 
 validate_destinations

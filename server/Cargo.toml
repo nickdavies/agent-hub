@@ -16,12 +16,12 @@ axum = "0.8"
 capabilities = { path = "../capabilities" }
 agent-hub-config = { package = "config", path = "../config" }
 agent-hub-approval-client = { path = "../approval-client" }
+agent-hub-web-auth = { path = "../web-auth" }
 protocol = { path = "../protocol" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 comrak = "0.24"
 html-escape = "0.2"
-openidconnect = "4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

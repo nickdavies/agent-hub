@@ -22848,7 +22848,7 @@ mod multi_repo_tests {
             "/host/repo:/repos/agent-hub-poc-test:ro".to_string(),
             "--entrypoint".to_string(),
             "/usr/bin/sh".to_string(),
-            "agent-hub/job-code:2026-08-24".to_string(),
+            "agent-hub/job-code:2026-09-09".to_string(),
             "-lc".to_string(),
             "/usr/local/bin/opencode run".to_string(),
         ];

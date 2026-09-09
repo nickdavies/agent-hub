@@ -10,7 +10,7 @@ use super::config::Token;
 use super::oauth;
 
 pub fn match_bearer_token<'a>(header: &str, tokens: &'a [Token]) -> Option<&'a Token> {
-    let token = header.strip_prefix("Bearer ")?;
+    let token = agent_hub_web_auth::bearer_token(header)?;
     tokens.iter().find(|t| t.secret.expose() == token)
 }
 

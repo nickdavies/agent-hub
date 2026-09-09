@@ -48,12 +48,12 @@ dependencies = [
 name = "agent-hub-approval-service"
 version = "0.1.0"
 dependencies = [
+ "agent-hub-web-auth",
  "anyhow",
  "askama",
  "askama_web",
  "axum 0.8.8",
  "chrono",
- "openidconnect",
  "protocol",
  "reqwest",
  "rmcp",
@@ -125,6 +125,7 @@ name = "agent-hub-server"
 version = "0.1.0"
 dependencies = [
  "agent-hub-approval-client",
+ "agent-hub-web-auth",
  "anyhow",
  "askama",
  "askama_web",
@@ -140,7 +141,6 @@ dependencies = [
  "html-escape",
  "libc",
  "local-agent",
- "openidconnect",
  "prost",
  "prost-types",
  "protocol",
@@ -163,6 +163,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "agent-hub-web-auth"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.8",
+ "openidconnect",
+ "protocol",
+ "reqwest",
+ "serde",
+ "thiserror 2.0.18",
+ "tower-sessions",
+ "tracing",
 ]
 
 [[package]]

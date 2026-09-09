@@ -522,6 +522,9 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         let mut mismatched = parsed.image.build_contexts["agent-hub-source"].clone();
         mismatched.archive_sha256 = "not-a-digest".into();
         assert!(mismatched.validate().is_err());
+        let mut floating = parsed.image.build_contexts["agent-hub-source"].clone();
+        floating.commit = "latest".into();
+        assert!(floating.validate().is_err());
     }
 
     #[test]

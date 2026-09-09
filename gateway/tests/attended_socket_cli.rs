@@ -160,7 +160,9 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
                 || stderr.contains("invalid action/command")
                 || stderr.contains("message outside")
                 || stderr.contains("invalid 'in_cwds'")
-                || stderr.contains("invalid type")
+                || stderr.contains("in_cwds roots")
+                || stderr.contains("invalid type"),
+            "unexpected validation error: {stderr}"
         );
     }
 }

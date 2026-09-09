@@ -472,7 +472,6 @@ pub struct OpenCodeHookInput {
     /// remains intact for review, delegation, and attended request digests.
     #[serde(default)]
     pub tool_match_input: Option<serde_json::Value>,
-    #[serde(default = "default_cwd")]
     pub cwd: String,
     #[serde(default)]
     pub workspace_roots: Option<Vec<String>>,

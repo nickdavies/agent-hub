@@ -24,9 +24,7 @@ pub async fn require_auth<N: Notifier>(
         .and_then(|v| v.to_str().ok())
     {
         // If Authorization header is present, it must be valid
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+        let token = agent_hub_web_auth::bearer_token(header).ok_or(StatusCode::UNAUTHORIZED)?;
 
         let matched = state
             .config
@@ -62,4 +60,13 @@ pub async fn require_web_auth(session: Session, request: Request, next: Next) ->
         return next.run(request).await;
     }
     Redirect::temporary("/auth/login").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bearer_token_parser_rejects_malformed_authorization() {
+        assert_eq!(agent_hub_web_auth::bearer_token("Bearer abc"), Some("abc"));
+        assert!(agent_hub_web_auth::bearer_token("abc").is_none());
+    }
 }

@@ -1,3 +1,3 @@
 [workspace]
-members = ["server", "approval-service", "approvals-server", "cli", "capabilities", "gateway", "config", "protocol", "executor", "local-agent", "approval-client"]
+members = ["server", "approval-service", "approvals-server", "cli", "capabilities", "gateway", "config", "protocol", "executor", "local-agent", "approval-client", "web-auth"]
 resolver = "3"

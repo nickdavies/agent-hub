@@ -6,7 +6,7 @@ use agent_hub_executor::egress::{
 };
 use agent_hub_executor::{Cancellation, Deadline};
 
-const JOB_IMAGE: &str = "agent-hub/job-code:2026-08-24";
+const JOB_IMAGE: &str = "agent-hub/job-code:2026-09-09";
 const SQUID_IMAGE: &str =
     "ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029";
 const FIXTURE_LABEL: &str = "agent-hub.reddit.com/executor-fixture";

@@ -53,4 +53,7 @@ fn systemd_unit_preserves_legacy_install_contract() {
     assert!(deploy.contains("cargo build --locked --release -p agent-hub-approvals-server"));
     assert!(deploy.contains("release/agent-hub-approvals-server"));
     assert!(deploy.contains("/agent-hub-server\""));
+    assert!(deploy.contains("--validate-legacy-state"));
+    assert!(deploy.contains("/approvals/queue"));
+    assert!(deploy.contains("/api/v1/sessions"));
 }

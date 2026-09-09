@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     tags: ["v*"]
@@ -28,6 +29,43 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  gateway-network:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Gateway HTTP network outcomes
+        run: cargo test -p agent-hub-gateway --test http_outcomes -- --ignored
+      - name: Gateway CLI network outcomes
+        run: cargo test -p agent-hub-gateway --test agent_hub_run_cli -- --ignored
+
+  executor-slow-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Executor restart recovery
+        run: cargo test -p agent-hub-executor --test executor_contract cancelled_egress_late_creates_recover_all_resource_kinds_after_restart -- --ignored --exact
+
+  local-agent-faults:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Local-agent process-global fault coverage
+        run: |
+          cargo test -p local-agent tests::cleanup_running_after_hook_observes_persisted_phase_before_cleanup -- --ignored --exact
+          cargo test -p local-agent tests::reconciled_workspace_preparing_enters_persisted_cleanup_before_reporting -- --ignored --exact
+          cargo test -p local-agent tests::event_publication_completion_fault_replays_after_acknowledged_delivery -- --ignored --exact
+          cargo test -p local-agent tests::central_execution_fault_hook_targets_every_lifecycle_and_operation_boundary -- --ignored --exact
+          cargo test -p local-agent tests::central_execution_pause_hook_uses_ready_and_release_files -- --ignored --exact
 
   typecheck-opencode-plugin:
     runs-on: ubuntu-latest

@@ -186,10 +186,10 @@ The local setup uses a shared artifact store directory mounted into the server c
 make build-job-images
 ```
 
-Builds `agent-hub/job-base:latest`, `agent-hub/job-code:2026-08-24`, and
+Builds `agent-hub/job-base:latest`, `agent-hub/job-code:2026-09-09`, and
 `agent-hub/job-infra:latest` from Dockerfiles in `../agent-hub-configs/images/`.
 The supported coding runner is OpenCode. The job-code image is tagged
-`agent-hub/job-code:2026-08-24`; its base image, Debian snapshot, and every
+`agent-hub/job-code:2026-09-09`; its base image, Debian snapshot, and every
 downloaded tool version/checksum are fixed in the Dockerfile. The build accepts
 no artifact URL or digest inputs. After building job-code, the CLI runs the image's
 shared toolchain preflight with no network, mounts, or credentials, a read-only root,
@@ -246,6 +246,12 @@ are never made available to agent or command jobs.
 
 - `CONFIG_ROOT` must point to the same config checkout for server, CLI build, and
   local-agent startup.
+- Coordinate an Agent Hub release with an exact `agent-hub-configs` commit. That
+  config commit must pin `[image.build_contexts.agent-hub-source].commit` to the
+  released 40-character Agent Hub commit and its `archive_sha256` to that commit's
+  verified archive. Commit both sides before cutover and record the pair in the
+  release evidence. Do not use a branch, tag, or `latest`: config loading and build
+  context materialization hard-fail non-canonical or unresolved commit identities.
 - Installed workflow IDs come from `[system.workflows].installed`; the current
   local set is `simple-code-change` and `github-pr`.
 - Workflow directories use those exact IDs and contain one `workflow.toml` each.

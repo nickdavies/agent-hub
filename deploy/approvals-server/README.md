@@ -17,6 +17,7 @@ Review a dry run, then deploy:
 
 ```sh
 deploy/approvals-server/deploy.sh --dry-run
+deploy/approvals-server/deploy.sh --validate-legacy-state /path/to/current/server_data.json
 deploy/approvals-server/deploy.sh
 ```
 
@@ -58,19 +59,33 @@ installation directories.
 The script does not invoke systemd. Restart is intentionally separate so an
 operator controls activation of the newly installed binary and unit.
 
+Before cutover, `--validate-legacy-state` exports and builds the same captured
+clean HEAD used by deployment, copies the specified regular non-symlink legacy
+state into its private deployment workspace, and starts the standalone approvals
+server against only that copy. It proves `/health`, the mobile
+`/approvals/queue`, and `/api/v1/sessions`, sends the configured `SIGINT`, waits
+for a successful stop/save, and verifies that the source state's SHA-256 did not
+change. The validation mode installs nothing, does not invoke systemd, and removes
+the copied state with the private workspace. Run it while the legacy server is
+stopped or against a separately captured point-in-time copy so the input is
+internally consistent.
+
 ## Manual cutover
 
-1. Verify the installed unit, then reload the user manager:
+1. Stop writes to the legacy server, copy its state to a separate validation
+   path, and run `--validate-legacy-state` against that copy. Do not point the
+   validator at live state.
+2. Verify the installed unit, then reload the user manager:
 
    ```sh
    systemd-analyze --user verify agent-hub-approvals.service
    systemctl --user daemon-reload
    ```
-2. Identify the exact old server PID. The current process is interactive and
+3. Identify the exact old server PID. The current process is interactive and
    unmanaged; if that changes, disable its supervisor before continuing.
-3. Send that PID `SIGINT`, wait until it exits, and verify port 8080 has no
+4. Send that PID `SIGINT`, wait until it exits, and verify port 8080 has no
    listener before copying state or starting the unit.
-4. Derive the state location, create it with mode `0700`, and copy final state:
+5. Derive the state location, create it with mode `0700`, and copy final state:
 
    ```sh
    state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -79,7 +94,7 @@ operator controls activation of the newly installed binary and unit.
      "$state_home/agent-hub-approvals/server_data.json"
    ```
 
-5. Start `agent-hub-approvals.service` for the first activation or apply a
+6. Start `agent-hub-approvals.service` for the first activation or apply a
    redeployment with an explicit restart, then check its status and health:
 
    ```sh
@@ -87,4 +102,4 @@ operator controls activation of the newly installed binary and unit.
    systemctl --user status agent-hub-approvals.service
    curl --fail http://127.0.0.1:8080/health
    ```
-6. Leave `agent-hub-approvals.service` disabled by default; enable it only if automatic user-session startup is later desired.
+7. Leave `agent-hub-approvals.service` disabled by default; enable it only if automatic user-session startup is later desired.
