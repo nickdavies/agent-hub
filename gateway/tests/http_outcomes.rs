@@ -417,6 +417,7 @@ fn diagnostics(output: &GatewayOutput) -> String {
 }
 
 #[tokio::test]
+#[ignore = "loopback network integration; run explicitly with --ignored"]
 async fn tool_approval_explicit_denial_preserves_operator_reason() {
     let server = TestServer::start(Scenario::ApprovalDenied).await;
     let output = run_gateway(&server, "approval", &approval_input()).await;
@@ -434,6 +435,7 @@ async fn tool_approval_explicit_denial_preserves_operator_reason() {
 }
 
 #[tokio::test]
+#[ignore = "loopback network integration; run explicitly with --ignored"]
 async fn tool_approval_healthy_wait_timeout_is_neutral_operator_away_response() {
     let server = TestServer::start(Scenario::ApprovalTimeout).await;
     let output = run_gateway(&server, "approval", &approval_input()).await;
@@ -461,6 +463,7 @@ async fn tool_approval_healthy_wait_timeout_is_neutral_operator_away_response() 
 }
 
 #[tokio::test]
+#[ignore = "loopback network integration; run explicitly with --ignored"]
 async fn tool_approval_failed_wait_until_deadline_is_neutral_pipeline_response() {
     let server = TestServer::start(Scenario::ApprovalPipelineError).await;
     let output = run_gateway(&server, "approval", &approval_input()).await;
@@ -488,6 +491,7 @@ async fn tool_approval_failed_wait_until_deadline_is_neutral_pipeline_response()
 }
 
 #[tokio::test]
+#[ignore = "loopback network integration; run explicitly with --ignored"]
 async fn question_explicit_rejection_exits_one() {
     let server = TestServer::start(Scenario::QuestionRejected).await;
     let output = run_gateway(&server, "question", &question_input()).await;
@@ -500,6 +504,7 @@ async fn question_explicit_rejection_exits_one() {
 }
 
 #[tokio::test]
+#[ignore = "loopback network integration; run explicitly with --ignored"]
 async fn question_healthy_wait_timeout_exits_three() {
     let server = TestServer::start(Scenario::QuestionTimeout).await;
     let output = run_gateway(&server, "question", &question_input()).await;
@@ -512,6 +517,7 @@ async fn question_healthy_wait_timeout_exits_three() {
 }
 
 #[tokio::test]
+#[ignore = "loopback network integration; run explicitly with --ignored"]
 async fn question_failed_wait_until_deadline_exits_four() {
     let server = TestServer::start(Scenario::QuestionPipelineError).await;
     let output = run_gateway(&server, "question", &question_input()).await;

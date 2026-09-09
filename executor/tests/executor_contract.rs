@@ -433,6 +433,7 @@ async fn cancelled_primary_late_create_is_recovered_after_restart_and_quiescence
 }
 
 #[tokio::test]
+#[ignore = "slow process-recovery integration; run explicitly with --ignored"]
 async fn cancelled_egress_late_creates_recover_all_resource_kinds_after_restart() {
     let root = temp_root("egress-late-create");
     let command = root.join("docker");

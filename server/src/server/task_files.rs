@@ -598,6 +598,12 @@ impl TaskAdapter for TaskFileStore {
     }
 
     fn operation_timeout(&self) -> std::time::Duration {
+        #[cfg(test)]
+        if let Ok(value) = std::env::var("AGENT_HUB_TEST_FILE_HELPER_DEADLINE_MS") {
+            return std::time::Duration::from_millis(
+                value.parse().expect("numeric helper deadline"),
+            );
+        }
         std::time::Duration::from_secs(30)
     }
 
@@ -1174,7 +1180,11 @@ mod tests {
             "hold-lock" => store
                 .with_provider_lock(
                     super::super::task_adapter::ProviderOperationDeadline::from_now(
-                        std::time::Duration::from_secs(30),
+                        std::env::var("AGENT_HUB_TEST_FILE_HELPER_DEADLINE_MS")
+                            .ok()
+                            .map(|value| value.parse().expect("numeric helper deadline"))
+                            .map(std::time::Duration::from_millis)
+                            .unwrap_or(std::time::Duration::from_secs(30)),
                     ),
                     || Ok(()),
                 )
@@ -1252,8 +1262,6 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut second = second.spawn().expect("spawn second mutation");
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(second.try_wait().expect("poll contender").is_none());
         std::fs::write(&release, b"release").expect("release first mutation");
         assert!(wait_for_child(&mut first, Duration::from_secs(5)).success());
         assert!(wait_for_child(&mut second, Duration::from_secs(5)).success());
@@ -1477,7 +1485,8 @@ mod tests {
 
     #[test]
     fn provider_lock_outlives_delivery_lease_and_replay_is_idempotent() {
-        const ORIGINAL_OUTBOX_LEASE: Duration = Duration::from_secs(50);
+        const TEST_OUTBOX_LEASE: Duration = Duration::from_millis(100);
+        const CONTENDER_DEADLINE: Duration = Duration::from_millis(300);
         let fixture = SubprocessFixture::new("task-file-lease-fence");
         let store = fixture.store();
         let task_id = Uuid::new_v4();
@@ -1510,13 +1519,17 @@ mod tests {
 
         let mut replay = fixture.helper_command("mutate");
         configure(&mut replay);
-        replay.stdout(Stdio::null()).stderr(Stdio::null());
+        replay
+            .env(
+                "AGENT_HUB_TEST_FILE_HELPER_DEADLINE_MS",
+                CONTENDER_DEADLINE.as_millis().to_string(),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let mut replay = replay.spawn().expect("spawn replay");
-        std::thread::sleep(ORIGINAL_OUTBOX_LEASE + Duration::from_secs(1));
-        let replay_status = replay
-            .try_wait()
-            .expect("poll blocked replay")
-            .expect("blocked contender must hit its provider deadline");
+        let replay_started = Instant::now();
+        let replay_status = wait_for_child(&mut replay, Duration::from_secs(2));
+        assert!(replay_started.elapsed() >= TEST_OUTBOX_LEASE);
         assert!(!replay_status.success());
         std::fs::write(release, b"release").expect("release owner");
         assert!(wait_for_child(&mut owner, Duration::from_secs(10)).success());

@@ -1160,7 +1160,7 @@ async fn poll_for_decision(
             client.wait_approval(
                 approval_id,
                 waiter_id,
-                remaining.min(Duration::from_secs(60)),
+                Duration::from_secs(60),
             ),
         )
         .await?;
