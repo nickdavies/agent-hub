@@ -358,9 +358,12 @@ fn validate_tool_config_dto(config: &ToolConfigJson) -> Result<(), String> {
             }
         }
         for (name, paths) in [("in_paths", &rule.in_paths), ("in_cwds", &rule.in_cwds)] {
-            if paths.as_ref().is_some_and(|paths| {
-                paths.is_empty() || paths.iter().any(|path| path.trim().is_empty())
-            }) {
+            if paths.as_ref().is_some_and(Vec::is_empty)
+                || (name == "in_paths"
+                    && paths
+                        .as_ref()
+                        .is_some_and(|paths| paths.iter().any(|path| path.trim().is_empty())))
+            {
                 return Err(format!("rule {number} has invalid '{name}'"));
             }
         }

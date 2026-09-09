@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::{EnvironmentConfig, NetworkPolicyConfig, SystemConfig, flatten_policy};
 
 pub const DURABLE_OPENCODE_MODEL: &str = "openai/gpt-5.6-sol";
-pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-09-04";
+pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-09-09";
 pub const APPROVAL_BUNDLE_PROTOCOL: &str = protocol::APPROVAL_BUNDLE_PROTOCOL;
 pub const APPROVAL_PLUGIN_URI: &str =
     "file:///opencode/config/opencode/approval/agent-hub-opencode-plugin.js";
@@ -1174,7 +1174,7 @@ triage_environment = "test"
             r#"[environment]
 name = "test"
 description = "test"
-image = "agent-hub/job-code:2026-09-04"
+image = "agent-hub/job-code:2026-09-09"
 network_policy = "none"
 approval_mode = "auto"
 include_skills = ["example"]
