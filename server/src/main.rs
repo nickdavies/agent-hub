@@ -165,10 +165,9 @@ async fn serve() -> anyhow::Result<()> {
     let oauth = if config.auth_mode != server::config::AuthMode::None
         && let Some(base_url) = config.base_url.as_deref()
     {
-        let oauth = OAuthManager::from_env(base_url)
+        OAuthManager::from_env(base_url)
             .await
-            .context("failed to initialize OAuth")?;
-        oauth
+            .context("failed to initialize OAuth")?
     } else {
         None
     };

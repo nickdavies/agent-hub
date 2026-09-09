@@ -32,16 +32,16 @@ run-local-agent:
 		--mode docker
 
 test-approval-client-fast:
-	cargo test -p agent-hub-gateway --bin agent-hub-gateway
+	cargo test -p agent-hub-approval-client
 
 test-approval-service-fast:
-	cargo test -p agent-hub-server approval
+	cargo test -p agent-hub-approval-service
 
 test-server-fast:
 	cargo test -p agent-hub-server
 
 test-api-fast:
-	cargo test -p agent-hub-server server::integration_tests
+	cargo test -p agent-hub-server server::tests
 
 test-gateway-fast:
 	cargo test -p agent-hub-gateway

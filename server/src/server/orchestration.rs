@@ -747,11 +747,6 @@ pub struct OrchestrationService {
 
 impl OrchestrationService {
     #[cfg(test)]
-    pub(crate) fn database_path_for_tests(&self) -> &std::path::Path {
-        self.db_path.as_path()
-    }
-
-    #[cfg(test)]
     fn release_writer_guard_for_restart_test(&self) -> anyhow::Result<()> {
         if let Some(file) = self.writer_guard.get() {
             file.unlock()?;

@@ -1,6 +1,7 @@
 use protocol::{ImmutableAuthorizationBundle, Job};
 use uuid::Uuid;
 
+#[allow(clippy::result_large_err)]
 pub mod pb {
     tonic::include_proto!("worker");
 }

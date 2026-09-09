@@ -1157,11 +1157,7 @@ async fn poll_for_decision(
         let resp = await_approval_deadline(
             deadline,
             last_wait_was_healthy,
-            client.wait_approval(
-                approval_id,
-                waiter_id,
-                Duration::from_secs(60),
-            ),
+            client.wait_approval(approval_id, waiter_id, Duration::from_secs(60)),
         )
         .await?;
 

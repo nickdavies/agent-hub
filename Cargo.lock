@@ -124,7 +124,7 @@ dependencies = [
 name = "agent-hub-server"
 version = "0.1.0"
 dependencies = [
- "agent-hub-approval-service",
+ "agent-hub-approval-client",
  "anyhow",
  "askama",
  "askama_web",
@@ -145,7 +145,6 @@ dependencies = [
  "prost-types",
  "protocol",
  "reqwest",
- "rmcp",
  "rusqlite",
  "serde",
  "serde_json",

@@ -23,15 +23,14 @@ use super::questions;
 use crate::presence::PresenceState;
 
 /// Tracks pending delayed notifications so they can be cancelled.
+#[derive(Default)]
 pub struct PendingNotifications {
     pending: RwLock<HashMap<SessionId, CancellationToken>>,
 }
 
 impl PendingNotifications {
     pub fn new() -> Self {
-        Self {
-            pending: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Register a cancellation token for a session. Cancels any existing pending notification.

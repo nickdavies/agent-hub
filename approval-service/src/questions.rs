@@ -18,6 +18,7 @@ struct QuestionEntry {
     last_polled_at: Option<Instant>,
 }
 
+#[derive(Default)]
 pub struct QuestionRegistry {
     entries: RwLock<HashMap<Uuid, QuestionEntry>>,
     /// gateway request_id → question Uuid (idempotency)
@@ -38,11 +39,7 @@ pub struct RegisterQuestion {
 
 impl QuestionRegistry {
     pub fn new() -> Self {
-        Self {
-            entries: RwLock::new(HashMap::new()),
-            by_request_id: RwLock::new(HashMap::new()),
-            by_session_id: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Register a new question or return existing one if request_id matches.

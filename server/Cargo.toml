@@ -8,7 +8,6 @@ name = "agent-hub-server"
 path = "src/main.rs"
 
 [dependencies]
-agent-hub-approval-service = { path = "../approval-service" }
 anyhow = "1"
 async-trait = "0.1"
 askama = "0.15"

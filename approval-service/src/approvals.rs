@@ -24,6 +24,7 @@ struct ApprovalEntry {
     active_waiters: HashSet<Uuid>,
 }
 
+#[derive(Default)]
 pub struct ApprovalRegistry {
     entries: RwLock<HashMap<Uuid, ApprovalEntry>>,
     /// request_id -> approval Uuid (idempotency)
@@ -65,11 +66,7 @@ pub enum ApprovalSnapshot {
 
 impl ApprovalRegistry {
     pub fn new() -> Self {
-        Self {
-            entries: RwLock::new(HashMap::new()),
-            by_request_id: RwLock::new(HashMap::new()),
-            by_session_id: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Register a new approval, or return the existing approval only when the
