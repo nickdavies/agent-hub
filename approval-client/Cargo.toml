@@ -1,0 +1,16 @@
+[package]
+name = "agent-hub-approval-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+protocol = { path = "../protocol" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+uuid = "1"
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full", "test-util"] }

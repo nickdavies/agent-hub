@@ -2,9 +2,10 @@ use std::io::Read;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use agent_hub_approval_client::{ApprovalClient, ErrorKind};
 use protocol::{
-    QuestionDecision, QuestionGatewayOutput, QuestionProxyRequest, QuestionProxyResponse,
-    QuestionResolveRequest, QuestionStatus, QuestionWaitResponse, Secret,
+    QuestionDecision, QuestionGatewayOutput, QuestionProxyRequest, QuestionResolveRequest,
+    QuestionStatus, Secret,
 };
 
 /// Arguments for the `question` subcommand.
@@ -95,10 +96,7 @@ async fn proxy_question(
     args: &QuestionArgs,
     req: &QuestionProxyRequest,
 ) -> Result<Vec<Vec<String>>, QuestionFlowError> {
-    let (client, base) = crate::http::authenticated_client(&args.server, args.token.is_some())
-        .map_err(QuestionFlowError::Pipeline)?;
-
-    let register_url = crate::http::endpoint(&base, "api/v1/hooks/question")
+    let client = crate::gateway_client(&args.server, args.token.clone())
         .map_err(QuestionFlowError::Pipeline)?;
     eprintln!(
         "[info] registering question: session={} questions={}",
@@ -106,24 +104,11 @@ async fn proxy_question(
         req.questions.len()
     );
 
-    let register = authenticated(args.token.as_ref(), client.post(register_url.as_str()));
-    let register_resp = register
-        .json(req)
-        .timeout(Duration::from_secs(10))
-        .send()
+    let register_resp = client
+        .register_question(req)
         .await
         .map_err(|e| QuestionFlowError::Pipeline(format!("failed to register question: {e}")))?;
-
-    if !register_resp.status().is_success() {
-        return Err(QuestionFlowError::Pipeline(format!(
-            "server returned {} for question registration",
-            register_resp.status()
-        )));
-    }
-
-    let proxy_resp: QuestionProxyResponse = register_resp.json().await.map_err(|e| {
-        QuestionFlowError::Pipeline(format!("failed to parse question response: {e}"))
-    })?;
+    let proxy_resp = register_resp.value;
 
     // Check if already resolved (e.g. idempotency replay)
     if !matches!(proxy_resp.status, QuestionStatus::Pending) {
@@ -131,33 +116,25 @@ async fn proxy_question(
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
-    let wait_url =
-        crate::http::endpoint(&base, &format!("api/v1/questions/{}/wait", proxy_resp.id))
-            .map_err(QuestionFlowError::Pipeline)?;
-    let cancel_url = crate::http::endpoint(
-        &base,
-        &format!("api/v1/questions/{}/resolve", proxy_resp.id),
-    )
-    .map_err(QuestionFlowError::Pipeline)?;
-
     eprintln!(
         "[info] waiting for question answer (id={}, timeout={}s)",
         proxy_resp.id, args.timeout
     );
 
     tokio::select! {
-        result = poll_for_answer(&client, wait_url.as_str(), args.token.as_ref(), deadline, args.timeout) => result,
+        result = poll_for_answer(&client, proxy_resp.id, deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal, cancelling question {}", proxy_resp.id);
-            let cancel = authenticated(args.token.as_ref(), client.post(cancel_url.as_str()));
-            let _ = cancel
-                .json(&QuestionResolveRequest {
-                    decision: QuestionDecision::Cancel,
-                    answers: None,
-                    reason: Some("aborted by signal".to_string()),
-                })
-                .timeout(Duration::from_secs(5))
-                .send()
+            let _ = client
+                .resolve_question_with_timeout(
+                    proxy_resp.id,
+                    &QuestionResolveRequest {
+                        decision: QuestionDecision::Cancel,
+                        answers: None,
+                        reason: Some("aborted by signal".to_string()),
+                    },
+                    Some(Duration::from_secs(5)),
+                )
                 .await;
             Err(QuestionFlowError::Pipeline("aborted by signal".to_string()))
         }
@@ -166,9 +143,8 @@ async fn proxy_question(
 
 /// Long-poll the server until the question is resolved or global timeout expires.
 async fn poll_for_answer(
-    client: &reqwest::Client,
-    wait_url: &str,
-    token: Option<&Secret>,
+    client: &ApprovalClient,
+    question_id: uuid::Uuid,
     deadline: tokio::time::Instant,
     timeout_secs: u64,
 ) -> Result<Vec<Vec<String>>, QuestionFlowError> {
@@ -186,87 +162,48 @@ async fn poll_for_answer(
         let resp = await_question_deadline(
             deadline,
             last_wait_was_healthy,
-            authenticated(token, client.get(wait_url))
-                .timeout(Duration::from_secs(60))
-                .send(),
+            client.wait_question(question_id, Duration::from_secs(60)),
         )
         .await?;
 
         let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[warn] question wait failed (attempt {attempt}, retrying in 2s): {e}");
-                last_wait_was_healthy = false;
-                await_question_deadline(
-                    deadline,
-                    last_wait_was_healthy,
-                    tokio::time::sleep(Duration::from_secs(2)),
-                )
-                .await?;
-                continue;
+            Ok(response) => response,
+            Err(error)
+                if error.kind() == ErrorKind::Timeout
+                    && tokio::time::Instant::now() >= deadline =>
+            {
+                return Err(question_deadline_error(last_wait_was_healthy));
             }
-        };
-
-        let http_status = resp.status();
-
-        if !http_status.is_success() {
-            if http_status.is_client_error() {
+            Err(error) if error.is_client_response() => {
+                let http_status = error.status().expect("client response has status");
                 return Err(QuestionFlowError::Pipeline(format!(
                     "server returned {http_status} for question wait"
                 )));
             }
-            eprintln!(
-                "[warn] server returned {http_status} for question wait (attempt {attempt}, retrying in 2s)"
-            );
-            last_wait_was_healthy = false;
-            await_question_deadline(
-                deadline,
-                last_wait_was_healthy,
-                tokio::time::sleep(Duration::from_secs(2)),
-            )
-            .await?;
-            continue;
+            Err(error) => {
+                eprintln!(
+                    "[warn] question wait failed (attempt {attempt}, retrying in 2s): {error}"
+                );
+                last_wait_was_healthy = false;
+                await_question_deadline(
+                    deadline,
+                    last_wait_was_healthy,
+                    tokio::time::sleep(Duration::from_secs(2)),
+                )
+                .await?;
+                continue;
+            }
+        };
+        let http_status = resp.status;
+        let wait = resp.value;
+
+        if !(200..300).contains(&http_status) {
+            unreachable!("approval client accepts only successful responses");
         }
-
-        let body = match await_question_deadline(deadline, last_wait_was_healthy, resp.text())
-            .await?
-        {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!(
-                    "[warn] failed to read question wait body (attempt {attempt}, retrying in 2s): {e}"
-                );
-                last_wait_was_healthy = false;
-                await_question_deadline(
-                    deadline,
-                    last_wait_was_healthy,
-                    tokio::time::sleep(Duration::from_secs(2)),
-                )
-                .await?;
-                continue;
-            }
-        };
-
-        let wait: QuestionWaitResponse = match serde_json::from_str(&body) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!(
-                    "[warn] failed to parse question wait response (attempt {attempt}, retrying in 2s): {e}"
-                );
-                last_wait_was_healthy = false;
-                await_question_deadline(
-                    deadline,
-                    last_wait_was_healthy,
-                    tokio::time::sleep(Duration::from_secs(2)),
-                )
-                .await?;
-                continue;
-            }
-        };
 
         ensure_question_before_deadline(deadline, last_wait_was_healthy)?;
 
-        if http_status.as_u16() == 202 {
+        if http_status == 202 {
             if !matches!(wait.status, QuestionStatus::Pending) {
                 return Err(QuestionFlowError::Pipeline(format!(
                     "server returned {http_status} with non-pending question status"
@@ -328,16 +265,6 @@ where
     tokio::time::timeout_at(deadline, future)
         .await
         .map_err(|_| question_deadline_error(last_wait_was_healthy))
-}
-
-fn authenticated(
-    token: Option<&Secret>,
-    request: reqwest::RequestBuilder,
-) -> reqwest::RequestBuilder {
-    match token {
-        Some(token) => request.bearer_auth(token.expose()),
-        None => request,
-    }
 }
 
 /// Wait for SIGTERM or SIGINT.

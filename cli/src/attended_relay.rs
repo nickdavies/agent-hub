@@ -5,22 +5,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_hub_approval_client::{ApprovalClient, ClientOptions};
 use agent_hub_executor::ExecutionCancellationContext;
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use protocol::{
     ATTENDED_GATEWAY_MAX_FRAME_BYTES, Approval, ApprovalDecision, ApprovalResolveRequest,
-    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, AttendedGatewayBindingV1,
-    AttendedGatewayDecisionKind, AttendedGatewayRequestV1, Secret, decode_attended_gateway_payload,
+    ApprovalStatus, AttendedGatewayBindingV1, AttendedGatewayDecisionKind,
+    AttendedGatewayRequestV1, Secret, decode_attended_gateway_payload,
     encode_attended_gateway_frame,
 };
-use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Semaphore, watch};
-use url::Url;
 use uuid::Uuid;
+
+#[cfg(test)]
+use protocol::ApprovalResponse;
 
 const MAX_CONNECTIONS: usize = 32;
 const MAX_IN_FLIGHT_APPROVALS: usize = 16;
@@ -126,8 +128,7 @@ pub(crate) enum SupervisionOutcome {
 #[derive(Clone)]
 struct RelayRuntime {
     config: AttendedRelayConfig,
-    endpoint: Url,
-    client: Client,
+    client: ApprovalClient,
     state: Arc<Mutex<RelayState>>,
     effects: ExecutionCancellationContext,
     approvals: Arc<Semaphore>,
@@ -242,7 +243,7 @@ impl AttendedRelay {
         effects: &ExecutionCancellationContext,
         fail_closed: watch::Sender<bool>,
     ) -> anyhow::Result<Self> {
-        let endpoint = validated_endpoint(&config.server_url, config.token.is_some())?;
+        let client = approval_client(&config.server_url, config.token.clone())?;
         ensure!(
             config.approval_bundle.digest == config.binding.approval_bundle_digest
                 && config.approval_bundle.protocol == protocol::APPROVAL_BUNDLE_PROTOCOL,
@@ -292,15 +293,9 @@ impl AttendedRelay {
         }
         chmod.completed()?;
         let identity = verify_socket(&config.socket_path, None)?;
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .connect_timeout(HTTP_OPERATION_TIMEOUT)
-            .timeout(HTTP_OPERATION_TIMEOUT)
-            .build()?;
         let ledger_file = create_private_ledger(&config.ledger_path)?;
         let runtime = RelayRuntime {
             config: config.clone(),
-            endpoint,
             client,
             state: Arc::new(Mutex::new(RelayState {
                 request_ids: HashSet::new(),
@@ -360,13 +355,7 @@ impl AttendedRelay {
         };
         let pending_result = tokio::time::timeout(CANCELLATION_DRAIN_TIMEOUT, async {
             cancel_all_pending(&self.runtime).await?;
-            recover_approval_effects(
-                &self.runtime.client,
-                &self.runtime.endpoint,
-                self.runtime.config.token.as_ref(),
-                &self.runtime.effects,
-            )
-            .await
+            recover_approval_effects(&self.runtime.client, &self.runtime.effects).await
         })
         .await
         .context("pending approval cancellation drain timed out")
@@ -542,20 +531,13 @@ pub(crate) async fn recover_attended_relay(
     token: Option<&Secret>,
     effects: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
-    let endpoint = validated_endpoint(endpoint, token.is_some())?;
-    let client = Client::builder()
-        .redirect(Policy::none())
-        .connect_timeout(HTTP_OPERATION_TIMEOUT)
-        .timeout(HTTP_OPERATION_TIMEOUT)
-        .build()?;
-    recover_approval_effects(&client, &endpoint, token, effects).await?;
+    let client = approval_client(endpoint, token.cloned())?;
+    recover_approval_effects(&client, effects).await?;
     recover_attended_relay_socket(socket_path, effects)
 }
 
 async fn recover_approval_effects(
-    client: &Client,
-    endpoint: &Url,
-    token: Option<&Secret>,
+    client: &ApprovalClient,
     effects: &ExecutionCancellationContext,
 ) -> anyhow::Result<()> {
     let registrations = effects.unresolved_operation_resources("attended_relay_approval_register");
@@ -566,15 +548,10 @@ async fn recover_approval_effects(
     for resource in registrations {
         let registration: RegistrationEffect = serde_json::from_str(&resource)
             .context("invalid attended approval registration effect")?;
-        let response: ApprovalResponse = send_json(
-            authenticated(
-                token,
-                client.post(endpoint_url(endpoint, "api/v1/hooks/approval")?),
-            )
-            .json(&registration.request.approval),
-            StatusCode::OK,
-        )
-        .await?;
+        let response = client
+            .register_approval(&registration.request.approval, None, None)
+            .await?
+            .value;
         persist_approval_state(
             effects,
             &registration.request_id,
@@ -582,27 +559,12 @@ async fn recover_approval_effects(
             &response.status,
         )?;
         let status = if response.status == ApprovalStatus::Pending {
-            cancel_remote(
-                client,
-                endpoint,
-                token,
-                response.id,
-                effects,
-                &registration.request_id,
-            )
-            .await?
+            cancel_remote(client, response.id, effects, &registration.request_id).await?
         } else {
             response.status
         };
         ensure!(status.is_resolved(), "recovered approval is not terminal");
-        verify_terminal(
-            client,
-            endpoint,
-            token,
-            response.id,
-            &registration.request_id,
-        )
-        .await?;
+        verify_terminal(client, response.id, &registration.request_id).await?;
         reconcile_request_effects(effects, &registration.request_id)?;
     }
     let states = effects.unresolved_operation_resources("attended_relay_approval_state");
@@ -617,26 +579,11 @@ async fn recover_approval_effects(
         if !recovered.insert(state.request_id.clone()) {
             continue;
         }
-        let current = get_approval(client, endpoint, token, state.approval_id).await?;
+        let current = get_approval(client, state.approval_id).await?;
         if current.status == ApprovalStatus::Pending {
-            cancel_remote(
-                client,
-                endpoint,
-                token,
-                state.approval_id,
-                effects,
-                &state.request_id,
-            )
-            .await?;
+            cancel_remote(client, state.approval_id, effects, &state.request_id).await?;
         }
-        verify_terminal(
-            client,
-            endpoint,
-            token,
-            state.approval_id,
-            &state.request_id,
-        )
-        .await?;
+        verify_terminal(client, state.approval_id, &state.request_id).await?;
         reconcile_request_effects(effects, &state.request_id)?;
     }
     Ok(())
@@ -1107,19 +1054,12 @@ async fn relay_request(
         .effects
         .begin_external_operation("attended_relay_approval_register", &registration_resource)
         .map_err(|_| RelayFailure::Persistence)?;
-    let response: ApprovalResponse = send_json(
-        authenticated(
-            runtime.config.token.as_ref(),
-            runtime.client.post(
-                endpoint_url(&runtime.endpoint, "api/v1/hooks/approval")
-                    .map_err(|_| RelayFailure::Registration)?,
-            ),
-        )
-        .json(&request.approval),
-        StatusCode::OK,
-    )
-    .await
-    .map_err(|_| RelayFailure::Registration)?;
+    let response = runtime
+        .client
+        .register_approval(&request.approval, None, None)
+        .await
+        .map_err(|_| RelayFailure::Registration)?
+        .value;
     runtime.state.lock().await.pending.insert(
         request.request_id.clone(),
         PendingApproval {
@@ -1142,8 +1082,6 @@ async fn relay_request(
             if *disconnected.borrow() {
                 status = cancel_remote(
                     &runtime.client,
-                    &runtime.endpoint,
-                    runtime.config.token.as_ref(),
                     response.id,
                     &runtime.effects,
                     &request.request_id,
@@ -1166,15 +1104,9 @@ async fn relay_request(
         }
         persist_approval_state(&runtime.effects, &request.request_id, response.id, &status)
             .map_err(|_| RelayFailure::Persistence)?;
-        verify_terminal(
-            &runtime.client,
-            &runtime.endpoint,
-            runtime.config.token.as_ref(),
-            response.id,
-            &request.request_id,
-        )
-        .await
-        .map_err(|_| RelayFailure::Wait)?;
+        verify_terminal(&runtime.client, response.id, &request.request_id)
+            .await
+            .map_err(|_| RelayFailure::Wait)?;
         reconcile_request_effects(&runtime.effects, &request.request_id)
             .map_err(|_| RelayFailure::Persistence)?;
         Ok::<_, RelayFailure>(status)
@@ -1268,33 +1200,12 @@ async fn settle_remote_after_failure(
     approval_id: Uuid,
     request_id: &str,
 ) -> anyhow::Result<()> {
-    let approval = get_approval(
-        &runtime.client,
-        &runtime.endpoint,
-        runtime.config.token.as_ref(),
-        approval_id,
-    )
-    .await?;
+    let approval = get_approval(&runtime.client, approval_id).await?;
     verify_remote_identity(&approval, approval_id, request_id)?;
     if approval.status == ApprovalStatus::Pending {
-        cancel_remote(
-            &runtime.client,
-            &runtime.endpoint,
-            runtime.config.token.as_ref(),
-            approval_id,
-            &runtime.effects,
-            request_id,
-        )
-        .await?;
+        cancel_remote(&runtime.client, approval_id, &runtime.effects, request_id).await?;
     }
-    verify_terminal(
-        &runtime.client,
-        &runtime.endpoint,
-        runtime.config.token.as_ref(),
-        approval_id,
-        request_id,
-    )
-    .await?;
+    verify_terminal(&runtime.client, approval_id, request_id).await?;
     reconcile_request_effects(&runtime.effects, request_id)
 }
 
@@ -1329,19 +1240,12 @@ async fn wait_once(
     approval_id: Uuid,
     timeout: Duration,
 ) -> anyhow::Result<ApprovalStatus> {
-    let response: ApprovalWaitResponse = send_json(
-        authenticated(
-            runtime.config.token.as_ref(),
-            runtime.client.get(endpoint_url(
-                &runtime.endpoint,
-                &format!("api/v1/approvals/{approval_id}/wait"),
-            )?),
-        )
-        .timeout(timeout),
-        StatusCode::OK,
-    )
-    .await?;
-    Ok(response.status)
+    Ok(runtime
+        .client
+        .wait_approval(approval_id, None, timeout)
+        .await?
+        .value
+        .status)
 }
 
 async fn cancel_all_pending(runtime: &RelayRuntime) -> anyhow::Result<()> {
@@ -1351,22 +1255,13 @@ async fn cancel_all_pending(runtime: &RelayRuntime) -> anyhow::Result<()> {
         let result = async {
             let status = cancel_remote(
                 &runtime.client,
-                &runtime.endpoint,
-                runtime.config.token.as_ref(),
                 pending.approval_id,
                 &runtime.effects,
                 &request_id,
             )
             .await?;
             ensure!(status.is_resolved(), "cancelled approval is not terminal");
-            verify_terminal(
-                &runtime.client,
-                &runtime.endpoint,
-                runtime.config.token.as_ref(),
-                pending.approval_id,
-                &request_id,
-            )
-            .await?;
+            verify_terminal(&runtime.client, pending.approval_id, &request_id).await?;
             reconcile_request_effects(&runtime.effects, &request_id)
         }
         .await;
@@ -1383,9 +1278,7 @@ async fn cancel_all_pending(runtime: &RelayRuntime) -> anyhow::Result<()> {
 }
 
 async fn cancel_remote(
-    client: &Client,
-    endpoint: &Url,
-    token: Option<&Secret>,
+    client: &ApprovalClient,
     approval_id: Uuid,
     effects: &ExecutionCancellationContext,
     request_id: &str,
@@ -1397,21 +1290,16 @@ async fn cancel_remote(
             "approval_id": approval_id,
         }))?,
     )?;
-    let approval: Approval = send_json(
-        authenticated(
-            token,
-            client.post(endpoint_url(
-                endpoint,
-                &format!("api/v1/approvals/{approval_id}/resolve"),
-            )?),
+    let approval = client
+        .resolve_approval(
+            approval_id,
+            &ApprovalResolveRequest {
+                decision: ApprovalDecision::Cancel,
+                message: None,
+            },
         )
-        .json(&ApprovalResolveRequest {
-            decision: ApprovalDecision::Cancel,
-            message: None,
-        }),
-        StatusCode::OK,
-    )
-    .await?;
+        .await?
+        .value;
     verify_remote_identity(&approval, approval_id, request_id)?;
     operation.completed()?;
     persist_approval_state(effects, request_id, approval_id, &approval.status)?;
@@ -1419,13 +1307,11 @@ async fn cancel_remote(
 }
 
 async fn verify_terminal(
-    client: &Client,
-    endpoint: &Url,
-    token: Option<&Secret>,
+    client: &ApprovalClient,
     approval_id: Uuid,
     request_id: &str,
 ) -> anyhow::Result<ApprovalStatus> {
-    let approval = get_approval(client, endpoint, token, approval_id).await?;
+    let approval = get_approval(client, approval_id).await?;
     verify_remote_identity(&approval, approval_id, request_id)?;
     ensure!(approval.status.is_resolved(), "approval remains pending");
     Ok(approval.status)
@@ -1443,23 +1329,8 @@ fn verify_remote_identity(
     Ok(())
 }
 
-async fn get_approval(
-    client: &Client,
-    endpoint: &Url,
-    token: Option<&Secret>,
-    approval_id: Uuid,
-) -> anyhow::Result<Approval> {
-    send_json(
-        authenticated(
-            token,
-            client.get(endpoint_url(
-                endpoint,
-                &format!("api/v1/approvals/{approval_id}"),
-            )?),
-        ),
-        StatusCode::OK,
-    )
-    .await
+async fn get_approval(client: &ApprovalClient, approval_id: Uuid) -> anyhow::Result<Approval> {
+    Ok(client.get_approval(approval_id).await?.value)
 }
 
 fn persist_approval_state(
@@ -1490,27 +1361,6 @@ fn reconcile_request_effects(
         effects.reconcile_operation_kind_resource(kind, request_id)?;
     }
     Ok(())
-}
-
-async fn send_json<T: DeserializeOwned>(
-    request: reqwest::RequestBuilder,
-    expected: StatusCode,
-) -> anyhow::Result<T> {
-    let mut response = request.send().await?;
-    ensure!(
-        response.status() == expected
-            || (expected == StatusCode::OK && response.status() == StatusCode::ACCEPTED),
-        "approval server returned classified HTTP failure"
-    );
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        ensure!(
-            bytes.len().saturating_add(chunk.len()) <= ATTENDED_GATEWAY_MAX_FRAME_BYTES,
-            "approval server response exceeds limit"
-        );
-        bytes.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice(&bytes).context("approval server returned invalid response")
 }
 
 async fn verify_realized_socket_mount(runtime: &RelayRuntime) -> anyhow::Result<()> {
@@ -1568,53 +1418,21 @@ async fn verify_realized_socket_mount(runtime: &RelayRuntime) -> anyhow::Result<
     Ok(())
 }
 
-fn authenticated(
-    token: Option<&Secret>,
-    request: reqwest::RequestBuilder,
-) -> reqwest::RequestBuilder {
-    match token {
-        Some(token) => request.bearer_auth(token.expose()),
-        None => request,
-    }
+fn approval_client(endpoint: &str, token: Option<Secret>) -> anyhow::Result<ApprovalClient> {
+    Ok(ApprovalClient::with_options(
+        endpoint,
+        token,
+        ClientOptions {
+            operation_timeout: HTTP_OPERATION_TIMEOUT,
+            response_limit: ATTENDED_GATEWAY_MAX_FRAME_BYTES,
+        },
+    )?)
 }
 
-fn endpoint_url(endpoint: &Url, path: &str) -> anyhow::Result<Url> {
-    let mut url = endpoint.clone();
-    let base = endpoint.path().trim_end_matches('/');
-    url.set_path(&format!("{base}/{path}"));
-    Ok(url)
-}
-
-pub(crate) fn validated_endpoint(value: &str, has_token: bool) -> anyhow::Result<Url> {
-    let url = Url::parse(value).context("approval server URL is invalid")?;
-    ensure!(
-        matches!(url.scheme(), "http" | "https"),
-        "approval server URL must use HTTP or HTTPS"
-    );
-    ensure!(
-        url.username().is_empty() && url.password().is_none(),
-        "approval server URL must not contain credentials"
-    );
-    ensure!(
-        url.query().is_none() && url.fragment().is_none(),
-        "approval server URL must not contain query or fragment"
-    );
-    let host = url.host_str().context("approval server URL has no host")?;
-    let loopback = host
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|address| address.is_loopback());
-    if url.scheme() == "http" {
-        ensure!(
-            loopback,
-            "HTTP approval endpoints require a literal loopback address"
-        );
-    } else if !loopback {
-        ensure!(
-            has_token,
-            "non-loopback approval endpoints require HTTPS plus a bearer token"
-        );
-    }
-    Ok(url)
+pub(crate) fn validated_endpoint(value: &str, has_token: bool) -> anyhow::Result<url::Url> {
+    Ok(agent_hub_approval_client::validate_endpoint(
+        value, has_token,
+    )?)
 }
 
 fn remove_socket(
@@ -1977,8 +1795,7 @@ mod tests {
                 ledger_path: root.join("ledger.jsonl"),
                 plugin_nonce: "f".repeat(32),
             },
-            endpoint: Url::parse("http://127.0.0.1:1").unwrap(),
-            client: Client::new(),
+            client: approval_client("http://127.0.0.1:1", None).unwrap(),
             state: Arc::new(Mutex::new(RelayState {
                 request_ids: HashSet::new(),
                 pending: HashMap::new(),
@@ -2312,14 +2129,22 @@ mod tests {
 
     #[test]
     fn endpoint_rejects_credentials_and_insecure_bearer() {
-        assert!(validated_endpoint("https://token@example.test", false).is_err());
-        assert!(validated_endpoint("file:///server", false).is_err());
-        assert!(validated_endpoint("http://example.test", true).is_err());
-        assert!(validated_endpoint("http://example.test", false).is_err());
-        assert!(validated_endpoint("https://example.test", false).is_err());
-        validated_endpoint("https://example.test/approvals", true).unwrap();
-        validated_endpoint("http://127.0.0.1:8080", true).unwrap();
-        validated_endpoint("http://127.0.0.1:8080", false).unwrap();
+        assert!(
+            agent_hub_approval_client::validate_endpoint("https://token@example.test", false)
+                .is_err()
+        );
+        assert!(agent_hub_approval_client::validate_endpoint("file:///server", false).is_err());
+        assert!(agent_hub_approval_client::validate_endpoint("http://example.test", true).is_err());
+        assert!(
+            agent_hub_approval_client::validate_endpoint("http://example.test", false).is_err()
+        );
+        assert!(
+            agent_hub_approval_client::validate_endpoint("https://example.test", false).is_err()
+        );
+        agent_hub_approval_client::validate_endpoint("https://example.test/approvals", true)
+            .unwrap();
+        agent_hub_approval_client::validate_endpoint("http://127.0.0.1:8080", true).unwrap();
+        agent_hub_approval_client::validate_endpoint("http://127.0.0.1:8080", false).unwrap();
     }
 
     #[tokio::test]

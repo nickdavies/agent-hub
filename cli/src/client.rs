@@ -1,70 +1,38 @@
-use std::time::Duration;
-
+use agent_hub_approval_client::ApprovalClient;
 use protocol::{
     ApprovalDecision, ApprovalResolveRequest, PendingQuestion, QuestionDecision,
     QuestionResolveRequest, Secret,
 };
 use uuid::Uuid;
 
-// Re-export types so existing `use crate::client::X` imports work.
 pub use protocol::Approval;
 pub use protocol::PendingQuestion as Question;
 
 pub struct Client {
-    http: reqwest::Client,
-    base_url: String,
-    token: Option<Secret>,
+    inner: ApprovalClient,
 }
 
 impl Client {
-    pub fn new(base_url: String, token: Option<Secret>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build HTTP client");
-        Self {
-            http,
-            base_url,
-            token,
-        }
-    }
-
-    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(token) = &self.token {
-            req.bearer_auth(token.expose())
-        } else {
-            req
-        }
+    pub fn new(base_url: String, token: Option<Secret>) -> Result<Self, String> {
+        ApprovalClient::new(&base_url, token)
+            .map(|inner| Self { inner })
+            .map_err(|error| error.to_string())
     }
 
     pub async fn list_pending(&self) -> Result<Vec<Approval>, String> {
-        let url = format!("{}/api/v1/approvals/pending", self.base_url);
-        let req = self.auth(self.http.get(&url));
-        let resp = req
-            .send()
+        self.inner
+            .list_pending_approvals()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("{} returned {}", url, resp.status()));
-        }
-        resp.json()
-            .await
-            .map_err(|e| format!("failed to parse response: {e}"))
+            .map(|response| response.value)
+            .map_err(|error| error.to_string())
     }
 
     pub async fn list_pending_questions(&self) -> Result<Vec<PendingQuestion>, String> {
-        let url = format!("{}/api/v1/questions/pending", self.base_url);
-        let req = self.auth(self.http.get(&url));
-        let resp = req
-            .send()
+        self.inner
+            .list_pending_questions()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("{} returned {}", url, resp.status()));
-        }
-        resp.json()
-            .await
-            .map_err(|e| format!("failed to parse response: {e}"))
+            .map(|response| response.value)
+            .map_err(|error| error.to_string())
     }
 
     pub async fn approve(&self, id: Uuid, message: Option<String>) -> Result<(), String> {
@@ -81,81 +49,61 @@ impl Client {
         decision: ApprovalDecision,
         message: Option<String>,
     ) -> Result<(), String> {
-        let url = format!("{}/api/v1/approvals/{}/resolve", self.base_url, id);
-        let req = self
-            .auth(self.http.post(&url))
-            .json(&ApprovalResolveRequest { decision, message });
-        let resp = req
-            .send()
+        self.inner
+            .resolve_approval_status(id, &ApprovalResolveRequest { decision, message })
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("{} returned {}", url, resp.status()));
-        }
-        Ok(())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub async fn answer_question(&self, id: Uuid, answers: Vec<Vec<String>>) -> Result<(), String> {
-        let url = format!("{}/api/v1/questions/{}/resolve", self.base_url, id);
-        let req = self
-            .auth(self.http.post(&url))
-            .json(&QuestionResolveRequest {
+        self.resolve_question(
+            id,
+            QuestionResolveRequest {
                 decision: QuestionDecision::Answer,
                 answers: Some(answers),
                 reason: None,
-            });
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("{} returned {}", url, resp.status()));
-        }
-        Ok(())
+            },
+        )
+        .await
     }
 
     pub async fn reject_question(&self, id: Uuid) -> Result<(), String> {
-        let url = format!("{}/api/v1/questions/{}/resolve", self.base_url, id);
-        let req = self
-            .auth(self.http.post(&url))
-            .json(&QuestionResolveRequest {
+        self.resolve_question(
+            id,
+            QuestionResolveRequest {
                 decision: QuestionDecision::Reject,
                 answers: None,
                 reason: None,
-            });
-        let resp = req
-            .send()
+            },
+        )
+        .await
+    }
+
+    async fn resolve_question(
+        &self,
+        id: Uuid,
+        request: QuestionResolveRequest,
+    ) -> Result<(), String> {
+        self.inner
+            .resolve_question_status(id, &request)
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("{} returned {}", url, resp.status()));
-        }
-        Ok(())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub async fn health_check(&self) -> Result<(), String> {
-        let url = format!("{}/health", self.base_url);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
+        self.inner
+            .health()
             .await
-            .map_err(|e| format!("connection failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("{} returned {}", url, resp.status()));
-        }
-        Ok(())
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
-    /// Check that the server accepts our auth token by hitting an authenticated endpoint.
-    /// Returns the HTTP status code on success, or an error string on connection failure.
     pub async fn check_auth(&self) -> Result<u16, String> {
-        let url = format!("{}/api/v1/sessions", self.base_url);
-        let req = self.auth(self.http.get(&url));
-        let resp = req
-            .send()
+        self.inner
+            .session_status()
             .await
-            .map_err(|e| format!("connection failed: {e}"))?;
-        Ok(resp.status().as_u16())
+            .map_err(|error| error.to_string())
     }
 }

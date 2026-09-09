@@ -80,7 +80,19 @@ pub async fn run(config_path: String, server: Option<String>, token: Option<Stri
     match &server {
         Some(server_url) => {
             let server_url = normalize_server_url(server_url);
-            let client = Client::new(server_url.clone(), token.as_deref().map(Secret::new));
+            let client = match Client::new(server_url.clone(), token.as_deref().map(Secret::new)) {
+                Ok(client) => client,
+                Err(error) => {
+                    println!("[FAIL] Server endpoint: {error}");
+                    failures += 1;
+                    println!();
+                    println!(
+                        "Validation failed: {} error(s), {} warning(s).",
+                        failures, warnings
+                    );
+                    return 1;
+                }
+            };
 
             // Phase A: health check (unauthenticated)
             match client.health_check().await {

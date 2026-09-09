@@ -1,6 +1,5 @@
 mod approval;
 mod approval_socket;
-mod http;
 mod providers;
 mod question;
 mod types;
@@ -10,14 +9,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use agent_hub_approval_client::{ApprovalClient, ClientOptions, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 use config::{
     ConfigAction, expand_tilde, load_tool_config, resolve_action_with_input,
     resolve_action_with_input_and_rule,
 };
 use protocol::{
-    ApprovalContext, ApprovalRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
-    ExtraContext, RequestType, Secret, StatusReport,
+    ApprovalContext, ApprovalRequest, ApprovalStatus, ExtraContext, RequestType, Secret,
+    StatusReport,
 };
 use uuid::Uuid;
 
@@ -190,6 +190,18 @@ impl ApprovalFlowError {
             Self::FailClosed(reason) => return RunError::FailClosed(reason),
         })
     }
+}
+
+fn gateway_client(server: &str, token: Option<Secret>) -> Result<ApprovalClient, String> {
+    ApprovalClient::with_options(
+        server,
+        token,
+        ClientOptions {
+            operation_timeout: Duration::from_secs(10),
+            response_limit: protocol::AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES,
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tokio::main]
@@ -544,7 +556,7 @@ fn validate_approval_transport(args: &ApprovalArgs) -> Result<(), String> {
                 .server
                 .as_deref()
                 .ok_or_else(|| "host HTTP mode requires an approval server".to_string())?;
-            http::authenticated_client(server, args.token.is_some()).map(|_| ())
+            gateway_client(server, args.token.clone()).map(|_| ())
         }
         Some(mode) => Err(format!("unsupported approval mode '{mode}'")),
     }
@@ -638,37 +650,21 @@ async fn run_status_report(args: StatusReportArgs) -> ExitCode {
         }
     };
 
-    let (client, base) = match http::authenticated_client(&args.server, args.token.is_some()) {
+    let client = match gateway_client(&args.server, args.token.clone()) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("agent-hub-gateway: {error}");
             return ExitCode::from(2);
         }
     };
-    let url = http::endpoint(&base, "api/v1/hooks/status").expect("validated endpoint");
-
-    let request = client.post(url.as_str());
-    let request = if let Some(token) = &args.token {
-        request.bearer_auth(token.expose())
-    } else {
-        request
-    };
-    match request
-        .json(&report)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => ExitCode::SUCCESS,
-        Ok(resp) => {
-            eprintln!(
-                "agent-hub-gateway: status report returned {}",
-                resp.status()
-            );
+    match client.report_status(&report).await {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) if error.status().is_some() => {
+            eprintln!("agent-hub-gateway: status report returned {error}");
             ExitCode::from(1)
         }
-        Err(e) => {
-            eprintln!("agent-hub-gateway: status report failed: {e}");
+        Err(error) => {
+            eprintln!("agent-hub-gateway: status report failed: {error}");
             ExitCode::from(1)
         }
     }
@@ -1046,26 +1042,12 @@ async fn escalate_to_server(
         ApprovalFlowError::Pipeline("approval server is required outside sandbox mode".to_string())
     })?;
     let token = args.token.as_ref();
-    let (client, base) =
-        http::authenticated_client(server, token.is_some()).map_err(ApprovalFlowError::Pipeline)?;
-    let register_url =
-        http::endpoint(&base, "api/v1/hooks/approval").map_err(ApprovalFlowError::Pipeline)?;
+    let client = gateway_client(server, token.cloned()).map_err(ApprovalFlowError::Pipeline)?;
     eprintln!(
         "[info] registering approval request: tool={} session={}",
         event.tool_call.tool_name(),
         event.session_id
     );
-    let register = client.post(register_url.as_str());
-    let register = if let Some(token) = token {
-        register.bearer_auth(token.expose())
-    } else {
-        register
-    };
-    let register = if let Some(waiter_id) = waiter_id {
-        register.header(protocol::APPROVAL_WAITER_HEADER, waiter_id.to_string())
-    } else {
-        register
-    };
     let register_timeout = deadline
         .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
         .unwrap_or(Duration::from_secs(10))
@@ -1074,39 +1056,22 @@ async fn escalate_to_server(
         return Err(ApprovalFlowError::Timeout);
     }
     let register_resp = tokio::select! {
-        result = register.json(&request).timeout(register_timeout).send() => {
-            result.map_err(|e| ApprovalFlowError::Pipeline(format!("failed to register approval: {e}")))?
+        result = client.register_approval(&request, waiter_id, Some(register_timeout)) => {
+            result.map_err(|error| {
+                let message = format!("failed to register approval: {error}");
+                if error.is_client_response() || error.kind() == ErrorKind::ResponseTooLarge {
+                    ApprovalFlowError::FailClosed(message)
+                } else {
+                    ApprovalFlowError::Pipeline(message)
+                }
+            })?
         }
         _ = shutdown_signal() => {
             return Err(ApprovalFlowError::Pipeline("aborted by signal".to_string()));
         }
     };
 
-    if !register_resp.status().is_success() {
-        let status = register_resp.status();
-        eprintln!(
-            "[error] server returned {} for approval registration",
-            status
-        );
-        let message = format!("server returned {status} for approval registration");
-        return if status.is_client_error() {
-            Err(ApprovalFlowError::FailClosed(message))
-        } else {
-            Err(ApprovalFlowError::Pipeline(message))
-        };
-    }
-
-    let response_timeout = deadline
-        .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
-        .unwrap_or(Duration::from_secs(10));
-    if response_timeout.is_zero() {
-        return Err(ApprovalFlowError::Timeout);
-    }
-    let body =
-        read_bounded_response(register_resp, response_timeout, "approval registration").await?;
-    let approval: ApprovalResponse = serde_json::from_slice(&body).map_err(|e| {
-        ApprovalFlowError::Pipeline(format!("failed to parse approval response: {e}"))
-    })?;
+    let approval = register_resp.value;
     validate_approval_status(&approval.status)?;
 
     if matches!(approval.status, ApprovalStatus::Pending) {
@@ -1122,41 +1087,27 @@ async fn escalate_to_server(
     // Long-poll until resolved or global timeout
     let deadline =
         deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(args.timeout));
-    let mut wait_url = http::endpoint(&base, &format!("api/v1/approvals/{}/wait", approval.id))
-        .map_err(ApprovalFlowError::Pipeline)?;
-    if let Some(waiter_id) = waiter_id {
-        wait_url
-            .query_pairs_mut()
-            .append_pair("waiter_id", &waiter_id.to_string());
-    }
-
     eprintln!(
         "[info] waiting for approval (id={}, timeout={}s) — approve or deny in the web UI",
         approval.id, args.timeout
     );
 
-    let cancel_url = http::endpoint(&base, &format!("api/v1/approvals/{}/resolve", approval.id))
-        .map_err(ApprovalFlowError::Pipeline)?;
-
     let output = tokio::select! {
-        result = poll_for_decision(&client, wait_url.as_str(), token, deadline, args.timeout) => result,
+        result = poll_for_decision(&client, approval.id, waiter_id, deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal while waiting for approval {}", approval.id);
             if let Some(waiter_id) = waiter_id {
-                cancel_waiter(&client, &base, token, approval.id, waiter_id).await?;
+                cancel_waiter(&client, approval.id, waiter_id).await?;
                 eprintln!("[info] server confirmed cancellation for waiter {waiter_id}");
             } else {
-                let cancel = client.post(cancel_url.as_str());
-                let cancel = if let Some(token) = token {
-                    cancel.bearer_auth(token.expose())
-                } else {
-                    cancel
-                };
-                let _ = cancel
-                    .json(&serde_json::json!({"decision": "cancel"}))
-                    .timeout(Duration::from_secs(5))
-                    .send()
-                    .await;
+                let _ = client.resolve_approval_with_timeout(
+                    approval.id,
+                    &protocol::ApprovalResolveRequest {
+                        decision: protocol::ApprovalDecision::Cancel,
+                        message: None,
+                    },
+                    Some(Duration::from_secs(5)),
+                ).await;
             }
             Err(ApprovalFlowError::Pipeline("aborted by signal".to_string()))
         }
@@ -1165,51 +1116,17 @@ async fn escalate_to_server(
 }
 
 async fn cancel_waiter(
-    client: &reqwest::Client,
-    base: &reqwest::Url,
-    token: Option<&Secret>,
+    client: &ApprovalClient,
     approval_id: Uuid,
     waiter_id: Uuid,
 ) -> Result<(), ApprovalFlowError> {
-    let url = http::endpoint(
-        base,
-        &format!("api/v1/approvals/{approval_id}/waiters/cancel"),
-    )
-    .map_err(ApprovalFlowError::FailClosed)?;
-    let request = client
-        .post(url)
-        .json(&protocol::ApprovalWaiterCancelRequest {
-            waiter_id: waiter_id.to_string(),
-        });
-    let request = if let Some(token) = token {
-        request.bearer_auth(token.expose())
-    } else {
-        request
-    };
-    let response = request
-        .timeout(Duration::from_secs(10))
-        .send()
+    let confirmation = client
+        .cancel_approval_waiter(approval_id, waiter_id)
         .await
         .map_err(|error| {
             ApprovalFlowError::Pipeline(format!("failed to cancel approval waiter: {error}"))
-        })?;
-    if !response.status().is_success() {
-        return Err(ApprovalFlowError::Pipeline(format!(
-            "server returned {} for approval waiter cancellation",
-            response.status()
-        )));
-    }
-    let body = read_bounded_response(
-        response,
-        Duration::from_secs(10),
-        "approval waiter cancellation",
-    )
-    .await?;
-    let confirmation: ApprovalResponse = serde_json::from_slice(&body).map_err(|error| {
-        ApprovalFlowError::Pipeline(format!(
-            "failed to parse approval waiter cancellation response: {error}"
-        ))
-    })?;
+        })?
+        .value;
     if confirmation.id != approval_id {
         return Err(ApprovalFlowError::FailClosed(
             "approval waiter cancellation response binding mismatch".to_string(),
@@ -1220,9 +1137,9 @@ async fn cancel_waiter(
 
 /// Long-poll the server until the approval is resolved or the global timeout expires.
 async fn poll_for_decision(
-    client: &reqwest::Client,
-    wait_url: &str,
-    token: Option<&Secret>,
+    client: &ApprovalClient,
+    approval_id: Uuid,
+    waiter_id: Option<Uuid>,
     deadline: tokio::time::Instant,
     timeout_secs: u64,
 ) -> Result<HookOutput, ApprovalFlowError> {
@@ -1237,40 +1154,27 @@ async fn poll_for_decision(
 
         attempt += 1;
 
-        let wait = client.get(wait_url);
-        let wait = if let Some(token) = token {
-            wait.bearer_auth(token.expose())
-        } else {
-            wait
-        };
         let resp = await_approval_deadline(
             deadline,
             last_wait_was_healthy,
-            wait.timeout(remaining.min(Duration::from_secs(60))).send(),
+            client.wait_approval(
+                approval_id,
+                waiter_id,
+                remaining.min(Duration::from_secs(60)),
+            ),
         )
         .await?;
 
         let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[warn] wait request failed (attempt {attempt}, retrying in 2s): {e}");
-                last_wait_was_healthy = false;
-                await_approval_deadline(
-                    deadline,
-                    last_wait_was_healthy,
-                    tokio::time::sleep(Duration::from_secs(2)),
-                )
-                .await?;
-                continue;
+            Ok(response) => response,
+            Err(error)
+                if error.kind() == ErrorKind::Timeout
+                    && tokio::time::Instant::now() >= deadline =>
+            {
+                return Err(deadline_error(last_wait_was_healthy));
             }
-        };
-
-        let http_status = resp.status();
-
-        // Non-success HTTP responses that indicate the approval is gone (4xx)
-        // are not retryable. Everything else (5xx, network weirdness) is.
-        if !http_status.is_success() {
-            if http_status.is_client_error() {
+            Err(error) if error.is_client_response() => {
+                let http_status = error.status().expect("client response has status");
                 eprintln!(
                     "[error] server returned {http_status} for approval wait — approval may have expired"
                 );
@@ -1278,46 +1182,9 @@ async fn poll_for_decision(
                     "server returned {http_status} for approval wait"
                 )));
             }
-            eprintln!(
-                "[warn] server returned {http_status} for approval wait (attempt {attempt}, retrying in 2s)"
-            );
-            last_wait_was_healthy = false;
-            await_approval_deadline(
-                deadline,
-                last_wait_was_healthy,
-                tokio::time::sleep(Duration::from_secs(2)),
-            )
-            .await?;
-            continue;
-        }
-
-        let body_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if body_remaining.is_zero() {
-            return Err(deadline_error(last_wait_was_healthy));
-        }
-        let body = match read_bounded_response(resp, body_remaining, "approval wait").await {
-            Ok(body) => body,
-            Err(ApprovalFlowError::Pipeline(e)) => {
+            Err(error) => {
                 eprintln!(
-                    "[warn] failed to read wait response body (attempt {attempt}, retrying in 2s): {e}"
-                );
-                last_wait_was_healthy = false;
-                await_approval_deadline(
-                    deadline,
-                    last_wait_was_healthy,
-                    tokio::time::sleep(Duration::from_secs(2)),
-                )
-                .await?;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-
-        let wait: ApprovalWaitResponse = match serde_json::from_slice(&body) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!(
-                    "[warn] failed to parse bounded wait response (attempt {attempt}, retrying in 2s): {e}"
+                    "[warn] approval wait failed (attempt {attempt}, retrying in 2s): {error}"
                 );
                 last_wait_was_healthy = false;
                 await_approval_deadline(
@@ -1329,11 +1196,17 @@ async fn poll_for_decision(
                 continue;
             }
         };
+        let http_status = resp.status;
+        let wait = resp.value;
+
+        if !(200..300).contains(&http_status) {
+            unreachable!("approval client accepts only successful responses");
+        }
         validate_approval_status(&wait.status)?;
 
         ensure_approval_before_deadline(deadline, last_wait_was_healthy)?;
 
-        if http_status.as_u16() == 202 {
+        if http_status == 202 {
             if !matches!(wait.status, ApprovalStatus::Pending) {
                 return Err(ApprovalFlowError::Pipeline(format!(
                     "server returned {http_status} with non-pending approval status"
@@ -1367,32 +1240,6 @@ fn deadline_error(last_wait_was_healthy: bool) -> ApprovalFlowError {
     } else {
         ApprovalFlowError::Pipeline("approval wait failed until the deadline".to_string())
     }
-}
-
-async fn read_bounded_response(
-    mut response: reqwest::Response,
-    timeout: Duration,
-    label: &str,
-) -> Result<Vec<u8>, ApprovalFlowError> {
-    let read = async {
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|error| {
-            ApprovalFlowError::Pipeline(format!("failed to read {label} response: {error}"))
-        })? {
-            if body.len().saturating_add(chunk.len())
-                > protocol::AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES
-            {
-                return Err(ApprovalFlowError::FailClosed(format!(
-                    "{label} response exceeds limit"
-                )));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
-    };
-    tokio::time::timeout(timeout, read)
-        .await
-        .map_err(|_| ApprovalFlowError::Timeout)?
 }
 
 fn validate_approval_status(status: &ApprovalStatus) -> Result<(), ApprovalFlowError> {

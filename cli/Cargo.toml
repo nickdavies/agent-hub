@@ -12,13 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+agent-hub-approval-client = { path = "../approval-client" }
 agent-hub-executor = { path = "../executor" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 config = { path = "../config" }
 crossterm = { version = "0.28", features = ["event-stream"] }
 protocol = { path = "../protocol" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"

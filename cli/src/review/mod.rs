@@ -12,7 +12,8 @@ use ui::{Action, AnswerQuestionResult, DenyInputResult, Mode, ReviewItem, Ui};
 
 pub async fn run(server: String, token: Option<String>, poll_interval: u64) -> anyhow::Result<()> {
     let server = server.trim_end_matches('/').to_string();
-    let client = Client::new(server.clone(), token.map(Secret::new));
+    let client = Client::new(server.clone(), token.map(Secret::new))
+        .map_err(|error| anyhow::anyhow!("Invalid server endpoint: {error}"))?;
 
     // Health check before entering TUI
     client
