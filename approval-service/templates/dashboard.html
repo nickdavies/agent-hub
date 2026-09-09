@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dashboard — Claude Notify</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        tr.selected td { background: rgba(24, 115, 204, 0.1) !important; }
+        #help-bar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--pico-card-background-color); border-top: 1px solid var(--pico-muted-border-color); padding: 0.25rem 1rem; font-size: 0.8rem; color: var(--pico-muted-color); z-index: 10; }
+        #help-bar kbd { font-size: 0.75rem; padding: 0.1rem 0.3rem; border: 1px solid var(--pico-muted-border-color); border-radius: 3px; background: var(--pico-background-color); color: var(--pico-color); font-weight: bold; }
+        #help-detail { display: none; margin-top: 0.5rem; }
+        #help-detail.visible { display: block; }
+        main.container { padding-bottom: 3rem; }
+        .deny-input { display: none; margin-top: 0.25rem; }
+        .deny-input.visible { display: flex; gap: 0.5rem; align-items: center; }
+        .deny-input input { margin: 0; padding: 0.25rem 0.5rem; font-size: 0.85rem; }
+        .deny-input button { margin: 0; padding: 0.25rem 0.5rem; font-size: 0.85rem; white-space: nowrap; }
+        tr.meta-row td { border-bottom: none; }
+        tr.tool-preview { display: none; }
+        tr.tool-preview td { border-top: none; padding-top: 0; padding-bottom: 0.75rem; }
+        tr.tool-preview.visible { display: table-row; }
+        tr.tool-preview code { font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; color: var(--pico-muted-color); }
+
+        /* Question answer form */
+        .question-card { border: 1px solid var(--pico-muted-border-color); border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+        .question-card h5 { margin: 0 0 0.25rem; font-size: 0.95rem; }
+        .question-card .q-header { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; color: var(--pico-muted-color); margin-bottom: 0.5rem; }
+        .question-card label { display: flex; align-items: flex-start; gap: 0.5rem; margin-bottom: 0.35rem; font-size: 0.9rem; cursor: pointer; }
+        .question-card label input { margin-top: 0.15rem; }
+        .question-card .q-description { font-size: 0.8rem; color: var(--pico-muted-color); margin-left: 1.5rem; }
+        .question-card .custom-input { margin-top: 0.5rem; display: none; }
+        .question-card .custom-input.visible { display: block; }
+        .question-actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+        .question-actions button { margin: 0; padding: 0.3rem 0.75rem; font-size: 0.85rem; }
+
+        /* Session status badges */
+        .status-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; line-height: 1.4; text-transform: capitalize; }
+        .status-active { background: #16a34a22; color: #16a34a; }
+        .status-idle { background: #6b728022; color: #6b7280; }
+        .status-waiting { background: #f59e0b22; color: #d97706; animation: pulse-waiting 2s ease-in-out infinite; }
+        .status-ended { background: #6b728015; color: #9ca3af; }
+        @keyframes pulse-waiting { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        tr.session-ended td { opacity: 0.5; }
+        .session-name { font-size: 0.85rem; color: var(--pico-muted-color); }
+        .waiting-reason { font-size: 0.7rem; color: #d97706; margin-left: 0.25rem; }
+    </style>
+</head>
+<body>
+<nav class="container">
+    <ul><li><strong>Claude Notify</strong></li></ul>
+    <ul>
+        {% if has_auth %}
+        <li>{{ email }}</li>
+        <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>
+        {% endif %}
+    </ul>
+</nav>
+<main class="container">
+    <h3>Pending Approvals <small><a href="/approvals/queue">Mobile queue</a></small></h3>
+    <div id="approvals-container">
+    {% if pending_approvals.is_empty() %}
+    <p id="no-approvals">No pending approvals.</p>
+    {% else %}
+    <table id="approvals-table">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Session</th>
+                <th>Tool</th>
+                <th>Time</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for a in pending_approvals %}
+            <tr class="meta-row" data-id="{{ a.id }}">
+                <td>{{ a.project }}</td>
+                <td>{{ a.session_display_name }}</td>
+                <td>{{ a.tool }}</td>
+                <td>{{ a.created_at.format("%H:%M:%S") }}</td>
+                <td>
+                    <a href="/approvals/{{ a.id }}">Review</a>
+                    {% if readwrite %}
+                    <span style="margin-left:0.5rem">
+                        <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="approveRow('{{ a.id }}')">Approve</button>
+                        <button class="outline secondary" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showDenyInput('{{ a.id }}')">Deny</button>
+                    </span>
+                    <div class="deny-input" id="deny-{{ a.id }}">
+                        <input type="text" placeholder="Reason..." onkeydown="if(event.key==='Enter'){denyRow('{{ a.id }}',this.value);} if(event.key==='Escape'){hideDenyInputs();}">
+                        <button class="secondary" onclick="denyRow('{{ a.id }}',this.previousElementSibling.value)">Send</button>
+                    </div>
+                    {% endif %}
+                </td>
+            </tr>
+            <tr class="tool-preview" data-id="{{ a.id }}" data-tool-input="{{ a.tool_input }}">
+                <td colspan="5"><code></code></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+    </div>
+
+    <h3>Pending Questions</h3>
+    <div id="questions-container">
+    <p id="no-questions">No pending questions.</p>
+    </div>
+
+    <h3>Sessions</h3>
+    <div id="sessions-container">
+    {% if sessions.is_empty() %}
+    <p id="no-sessions">No active sessions.</p>
+    {% else %}
+    <table id="sessions-table">
+        <thead>
+            <tr>
+                <th>Status</th>
+                <th>Project</th>
+                <th>Session</th>
+                {% if readwrite %}<th>Approval Mode</th>{% endif %}
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in sessions %}
+            <tr{% match s.status %}{% when crate::sessions::EffectiveSessionStatus::Ended %} class="session-ended"{% when _ %}{% endmatch %}>
+                <td>{% match s.status %}{% when crate::sessions::EffectiveSessionStatus::Active %}<span class="status-badge status-active">Active</span>{% when crate::sessions::EffectiveSessionStatus::Idle %}<span class="status-badge status-idle">Idle</span>{% when crate::sessions::EffectiveSessionStatus::Waiting with { reason } %}<span class="status-badge status-waiting">Waiting</span>{% if let Some(r) = reason %}<span class="waiting-reason">{{ r }}</span>{% endif %}{% when crate::sessions::EffectiveSessionStatus::Ended %}<span class="status-badge status-ended">Ended</span>{% endmatch %}</td>
+                <td>{{ s.project }}</td>
+                <td>
+                    {% match s.display_name %}{% when Some with (name) %}<span class="session-name">{{ name }}</span><br>{% when None %}{% endmatch %}<code style="font-size:0.75rem">{{ s.session_id }}</code>
+                </td>
+                {% if readwrite %}
+                <td>
+                    {% if s.editor_type != crate::sessions::Provider::Cursor %}
+                    <button class="outline" style="margin:0;padding:0.25rem 0.5rem"
+                        onclick="toggleMode('{{ s.session_id }}', '{% if s.config.approval_mode == crate::sessions::SessionApprovalMode::Remote %}terminal{% else %}remote{% endif %}')">
+                        {% if s.config.approval_mode == crate::sessions::SessionApprovalMode::Remote %}
+                        remote (switch to terminal)
+                        {% else %}
+                        terminal (switch to remote)
+                        {% endif %}
+                    </button>
+                    {% else %}
+                    <span style="color:var(--pico-muted-color)">remote (cursor)</span>
+                    {% endif %}
+                </td>
+                {% endif %}
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+    </div>
+</main>
+
+<div id="help-bar">
+    <span><kbd>j</kbd>/<kbd>k</kbd> navigate &nbsp; <kbd>Enter</kbd> review &nbsp;
+    {% if readwrite %}<kbd>a</kbd> approve &nbsp; <kbd>d</kbd> deny &nbsp;{% endif %}
+    <kbd>?</kbd> help</span>
+    <div id="help-detail">
+        <strong>Keyboard Shortcuts</strong><br>
+        <kbd>j</kbd> / <kbd>↓</kbd> — Select next approval<br>
+        <kbd>k</kbd> / <kbd>↑</kbd> — Select previous approval<br>
+        <kbd>Enter</kbd> — Open selected approval<br>
+        {% if readwrite %}
+        <kbd>a</kbd> / <kbd>1</kbd> — Approve selected<br>
+        <kbd>d</kbd> / <kbd>2</kbd> — Deny selected (prompts for reason)<br>
+        {% endif %}
+        <kbd>?</kbd> — Toggle this help
+    </div>
+</div>
+
+<script>
+(function() {
+    const READWRITE = {{ readwrite }};
+    const POLL_MS = 2000;
+    const MAX_DETAIL_LEN = 2000;
+    let selectedIdx = -1;
+    let denyActiveId = null;
+
+    function inputSummary(input) {
+        if (input == null) return '';
+        if (typeof input === 'string') return truncDetail(input);
+        if (typeof input !== 'object' || Array.isArray(input)) return truncDetail(JSON.stringify(input));
+        if ('command' in input && typeof input.command === 'string') return truncDetail(input.command);
+        const firstStr = Object.values(input).find(v => typeof v === 'string');
+        if (firstStr) return truncDetail(firstStr);
+        return truncDetail(JSON.stringify(input));
+    }
+
+    function truncDetail(s) {
+        return s.length > MAX_DETAIL_LEN ? s.slice(0, MAX_DETAIL_LEN) + '…' : s;
+    }
+
+    // Fill in content for server-rendered preview rows
+    document.querySelectorAll('tr.tool-preview[data-tool-input]').forEach(row => {
+        const code = row.querySelector('code');
+        if (!code) return;
+        try {
+            const input = JSON.parse(row.dataset.toolInput);
+            code.textContent = inputSummary(input);
+        } catch(e) {}
+    });
+
+    // Auto-select first approval on page load
+    if (getMetaRows().length > 0) {
+        selectedIdx = 0;
+        updateSelection();
+    }
+
+    // --- Polling ---
+    async function poll() {
+        try {
+            const [approvalsResp, sessionsResp, questionsResp] = await Promise.all([
+                fetch('/api/v1/approvals/pending', { credentials: 'same-origin' }),
+                fetch('/api/v1/sessions', { credentials: 'same-origin' }),
+                fetch('/api/v1/questions/pending', { credentials: 'same-origin' })
+            ]);
+            if (approvalsResp.ok) {
+                const approvals = await approvalsResp.json();
+                renderApprovals(approvals);
+            }
+            if (sessionsResp.ok) {
+                const sessions = await sessionsResp.json();
+                renderSessions(sessions);
+            }
+            if (questionsResp.ok) {
+                const questions = await questionsResp.json();
+                renderQuestions(questions);
+            }
+        } catch (e) {
+            // silently ignore fetch errors
+        }
+    }
+
+    // Build a fingerprint for an approval so we can detect data changes.
+    function approvalFingerprint(a) {
+        const time = new Date(a.created_at).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+        return [a.project, a.session_display_name, a.tool_name, time, JSON.stringify(a.tool_input)].join('\0');
+    }
+
+    // Create the pair of DOM rows (meta-row + tool-preview) for one approval.
+    function createApprovalRows(a, idx) {
+        const time = new Date(a.created_at).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+        const sel = idx === selectedIdx;
+
+        const metaRow = document.createElement('tr');
+        metaRow.className = sel ? 'meta-row selected' : 'meta-row';
+        metaRow.dataset.id = a.id;
+        metaRow.dataset.fp = approvalFingerprint(a);
+
+        let actionHtml = `<a href="/approvals/${a.id}">Review</a>`;
+        if (READWRITE) {
+            actionHtml += ` <span style="margin-left:0.5rem">
+                <button class="outline" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="approveRow('${a.id}')">Approve</button>
+                <button class="outline secondary" style="margin:0;padding:0.15rem 0.4rem;font-size:0.8rem" onclick="showDenyInput('${a.id}')">Deny</button>
+            </span>
+            <div class="deny-input" id="deny-${a.id}">
+                <input type="text" placeholder="Reason..." onkeydown="if(event.key==='Enter'){denyRow('${a.id}',this.value);} if(event.key==='Escape'){hideDenyInputs();}">
+                <button class="secondary" onclick="denyRow('${a.id}',this.previousElementSibling.value)">Send</button>
+            </div>`;
+        }
+
+        metaRow.innerHTML =
+            `<td>${esc(a.project)}</td>` +
+            `<td>${esc(a.session_display_name)}</td>` +
+            `<td>${esc(a.tool_name)}</td>` +
+            `<td>${time}</td>` +
+            `<td>${actionHtml}</td>`;
+
+        const prevRow = document.createElement('tr');
+        prevRow.className = sel ? 'tool-preview selected visible' : 'tool-preview';
+        prevRow.dataset.id = a.id;
+        prevRow.innerHTML = `<td colspan="5"><code>${esc(inputSummary(a.tool_input))}</code></td>`;
+
+        return { metaRow, prevRow };
+    }
+
+    function renderApprovals(approvals) {
+        const container = document.getElementById('approvals-container');
+
+        // Don't touch the DOM while user is typing a deny reason
+        if (denyActiveId) {
+            const currentIds = new Set(approvals.map(a => a.id));
+            if (!currentIds.has(denyActiveId)) {
+                denyActiveId = null;
+            } else {
+                return;
+            }
+        }
+
+        const wasEmpty = selectedIdx < 0;
+        if (approvals.length === 0) {
+            container.innerHTML = '<p>No pending approvals.</p>';
+            selectedIdx = -1;
+            return;
+        }
+        if (wasEmpty) selectedIdx = 0;
+        if (selectedIdx >= approvals.length) selectedIdx = approvals.length - 1;
+
+        // Ensure table structure exists
+        let table = document.getElementById('approvals-table');
+        if (!table) {
+            container.innerHTML = `<table id="approvals-table"><thead><tr>
+                <th>Project</th><th>Session</th><th>Tool</th><th>Time</th><th>Action</th>
+                </tr></thead><tbody></tbody></table>`;
+            table = document.getElementById('approvals-table');
+        }
+        const tbody = table.querySelector('tbody');
+
+        // Index existing DOM rows by approval id
+        const existingMeta = {};
+        const existingPreview = {};
+        tbody.querySelectorAll('tr.meta-row').forEach(r => { existingMeta[r.dataset.id] = r; });
+        tbody.querySelectorAll('tr.tool-preview').forEach(r => { existingPreview[r.dataset.id] = r; });
+
+        const newIds = new Set(approvals.map(a => a.id));
+
+        // Remove rows for approvals no longer present
+        for (const id of Object.keys(existingMeta)) {
+            if (!newIds.has(id)) {
+                existingMeta[id].remove();
+                if (existingPreview[id]) existingPreview[id].remove();
+                delete existingMeta[id];
+                delete existingPreview[id];
+            }
+        }
+
+        // Upsert rows in order and ensure correct DOM position
+        let insertBefore = tbody.firstChild;
+        approvals.forEach((a, i) => {
+            const fp = approvalFingerprint(a);
+            let metaRow = existingMeta[a.id];
+            let prevRow = existingPreview[a.id];
+
+            if (metaRow && metaRow.dataset.fp === fp) {
+                // Row exists and data unchanged — just update selection classes
+                const sel = i === selectedIdx;
+                metaRow.classList.toggle('selected', sel);
+                if (prevRow) {
+                    prevRow.classList.toggle('selected', sel);
+                    prevRow.classList.toggle('visible', sel);
+                }
+            } else if (metaRow) {
+                // Row exists but data changed — replace it
+                const created = createApprovalRows(a, i);
+                tbody.replaceChild(created.metaRow, metaRow);
+                if (prevRow) {
+                    tbody.replaceChild(created.prevRow, prevRow);
+                } else {
+                    created.metaRow.after(created.prevRow);
+                }
+                metaRow = created.metaRow;
+                prevRow = created.prevRow;
+            } else {
+                // New row — create and insert
+                const created = createApprovalRows(a, i);
+                metaRow = created.metaRow;
+                prevRow = created.prevRow;
+                tbody.insertBefore(metaRow, insertBefore);
+                metaRow.after(prevRow);
+            }
+
+            // Ensure correct ordering: metaRow should be at the current insertBefore position
+            if (metaRow !== insertBefore) {
+                tbody.insertBefore(metaRow, insertBefore);
+                metaRow.after(prevRow);
+            }
+            // Advance past both rows (meta + preview)
+            insertBefore = prevRow.nextSibling;
+        });
+    }
+
+    function statusBadgeHtml(status) {
+        const s = status.status;
+        const cls = 'status-badge status-' + s;
+        const label = s.charAt(0).toUpperCase() + s.slice(1);
+        let html = `<span class="${cls}">${label}</span>`;
+        if (s === 'waiting' && status.reason) {
+            html += `<span class="waiting-reason">${esc(status.reason)}</span>`;
+        }
+        return html;
+    }
+
+    function sessionNameHtml(s) {
+        let html = '';
+        if (s.display_name) {
+            html += `<span class="session-name">${esc(s.display_name)}</span><br>`;
+        }
+        html += `<code style="font-size:0.75rem">${esc(s.session_id)}</code>`;
+        return html;
+    }
+
+    function renderSessions(sessions) {
+        const container = document.getElementById('sessions-container');
+        if (sessions.length === 0) {
+            container.innerHTML = '<p>No active sessions.</p>';
+            return;
+        }
+        let html = `<table id="sessions-table"><thead><tr>
+            <th>Status</th><th>Project</th><th>Session</th>`;
+        if (READWRITE) html += '<th>Approval Mode</th>';
+        html += '</tr></thead><tbody>';
+        sessions.forEach(s => {
+            const mode = s.config.approval_mode;
+            const isEnded = s.status.status === 'ended';
+            html += `<tr${isEnded ? ' class="session-ended"' : ''}>`;
+            html += `<td>${statusBadgeHtml(s.status)}</td>`;
+            html += `<td>${esc(s.project)}</td>`;
+            html += `<td>${sessionNameHtml(s)}</td>`;
+            if (READWRITE) {
+                if (s.editor_type !== 'cursor') {
+                    const nextMode = mode === 'remote' ? 'terminal' : 'remote';
+                    const label = mode === 'remote' ? 'remote (switch to terminal)' : 'terminal (switch to remote)';
+                    html += `<td><button class="outline" style="margin:0;padding:0.25rem 0.5rem" onclick="toggleMode('${esc(s.session_id)}','${nextMode}')">${label}</button></td>`;
+                } else {
+                    html += '<td><span style="color:var(--pico-muted-color)">remote (cursor)</span></td>';
+                }
+            }
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    }
+
+    function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
+    }
+
+    // --- Selection ---
+    function getMetaRows() {
+        const table = document.getElementById('approvals-table');
+        return table ? Array.from(table.querySelectorAll('tbody tr.meta-row')) : [];
+    }
+
+    function updateSelection() {
+        const table = document.getElementById('approvals-table');
+        if (!table) return;
+        table.querySelectorAll('tbody tr.meta-row').forEach((r, i) => {
+            const sel = i === selectedIdx;
+            r.classList.toggle('selected', sel);
+            const preview = r.nextElementSibling;
+            if (preview && preview.classList.contains('tool-preview')) {
+                preview.classList.toggle('selected', sel);
+                preview.classList.toggle('visible', sel);
+            }
+        });
+    }
+
+    function moveSelection(delta) {
+        const rows = getMetaRows();
+        if (rows.length === 0) return;
+        if (selectedIdx < 0) { selectedIdx = 0; }
+        else { selectedIdx = Math.max(0, Math.min(rows.length - 1, selectedIdx + delta)); }
+        updateSelection();
+    }
+
+    function getSelectedId() {
+        const rows = getMetaRows();
+        if (selectedIdx >= 0 && selectedIdx < rows.length) {
+            return rows[selectedIdx].dataset.id;
+        }
+        return null;
+    }
+
+    // --- Actions ---
+    window.approveRow = async function(id) {
+        await fetch(`/api/v1/approvals/${id}/resolve`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'approve', message: null })
+        });
+        poll();
+    };
+
+    window.showDenyInput = function(id) {
+        hideDenyInputs();
+        denyActiveId = id;
+        const el = document.getElementById('deny-' + id);
+        if (el) {
+            el.classList.add('visible');
+            const input = el.querySelector('input');
+            if (input) input.focus();
+        }
+    };
+
+    window.hideDenyInputs = function() {
+        denyActiveId = null;
+        document.querySelectorAll('.deny-input').forEach(el => el.classList.remove('visible'));
+    };
+
+    window.denyRow = async function(id, reason) {
+        await fetch(`/api/v1/approvals/${id}/resolve`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'deny', message: reason || '' })
+        });
+        hideDenyInputs();
+        poll();
+    };
+
+    window.toggleMode = async function(sessionId, mode) {
+        await fetch(`/api/v1/sessions/${sessionId}`, {
+            method: 'PUT',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approval_mode: mode })
+        });
+        poll();
+    };
+
+    // --- Question helpers ---
+
+    window.toggleCustomInput = function(qid, qIdx, checked) {
+        const el = document.getElementById(`custom-${qid}-${qIdx}`);
+        if (el) el.classList.toggle('visible', checked);
+    };
+
+    function collectAnswers(qid, numQuestions) {
+        const answers = [];
+        for (let i = 0; i < numQuestions; i++) {
+            const selected = [];
+            const inputs = document.querySelectorAll(`input[name="q-${qid}-${i}"]`);
+            inputs.forEach(inp => {
+                if (inp.checked) {
+                    if (inp.value === '__custom__') {
+                        const custom = document.querySelector(`#custom-${qid}-${i} input`);
+                        if (custom && custom.value.trim()) selected.push(custom.value.trim());
+                    } else {
+                        selected.push(inp.value);
+                    }
+                }
+            });
+            answers.push(selected);
+        }
+        return answers;
+    }
+
+    window.submitQuestion = async function(qid, numQuestions) {
+        const answers = collectAnswers(qid, numQuestions);
+        await fetch(`/api/v1/questions/${qid}/resolve`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'answer', answers })
+        });
+        poll();
+    };
+
+    window.rejectQuestion = async function(qid) {
+        await fetch(`/api/v1/questions/${qid}/resolve`, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'reject' })
+        });
+        poll();
+    };
+
+    function renderQuestions(questions) {
+        const container = document.getElementById('questions-container');
+        if (questions.length === 0) {
+            container.innerHTML = '<p>No pending questions.</p>';
+            return;
+        }
+        const existingIds = new Set(
+            Array.from(container.querySelectorAll('[data-qid]')).map(el => el.dataset.qid)
+        );
+        const newIds = new Set(questions.map(q => q.id));
+
+        // Remove cards no longer pending
+        for (const id of existingIds) {
+            if (!newIds.has(id)) {
+                const el = document.getElementById('qcard-' + id);
+                if (el) el.remove();
+            }
+        }
+
+        // Add new cards
+        for (const pq of questions) {
+            if (existingIds.has(pq.id)) continue; // already shown
+            const card = document.createElement('div');
+            card.className = 'question-card';
+            card.id = 'qcard-' + pq.id;
+            card.dataset.qid = pq.id;
+            const time = new Date(pq.created_at).toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+            let html = `<p style="font-size:0.75rem;color:var(--pico-muted-color);margin:0 0 0.5rem">
+                <strong>${esc(pq.session_display_name)}</strong> · ${esc(pq.project)} · ${time}
+            </p>`;
+            pq.questions.forEach((q, qi) => {
+                const inputType = q.multiple ? 'checkbox' : 'radio';
+                html += `<div class="q-header">${esc(q.header)}</div><h5>${esc(q.question)}</h5>`;
+                q.options.forEach(opt => {
+                    html += `<label><input type="${inputType}" name="q-${pq.id}-${qi}" value="${esc(opt.label)}"> ${esc(opt.label)}</label>`;
+                    if (opt.description) {
+                        html += `<div class="q-description">${esc(opt.description)}</div>`;
+                    }
+                });
+                const custom = q.custom !== false;
+                if (custom) {
+                    html += `<label style="margin-top:0.5rem"><input type="${inputType}" name="q-${pq.id}-${qi}" value="__custom__" onchange="toggleCustomInput('${pq.id}',${qi},this.checked)"> Type your own answer</label>`;
+                    html += `<div class="custom-input" id="custom-${pq.id}-${qi}"><input type="text" placeholder="Your answer..." style="margin:0;padding:0.25rem 0.5rem;font-size:0.85rem"></div>`;
+                }
+            });
+            if (READWRITE) {
+                html += `<div class="question-actions">
+                    <button onclick="submitQuestion('${pq.id}',${pq.questions.length})">Submit Answer</button>
+                    <button class="outline secondary" onclick="rejectQuestion('${pq.id}')">Dismiss</button>
+                </div>`;
+            }
+            card.innerHTML = html;
+            container.appendChild(card);
+
+            // Allow pressing Enter inside a custom text input to submit the question
+            card.querySelectorAll('.custom-input input[type="text"]').forEach(input => {
+                input.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        submitQuestion(pq.id, pq.questions.length);
+                    }
+                });
+            });
+        }
+
+        // Ensure "no questions" placeholder is removed if we have cards
+        const placeholder = container.querySelector('p');
+        if (placeholder && questions.length > 0) placeholder.remove();
+    }
+
+    // Start polling
+    setInterval(poll, POLL_MS);
+    document.addEventListener('keydown', function(e) {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+        const key = e.key;
+        if (key === 'j' || key === 'ArrowDown') { e.preventDefault(); moveSelection(1); }
+        else if (key === 'k' || key === 'ArrowUp') { e.preventDefault(); moveSelection(-1); }
+        else if (key === 'Enter') {
+            const id = getSelectedId();
+            if (id) { e.preventDefault(); window.location.href = '/approvals/' + id; }
+        }
+        else if (READWRITE && (key === 'a' || key === '1')) {
+            const id = getSelectedId();
+            if (id) { e.preventDefault(); approveRow(id); }
+        }
+        else if (READWRITE && (key === 'd' || key === '2')) {
+            const id = getSelectedId();
+            if (id) { e.preventDefault(); showDenyInput(id); }
+        }
+        else if (key === '?') {
+            document.getElementById('help-detail').classList.toggle('visible');
+        }
+    });
+
+    // Start polling
+    setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

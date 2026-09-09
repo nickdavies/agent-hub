@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>Approval Queue — Claude Notify</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        body { min-height: 100vh; }
+        main { max-width: 44rem; padding-top: max(0.5rem, env(safe-area-inset-top)); padding-bottom: calc(1rem + env(safe-area-inset-bottom)); }
+        article { margin-bottom: 1rem; }
+        .queue-header { display: grid; grid-template-columns: auto 1fr auto; align-items: baseline; gap: 0.6rem; margin-bottom: 0.5rem; }
+        .queue-header h1 { font-size: 1.25rem; margin: 0; }
+        .queue-header a { text-decoration: none; }
+        #queue-summary { color: var(--pico-muted-color); font-size: 0.85rem; margin: 0; white-space: nowrap; }
+        #error-state { border: 1px solid var(--pico-del-color); color: var(--pico-del-color); padding: 0.75rem; border-radius: var(--pico-border-radius); }
+        .request-heading { font-size: 1rem; margin-bottom: 0.5rem; }
+        #request-details dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 0.75rem; margin-bottom: 0; overflow-wrap: anywhere; }
+        #request-details dt { color: var(--pico-primary); font-weight: bold; }
+        #request-details dd { margin: 0; min-width: 0; }
+        .smart-view dt { color: var(--pico-primary); font-weight: bold; margin-top: 0.6rem; }
+        .smart-view dd { margin-left: 0; overflow-wrap: anywhere; }
+        .smart-view dd pre { margin: 0; }
+        pre { max-height: none; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+        pre code { white-space: inherit; overflow-wrap: inherit; }
+        .view-heading { align-items: center; display: flex; justify-content: space-between; gap: 1rem; }
+        .view-heading h3 { margin-bottom: 0.5rem; }
+        .view-heading button { margin: 0; padding: 0.25rem 0.6rem; width: auto; white-space: nowrap; }
+        #readonly-status { border-top: 1px solid var(--pico-muted-border-color); padding: 0.75rem 0; color: var(--pico-muted-color); }
+        #queue-actions { position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; background: var(--pico-card-background-color); border-top: 1px solid var(--pico-muted-border-color); box-shadow: 0 -0.25rem 1rem rgba(0, 0, 0, 0.08); }
+        #queue-actions .action-inner { max-width: 44rem; margin: 0 auto; padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom)); }
+        #primary-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+        #primary-actions button { min-height: 3.5rem; margin: 0; font-size: 1.1rem; font-weight: bold; }
+        #deny-panel { margin-bottom: 0.75rem; }
+        #deny-panel label { margin-bottom: 0.25rem; }
+        #deny-panel input { margin-bottom: 0.5rem; }
+        #deny-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }
+        #deny-actions button { margin: 0; }
+        [hidden] { display: none !important; }
+    </style>
+</head>
+<body>
+<main class="container" id="queue-state">
+    <header class="queue-header">
+        <a href="/approvals" aria-label="Back to dashboard">←</a>
+        <h1>Approval Queue</h1>
+        <p id="queue-summary" aria-live="polite">Loading…</p>
+    </header>
+
+    <p id="loading-state" role="status">Loading approval details…</p>
+    <p id="empty-state" role="status" hidden>No pending approvals. Waiting for new work…</p>
+    <p id="error-state" role="alert" hidden></p>
+
+    <article id="request-state" aria-labelledby="request-heading" aria-live="polite" aria-atomic="true" hidden>
+        <h2 id="request-heading" class="request-heading" tabindex="-1">Pending request</h2>
+
+        <section aria-labelledby="input-heading">
+            <div class="view-heading">
+                <h3 id="input-heading">Tool Input</h3>
+                <button type="button" class="outline secondary" id="view-toggle" aria-controls="smart-view raw-view" aria-expanded="false">Show raw JSON</button>
+            </div>
+            <div id="smart-view" class="smart-view"></div>
+            <pre id="raw-view" hidden><code id="raw-content"></code></pre>
+        </section>
+
+        <section id="request-details" aria-labelledby="details-heading">
+            <h3 id="details-heading">Request Details</h3>
+            <dl>
+                <dt>Tool</dt><dd id="tool-name"></dd>
+                <dt>Project</dt><dd id="project"></dd>
+                <dt>Session</dt><dd id="session"></dd>
+                <dt>Provider</dt><dd><code id="provider"></code></dd>
+                <dt>Status</dt><dd><mark>Pending</mark></dd>
+            </dl>
+        </section>
+    </article>
+
+    {% if !readwrite %}
+    <p id="readonly-status" role="status">This approval queue is read-only.</p>
+    {% endif %}
+</main>
+
+{% if readwrite %}
+<footer id="queue-actions" hidden>
+    <div class="action-inner">
+        <div id="deny-panel" hidden>
+            <label for="deny-reason">Reason (optional)</label>
+            <input type="text" id="deny-reason" autocomplete="off">
+            <div id="deny-actions">
+                <button type="button" class="secondary" id="confirm-deny">Deny request</button>
+                <button type="button" class="outline secondary" id="cancel-deny">Cancel</button>
+            </div>
+        </div>
+        <div id="primary-actions">
+            <button type="button" id="approve-button" aria-label="Approve current request" aria-keyshortcuts="a">Approve</button>
+            <button type="button" class="secondary" id="deny-button" aria-label="Deny current request" aria-keyshortcuts="d">Deny</button>
+        </div>
+        <small id="action-status" role="status" aria-live="assertive"></small>
+    </div>
+</footer>
+{% endif %}
+
+<script>
+(function() {
+    const READWRITE = {{ readwrite }};
+    const POLL_MS = 2000;
+    let currentId = null;
+    let queueRequest = null;
+    let pollTimer = null;
+    let actionInFlight = false;
+    let rawMode = false;
+    let errorKind = null;
+    let focusNewRequest = false;
+    let resolvedApprovalId = null;
+
+    const loadingState = document.getElementById('loading-state');
+    const emptyState = document.getElementById('empty-state');
+    const errorState = document.getElementById('error-state');
+    const requestState = document.getElementById('request-state');
+    const queueSummary = document.getElementById('queue-summary');
+    const queueActions = document.getElementById('queue-actions');
+
+    function setText(id, value) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value == null ? '' : String(value);
+    }
+
+    function showError(message, kind) {
+        errorState.textContent = message;
+        errorState.hidden = false;
+        errorKind = kind;
+    }
+
+    function clearError() {
+        errorState.hidden = true;
+        errorState.textContent = '';
+        errorKind = null;
+    }
+
+    function updateActionSpacing() {
+        const queueState = document.getElementById('queue-state');
+        if (!queueActions || queueActions.hidden) {
+            queueState.style.paddingBottom = '';
+            return;
+        }
+        queueState.style.paddingBottom = Math.ceil(queueActions.getBoundingClientRect().height + 16) + 'px';
+    }
+
+    function requestActionSpacingUpdate() {
+        window.requestAnimationFrame(updateActionSpacing);
+    }
+
+    function createSmartEntry(key, value) {
+        const group = document.createElement('div');
+        const term = document.createElement('dt');
+        term.textContent = key;
+        const detail = document.createElement('dd');
+        const pre = document.createElement('pre');
+        const code = document.createElement('code');
+        code.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+        pre.appendChild(code);
+        detail.appendChild(pre);
+        group.append(term, detail);
+        return group;
+    }
+
+    function entriesWithDippyContext(entries, reason) {
+        const commandIndex = entries.findIndex(([key]) => key === 'command');
+        const descriptionIndex = entries.findIndex(([key]) => key === 'description');
+        const dippyEntry = ['Dippy context', reason];
+
+        if (commandIndex >= 0 && descriptionIndex >= 0) {
+            const result = [];
+            const anchorIndex = Math.min(commandIndex, descriptionIndex);
+            entries.forEach(([key, value], index) => {
+                if (index === anchorIndex) {
+                    result.push(['command', entries[commandIndex][1]], dippyEntry, ['description', entries[descriptionIndex][1]]);
+                }
+                if (key !== 'command' && key !== 'description') result.push([key, value]);
+            });
+            return result;
+        }
+
+        const result = [];
+        for (const entry of entries) {
+            const [key] = entry;
+            if (commandIndex < 0 && key === 'description') result.push(dippyEntry);
+            result.push(entry);
+            if (key === 'command') result.push(dippyEntry);
+        }
+        if (commandIndex < 0 && descriptionIndex < 0) result.push(dippyEntry);
+        return result;
+    }
+
+    function orderedSmartEntries(input, toolName, extra) {
+        const entries = Object.entries(input);
+        const dippyReason = extra && typeof extra.dippy_reason === 'string' ? extra.dippy_reason : null;
+        const diff = extra && typeof extra.diff === 'string' ? extra.diff : null;
+
+        const ordered = [];
+        const consumed = new Set();
+        function addField(key, label) {
+            if (!Object.prototype.hasOwnProperty.call(input, key) || consumed.has(key)) return;
+            ordered.push([label || key, input[key]]);
+            consumed.add(key);
+        }
+        function addPreferredPath() {
+            if (Object.prototype.hasOwnProperty.call(input, 'path')) {
+                addField('path', 'path');
+            } else {
+                addField('file_path', 'path');
+            }
+        }
+        function addDiff() {
+            if (diff !== null) ordered.push(['diff', diff]);
+        }
+        function addDippyContext() {
+            if (dippyReason !== null) ordered.push(['Dippy context', dippyReason]);
+        }
+        function addRemaining() {
+            for (const [key, value] of entries) {
+                if (!consumed.has(key)) ordered.push([key, value]);
+            }
+        }
+
+        if (toolName === 'Bash') {
+            addField('command');
+            addDippyContext();
+            addField('description');
+            addRemaining();
+            addDiff();
+            return ordered;
+        }
+
+        if (toolName === 'Write') {
+            addPreferredPath();
+            addDiff();
+            addField('content');
+            addRemaining();
+            addDippyContext();
+            return ordered;
+        }
+        if (toolName === 'MultiEdit') {
+            addPreferredPath();
+            addDiff();
+            addField('edits');
+            addRemaining();
+            addDippyContext();
+            return ordered;
+        }
+        if (toolName === 'Edit' || toolName === 'StrReplace') {
+            addPreferredPath();
+            addDiff();
+            const mutationFields = toolName === 'Edit'
+                ? ['old_content', 'new_content', 'old_string', 'new_string']
+                : ['old_string', 'new_string', 'old_content', 'new_content'];
+            mutationFields.forEach(key => addField(key));
+            addRemaining();
+            addDippyContext();
+            return ordered;
+        }
+        if (toolName === 'WebFetch') {
+            if (Object.prototype.hasOwnProperty.call(input, 'tool')) {
+                addField('tool');
+            } else {
+                ordered.push(['tool', toolName]);
+            }
+            addField('url');
+            addField('headers');
+            const timeoutKey = ['timeout', 'timeout_seconds', 'timeout_ms']
+                .find(key => Object.prototype.hasOwnProperty.call(input, key));
+            if (timeoutKey) addField(timeoutKey, 'timeout');
+            addRemaining();
+            if (diff !== null) ordered.push(['diff', diff]);
+            addDippyContext();
+            return ordered;
+        }
+
+        if (dippyReason !== null) {
+            const generic = entriesWithDippyContext(entries, dippyReason);
+            if (diff !== null) generic.push(['diff', diff]);
+            return generic;
+        }
+        addRemaining();
+        if (diff !== null) ordered.push(['diff', diff]);
+        return ordered;
+    }
+
+    function renderSmartInput(input, toolName, extra) {
+        const container = document.getElementById('smart-view');
+        container.replaceChildren();
+        if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+            const pre = document.createElement('pre');
+            const code = document.createElement('code');
+            code.textContent = typeof input === 'string' ? input : JSON.stringify(input, null, 2);
+            pre.appendChild(code);
+            container.appendChild(pre);
+            const dippyReason = extra && typeof extra.dippy_reason === 'string' ? extra.dippy_reason : null;
+            const diff = extra && typeof extra.diff === 'string' ? extra.diff : null;
+            if (dippyReason !== null || diff !== null) {
+                const list = document.createElement('dl');
+                if (dippyReason !== null) list.appendChild(createSmartEntry('Dippy context', dippyReason));
+                if (diff !== null) list.appendChild(createSmartEntry('diff', diff));
+                container.appendChild(list);
+            }
+            return;
+        }
+
+        const list = document.createElement('dl');
+        for (const [label, value] of orderedSmartEntries(input, toolName, extra)) {
+            list.appendChild(createSmartEntry(label, value));
+        }
+        container.appendChild(list);
+    }
+
+    function renderApproval(approval, count) {
+        currentId = approval.id;
+        rawMode = false;
+        setText('tool-name', approval.tool_name || 'Unknown tool');
+        setText('project', approval.project || 'Unknown project');
+        setText('session', approval.session_display_name || approval.session_id || 'Unknown session');
+        setText('provider', approval.provider || 'Unknown provider');
+        const extra = approval.context && approval.context.extra;
+        renderSmartInput(approval.tool_input, approval.tool_name, extra);
+        setText('raw-content', JSON.stringify(approval.tool_input, null, 2));
+        document.getElementById('smart-view').hidden = false;
+        document.getElementById('raw-view').hidden = true;
+        const toggle = document.getElementById('view-toggle');
+        toggle.textContent = 'Show raw JSON';
+        toggle.setAttribute('aria-expanded', 'false');
+        loadingState.hidden = true;
+        emptyState.hidden = true;
+        requestState.hidden = false;
+        queueSummary.textContent = count + ' pending';
+        if (queueActions) queueActions.hidden = false;
+        setText('action-status', '');
+        hideDeny();
+        requestActionSpacingUpdate();
+        if (focusNewRequest) {
+            focusNewRequest = false;
+            window.requestAnimationFrame(() => document.getElementById('request-heading').focus());
+        }
+    }
+
+    function renderEmpty() {
+        currentId = null;
+        loadingState.hidden = true;
+        requestState.hidden = true;
+        emptyState.hidden = false;
+        queueSummary.textContent = 'None pending';
+        if (queueActions) queueActions.hidden = true;
+        setText('action-status', '');
+        focusNewRequest = false;
+        requestActionSpacingUpdate();
+    }
+
+    function applyQueue(approvals) {
+        if (!Array.isArray(approvals)) throw new Error('Pending approvals response was not a list.');
+        if (errorKind === 'load') clearError();
+        let pending = approvals;
+        if (resolvedApprovalId) {
+            const stillListed = approvals.some(approval => approval.id === resolvedApprovalId);
+            pending = approvals.filter(approval => approval.id !== resolvedApprovalId);
+            if (!stillListed) resolvedApprovalId = null;
+        }
+        if (pending.length === 0) {
+            renderEmpty();
+            return;
+        }
+
+        const current = pending.find(approval => approval.id === currentId);
+        if (current) {
+            queueSummary.textContent = pending.length + ' pending';
+            return;
+        }
+        renderApproval(pending[0], pending.length);
+    }
+
+    function loadQueue() {
+        if (queueRequest) return queueRequest;
+        queueRequest = fetch('/api/v1/approvals/pending', { credentials: 'same-origin' })
+            .then(response => {
+                if (!response.ok) throw new Error('Could not load approvals (HTTP ' + response.status + ').');
+                return response.json();
+            })
+            .then(applyQueue)
+            .catch(error => {
+                if (!currentId) {
+                    loadingState.hidden = true;
+                    emptyState.hidden = true;
+                    requestState.hidden = true;
+                }
+                showError(error.message || 'Could not load approvals.', 'load');
+                throw error;
+            })
+            .finally(() => { queueRequest = null; });
+        return queueRequest;
+    }
+
+    function schedulePoll() {
+        window.clearTimeout(pollTimer);
+        pollTimer = window.setTimeout(async () => {
+            if (!actionInFlight) await loadQueue().catch(() => {});
+            schedulePoll();
+        }, POLL_MS);
+    }
+
+    function setActionBusy(busy, message) {
+        actionInFlight = busy;
+        for (const id of ['approve-button', 'deny-button', 'confirm-deny', 'cancel-deny']) {
+            const button = document.getElementById(id);
+            if (button) button.disabled = busy;
+        }
+        setText('action-status', message || '');
+        requestActionSpacingUpdate();
+    }
+
+    async function resolveCurrent(decision, message) {
+        if (!READWRITE || !currentId || actionInFlight) return;
+        const approvalId = currentId;
+        setActionBusy(true, decision === 'approve' ? 'Approving…' : 'Denying…');
+        clearError();
+        window.clearTimeout(pollTimer);
+        try {
+            if (queueRequest) await queueRequest.catch(() => {});
+            const response = await fetch('/api/v1/approvals/' + encodeURIComponent(approvalId) + '/resolve', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ decision, message })
+            });
+            if (!response.ok) throw new Error('Could not resolve approval (HTTP ' + response.status + ').');
+        } catch (error) {
+            showError(error.message || 'Could not resolve approval.', 'action');
+            setText('action-status', 'Request was not resolved.');
+            setActionBusy(false, document.getElementById('action-status').textContent);
+            schedulePoll();
+            return;
+        }
+
+        resolvedApprovalId = approvalId;
+        currentId = null;
+        focusNewRequest = true;
+        setText('action-status', '');
+        requestState.hidden = true;
+        loadingState.textContent = 'Request resolved. Refreshing the queue…';
+        loadingState.hidden = false;
+        if (queueActions) queueActions.hidden = true;
+        requestActionSpacingUpdate();
+
+        try {
+            await loadQueue();
+        } catch (error) {
+            showError('Request resolved, but the queue could not be refreshed.', 'load');
+        } finally {
+            setActionBusy(false, document.getElementById('action-status').textContent);
+            schedulePoll();
+        }
+    }
+
+    function showDeny() {
+        if (!READWRITE || !currentId || actionInFlight) return;
+        document.getElementById('deny-panel').hidden = false;
+        document.getElementById('primary-actions').hidden = true;
+        document.getElementById('deny-reason').focus();
+        requestActionSpacingUpdate();
+    }
+
+    function hideDeny() {
+        if (!READWRITE) return;
+        document.getElementById('deny-panel').hidden = true;
+        document.getElementById('primary-actions').hidden = false;
+        document.getElementById('deny-reason').value = '';
+        requestActionSpacingUpdate();
+    }
+
+    document.getElementById('view-toggle').addEventListener('click', () => {
+        rawMode = !rawMode;
+        document.getElementById('smart-view').hidden = rawMode;
+        document.getElementById('raw-view').hidden = !rawMode;
+        document.getElementById('view-toggle').textContent = rawMode ? 'Show key/value view' : 'Show raw JSON';
+        document.getElementById('view-toggle').setAttribute('aria-expanded', String(rawMode));
+    });
+
+    if (READWRITE) {
+        document.getElementById('approve-button').addEventListener('click', () => resolveCurrent('approve', null));
+        document.getElementById('deny-button').addEventListener('click', showDeny);
+        document.getElementById('cancel-deny').addEventListener('click', hideDeny);
+        document.getElementById('confirm-deny').addEventListener('click', () => {
+            resolveCurrent('deny', document.getElementById('deny-reason').value || '');
+        });
+        document.getElementById('deny-reason').addEventListener('keydown', event => {
+            if (event.key === 'Enter') resolveCurrent('deny', event.currentTarget.value || '');
+            if (event.key === 'Escape') hideDeny();
+        });
+        document.addEventListener('keydown', event => {
+            const target = event.target;
+            const editable = target instanceof Element &&
+                (target.matches('input, textarea, select') || target.isContentEditable);
+            if (actionInFlight || !currentId || event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || editable) return;
+            if (event.key === 'a') {
+                event.preventDefault();
+                resolveCurrent('approve', null);
+            } else if (event.key === 'd') {
+                event.preventDefault();
+                showDeny();
+            }
+        });
+        window.addEventListener('resize', requestActionSpacingUpdate);
+    }
+
+    loadQueue().catch(() => {}).finally(schedulePoll);
+})();
+</script>
+</body>
+</html>

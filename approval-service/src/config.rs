@@ -1,0 +1,189 @@
+use std::env;
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
+
+// Re-export protocol types so existing `use super::config::X` imports work.
+pub use protocol::{NotifyConfig, NotifyConfigUpdate, Secret};
+
+use super::sessions::SessionApprovalMode;
+use crate::error::AppError;
+
+/// Feature mode for the approval system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalFeatureMode {
+    Disabled,
+    Readonly,
+    Readwrite,
+}
+
+/// Authentication mode for the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Bearer token authentication required.
+    Token,
+    /// No authentication. Intended for localhost / Docker use only.
+    None,
+}
+
+/// Immutable server configuration loaded from environment at startup.
+pub struct ServerConfig {
+    pub auth_mode: AuthMode,
+    pub tokens: Vec<Token>,
+    pub listen_addr: String,
+    pub presence_ttl_secs: u64,
+    pub session_ttl_secs: u64,
+    pub notification_delay_secs: u64,
+    pub approval_mode: ApprovalFeatureMode,
+    pub base_url: Option<String>,
+    pub default_approval_mode: SessionApprovalMode,
+}
+
+pub struct Token {
+    pub label: String,
+    pub secret: Secret,
+}
+
+impl ServerConfig {
+    pub fn from_env() -> Result<Self, AppError> {
+        let auth_mode = match env::var("AUTH_MODE").unwrap_or_default().as_str() {
+            "none" => AuthMode::None,
+            _ => AuthMode::Token,
+        };
+
+        let tokens = if auth_mode == AuthMode::Token {
+            let raw_tokens = env::var("AGENT_HUB_TOKENS")
+                .map_err(|_| AppError::Config("AGENT_HUB_TOKENS not set".into()))?;
+            let tokens = parse_tokens(&raw_tokens)?;
+            if tokens.is_empty() {
+                return Err(AppError::Config("AGENT_HUB_TOKENS is empty".into()));
+            }
+            tokens
+        } else {
+            Vec::new()
+        };
+
+        let default_addr = match auth_mode {
+            AuthMode::None => "127.0.0.1:8080",
+            AuthMode::Token => "0.0.0.0:8080",
+        };
+        let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| default_addr.into());
+        let presence_ttl_secs = env::var("PRESENCE_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let session_ttl_secs = env::var("SESSION_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7200);
+        let notification_delay_secs = env::var("NOTIFICATION_DELAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let approval_mode = match env::var("APPROVAL_MODE").unwrap_or_default().as_str() {
+            "readonly" => ApprovalFeatureMode::Readonly,
+            "readwrite" => ApprovalFeatureMode::Readwrite,
+            _ => ApprovalFeatureMode::Disabled,
+        };
+
+        let base_url = env::var("BASE_URL")
+            .ok()
+            .map(|u| u.trim_end_matches('/').to_string());
+
+        if approval_mode != ApprovalFeatureMode::Disabled && base_url.is_none() {
+            return Err(AppError::Config(
+                "BASE_URL is required when APPROVAL_MODE is not disabled".into(),
+            ));
+        }
+
+        let default_approval_mode = match env::var("DEFAULT_APPROVAL_MODE")
+            .unwrap_or_default()
+            .as_str()
+        {
+            "terminal" => SessionApprovalMode::Terminal,
+            _ => SessionApprovalMode::Remote,
+        };
+
+        Ok(Self {
+            auth_mode,
+            tokens,
+            listen_addr,
+            presence_ttl_secs,
+            session_ttl_secs,
+            notification_delay_secs,
+            approval_mode,
+            base_url,
+            default_approval_mode,
+        })
+    }
+}
+
+fn parse_tokens(raw: &str) -> Result<Vec<Token>, AppError> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            if let Some((label, secret)) = entry.split_once(':') {
+                if secret.is_empty() {
+                    return Err(AppError::Config(format!(
+                        "token with label '{label}' has empty secret"
+                    )));
+                }
+                Ok(Token {
+                    label: label.into(),
+                    secret: Secret::new(secret),
+                })
+            } else {
+                Ok(Token {
+                    label: entry.into(),
+                    secret: Secret::new(entry),
+                })
+            }
+        })
+        .collect()
+}
+
+/// Shared mutable notify config.
+pub type SharedNotifyConfig = Arc<RwLock<NotifyConfig>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_labeled_tokens() {
+        let tokens = parse_tokens("desktop:abc123,mobile:def456").unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].label, "desktop");
+        assert_eq!(tokens[0].secret.expose(), "abc123");
+        assert_eq!(tokens[1].label, "mobile");
+        assert_eq!(tokens[1].secret.expose(), "def456");
+    }
+
+    #[test]
+    fn parse_plain_tokens() {
+        let tokens = parse_tokens("abc123,def456").unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].label, "abc123");
+        assert_eq!(tokens[0].secret.expose(), "abc123");
+    }
+
+    #[test]
+    fn parse_empty_secret_fails() {
+        assert!(parse_tokens("desktop:").is_err());
+    }
+
+    #[test]
+    fn notify_config_partial_update() {
+        let mut cfg = NotifyConfig::with_delay(0);
+        cfg.apply(NotifyConfigUpdate {
+            stop_enabled: Some(false),
+            permission_enabled: None,
+            notification_delay_secs: Some(30),
+        });
+        assert!(!cfg.stop_enabled);
+        assert!(cfg.permission_enabled);
+        assert_eq!(cfg.notification_delay_secs, 30);
+    }
+}
