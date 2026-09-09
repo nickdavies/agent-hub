@@ -14,7 +14,6 @@ use tracing::{error, info, warn};
 
 use super::AppState;
 use super::DEFAULT_WEB_HOME;
-use super::notifier::Notifier;
 use crate::error::AppError;
 use protocol::Secret;
 
@@ -213,8 +212,8 @@ pub struct CallbackParams {
 }
 
 /// GET /auth/start/{provider} — initiate OAuth redirect.
-pub async fn start_auth<N: Notifier>(
-    State(state): State<AppState<N>>,
+pub async fn start_auth(
+    State(state): State<AppState>,
     session: Session,
     Path(provider_name): Path<String>,
 ) -> Response {
@@ -258,8 +257,8 @@ pub async fn start_auth<N: Notifier>(
 }
 
 /// GET /auth/callback/{provider} — handle OAuth callback.
-pub async fn callback<N: Notifier>(
-    State(state): State<AppState<N>>,
+pub async fn callback(
+    State(state): State<AppState>,
     session: Session,
     Path(provider_name): Path<String>,
     Query(params): Query<CallbackParams>,

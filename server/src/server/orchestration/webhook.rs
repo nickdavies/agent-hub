@@ -88,8 +88,8 @@ pub struct GithubWebhookIngestResponse {
     pub mapped_event: Option<WorkflowEventKind>,
 }
 
-pub async fn github_webhook<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn github_webhook(
+    State(state): State<super::super::AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<axum::response::Response, AppError> {

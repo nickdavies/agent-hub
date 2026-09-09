@@ -727,7 +727,7 @@ pub struct OrchestrationService {
     last_github_poll_at: Arc<Mutex<Option<Instant>>>,
     db_path: Arc<PathBuf>,
     init_once: Arc<OnceCell<()>>,
-    force_gateway_approval_mode: bool,
+    approval_client: Option<Arc<agent_hub_approval_client::ApprovalClient>>,
     environments: Arc<Vec<EnvironmentDefinition>>,
     overlays: Arc<Vec<EnvironmentOverlay>>,
     discovered_repos: Arc<Vec<DiscoveredRepo>>,
@@ -799,7 +799,7 @@ impl OrchestrationService {
             last_github_poll_at: Arc::new(Mutex::new(None)),
             db_path: Arc::new(PathBuf::from(db_path)),
             init_once: Arc::new(OnceCell::new()),
-            force_gateway_approval_mode: false,
+            approval_client: None,
             environments: Arc::new(Vec::new()),
             overlays: Arc::new(Vec::new()),
             discovered_repos: Arc::new(Vec::new()),
@@ -848,12 +848,11 @@ impl OrchestrationService {
         }
     }
 
-    pub fn with_server_approval_mode(
+    pub fn with_approval_client(
         mut self,
-        approval_mode: super::config::ApprovalFeatureMode,
+        approval_client: Option<Arc<agent_hub_approval_client::ApprovalClient>>,
     ) -> Self {
-        self.force_gateway_approval_mode =
-            !matches!(approval_mode, super::config::ApprovalFeatureMode::Disabled);
+        self.approval_client = approval_client;
         self
     }
 
@@ -7085,7 +7084,10 @@ impl OrchestrationService {
             project_approval_mode_into_job_context(
                 &mut job.context,
                 &item.context,
-                self.force_gateway_approval_mode,
+                self.approval_client
+                    .as_deref()
+                    .map(agent_hub_approval_client::ApprovalClient::endpoint)
+                    .map(reqwest::Url::as_str),
             );
             self.project_resolved_authorization(
                 &mut job,
@@ -7438,7 +7440,10 @@ impl OrchestrationService {
         project_approval_mode_into_job_context(
             &mut job.context,
             &item.context,
-            self.force_gateway_approval_mode,
+            self.approval_client
+                .as_deref()
+                .map(agent_hub_approval_client::ApprovalClient::endpoint)
+                .map(reqwest::Url::as_str),
         );
         self.project_resolved_authorization(&mut job, item, state.kind(), checkpoint_owner_id)?;
         Ok(job)
@@ -7509,17 +7514,6 @@ impl OrchestrationService {
         checkpoint_owner_id: Uuid,
     ) -> Result<(), AppError> {
         remove_legacy_event_aliases(&mut job.context);
-        if job.context.get("environment_base").is_some()
-            && job
-                .context
-                .get("approval_mode")
-                .and_then(serde_json::Value::as_str)
-                == Some("gateway")
-        {
-            return Err(AppError::WorkflowInvalid(
-                "approval_mode 'gateway' is unsupported for durable OpenCode execution".to_string(),
-            ));
-        }
         let execution_kind = job
             .context
             .get(CONTEXT_WORKFLOW_KEY)
@@ -10782,7 +10776,10 @@ impl OrchestrationService {
                         project_approval_mode_into_job_context(
                             &mut job.context,
                             &item.context,
-                            self.force_gateway_approval_mode,
+                            self.approval_client
+                                .as_deref()
+                                .map(agent_hub_approval_client::ApprovalClient::endpoint)
+                                .map(reqwest::Url::as_str),
                         );
                         let checkpoint_owner_id =
                             self.checkpoint_owner_for_work_item(item.id).await?.id;
@@ -10888,7 +10885,10 @@ impl OrchestrationService {
         project_approval_mode_into_job_context(
             &mut job.context,
             &item.context,
-            self.force_gateway_approval_mode,
+            self.approval_client
+                .as_deref()
+                .map(agent_hub_approval_client::ApprovalClient::endpoint)
+                .map(reqwest::Url::as_str),
         );
         let checkpoint_owner_id = self.checkpoint_owner_for_work_item(item.id).await?.id;
         self.project_resolved_authorization(
@@ -14123,7 +14123,7 @@ fn task_human_gate_state_name(state: &TaskHumanGateState) -> String {
 fn project_approval_mode_into_job_context(
     job_context: &mut serde_json::Value,
     work_item_context: &serde_json::Value,
-    force_gateway_approval_mode: bool,
+    approvals_server: Option<&str>,
 ) {
     if !job_context.is_object() {
         *job_context = serde_json::json!({});
@@ -14143,7 +14143,7 @@ fn project_approval_mode_into_job_context(
         })
         .is_some_and(|mode| mode.eq_ignore_ascii_case("gateway"));
 
-    let effective_mode = if force_gateway_approval_mode || env_requests_gateway {
+    let effective_mode = if approvals_server.is_some() || env_requests_gateway {
         "gateway"
     } else {
         "auto"
@@ -14152,6 +14152,25 @@ fn project_approval_mode_into_job_context(
         "approval_mode".to_string(),
         serde_json::Value::String(effective_mode.to_string()),
     );
+    if let Some(endpoint) = approvals_server {
+        context.insert(
+            "approvals_server".to_string(),
+            serde_json::Value::String(endpoint.to_string()),
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn approval_client_endpoint_is_projected_into_gateway_job_context() {
+    let mut job_context = serde_json::json!({});
+    project_approval_mode_into_job_context(
+        &mut job_context,
+        &serde_json::json!({}),
+        Some("https://approvals.example"),
+    );
+    assert_eq!(job_context["approval_mode"], "gateway");
+    assert_eq!(job_context["approvals_server"], "https://approvals.example");
 }
 
 fn triage_valid_next_events(item: &WorkItem) -> Vec<WorkflowEventKind> {
@@ -22249,12 +22268,9 @@ kind = "terminal"
                 auth_mode: super::super::config::AuthMode::None,
                 tokens: vec![],
                 listen_addr: "127.0.0.1:0".into(),
-                presence_ttl_secs: 120,
-                session_ttl_secs: 120,
-                notification_delay_secs: 0,
-                approval_mode: super::super::config::ApprovalFeatureMode::Disabled,
                 base_url: None,
-                default_approval_mode: super::super::sessions::SessionApprovalMode::Remote,
+                approvals_server: None,
+                approvals_token: None,
                 workflows_dir: "workflows".into(),
                 config_root: "../agent-hub-configs".into(),
                 task_dir: "tasks".into(),
@@ -22276,25 +22292,15 @@ kind = "terminal"
             artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
                 std::path::PathBuf::from("local-agent-data"),
             )),
-            presence: Arc::new(super::super::presence::Presence::new(120)),
-            sessions: Arc::new(super::super::sessions::SessionRegistry::new(120)),
-            notifier: Arc::new(super::super::notifier::NullNotifier),
-            notify_config: Arc::new(tokio::sync::RwLock::new(
-                protocol::NotifyConfig::with_delay(0),
-            )),
-            pending: Arc::new(super::super::hooks::PendingNotifications::new()),
-            approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
-            questions: Arc::new(super::super::questions::QuestionRegistry::new()),
             orchestration: Arc::new((*svc).clone()),
             job_events: Arc::new(job_events),
             oauth: Arc::new(None),
-            loaded_config_tree: Arc::new(None),
         };
 
         let app = Router::new()
             .route(
                 "/api/v1/orchestration/jobs/{id}/events",
-                get(job_events_sse::<super::super::notifier::NullNotifier>),
+                get(job_events_sse),
             )
             .with_state(state);
 
@@ -22454,12 +22460,9 @@ kind = "terminal"
                 auth_mode: super::super::config::AuthMode::None,
                 tokens: vec![],
                 listen_addr: "127.0.0.1:0".into(),
-                presence_ttl_secs: 120,
-                session_ttl_secs: 120,
-                notification_delay_secs: 0,
-                approval_mode: super::super::config::ApprovalFeatureMode::Disabled,
                 base_url: None,
-                default_approval_mode: super::super::sessions::SessionApprovalMode::Remote,
+                approvals_server: None,
+                approvals_token: None,
                 workflows_dir: "workflows".into(),
                 config_root: "../agent-hub-configs".into(),
                 task_dir: "tasks".into(),
@@ -22481,19 +22484,9 @@ kind = "terminal"
             artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
                 std::path::PathBuf::from("local-agent-data"),
             )),
-            presence: Arc::new(super::super::presence::Presence::new(120)),
-            sessions: Arc::new(super::super::sessions::SessionRegistry::new(120)),
-            notifier: Arc::new(super::super::notifier::NullNotifier),
-            notify_config: Arc::new(tokio::sync::RwLock::new(
-                protocol::NotifyConfig::with_delay(0),
-            )),
-            pending: Arc::new(super::super::hooks::PendingNotifications::new()),
-            approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
-            questions: Arc::new(super::super::questions::QuestionRegistry::new()),
             orchestration: Arc::new((*svc).clone()),
             job_events: Arc::new(job_events.clone()),
             oauth: Arc::new(None),
-            loaded_config_tree: Arc::new(None),
         };
 
         let req = JobUpdateRequest {
@@ -22503,7 +22496,7 @@ kind = "terminal"
             result: None,
         };
 
-        let _ = update_job::<super::super::notifier::NullNotifier>(
+        let _ = update_job(
             State(state.clone()),
             Path(job.id),
             session_headers.clone(),
@@ -22519,14 +22512,9 @@ kind = "terminal"
             result: None,
         };
 
-        let _ = update_job::<super::super::notifier::NullNotifier>(
-            State(state),
-            Path(job.id),
-            session_headers,
-            Json(req),
-        )
-        .await
-        .expect("update");
+        let _ = update_job(State(state), Path(job.id), session_headers, Json(req))
+            .await
+            .expect("update");
 
         // Marked terminal entries should eventually be cleanable.
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -25677,7 +25665,7 @@ kind = "terminal"
     }
 
     #[tokio::test]
-    async fn gateway_environment_is_rejected_before_authorization() {
+    async fn gateway_environment_uses_standard_authorization_path() {
         let db = std::env::temp_dir().join(format!("orch-{}.sqlite3", Uuid::new_v4()));
         let tasks = std::env::temp_dir().join(format!("tasks-{}", Uuid::new_v4()));
         let svc = OrchestrationService::new(
@@ -25690,19 +25678,14 @@ kind = "terminal"
         let mut job = checkpoint_test_job(&svc, owner.id).await;
         job.context["environment_base"] = serde_json::json!("code-supervised");
         job.context["approval_mode"] = serde_json::json!("gateway");
-        let error = svc
-            .project_resolved_authorization(
-                &mut job,
-                &owner,
-                protocol::ReactiveStateKind::Command,
-                owner.id,
-            )
-            .expect_err("gateway environment must fail closed");
-        assert!(
-            error
-                .to_string()
-                .contains("approval_mode 'gateway' is unsupported")
-        );
+        svc.project_resolved_authorization(
+            &mut job,
+            &owner,
+            protocol::ReactiveStateKind::Command,
+            owner.id,
+        )
+        .expect("gateway environment authorization");
+        assert!(job.canonical_authorization.is_some());
         let conn = Connection::open(db).expect("open orchestration db");
         let job_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
@@ -27912,12 +27895,9 @@ kind = "terminal"
                 auth_mode: super::super::config::AuthMode::None,
                 tokens: vec![],
                 listen_addr: "127.0.0.1:0".into(),
-                presence_ttl_secs: 120,
-                session_ttl_secs: 120,
-                notification_delay_secs: 0,
-                approval_mode: super::super::config::ApprovalFeatureMode::Disabled,
                 base_url: None,
-                default_approval_mode: super::super::sessions::SessionApprovalMode::Remote,
+                approvals_server: None,
+                approvals_token: None,
                 workflows_dir: "workflows".into(),
                 config_root: "../agent-hub-configs".into(),
                 task_dir: "tasks".into(),
@@ -27939,40 +27919,25 @@ kind = "terminal"
             artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
                 std::path::PathBuf::from("local-agent-data"),
             )),
-            presence: Arc::new(super::super::presence::Presence::new(120)),
-            sessions: Arc::new(super::super::sessions::SessionRegistry::new(120)),
-            notifier: Arc::new(super::super::notifier::NullNotifier),
-            notify_config: Arc::new(tokio::sync::RwLock::new(
-                protocol::NotifyConfig::with_delay(0),
-            )),
-            pending: Arc::new(super::super::hooks::PendingNotifications::new()),
-            approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
-            questions: Arc::new(super::super::questions::QuestionRegistry::new()),
             orchestration: Arc::new(svc.clone()),
             job_events: Arc::new(crate::server::job_events::JobEventHub::new()),
             oauth: Arc::new(None),
-            loaded_config_tree: Arc::new(None),
         };
 
         let body = axum::body::Bytes::from(
             r#"{"action":"closed","pull_request":{"html_url":"https://github.com/reddit/agent-hub/pull/42","merged":true}}"#,
         );
-        let unsigned = github_webhook::<super::super::notifier::NullNotifier>(
-            State(state.clone()),
-            headers.clone(),
-            body.clone(),
-        )
-        .await
-        .expect("unsigned webhook");
+        let unsigned = github_webhook(State(state.clone()), headers.clone(), body.clone())
+            .await
+            .expect("unsigned webhook");
         assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
         headers.insert(
             "x-hub-signature-256",
             github_signature_header("webhook-secret", &body),
         );
-        let resp =
-            github_webhook::<super::super::notifier::NullNotifier>(State(state), headers, body)
-                .await
-                .expect("webhook");
+        let resp = github_webhook(State(state), headers, body)
+            .await
+            .expect("webhook");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -28025,12 +27990,9 @@ kind = "terminal"
                 auth_mode: super::super::config::AuthMode::None,
                 tokens: vec![],
                 listen_addr: "127.0.0.1:0".into(),
-                presence_ttl_secs: 120,
-                session_ttl_secs: 120,
-                notification_delay_secs: 0,
-                approval_mode: super::super::config::ApprovalFeatureMode::Disabled,
                 base_url: None,
-                default_approval_mode: super::super::sessions::SessionApprovalMode::Remote,
+                approvals_server: None,
+                approvals_token: None,
                 workflows_dir: "workflows".into(),
                 config_root: "../agent-hub-configs".into(),
                 task_dir: "tasks".into(),
@@ -28052,19 +28014,9 @@ kind = "terminal"
             artifact_store: Arc::new(super::super::artifact_store::DirectoryStore::new(
                 std::path::PathBuf::from("local-agent-data"),
             )),
-            presence: Arc::new(super::super::presence::Presence::new(120)),
-            sessions: Arc::new(super::super::sessions::SessionRegistry::new(120)),
-            notifier: Arc::new(super::super::notifier::NullNotifier),
-            notify_config: Arc::new(tokio::sync::RwLock::new(
-                protocol::NotifyConfig::with_delay(0),
-            )),
-            pending: Arc::new(super::super::hooks::PendingNotifications::new()),
-            approvals: Arc::new(super::super::approvals::ApprovalRegistry::new()),
-            questions: Arc::new(super::super::questions::QuestionRegistry::new()),
             orchestration: Arc::new(svc.clone()),
             job_events: Arc::new(crate::server::job_events::JobEventHub::new()),
             oauth: Arc::new(None),
-            loaded_config_tree: Arc::new(None),
         };
 
         let body = axum::body::Bytes::from(
@@ -28074,10 +28026,9 @@ kind = "terminal"
             "x-hub-signature-256",
             github_signature_header("webhook-secret", &body),
         );
-        let resp =
-            github_webhook::<super::super::notifier::NullNotifier>(State(state), headers, body)
-                .await
-                .expect("webhook");
+        let resp = github_webhook(State(state), headers, body)
+            .await
+            .expect("webhook");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

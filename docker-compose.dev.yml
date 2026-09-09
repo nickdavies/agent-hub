@@ -1,39 +1,23 @@
 services:
-  vikunja:
-    image: vikunja/vikunja:2.3.0
-    environment:
-      VIKUNJA_SERVICE_PUBLICURL: http://localhost:3456/
-      VIKUNJA_SERVICE_JWTSECRET: ${VIKUNJA_JWT_SECRET:-local-dev-jwt-secret-change-me}
-      VIKUNJA_DATABASE_PATH: /db/vikunja.db
-    ports:
-      - 127.0.0.1:3456:3456
-    volumes:
-      - ./dev-data/vikunja-files:/app/vikunja/files
-      - ./dev-data/vikunja-db:/db
-    restart: unless-stopped
-
   server:
     build:
       context: .
       dockerfile: Dockerfile
     user: "1000:1001"
-    command: ["serve", "noop"]
+    command: ["serve"]
     env_file:
       - .env
     environment:
       AUTH_MODE: ${AUTH_MODE:-none}
-      APPROVAL_MODE: ${APPROVAL_MODE:-readwrite}
-      BASE_URL: ${BASE_URL:-http://localhost:8180}
-      DEFAULT_APPROVAL_MODE: ${DEFAULT_APPROVAL_MODE:-remote}
+      AGENT_HUB_APPROVALS_SERVER: ${AGENT_HUB_APPROVALS_SERVER:-}
+      AGENT_HUB_APPROVALS_TOKEN: ${AGENT_HUB_APPROVALS_TOKEN:-}
       LISTEN_ADDR: ${LISTEN_ADDR:-0.0.0.0:8080}
       WORKFLOWS_DIR: /workflows
       CONFIG_ROOT: ${CONFIG_ROOT:-/config}
       ORCHESTRATION_DB: /data/orchestration.sqlite3
-      TASK_ADAPTER: ${TASK_ADAPTER:-vikunja}
-      VIKUNJA_BASE_URL: ${VIKUNJA_BASE_URL:-http://vikunja:3456}
-      VIKUNJA_TOKEN: ${VIKUNJA_TOKEN:-}
-      VIKUNJA_PROJECT_ID: ${VIKUNJA_PROJECT_ID:-}
-      VIKUNJA_LABEL_PREFIX: ${VIKUNJA_LABEL_PREFIX:-agent-hub}
+      TASK_ADAPTER: file
+      TASK_DIR: /tasks
+      TASK_STATE_DIR: /data/task-state
       ARTIFACT_STORE_ROOT: /artifacts
       GITHUB_POLLING_ENABLED: ${GITHUB_POLLING_ENABLED:-true}
       GITHUB_POLL_INTERVAL_SECS: ${GITHUB_POLL_INTERVAL_SECS:-30}
@@ -44,7 +28,6 @@ services:
       # this in a row pointing at github.snooguts.net.
       GITHUB_ENTERPRISE_TOKEN: ${GITHUB_ENTERPRISE_TOKEN:-}
       GRPC_LISTEN_ADDR: 0.0.0.0:50051
-      VIKUNJA_BOT_USER_ID: ${VIKUNJA_BOT_USER_ID:-1}
       HOME: /home/nick.davies
       RUST_LOG: ${RUST_LOG:-info}
     ports:
@@ -54,9 +37,8 @@ services:
       - ../agent-hub-configs/workflows:/workflows:ro
       - ../agent-hub-configs:/config:ro
       - ./dev-data/server:/data
+      - ./dev-data/tasks:/tasks
       - ${ARTIFACT_STORE_ROOT_HOST:-./dev-data/artifacts}:/artifacts
       - /home/nick.davies/code:/home/nick.davies/code:ro
       - /home/nick.davies/workspaces:/home/nick.davies/workspaces:ro
-    depends_on:
-      - vikunja
     restart: unless-stopped

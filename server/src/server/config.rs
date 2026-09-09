@@ -1,26 +1,13 @@
 use std::env;
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::Context;
 use protocol::{EnvironmentDefinition, EnvironmentOverlay};
-use tokio::sync::RwLock;
 
-// Re-export protocol types so existing `use super::config::X` imports work.
-pub use protocol::{NotifyConfig, NotifyConfigUpdate, Secret};
-
-use super::sessions::SessionApprovalMode;
 use crate::error::AppError;
+pub use protocol::Secret;
 
 pub const GITHUB_WEBHOOK_SECRET_ENV: &str = "AGENT_HUB_GITHUB_WEBHOOK_SECRET";
-
-/// Feature mode for the approval system.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApprovalFeatureMode {
-    Disabled,
-    Readonly,
-    Readwrite,
-}
 
 /// Authentication mode for the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,12 +23,9 @@ pub struct ServerConfig {
     pub auth_mode: AuthMode,
     pub tokens: Vec<Token>,
     pub listen_addr: String,
-    pub presence_ttl_secs: u64,
-    pub session_ttl_secs: u64,
-    pub notification_delay_secs: u64,
-    pub approval_mode: ApprovalFeatureMode,
     pub base_url: Option<String>,
-    pub default_approval_mode: SessionApprovalMode,
+    pub approvals_server: Option<String>,
+    pub approvals_token: Option<Secret>,
     pub workflows_dir: String,
     pub config_root: String,
     pub task_dir: String,
@@ -100,53 +84,21 @@ impl ServerConfig {
             AuthMode::Token => "0.0.0.0:8080",
         };
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| default_addr.into());
-        let presence_ttl_secs = env::var("PRESENCE_TTL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120);
-        let session_ttl_secs = env::var("SESSION_TTL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(7200);
-        let notification_delay_secs = env::var("NOTIFICATION_DELAY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-
-        let approval_mode = match env::var("APPROVAL_MODE").unwrap_or_default().as_str() {
-            "readonly" => ApprovalFeatureMode::Readonly,
-            "readwrite" => ApprovalFeatureMode::Readwrite,
-            _ => ApprovalFeatureMode::Disabled,
-        };
-
         let base_url = env::var("BASE_URL")
             .ok()
             .map(|u| u.trim_end_matches('/').to_string());
-
-        if approval_mode != ApprovalFeatureMode::Disabled && base_url.is_none() {
-            return Err(AppError::Config(
-                "BASE_URL is required when APPROVAL_MODE is not disabled".into(),
-            ));
-        }
-
-        let default_approval_mode = match env::var("DEFAULT_APPROVAL_MODE")
-            .unwrap_or_default()
-            .as_str()
-        {
-            "terminal" => SessionApprovalMode::Terminal,
-            _ => SessionApprovalMode::Remote,
-        };
+        let (approvals_server, approvals_token) = approval_client_config(
+            env::var("AGENT_HUB_APPROVALS_SERVER").ok(),
+            env::var("AGENT_HUB_APPROVALS_TOKEN").ok(),
+        )?;
 
         Ok(Self {
             auth_mode,
             tokens,
             listen_addr,
-            presence_ttl_secs,
-            session_ttl_secs,
-            notification_delay_secs,
-            approval_mode,
             base_url,
-            default_approval_mode,
+            approvals_server,
+            approvals_token,
             workflows_dir: env::var("WORKFLOWS_DIR").unwrap_or_else(|_| "workflows".into()),
             config_root: env::var("CONFIG_ROOT")
                 .ok()
@@ -194,6 +146,25 @@ impl ServerConfig {
                 .unwrap_or(30),
         })
     }
+}
+
+fn approval_client_config(
+    server: Option<String>,
+    token: Option<String>,
+) -> Result<(Option<String>, Option<Secret>), AppError> {
+    let server = server
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+    let token = token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(Secret::new);
+    if token.is_some() && server.is_none() {
+        return Err(AppError::Config(
+            "AGENT_HUB_APPROVALS_TOKEN requires AGENT_HUB_APPROVALS_SERVER".into(),
+        ));
+    }
+    Ok((server, token))
 }
 
 fn validate_task_adapter(value: &str) -> Result<(), AppError> {
@@ -399,9 +370,6 @@ fn parse_tokens(raw: &str) -> Result<Vec<Token>, AppError> {
         .collect()
 }
 
-/// Shared mutable notify config.
-pub type SharedNotifyConfig = Arc<RwLock<NotifyConfig>>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,15 +412,18 @@ mod tests {
     }
 
     #[test]
-    fn notify_config_partial_update() {
-        let mut cfg = NotifyConfig::with_delay(0);
-        cfg.apply(NotifyConfigUpdate {
-            stop_enabled: Some(false),
-            permission_enabled: None,
-            notification_delay_secs: Some(30),
-        });
-        assert!(!cfg.stop_enabled);
-        assert!(cfg.permission_enabled);
-        assert_eq!(cfg.notification_delay_secs, 30);
+    fn approval_client_config_is_optional_but_token_requires_endpoint() {
+        let (server, token) = approval_client_config(None, None).unwrap();
+        assert!(server.is_none());
+        assert!(token.is_none());
+        assert!(approval_client_config(None, Some("secret".into())).is_err());
+
+        let (server, token) = approval_client_config(
+            Some(" https://approvals.example/ ".into()),
+            Some(" secret ".into()),
+        )
+        .unwrap();
+        assert_eq!(server.as_deref(), Some("https://approvals.example"));
+        assert_eq!(token.unwrap().expose(), "secret");
     }
 }

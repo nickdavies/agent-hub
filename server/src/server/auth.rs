@@ -7,7 +7,6 @@ use tracing::debug;
 
 use super::AppState;
 use super::config::Token;
-use super::notifier::Notifier;
 use super::oauth;
 
 pub fn match_bearer_token<'a>(header: &str, tokens: &'a [Token]) -> Option<&'a Token> {
@@ -17,8 +16,8 @@ pub fn match_bearer_token<'a>(header: &str, tokens: &'a [Token]) -> Option<&'a T
 
 /// API auth middleware: validates Bearer token against configured tokens.
 /// Also accepts valid session cookies (for web UI calling API endpoints).
-pub async fn require_auth<N: Notifier>(
-    state: axum::extract::State<AppState<N>>,
+pub async fn require_auth(
+    state: axum::extract::State<AppState>,
     session: Session,
     request: Request,
     next: Next,

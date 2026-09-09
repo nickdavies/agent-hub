@@ -10,15 +10,12 @@ use std::path::Path as FsPath;
 use tower_sessions::Session;
 use uuid::Uuid;
 
-use protocol::{Approval, SessionView, WorkflowEventKind};
+use protocol::WorkflowEventKind;
 
 use super::AppState;
 use super::DEFAULT_WEB_HOME;
-use super::config::ApprovalFeatureMode;
-use super::notifier::Notifier;
 use super::oauth;
 use super::orchestration::{GithubPrLifecycleState, GithubPrState, MergeReadiness};
-use super::review::ApprovalReview;
 use super::task_adapter::{
     HumanActionKind, TaskHumanAction, task_from_work_item_with_valid_next_events,
 };
@@ -49,46 +46,6 @@ struct LoginTemplate {
 }
 
 #[derive(Template)]
-#[template(path = "dashboard.html")]
-struct DashboardTemplate {
-    email: String,
-    sessions: Vec<SessionView>,
-    pending_approvals: Vec<Approval>,
-    readwrite: bool,
-    has_auth: bool,
-    approvals_enabled: bool,
-}
-
-#[derive(Template)]
-#[template(path = "approval_detail.html")]
-struct ApprovalDetailTemplate {
-    email: String,
-    review: ApprovalReview,
-    approval_json: String,
-    readwrite: bool,
-    has_auth: bool,
-    approvals_enabled: bool,
-}
-
-/// JSON embedded in a raw-text script element must not contain a literal
-/// `</script>` (or browser-significant `<`, `>`, and `&` characters).
-fn script_safe_json<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "{}".to_owned())
-        .replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
-}
-
-#[derive(Template)]
-#[template(path = "approval_queue.html")]
-struct ApprovalQueueTemplate {
-    readwrite: bool,
-}
-
-#[derive(Template)]
 #[template(path = "orchestration_dashboard.html")]
 struct OrchestrationDashboardTemplate {
     email: String,
@@ -101,7 +58,6 @@ struct OrchestrationDashboardTemplate {
     triage_work_items: Vec<WorkItemRow>,
     has_auth: bool,
     readwrite: bool,
-    approvals_enabled: bool,
 }
 
 #[derive(Template)]
@@ -111,7 +67,6 @@ struct OrchestrationWorkItemsTemplate {
     work_items: Vec<WorkItemRow>,
     has_auth: bool,
     readwrite: bool,
-    approvals_enabled: bool,
 }
 
 #[derive(Template)]
@@ -120,7 +75,6 @@ struct OrchestrationJobsTemplate {
     email: String,
     jobs: Vec<JobListRow>,
     has_auth: bool,
-    approvals_enabled: bool,
 }
 
 #[derive(Template)]
@@ -129,7 +83,6 @@ struct OrchestrationTranscriptsTemplate {
     email: String,
     jobs: Vec<TranscriptJobRow>,
     has_auth: bool,
-    approvals_enabled: bool,
 }
 
 #[derive(Template)]
@@ -138,7 +91,6 @@ struct OrchestrationWorkersTemplate {
     email: String,
     workers: Vec<WorkerRow>,
     has_auth: bool,
-    approvals_enabled: bool,
 }
 
 #[derive(Template)]
@@ -156,7 +108,6 @@ struct OrchestrationWorkItemDetailTemplate {
     workflow_options: Vec<WorkflowOption>,
     has_auth: bool,
     readwrite: bool,
-    approvals_enabled: bool,
 }
 
 #[derive(Template)]
@@ -169,7 +120,6 @@ struct OrchestrationJobDetailTemplate {
     structured_transcript_artifacts: Vec<StructuredTranscriptArtifactRow>,
     retrievable_artifacts: Vec<RetrievableArtifactRow>,
     has_auth: bool,
-    approvals_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -340,7 +290,7 @@ const STRUCTURED_VALUE_PREVIEW_MAX_JSON_BYTES: usize =
 // --- Handlers ---
 
 /// GET /auth/login
-pub async fn login_page<N: Notifier>(State(state): State<AppState<N>>) -> Response {
+pub async fn login_page(State(state): State<AppState>) -> Response {
     let (providers, has_basic_auth) = match &*state.oauth {
         Some(mgr) => (
             mgr.provider_names().into_iter().map(String::from).collect(),
@@ -361,8 +311,8 @@ pub struct BasicAuthForm {
 }
 
 /// POST /auth/login/basic — basic auth form submission.
-pub async fn basic_auth_login<N: Notifier>(
-    State(state): State<AppState<N>>,
+pub async fn basic_auth_login(
+    State(state): State<AppState>,
     session: Session,
     Form(form): Form<BasicAuthForm>,
 ) -> Response {
@@ -384,79 +334,11 @@ pub async fn basic_auth_login<N: Notifier>(
     Redirect::to(DEFAULT_WEB_HOME).into_response()
 }
 
-/// GET /approvals — dashboard (auth enforced by middleware)
-pub async fn dashboard<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-) -> Response {
-    let email = session_email(&session).await;
-    let sessions = super::build_session_views(&state).await;
-    let pending_approvals = state.approvals.list_pending().await;
-    let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
-    let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
-
-    into_html_response(DashboardTemplate {
-        email,
-        sessions,
-        pending_approvals,
-        readwrite,
-        has_auth,
-        approvals_enabled,
-    })
-}
-
-/// GET /approvals/queue — mobile approval queue (auth enforced by middleware)
-pub async fn approval_queue<N: Notifier>(State(state): State<AppState<N>>) -> Response {
-    into_html_response(ApprovalQueueTemplate {
-        readwrite: state.config.approval_mode == ApprovalFeatureMode::Readwrite,
-    })
-}
-
-/// GET /approvals/{id} (auth enforced by middleware)
-pub async fn approval_detail<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-    Path(id): Path<Uuid>,
-) -> Response {
-    let email = session_email(&session).await;
-
-    let approval = match state.approvals.get(id).await {
-        Some(a) => a,
-        None => return (StatusCode::NOT_FOUND, "Approval not found").into_response(),
-    };
-
-    let approval_json = script_safe_json(&approval);
-    let review = match ApprovalReview::new(approval) {
-        Ok(review) => review,
-        Err(error) => {
-            tracing::error!("invalid stored approval review: {error}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid approval record").into_response();
-        }
-    };
-    let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
-    let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
-
-    into_html_response(ApprovalDetailTemplate {
-        email,
-        review,
-        approval_json,
-        readwrite,
-        has_auth,
-        approvals_enabled,
-    })
-}
-
 /// GET /orchestration — summary dashboard
-pub async fn orchestration_dashboard<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-) -> Response {
+pub async fn orchestration_dashboard(State(state): State<AppState>, session: Session) -> Response {
     let email = session_email(&session).await;
-    let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
+    let readwrite = true;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
 
     let work_item_state_counts = match state.orchestration.work_item_state_counts().await {
         Ok(counts) => counts,
@@ -589,19 +471,14 @@ pub async fn orchestration_dashboard<N: Notifier>(
         triage_work_items,
         has_auth,
         readwrite,
-        approvals_enabled,
     })
 }
 
 /// GET /orchestration/work-items — work-item operator view
-pub async fn orchestration_work_items<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-) -> Response {
+pub async fn orchestration_work_items(State(state): State<AppState>, session: Session) -> Response {
     let email = session_email(&session).await;
-    let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
+    let readwrite = true;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
 
     let work_items = match state.orchestration.list_work_items().await {
         Ok(items) => items,
@@ -618,18 +495,13 @@ pub async fn orchestration_work_items<N: Notifier>(
         work_items: rows,
         has_auth,
         readwrite,
-        approvals_enabled,
     })
 }
 
 /// GET /orchestration/jobs
-pub async fn orchestration_jobs<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-) -> Response {
+pub async fn orchestration_jobs(State(state): State<AppState>, session: Session) -> Response {
     let email = session_email(&session).await;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
 
     let jobs = match state.orchestration.list_jobs().await {
         Ok(items) => items,
@@ -653,18 +525,16 @@ pub async fn orchestration_jobs<N: Notifier>(
         email,
         jobs: rows,
         has_auth,
-        approvals_enabled,
     })
 }
 
 /// GET /orchestration/transcripts
-pub async fn orchestration_transcripts<N: Notifier>(
-    State(state): State<AppState<N>>,
+pub async fn orchestration_transcripts(
+    State(state): State<AppState>,
     session: Session,
 ) -> Response {
     let email = session_email(&session).await;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
 
     let jobs = match state.orchestration.list_jobs_with_transcripts().await {
         Ok(items) => items,
@@ -709,18 +579,13 @@ pub async fn orchestration_transcripts<N: Notifier>(
         email,
         jobs: rows,
         has_auth,
-        approvals_enabled,
     })
 }
 
 /// GET /orchestration/workers
-pub async fn orchestration_workers<N: Notifier>(
-    State(state): State<AppState<N>>,
-    session: Session,
-) -> Response {
+pub async fn orchestration_workers(State(state): State<AppState>, session: Session) -> Response {
     let email = session_email(&session).await;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
 
     let workers = match state.orchestration.list_workers().await {
         Ok(items) => items,
@@ -754,20 +619,18 @@ pub async fn orchestration_workers<N: Notifier>(
         email,
         workers: rows,
         has_auth,
-        approvals_enabled,
     })
 }
 
 /// GET /orchestration/work-items/{id}
-pub async fn orchestration_work_item_detail<N: Notifier>(
-    State(state): State<AppState<N>>,
+pub async fn orchestration_work_item_detail(
+    State(state): State<AppState>,
     session: Session,
     Path(id): Path<Uuid>,
 ) -> Response {
     let email = session_email(&session).await;
-    let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
+    let readwrite = true;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
 
     let item = match state.orchestration.get_work_item(id).await {
         Ok(Some(item)) => item,
@@ -874,19 +737,17 @@ pub async fn orchestration_work_item_detail<N: Notifier>(
         workflow_options,
         has_auth,
         readwrite,
-        approvals_enabled,
     })
 }
 
 /// GET /orchestration/jobs/{id}
-pub async fn orchestration_job_detail<N: Notifier>(
-    State(state): State<AppState<N>>,
+pub async fn orchestration_job_detail(
+    State(state): State<AppState>,
     session: Session,
     Path(id): Path<Uuid>,
 ) -> Response {
     let email = session_email(&session).await;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
-    let approvals_enabled = state.config.approval_mode != ApprovalFeatureMode::Disabled;
     let job = match state.orchestration.get_job(id).await {
         Ok(Some(job)) => job,
         Ok(None) => return (StatusCode::NOT_FOUND, "Job not found").into_response(),
@@ -933,13 +794,12 @@ pub async fn orchestration_job_detail<N: Notifier>(
         structured_transcript_artifacts,
         retrievable_artifacts,
         has_auth,
-        approvals_enabled,
     })
 }
 
 /// GET /orchestration/jobs/{id}/artifacts/{key}
-pub async fn orchestration_job_artifact<N: Notifier>(
-    State(state): State<AppState<N>>,
+pub async fn orchestration_job_artifact(
+    State(state): State<AppState>,
     Path((id, key)): Path<(Uuid, String)>,
     Query(query): Query<ArtifactQuery>,
 ) -> Response {
@@ -1021,15 +881,11 @@ pub struct OrchestrationActionForm {
 }
 
 /// POST /orchestration/work-items/{id}/action
-pub async fn orchestration_fire_work_item_action<N: Notifier>(
-    State(state): State<AppState<N>>,
+pub async fn orchestration_fire_work_item_action(
+    State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Form(form): Form<OrchestrationActionForm>,
 ) -> Response {
-    if state.config.approval_mode != ApprovalFeatureMode::Readwrite {
-        return (StatusCode::FORBIDDEN, "Read-only mode").into_response();
-    }
-
     let action = match parse_human_action(&form.action) {
         Some(action) => action,
         None => return (StatusCode::BAD_REQUEST, "Unknown action").into_response(),
@@ -1155,10 +1011,7 @@ fn map_count(map: &HashMap<String, usize>, key: &str) -> usize {
     map.get(key).copied().unwrap_or_default()
 }
 
-fn work_item_row_from_item<N: Notifier>(
-    state: &AppState<N>,
-    item: &protocol::WorkItem,
-) -> WorkItemRow {
+fn work_item_row_from_item(state: &AppState, item: &protocol::WorkItem) -> WorkItemRow {
     let valid_next_events = state.orchestration.valid_next_events_for_work_item(item);
     let task = task_from_work_item_with_valid_next_events(item, None, &valid_next_events);
     let title = item
@@ -2147,7 +2000,6 @@ mod tests {
                     .to_string(),
             }],
             has_auth: false,
-            approvals_enabled: true,
         }
         .render()
         .expect("render orchestration job detail");

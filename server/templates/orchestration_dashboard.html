@@ -15,9 +15,6 @@
         <li><a href="/orchestration/jobs">Jobs</a></li>
         <li><a href="/orchestration/workers">Workers</a></li>
         <li><a href="/orchestration/transcripts">Transcripts</a></li>
-        {% if approvals_enabled %}
-        <li><a href="/approvals">Approvals</a></li>
-        {% endif %}
         {% if has_auth %}
         <li>{{ email }}</li>
         <li><form method="post" action="/auth/logout" style="margin:0"><button type="submit" class="outline secondary" style="margin:0;padding:0.25rem 0.5rem">Logout</button></form></li>

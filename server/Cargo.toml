@@ -16,6 +16,7 @@ askama_web = { version = "0.15", features = ["axum-0.8"] }
 axum = "0.8"
 capabilities = { path = "../capabilities" }
 agent-hub-config = { package = "config", path = "../config" }
+agent-hub-approval-client = { path = "../approval-client" }
 protocol = { path = "../protocol" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -42,7 +43,6 @@ tower-sessions = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
-rmcp = { version = "1", features = ["server", "transport-streamable-http-server"] }
 tonic = { version = "0.12", features = ["transport"] }
 prost = "0.13"
 prost-types = "0.13"

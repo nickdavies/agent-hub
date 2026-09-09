@@ -1,9 +1,7 @@
 use super::*;
 use crate::grpc::{WorkerLifecycleGrpc, pb as worker_pb};
-use crate::server::config::{ApprovalFeatureMode, AuthMode, ServerConfig};
+use crate::server::config::{AuthMode, ServerConfig};
 use crate::server::job_events::JobEventHub;
-use crate::server::notifier::NullNotifier;
-use crate::server::sessions::SessionApprovalMode;
 use anyhow::{Context, ensure};
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
@@ -744,7 +742,7 @@ fn e2e_app_state(
     orchestration: Arc<OrchestrationService>,
     job_events: Arc<JobEventHub>,
     root: &Path,
-) -> anyhow::Result<crate::server::AppState<NullNotifier>> {
+) -> anyhow::Result<crate::server::AppState> {
     let config_root = root.join("server-config");
     let workflows = root.join("empty-workflows");
     let tasks = root.join("http-tasks");
@@ -761,12 +759,9 @@ fn e2e_app_state(
         auth_mode: AuthMode::None,
         tokens: vec![],
         listen_addr: "127.0.0.1:0".into(),
-        presence_ttl_secs: 120,
-        session_ttl_secs: 7200,
-        notification_delay_secs: 0,
-        approval_mode: ApprovalFeatureMode::Disabled,
         base_url: None,
-        default_approval_mode: SessionApprovalMode::Remote,
+        approvals_server: None,
+        approvals_token: None,
         workflows_dir: workflows.to_string_lossy().into_owned(),
         config_root: config_root.to_string_lossy().into_owned(),
         task_dir: tasks.to_string_lossy().into_owned(),
@@ -785,7 +780,7 @@ fn e2e_app_state(
         github_polling_enabled: false,
         github_poll_interval_secs: 30,
     };
-    let mut state = crate::server::AppState::new(config, NullNotifier, None);
+    let mut state = crate::server::AppState::new(config, None);
     state.orchestration = orchestration;
     state.job_events = job_events;
     Ok(state)

@@ -87,21 +87,21 @@ fn worker_session_from_headers(
     }
 }
 
-pub async fn create_work_item<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn create_work_item(
+    State(state): State<super::super::AppState>,
     Json(req): Json<CreateWorkItemRequest>,
 ) -> Result<Json<WorkItem>, AppError> {
     Ok(Json(state.orchestration.create_work_item(req).await?))
 }
 
-pub async fn list_work_items<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn list_work_items(
+    State(state): State<super::super::AppState>,
 ) -> Result<Json<Vec<WorkItem>>, AppError> {
     Ok(Json(state.orchestration.list_work_items().await?))
 }
 
-pub async fn fire_work_item_event<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn fire_work_item_event(
+    State(state): State<super::super::AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<FireEventRequest>,
 ) -> Result<Json<FireEventResponse>, AppError> {
@@ -110,14 +110,14 @@ pub async fn fire_work_item_event<N: super::super::notifier::Notifier>(
     ))
 }
 
-pub async fn list_jobs<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn list_jobs(
+    State(state): State<super::super::AppState>,
 ) -> Result<Json<Vec<Job>>, AppError> {
     Ok(Json(state.orchestration.list_jobs().await?))
 }
 
-pub async fn update_job<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn update_job(
+    State(state): State<super::super::AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(req): Json<JobUpdateRequest>,
@@ -137,8 +137,8 @@ pub async fn update_job<N: super::super::notifier::Notifier>(
     Ok(Json(job))
 }
 
-pub async fn get_job<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn get_job(
+    State(state): State<super::super::AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Job>, AppError> {
@@ -151,8 +151,8 @@ pub async fn get_job<N: super::super::notifier::Notifier>(
     ))
 }
 
-pub async fn get_job_cancellation_command<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn get_job_cancellation_command(
+    State(state): State<super::super::AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Option<protocol::CancellationCommand>>, AppError> {
@@ -165,8 +165,8 @@ pub async fn get_job_cancellation_command<N: super::super::notifier::Notifier>(
     ))
 }
 
-pub async fn job_events_sse<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn job_events_sse(
+    State(state): State<super::super::AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, AppError> {
     let job = state
@@ -202,8 +202,8 @@ pub async fn job_events_sse<N: super::super::notifier::Notifier>(
     )
 }
 
-pub async fn register_worker<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn register_worker(
+    State(state): State<super::super::AppState>,
     headers: HeaderMap,
     Json(req): Json<RegisterWorkerRequest>,
 ) -> Result<(HeaderMap, Json<RegisterWorkerResponse>), AppError> {
@@ -217,8 +217,8 @@ pub async fn register_worker<N: super::super::notifier::Notifier>(
     Ok((response_headers, Json(registered)))
 }
 
-pub async fn heartbeat_worker<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn heartbeat_worker(
+    State(state): State<super::super::AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(req): Json<HeartbeatRequest>,
@@ -247,14 +247,14 @@ pub async fn heartbeat_worker<N: super::super::notifier::Notifier>(
     ))
 }
 
-pub async fn list_workers<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn list_workers(
+    State(state): State<super::super::AppState>,
 ) -> Result<Json<Vec<WorkerInfo>>, AppError> {
     Ok(Json(state.orchestration.list_workers().await?))
 }
 
-pub async fn poll_job<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn poll_job(
+    State(state): State<super::super::AppState>,
     headers: HeaderMap,
     Json(req): Json<PollJobRequest>,
 ) -> Result<(HeaderMap, Json<PollJobResponse>), AppError> {
@@ -274,8 +274,8 @@ pub async fn poll_job<N: super::super::notifier::Notifier>(
     ))
 }
 
-pub async fn dispatch<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn dispatch(
+    State(state): State<super::super::AppState>,
 ) -> Result<Json<DispatchResponse>, AppError> {
     let created = state.orchestration.dispatch_actionable().await?;
     Ok(Json(DispatchResponse {
@@ -288,14 +288,14 @@ pub struct DispatchResponse {
     pub created_jobs: usize,
 }
 
-pub async fn list_workflows<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn list_workflows(
+    State(state): State<super::super::AppState>,
 ) -> Json<Vec<ReactiveWorkflowDefinition>> {
     Json(state.orchestration.list_workflows())
 }
 
-pub async fn validate_workflows<N: super::super::notifier::Notifier>(
-    State(state): State<super::super::AppState<N>>,
+pub async fn validate_workflows(
+    State(state): State<super::super::AppState>,
 ) -> Json<protocol::WorkflowValidationReport> {
     Json(state.orchestration.workflow_validation_report())
 }
