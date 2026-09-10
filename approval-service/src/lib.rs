@@ -19,11 +19,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::{DefaultBodyLimit, Query};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state};
+use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_sessions::{MemoryStore, SessionManagerLayer};
 use uuid::Uuid;
 
@@ -58,12 +59,15 @@ pub struct AppState<N: Notifier> {
     pub approvals: Arc<ApprovalRegistry>,
     pub questions: Arc<QuestionRegistry>,
     pub oauth: Arc<Option<OAuthManager>>,
+    storage: Arc<dyn storage::Storage>,
+    mutation_lock: Arc<Mutex<()>>,
 }
 
-pub async fn serve_from_env<N: Notifier, S: storage::Storage>(
+pub async fn serve_from_env<N: Notifier, S: storage::Storage + 'static>(
     notifier: N,
     storage: S,
 ) -> anyhow::Result<()> {
+    let storage: Arc<dyn storage::Storage> = Arc::new(storage);
     let persisted = storage
         .load()
         .await
@@ -90,7 +94,7 @@ pub async fn serve_from_env<N: Notifier, S: storage::Storage>(
     } else {
         None
     };
-    let state = AppState::new(config, notifier, oauth);
+    let state = AppState::new_with_storage(config, notifier, oauth, Arc::clone(&storage));
     if let Some(persisted) = persisted {
         tracing::info!(
             sessions = persisted.sessions.len(),
@@ -108,8 +112,8 @@ pub async fn serve_from_env<N: Notifier, S: storage::Storage>(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
-    storage
-        .save(&state.snapshot().await)
+    state
+        .persist()
         .await
         .context("failed to save state on shutdown")?;
     tracing::info!("state saved on shutdown");
@@ -117,45 +121,61 @@ pub async fn serve_from_env<N: Notifier, S: storage::Storage>(
 }
 
 fn spawn_maintenance<N: Notifier>(state: &AppState<N>) {
-    let sessions = Arc::clone(&state.sessions);
-    let approvals = Arc::clone(&state.approvals);
-    let questions = Arc::clone(&state.questions);
+    let state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            for session_id in sessions.evict_stale(Duration::from_secs(1800)).await {
-                approvals.evict_session(&session_id).await;
-                questions.evict_session(&session_id).await;
+            let _guard = state.mutation_lock.lock().await;
+            let mut changed = false;
+            for session_id in state.sessions.evict_stale(Duration::from_secs(1800)).await {
+                state.approvals.evict_session(&session_id).await;
+                state.questions.evict_session(&session_id).await;
+                changed = true;
             }
-            let orphaned = approvals.evict_orphaned(Duration::from_secs(120)).await;
+            let orphaned = state
+                .approvals
+                .evict_orphaned(Duration::from_secs(120))
+                .await;
             if orphaned > 0 {
+                changed = true;
                 tracing::info!(count = orphaned, "cancelled orphaned approvals");
             }
-            let orphaned = questions.evict_orphaned(Duration::from_secs(120)).await;
+            let orphaned = state
+                .questions
+                .evict_orphaned(Duration::from_secs(120))
+                .await;
             if orphaned > 0 {
                 tracing::info!(count = orphaned, "cancelled orphaned questions");
             }
-            let waiting = sessions
+            let waiting = state
+                .sessions
                 .list()
                 .await
                 .into_iter()
                 .filter(|session| session.stored_status == SessionStatus::Waiting)
                 .collect::<Vec<_>>();
             for session in waiting {
-                let has_approval = approvals
+                let has_approval = state
+                    .approvals
                     .first_pending_for_session(&session.session_id)
                     .await
                     .is_some();
-                let has_question = questions
+                let has_question = state
+                    .questions
                     .first_pending_for_session(&session.session_id)
                     .await
                     .is_some();
                 if !has_approval && !has_question {
-                    sessions
+                    state
+                        .sessions
                         .set_status(&session.session_id, SessionStatus::Idle, None, None)
                         .await;
+                    changed = true;
                 }
+            }
+            if changed && let Err(error) = state.persist().await {
+                panic!("failed to persist maintenance mutation: {error:#}");
             }
         }
     });
@@ -180,6 +200,8 @@ impl<N: Notifier> Clone for AppState<N> {
             approvals: Arc::clone(&self.approvals),
             questions: Arc::clone(&self.questions),
             oauth: Arc::clone(&self.oauth),
+            storage: Arc::clone(&self.storage),
+            mutation_lock: Arc::clone(&self.mutation_lock),
         }
     }
 }
@@ -246,6 +268,10 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
             .layer(from_fn_with_state(state.clone(), auth::require_auth::<N>))
             .with_state(state.clone())
     };
+    let api_v1 = api_v1.layer(from_fn_with_state(
+        state.clone(),
+        persist_after_mutation::<N>,
+    ));
 
     let public = Router::new().route("/health", get(health));
 
@@ -292,6 +318,32 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn persist_after_mutation<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        return next.run(request).await;
+    }
+    let _guard = state.mutation_lock.lock().await;
+    let response = next.run(request).await;
+    if response.status().is_success()
+        && let Err(error) = state.persist().await
+    {
+        tracing::error!(%error, "failed to persist state mutation");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to persist state mutation",
+        )
+            .into_response();
+    }
+    response
 }
 
 /// Resolve the effective status for a session by combining its stored status
@@ -689,6 +741,20 @@ async fn handle_question_resolve<N: Notifier>(
 
 impl<N: Notifier> AppState<N> {
     pub fn new(server_config: ServerConfig, notifier: N, oauth: Option<OAuthManager>) -> Self {
+        Self::new_with_storage(
+            server_config,
+            notifier,
+            oauth,
+            Arc::new(storage::NullStorage),
+        )
+    }
+
+    fn new_with_storage(
+        server_config: ServerConfig,
+        notifier: N,
+        oauth: Option<OAuthManager>,
+        storage: Arc<dyn storage::Storage>,
+    ) -> Self {
         let presence = Presence::new(server_config.presence_ttl_secs);
         let sessions = SessionRegistry::new(server_config.session_ttl_secs)
             .with_default_approval_mode(server_config.default_approval_mode);
@@ -704,7 +770,13 @@ impl<N: Notifier> AppState<N> {
             approvals: Arc::new(ApprovalRegistry::new()),
             questions: Arc::new(QuestionRegistry::new()),
             oauth: Arc::new(oauth),
+            storage,
+            mutation_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    async fn persist(&self) -> anyhow::Result<()> {
+        self.storage.save(&self.snapshot().await).await
     }
 
     /// Capture current state for persistence.

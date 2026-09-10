@@ -7,6 +7,10 @@ for command in git mktemp python3 timeout; do
         exit 1
     }
 done
+real_home="$HOME"
+real_cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+real_rustup_home="${RUSTUP_HOME:-${HOME}/.rustup}"
+real_cargo="$(command -v cargo)"
 
 repo_root="$(git -C "${BASH_SOURCE[0]%/*}" rev-parse --show-toplevel)"
 mkdir -p -- "${repo_root}/target"
@@ -157,5 +161,10 @@ grep -q "Validated copied legacy state" "${sandbox}/legacy.out"
 [[ "$(wc -l <"$build_log")" == 2 ]]
 [[ ! -e "${cache_home}/agent-hub-approvals" ]] || \
     [[ -z "$(ls -A "${cache_home}/agent-hub-approvals")" ]]
+
+HOME="$real_home" CARGO_HOME="$real_cargo_home" RUSTUP_HOME="$real_rustup_home" \
+    PATH="${PATH#*:}" "$real_cargo" test --locked \
+        --manifest-path "${repo_root}/Cargo.toml" \
+        -p agent-hub-approvals-server --test crash_durability
 
 printf '%s\n' "deploy.sh harness passed"

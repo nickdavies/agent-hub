@@ -17,6 +17,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+agent-hub-approval-client = { path = "../approval-client" }
 libc = "0.2"
+protocol = { path = "../protocol" }
 serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }

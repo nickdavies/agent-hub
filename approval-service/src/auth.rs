@@ -24,13 +24,7 @@ pub async fn require_auth<N: Notifier>(
         .and_then(|v| v.to_str().ok())
     {
         // If Authorization header is present, it must be valid
-        let token = agent_hub_web_auth::bearer_token(header).ok_or(StatusCode::UNAUTHORIZED)?;
-
-        let matched = state
-            .config
-            .tokens
-            .iter()
-            .find(|t| t.secret.expose() == token)
+        let matched = agent_hub_web_auth::match_bearer_token(header, &state.config.tokens)
             .ok_or(StatusCode::UNAUTHORIZED)?;
 
         debug!(

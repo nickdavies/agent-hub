@@ -33,11 +33,16 @@ enum Command {
         #[arg(long, env = "ORCHESTRATION_DB")]
         database: PathBuf,
     },
+    /// Refuse a rollback to a v3-only server while v4 work or sessions remain.
+    RollbackPreflightV3 {
+        #[arg(long, env = "ORCHESTRATION_DB")]
+        database: PathBuf,
+    },
     /// Explicitly change the durable authorization protocol fence.
     SetAuthorizationProtocolMode {
         #[arg(long, env = "ORCHESTRATION_DB")]
         database: PathBuf,
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3))]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
         max_version: u32,
     },
     /// Start the orchestration API server.
@@ -55,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::RollbackPreflightV1 { database } => rollback_preflight_v1(&database),
         Command::RollbackPreflightV2 { database } => rollback_preflight_v2(&database),
+        Command::RollbackPreflightV3 { database } => rollback_preflight_v3(&database),
         Command::SetAuthorizationProtocolMode {
             database,
             max_version,
@@ -69,6 +75,10 @@ fn rollback_preflight_v1(database: &std::path::Path) -> anyhow::Result<()> {
 
 fn rollback_preflight_v2(database: &std::path::Path) -> anyhow::Result<()> {
     rollback_preflight(database, 2)
+}
+
+fn rollback_preflight_v3(database: &std::path::Path) -> anyhow::Result<()> {
+    rollback_preflight(database, 3)
 }
 
 fn rollback_preflight(database: &std::path::Path, target_version: u32) -> anyhow::Result<()> {
@@ -89,7 +99,7 @@ fn rollback_preflight(database: &std::path::Path, target_version: u32) -> anyhow
         |row| row.get(0),
     )?;
     let capable_sessions: u64 = tx.query_row(
-        "SELECT COUNT(*) FROM workers WHERE (?1 <= 2 AND protocol_capabilities_json LIKE '%canonical_authorization_v2%') OR protocol_capabilities_json LIKE '%canonical_authorization_v3%'",
+        "SELECT COUNT(*) FROM workers WHERE (?1 <= 2 AND protocol_capabilities_json LIKE '%canonical_authorization_v2%') OR (?1 <= 3 AND protocol_capabilities_json LIKE '%canonical_authorization_v3%') OR (?1 <= 4 AND protocol_capabilities_json LIKE '%canonical_authorization_v4%')",
         [rejected_version],
         |row| row.get(0),
     )?;
@@ -142,17 +152,20 @@ fn set_authorization_protocol_mode(
     if max_version == 2 {
         return rollback_preflight_v2(database);
     }
+    if max_version == 3 {
+        return rollback_preflight_v3(database);
+    }
     let mut connection = Connection::open(database)?;
     let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
     let updated = tx.execute(
-        "UPDATE authorization_protocol_mode SET max_authorization_version = 3, updated_at = ?1 WHERE id = 1",
-        [chrono::Utc::now().to_rfc3339()],
+        "UPDATE authorization_protocol_mode SET max_authorization_version = ?1, updated_at = ?2 WHERE id = 1",
+        rusqlite::params![max_version, chrono::Utc::now().to_rfc3339()],
     )?;
     if updated != 1 {
         anyhow::bail!("authorization protocol fence row is missing or malformed");
     }
     tx.commit()?;
-    println!("authorization protocol fence set to v3");
+    println!("authorization protocol fence set to v{max_version}");
     Ok(())
 }
 
@@ -395,6 +408,85 @@ mod rollback_preflight_tests {
             .execute("DELETE FROM authorization_protocol_mode", [])
             .unwrap();
         assert!(set_authorization_protocol_mode(&path, 2).is_err());
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+
+    #[tokio::test]
+    async fn v4_rollback_fences_every_durable_dependency_and_can_roll_forward() {
+        let path = std::env::temp_dir().join(format!(
+            "rollback-preflight-v4-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let tasks =
+            std::env::temp_dir().join(format!("rollback-v4-tasks-{}", uuid::Uuid::new_v4()));
+        let service = server::orchestration::OrchestrationService::new(
+            Arc::new(server::workflows::WorkflowCatalog::empty_for_test()),
+            Arc::new(server::task_files::TaskFileStore::new(tasks.clone())),
+            path.to_string_lossy().into_owned(),
+        );
+        service.init().await.unwrap();
+        drop(service);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            r#"
+            INSERT INTO work_items (id, workflow_id, current_step, state, context_json, created_at, updated_at)
+            VALUES ('item-v4', 'workflow', 'step', 'running', '{}', 'now', 'now');
+            INSERT INTO jobs (id, work_item_id, step_id, state, execution_mode, command, args_json, env_json, context_json, checkpoint_owner_id, canonical_authorization_version, created_at, updated_at)
+            VALUES ('job-v4', 'item-v4', 'step', 'running', 'host', 'true', '[]', '{}', '{}', 'owner', 4, 'now', 'now');
+            INSERT INTO workers (id, hostname, state, supported_modes_json, protocol_capabilities_json, session_id, session_generation, last_heartbeat_at)
+            VALUES ('worker-v4', 'host', 'idle', '[]', '["canonical_authorization_v4"]', 'session-v4', 1, 'now');
+            INSERT INTO authorization_obligations (checkpoint_owner_id, work_item_id, request_digest, request_json, job_json, canonical_authorization_version, canonical_authorization_bytes, state, created_at, updated_at)
+            VALUES ('owner', 'item-v4', 'obligation-v4', '{}', '{}', 4, X'00', 'pending', 'now', 'now');
+            INSERT INTO authorization_records (authorization_id, work_item_id, checkpoint_owner_id, request_digest, invocation_id, request_json, canonical_authorization_version, canonical_authorization_bytes, created_at)
+            VALUES ('authorization-v4', 'item-v4', 'owner', 'record-v4', 'invocation', '{}', 4, X'00', 'now');
+            INSERT INTO worker_session_recovery_inbox (job_id, recovery_id, work_item_id, checkpoint_owner_id, source_session_id, source_session_generation, reason, state, next_attempt_at, updated_at)
+            VALUES ('job-v4', 'recovery-v4', 'item-v4', 'owner', 'session-v4', 1, 'restart', 'pending', 'now', 'now');
+            "#,
+        ).unwrap();
+
+        let error = rollback_preflight_v3(&path).unwrap_err().to_string();
+        assert!(error.contains("active_higher_jobs=1"), "{error}");
+        assert!(error.contains("higher_capability_workers=1"), "{error}");
+        assert!(error.contains("higher_obligations=1"), "{error}");
+        assert!(error.contains("reactivatable_higher_records=1"), "{error}");
+        assert!(error.contains("higher_recovery=1"), "{error}");
+        assert_eq!(
+            connection.query_row(
+                "SELECT max_authorization_version FROM authorization_protocol_mode WHERE id = 1",
+                [],
+                |row| row.get::<_, u32>(0),
+            ).unwrap(),
+            4,
+            "failed downgrade must roll back the v3 fence"
+        );
+
+        connection
+            .execute("DELETE FROM worker_session_recovery_inbox", [])
+            .unwrap();
+        connection
+            .execute("DELETE FROM authorization_records", [])
+            .unwrap();
+        connection
+            .execute("DELETE FROM authorization_obligations", [])
+            .unwrap();
+        connection.execute("DELETE FROM jobs", []).unwrap();
+        connection.execute("DELETE FROM workers", []).unwrap();
+        connection
+            .execute("UPDATE work_items SET state = 'succeeded'", [])
+            .unwrap();
+        set_authorization_protocol_mode(&path, 3).unwrap();
+        assert!(connection.execute(
+            "INSERT INTO workers (id, hostname, state, supported_modes_json, protocol_capabilities_json, last_heartbeat_at) VALUES ('rejected-v4','host','idle','[]','[\"canonical_authorization_v4\"]','now')",
+            [],
+        ).is_err());
+        set_authorization_protocol_mode(&path, 4).unwrap();
+        assert_eq!(connection.execute(
+            "INSERT INTO workers (id, hostname, state, supported_modes_json, protocol_capabilities_json, last_heartbeat_at) VALUES ('accepted-v4','host','idle','[]','[\"canonical_authorization_v4\"]','now')",
+            [],
+        ).unwrap(), 1);
+
         drop(connection);
         std::fs::remove_file(path).unwrap();
         let _ = std::fs::remove_dir_all(tasks);

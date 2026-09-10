@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,20 +37,30 @@ pub struct PersistedSession {
 
 /// Encapsulates all storage operations for server state persistence.
 pub trait Storage: Send + Sync {
-    fn load(&self) -> impl Future<Output = anyhow::Result<Option<PersistedState>>> + Send;
-    fn save(&self, state: &PersistedState) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn load(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<PersistedState>>> + Send + '_>>;
+    fn save<'a>(
+        &'a self,
+        state: &'a PersistedState,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 }
 
 /// No-op storage backend. State is not persisted.
 pub struct NullStorage;
 
 impl Storage for NullStorage {
-    async fn load(&self) -> anyhow::Result<Option<PersistedState>> {
-        Ok(None)
+    fn load(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<PersistedState>>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
     }
 
-    async fn save(&self, _state: &PersistedState) -> anyhow::Result<()> {
-        Ok(())
+    fn save<'a>(
+        &'a self,
+        _state: &'a PersistedState,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -65,25 +76,48 @@ impl LocalFileStorage {
 }
 
 impl Storage for LocalFileStorage {
-    async fn load(&self) -> anyhow::Result<Option<PersistedState>> {
-        match tokio::fs::read(&self.path).await {
-            Ok(data) => {
-                let state: PersistedState = serde_json::from_slice(&data)?;
-                Ok(Some(state))
+    fn load(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<PersistedState>>> + Send + '_>> {
+        Box::pin(async move {
+            match tokio::fs::read(&self.path).await {
+                Ok(data) => {
+                    let state: PersistedState = serde_json::from_slice(&data)?;
+                    Ok(Some(state))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        })
     }
 
-    async fn save(&self, state: &PersistedState) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
+    fn save<'a>(
+        &'a self,
+        state: &'a PersistedState,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+
+            let parent = self
+                .path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
             tokio::fs::create_dir_all(parent).await?;
-        }
-        let data = serde_json::to_vec_pretty(state)?;
-        let tmp = self.path.with_extension("tmp");
-        tokio::fs::write(&tmp, &data).await?;
-        tokio::fs::rename(&tmp, &self.path).await?;
-        Ok(())
+            let data = serde_json::to_vec_pretty(state)?;
+            let tmp = self.path.with_extension("tmp");
+            let mut file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp)
+                .await?;
+            file.write_all(&data).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&tmp, &self.path).await?;
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all()).await??;
+            Ok(())
+        })
     }
 }

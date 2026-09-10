@@ -65,6 +65,77 @@ impl EmailPattern {
 #[error("{0}")]
 pub struct ConfigError(String);
 
+/// Authentication mode shared by the HTTP services.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    Token,
+    None,
+}
+
+pub struct Token {
+    pub label: String,
+    pub secret: Secret,
+}
+
+pub fn parse_auth_config(
+    auth_mode: Option<&str>,
+    raw_tokens: Option<&str>,
+) -> Result<(AuthMode, Vec<Token>), ConfigError> {
+    let auth_mode = match auth_mode.unwrap_or("") {
+        "" | "token" => AuthMode::Token,
+        "none" => AuthMode::None,
+        value => return Err(ConfigError(format!("unknown AUTH_MODE value '{value}'"))),
+    };
+    let tokens = if auth_mode == AuthMode::Token {
+        let raw = raw_tokens.ok_or_else(|| ConfigError("AGENT_HUB_TOKENS not set".into()))?;
+        let tokens = parse_tokens(raw)?;
+        if tokens.is_empty() {
+            return Err(ConfigError("AGENT_HUB_TOKENS is empty".into()));
+        }
+        tokens
+    } else {
+        Vec::new()
+    };
+    Ok((auth_mode, tokens))
+}
+
+fn parse_tokens(raw: &str) -> Result<Vec<Token>, ConfigError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|entry| {
+            let (label, secret) = entry.split_once(':').unwrap_or((entry, entry));
+            if secret.is_empty() {
+                return Err(ConfigError(format!(
+                    "token with label '{label}' has empty secret"
+                )));
+            }
+            Ok(Token {
+                label: label.into(),
+                secret: Secret::new(secret),
+            })
+        })
+        .collect()
+}
+
+pub fn match_bearer_token<'a>(header: &str, tokens: &'a [Token]) -> Option<&'a Token> {
+    let candidate = bearer_token(header)?;
+    tokens
+        .iter()
+        .find(|token| constant_time_eq(token.secret.expose().as_bytes(), candidate.as_bytes()))
+}
+
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or(0) ^ right.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
+}
+
 impl OAuthManager {
     pub async fn from_env(base_url: &str) -> Result<Option<Self>, ConfigError> {
         let mut providers = Vec::new();
@@ -142,7 +213,11 @@ impl OAuthManager {
 
     pub fn check_basic_auth(&self, user: &str, password: &str) -> bool {
         self.basic_auth.as_ref().is_some_and(|credentials| {
-            credentials.user == user && credentials.password.expose() == password
+            constant_time_eq(credentials.user.as_bytes(), user.as_bytes())
+                && constant_time_eq(
+                    credentials.password.expose().as_bytes(),
+                    password.as_bytes(),
+                )
         })
     }
 
@@ -376,5 +451,27 @@ mod tests {
         assert_eq!(bearer_token("Bearer secret"), Some("secret"));
         assert_eq!(bearer_token("bearer secret"), None);
         assert_eq!(bearer_token("secret"), None);
+    }
+
+    #[test]
+    fn auth_config_rejects_unknown_mode_and_parses_labeled_tokens() {
+        assert!(parse_auth_config(Some("typo"), Some("token")).is_err());
+        let (mode, tokens) =
+            parse_auth_config(Some("token"), Some("desktop:secret,plain")).unwrap();
+        assert_eq!(mode, AuthMode::Token);
+        assert_eq!(tokens[0].label, "desktop");
+        assert_eq!(tokens[0].secret.expose(), "secret");
+        assert_eq!(tokens[1].label, "plain");
+    }
+
+    #[test]
+    fn bearer_matching_uses_exact_secret_bytes() {
+        let (_, tokens) = parse_auth_config(Some("token"), Some("desktop:secret")).unwrap();
+        assert_eq!(
+            match_bearer_token("Bearer secret", &tokens).unwrap().label,
+            "desktop"
+        );
+        assert!(match_bearer_token("Bearer secre", &tokens).is_none());
+        assert!(match_bearer_token("Bearer secret-extra", &tokens).is_none());
     }
 }

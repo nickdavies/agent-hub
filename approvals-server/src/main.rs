@@ -110,6 +110,6 @@ async fn serve_with_storage(
     }
 }
 
-async fn serve(notifier: impl Notifier, storage: impl Storage) -> anyhow::Result<()> {
+async fn serve(notifier: impl Notifier, storage: impl Storage + 'static) -> anyhow::Result<()> {
     server::serve_from_env(notifier, storage).await
 }

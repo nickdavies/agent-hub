@@ -5,18 +5,10 @@ use anyhow::Context;
 use protocol::{EnvironmentDefinition, EnvironmentOverlay};
 
 use crate::error::AppError;
+pub use agent_hub_web_auth::{AuthMode, Token};
 pub use protocol::Secret;
 
 pub const GITHUB_WEBHOOK_SECRET_ENV: &str = "AGENT_HUB_GITHUB_WEBHOOK_SECRET";
-
-/// Authentication mode for the server.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AuthMode {
-    /// Bearer token authentication required.
-    Token,
-    /// No authentication. Intended for localhost / Docker use only.
-    None,
-}
 
 /// Immutable server configuration loaded from environment at startup.
 pub struct ServerConfig {
@@ -51,33 +43,19 @@ pub struct ServerConfig {
     pub github_poll_interval_secs: u64,
 }
 
-pub struct Token {
-    pub label: String,
-    pub secret: Secret,
-}
-
 impl ServerConfig {
     pub fn from_env() -> Result<Self, AppError> {
         let task_adapter = env::var("TASK_ADAPTER").unwrap_or_else(|_| "file".into());
         validate_task_adapter(&task_adapter)?;
         let task_state_dir = env::var("TASK_STATE_DIR")
             .map_err(|_| AppError::Config("TASK_STATE_DIR is required for file mode".into()))?;
-        let auth_mode = match env::var("AUTH_MODE").unwrap_or_default().as_str() {
-            "none" => AuthMode::None,
-            _ => AuthMode::Token,
-        };
-
-        let tokens = if auth_mode == AuthMode::Token {
-            let raw_tokens = env::var("AGENT_HUB_TOKENS")
-                .map_err(|_| AppError::Config("AGENT_HUB_TOKENS not set".into()))?;
-            let tokens = parse_tokens(&raw_tokens)?;
-            if tokens.is_empty() {
-                return Err(AppError::Config("AGENT_HUB_TOKENS is empty".into()));
-            }
-            tokens
-        } else {
-            Vec::new()
-        };
+        let auth_mode_value = env::var("AUTH_MODE").ok();
+        let tokens_value = env::var("AGENT_HUB_TOKENS").ok();
+        let (auth_mode, tokens) = agent_hub_web_auth::parse_auth_config(
+            auth_mode_value.as_deref(),
+            tokens_value.as_deref(),
+        )
+        .map_err(|error| AppError::Config(error.to_string()))?;
 
         let default_addr = match auth_mode {
             AuthMode::None => "127.0.0.1:8080",
@@ -345,31 +323,6 @@ pub fn load_config_tree(root: &Path) -> anyhow::Result<LoadedConfigTree> {
     })
 }
 
-fn parse_tokens(raw: &str) -> Result<Vec<Token>, AppError> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|entry| {
-            if let Some((label, secret)) = entry.split_once(':') {
-                if secret.is_empty() {
-                    return Err(AppError::Config(format!(
-                        "token with label '{label}' has empty secret"
-                    )));
-                }
-                Ok(Token {
-                    label: label.into(),
-                    secret: Secret::new(secret),
-                })
-            } else {
-                Ok(Token {
-                    label: entry.into(),
-                    secret: Secret::new(entry),
-                })
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +343,11 @@ mod tests {
 
     #[test]
     fn parse_labeled_tokens() {
-        let tokens = parse_tokens("desktop:abc123,mobile:def456").unwrap();
+        let (_, tokens) = agent_hub_web_auth::parse_auth_config(
+            Some("token"),
+            Some("desktop:abc123,mobile:def456"),
+        )
+        .unwrap();
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].label, "desktop");
         assert_eq!(tokens[0].secret.expose(), "abc123");
@@ -400,7 +357,8 @@ mod tests {
 
     #[test]
     fn parse_plain_tokens() {
-        let tokens = parse_tokens("abc123,def456").unwrap();
+        let (_, tokens) =
+            agent_hub_web_auth::parse_auth_config(Some("token"), Some("abc123,def456")).unwrap();
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].label, "abc123");
         assert_eq!(tokens[0].secret.expose(), "abc123");
@@ -408,7 +366,7 @@ mod tests {
 
     #[test]
     fn parse_empty_secret_fails() {
-        assert!(parse_tokens("desktop:").is_err());
+        assert!(agent_hub_web_auth::parse_auth_config(Some("token"), Some("desktop:")).is_err());
     }
 
     #[test]

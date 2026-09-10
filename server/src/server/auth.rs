@@ -6,13 +6,9 @@ use tower_sessions::Session;
 use tracing::debug;
 
 use super::AppState;
-use super::config::Token;
 use super::oauth;
 
-pub fn match_bearer_token<'a>(header: &str, tokens: &'a [Token]) -> Option<&'a Token> {
-    let token = agent_hub_web_auth::bearer_token(header)?;
-    tokens.iter().find(|t| t.secret.expose() == token)
-}
+pub use agent_hub_web_auth::match_bearer_token;
 
 /// API auth middleware: validates Bearer token against configured tokens.
 /// Also accepts valid session cookies (for web UI calling API endpoints).
@@ -64,6 +60,7 @@ pub async fn require_web_auth(session: Session, request: Request, next: Next) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::config::Token;
 
     fn token(label: &str, secret: &str) -> Token {
         Token {

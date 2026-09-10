@@ -73,6 +73,7 @@ dependencies = [
 name = "agent-hub-approvals-server"
 version = "0.1.0"
 dependencies = [
+ "agent-hub-approval-client",
  "agent-hub-approval-service",
  "anyhow",
  "clap",

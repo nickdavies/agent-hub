@@ -294,15 +294,12 @@ impl ApprovalRegistry {
         count
     }
 
-    /// Export pending approvals for persistence, sorted by creation time.
+    /// Export approvals for persistence, sorted by creation time.
     pub async fn snapshot(&self) -> Vec<ApprovalSnapshot> {
         let entries = self.entries.read().await;
-        let mut pending: Vec<&ApprovalEntry> = entries
-            .values()
-            .filter(|e| !e.approval.status.is_resolved())
-            .collect();
-        pending.sort_by_key(|e| e.approval.created_at);
-        pending
+        let mut approvals: Vec<&ApprovalEntry> = entries.values().collect();
+        approvals.sort_by_key(|e| e.approval.created_at);
+        approvals
             .into_iter()
             .map(|entry| match &entry.canonical_request {
                 Some(canonical_request) => ApprovalSnapshot::Current {
@@ -328,14 +325,11 @@ impl ApprovalRegistry {
                 } => (approval, Some(canonical_request.into_boxed_str())),
                 ApprovalSnapshot::Legacy(approval) => (approval, None),
             };
-            if approval.status.is_resolved() {
-                continue;
-            }
             let id = approval.id;
             let request_id = approval.request_id.clone();
             let session_id = approval.session_id.clone();
 
-            let (tx, _rx) = watch::channel(ApprovalStatus::Pending);
+            let (tx, _rx) = watch::channel(approval.status.clone());
             entries.insert(
                 id,
                 ApprovalEntry {
