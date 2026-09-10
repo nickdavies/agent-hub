@@ -6,7 +6,8 @@ use std::time::Duration;
 use agent_hub_approval_client::ApprovalClient;
 use protocol::{
     ApprovalContext, ApprovalDecision, ApprovalRequest, ApprovalResolveRequest, ApprovalStatus,
-    RequestType, SessionId,
+    QuestionDecision, QuestionInfo, QuestionOption, QuestionProxyRequest, QuestionResolveRequest,
+    QuestionStatus, RequestType, SessionId,
 };
 use uuid::Uuid;
 
@@ -79,6 +80,27 @@ fn request(id: &str) -> ApprovalRequest {
     }
 }
 
+fn question(id: &str) -> QuestionProxyRequest {
+    QuestionProxyRequest {
+        id: id.into(),
+        session_id: SessionId::new("deployment-question-session"),
+        session_display_name: "Deployment question integration".into(),
+        cwd: "/workspace/deployment".into(),
+        question_request_id: "opencode-question".into(),
+        questions: vec![QuestionInfo {
+            question: "Continue?".into(),
+            header: "Decision".into(),
+            options: vec![QuestionOption {
+                label: "Yes".into(),
+                description: "Continue".into(),
+            }],
+            multiple: Some(false),
+            custom: Some(true),
+        }],
+        provider: "opencode".into(),
+    }
+}
+
 #[tokio::test]
 async fn packaged_server_real_client_lifecycle_is_kill_9_durable() {
     let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -137,6 +159,67 @@ async fn packaged_server_real_client_lifecycle_is_kill_9_durable() {
         .value;
     assert_eq!(resolved_retry.id, pending.id);
     assert!(resolved_retry.status.is_resolved());
+
+    let pending_question_request = question("kill9-question");
+    let pending_question = client
+        .register_question(&pending_question_request)
+        .await
+        .unwrap()
+        .value;
+    kill_9(&mut child);
+
+    let mut child = start_server(&state_path, &listen_addr);
+    wait_until_ready(&mut child, &client).await;
+    let question_retry = client
+        .register_question(&pending_question_request)
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(question_retry.id, pending_question.id);
+    assert_eq!(question_retry.status, QuestionStatus::Pending);
+    let mut conflicting_question = pending_question_request.clone();
+    conflicting_question.cwd = "/workspace/different".into();
+    assert_eq!(
+        client
+            .register_question(&conflicting_question)
+            .await
+            .unwrap_err()
+            .status(),
+        Some(409)
+    );
+    client
+        .resolve_question(
+            pending_question.id,
+            &QuestionResolveRequest {
+                decision: QuestionDecision::Answer,
+                answers: Some(vec![vec!["Yes".into()]]),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    kill_9(&mut child);
+
+    let mut child = start_server(&state_path, &listen_addr);
+    wait_until_ready(&mut child, &client).await;
+    assert_eq!(
+        client
+            .get_question(pending_question.id)
+            .await
+            .unwrap()
+            .value
+            .status,
+        QuestionStatus::Answered {
+            answers: vec![vec!["Yes".into()]]
+        }
+    );
+    let resolved_question_retry = client
+        .register_question(&pending_question_request)
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(resolved_question_retry.id, pending_question.id);
+    assert!(resolved_question_retry.status.is_resolved());
 
     let cancel_waiter = Uuid::new_v4();
     let cancelled = client

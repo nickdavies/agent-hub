@@ -46,18 +46,9 @@ impl ServerConfig {
             AuthMode::Token => "0.0.0.0:8080",
         };
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| default_addr.into());
-        let presence_ttl_secs = env::var("PRESENCE_TTL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120);
-        let session_ttl_secs = env::var("SESSION_TTL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(7200);
-        let notification_delay_secs = env::var("NOTIFICATION_DELAY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let presence_ttl_secs = parse_optional_u64("PRESENCE_TTL", 120)?;
+        let session_ttl_secs = parse_optional_u64("SESSION_TTL", 7200)?;
+        let notification_delay_secs = parse_optional_u64("NOTIFICATION_DELAY", 0)?;
 
         let approval_mode = parse_approval_mode(&env::var("APPROVAL_MODE").unwrap_or_default())?;
 
@@ -71,13 +62,8 @@ impl ServerConfig {
             ));
         }
 
-        let default_approval_mode = match env::var("DEFAULT_APPROVAL_MODE")
-            .unwrap_or_default()
-            .as_str()
-        {
-            "terminal" => SessionApprovalMode::Terminal,
-            _ => SessionApprovalMode::Remote,
-        };
+        let default_approval_mode =
+            parse_default_approval_mode(optional_env("DEFAULT_APPROVAL_MODE")?.as_deref())?;
 
         Ok(Self {
             auth_mode,
@@ -90,6 +76,33 @@ impl ServerConfig {
             base_url,
             default_approval_mode,
         })
+    }
+}
+
+fn optional_env(name: &str) -> Result<Option<String>, AppError> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(AppError::Config(format!("invalid {name}: {error}"))),
+    }
+}
+
+fn parse_optional_u64(name: &str, default: u64) -> Result<u64, AppError> {
+    match optional_env(name)? {
+        None => Ok(default),
+        Some(value) => value
+            .parse()
+            .map_err(|_| AppError::Config(format!("invalid {name} value '{value}'"))),
+    }
+}
+
+fn parse_default_approval_mode(value: Option<&str>) -> Result<SessionApprovalMode, AppError> {
+    match value {
+        None | Some("remote") => Ok(SessionApprovalMode::Remote),
+        Some("terminal") => Ok(SessionApprovalMode::Terminal),
+        Some(value) => Err(AppError::Config(format!(
+            "unknown DEFAULT_APPROVAL_MODE value '{value}'"
+        ))),
     }
 }
 
@@ -144,6 +157,20 @@ mod tests {
     #[test]
     fn unknown_approval_mode_fails() {
         assert!(parse_approval_mode("read-write").is_err());
+    }
+
+    #[test]
+    fn default_approval_mode_is_strict_and_missing_uses_remote() {
+        assert_eq!(
+            parse_default_approval_mode(None).unwrap(),
+            SessionApprovalMode::Remote
+        );
+        assert_eq!(
+            parse_default_approval_mode(Some("terminal")).unwrap(),
+            SessionApprovalMode::Terminal
+        );
+        assert!(parse_default_approval_mode(Some("automatic")).is_err());
+        assert!(parse_default_approval_mode(Some("")).is_err());
     }
 
     #[test]

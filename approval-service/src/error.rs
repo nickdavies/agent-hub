@@ -32,6 +32,9 @@ pub enum AppError {
 
     #[error("question not found: {0}")]
     QuestionNotFound(String),
+
+    #[error("question request conflict: {0}")]
+    QuestionConflict(String),
 }
 
 impl IntoResponse for AppError {
@@ -46,6 +49,7 @@ impl IntoResponse for AppError {
             AppError::InvalidApprovalRequest(_) => StatusCode::BAD_REQUEST,
             AppError::ApprovalReadonly => StatusCode::FORBIDDEN,
             AppError::QuestionNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::QuestionConflict(_) => StatusCode::CONFLICT,
             AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()

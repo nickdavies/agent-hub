@@ -106,6 +106,7 @@ name = "agent-hub-gateway"
 version = "0.1.0"
 dependencies = [
  "agent-hub-approval-client",
+ "agent-hub-approval-service",
  "axum 0.8.8",
  "capabilities",
  "chrono",

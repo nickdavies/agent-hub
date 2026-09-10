@@ -10,6 +10,7 @@ workflow, task, artifact, workspace, or `CONFIG_ROOT` configuration.
 - Environment: `${XDG_CONFIG_HOME:-$HOME/.config}/agent-hub/approvals-server.env`
 - User unit: `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agent-hub-approvals.service`
 - State: `${XDG_STATE_HOME:-$HOME/.local/state}/agent-hub-approvals/server_data.json`
+- Rollback slots: `${XDG_CACHE_HOME:-$HOME/.cache}/agent-hub-approvals/rollback`
 
 ## Deploy
 
@@ -30,10 +31,13 @@ private workspace under
 An inherited `CARGO_TARGET_DIR` is deliberately ignored so the installed binary
 can only come from the captured source and private build. Before installation,
 the script confirms that the original HEAD and clean worktree are unchanged. It
-atomically installs the resulting binary and verifies the installed bytes against
-the build output. The `agent-hub-approvals-server` build output is installed under
-the legacy `agent-hub-server` filename so the existing systemd unit and cutover
-paths remain unchanged.
+atomically installs the resulting approvals-only binary under the established
+`agent-hub-server` filename and verifies the installed bytes against the build
+output. The package never supplies a separately built orchestration API server as
+an approvals rollback artifact. Deployment requires the live approvals
+binary, state, environment, and unit to be regular files. It captures their exact
+bytes and modes in a new owner-only rollback slot, writes a checksum manifest, and
+atomically selects that slot before replacing the approvals-only binary and unit.
 
 Effective `HOME`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME` paths must be absolute
 and contain no explicit `.` or `..` components. Every existing component from
@@ -56,8 +60,9 @@ repository, packaged files, and existing destinations and reports the build,
 install, and configuration behavior without creating snapshot, build, or
 installation directories.
 
-The script does not invoke systemd. Restart is intentionally separate so an
-operator controls activation of the newly installed binary and unit.
+The script does not invoke systemd or modify the live state. Stop/start remains an
+explicit operator action. An existing `AUTH_MODE=none` environment, including the
+accepted standalone `LISTEN_ADDR=0.0.0.0:8080` configuration, is preserved.
 
 Before cutover, `--validate-legacy-state` exports and builds the same captured
 clean HEAD used by deployment, copies the specified regular non-symlink legacy
@@ -66,15 +71,16 @@ server against only that copy. It proves `/health`, the mobile
 `/approvals/queue`, and `/api/v1/sessions`, sends the configured `SIGINT`, waits
 for a successful stop/save, and verifies that the source state's SHA-256 did not
 change. The validation mode installs nothing, does not invoke systemd, and removes
-the copied state with the private workspace. Run it while the legacy server is
-stopped or against a separately captured point-in-time copy so the input is
-internally consistent.
+the copied state with the private workspace. It records the validated source
+checksum in the private deployment cache. Deployment hard-fails unless that
+checksum still matches the exact live state, so validation must precede stopping
+the old process and cutover.
 
 ## Manual cutover
 
-1. Stop writes to the legacy server, copy its state to a separate validation
-   path, and run `--validate-legacy-state` against that copy. Do not point the
-   validator at live state.
+1. Quiesce writes and run `--validate-legacy-state` against the live state. The
+   validator reads and tests only a private copy and verifies the source bytes did
+   not change.
 2. Verify the installed unit, then reload the user manager:
 
    ```sh
@@ -103,3 +109,23 @@ internally consistent.
    curl --fail http://127.0.0.1:8080/health
    ```
 7. Leave `agent-hub-approvals.service` disabled by default; enable it only if automatic user-session startup is later desired.
+
+## Rollback
+
+Stop the approvals service, then restore the selected owner-private rollback slot:
+
+```sh
+deploy/approvals-server/rollback.sh
+systemctl --user daemon-reload
+systemctl --user start agent-hub-approvals.service
+```
+
+The rollback command validates the slot manifest and all integrity digests before
+staging all four files and atomically replacing each approvals binary, state,
+environment, and unit file. It does not invoke systemd. The manifest reader accepts the former
+`signed_by_digest` spelling, while newly written manifests use
+`integrity_digest`.
+
+This rollback is independent of orchestration API protocol/database rollback.
+See `docs/local-orchestration-dev.md` for the API server's v4-to-v3 and older
+preflights.

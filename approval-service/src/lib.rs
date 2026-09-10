@@ -146,6 +146,7 @@ fn spawn_maintenance<N: Notifier>(state: &AppState<N>) {
                 .evict_orphaned(Duration::from_secs(120))
                 .await;
             if orphaned > 0 {
+                changed = true;
                 tracing::info!(count = orphaned, "cancelled orphaned questions");
             }
             let waiting = state
@@ -786,6 +787,7 @@ impl<N: Notifier> AppState<N> {
             notify_config: Some(self.notify_config.read().await.clone()),
             presence: Some(self.presence.raw_state().await),
             pending_approvals: self.approvals.snapshot().await,
+            pending_questions: self.questions.snapshot().await,
         }
     }
 
@@ -800,6 +802,9 @@ impl<N: Notifier> AppState<N> {
         }
         if !state.pending_approvals.is_empty() {
             self.approvals.restore(state.pending_approvals).await;
+        }
+        if !state.pending_questions.is_empty() {
+            self.questions.restore(state.pending_questions).await;
         }
     }
 }
@@ -1770,8 +1775,11 @@ mod integration_tests {
                     custom: None,
                 }],
                 provider: "opencode".to_string(),
+                canonical_request: "legacy-test-request".to_string(),
             })
-            .await;
+            .await
+            .unwrap()
+            .question;
 
         // While question is pending, first_pending_for_session returns Some.
         assert!(

@@ -10,6 +10,7 @@ use protocol::{
 };
 
 use super::approvals::ApprovalSnapshot;
+use super::questions::QuestionSnapshot;
 
 /// Serializable snapshot of server state that survives restarts.
 #[derive(Serialize, Deserialize)]
@@ -20,6 +21,8 @@ pub struct PersistedState {
     pub presence: Option<PresenceState>,
     #[serde(default)]
     pub pending_approvals: Vec<ApprovalSnapshot>,
+    #[serde(default)]
+    pub pending_questions: Vec<QuestionSnapshot>,
 }
 
 /// A single session's persisted data (excludes last_seen which is runtime-only).
@@ -119,5 +122,19 @@ impl Storage for LocalFileStorage {
             tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all()).await??;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_without_questions_remains_readable() {
+        let state: PersistedState = serde_json::from_str(
+            r#"{"sessions":{},"notify_config":null,"presence":null,"pending_approvals":[]}"#,
+        )
+        .unwrap();
+        assert!(state.pending_questions.is_empty());
     }
 }

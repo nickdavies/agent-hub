@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command in git mktemp python3 timeout; do
+for command in git mktemp python3 tar timeout; do
     command -v "$command" >/dev/null || {
         echo "error: required harness command not found: $command" >&2
         exit 1
@@ -24,7 +24,8 @@ config_home="${sandbox}/config"
 cache_home="${sandbox}/cache"
 bin_dir="${sandbox}/bin"
 mkdir -m 0700 -- "$source_repo" "$home" "$config_home" "$cache_home" "$bin_dir"
-git -C "$repo_root" archive HEAD | tar -x -C "$source_repo"
+git -C "$repo_root" ls-files --cached --others --exclude-standard -z | \
+    tar --null -C "$repo_root" -T - -cf - | tar -x -C "$source_repo"
 git -C "$source_repo" init -q
 git -C "$source_repo" add .
 git -C "$source_repo" -c user.name=deploy-test -c user.email=deploy-test.invalid commit -qm snapshot
@@ -103,6 +104,17 @@ export EXPECTED_UNIT_SHA256="$unit_sha256"
 export BUILD_LOG="$build_log"
 export MV_LOG="$mv_log"
 
+release_output="${sandbox}/release-output"
+"${source_repo}/deploy/approvals-server/package-release.sh" \
+    "${repo_root}/target/release" "$release_output"
+(
+    cd "$release_output"
+    sha256sum --check SHA256SUMS
+)
+grep -q '"integrity_digest"' "${release_output}/approvals-server-release-manifest.json"
+grep -q '"integrity_digest"' "${release_output}/gateway-release-manifest.json"
+! grep -R -q 'signed_by_digest' "$release_output"
+
 touch "${source_repo}/untracked"
 if "$deploy" --dry-run >"${sandbox}/dirty.out" 2>"${sandbox}/dirty.err"; then
     echo "error: dirty source unexpectedly passed deployment validation" >&2
@@ -113,7 +125,7 @@ rm -- "${source_repo}/untracked"
 
 dry_run="$($deploy --dry-run)"
 grep -q "Would export HEAD" <<<"$dry_run"
-grep -q "Would not touch service state or invoke systemd" <<<"$dry_run"
+grep -q "Would not modify service state or invoke systemd" <<<"$dry_run"
 [[ ! -e "${home}/.local" ]]
 [[ ! -e "${config_home}/agent-hub" ]]
 
@@ -127,9 +139,29 @@ fi
 grep -q "existing binary must be a regular, non-symlink file" "${sandbox}/symlink.err"
 rm -- "$dest_binary"
 
-"$deploy" >"${sandbox}/deploy.out"
 dest_environment="${config_home}/agent-hub/approvals-server.env"
 dest_unit="${config_home}/systemd/user/agent-hub-approvals.service"
+dest_state="${home}/.local/state/agent-hub-approvals/server_data.json"
+mkdir -p -- "${dest_environment%/*}" "${dest_unit%/*}" "${dest_state%/*}"
+install -m 0755 -- "$fake_server" "$dest_binary"
+install -m 0600 -- "${source_repo}/deploy/approvals-server/approvals-server.env" "$dest_environment"
+install -m 0644 -- "${source_repo}/deploy/approvals-server/agent-hub-approvals.service" "$dest_unit"
+printf '%s\n' '{"sessions":{},"notify_config":null,"presence":null,"pending_approvals":[]}' >"$dest_state"
+chmod 0600 "$dest_state"
+legacy_sha256="$(sha256sum "$dest_state" | cut -d' ' -f1)"
+set +e
+timeout --signal=TERM --kill-after=2s 20s \
+    "$deploy" --validate-legacy-state "$dest_state" >"${sandbox}/legacy.out"
+validation_status=$?
+set -e
+if ((validation_status != 0)); then
+    echo "error: legacy-state validation failed or exceeded its deadline (status $validation_status)" >&2
+    exit 1
+fi
+[[ "$(sha256sum "$dest_state" | cut -d' ' -f1)" == "$legacy_sha256" ]]
+grep -q "Validated copied legacy state" "${sandbox}/legacy.out"
+
+"$deploy" >"${sandbox}/deploy.out"
 [[ "$(sha256sum "$dest_binary" | cut -d' ' -f1)" == "$(sha256sum "$fake_server" | cut -d' ' -f1)" ]]
 cmp -s -- "${source_repo}/deploy/approvals-server/approvals-server.env" "$dest_environment"
 cmp -s -- "${source_repo}/deploy/approvals-server/agent-hub-approvals.service" "$dest_unit"
@@ -137,34 +169,29 @@ cmp -s -- "${source_repo}/deploy/approvals-server/agent-hub-approvals.service" "
 [[ "$(stat -c %a -- "$dest_environment")" == 600 ]]
 [[ "$(stat -c %a -- "$dest_unit")" == 644 ]]
 grep -q '/\.agent-hub-server\.' "$mv_log"
-grep -q '/\.approvals-server.env\.' "$mv_log"
 grep -q '/\.agent-hub-approvals.service\.' "$mv_log"
 while IFS= read -r build_dir; do
     [[ "$build_dir" == "${cache_home}/agent-hub-approvals/"deploy.* ]]
     [[ "$build_dir" != "$source_repo" ]]
 done <"$build_log"
-
-legacy_state="${sandbox}/legacy-state.json"
-printf '%s\n' '{"sessions":{},"notify_config":null,"presence":null,"pending_approvals":[]}' >"$legacy_state"
-legacy_sha256="$(sha256sum "$legacy_state" | cut -d' ' -f1)"
-set +e
-timeout --signal=TERM --kill-after=2s 20s \
-    "$deploy" --validate-legacy-state "$legacy_state" >"${sandbox}/legacy.out"
-validation_status=$?
-set -e
-if ((validation_status != 0)); then
-    echo "error: legacy-state validation failed or exceeded its deadline (status $validation_status)" >&2
-    exit 1
-fi
-[[ "$(sha256sum "$legacy_state" | cut -d' ' -f1)" == "$legacy_sha256" ]]
-grep -q "Validated copied legacy state" "${sandbox}/legacy.out"
 [[ "$(wc -l <"$build_log")" == 2 ]]
-[[ ! -e "${cache_home}/agent-hub-approvals" ]] || \
-    [[ -z "$(ls -A "${cache_home}/agent-hub-approvals")" ]]
+rollback_root="${cache_home}/agent-hub-approvals/rollback"
+rollback_slot="${rollback_root}/$(<"${rollback_root}/current")"
+[[ "$(stat -c %a -- "$rollback_slot")" == 700 ]]
+grep -q '"integrity_digest"' "${rollback_slot}/manifest.json"
+! grep -q 'signed_by_digest' "${rollback_slot}/manifest.json"
+
+printf '%s\n' replaced >"$dest_state"
+"${source_repo}/deploy/approvals-server/rollback.sh" >"${sandbox}/rollback.out"
+[[ "$(sha256sum "$dest_state" | cut -d' ' -f1)" == "$legacy_sha256" ]]
 
 HOME="$real_home" CARGO_HOME="$real_cargo_home" RUSTUP_HOME="$real_rustup_home" \
     PATH="${PATH#*:}" "$real_cargo" test --locked \
         --manifest-path "${repo_root}/Cargo.toml" \
         -p agent-hub-approvals-server --test crash_durability
+HOME="$real_home" CARGO_HOME="$real_cargo_home" RUSTUP_HOME="$real_rustup_home" \
+    PATH="${PATH#*:}" "$real_cargo" test --locked \
+        --manifest-path "${repo_root}/Cargo.toml" \
+        -p agent-hub-gateway --test real_service_compat -- --ignored
 
 printf '%s\n' "deploy.sh harness passed"

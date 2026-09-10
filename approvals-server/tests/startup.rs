@@ -52,11 +52,12 @@ fn starts_without_orchestration_configuration_and_saves_on_sigint() {
         serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
     assert!(state["sessions"].is_object());
     assert!(state["pending_approvals"].is_array());
+    assert!(state["pending_questions"].is_array());
     std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
-fn systemd_unit_preserves_legacy_install_contract() {
+fn systemd_unit_preserves_legacy_install_path_with_approvals_only_binary() {
     let package =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/approvals-server");
     let unit = std::fs::read_to_string(package.join("agent-hub-approvals.service")).unwrap();
@@ -71,4 +72,31 @@ fn systemd_unit_preserves_legacy_install_contract() {
     assert!(deploy.contains("--validate-legacy-state"));
     assert!(deploy.contains("/approvals/queue"));
     assert!(deploy.contains("/api/v1/sessions"));
+}
+
+#[test]
+fn malformed_numeric_and_default_mode_configuration_fail_startup() {
+    for (name, value) in [
+        ("PRESENCE_TTL", "not-a-number"),
+        ("SESSION_TTL", ""),
+        ("NOTIFICATION_DELAY", "1.5"),
+        ("DEFAULT_APPROVAL_MODE", "automatic"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-hub-approvals-server"))
+            .args(["serve", "noop"])
+            .env("AUTH_MODE", "none")
+            .env("APPROVAL_MODE", "disabled")
+            .env(name, value)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{name}={value:?} unexpectedly passed startup"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(name),
+            "startup error did not identify {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

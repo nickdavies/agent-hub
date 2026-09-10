@@ -304,20 +304,17 @@ async fn fire_and_forget<N: Notifier>(notifier: &N, title: &str, message: &str, 
 pub async fn question<N: Notifier>(
     State(state): State<AppState<N>>,
     Json(req): Json<QuestionProxyRequest>,
-) -> Json<QuestionProxyResponse> {
-    let project = state
-        .sessions
-        .get_or_register(&req.session_id, &req.cwd, None)
-        .await;
+) -> Result<Json<QuestionProxyResponse>, crate::error::AppError> {
+    let canonical_request = serde_json::to_string(&req).map_err(|error| {
+        crate::error::AppError::Config(format!("could not canonicalize question request: {error}"))
+    })?;
+    let request_id = req.id.clone();
+    let session_id = req.session_id.clone();
+    let session_display_name = req.session_display_name.clone();
+    let cwd = req.cwd.clone();
+    let project = super::sessions::project_name(&req.cwd);
 
-    if !req.session_display_name.is_empty() {
-        state
-            .sessions
-            .set_display_name(&req.session_id, req.session_display_name.clone())
-            .await;
-    }
-
-    let pq = state
+    let outcome = state
         .questions
         .register(questions::RegisterQuestion {
             request_id: req.id,
@@ -327,13 +324,31 @@ pub async fn question<N: Notifier>(
             question_request_id: req.question_request_id,
             questions: req.questions,
             provider: req.provider,
+            canonical_request,
         })
-        .await;
+        .await
+        .map_err(|questions::RegisterQuestionError::Conflict| {
+            crate::error::AppError::QuestionConflict(request_id)
+        })?;
+    let pq = outcome.question;
 
-    Json(QuestionProxyResponse {
+    if outcome.created {
+        state
+            .sessions
+            .get_or_register(&session_id, &cwd, None)
+            .await;
+        if !session_display_name.is_empty() {
+            state
+                .sessions
+                .set_display_name(&session_id, session_display_name)
+                .await;
+        }
+    }
+
+    Ok(Json(QuestionProxyResponse {
         id: pq.id,
         status: pq.status,
-    })
+    }))
 }
 
 #[cfg(test)]

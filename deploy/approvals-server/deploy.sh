@@ -26,6 +26,10 @@ dest_environment="${config_home}/agent-hub/approvals-server.env"
 dest_unit="${config_home}/systemd/user/agent-hub-approvals.service"
 cache_home="${XDG_CACHE_HOME:-${HOME}/.cache}"
 cache_root="${cache_home}/agent-hub-approvals"
+state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
+dest_state="${state_home}/agent-hub-approvals/server_data.json"
+rollback_root="${cache_root}/rollback"
+validation_record="${cache_root}/validated-legacy-state.sha256"
 workspace=
 staged_binary=
 staged_environment=
@@ -47,7 +51,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in cargo cmp git install mkdir mktemp mv rm sha256sum stat tar; do
+for command in cargo chmod cmp cp git install mkdir mktemp mv python3 rm sha256sum stat tar; do
     command -v "$command" >/dev/null || {
         echo "error: required command not found: $command" >&2
         exit 1
@@ -249,6 +253,7 @@ sha256() {
 validate_effective_path HOME "$HOME"
 validate_effective_path XDG_CACHE_HOME "$cache_home"
 validate_effective_path XDG_CONFIG_HOME "$config_home"
+validate_effective_path XDG_STATE_HOME "$state_home"
 
 if ! worktree_is_clean; then
     echo "error: deployment requires a clean Git worktree (including staged and untracked files)" >&2
@@ -279,7 +284,9 @@ if [[ "$mode" == dry-run ]]; then
         echo "Would install the captured approvals-server.env as ${dest_environment} with mode 0600"
     fi
     echo "Would atomically install the captured agent-hub-approvals.service as ${dest_unit} with mode 0644"
-    echo "Would not touch service state or invoke systemd"
+    echo "Would require the exact live state to have passed --validate-legacy-state"
+    echo "Would capture the live approvals binary, state, environment, and unit in ${rollback_root}"
+    echo "Would not modify service state or invoke systemd"
     exit 0
 fi
 
@@ -358,10 +365,70 @@ if [[ "$mode" == validate-legacy-state ]]; then
         echo "error: source legacy state changed during validation" >&2
         exit 1
     fi
+    ensure_trusted_cache_directory "rollback validation cache" "$cache_root"
+    validation_tmp="$(mktemp "${cache_root}/.validated-legacy-state.XXXXXX")"
+    printf '%s\n' "$legacy_sha256" >"$validation_tmp"
+    chmod 0600 "$validation_tmp"
+    mv -T -- "$validation_tmp" "$validation_record"
     echo "Validated copied legacy state load, mobile queue, API, SIGINT stop, and save"
     echo "Source legacy state was not modified: ${legacy_state}"
     exit 0
 fi
+
+for live_file in "$dest_binary" "$dest_state" "$dest_environment" "$dest_unit"; do
+    if [[ ! -f "$live_file" || -L "$live_file" ]]; then
+        echo "error: cutover requires a live regular, non-symlink rollback source: $live_file" >&2
+        exit 1
+    fi
+done
+if [[ ! -f "$validation_record" || -L "$validation_record" ]] || \
+    [[ "$(<"$validation_record")" != "$(sha256 "$dest_state")" ]]; then
+    echo "error: exact live state must pass --validate-legacy-state before cutover" >&2
+    exit 1
+fi
+
+ensure_trusted_cache_directory "rollback cache" "$rollback_root"
+rollback_slot="$(mktemp -d "${rollback_root}/slot.XXXXXX")"
+[[ "$(stat -c %a -- "$rollback_slot")" == 700 ]] || {
+    echo "error: rollback slot must have mode 0700" >&2
+    exit 1
+}
+cp --preserve=mode -- "$dest_binary" "${rollback_slot}/agent-hub-server"
+cp --preserve=mode -- "$dest_state" "${rollback_slot}/server_data.json"
+cp --preserve=mode -- "$dest_environment" "${rollback_slot}/approvals-server.env"
+cp --preserve=mode -- "$dest_unit" "${rollback_slot}/agent-hub-approvals.service"
+cmp -s -- "$dest_binary" "${rollback_slot}/agent-hub-server"
+cmp -s -- "$dest_state" "${rollback_slot}/server_data.json"
+cmp -s -- "$dest_environment" "${rollback_slot}/approvals-server.env"
+cmp -s -- "$dest_unit" "${rollback_slot}/agent-hub-approvals.service"
+if [[ "$(<"$validation_record")" != "$(sha256 "$dest_state")" ]]; then
+    echo "error: live state changed after validation; refusing cutover" >&2
+    exit 1
+fi
+ROLLBACK_SLOT="$rollback_slot" python3 - <<'PY' >"${rollback_slot}/manifest.json"
+import hashlib
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["ROLLBACK_SLOT"])
+files = []
+for path in sorted(root.iterdir()):
+    if path.name == "manifest.json":
+        continue
+    files.append({
+        "path": path.name,
+        "integrity_digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "mode": oct(path.stat().st_mode & 0o777)[2:].zfill(4),
+    })
+print(json.dumps({"schema": "agent-hub-approvals-rollback-v1", "files": files}, indent=2, sort_keys=True))
+PY
+chmod 0600 "${rollback_slot}/manifest.json"
+rollback_pointer_tmp="$(mktemp "${rollback_root}/.current.XXXXXX")"
+printf '%s\n' "${rollback_slot##*/}" >"$rollback_pointer_tmp"
+chmod 0600 "$rollback_pointer_tmp"
+mv -T -- "$rollback_pointer_tmp" "${rollback_root}/current"
+echo "Captured rollback slot: ${rollback_slot}"
 
 validate_destinations
 validate_environment

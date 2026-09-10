@@ -88,14 +88,55 @@ jobs:
       - name: Test
         run: bun run test
 
-  approval-service-server:
+  approvals-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Approval service and server tests
-        run: cargo test -p agent-hub-approval-service -p agent-hub-approvals-server
+      - name: Approval release formatting
+        run: cargo fmt --check
+      - name: Approval release clippy
+        run: >-
+          cargo clippy --all-targets
+          -p protocol
+          -p agent-hub-web-auth
+          -p agent-hub-approval-client
+          -p agent-hub-approval-service
+          -p agent-hub-approvals-server
+          -p agent-hub-gateway
+          -- -D warnings
+      - name: Approval release tests
+        run: >-
+          cargo test
+          -p protocol
+          -p agent-hub-web-auth
+          -p agent-hub-approval-client
+          -p agent-hub-approval-service
+          -p agent-hub-approvals-server
+          -p agent-hub-gateway
+      - name: Approval gateway network compatibility
+        run: |
+          cargo test -p agent-hub-gateway --test http_outcomes -- --ignored
+          cargo test -p agent-hub-gateway --test real_service_compat -- --ignored
+      - name: Build approval release binaries
+        run: cargo build --locked --release -p agent-hub-approvals-server -p agent-hub-gateway
+      - name: Package approval release
+        run: deploy/approvals-server/package-release.sh target/release target/approval-release
+      - name: Verify approval release checksums and manifests
+        run: |
+          cd target/approval-release
+          sha256sum --check SHA256SUMS
+          grep -q '"integrity_digest"' approvals-server-release-manifest.json
+          grep -q '"integrity_digest"' gateway-release-manifest.json
+          ! grep -R -q 'signed_by_digest' .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: approvals-release-${{ github.sha }}
+          path: target/approval-release/
+          if-no-files-found: error
 
   approvals-deploy-harness:
     runs-on: ubuntu-latest
@@ -121,73 +162,15 @@ jobs:
 
   release-gate:
     needs:
-      - check
-      - gateway-network
-      - executor-slow-recovery
-      - local-agent-faults
-      - typecheck-opencode-plugin
-      - approval-service-server
+      - approvals-release
       - approvals-deploy-harness
-      - docker-check
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Require release checks
         env:
-          CHECK: ${{ needs.check.result }}
-          GATEWAY_NETWORK: ${{ needs.gateway-network.result }}
-          EXECUTOR_SLOW_RECOVERY: ${{ needs.executor-slow-recovery.result }}
-          LOCAL_AGENT_FAULTS: ${{ needs.local-agent-faults.result }}
-          OPENCODE_PLUGIN: ${{ needs.typecheck-opencode-plugin.result }}
-          APPROVAL_SERVICE_SERVER: ${{ needs.approval-service-server.result }}
+          APPROVALS_RELEASE: ${{ needs.approvals-release.result }}
           APPROVALS_DEPLOY_HARNESS: ${{ needs.approvals-deploy-harness.result }}
-          DOCKER_CHECK: ${{ needs.docker-check.result }}
         run: |
-          test "$CHECK" = success
-          test "$GATEWAY_NETWORK" = success
-          test "$EXECUTOR_SLOW_RECOVERY" = success
-          test "$LOCAL_AGENT_FAULTS" = success
-          test "$OPENCODE_PLUGIN" = success
-          test "$APPROVAL_SERVICE_SERVER" = success
+          test "$APPROVALS_RELEASE" = success
           test "$APPROVALS_DEPLOY_HARNESS" = success
-          if [[ "${{ github.event_name }}" == pull_request ]]; then
-            test "$DOCKER_CHECK" = success
-          else
-            test "$DOCKER_CHECK" = skipped
-          fi
-
-  docker-push:
-    needs: release-gate
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

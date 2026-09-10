@@ -266,30 +266,44 @@ are never made available to agent or command jobs.
 - `VIKUNJA_BASE_URL` should be the Vikunja service root (for local compose: `http://vikunja:3456` inside the server container), not the `/api/v1` path.
 ## Authorization protocol rollback
 
-New databases start with the v3 fence. Schema upgrades preserve an existing v1 or v2 fence; startup
-never raises it. Lift a preserved fence only after deploying compatible workers:
+This procedure applies only to the orchestration API server and its database. The
+standalone approvals server has a separate file rollback procedure in
+`deploy/approvals-server/README.md`.
+
+New databases start with the v4 fence. Schema upgrades preserve an existing lower
+fence; startup never raises it. Lift a preserved fence only after deploying
+compatible workers:
 
 ```bash
-agent-hub-server set-authorization-protocol-mode --database "$ORCHESTRATION_DB" --max-version 3
+agent-hub-server set-authorization-protocol-mode --database "$ORCHESTRATION_DB" --max-version 4
 ```
 
-Before rolling back to a v2-only build, stop dispatch, drain or explicitly quarantine every active
-v3 job, record, authorization obligation, and recovery item, and invalidate v3-capable sessions.
+Before rolling back to a v3-only build, stop dispatch, drain or explicitly
+quarantine every active v4 job, record, authorization obligation, recovery item,
+and reactivatable workflow, and invalidate v4-capable sessions. The rollback is
+prohibited until this preflight succeeds:
+
+```bash
+agent-hub-server rollback-preflight-v3 --database "$ORCHESTRATION_DB"
+```
+
+Before rolling back to a v2-only build, perform the same drain for v3 and v4 work.
 The rollback is prohibited until this preflight succeeds:
 
 ```bash
 agent-hub-server rollback-preflight-v2 --database "$ORCHESTRATION_DB"
 ```
 
-Before rolling back again to a v1-only build, perform the same drain for v2 and v3 work and run:
+Before rolling back again to a v1-only build, perform the same drain for v2, v3,
+and v4 work and run:
 
 ```bash
 agent-hub-server rollback-preflight-v1 --database "$ORCHESTRATION_DB"
 ```
 
-Both checks also reject reactivatable workflows because a lower-version server could mint or resume
-unsupported work. Do not rewrite stored authorization bytes between versions or reuse a
-higher-version session with a lower-version server.
+All checks reject reactivatable workflows because a lower-version server could
+mint or resume unsupported work. Do not rewrite stored authorization bytes between
+versions or reuse a higher-version session with a lower-version server.
 
 Each successful preflight commits its durable lower-version fence. A compatible server may lift it
 only through the explicit command; ordinary startup preserves it:
