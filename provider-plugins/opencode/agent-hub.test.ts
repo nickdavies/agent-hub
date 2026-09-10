@@ -1,5 +1,7 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test"
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test"
 import { EventEmitter } from "events"
+import { mkdirSync, rmSync } from "node:fs"
+import path from "node:path"
 import type { OpenCodeHookInput } from "./generated/gateway-types"
 
 let approvalPayloads: OpenCodeHookInput[] = []
@@ -12,10 +14,11 @@ let questionGatewayResults: Array<{
 let questionReplies: Array<{ requestID: string; directory: string; answers: string[][] }> = []
 let questionRejections: Array<{ requestID: string; directory: string }> = []
 
-mock.module("fs", () => ({
-  default: { appendFileSync: () => {} },
-  appendFileSync: () => {},
-}))
+const logRoot = path.resolve("../../target", `opencode-plugin-test-${crypto.randomUUID()}`)
+mkdirSync(path.join(logRoot, "opencode", "log"), { recursive: true })
+process.env.XDG_DATA_HOME = logRoot
+
+afterAll(() => rmSync(logRoot, { recursive: true, force: true }))
 
 mock.module("@opencode-ai/sdk/v2", () => ({
   OpencodeClient: class {
@@ -303,6 +306,7 @@ describe("question gateway outcomes", () => {
     ["spawn failure", { spawnError: "spawn failed" }],
     ["malformed output", { code: 0, stdout: "not json" }],
     ["answer cardinality mismatch", { code: 0, stdout: '{"answers":[["one answer"]]}' }],
+    ["oversized output", { code: 0, stdout: "x".repeat(1024 * 1024 + 1) }],
   ])("%s replies with neutral pipeline errors and never rejects", async (_name, result) => {
     questionGatewayResults.push(result)
     const hooks = await (await loadPlugin())(pluginInput("/home/user/project"))

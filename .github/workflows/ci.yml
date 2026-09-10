@@ -88,6 +88,23 @@ jobs:
       - name: Test
         run: bun run test
 
+  approval-service-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Approval service and server tests
+        run: cargo test -p agent-hub-approval-service -p agent-hub-approvals-server
+
+  approvals-deploy-harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolated approvals deployment contract
+        run: bash deploy/approvals-server/test-deploy.sh
+
   docker-check:
     needs: check
     if: github.event_name == 'pull_request'
@@ -102,8 +119,45 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  release-gate:
+    needs:
+      - check
+      - gateway-network
+      - executor-slow-recovery
+      - local-agent-faults
+      - typecheck-opencode-plugin
+      - approval-service-server
+      - approvals-deploy-harness
+      - docker-check
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require release checks
+        env:
+          CHECK: ${{ needs.check.result }}
+          GATEWAY_NETWORK: ${{ needs.gateway-network.result }}
+          EXECUTOR_SLOW_RECOVERY: ${{ needs.executor-slow-recovery.result }}
+          LOCAL_AGENT_FAULTS: ${{ needs.local-agent-faults.result }}
+          OPENCODE_PLUGIN: ${{ needs.typecheck-opencode-plugin.result }}
+          APPROVAL_SERVICE_SERVER: ${{ needs.approval-service-server.result }}
+          APPROVALS_DEPLOY_HARNESS: ${{ needs.approvals-deploy-harness.result }}
+          DOCKER_CHECK: ${{ needs.docker-check.result }}
+        run: |
+          test "$CHECK" = success
+          test "$GATEWAY_NETWORK" = success
+          test "$EXECUTOR_SLOW_RECOVERY" = success
+          test "$LOCAL_AGENT_FAULTS" = success
+          test "$OPENCODE_PLUGIN" = success
+          test "$APPROVAL_SERVICE_SERVER" = success
+          test "$APPROVALS_DEPLOY_HARNESS" = success
+          if [[ "${{ github.event_name }}" == pull_request ]]; then
+            test "$DOCKER_CHECK" = success
+          else
+            test "$DOCKER_CHECK" = skipped
+          fi
+
   docker-push:
-    needs: check
+    needs: release-gate
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

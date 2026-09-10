@@ -461,7 +461,11 @@ async function callGatewayQuestion(
   payload: QuestionProxyRequest,
 ): Promise<QuestionGatewayResult> {
   if (APPROVAL_TRANSPORT.kind === "attended_socket") {
-    return { error: "question relay is unavailable in approval-socket mode" }
+    log("ERROR", "question gateway unavailable for approval transport", {
+      requestId: payload.question_request_id,
+      transport: APPROVAL_TRANSPORT.kind,
+    })
+    return { outcome: "pipeline-error" }
   }
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const server = process.env.AGENT_HUB_SERVER
@@ -498,7 +502,10 @@ async function callGatewayQuestion(
     proc.on("close", (code: number | null) => {
       untrack(sid, proc)
       questionGatewayProcs.delete(requestId)
-      if (outputExceeded) return resolve({ error: "gateway: output exceeded limit" })
+      if (outputExceeded) {
+        log("ERROR", "question gateway output exceeded limit", { requestId, bin })
+        return resolve({ outcome: "pipeline-error" })
+      }
       if (stderr) log("INFO", "question gateway stderr", { output: stderr.trim() })
 
       if (code === 0) {

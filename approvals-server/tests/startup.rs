@@ -7,6 +7,9 @@ fn starts_without_orchestration_configuration_and_saves_on_sigint() {
     ));
     std::fs::create_dir(&directory).unwrap();
     let state_path = directory.join("server_data.json");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    drop(listener);
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agent-hub-approvals-server"))
         .args([
             "serve",
@@ -18,18 +21,30 @@ fn starts_without_orchestration_configuration_and_saves_on_sigint() {
         .env("AUTH_MODE", "none")
         .env("APPROVAL_MODE", "readwrite")
         .env("BASE_URL", "http://localhost:8080")
-        .env("LISTEN_ADDR", "127.0.0.1:0")
+        .env("LISTEN_ADDR", listen_addr.to_string())
         .env_remove("TASK_STATE_DIR")
         .env_remove("CONFIG_ROOT")
         .env_remove("WORKFLOWS_DIR")
         .spawn()
         .unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "server exited during startup"
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "server exited during startup"
+        );
+        if std::net::TcpStream::connect_timeout(&listen_addr, std::time::Duration::from_millis(50))
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server did not become ready before timeout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
     assert!(child.wait().unwrap().success());
 

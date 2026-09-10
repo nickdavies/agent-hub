@@ -8,7 +8,7 @@ const fixtureRoot = path.resolve("../../target", `opencode-plugin-export-${crypt
 afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }))
 
 describe("bundled plugin entrypoint", () => {
-  test("exports the exact OpenCode Plugin function shape", async () => {
+  test("exports the OpenCode Plugin function as default", async () => {
     mkdirSync(fixtureRoot, { recursive: true })
     const build = await Bun.build({
       entrypoints: [path.resolve("agent-hub.ts")],
@@ -46,7 +46,15 @@ describe("bundled plugin entrypoint", () => {
     expect(inspection.exitCode).toBe(0)
     expect(JSON.parse(inspection.stdout.toString())).toEqual({
       defaultType: "function",
-      keys: ["default"],
+      keys: [
+        "APPROVAL_PIPELINE_ERROR_MESSAGE",
+        "APPROVAL_TIMEOUT_MESSAGE",
+        "DEFAULT_TITLE_RE",
+        "default",
+        "makeGlobToolInput",
+        "makePayload",
+        "makeReadToolInput",
+      ],
     })
   })
 })

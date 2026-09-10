@@ -738,7 +738,7 @@ impl<N: Notifier> AppState<N> {
 // needing a running server, gateway, or opencode instance.
 // ===================================================================
 
-#[cfg(any())]
+#[cfg(test)]
 mod integration_tests {
     use super::*;
     use axum::body::Body;
@@ -796,130 +796,48 @@ mod integration_tests {
     }
 
     fn launch_request(id: &str, prompt: &str) -> String {
-        launch_request_with_digest(id, prompt, &"a".repeat(64))
+        launch_request_with_options(id, prompt, None, None)
     }
 
-    fn launch_request_with_digest(id: &str, prompt: &str, digest: &str) -> String {
-        let canonical_execution = serde_json::json!({
-            "version": "attended_authorization_request_v3",
-            "proposal": {
-                "environment": "code-auto",
-                "image_family": "job-code",
-                "image_tag": "agent-hub/job-code:test",
-                "image_id": format!("sha256:{}", "b".repeat(64)),
-                "network_class": "build",
-                "network_resources": ["github", "llm"],
-                "tool_approval": "auto",
-                "overlays": ["github:github.com:read"],
-                "timeout_secs": 3600,
-                "prompt_digest": "c".repeat(64),
-                "prompt": prompt
-            },
-            "execution": {
-                "config_root": "/config",
-                "config_digest": "d".repeat(64),
-                "config_provenance": {"deployment": "test"},
-                "environment_bundle_digest": "e".repeat(64),
-                "runtime": {
-                    "runtime_version": "v2",
-                    "environment": {
-                        "tier": "docker",
-                        "execution_mode": "docker",
-                        "container_image": "agent-hub/job-code:test",
-                        "timeout_secs": 3600,
-                        "memory_limit": "4g",
-                        "cpu_limit": "2",
-                        "network_resources": {"resources": ["github", "llm"]},
-                        "filesystem": "isolated",
-                        "file_mounts": [],
-                        "toolchains": ["rust"]
-                    },
-                    "permissions": {"can_read_workspace": true, "can_write_workspace": true},
-                    "approval_rules": {"auto_approve": ["read"]},
-                    "repos": [],
-                    "github_capabilities": []
-                },
-                "behavior": {"command": "opencode", "args": ["run"]},
-                "pids_limit": 512,
-                "credential_providers": [{
-                    "name": "github:github.com:read",
-                    "provider_type": "github-token",
-                    "source": "host",
-                    "command": null,
-                    "args": [],
-                    "validity": null,
-                    "targets": ["/agent-hub/github/tokens/github.com"],
-                    "access": "read",
-                    "constraints": {"host": "github.com"}
-                }],
-                "overlays": [{"name": "github:github.com:read"}],
-                "workspaces": [{
-                    "alias": "primary",
-                    "host_path": "/workspace/repo",
-                    "container_path": "/workspace/primary",
-                    "access": "read_write"
-                }],
-                "context_roots": [],
-                "repositories": [],
-                "primary_workspace": "primary"
-            },
-            "roots": [],
-            "workspace_root_identities": {"primary": "workspaces"},
-            "context_root_identities": {},
-            "git_views": [{
-                "workspace_alias": "primary",
-                "repository_type": "linked",
-                "workspace_path": "/workspace/repo",
-                "workspace_container_path": "/workspace/primary",
-                "git_dir": {"canonical_path": "/git/worktrees/repo", "device": 1, "inode": 2},
-                "common_dir": {"canonical_path": "/git", "device": 1, "inode": 1},
-                "object_stores": [],
-                "head": "0123456789abcdef0123456789abcdef01234567",
-                "reference": "refs/heads/test",
-                "index_sha256": "f".repeat(64),
-                "remote": "https://github.com/example/repo.git",
-                "access": "read_write",
-                "pointer_container_path": "/workspace/primary/.git",
-                "git_dir_container_path": "/agent-hub/git/primary"
-            }],
-            "approval_bundle_digest": "0".repeat(64),
-            "approval_bundle": null,
-            "output": {
-                "transcript": "transcript.jsonl",
-                "result": "result.json",
-                "artifacts": "artifacts.json",
-                "repositories": "repositories.json",
-                "cleanup": "cleanup.json",
-                "limits": {"stdout_bytes": 1024, "stderr_bytes": 1024, "transcript_bytes": 2048, "artifact_bytes": 4096}
-            },
-            "lifecycle": {"preserve_workspace_on_failure": true, "cancellation_requires_owner": true, "cleanup_is_explicit": true},
-            "retry": {"max_attempts": 3, "max_prelaunch_retries": 1, "max_provider_unavailable_retries": 1}
-        });
-        let canonical_bytes = serde_json::to_vec(&canonical_execution).unwrap();
-        let canonical_hex = canonical_bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+    fn launch_request_with_digest(id: &str, prompt: &str, request_digest: Option<&str>) -> String {
+        launch_request_with_options(id, prompt, request_digest, None)
+    }
+
+    fn launch_request_with_config_digest(id: &str, prompt: &str, config_digest: &str) -> String {
+        launch_request_with_options(id, prompt, None, Some(config_digest))
+    }
+
+    fn launch_request_with_options(
+        id: &str,
+        prompt: &str,
+        request_digest: Option<&str>,
+        config_digest: Option<&str>,
+    ) -> String {
+        let mut canonical_execution: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../protocol/tests/fixtures/attended_authorization_v3.json"
+        ))
+        .unwrap();
+        if let Some(config_digest) = config_digest {
+            canonical_execution["execution"]["config_digest"] = config_digest.into();
+        }
+        let canonical_execution: protocol::AttendedAuthorizationRequestV3 =
+            serde_json::from_value(canonical_execution).unwrap();
+        let resolved = protocol::AgentHubRunResolvedV1::new(
+            "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
+            canonical_execution.canonical_artifact().unwrap(),
+            "2026-01-01T00:00:00Z".parse().unwrap(),
+            "2099-01-01T00:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        let request_digest = request_digest.unwrap_or(&resolved.canonical_digest);
         serde_json::json!({
             "id": id,
-            "request_digest": digest,
+            "request_digest": request_digest,
             "session_id": "launch-session",
-            "session_display_name": "Canonical launch",
+            "session_display_name": prompt,
             "cwd": "/workspace/repo",
             "tool_name": "agent_hub_run_resolved",
-            "tool_input": {
-                "schema": "agent_hub_run_resolved_v1",
-                "invocation_id": "018f0f21-76c0-7b37-a446-31f82a5e7602",
-                "canonical_digest": digest,
-                "request_digest": "1".repeat(64),
-                "canonical_execution": {
-                    "version": 3,
-                    "digest": digest,
-                    "canonical_bytes": canonical_hex
-                },
-                "requested_at": "2026-01-01T00:00:00Z",
-                "expires_at": "2099-01-01T00:00:00Z"
-            },
+            "tool_input": resolved,
             "provider": "agent-hub-host-launch",
             "request_type": "tool_use",
             "context": {
@@ -1018,8 +936,10 @@ mod integration_tests {
         assert_eq!(status, AxumStatus::OK);
         let record: serde_json::Value = serde_json::from_str(&record).unwrap();
         assert_eq!(record["request_id"], "launch-api-1");
-        assert_eq!(record["request_digest"], "a".repeat(64));
-        assert_eq!(record["tool_input"]["request_digest"], "1".repeat(64));
+        assert_eq!(
+            record["request_digest"],
+            record["tool_input"]["canonical_digest"]
+        );
         assert_eq!(record["tool_input"]["requested_at"], "2026-01-01T00:00:00Z");
         assert_eq!(record["tool_input"]["schema"], "agent_hub_run_resolved_v1");
 
@@ -1073,10 +993,10 @@ mod integration_tests {
         let (status, _) = post_json_response(
             &app,
             "/api/v1/hooks/approval",
-            &launch_request_with_digest("launch-idempotent", "same prompt", &"9".repeat(64)),
+            &launch_request_with_digest("launch-idempotent", "same prompt", Some(&"9".repeat(64))),
         )
         .await;
-        assert_eq!(status, AxumStatus::CONFLICT);
+        assert_eq!(status, AxumStatus::BAD_REQUEST);
 
         let (status, conflict) = post_json_response(
             &app,
@@ -1087,13 +1007,14 @@ mod integration_tests {
         assert_eq!(status, AxumStatus::CONFLICT);
         assert!(conflict.contains("launch-idempotent"));
 
-        let mut changed_resolved_digest: serde_json::Value =
-            serde_json::from_str(&launch_request("launch-idempotent", "same prompt")).unwrap();
-        changed_resolved_digest["tool_input"]["request_digest"] = "2".repeat(64).into();
         let (status, _) = post_json_response(
             &app,
             "/api/v1/hooks/approval",
-            &serde_json::to_string(&changed_resolved_digest).unwrap(),
+            &launch_request_with_config_digest(
+                "launch-idempotent",
+                "same prompt",
+                "changed-config-digest",
+            ),
         )
         .await;
         assert_eq!(status, AxumStatus::CONFLICT);

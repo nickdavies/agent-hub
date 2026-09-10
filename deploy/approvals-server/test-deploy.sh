@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for command in git mktemp python3 timeout; do
+    command -v "$command" >/dev/null || {
+        echo "error: required harness command not found: $command" >&2
+        exit 1
+    }
+done
+
+repo_root="$(git -C "${BASH_SOURCE[0]%/*}" rev-parse --show-toplevel)"
+mkdir -p -- "${repo_root}/target"
+test_root="${repo_root}/target/deploy-approvals-server-test"
+sandbox="$(mktemp -d "${test_root}.XXXXXX")"
+trap 'rm -rf -- "$sandbox"' EXIT
+
+source_repo="${sandbox}/source"
+home="${sandbox}/home"
+config_home="${sandbox}/config"
+cache_home="${sandbox}/cache"
+bin_dir="${sandbox}/bin"
+mkdir -m 0700 -- "$source_repo" "$home" "$config_home" "$cache_home" "$bin_dir"
+git -C "$repo_root" archive HEAD | tar -x -C "$source_repo"
+git -C "$source_repo" init -q
+git -C "$source_repo" add .
+git -C "$source_repo" -c user.name=deploy-test -c user.email=deploy-test.invalid commit -qm snapshot
+
+fake_server="${sandbox}/fake-server"
+cat >"$fake_server" <<'PYTHON'
+#!/usr/bin/env python3
+import json
+import os
+import signal
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+state_path = sys.argv[sys.argv.index("--path") + 1]
+with open(state_path, encoding="utf-8") as state_file:
+    state = json.load(state_file)
+host, port = os.environ["LISTEN_ADDR"].rsplit(":", 1)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/health", "/approvals/queue", "/api/v1/sessions"):
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, _format, *_args):
+        pass
+
+server = HTTPServer((host, int(port)), Handler)
+
+def stop(_signal, _frame):
+    raise SystemExit(0)
+
+signal.signal(signal.SIGINT, stop)
+try:
+    server.serve_forever()
+finally:
+    server.server_close()
+    with open(state_path, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file)
+PYTHON
+chmod 0755 "$fake_server"
+
+cat >"${bin_dir}/cargo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == build ]]
+[[ "$PWD" == "${XDG_CACHE_HOME}/agent-hub-approvals/"deploy.* ]]
+[[ "$(sha256sum deploy/approvals-server/agent-hub-approvals.service | cut -d' ' -f1)" == "$EXPECTED_UNIT_SHA256" ]]
+printf '%s\n' "$PWD" >>"$BUILD_LOG"
+mkdir -p -- "${CARGO_TARGET_DIR}/release"
+install -m 0755 -- "$HARNESS_FAKE_SERVER" "${CARGO_TARGET_DIR}/release/agent-hub-approvals-server"
+SH
+chmod 0755 "${bin_dir}/cargo"
+
+cat >"${bin_dir}/mv" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$MV_LOG"
+exec /usr/bin/mv "$@"
+SH
+chmod 0755 "${bin_dir}/mv"
+
+deploy="${source_repo}/deploy/approvals-server/deploy.sh"
+build_log="${sandbox}/build.log"
+mv_log="${sandbox}/mv.log"
+unit_sha256="$(sha256sum "${source_repo}/deploy/approvals-server/agent-hub-approvals.service" | cut -d' ' -f1)"
+export HOME="$home"
+export XDG_CONFIG_HOME="$config_home"
+export XDG_CACHE_HOME="$cache_home"
+export PATH="${bin_dir}:${PATH}"
+export HARNESS_FAKE_SERVER="$fake_server"
+export EXPECTED_UNIT_SHA256="$unit_sha256"
+export BUILD_LOG="$build_log"
+export MV_LOG="$mv_log"
+
+touch "${source_repo}/untracked"
+if "$deploy" --dry-run >"${sandbox}/dirty.out" 2>"${sandbox}/dirty.err"; then
+    echo "error: dirty source unexpectedly passed deployment validation" >&2
+    exit 1
+fi
+grep -q "clean Git worktree" "${sandbox}/dirty.err"
+rm -- "${source_repo}/untracked"
+
+dry_run="$($deploy --dry-run)"
+grep -q "Would export HEAD" <<<"$dry_run"
+grep -q "Would not touch service state or invoke systemd" <<<"$dry_run"
+[[ ! -e "${home}/.local" ]]
+[[ ! -e "${config_home}/agent-hub" ]]
+
+dest_binary="${home}/.local/libexec/agent-hub-approvals/agent-hub-server"
+mkdir -p -- "${dest_binary%/*}"
+ln -s -- "$fake_server" "$dest_binary"
+if "$deploy" >"${sandbox}/symlink.out" 2>"${sandbox}/symlink.err"; then
+    echo "error: symlink destination unexpectedly passed validation" >&2
+    exit 1
+fi
+grep -q "existing binary must be a regular, non-symlink file" "${sandbox}/symlink.err"
+rm -- "$dest_binary"
+
+"$deploy" >"${sandbox}/deploy.out"
+dest_environment="${config_home}/agent-hub/approvals-server.env"
+dest_unit="${config_home}/systemd/user/agent-hub-approvals.service"
+[[ "$(sha256sum "$dest_binary" | cut -d' ' -f1)" == "$(sha256sum "$fake_server" | cut -d' ' -f1)" ]]
+cmp -s -- "${source_repo}/deploy/approvals-server/approvals-server.env" "$dest_environment"
+cmp -s -- "${source_repo}/deploy/approvals-server/agent-hub-approvals.service" "$dest_unit"
+[[ "$(stat -c %a -- "$dest_binary")" == 755 ]]
+[[ "$(stat -c %a -- "$dest_environment")" == 600 ]]
+[[ "$(stat -c %a -- "$dest_unit")" == 644 ]]
+grep -q '/\.agent-hub-server\.' "$mv_log"
+grep -q '/\.approvals-server.env\.' "$mv_log"
+grep -q '/\.agent-hub-approvals.service\.' "$mv_log"
+while IFS= read -r build_dir; do
+    [[ "$build_dir" == "${cache_home}/agent-hub-approvals/"deploy.* ]]
+    [[ "$build_dir" != "$source_repo" ]]
+done <"$build_log"
+
+legacy_state="${sandbox}/legacy-state.json"
+printf '%s\n' '{"sessions":{},"notify_config":null,"presence":null,"pending_approvals":[]}' >"$legacy_state"
+legacy_sha256="$(sha256sum "$legacy_state" | cut -d' ' -f1)"
+set +e
+timeout --signal=TERM --kill-after=2s 20s \
+    "$deploy" --validate-legacy-state "$legacy_state" >"${sandbox}/legacy.out"
+validation_status=$?
+set -e
+if ((validation_status != 0)); then
+    echo "error: legacy-state validation failed or exceeded its deadline (status $validation_status)" >&2
+    exit 1
+fi
+[[ "$(sha256sum "$legacy_state" | cut -d' ' -f1)" == "$legacy_sha256" ]]
+grep -q "Validated copied legacy state" "${sandbox}/legacy.out"
+[[ "$(wc -l <"$build_log")" == 2 ]]
+[[ ! -e "${cache_home}/agent-hub-approvals" ]] || \
+    [[ -z "$(ls -A "${cache_home}/agent-hub-approvals")" ]]
+
+printf '%s\n' "deploy.sh harness passed"
