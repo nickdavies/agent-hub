@@ -33,9 +33,16 @@
           "items": {
             "type": "array",
             "items": {
-              "type": "string"
-            }
-          }
+              "type": "string",
+              "maxLength": 4096,
+              "minLength": 1
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "maxItems": 32,
+          "minItems": 1
         },
         "type": {
           "type": "string",
@@ -55,7 +62,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 4096
         },
         "type": {
           "type": "string",

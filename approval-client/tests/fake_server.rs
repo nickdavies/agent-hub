@@ -9,8 +9,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::any;
 use protocol::{
-    ApprovalDecision, ApprovalResolveRequest, QuestionInfo, QuestionOption, QuestionProxyRequest,
-    Secret, SessionId,
+    ApprovalDecision, ApprovalResolveRequest, QuestionDecision, QuestionInfo, QuestionOption,
+    QuestionProxyRequest, QuestionResolveRequest, Secret, SessionId,
 };
 use tokio::net::TcpListener;
 
@@ -248,4 +248,32 @@ async fn question_registration_validates_before_sending() {
     assert_eq!(error.kind(), ErrorKind::ClientResponse);
     assert_eq!(error.status(), None);
     assert_eq!(requests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn question_resolution_validates_before_sending() {
+    let (endpoint, _, requests) = server(StatusCode::OK, Vec::new(), Duration::ZERO).await;
+    let client = ApprovalClient::new(&endpoint, None).unwrap();
+    let duplicate = QuestionResolveRequest {
+        decision: QuestionDecision::Answer,
+        answers: Some(vec![vec!["same".into(), "same".into()]]),
+        reason: None,
+    };
+    let error = client
+        .resolve_question_status(uuid::Uuid::nil(), &duplicate)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ClientResponse);
+
+    let oversized_reason = QuestionResolveRequest {
+        decision: QuestionDecision::Reject,
+        answers: None,
+        reason: Some("界".repeat(protocol::QUESTION_REASON_MAX_CHARS + 1)),
+    };
+    let error = client
+        .resolve_question(uuid::Uuid::nil(), &oversized_reason)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ClientResponse);
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
 }

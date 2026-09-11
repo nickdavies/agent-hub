@@ -100,7 +100,10 @@ pub async fn serve_from_env<N: Notifier, S: storage::Storage + 'static>(
             sessions = persisted.sessions.len(),
             "restoring persisted state"
         );
-        state.restore(persisted).await;
+        state
+            .restore(persisted)
+            .await
+            .context("persisted state failed validation")?;
     }
     spawn_maintenance(&state);
     let app = router(state.clone());
@@ -724,6 +727,8 @@ async fn handle_question_resolve<N: Notifier>(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(req): Json<QuestionResolveRequest>,
 ) -> Result<Json<questions::PendingQuestion>, AppError> {
+    req.validate()
+        .map_err(AppError::InvalidQuestionResolution)?;
     if req.decision == QuestionDecision::Answer {
         let answers = req.answers.ok_or_else(|| {
             AppError::InvalidQuestionResolution("answer decision requires answers".into())
@@ -815,7 +820,10 @@ impl<N: Notifier> AppState<N> {
     }
 
     /// Restore state from a persisted snapshot.
-    pub async fn restore(&self, state: storage::PersistedState) {
+    pub async fn restore(&self, state: storage::PersistedState) -> anyhow::Result<()> {
+        self.questions
+            .validate_snapshots(&state.pending_questions)
+            .map_err(anyhow::Error::msg)?;
         self.sessions.restore(state.sessions).await;
         if let Some(cfg) = state.notify_config {
             *self.notify_config.write().await = cfg;
@@ -829,6 +837,7 @@ impl<N: Notifier> AppState<N> {
         if !state.pending_questions.is_empty() {
             self.questions.restore(state.pending_questions).await;
         }
+        Ok(())
     }
 }
 
@@ -1171,7 +1180,7 @@ mod integration_tests {
         let snapshot = original_state.snapshot().await;
 
         let restored_state = AppState::new(config(), NullNotifier, None);
-        restored_state.restore(snapshot).await;
+        restored_state.restore(snapshot).await.unwrap();
         let restored_app = router(restored_state);
         let retry = create_launch(&restored_app, "launch-restored", "persist me").await;
         assert_eq!(retry["id"], first["id"]);
@@ -1213,7 +1222,8 @@ mod integration_tests {
         let restored = AppState::new(config(), NullNotifier, None);
         restored
             .restore(serde_json::from_value(value).unwrap())
-            .await;
+            .await
+            .unwrap();
         let app = router(restored);
         let retry = create_launch(&app, "legacy-retry", "legacy prompt").await;
         assert_eq!(retry["id"], created["id"]);
@@ -1809,6 +1819,18 @@ mod integration_tests {
             serde_json::json!({"decision": "answer", "answers": [["Maybe"], ["A"]]}),
             serde_json::json!({"decision": "answer", "answers": [["Yes"], []]}),
             serde_json::json!({"decision": "answer", "answers": [["Yes"], ["A", "A"]]}),
+            serde_json::json!({
+                "decision": "answer",
+                "answers": [["Yes"], vec!["answer"; protocol::QUESTION_OPTIONS_MAX_COUNT + 1]]
+            }),
+            serde_json::json!({
+                "decision": "answer",
+                "answers": [["Yes"], ["界".repeat(protocol::QUESTION_CUSTOM_ANSWER_MAX_CHARS + 1)]]
+            }),
+            serde_json::json!({
+                "decision": "reject",
+                "reason": "🙂".repeat(protocol::QUESTION_REASON_MAX_CHARS + 1)
+            }),
         ] {
             let status = post_json(
                 &app,
@@ -1826,7 +1848,7 @@ mod integration_tests {
 
         let valid = serde_json::json!({
             "decision": "answer",
-            "answers": [["Yes"], ["A", "custom answer"]]
+            "answers": [["Yes"], ["A", "界".repeat(protocol::QUESTION_CUSTOM_ANSWER_MAX_CHARS)]]
         });
         assert_eq!(
             post_json(
@@ -1837,6 +1859,56 @@ mod integration_tests {
             .await,
             AxumStatus::OK
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_invalid_question_answers_are_rejected_before_restore() {
+        let config = || ServerConfig {
+            auth_mode: AuthMode::None,
+            tokens: vec![],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode: ApprovalFeatureMode::Readwrite,
+            base_url: None,
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        let original = AppState::new(config(), NullNotifier, None);
+        let app = router(original.clone());
+        let registration = serde_json::json!({
+            "id": "persisted-invalid-answer",
+            "session_id": "ses_persisted_invalid",
+            "session_display_name": "Persisted invalid",
+            "cwd": "/workspace/project",
+            "question_request_id": "persisted-invalid-answer",
+            "questions": [{
+                "question": "Continue?",
+                "header": "Decision",
+                "options": [{"label": "Yes", "description": "Continue"}],
+                "custom": false
+            }],
+            "provider": "opencode"
+        });
+        assert_eq!(
+            post_json(&app, "/api/v1/hooks/question", &registration.to_string()).await,
+            AxumStatus::OK
+        );
+        let mut snapshot = serde_json::to_value(original.snapshot().await).unwrap();
+        snapshot["pending_questions"][0]["question"]["status"] = serde_json::json!({
+            "type": "answered",
+            "answers": [["No"]]
+        });
+
+        let restored = AppState::new(config(), NullNotifier, None);
+        assert!(
+            restored
+                .restore(serde_json::from_value(snapshot).unwrap())
+                .await
+                .is_err()
+        );
+        assert!(restored.sessions.list().await.is_empty());
+        assert!(restored.questions.list_pending().await.is_empty());
     }
 
     #[tokio::test]

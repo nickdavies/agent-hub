@@ -1487,8 +1487,11 @@ export type QuestionProxyResponse = {
   | {
       /**
        * One `Answer` (array of selected labels) per question, in order.
+       *
+       * @minItems 1
+       * @maxItems 32
        */
-      answers: string[][]
+      answers: [[string, ...string[]], ...[string, ...string[]][]]
       type: "answered"
     }
   | {
@@ -1499,6 +1502,26 @@ export type QuestionProxyResponse = {
       type: "cancelled"
     }
 )
+
+/**
+ * Decision choices when resolving a question.
+ */
+export type QuestionDecision = "answer" | "reject" | "cancel"
+
+/**
+ * Request body for POST /api/v1/questions/{id}/resolve.
+ */
+export interface QuestionResolveRequest {
+  /**
+   * Required when `decision == Answer`. One array of selected labels per question.
+   */
+  answers?: [[string, ...string[]], ...[string, ...string[]][]] | null
+  decision: QuestionDecision
+  /**
+   * Optional reason shown in the dashboard (used with `Reject` or `Cancel`).
+   */
+  reason?: string | null
+}
 
 /**
  * Stored session status as reported by the client.

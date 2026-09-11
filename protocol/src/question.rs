@@ -17,6 +17,8 @@ pub const QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS: usize = 256;
 pub const QUESTION_CWD_MAX_CHARS: usize = 4096;
 pub const QUESTION_REQUEST_ID_MAX_CHARS: usize = 256;
 pub const QUESTION_PROVIDER_MAX_CHARS: usize = 64;
+pub const QUESTION_CUSTOM_ANSWER_MAX_CHARS: usize = 4096;
+pub const QUESTION_REASON_MAX_CHARS: usize = 4096;
 
 // ===========================================================================
 // Question content types (mirrors opencode's QuestionInfo / QuestionOption)
@@ -130,10 +132,14 @@ pub enum QuestionStatus {
     /// Operator submitted answers.
     Answered {
         /// One `Answer` (array of selected labels) per question, in order.
+        #[schemars(schema_with = "question_answers_schema")]
         answers: Vec<Vec<String>>,
     },
     /// Operator dismissed the question.
-    Rejected { reason: Option<String> },
+    Rejected {
+        #[schemars(length(max = 4096))]
+        reason: Option<String>,
+    },
     /// Gateway timed out or was killed without resolving.
     Cancelled,
 }
@@ -325,10 +331,95 @@ pub struct QuestionResolveRequest {
     pub decision: QuestionDecision,
     /// Required when `decision == Answer`. One array of selected labels per question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "optional_question_answers_schema")]
     pub answers: Option<Vec<Vec<String>>>,
     /// Optional reason shown in the dashboard (used with `Reject` or `Cancel`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
     pub reason: Option<String>,
+}
+
+impl QuestionResolveRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(reason) = &self.reason
+            && reason.chars().count() > QUESTION_REASON_MAX_CHARS
+        {
+            return Err(format!(
+                "question resolution reason must contain at most {QUESTION_REASON_MAX_CHARS} characters"
+            ));
+        }
+
+        match self.decision {
+            QuestionDecision::Answer => {
+                let answers = self
+                    .answers
+                    .as_deref()
+                    .ok_or_else(|| "answer decision requires answers".to_string())?;
+                if self.reason.is_some() {
+                    return Err("answer decision does not accept a reason".into());
+                }
+                validate_answer_shape(answers)
+            }
+            QuestionDecision::Reject | QuestionDecision::Cancel => {
+                if self.answers.is_some() {
+                    return Err("reject and cancel decisions do not accept answers".into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_answer_shape(answers: &[Vec<String>]) -> Result<(), String> {
+    if answers.is_empty() || answers.len() > QUESTION_MAX_COUNT {
+        return Err(format!(
+            "answers must contain 1 to {QUESTION_MAX_COUNT} items"
+        ));
+    }
+    for (index, selected) in answers.iter().enumerate() {
+        if selected.is_empty() || selected.len() > QUESTION_OPTIONS_MAX_COUNT {
+            return Err(format!(
+                "question {index} must contain 1 to {QUESTION_OPTIONS_MAX_COUNT} selections"
+            ));
+        }
+        let mut unique = std::collections::HashSet::new();
+        for answer in selected {
+            let chars = answer.chars().count();
+            if chars == 0 || chars > QUESTION_CUSTOM_ANSWER_MAX_CHARS {
+                return Err(format!(
+                    "question {index} selections must contain 1 to {QUESTION_CUSTOM_ANSWER_MAX_CHARS} characters"
+                ));
+            }
+            if !unique.insert(answer) {
+                return Err(format!("question {index} contains a duplicate selection"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn question_answers_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": QUESTION_MAX_COUNT,
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": QUESTION_OPTIONS_MAX_COUNT,
+            "uniqueItems": true,
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": QUESTION_CUSTOM_ANSWER_MAX_CHARS
+            }
+        }
+    })
+}
+
+fn optional_question_answers_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let answers = question_answers_schema(generator);
+    schemars::json_schema!({ "anyOf": [answers, { "type": "null" }] })
 }
 
 // ===========================================================================
@@ -625,5 +716,68 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn question_resolution_bounds_unicode_and_selection_shape() {
+        let valid = QuestionResolveRequest {
+            decision: QuestionDecision::Answer,
+            answers: Some(vec![vec!["界".repeat(QUESTION_CUSTOM_ANSWER_MAX_CHARS)]]),
+            reason: None,
+        };
+        valid.validate().unwrap();
+
+        let duplicate = QuestionResolveRequest {
+            decision: QuestionDecision::Answer,
+            answers: Some(vec![vec!["same".into(), "same".into()]]),
+            reason: None,
+        };
+        assert!(duplicate.validate().is_err());
+
+        let too_many = QuestionResolveRequest {
+            decision: QuestionDecision::Answer,
+            answers: Some(vec![vec!["answer".into(); QUESTION_OPTIONS_MAX_COUNT + 1]]),
+            reason: None,
+        };
+        assert!(too_many.validate().is_err());
+
+        let oversized_answer = QuestionResolveRequest {
+            decision: QuestionDecision::Answer,
+            answers: Some(vec![vec![
+                "界".repeat(QUESTION_CUSTOM_ANSWER_MAX_CHARS + 1),
+            ]]),
+            reason: None,
+        };
+        assert!(oversized_answer.validate().is_err());
+
+        let valid_reason = QuestionResolveRequest {
+            decision: QuestionDecision::Reject,
+            answers: None,
+            reason: Some("🙂".repeat(QUESTION_REASON_MAX_CHARS)),
+        };
+        valid_reason.validate().unwrap();
+        let oversized_reason = QuestionResolveRequest {
+            reason: Some("🙂".repeat(QUESTION_REASON_MAX_CHARS + 1)),
+            ..valid_reason
+        };
+        assert!(oversized_reason.validate().is_err());
+    }
+
+    #[test]
+    fn question_resolution_schema_matches_runtime_bounds() {
+        let schema = serde_json::to_value(schemars::schema_for!(QuestionResolveRequest)).unwrap();
+        let properties = &schema["properties"];
+        let answers = &properties["answers"]["anyOf"][0];
+        assert_eq!(answers["minItems"], 1);
+        assert_eq!(answers["maxItems"], QUESTION_MAX_COUNT);
+        assert_eq!(answers["items"]["minItems"], 1);
+        assert_eq!(answers["items"]["maxItems"], QUESTION_OPTIONS_MAX_COUNT);
+        assert_eq!(answers["items"]["uniqueItems"], true);
+        assert_eq!(answers["items"]["items"]["minLength"], 1);
+        assert_eq!(
+            answers["items"]["items"]["maxLength"],
+            QUESTION_CUSTOM_ANSWER_MAX_CHARS
+        );
+        assert_eq!(properties["reason"]["maxLength"], QUESTION_REASON_MAX_CHARS);
     }
 }

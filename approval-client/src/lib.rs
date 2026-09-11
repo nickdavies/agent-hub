@@ -296,6 +296,9 @@ impl ApprovalClient {
         id: Uuid,
         request: &QuestionResolveRequest,
     ) -> Result<u16, Error> {
+        request
+            .validate()
+            .map_err(|error| Error::invalid_request("question resolution", error))?;
         self.send_status(
             self.authenticated(
                 self.http
@@ -315,6 +318,9 @@ impl ApprovalClient {
         request: &QuestionResolveRequest,
         timeout: Option<Duration>,
     ) -> Result<ApiResponse<PendingQuestion>, Error> {
+        request
+            .validate()
+            .map_err(|error| Error::invalid_request("question resolution", error))?;
         self.send_json(
             self.authenticated(
                 self.http

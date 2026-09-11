@@ -16,7 +16,14 @@ repo_root="$(git -C "${BASH_SOURCE[0]%/*}" rev-parse --show-toplevel)"
 mkdir -p -- "${repo_root}/target"
 test_root="${repo_root}/target/deploy-approvals-server-test"
 sandbox="$(mktemp -d "${test_root}.XXXXXX")"
-trap 'rm -rf -- "$sandbox"' EXIT
+cleanup() {
+    local pid
+    while read -r pid; do
+        kill "$pid" 2>/dev/null || true
+    done < <(jobs -pr)
+    rm -rf -- "$sandbox"
+}
+trap cleanup EXIT
 
 source_repo="${sandbox}/source"
 home="${sandbox}/home"
@@ -90,6 +97,30 @@ printf '%s\n' "$*" >>"$MV_LOG"
 exec /usr/bin/mv "$@"
 SH
 chmod 0755 "${bin_dir}/mv"
+
+cat >"${bin_dir}/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+property=
+for argument in "$@"; do
+    if [[ "$argument" == --property=* ]]; then
+        property="${argument#--property=}"
+    fi
+done
+case "${HARNESS_UNIT_STATE:-missing}:$property" in
+    missing:LoadState) printf '%s\n' not-found ;;
+    active:LoadState) printf '%s\n' loaded ;;
+    active:ActiveState) printf '%s\n' active ;;
+    active:SubState) printf '%s\n' running ;;
+    active:MainPID) printf '%s\n' 4242 ;;
+    inactive:LoadState) printf '%s\n' loaded ;;
+    inactive:ActiveState) printf '%s\n' inactive ;;
+    inactive:SubState) printf '%s\n' dead ;;
+    inactive:MainPID) printf '%s\n' 0 ;;
+    *) exit 1 ;;
+esac
+SH
+chmod 0755 "${bin_dir}/systemctl"
 
 deploy="${source_repo}/deploy/approvals-server/deploy.sh"
 build_log="${sandbox}/build.log"
@@ -222,6 +253,58 @@ done <"$build_log"
 grep -q '"integrity_digest"' "${rollback_slot}/manifest.json"
 
 printf '%s\n' replaced >"$dest_state"
+listener_state="${sandbox}/listener-state.json"
+printf '%s\n' '{"sessions":{},"notify_config":null,"presence":null,"pending_approvals":[]}' >"$listener_state"
+LISTEN_ADDR="127.0.0.1:${listen_port}" "$dest_binary" serve noop local-file --path "$listener_state" \
+    >"${sandbox}/rollback-listener.log" 2>&1 &
+listener_pid=$!
+for _ in {1..100}; do
+    if LISTEN_PORT="$listen_port" python3 -c 'import os, socket; s=socket.create_connection(("127.0.0.1", int(os.environ["LISTEN_PORT"])), .1); s.close()' 2>/dev/null; then
+        break
+    fi
+    sleep 0.05
+done
+if "${source_repo}/deploy/approvals-server/rollback.sh" >"${sandbox}/running-listener.out" 2>"${sandbox}/running-listener.err"; then
+    echo "error: rollback with a running listener unexpectedly succeeded" >&2
+    exit 1
+fi
+grep -q "approvals listener is not stopped" "${sandbox}/running-listener.err"
+grep -q '^replaced$' "$dest_state"
+kill -INT "$listener_pid"
+wait "$listener_pid"
+
+cp -- "${rollback_slot}/manifest.json" "${sandbox}/manifest.json"
+python3 -c 'import time; time.sleep(60)' &
+running_pid=$!
+ROLLBACK_MANIFEST="${rollback_slot}/manifest.json" RUNNING_PID="$running_pid" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["ROLLBACK_MANIFEST"])
+manifest = json.loads(path.read_text())
+manifest["stopped_pid"] = int(os.environ["RUNNING_PID"])
+path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+PY
+if "${source_repo}/deploy/approvals-server/rollback.sh" >"${sandbox}/running-process.out" 2>"${sandbox}/running-process.err"; then
+    echo "error: rollback with an expected stopped process running unexpectedly succeeded" >&2
+    exit 1
+fi
+grep -q "expected stopped approvals process identity is running" "${sandbox}/running-process.err"
+grep -q '^replaced$' "$dest_state"
+kill "$running_pid"
+wait "$running_pid" 2>/dev/null || true
+cp -- "${sandbox}/manifest.json" "${rollback_slot}/manifest.json"
+
+if HARNESS_UNIT_STATE=active "${source_repo}/deploy/approvals-server/rollback.sh" \
+    >"${sandbox}/active-unit.out" 2>"${sandbox}/active-unit.err"; then
+    echo "error: rollback with an active unit unexpectedly succeeded" >&2
+    exit 1
+fi
+grep -q "approvals unit is not proven stopped" "${sandbox}/active-unit.err"
+grep -q '^replaced$' "$dest_state"
+
+export HARNESS_UNIT_STATE=inactive
 "${source_repo}/deploy/approvals-server/rollback.sh" >"${sandbox}/rollback.out"
 [[ "$(sha256sum "$dest_state" | cut -d' ' -f1)" == "$final_state_sha256" ]]
 

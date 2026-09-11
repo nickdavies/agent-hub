@@ -162,7 +162,7 @@ async fn state_round_trip_preserves_legacy_shape_and_strict_retry_identity() {
     assert!(encoded["pending_approvals"][0]["canonical_request"].is_string());
 
     let restored = state(ApprovalFeatureMode::Readwrite);
-    restored.restore(snapshot).await;
+    restored.restore(snapshot).await.unwrap();
     let restored_app = router(restored);
     let (_, retry) = request(
         &restored_app,

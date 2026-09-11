@@ -115,9 +115,19 @@ systemctl --user daemon-reload
 systemctl --user start agent-hub-approvals.service
 ```
 
-The rollback command validates the slot manifest and all `integrity_digest` values before
-staging all four files and atomically replacing each approvals binary, state,
-environment, and unit file. It does not invoke systemd.
+The rollback command validates the slot manifest and all `integrity_digest` values,
+confirms the captured stopped PID remains absent, parses the installed environment and
+proves its listener address is unbound, and requires an inactive/dead unit with no main
+PID when the user manager can identify the unit. Only then does it stage all four files
+and atomically replace each approvals binary, state, environment, and unit file. It does
+not change systemd state.
+
+Each file replacement is atomic, but the four replacements are not one filesystem
+transaction. If rollback exits after replacing only some files, keep the service stopped,
+correct the reported destination or filesystem problem, and rerun the same rollback
+command. The selected immutable slot remains the source for every file, so a successful
+rerun replaces and verifies the complete binary, state, environment, and unit set. Do not
+start or reload the service between a partial failure and the successful rerun.
 
 For a coordinated rollback, perform the orchestration v4 drain and v3 preflight
 before replacing the v4-capable API binary, then stop and restore the approvals

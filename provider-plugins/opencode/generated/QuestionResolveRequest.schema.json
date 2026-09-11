@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QuestionResolveRequest",
+  "description": "Request body for POST /api/v1/questions/{id}/resolve.",
+  "type": "object",
+  "properties": {
+    "answers": {
+      "description": "Required when `decision == Answer`. One array of selected labels per question.",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 4096,
+              "minLength": 1
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "maxItems": 32,
+          "minItems": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "decision": {
+      "$ref": "#/$defs/QuestionDecision"
+    },
+    "reason": {
+      "description": "Optional reason shown in the dashboard (used with `Reject` or `Cancel`).",
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4096
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "decision"
+  ],
+  "$defs": {
+    "QuestionDecision": {
+      "description": "Decision choices when resolving a question.",
+      "oneOf": [
+        {
+          "description": "Operator submitted answers.",
+          "type": "string",
+          "const": "answer"
+        },
+        {
+          "description": "Operator dismissed / rejected the question.",
+          "type": "string",
+          "const": "reject"
+        },
+        {
+          "description": "Gateway cancelled (e.g. session ended).",
+          "type": "string",
+          "const": "cancel"
+        }
+      ]
+    }
+  }
+}

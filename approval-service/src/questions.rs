@@ -313,6 +313,46 @@ impl QuestionRegistry {
             info!(question_id = %id, "question restored");
         }
     }
+
+    pub fn validate_snapshots(&self, snapshots: &[QuestionSnapshot]) -> Result<(), String> {
+        for snapshot in snapshots {
+            let question = match snapshot {
+                QuestionSnapshot::Current { question, .. } | QuestionSnapshot::Legacy(question) => {
+                    question
+                }
+            };
+            if question.questions.is_empty()
+                || question.questions.len() > protocol::QUESTION_MAX_COUNT
+            {
+                return Err(format!(
+                    "persisted question {} has an invalid question count",
+                    question.id
+                ));
+            }
+            for info in &question.questions {
+                info.validate()?;
+            }
+            match &question.status {
+                QuestionStatus::Answered { answers } => {
+                    validate_answers(&question.questions, answers).map_err(|error| {
+                        format!("persisted question {} is invalid: {error}", question.id)
+                    })?;
+                }
+                QuestionStatus::Rejected { reason } => {
+                    if reason.as_ref().is_some_and(|reason| {
+                        reason.chars().count() > protocol::QUESTION_REASON_MAX_CHARS
+                    }) {
+                        return Err(format!(
+                            "persisted question {} has an oversized rejection reason",
+                            question.id
+                        ));
+                    }
+                }
+                QuestionStatus::Pending | QuestionStatus::Cancelled => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 fn legacy_request_matches(question: &PendingQuestion, request: &RegisterQuestion) -> bool {
@@ -337,6 +377,9 @@ fn validate_answers(
         if selected.is_empty() {
             return Err(ResolveQuestionError::EmptyAnswer(index));
         }
+        if selected.len() > protocol::QUESTION_OPTIONS_MAX_COUNT {
+            return Err(ResolveQuestionError::InvalidAnswer(index));
+        }
         if !question.multiple.unwrap_or(false) && selected.len() != 1 {
             return Err(ResolveQuestionError::MultipleAnswers(index));
         }
@@ -349,7 +392,9 @@ fn validate_answers(
                 .options
                 .iter()
                 .any(|option| option.label == *answer);
-            let is_custom = question.custom.unwrap_or(true) && !answer.trim().is_empty();
+            let is_custom = question.custom.unwrap_or(true)
+                && !answer.trim().is_empty()
+                && answer.chars().count() <= protocol::QUESTION_CUSTOM_ANSWER_MAX_CHARS;
             if !is_label && !is_custom {
                 return Err(ResolveQuestionError::InvalidAnswer(index));
             }

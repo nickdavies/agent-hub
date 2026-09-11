@@ -65,6 +65,7 @@ fn main() {
     write_schema::<protocol::QuestionProxyRequest>(&out_dir, "QuestionProxyRequest");
     write_schema::<protocol::QuestionProxyResponse>(&out_dir, "QuestionProxyResponse");
     write_schema::<protocol::QuestionGatewayOutput>(&out_dir, "QuestionGatewayOutput");
+    write_schema::<protocol::QuestionResolveRequest>(&out_dir, "QuestionResolveRequest");
 
     eprintln!("Done.");
 }
