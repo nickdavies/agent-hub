@@ -1437,9 +1437,13 @@ export interface QuestionProxyRequest {
    * The opencode-native question ID (e.g. "que_01j...").
    */
   question_request_id: string
-  questions: QuestionInfo[]
+  /**
+   * @minItems 1
+   * @maxItems 32
+   */
+  questions: [QuestionInfo, ...QuestionInfo[]]
   session_display_name: string
-  session_id: SessionId
+  session_id: string
 }
 /**
  * One question with its choices.

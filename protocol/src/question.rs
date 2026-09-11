@@ -7,9 +7,16 @@ use crate::sessions::SessionId;
 
 pub const QUESTION_TEXT_MAX_CHARS: usize = 4096;
 pub const QUESTION_HEADER_MAX_CHARS: usize = 30;
+pub const QUESTION_MAX_COUNT: usize = 32;
 pub const QUESTION_OPTIONS_MAX_COUNT: usize = 64;
 pub const QUESTION_OPTION_LABEL_MAX_CHARS: usize = 128;
 pub const QUESTION_OPTION_DESCRIPTION_MAX_CHARS: usize = 1024;
+pub const QUESTION_PROXY_ID_MAX_CHARS: usize = 128;
+pub const QUESTION_SESSION_ID_MAX_CHARS: usize = 256;
+pub const QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS: usize = 256;
+pub const QUESTION_CWD_MAX_CHARS: usize = 4096;
+pub const QUESTION_REQUEST_ID_MAX_CHARS: usize = 256;
+pub const QUESTION_PROVIDER_MAX_CHARS: usize = 64;
 
 // ===========================================================================
 // Question content types (mirrors opencode's QuestionInfo / QuestionOption)
@@ -146,19 +153,53 @@ impl QuestionStatus {
 #[serde(deny_unknown_fields)]
 pub struct QuestionProxyRequest {
     /// Gateway-generated UUID used as an idempotency key.
+    #[schemars(length(min = 1, max = 128))]
     pub id: String,
+    #[schemars(with = "String", length(min = 1, max = 256))]
     pub session_id: SessionId,
+    #[schemars(length(min = 1, max = 256))]
     pub session_display_name: String,
+    #[schemars(length(min = 1, max = 4096))]
     pub cwd: String,
     /// The opencode-native question ID (e.g. "que_01j...").
+    #[schemars(length(min = 1, max = 256))]
     pub question_request_id: String,
+    #[schemars(length(min = 1, max = 32))]
     pub questions: Vec<QuestionInfo>,
     /// Provider that originated the question (always "opencode" for now).
+    #[schemars(length(min = 1, max = 64))]
     pub provider: String,
 }
 
 impl QuestionProxyRequest {
     pub fn validate(&self) -> Result<(), String> {
+        validate_bounded_text("question proxy id", &self.id, QUESTION_PROXY_ID_MAX_CHARS)?;
+        validate_bounded_text(
+            "question session id",
+            self.session_id.as_str(),
+            QUESTION_SESSION_ID_MAX_CHARS,
+        )?;
+        validate_bounded_text(
+            "question session display name",
+            &self.session_display_name,
+            QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS,
+        )?;
+        validate_bounded_text("question cwd", &self.cwd, QUESTION_CWD_MAX_CHARS)?;
+        validate_bounded_text(
+            "question request id",
+            &self.question_request_id,
+            QUESTION_REQUEST_ID_MAX_CHARS,
+        )?;
+        if self.questions.is_empty() || self.questions.len() > QUESTION_MAX_COUNT {
+            return Err(format!(
+                "questions must contain 1 to {QUESTION_MAX_COUNT} items"
+            ));
+        }
+        validate_bounded_text(
+            "question provider",
+            &self.provider,
+            QUESTION_PROVIDER_MAX_CHARS,
+        )?;
         for question in &self.questions {
             question.validate()?;
         }
@@ -349,6 +390,18 @@ mod tests {
         }
     }
 
+    fn valid_request() -> QuestionProxyRequest {
+        QuestionProxyRequest {
+            id: "request-1".into(),
+            session_id: SessionId::new("session-1"),
+            session_display_name: "Session".into(),
+            cwd: "/workspace".into(),
+            question_request_id: "question-1".into(),
+            questions: vec![valid_question()],
+            provider: "opencode".into(),
+        }
+    }
+
     #[test]
     fn question_contract_accepts_boundaries_and_counts_unicode_characters() {
         let question = QuestionInfo::new(
@@ -417,11 +470,78 @@ mod tests {
     }
 
     #[test]
+    fn question_request_accepts_exact_unicode_boundaries() {
+        let request = QuestionProxyRequest {
+            id: "🦀".repeat(QUESTION_PROXY_ID_MAX_CHARS),
+            session_id: SessionId::new("界".repeat(QUESTION_SESSION_ID_MAX_CHARS)),
+            session_display_name: "é".repeat(QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS),
+            cwd: "🙂".repeat(QUESTION_CWD_MAX_CHARS),
+            question_request_id: "🦀".repeat(QUESTION_REQUEST_ID_MAX_CHARS),
+            questions: vec![valid_question(); QUESTION_MAX_COUNT],
+            provider: "界".repeat(QUESTION_PROVIDER_MAX_CHARS),
+        };
+
+        request.validate().unwrap();
+    }
+
+    #[test]
+    fn question_request_rejects_empty_and_oversize_top_level_fields() {
+        for (field, max_chars) in [
+            ("id", QUESTION_PROXY_ID_MAX_CHARS),
+            ("session_id", QUESTION_SESSION_ID_MAX_CHARS),
+            (
+                "session_display_name",
+                QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS,
+            ),
+            ("cwd", QUESTION_CWD_MAX_CHARS),
+            ("question_request_id", QUESTION_REQUEST_ID_MAX_CHARS),
+            ("provider", QUESTION_PROVIDER_MAX_CHARS),
+        ] {
+            for value in [String::new(), "界".repeat(max_chars + 1)] {
+                let mut request = valid_request();
+                match field {
+                    "id" => request.id = value,
+                    "session_id" => request.session_id = SessionId::new(value),
+                    "session_display_name" => request.session_display_name = value,
+                    "cwd" => request.cwd = value,
+                    "question_request_id" => request.question_request_id = value,
+                    "provider" => request.provider = value,
+                    _ => unreachable!(),
+                }
+                assert!(request.validate().is_err(), "accepted invalid {field}");
+            }
+        }
+
+        for questions in [vec![], vec![valid_question(); QUESTION_MAX_COUNT + 1]] {
+            let mut request = valid_request();
+            request.questions = questions;
+            assert!(request.validate().is_err(), "accepted invalid questions");
+        }
+    }
+
+    #[test]
     fn question_schema_matches_runtime_bounds() {
         let schema = serde_json::to_value(schemars::schema_for!(QuestionProxyRequest)).unwrap();
+        let request = &schema["properties"];
         let question = &schema["$defs"]["QuestionInfo"]["properties"];
         let option = &schema["$defs"]["QuestionOption"]["properties"];
 
+        for (field, max_chars) in [
+            ("id", QUESTION_PROXY_ID_MAX_CHARS),
+            ("session_id", QUESTION_SESSION_ID_MAX_CHARS),
+            (
+                "session_display_name",
+                QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS,
+            ),
+            ("cwd", QUESTION_CWD_MAX_CHARS),
+            ("question_request_id", QUESTION_REQUEST_ID_MAX_CHARS),
+            ("provider", QUESTION_PROVIDER_MAX_CHARS),
+        ] {
+            assert_eq!(request[field]["minLength"], 1, "{field} minLength");
+            assert_eq!(request[field]["maxLength"], max_chars, "{field} maxLength");
+        }
+        assert_eq!(request["questions"]["minItems"], 1);
+        assert_eq!(request["questions"]["maxItems"], QUESTION_MAX_COUNT);
         assert_eq!(question["question"]["minLength"], 1);
         assert_eq!(question["question"]["maxLength"], QUESTION_TEXT_MAX_CHARS);
         assert_eq!(question["header"]["minLength"], 1);

@@ -897,7 +897,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         const sid = event.properties.sessionID
         const requestId = event.properties.id
         const questions = event.properties.questions
-        const header = questions[0]?.header ?? "Plan question"
+        const firstQuestion = questions[0]
+        if (!firstQuestion) throw new Error("question.asked event contained no questions")
+        const header = firstQuestion.header
 
         // Immediately report Waiting (bypass debounce — time-sensitive)
         const existing = statusTimers.get(sid)
@@ -912,13 +914,22 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           session_display_name: titles.get(sid) ?? sid,
           cwd: directory,
           question_request_id: requestId,
-          questions: questions.map((q) => ({
-            question: q.question,
-            header: q.header,
-            options: q.options.map((o) => ({ label: o.label, description: o.description })),
-            multiple: q.multiple,
-            custom: q.custom,
-          })),
+          questions: [
+            {
+              question: firstQuestion.question,
+              header: firstQuestion.header,
+              options: firstQuestion.options.map((o) => ({ label: o.label, description: o.description })),
+              multiple: firstQuestion.multiple,
+              custom: firstQuestion.custom,
+            },
+            ...questions.slice(1).map((q) => ({
+              question: q.question,
+              header: q.header,
+              options: q.options.map((o) => ({ label: o.label, description: o.description })),
+              multiple: q.multiple,
+              custom: q.custom,
+            })),
+          ],
           provider: "opencode",
         }
 

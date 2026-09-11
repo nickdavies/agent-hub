@@ -1901,7 +1901,14 @@ mod integration_tests {
             variants.push((field, conflicting));
         }
         let mut conflicting = original.clone();
-        conflicting["questions"] = serde_json::json!([]);
+        conflicting["questions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "question": "Stop?",
+                "header": "Decision",
+                "options": []
+            }));
         variants.push(("questions", conflicting));
 
         for (field, conflicting) in variants {
@@ -1916,17 +1923,20 @@ mod integration_tests {
     #[tokio::test]
     async fn question_registration_enforces_contract_bounds() {
         use protocol::{
-            QUESTION_HEADER_MAX_CHARS, QUESTION_OPTION_DESCRIPTION_MAX_CHARS,
-            QUESTION_OPTION_LABEL_MAX_CHARS, QUESTION_OPTIONS_MAX_COUNT, QUESTION_TEXT_MAX_CHARS,
+            QUESTION_CWD_MAX_CHARS, QUESTION_HEADER_MAX_CHARS, QUESTION_MAX_COUNT,
+            QUESTION_OPTION_DESCRIPTION_MAX_CHARS, QUESTION_OPTION_LABEL_MAX_CHARS,
+            QUESTION_OPTIONS_MAX_COUNT, QUESTION_PROVIDER_MAX_CHARS, QUESTION_PROXY_ID_MAX_CHARS,
+            QUESTION_REQUEST_ID_MAX_CHARS, QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS,
+            QUESTION_SESSION_ID_MAX_CHARS, QUESTION_TEXT_MAX_CHARS,
         };
 
         let app = test_app();
         let mut request = serde_json::json!({
-            "id": "question-bounds",
-            "session_id": "ses_question_bounds",
-            "session_display_name": "Bounds",
-            "cwd": "/workspace/project",
-            "question_request_id": "question-bounds",
+            "id": "🦀".repeat(QUESTION_PROXY_ID_MAX_CHARS),
+            "session_id": "界".repeat(QUESTION_SESSION_ID_MAX_CHARS),
+            "session_display_name": "é".repeat(QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS),
+            "cwd": "🙂".repeat(QUESTION_CWD_MAX_CHARS),
+            "question_request_id": "🦀".repeat(QUESTION_REQUEST_ID_MAX_CHARS),
             "questions": [{
                 "question": "界".repeat(QUESTION_TEXT_MAX_CHARS),
                 "header": "é".repeat(QUESTION_HEADER_MAX_CHARS),
@@ -1935,22 +1945,56 @@ mod integration_tests {
                     "description": "🦀".repeat(QUESTION_OPTION_DESCRIPTION_MAX_CHARS)
                 }]
             }],
-            "provider": "opencode"
+            "provider": "界".repeat(QUESTION_PROVIDER_MAX_CHARS)
         });
         request["questions"][0]["options"] = serde_json::Value::Array(vec![
             request["questions"][0]["options"][0].clone();
             QUESTION_OPTIONS_MAX_COUNT
         ]);
+        let small_question = serde_json::json!({
+            "question": "Continue?",
+            "header": "Decision",
+            "options": []
+        });
+        request["questions"]
+            .as_array_mut()
+            .unwrap()
+            .extend(vec![small_question; QUESTION_MAX_COUNT - 1]);
         assert_eq!(
             post_json(&app, "/api/v1/hooks/question", &request.to_string()).await,
             AxumStatus::OK
         );
 
+        for (field, max_chars) in [
+            ("id", QUESTION_PROXY_ID_MAX_CHARS),
+            ("session_id", QUESTION_SESSION_ID_MAX_CHARS),
+            (
+                "session_display_name",
+                QUESTION_SESSION_DISPLAY_NAME_MAX_CHARS,
+            ),
+            ("cwd", QUESTION_CWD_MAX_CHARS),
+            ("question_request_id", QUESTION_REQUEST_ID_MAX_CHARS),
+            ("provider", QUESTION_PROVIDER_MAX_CHARS),
+        ] {
+            for value in [String::new(), "界".repeat(max_chars + 1)] {
+                let mut invalid = request.clone();
+                invalid[field] = value.into();
+                assert_eq!(
+                    post_json(&app, "/api/v1/hooks/question", &invalid.to_string()).await,
+                    AxumStatus::BAD_REQUEST,
+                    "accepted invalid {field}"
+                );
+            }
+        }
+
         for (field, value) in [
             ("question", String::new()),
             ("question", "q".repeat(QUESTION_TEXT_MAX_CHARS + 1)),
+            ("header", String::new()),
             ("header", "h".repeat(QUESTION_HEADER_MAX_CHARS + 1)),
+            ("label", String::new()),
             ("label", "l".repeat(QUESTION_OPTION_LABEL_MAX_CHARS + 1)),
+            ("description", String::new()),
             (
                 "description",
                 "d".repeat(QUESTION_OPTION_DESCRIPTION_MAX_CHARS + 1),
@@ -1972,14 +2016,42 @@ mod integration_tests {
             );
         }
 
+        for field in ["questions", "options"] {
+            let mut invalid = request.clone();
+            invalid["id"] = format!("question-bounds-{field}").into();
+            if field == "questions" {
+                invalid["questions"] = serde_json::Value::Array(vec![
+                    invalid["questions"][1]
+                        .clone();
+                    QUESTION_MAX_COUNT + 1
+                ]);
+            } else {
+                let option = invalid["questions"][0]["options"][0].clone();
+                invalid["questions"][0]["options"] =
+                    serde_json::Value::Array(vec![option; QUESTION_OPTIONS_MAX_COUNT + 1]);
+            }
+            assert_eq!(
+                post_json(&app, "/api/v1/hooks/question", &invalid.to_string()).await,
+                AxumStatus::BAD_REQUEST,
+                "accepted too many {field}"
+            );
+        }
+
         let mut invalid = request;
-        invalid["id"] = "question-bounds-options".into();
-        let option = invalid["questions"][0]["options"][0].clone();
-        invalid["questions"][0]["options"] =
-            serde_json::Value::Array(vec![option; QUESTION_OPTIONS_MAX_COUNT + 1]);
+        invalid["id"] = "question-bounds-empty".into();
+        invalid["questions"] = serde_json::json!([]);
         assert_eq!(
             post_json(&app, "/api/v1/hooks/question", &invalid.to_string()).await,
             AxumStatus::BAD_REQUEST
+        );
+
+        let (_, pending) = get_json(&app, "/api/v1/questions/pending").await;
+        assert_eq!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&pending)
+                .unwrap()
+                .len(),
+            1,
+            "invalid requests must not be persisted"
         );
     }
 

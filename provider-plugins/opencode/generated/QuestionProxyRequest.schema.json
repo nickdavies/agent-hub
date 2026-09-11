@@ -5,31 +5,45 @@
   "type": "object",
   "properties": {
     "cwd": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 4096,
+      "minLength": 1
     },
     "id": {
       "description": "Gateway-generated UUID used as an idempotency key.",
-      "type": "string"
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     },
     "provider": {
       "description": "Provider that originated the question (always \"opencode\" for now).",
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "question_request_id": {
       "description": "The opencode-native question ID (e.g. \"que_01j...\").",
-      "type": "string"
+      "type": "string",
+      "maxLength": 256,
+      "minLength": 1
     },
     "questions": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/QuestionInfo"
-      }
+      },
+      "maxItems": 32,
+      "minItems": 1
     },
     "session_display_name": {
-      "type": "string"
+      "type": "string",
+      "maxLength": 256,
+      "minLength": 1
     },
     "session_id": {
-      "$ref": "#/$defs/SessionId"
+      "type": "string",
+      "maxLength": 256,
+      "minLength": 1
     }
   },
   "additionalProperties": false,
@@ -107,10 +121,6 @@
         "label",
         "description"
       ]
-    },
-    "SessionId": {
-      "description": "Opaque session identifier.\n\nWraps a `String` with `#[serde(transparent)]` so the JSON wire format\nstays a bare string — no migration needed for TypeScript plugins, shell\nscripts, or persisted state files.",
-      "type": "string"
     }
   }
 }
