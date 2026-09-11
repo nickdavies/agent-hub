@@ -46,6 +46,22 @@ pub enum RegisterQuestionError {
     Conflict,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveQuestionError {
+    #[error("question not found")]
+    NotFound,
+    #[error("answer count does not match question count")]
+    AnswerCount,
+    #[error("question {0} requires at least one answer")]
+    EmptyAnswer(usize),
+    #[error("question {0} does not allow multiple answers")]
+    MultipleAnswers(usize),
+    #[error("question {0} contains a duplicate answer")]
+    DuplicateAnswer(usize),
+    #[error("question {0} contains an invalid option or custom answer")]
+    InvalidAnswer(usize),
+}
+
 pub struct RegisterQuestionOutcome {
     pub question: PendingQuestion,
     pub created: bool,
@@ -149,6 +165,24 @@ impl QuestionRegistry {
         entry.question.status = status.clone();
         entry.tx.send_replace(status);
         Some(entry.question.clone())
+    }
+
+    /// Validate and apply an answer against the immutable original questions.
+    pub async fn answer(
+        &self,
+        id: Uuid,
+        answers: Vec<Vec<String>>,
+    ) -> Result<PendingQuestion, ResolveQuestionError> {
+        let mut entries = self.entries.write().await;
+        let entry = entries.get_mut(&id).ok_or(ResolveQuestionError::NotFound)?;
+        validate_answers(&entry.question.questions, &answers)?;
+        if entry.question.status.is_resolved() {
+            return Ok(entry.question.clone());
+        }
+        let status = QuestionStatus::Answered { answers };
+        entry.question.status = status.clone();
+        entry.tx.send_replace(status);
+        Ok(entry.question.clone())
     }
 
     /// List only pending questions, sorted by creation time (oldest first).
@@ -292,6 +326,38 @@ fn legacy_request_matches(question: &PendingQuestion, request: &RegisterQuestion
         && question.provider == request.provider
 }
 
+fn validate_answers(
+    questions: &[protocol::QuestionInfo],
+    answers: &[Vec<String>],
+) -> Result<(), ResolveQuestionError> {
+    if answers.len() != questions.len() {
+        return Err(ResolveQuestionError::AnswerCount);
+    }
+    for (index, (question, selected)) in questions.iter().zip(answers).enumerate() {
+        if selected.is_empty() {
+            return Err(ResolveQuestionError::EmptyAnswer(index));
+        }
+        if !question.multiple.unwrap_or(false) && selected.len() != 1 {
+            return Err(ResolveQuestionError::MultipleAnswers(index));
+        }
+        let mut unique = HashSet::new();
+        for answer in selected {
+            if !unique.insert(answer) {
+                return Err(ResolveQuestionError::DuplicateAnswer(index));
+            }
+            let is_label = question
+                .options
+                .iter()
+                .any(|option| option.label == *answer);
+            let is_custom = question.custom.unwrap_or(true) && !answer.trim().is_empty();
+            if !is_label && !is_custom {
+                return Err(ResolveQuestionError::InvalidAnswer(index));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -356,5 +422,37 @@ mod tests {
             restored.register(request("different")).await,
             Err(RegisterQuestionError::Conflict)
         ));
+    }
+
+    #[tokio::test]
+    async fn invalid_answers_do_not_resolve_the_question() {
+        let registry = QuestionRegistry::new();
+        let mut params = request("canonical");
+        params.questions = vec![protocol::QuestionInfo {
+            question: "Pick".into(),
+            header: "Pick".into(),
+            options: vec![protocol::QuestionOption {
+                label: "one".into(),
+                description: "One".into(),
+            }],
+            multiple: Some(false),
+            custom: Some(false),
+        }];
+        let id = registry.register(params).await.unwrap().question.id;
+
+        assert!(matches!(
+            registry
+                .answer(id, vec![vec!["one".into(), "one".into()]])
+                .await,
+            Err(ResolveQuestionError::MultipleAnswers(0))
+        ));
+        assert!(matches!(
+            registry.answer(id, vec![vec!["custom".into()]]).await,
+            Err(ResolveQuestionError::InvalidAnswer(0))
+        ));
+        assert_eq!(
+            registry.get(id).await.unwrap().status,
+            QuestionStatus::Pending
+        );
     }
 }

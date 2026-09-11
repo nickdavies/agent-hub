@@ -724,20 +724,43 @@ async fn handle_question_resolve<N: Notifier>(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(req): Json<QuestionResolveRequest>,
 ) -> Result<Json<questions::PendingQuestion>, AppError> {
+    if req.decision == QuestionDecision::Answer {
+        let answers = req.answers.ok_or_else(|| {
+            AppError::InvalidQuestionResolution("answer decision requires answers".into())
+        })?;
+        if req.reason.is_some() {
+            return Err(AppError::InvalidQuestionResolution(
+                "answer decision does not accept a reason".into(),
+            ));
+        }
+        return state
+            .questions
+            .answer(id, answers)
+            .await
+            .map(Json)
+            .map_err(|error| match error {
+                questions::ResolveQuestionError::NotFound => {
+                    AppError::QuestionNotFound(id.to_string())
+                }
+                error => AppError::InvalidQuestionResolution(error.to_string()),
+            });
+    }
+    if req.answers.is_some() {
+        return Err(AppError::InvalidQuestionResolution(
+            "reject and cancel decisions do not accept answers".into(),
+        ));
+    }
     let new_status = match req.decision {
-        QuestionDecision::Answer => questions::QuestionStatus::Answered {
-            answers: req.answers.unwrap_or_default(),
-        },
         QuestionDecision::Reject => questions::QuestionStatus::Rejected { reason: req.reason },
         QuestionDecision::Cancel => questions::QuestionStatus::Cancelled,
+        QuestionDecision::Answer => unreachable!("answer handled above"),
     };
-
     state
         .questions
         .resolve(id, new_status)
         .await
-        .ok_or_else(|| AppError::QuestionNotFound(id.to_string()))
         .map(Json)
+        .ok_or_else(|| AppError::QuestionNotFound(id.to_string()))
 }
 
 impl<N: Notifier> AppState<N> {
@@ -1736,6 +1759,158 @@ mod integration_tests {
             sess["status"]["status"], "waiting",
             "session should be Waiting while question is pending"
         );
+    }
+
+    #[tokio::test]
+    async fn question_resolution_validates_original_question_without_partial_mutation() {
+        let app = test_app();
+        let registration = serde_json::json!({
+            "id": "resolution-validation",
+            "session_id": "ses_question_validation",
+            "session_display_name": "Validation",
+            "cwd": "/workspace/project",
+            "question_request_id": "question-validation",
+            "questions": [
+                {
+                    "question": "Choose one",
+                    "header": "Single",
+                    "options": [{"label": "Yes", "description": "Continue"}],
+                    "multiple": false,
+                    "custom": false
+                },
+                {
+                    "question": "Choose several",
+                    "header": "Multiple",
+                    "options": [
+                        {"label": "A", "description": "A"},
+                        {"label": "B", "description": "B"}
+                    ],
+                    "multiple": true,
+                    "custom": true
+                }
+            ],
+            "provider": "opencode"
+        });
+        let (status, body) =
+            post_json_response(&app, "/api/v1/hooks/question", &registration.to_string()).await;
+        assert_eq!(
+            status,
+            AxumStatus::OK,
+            "question registration failed: {body}"
+        );
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for invalid in [
+            serde_json::json!({"decision": "answer", "answers": [["Yes"]]}),
+            serde_json::json!({"decision": "answer", "answers": [["Yes", "Yes"], ["A"]]}),
+            serde_json::json!({"decision": "answer", "answers": [["Maybe"], ["A"]]}),
+            serde_json::json!({"decision": "answer", "answers": [["Yes"], []]}),
+            serde_json::json!({"decision": "answer", "answers": [["Yes"], ["A", "A"]]}),
+        ] {
+            let status = post_json(
+                &app,
+                &format!("/api/v1/questions/{id}/resolve"),
+                &invalid.to_string(),
+            )
+            .await;
+            assert_eq!(status, AxumStatus::BAD_REQUEST, "accepted {invalid}");
+            let (_, question) = get_json(&app, &format!("/api/v1/questions/{id}")).await;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&question).unwrap()["status"]["type"],
+                "pending"
+            );
+        }
+
+        let valid = serde_json::json!({
+            "decision": "answer",
+            "answers": [["Yes"], ["A", "custom answer"]]
+        });
+        assert_eq!(
+            post_json(
+                &app,
+                &format!("/api/v1/questions/{id}/resolve"),
+                &valid.to_string(),
+            )
+            .await,
+            AxumStatus::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn question_idempotency_binds_every_request_field() {
+        let app = test_app();
+        let original = serde_json::json!({
+            "id": "question-canonical",
+            "session_id": "ses_question_canonical",
+            "session_display_name": "Canonical",
+            "cwd": "/workspace/project",
+            "question_request_id": "question-canonical",
+            "questions": [{
+                "question": "Continue?",
+                "header": "Decision",
+                "options": [{"label": "Yes", "description": "Continue"}],
+                "multiple": false,
+                "custom": false
+            }],
+            "provider": "opencode"
+        });
+        assert_eq!(
+            post_json(&app, "/api/v1/hooks/question", &original.to_string()).await,
+            AxumStatus::OK
+        );
+
+        let mut variants = Vec::new();
+        for (field, value) in [
+            ("session_id", serde_json::json!("different-session")),
+            ("session_display_name", serde_json::json!("Different")),
+            ("cwd", serde_json::json!("/workspace/different")),
+            (
+                "question_request_id",
+                serde_json::json!("different-question"),
+            ),
+            ("provider", serde_json::json!("different-provider")),
+        ] {
+            let mut conflicting = original.clone();
+            conflicting[field] = value;
+            variants.push((field, conflicting));
+        }
+        for (field, value) in [
+            ("question", serde_json::json!("Stop?")),
+            ("header", serde_json::json!("Different")),
+            ("multiple", serde_json::json!(true)),
+            ("custom", serde_json::json!(true)),
+        ] {
+            let mut conflicting = original.clone();
+            conflicting["questions"][0][field] = value;
+            variants.push((field, conflicting));
+        }
+        for (field, value) in [
+            ("option label", serde_json::json!("No")),
+            ("option description", serde_json::json!("Different")),
+        ] {
+            let mut conflicting = original.clone();
+            let option_field = if field == "option label" {
+                "label"
+            } else {
+                "description"
+            };
+            conflicting["questions"][0]["options"][0][option_field] = value;
+            variants.push((field, conflicting));
+        }
+        let mut conflicting = original.clone();
+        conflicting["questions"] = serde_json::json!([]);
+        variants.push(("questions", conflicting));
+
+        for (field, conflicting) in variants {
+            assert_eq!(
+                post_json(&app, "/api/v1/hooks/question", &conflicting.to_string()).await,
+                AxumStatus::CONFLICT,
+                "field {field} was not bound"
+            );
+        }
     }
 
     /// A Waiting session whose question has been resolved must be eligible for

@@ -64,7 +64,7 @@ if set(files) != expected:
 for name in expected:
     path = root / name
     entry = files[name]
-    digest = entry.get("integrity_digest", entry.get("signed_by_digest"))
+    digest = entry.get("integrity_digest")
     mode = oct(path.stat().st_mode & 0o777)[2:].zfill(4)
     if entry.get("mode") != mode or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         raise SystemExit(f"error: rollback artifact validation failed: {name}")

@@ -32,6 +32,7 @@
       "$ref": "#/$defs/SessionId"
     }
   },
+  "additionalProperties": false,
   "required": [
     "id",
     "session_id",
@@ -74,6 +75,7 @@
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "question",
         "header",
@@ -91,6 +93,7 @@
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "label",
         "description"

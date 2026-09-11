@@ -97,7 +97,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Approval release formatting
-        run: cargo fmt --check
+        run: >-
+          cargo fmt --check
+          -p protocol
+          -p agent-hub-web-auth
+          -p agent-hub-approval-client
+          -p agent-hub-approval-service
+          -p agent-hub-approvals-server
+          -p agent-hub-gateway
       - name: Approval release clippy
         run: >-
           cargo clippy --all-targets
@@ -108,6 +115,15 @@ jobs:
           -p agent-hub-approvals-server
           -p agent-hub-gateway
           -- -D warnings
+      - name: Approval release check
+        run: >-
+          cargo check --all-targets
+          -p protocol
+          -p agent-hub-web-auth
+          -p agent-hub-approval-client
+          -p agent-hub-approval-service
+          -p agent-hub-approvals-server
+          -p agent-hub-gateway
       - name: Approval release tests
         run: >-
           cargo test
@@ -131,7 +147,6 @@ jobs:
           sha256sum --check SHA256SUMS
           grep -q '"integrity_digest"' approvals-server-release-manifest.json
           grep -q '"integrity_digest"' gateway-release-manifest.json
-          ! grep -R -q 'signed_by_digest' .
       - uses: actions/upload-artifact@v4
         with:
           name: approvals-release-${{ github.sha }}

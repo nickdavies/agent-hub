@@ -105,15 +105,18 @@ export BUILD_LOG="$build_log"
 export MV_LOG="$mv_log"
 
 release_output="${sandbox}/release-output"
+release_binaries="${sandbox}/release-binaries"
+mkdir -- "$release_binaries"
+install -m 0755 -- "$fake_server" "${release_binaries}/agent-hub-approvals-server"
+install -m 0755 -- "$fake_server" "${release_binaries}/agent-hub-gateway"
 "${source_repo}/deploy/approvals-server/package-release.sh" \
-    "${repo_root}/target/release" "$release_output"
+    "$release_binaries" "$release_output"
 (
     cd "$release_output"
     sha256sum --check SHA256SUMS
 )
 grep -q '"integrity_digest"' "${release_output}/approvals-server-release-manifest.json"
 grep -q '"integrity_digest"' "${release_output}/gateway-release-manifest.json"
-! grep -R -q 'signed_by_digest' "$release_output"
 
 touch "${source_repo}/untracked"
 if "$deploy" --dry-run >"${sandbox}/dirty.out" 2>"${sandbox}/dirty.err"; then
@@ -132,7 +135,7 @@ grep -q "Would not modify service state or invoke systemd" <<<"$dry_run"
 dest_binary="${home}/.local/libexec/agent-hub-approvals/agent-hub-server"
 mkdir -p -- "${dest_binary%/*}"
 ln -s -- "$fake_server" "$dest_binary"
-if "$deploy" >"${sandbox}/symlink.out" 2>"${sandbox}/symlink.err"; then
+if "$deploy" --capture-rollback 999999 >"${sandbox}/symlink.out" 2>"${sandbox}/symlink.err"; then
     echo "error: symlink destination unexpectedly passed validation" >&2
     exit 1
 fi
@@ -146,24 +149,64 @@ mkdir -p -- "${dest_environment%/*}" "${dest_unit%/*}" "${dest_state%/*}"
 install -m 0755 -- "$fake_server" "$dest_binary"
 install -m 0600 -- "${source_repo}/deploy/approvals-server/approvals-server.env" "$dest_environment"
 install -m 0644 -- "${source_repo}/deploy/approvals-server/agent-hub-approvals.service" "$dest_unit"
+listen_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+INSTALLED_ENVIRONMENT="$dest_environment" LISTEN_PORT="$listen_port" python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["INSTALLED_ENVIRONMENT"])
+lines = path.read_text().splitlines()
+path.write_text("\n".join(
+    f"LISTEN_ADDR=127.0.0.1:{os.environ['LISTEN_PORT']}" if line.startswith("LISTEN_ADDR=") else line
+    for line in lines
+) + "\n")
+PY
+cp -- "$dest_environment" "${sandbox}/expected-installed.env"
 printf '%s\n' '{"sessions":{},"notify_config":null,"presence":null,"pending_approvals":[]}' >"$dest_state"
 chmod 0600 "$dest_state"
-legacy_sha256="$(sha256sum "$dest_state" | cut -d' ' -f1)"
-set +e
-timeout --signal=TERM --kill-after=2s 20s \
-    "$deploy" --validate-legacy-state "$dest_state" >"${sandbox}/legacy.out"
-validation_status=$?
-set -e
-if ((validation_status != 0)); then
-    echo "error: legacy-state validation failed or exceeded its deadline (status $validation_status)" >&2
+if "$deploy" --cutover >"${sandbox}/missing.out" 2>"${sandbox}/missing.err"; then
+    echo "error: cutover without rollback capture unexpectedly succeeded" >&2
     exit 1
 fi
-[[ "$(sha256sum "$dest_state" | cut -d' ' -f1)" == "$legacy_sha256" ]]
-grep -q "Validated copied legacy state" "${sandbox}/legacy.out"
+grep -q "selected rollback bundle" "${sandbox}/missing.err"
 
-"$deploy" >"${sandbox}/deploy.out"
+LISTEN_ADDR="127.0.0.1:${listen_port}" "$dest_binary" serve noop local-file --path "$dest_state" \
+    >"${sandbox}/old-server.log" 2>&1 &
+old_pid=$!
+for _ in {1..100}; do
+    if LISTEN_PORT="$listen_port" python3 -c 'import os, socket; s=socket.create_connection(("127.0.0.1", int(os.environ["LISTEN_PORT"])), .1); s.close()' 2>/dev/null; then
+        break
+    fi
+    sleep 0.05
+done
+kill -INT "$old_pid"
+wait "$old_pid"
+set +e
+timeout --signal=TERM --kill-after=2s 20s \
+    "$deploy" --capture-rollback "$old_pid" >"${sandbox}/capture.out"
+capture_status=$?
+set -e
+if ((capture_status != 0)); then
+    echo "error: rollback capture failed or exceeded its deadline (status $capture_status)" >&2
+    exit 1
+fi
+grep -q "Confirmed stopped process" "${sandbox}/capture.out"
+
+rollback_root="${cache_home}/agent-hub-approvals/rollback"
+rollback_slot="${rollback_root}/$(<"${rollback_root}/current")"
+final_state_sha256="$(sha256sum "$dest_state" | cut -d' ' -f1)"
+printf '%s\n' stale >"$dest_state"
+if "$deploy" --cutover >"${sandbox}/stale.out" 2>"${sandbox}/stale.err"; then
+    echo "error: cutover with a stale rollback capture unexpectedly succeeded" >&2
+    exit 1
+fi
+grep -q "rollback bundle is stale" "${sandbox}/stale.err"
+cp -- "${rollback_slot}/server_data.json" "$dest_state"
+chmod 0600 "$dest_state"
+
+"$deploy" --cutover >"${sandbox}/deploy.out"
 [[ "$(sha256sum "$dest_binary" | cut -d' ' -f1)" == "$(sha256sum "$fake_server" | cut -d' ' -f1)" ]]
-cmp -s -- "${source_repo}/deploy/approvals-server/approvals-server.env" "$dest_environment"
+cmp -s -- "${sandbox}/expected-installed.env" "$dest_environment"
 cmp -s -- "${source_repo}/deploy/approvals-server/agent-hub-approvals.service" "$dest_unit"
 [[ "$(stat -c %a -- "$dest_binary")" == 755 ]]
 [[ "$(stat -c %a -- "$dest_environment")" == 600 ]]
@@ -174,16 +217,13 @@ while IFS= read -r build_dir; do
     [[ "$build_dir" == "${cache_home}/agent-hub-approvals/"deploy.* ]]
     [[ "$build_dir" != "$source_repo" ]]
 done <"$build_log"
-[[ "$(wc -l <"$build_log")" == 2 ]]
-rollback_root="${cache_home}/agent-hub-approvals/rollback"
-rollback_slot="${rollback_root}/$(<"${rollback_root}/current")"
+[[ "$(wc -l <"$build_log")" == 3 ]]
 [[ "$(stat -c %a -- "$rollback_slot")" == 700 ]]
 grep -q '"integrity_digest"' "${rollback_slot}/manifest.json"
-! grep -q 'signed_by_digest' "${rollback_slot}/manifest.json"
 
 printf '%s\n' replaced >"$dest_state"
 "${source_repo}/deploy/approvals-server/rollback.sh" >"${sandbox}/rollback.out"
-[[ "$(sha256sum "$dest_state" | cut -d' ' -f1)" == "$legacy_sha256" ]]
+[[ "$(sha256sum "$dest_state" | cut -d' ' -f1)" == "$final_state_sha256" ]]
 
 HOME="$real_home" CARGO_HOME="$real_cargo_home" RUSTUP_HOME="$real_rustup_home" \
     PATH="${PATH#*:}" "$real_cargo" test --locked \

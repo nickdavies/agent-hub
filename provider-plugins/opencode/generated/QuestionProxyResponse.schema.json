@@ -82,5 +82,6 @@
   ],
   "required": [
     "id"
-  ]
+  ],
+  "unevaluatedProperties": false
 }

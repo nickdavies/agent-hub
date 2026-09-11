@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mode=deploy
-legacy_state=
+mode=
+stopped_pid=
 if (($# == 1)) && [[ "$1" == "--dry-run" ]]; then
     mode=dry-run
-elif (($# == 2)) && [[ "$1" == "--validate-legacy-state" ]]; then
-    mode=validate-legacy-state
-    legacy_state="$2"
-elif (($# != 0)); then
-    echo "usage: $0 [--dry-run | --validate-legacy-state PATH]" >&2
+elif (($# == 2)) && [[ "$1" == "--capture-rollback" ]]; then
+    mode=capture-rollback
+    stopped_pid="$2"
+elif (($# == 1)) && [[ "$1" == "--cutover" ]]; then
+    mode=cutover
+else
+    echo "usage: $0 --dry-run | --capture-rollback STOPPED_PID | --cutover" >&2
     exit 2
 fi
 
@@ -29,7 +31,6 @@ cache_root="${cache_home}/agent-hub-approvals"
 state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
 dest_state="${state_home}/agent-hub-approvals/server_data.json"
 rollback_root="${cache_root}/rollback"
-validation_record="${cache_root}/validated-legacy-state.sha256"
 workspace=
 staged_binary=
 staged_environment=
@@ -51,22 +52,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in cargo chmod cmp cp git install mkdir mktemp mv python3 rm sha256sum stat tar; do
+for command in cargo chmod cmp cp git install kill mkdir mktemp mv python3 rm sha256sum stat tar; do
     command -v "$command" >/dev/null || {
         echo "error: required command not found: $command" >&2
         exit 1
     }
 done
 
-if [[ "$mode" == validate-legacy-state ]]; then
+if [[ "$mode" == capture-rollback ]]; then
     for command in chmod cp curl kill python3 sleep; do
         command -v "$command" >/dev/null || {
             echo "error: required validation command not found: $command" >&2
             exit 1
         }
     done
-    if [[ ! -f "$legacy_state" || -L "$legacy_state" ]]; then
-        echo "error: legacy state must be a regular, non-symlink file: $legacy_state" >&2
+    if [[ ! "$stopped_pid" =~ ^[1-9][0-9]*$ ]]; then
+        echo "error: STOPPED_PID must be a positive process ID" >&2
         exit 1
     fi
 fi
@@ -261,6 +262,12 @@ if ! worktree_is_clean; then
 fi
 captured_head="$(git -C "$repo_root" rev-parse --verify 'HEAD^{commit}')"
 
+if [[ "$mode" == cutover ]] && \
+    { [[ ! -f "${rollback_root}/current" ]] || [[ -L "${rollback_root}/current" ]]; }; then
+    echo "error: cutover requires a selected rollback bundle; run --capture-rollback first" >&2
+    exit 1
+fi
+
 for packaged_file in approvals-server.env agent-hub-approvals.service; do
     if [[ ! -f "${package_dir}/${packaged_file}" || -L "${package_dir}/${packaged_file}" ]]; then
         echo "error: packaged file must be a regular, non-symlink file: ${package_dir}/${packaged_file}" >&2
@@ -284,8 +291,8 @@ if [[ "$mode" == dry-run ]]; then
         echo "Would install the captured approvals-server.env as ${dest_environment} with mode 0600"
     fi
     echo "Would atomically install the captured agent-hub-approvals.service as ${dest_unit} with mode 0644"
-    echo "Would require the exact live state to have passed --validate-legacy-state"
-    echo "Would capture the live approvals binary, state, environment, and unit in ${rollback_root}"
+    echo "Would require --capture-rollback STOPPED_PID after the old service's SIGINT stop/save"
+    echo "Would require --cutover to match that rollback bundle to HEAD and every live file"
     echo "Would not modify service state or invoke systemd"
     exit 0
 fi
@@ -325,10 +332,46 @@ if [[ "$current_head" != "$captured_head" ]] || ! worktree_is_clean; then
     exit 1
 fi
 
-if [[ "$mode" == validate-legacy-state ]]; then
+if [[ "$mode" == capture-rollback ]]; then
+    if kill -0 "$stopped_pid" 2>/dev/null; then
+        echo "error: old approvals process $stopped_pid is still running" >&2
+        exit 1
+    fi
+    for live_file in "$dest_binary" "$dest_state" "$dest_environment" "$dest_unit"; do
+        if [[ ! -f "$live_file" || -L "$live_file" ]]; then
+            echo "error: rollback capture requires a live regular, non-symlink file: $live_file" >&2
+            exit 1
+        fi
+    done
+    INSTALLED_ENVIRONMENT="$dest_environment" python3 - <<'PY'
+import os
+import socket
+from pathlib import Path
+
+values = {}
+for line in Path(os.environ["INSTALLED_ENVIRONMENT"]).read_text().splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    if "=" not in line:
+        raise SystemExit("error: installed environment contains a malformed line")
+    key, value = line.split("=", 1)
+    values[key] = value
+listen_addr = values.get("LISTEN_ADDR")
+if not listen_addr or listen_addr.count(":") != 1:
+    raise SystemExit("error: installed environment must contain an IPv4 LISTEN_ADDR")
+host, port = listen_addr.rsplit(":", 1)
+probe = socket.socket()
+try:
+    probe.bind((host, int(port)))
+except OSError as error:
+    raise SystemExit(f"error: approvals listener is not stopped at {listen_addr}: {error}")
+finally:
+    probe.close()
+PY
     validation_state="${workspace}/server_data.json"
-    legacy_sha256="$(sha256 "$legacy_state")"
-    cp -- "$legacy_state" "$validation_state"
+    legacy_sha256="$(sha256 "$dest_state")"
+    cp -- "$dest_state" "$validation_state"
     chmod 0600 "$validation_state"
     port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
     AUTH_MODE=none APPROVAL_MODE=readwrite BASE_URL="http://127.0.0.1:${port}" \
@@ -361,51 +404,26 @@ if [[ "$mode" == validate-legacy-state ]]; then
         echo "error: validation server did not save copied state as a regular file" >&2
         exit 1
     fi
-    if [[ "$(sha256 "$legacy_state")" != "$legacy_sha256" ]]; then
-        echo "error: source legacy state changed during validation" >&2
+    if [[ "$(sha256 "$dest_state")" != "$legacy_sha256" ]]; then
+        echo "error: final live state changed during validation" >&2
         exit 1
     fi
-    ensure_trusted_cache_directory "rollback validation cache" "$cache_root"
-    validation_tmp="$(mktemp "${cache_root}/.validated-legacy-state.XXXXXX")"
-    printf '%s\n' "$legacy_sha256" >"$validation_tmp"
-    chmod 0600 "$validation_tmp"
-    mv -T -- "$validation_tmp" "$validation_record"
-    echo "Validated copied legacy state load, mobile queue, API, SIGINT stop, and save"
-    echo "Source legacy state was not modified: ${legacy_state}"
-    exit 0
-fi
-
-for live_file in "$dest_binary" "$dest_state" "$dest_environment" "$dest_unit"; do
-    if [[ ! -f "$live_file" || -L "$live_file" ]]; then
-        echo "error: cutover requires a live regular, non-symlink rollback source: $live_file" >&2
+    ensure_trusted_cache_directory "rollback cache" "$rollback_root"
+    rollback_slot="$(mktemp -d "${rollback_root}/slot.XXXXXX")"
+    [[ "$(stat -c %a -- "$rollback_slot")" == 700 ]] || {
+        echo "error: rollback slot must have mode 0700" >&2
         exit 1
-    fi
-done
-if [[ ! -f "$validation_record" || -L "$validation_record" ]] || \
-    [[ "$(<"$validation_record")" != "$(sha256 "$dest_state")" ]]; then
-    echo "error: exact live state must pass --validate-legacy-state before cutover" >&2
-    exit 1
-fi
-
-ensure_trusted_cache_directory "rollback cache" "$rollback_root"
-rollback_slot="$(mktemp -d "${rollback_root}/slot.XXXXXX")"
-[[ "$(stat -c %a -- "$rollback_slot")" == 700 ]] || {
-    echo "error: rollback slot must have mode 0700" >&2
-    exit 1
-}
-cp --preserve=mode -- "$dest_binary" "${rollback_slot}/agent-hub-server"
-cp --preserve=mode -- "$dest_state" "${rollback_slot}/server_data.json"
-cp --preserve=mode -- "$dest_environment" "${rollback_slot}/approvals-server.env"
-cp --preserve=mode -- "$dest_unit" "${rollback_slot}/agent-hub-approvals.service"
-cmp -s -- "$dest_binary" "${rollback_slot}/agent-hub-server"
-cmp -s -- "$dest_state" "${rollback_slot}/server_data.json"
-cmp -s -- "$dest_environment" "${rollback_slot}/approvals-server.env"
-cmp -s -- "$dest_unit" "${rollback_slot}/agent-hub-approvals.service"
-if [[ "$(<"$validation_record")" != "$(sha256 "$dest_state")" ]]; then
-    echo "error: live state changed after validation; refusing cutover" >&2
-    exit 1
-fi
-ROLLBACK_SLOT="$rollback_slot" python3 - <<'PY' >"${rollback_slot}/manifest.json"
+    }
+    cp --preserve=mode -- "$dest_binary" "${rollback_slot}/agent-hub-server"
+    cp --preserve=mode -- "$dest_state" "${rollback_slot}/server_data.json"
+    cp --preserve=mode -- "$dest_environment" "${rollback_slot}/approvals-server.env"
+    cp --preserve=mode -- "$dest_unit" "${rollback_slot}/agent-hub-approvals.service"
+    cmp -s -- "$dest_binary" "${rollback_slot}/agent-hub-server"
+    cmp -s -- "$dest_state" "${rollback_slot}/server_data.json"
+    cmp -s -- "$dest_environment" "${rollback_slot}/approvals-server.env"
+    cmp -s -- "$dest_unit" "${rollback_slot}/agent-hub-approvals.service"
+    ROLLBACK_SLOT="$rollback_slot" TARGET_COMMIT="$captured_head" STOPPED_PID="$stopped_pid" \
+        python3 - <<'PY' >"${rollback_slot}/manifest.json"
 import hashlib
 import json
 import os
@@ -421,14 +439,118 @@ for path in sorted(root.iterdir()):
         "integrity_digest": hashlib.sha256(path.read_bytes()).hexdigest(),
         "mode": oct(path.stat().st_mode & 0o777)[2:].zfill(4),
     })
-print(json.dumps({"schema": "agent-hub-approvals-rollback-v1", "files": files}, indent=2, sort_keys=True))
+print(json.dumps({
+    "schema": "agent-hub-approvals-rollback-v1",
+    "target_commit": os.environ["TARGET_COMMIT"],
+    "stopped_pid": int(os.environ["STOPPED_PID"]),
+    "files": files,
+}, indent=2, sort_keys=True))
 PY
-chmod 0600 "${rollback_slot}/manifest.json"
-rollback_pointer_tmp="$(mktemp "${rollback_root}/.current.XXXXXX")"
-printf '%s\n' "${rollback_slot##*/}" >"$rollback_pointer_tmp"
-chmod 0600 "$rollback_pointer_tmp"
-mv -T -- "$rollback_pointer_tmp" "${rollback_root}/current"
-echo "Captured rollback slot: ${rollback_slot}"
+    chmod 0600 "${rollback_slot}/manifest.json"
+    rollback_pointer_tmp="$(mktemp "${rollback_root}/.current.XXXXXX")"
+    printf '%s\n' "${rollback_slot##*/}" >"$rollback_pointer_tmp"
+    chmod 0600 "$rollback_pointer_tmp"
+    mv -T -- "$rollback_pointer_tmp" "${rollback_root}/current"
+    echo "Confirmed stopped process and validated final SIGINT-saved state"
+    echo "Captured rollback slot for ${captured_head}: ${rollback_slot}"
+    exit 0
+fi
+
+pointer="${rollback_root}/current"
+[[ -f "$pointer" && ! -L "$pointer" ]] || {
+    echo "error: cutover requires a selected rollback bundle; run --capture-rollback first" >&2
+    exit 1
+}
+slot_name="$(<"$pointer")"
+[[ "$slot_name" == slot.* && "$slot_name" != */* ]] || {
+    echo "error: invalid rollback slot pointer" >&2
+    exit 1
+}
+rollback_slot="${rollback_root}/${slot_name}"
+[[ -d "$rollback_slot" && ! -L "$rollback_slot" && \
+    "$(stat -c %u -- "$rollback_slot")" == "$EUID" && \
+    "$(stat -c %a -- "$rollback_slot")" == 700 ]] || {
+    echo "error: selected rollback bundle is not an owner-private directory" >&2
+    exit 1
+}
+for artifact in manifest.json agent-hub-server server_data.json approvals-server.env \
+    agent-hub-approvals.service; do
+    [[ -f "${rollback_slot}/${artifact}" && ! -L "${rollback_slot}/${artifact}" ]] || {
+        echo "error: rollback bundle artifact must be a regular, non-symlink file: ${rollback_slot}/${artifact}" >&2
+        exit 1
+    }
+done
+ROLLBACK_SLOT="$rollback_slot" TARGET_COMMIT="$captured_head" \
+    LIVE_BINARY="$dest_binary" LIVE_STATE="$dest_state" \
+    LIVE_ENVIRONMENT="$dest_environment" LIVE_UNIT="$dest_unit" python3 - <<'PY'
+import hashlib
+import json
+import os
+import socket
+from pathlib import Path
+
+root = Path(os.environ["ROLLBACK_SLOT"])
+manifest = json.loads((root / "manifest.json").read_text())
+if manifest.get("schema") != "agent-hub-approvals-rollback-v1":
+    raise SystemExit("error: unsupported rollback manifest")
+if manifest.get("target_commit") != os.environ["TARGET_COMMIT"]:
+    raise SystemExit("error: rollback bundle is stale for the current deployment commit")
+stopped_pid = manifest.get("stopped_pid")
+if not isinstance(stopped_pid, int) or stopped_pid <= 0:
+    raise SystemExit("error: rollback bundle has no valid stopped process identity")
+try:
+    os.kill(stopped_pid, 0)
+except ProcessLookupError:
+    pass
+except PermissionError:
+    raise SystemExit("error: captured old approvals process identity is running")
+else:
+    raise SystemExit("error: captured old approvals process identity is running")
+live = {
+    "agent-hub-server": Path(os.environ["LIVE_BINARY"]),
+    "server_data.json": Path(os.environ["LIVE_STATE"]),
+    "approvals-server.env": Path(os.environ["LIVE_ENVIRONMENT"]),
+    "agent-hub-approvals.service": Path(os.environ["LIVE_UNIT"]),
+}
+files = {entry["path"]: entry for entry in manifest.get("files", [])}
+if set(files) != set(live):
+    raise SystemExit("error: rollback manifest file set is invalid")
+for name, live_path in live.items():
+    captured = root / name
+    entry = files[name]
+    digest = hashlib.sha256(captured.read_bytes()).hexdigest()
+    mode = oct(captured.stat().st_mode & 0o777)[2:].zfill(4)
+    if entry.get("integrity_digest") != digest or entry.get("mode") != mode:
+        raise SystemExit(f"error: rollback bundle failed integrity validation: {name}")
+    if not live_path.is_file() or live_path.is_symlink():
+        raise SystemExit(f"error: live rollback source is unavailable: {live_path}")
+    if live_path.read_bytes() != captured.read_bytes():
+        raise SystemExit(f"error: rollback bundle is stale for live file: {live_path}")
+    live_mode = oct(live_path.stat().st_mode & 0o777)[2:].zfill(4)
+    if live_mode != mode:
+        raise SystemExit(f"error: rollback bundle mode is stale for live file: {live_path}")
+values = {}
+for line in live["approvals-server.env"].read_text().splitlines():
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    if "=" not in line:
+        raise SystemExit("error: installed environment contains a malformed line")
+    key, value = line.split("=", 1)
+    values[key] = value
+listen_addr = values.get("LISTEN_ADDR")
+if not listen_addr or listen_addr.count(":") != 1:
+    raise SystemExit("error: installed environment must contain an IPv4 LISTEN_ADDR")
+host, port = listen_addr.rsplit(":", 1)
+probe = socket.socket()
+try:
+    probe.bind((host, int(port)))
+except OSError as error:
+    raise SystemExit(f"error: approvals listener is not stopped at {listen_addr}: {error}")
+finally:
+    probe.close()
+PY
+echo "Validated rollback bundle for cutover: ${rollback_slot}"
 
 validate_destinations
 validate_environment
@@ -473,6 +595,19 @@ fi
 
 validate_destinations
 validate_environment
+for pair in \
+    "agent-hub-server:${dest_binary}" \
+    "server_data.json:${dest_state}" \
+    "approvals-server.env:${dest_environment}" \
+    "agent-hub-approvals.service:${dest_unit}"; do
+    IFS=: read -r captured_name live_file <<<"$pair"
+    if ! cmp -s -- "${rollback_slot}/${captured_name}" "$live_file" || \
+        [[ "$(stat -c %a -- "${rollback_slot}/${captured_name}")" != \
+        "$(stat -c %a -- "$live_file")" ]]; then
+        echo "error: rollback bundle became stale before installation: $live_file" >&2
+        exit 1
+    fi
+done
 if [[ "$environment_existed" == true ]]; then
     if [[ ! -e "$dest_environment" ]]; then
         echo "error: existing environment disappeared before commit: $dest_environment" >&2

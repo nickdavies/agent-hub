@@ -287,6 +287,22 @@ prohibited until this preflight succeeds:
 agent-hub-server rollback-preflight-v3 --database "$ORCHESTRATION_DB"
 ```
 
+For a coordinated rollback with the standalone approvals service, preserve this
+order:
+
+1. Stop dispatch and approvals writers.
+2. Complete the v4 drain and run `rollback-preflight-v3` with the v4-capable API
+   binary so the lower durable fence is committed before that binary is replaced.
+3. Send the approvals service SIGINT and wait for its final state save, then use
+   `deploy/approvals-server/rollback.sh` to restore its captured binary, state,
+   installed environment, and unit together.
+4. Reload and start the restored approvals unit and verify its health.
+5. Replace and start the orchestration API with the v3-only build, then resume
+   dispatch only after both services pass their checks.
+
+Do not restore approvals state from a source package or reconstruct it from the
+orchestration database; only the post-SIGINT rollback bundle is authoritative.
+
 Before rolling back to a v2-only build, perform the same drain for v3 and v4 work.
 The rollback is prohibited until this preflight succeeds:
 
