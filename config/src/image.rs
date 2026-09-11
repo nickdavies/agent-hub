@@ -4,11 +4,11 @@ use std::path::Path;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::SUPERVISED_OPENCODE_RUNTIME_VERSION;
+
 pub const JOB_CODE_PREFLIGHT_PATH: &str = "/usr/local/bin/agent-hub-job-code-preflight";
 pub const JOB_CODE_TOOL_MANIFEST_PATH: &str =
     "/usr/local/share/agent-hub/job-code-tool-manifest.json";
-pub const SUPERVISED_OPENCODE_VERSION: &str = "1.18.18";
-
 pub fn job_code_tool_manifest_sha256(contents: &str) -> String {
     hex::encode(Sha256::digest(contents.as_bytes()))
 }
@@ -108,9 +108,9 @@ pub fn validate_supervised_opencode_preflight_report(
         .ok_or_else(|| "preflight report has no tool manifest contents".to_string())?;
     let manifest: JobCodeToolManifest = serde_json::from_str(contents)
         .map_err(|error| format!("preflight returned an invalid tool manifest: {error}"))?;
-    if manifest.tools.opencode != SUPERVISED_OPENCODE_VERSION {
+    if manifest.tools.opencode != SUPERVISED_OPENCODE_RUNTIME_VERSION {
         return Err(format!(
-            "supervised OpenCode requires runtime {SUPERVISED_OPENCODE_VERSION} with config and tool.execute.before plugin API support, got {}",
+            "supervised OpenCode requires runtime {SUPERVISED_OPENCODE_RUNTIME_VERSION} with config and tool.execute.before plugin API support, got {}",
             manifest.tools.opencode
         ));
     }
@@ -691,6 +691,13 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
     #[test]
     fn supervised_opencode_preflight_requires_compatible_runtime() {
+        assert_eq!(crate::AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION, "1.18.26");
+        assert_eq!(SUPERVISED_OPENCODE_RUNTIME_VERSION, "1.18.18");
+        assert_ne!(
+            crate::AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION,
+            SUPERVISED_OPENCODE_RUNTIME_VERSION
+        );
+
         let valid = valid_preflight_report();
         validate_supervised_opencode_preflight_report(
             &serde_json::to_vec(&valid).unwrap(),
@@ -714,6 +721,27 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             )
             .unwrap_err()
             .contains("tool.execute.before")
+        );
+
+        let mut plugin_sdk_swapped_for_runtime = valid_preflight_report();
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            plugin_sdk_swapped_for_runtime["manifest"]["contents"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        manifest["tools"]["opencode"] =
+            serde_json::json!(crate::AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION);
+        set_manifest(&mut plugin_sdk_swapped_for_runtime, &manifest);
+        assert!(
+            validate_supervised_opencode_preflight_report(
+                &serde_json::to_vec(&plugin_sdk_swapped_for_runtime).unwrap(),
+                &format!("sha256:{}", "a".repeat(64)),
+                1000,
+                1001,
+            )
+            .unwrap_err()
+            .contains(SUPERVISED_OPENCODE_RUNTIME_VERSION)
         );
     }
 
@@ -750,7 +778,7 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             .into_iter()
             .map(|name| {
                 let version = if name == "opencode" {
-                    SUPERVISED_OPENCODE_VERSION.to_string()
+                    SUPERVISED_OPENCODE_RUNTIME_VERSION.to_string()
                 } else {
                     format!("{name} 1.0")
                 };

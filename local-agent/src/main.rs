@@ -16510,8 +16510,11 @@ async fn resolve_opencode_image(
         .context("OpenCode version output is not UTF-8")?
         .trim()
         .to_string();
-    if version != "1.18.18" {
-        anyhow::bail!("resolved OpenCode binary version must be 1.18.18, got '{version}'");
+    if version != agent_hub_config::SUPERVISED_OPENCODE_RUNTIME_VERSION {
+        anyhow::bail!(
+            "resolved OpenCode binary version must be {}, got '{version}'",
+            agent_hub_config::SUPERVISED_OPENCODE_RUNTIME_VERSION
+        );
     }
     Ok(ResolvedOpencodeImage {
         configured_image: configured_image.to_string(),

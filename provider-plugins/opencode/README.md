@@ -16,6 +16,10 @@ that needs human review escalates to the agent-hub server.
 - opencode 1.18.18, whose config and `tool.execute.before` plugin APIs are the
   runtime permission integration used by this plugin
 
+The host plugin installation is built from `@opencode-ai/plugin` and
+`@opencode-ai/sdk` 1.18.26. That SDK identity is independent of the supervised
+OpenCode 1.18.18 sandbox runtime and must not be substituted for it.
+
 ## Installation
 
 ### 1. Build the gateway binary

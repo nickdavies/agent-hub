@@ -7775,6 +7775,8 @@ grep -qx 'ready\|ready\.' real-llm.log
         let evidence = serde_json::to_vec(&serde_json::json!({
             "status": "PASS",
             "commit": evidence_commit,
+            "agent_hub_run_plugin_sdk_opencode_version": config::AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION,
+            "supervised_opencode_runtime_version": config::SUPERVISED_OPENCODE_RUNTIME_VERSION,
             "plugin_artifact_digest": plugin_digest,
             "plugin_artifact_digest_protocol": "agent-hub:supervised-e2e-plugin:v1",
             "image_digest": image_id,

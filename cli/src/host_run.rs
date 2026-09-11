@@ -464,7 +464,10 @@ fn verify_host_installation(config: &HostConfig) -> anyhow::Result<Vec<VerifiedF
         verify_pin(&config.policy, "policy:agent-hub-run")?,
         verify_pin(
             &config.opencode_plugin_install,
-            &format!("plugin:opencode-{}", config::SUPERVISED_OPENCODE_VERSION),
+            &format!(
+                "plugin:opencode-{}",
+                config::AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION
+            ),
         )?,
     ];
     ensure!(

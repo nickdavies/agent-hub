@@ -100,7 +100,13 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
             "self_binary":pin(&executable, "runtime:agent-hub"),
             "gateway":pin(&gateway_script, "runtime:agent-hub-gateway"),
             "policy":pin(&gateway_config, "policy:agent-hub-run"),
-            "opencode_plugin_install":pin(&plugin_install, "plugin:opencode-1.18.18"),
+            "opencode_plugin_install":pin(
+                &plugin_install,
+                &format!(
+                    "plugin:opencode-{}",
+                    config::AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION
+                )
+            ),
             "image_digests":{"test":format!("sha256:{}", "a".repeat(64))}
         }))
         .unwrap(),
@@ -167,6 +173,14 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
             "second-same-role-missing",
         ),
         ("018f0f21-76c0-7b37-a446-31f82a5e7620", "digest"),
+        (
+            "018f0f21-76c0-7b37-a446-31f82a5e7621",
+            "plugin-runtime-version",
+        ),
+        (
+            "018f0f21-76c0-7b37-a446-31f82a5e7622",
+            "plugin-sdk-mismatch",
+        ),
     ] {
         let mut changed = baseline_host_config.clone();
         match mutate {
@@ -214,6 +228,20 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
                 pin["sha256"] = digest.clone().into();
                 pin["source_identity"] =
                     format!("config:environments/test/environment.toml:sha256:{digest}").into();
+            }
+            "plugin-runtime-version" => {
+                let pin = &mut changed["opencode_plugin_install"];
+                let digest = pin["sha256"].as_str().unwrap();
+                pin["source_identity"] = format!(
+                    "plugin:opencode-{}:sha256:{digest}",
+                    config::SUPERVISED_OPENCODE_RUNTIME_VERSION
+                )
+                .into();
+            }
+            "plugin-sdk-mismatch" => {
+                let pin = &mut changed["opencode_plugin_install"];
+                let digest = pin["sha256"].as_str().unwrap();
+                pin["source_identity"] = format!("plugin:opencode-1.18.25:sha256:{digest}").into();
             }
             _ => unreachable!(),
         }

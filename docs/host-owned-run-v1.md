@@ -105,6 +105,11 @@ The canonical Rust contracts include `AgentHubRunIntentV1`,
 `AgentHubRunDecisionV1`, and `AgentHubRunOutputV1`. Generated public schemas and
 TypeScript definitions are under `provider-plugins/opencode/generated`.
 
-The OpenCode package directly pins both `@opencode-ai/plugin` and the imported
-`@opencode-ai/sdk` to 1.18.18 so install provenance cannot silently select a
-different SDK revision.
+The host `agent_hub_run` plugin package directly pins both
+`@opencode-ai/plugin` and the imported `@opencode-ai/sdk` to 1.18.26 so install
+provenance cannot silently select a different SDK revision. Its host pin source
+identity is therefore `plugin:opencode-1.18.26:sha256:<digest>`. This SDK
+identity is distinct from the sandbox's supervised OpenCode runtime identity:
+image manifests, environment launch validation, and preflight require OpenCode
+1.18.18 and reject the plugin SDK version in its place. Supervised E2E evidence
+records both version identities alongside the plugin and image digests.

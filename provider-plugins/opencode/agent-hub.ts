@@ -1,8 +1,8 @@
 /**
  * Agent Hub opencode plugin.
  *
- * Routes OpenCode 1.18.18 capability executions through agent-hub-gateway so
- * they use the same rule engine and escalation path as Claude Code and Cursor.
+ * Built against the OpenCode 1.18.26 plugin SDK to route supervised OpenCode
+ * 1.18.18 capability executions through agent-hub-gateway.
  *
  * Environment variables (set in the shell that launches opencode):
  *   AGENT_HUB_GATEWAY   path to the gateway binary (default: "agent-hub-gateway")

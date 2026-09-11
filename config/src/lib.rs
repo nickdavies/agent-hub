@@ -11,6 +11,9 @@ mod tools;
 pub mod triage;
 pub mod triage_mounts;
 
+pub const AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION: &str = "1.18.26";
+pub const SUPERVISED_OPENCODE_RUNTIME_VERSION: &str = "1.18.18";
+
 pub use deployment_validation::{
     CapturedAuthoritativeFile, GithubOverlayAccess, GithubOverlayConfig, ValidatedDeployment,
     ValidatedImageManifest, ValidatedNetworkPolicy, ValidatedOverlay, ValidatedOverlayRegistry,
@@ -25,9 +28,8 @@ pub use environment_bundle::{
 };
 pub use image::{
     ImageBuildContext, ImageConfig, JOB_CODE_PREFLIGHT_PATH, JOB_CODE_TOOL_MANIFEST_PATH,
-    SUPERVISED_OPENCODE_VERSION, job_code_preflight_docker_args, job_code_tool_manifest_sha256,
-    resolve_build_order, sha256_hex, validate_job_code_preflight_report,
-    validate_supervised_opencode_preflight_report,
+    job_code_preflight_docker_args, job_code_tool_manifest_sha256, resolve_build_order, sha256_hex,
+    validate_job_code_preflight_report, validate_supervised_opencode_preflight_report,
 };
 pub use network_policy::{
     FlattenedPolicy, NetworkPolicyConfig, PolicyAllowRule, canonical_policy_hosts, flatten_policy,
