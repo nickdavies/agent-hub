@@ -54,6 +54,10 @@ pub async fn run(args: QuestionArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(error) = req.validate() {
+        eprintln!("agent-hub-gateway question: invalid request: {error}");
+        return ExitCode::from(2);
+    }
 
     eprintln!(
         "[info] question: session={} questions={} request_id={}",

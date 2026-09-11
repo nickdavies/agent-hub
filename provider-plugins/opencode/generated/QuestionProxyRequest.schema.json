@@ -56,7 +56,9 @@
         },
         "header": {
           "description": "Short label (≤30 chars) shown as the tab/step heading.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 30,
+          "minLength": 1
         },
         "multiple": {
           "description": "If true, multiple options may be selected simultaneously.",
@@ -69,10 +71,13 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/QuestionOption"
-          }
+          },
+          "maxItems": 64
         },
         "question": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
         }
       },
       "additionalProperties": false,
@@ -87,10 +92,14 @@
       "type": "object",
       "properties": {
         "description": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 1024,
+          "minLength": 1
         },
         "label": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
         }
       },
       "additionalProperties": false,

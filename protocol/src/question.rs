@@ -5,6 +5,12 @@ use uuid::Uuid;
 
 use crate::sessions::SessionId;
 
+pub const QUESTION_TEXT_MAX_CHARS: usize = 4096;
+pub const QUESTION_HEADER_MAX_CHARS: usize = 30;
+pub const QUESTION_OPTIONS_MAX_COUNT: usize = 64;
+pub const QUESTION_OPTION_LABEL_MAX_CHARS: usize = 128;
+pub const QUESTION_OPTION_DESCRIPTION_MAX_CHARS: usize = 1024;
+
 // ===========================================================================
 // Question content types (mirrors opencode's QuestionInfo / QuestionOption)
 // ===========================================================================
@@ -13,17 +19,46 @@ use crate::sessions::SessionId;
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionOption {
+    #[schemars(length(min = 1, max = 128))]
     pub label: String,
+    #[schemars(length(min = 1, max = 1024))]
     pub description: String,
+}
+
+impl QuestionOption {
+    pub fn new(label: impl Into<String>, description: impl Into<String>) -> Result<Self, String> {
+        let option = Self {
+            label: label.into(),
+            description: description.into(),
+        };
+        option.validate()?;
+        Ok(option)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_bounded_text(
+            "question option label",
+            &self.label,
+            QUESTION_OPTION_LABEL_MAX_CHARS,
+        )?;
+        validate_bounded_text(
+            "question option description",
+            &self.description,
+            QUESTION_OPTION_DESCRIPTION_MAX_CHARS,
+        )
+    }
 }
 
 /// One question with its choices.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionInfo {
+    #[schemars(length(min = 1, max = 4096))]
     pub question: String,
     /// Short label (≤30 chars) shown as the tab/step heading.
+    #[schemars(length(min = 1, max = 30))]
     pub header: String,
+    #[schemars(length(max = 64))]
     pub options: Vec<QuestionOption>,
     /// If true, multiple options may be selected simultaneously.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +66,48 @@ pub struct QuestionInfo {
     /// If true (default), a free-text "Type your own answer" input is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom: Option<bool>,
+}
+
+impl QuestionInfo {
+    pub fn new(
+        question: impl Into<String>,
+        header: impl Into<String>,
+        options: Vec<QuestionOption>,
+        multiple: Option<bool>,
+        custom: Option<bool>,
+    ) -> Result<Self, String> {
+        let question = Self {
+            question: question.into(),
+            header: header.into(),
+            options,
+            multiple,
+            custom,
+        };
+        question.validate()?;
+        Ok(question)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_bounded_text("question text", &self.question, QUESTION_TEXT_MAX_CHARS)?;
+        validate_bounded_text("question header", &self.header, QUESTION_HEADER_MAX_CHARS)?;
+        if self.options.len() > QUESTION_OPTIONS_MAX_COUNT {
+            return Err(format!(
+                "question options must contain at most {QUESTION_OPTIONS_MAX_COUNT} items"
+            ));
+        }
+        for option in &self.options {
+            option.validate()?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_bounded_text(name: &str, value: &str, max_chars: usize) -> Result<(), String> {
+    let chars = value.chars().count();
+    if chars == 0 || chars > max_chars {
+        return Err(format!("{name} must contain 1 to {max_chars} characters"));
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -78,6 +155,15 @@ pub struct QuestionProxyRequest {
     pub questions: Vec<QuestionInfo>,
     /// Provider that originated the question (always "opencode" for now).
     pub provider: String,
+}
+
+impl QuestionProxyRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        for question in &self.questions {
+            question.validate()?;
+        }
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -245,6 +331,113 @@ pub struct PendingQuestion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_option() -> QuestionOption {
+        QuestionOption {
+            label: "Yes".into(),
+            description: "Continue".into(),
+        }
+    }
+
+    fn valid_question() -> QuestionInfo {
+        QuestionInfo {
+            question: "Continue?".into(),
+            header: "Decision".into(),
+            options: vec![valid_option()],
+            multiple: None,
+            custom: None,
+        }
+    }
+
+    #[test]
+    fn question_contract_accepts_boundaries_and_counts_unicode_characters() {
+        let question = QuestionInfo::new(
+            "🦀".repeat(QUESTION_TEXT_MAX_CHARS),
+            "界".repeat(QUESTION_HEADER_MAX_CHARS),
+            vec![
+                QuestionOption::new(
+                    "é".repeat(QUESTION_OPTION_LABEL_MAX_CHARS),
+                    "🙂".repeat(QUESTION_OPTION_DESCRIPTION_MAX_CHARS),
+                )
+                .unwrap();
+                QUESTION_OPTIONS_MAX_COUNT
+            ],
+            Some(true),
+            Some(false),
+        )
+        .unwrap();
+
+        assert_eq!(question.question.chars().count(), QUESTION_TEXT_MAX_CHARS);
+        assert_eq!(question.header.chars().count(), QUESTION_HEADER_MAX_CHARS);
+        assert_eq!(question.options.len(), QUESTION_OPTIONS_MAX_COUNT);
+        QuestionInfo::new("Custom answer?", "Custom", vec![], None, Some(true)).unwrap();
+    }
+
+    #[test]
+    fn question_contract_rejects_empty_and_oversize_fields() {
+        assert!(QuestionOption::new("", "Description").is_err());
+        assert!(QuestionInfo::new("", "Header", vec![], None, None).is_err());
+
+        for (field, value) in [
+            ("question", String::new()),
+            ("question", "q".repeat(QUESTION_TEXT_MAX_CHARS + 1)),
+            ("header", String::new()),
+            ("header", "h".repeat(QUESTION_HEADER_MAX_CHARS + 1)),
+        ] {
+            let mut question = valid_question();
+            match field {
+                "question" => question.question = value,
+                "header" => question.header = value,
+                _ => unreachable!(),
+            }
+            assert!(question.validate().is_err(), "accepted invalid {field}");
+        }
+
+        let mut question = valid_question();
+        question.options = vec![valid_option(); QUESTION_OPTIONS_MAX_COUNT + 1];
+        assert!(question.validate().is_err(), "accepted too many options");
+
+        for (field, value) in [
+            ("label", String::new()),
+            ("label", "l".repeat(QUESTION_OPTION_LABEL_MAX_CHARS + 1)),
+            ("description", String::new()),
+            (
+                "description",
+                "d".repeat(QUESTION_OPTION_DESCRIPTION_MAX_CHARS + 1),
+            ),
+        ] {
+            let mut option = valid_option();
+            match field {
+                "label" => option.label = value,
+                "description" => option.description = value,
+                _ => unreachable!(),
+            }
+            assert!(option.validate().is_err(), "accepted invalid {field}");
+        }
+    }
+
+    #[test]
+    fn question_schema_matches_runtime_bounds() {
+        let schema = serde_json::to_value(schemars::schema_for!(QuestionProxyRequest)).unwrap();
+        let question = &schema["$defs"]["QuestionInfo"]["properties"];
+        let option = &schema["$defs"]["QuestionOption"]["properties"];
+
+        assert_eq!(question["question"]["minLength"], 1);
+        assert_eq!(question["question"]["maxLength"], QUESTION_TEXT_MAX_CHARS);
+        assert_eq!(question["header"]["minLength"], 1);
+        assert_eq!(question["header"]["maxLength"], QUESTION_HEADER_MAX_CHARS);
+        assert_eq!(question["options"]["maxItems"], QUESTION_OPTIONS_MAX_COUNT);
+        assert_eq!(option["label"]["minLength"], 1);
+        assert_eq!(
+            option["label"]["maxLength"],
+            QUESTION_OPTION_LABEL_MAX_CHARS
+        );
+        assert_eq!(option["description"]["minLength"], 1);
+        assert_eq!(
+            option["description"]["maxLength"],
+            QUESTION_OPTION_DESCRIPTION_MAX_CHARS
+        );
+    }
 
     #[test]
     fn question_requests_reject_unknown_fields_at_every_level() {

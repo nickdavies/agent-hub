@@ -104,6 +104,15 @@ impl Error {
         }
     }
 
+    fn invalid_request(operation: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::ClientResponse,
+            operation,
+            status: None,
+            detail: detail.into(),
+        }
+    }
+
     fn request(operation: &'static str, error: reqwest::Error) -> Self {
         Self {
             kind: if error.is_timeout() {
@@ -322,6 +331,9 @@ impl ApprovalClient {
         &self,
         request: &QuestionProxyRequest,
     ) -> Result<ApiResponse<QuestionProxyResponse>, Error> {
+        request
+            .validate()
+            .map_err(|error| Error::invalid_request("question registration", error))?;
         self.post_json("api/v1/hooks/question", request, "question registration")
             .await
     }

@@ -1913,6 +1913,76 @@ mod integration_tests {
         }
     }
 
+    #[tokio::test]
+    async fn question_registration_enforces_contract_bounds() {
+        use protocol::{
+            QUESTION_HEADER_MAX_CHARS, QUESTION_OPTION_DESCRIPTION_MAX_CHARS,
+            QUESTION_OPTION_LABEL_MAX_CHARS, QUESTION_OPTIONS_MAX_COUNT, QUESTION_TEXT_MAX_CHARS,
+        };
+
+        let app = test_app();
+        let mut request = serde_json::json!({
+            "id": "question-bounds",
+            "session_id": "ses_question_bounds",
+            "session_display_name": "Bounds",
+            "cwd": "/workspace/project",
+            "question_request_id": "question-bounds",
+            "questions": [{
+                "question": "界".repeat(QUESTION_TEXT_MAX_CHARS),
+                "header": "é".repeat(QUESTION_HEADER_MAX_CHARS),
+                "options": [{
+                    "label": "🙂".repeat(QUESTION_OPTION_LABEL_MAX_CHARS),
+                    "description": "🦀".repeat(QUESTION_OPTION_DESCRIPTION_MAX_CHARS)
+                }]
+            }],
+            "provider": "opencode"
+        });
+        request["questions"][0]["options"] = serde_json::Value::Array(vec![
+            request["questions"][0]["options"][0].clone();
+            QUESTION_OPTIONS_MAX_COUNT
+        ]);
+        assert_eq!(
+            post_json(&app, "/api/v1/hooks/question", &request.to_string()).await,
+            AxumStatus::OK
+        );
+
+        for (field, value) in [
+            ("question", String::new()),
+            ("question", "q".repeat(QUESTION_TEXT_MAX_CHARS + 1)),
+            ("header", "h".repeat(QUESTION_HEADER_MAX_CHARS + 1)),
+            ("label", "l".repeat(QUESTION_OPTION_LABEL_MAX_CHARS + 1)),
+            (
+                "description",
+                "d".repeat(QUESTION_OPTION_DESCRIPTION_MAX_CHARS + 1),
+            ),
+        ] {
+            let mut invalid = request.clone();
+            invalid["id"] = format!("question-bounds-{field}-{}", value.len()).into();
+            match field {
+                "question" | "header" => invalid["questions"][0][field] = value.into(),
+                "label" | "description" => {
+                    invalid["questions"][0]["options"][0][field] = value.into()
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                post_json(&app, "/api/v1/hooks/question", &invalid.to_string()).await,
+                AxumStatus::BAD_REQUEST,
+                "accepted invalid {field}"
+            );
+        }
+
+        let mut invalid = request;
+        invalid["id"] = "question-bounds-options".into();
+        let option = invalid["questions"][0]["options"][0].clone();
+        invalid["questions"][0]["options"] =
+            serde_json::Value::Array(vec![option; QUESTION_OPTIONS_MAX_COUNT + 1]);
+        assert_eq!(
+            post_json(&app, "/api/v1/hooks/question", &invalid.to_string()).await,
+            AxumStatus::BAD_REQUEST
+        );
+    }
+
     /// A Waiting session whose question has been resolved must be eligible for
     /// zombie reset (first_pending_for_session returns None after resolve).
     #[tokio::test]

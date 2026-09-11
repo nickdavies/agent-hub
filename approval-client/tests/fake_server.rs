@@ -7,7 +7,10 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::any;
-use protocol::{ApprovalDecision, ApprovalResolveRequest, Secret};
+use protocol::{
+    ApprovalDecision, ApprovalResolveRequest, QuestionInfo, QuestionOption, QuestionProxyRequest,
+    Secret, SessionId,
+};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
@@ -147,4 +150,52 @@ async fn bounds_operation_time_and_response_bodies() {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::ResponseTooLarge);
+}
+
+fn question_request(question: QuestionInfo) -> QuestionProxyRequest {
+    QuestionProxyRequest {
+        id: "request-1".into(),
+        session_id: SessionId::new("session-1"),
+        session_display_name: "Session".into(),
+        cwd: "/workspace".into(),
+        question_request_id: "question-1".into(),
+        questions: vec![question],
+        provider: "opencode".into(),
+    }
+}
+
+#[tokio::test]
+async fn question_registration_validates_before_sending() {
+    let response = serde_json::json!({
+        "id": uuid::Uuid::nil(),
+        "type": "pending"
+    });
+    let (endpoint, _) = server(StatusCode::OK, response.to_string(), Duration::ZERO).await;
+    let client = ApprovalClient::new(&endpoint, None).unwrap();
+    let valid = QuestionInfo::new(
+        "界".repeat(protocol::QUESTION_TEXT_MAX_CHARS),
+        "é".repeat(protocol::QUESTION_HEADER_MAX_CHARS),
+        vec![QuestionOption::new("Yes", "Continue").unwrap()],
+        None,
+        None,
+    )
+    .unwrap();
+    client
+        .register_question(&question_request(valid))
+        .await
+        .unwrap();
+
+    let invalid = QuestionInfo {
+        question: String::new(),
+        header: "Decision".into(),
+        options: vec![],
+        multiple: None,
+        custom: None,
+    };
+    let error = client
+        .register_question(&question_request(invalid))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ClientResponse);
+    assert_eq!(error.status(), None);
 }

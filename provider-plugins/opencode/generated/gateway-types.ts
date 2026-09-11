@@ -1457,6 +1457,9 @@ export interface QuestionInfo {
    * If true, multiple options may be selected simultaneously.
    */
   multiple?: boolean | null
+  /**
+   * @maxItems 64
+   */
   options: QuestionOption[]
   question: string
 }

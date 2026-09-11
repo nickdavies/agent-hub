@@ -305,6 +305,8 @@ pub async fn question<N: Notifier>(
     State(state): State<AppState<N>>,
     Json(req): Json<QuestionProxyRequest>,
 ) -> Result<Json<QuestionProxyResponse>, crate::error::AppError> {
+    req.validate()
+        .map_err(crate::error::AppError::InvalidQuestionRequest)?;
     let canonical_request = serde_json::to_string(&req).map_err(|error| {
         crate::error::AppError::Config(format!("could not canonicalize question request: {error}"))
     })?;
