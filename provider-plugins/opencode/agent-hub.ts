@@ -14,8 +14,8 @@
  *   AGENT_HUB_TOKEN     bearer token for server auth (default: none)
  *   AGENT_HUB_CONFIG    path to agent-hub-permissions.json rule config (optional)
  *
- * Installation: add to .opencode/config.json:
- *   { "plugin": ["file:///path/to/opencode-plugin"] }
+ * Installation: add to opencode.json:
+ *   { "plugin": ["file:///path/to/agent-hub.ts"] }
  */
 
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
@@ -40,6 +40,8 @@ import { isStructuredOutputTool, normalizeToolExecution } from "./permission-nor
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
 let readinessRecorded = false
 let configInitialized = false
+const permissionOwnedSessions = new Set<string>()
+const SESSION_ALLOW_RULES = [{ permission: "*", pattern: "*", action: "allow" as const }]
 
 type ExecutionStatus = "routing" | "authorized" | "completed" | "denied" | "transcript_only"
 interface ExecutionRecord {
@@ -125,10 +127,117 @@ const questionGatewayProcs: Map<string, ChildProcess> = new Map()
 // this set and skips the question.reject call to avoid a double-resolve error.
 const locallyAnsweredQuestions: Set<string> = new Set()
 const GATEWAY_OUTPUT_LIMIT_BYTES = 1024 * 1024
+const DENIAL_LIMIT_BYTES = 4096
+const GATEWAY_OPERATION_TIMEOUT_MS = 86_410_000
+const SHORT_GATEWAY_OPERATION_TIMEOUT_MS = 15_000
 
-function appendBounded(current: string, chunk: Buffer): string | undefined {
-  if (Buffer.byteLength(current) + chunk.byteLength > GATEWAY_OUTPUT_LIMIT_BYTES) return undefined
-  return current + chunk.toString()
+type GatewayFailureCategory = "spawn" | "read" | "write" | "timeout" | "signal" | "nonzero" | "malformed" | "oversized" | "schema"
+type GatewayProcessResult =
+  | { ok: true; stdout: string; stderr: string }
+  | { ok: false; category: GatewayFailureCategory; detail: string }
+
+function boundedUtf8(value: string, limit = DENIAL_LIMIT_BYTES): string {
+  if (Buffer.byteLength(value) <= limit) return value
+  let result = ""
+  let bytes = 0
+  for (const character of value) {
+    const size = Buffer.byteLength(character)
+    if (bytes + size > limit) break
+    result += character
+    bytes += size
+  }
+  return result
+}
+
+function pipelineDenial(category: GatewayFailureCategory, detail: string): string {
+  return boundedUtf8(`Agent Hub denied tool execution because the approval pipeline failed (${category}): ${detail || "no detail available"}`)
+}
+
+export function runGatewayProcess(options: {
+  bin: string
+  args: string[]
+  input: string
+  timeoutMs: number
+  env?: NodeJS.ProcessEnv
+  sid?: string
+  onSpawn?: (proc: ChildProcess) => void
+}): Promise<GatewayProcessResult> {
+  return new Promise((resolve) => {
+    let proc: ChildProcess
+    try {
+      proc = spawn(options.bin, options.args, { stdio: ["pipe", "pipe", "pipe"], env: options.env })
+    } catch (error) {
+      resolve({ ok: false, category: "spawn", detail: boundedUtf8(String(error)) })
+      return
+    }
+
+    if (options.sid) track(options.sid, proc)
+    options.onSpawn?.(proc)
+    let settled = false
+    let pendingFailure: Exclude<GatewayProcessResult, { ok: true }> | undefined
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+
+    const finish = (result: GatewayProcessResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (options.sid) untrack(options.sid, proc)
+      resolve(result.ok ? result : { ...result, detail: boundedUtf8(result.detail) })
+    }
+    const failAndReap = (category: GatewayFailureCategory, detail: string) => {
+      if (pendingFailure || settled) return
+      pendingFailure = { ok: false, category, detail }
+      try { proc.kill("SIGKILL") } catch (error) {
+        finish({ ok: false, category, detail: `${detail}; kill failed: ${String(error)}` })
+      }
+    }
+    const capture = (stream: "stdout" | "stderr", chunk: Buffer | string) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      const current = stream === "stdout" ? stdoutBytes : stderrBytes
+      if (current + bytes.byteLength > GATEWAY_OUTPUT_LIMIT_BYTES) {
+        failAndReap("oversized", `${stream} exceeded ${GATEWAY_OUTPUT_LIMIT_BYTES} bytes`)
+        return
+      }
+      if (stream === "stdout") {
+        stdoutBytes += bytes.byteLength
+        stdout.push(bytes)
+      } else {
+        stderrBytes += bytes.byteLength
+        stderr.push(bytes)
+      }
+    }
+
+    const timer = setTimeout(() => {
+      failAndReap("timeout", `gateway exceeded ${options.timeoutMs} ms`)
+    }, options.timeoutMs)
+    proc.stdout?.on("data", (chunk: Buffer | string) => capture("stdout", chunk))
+    proc.stderr?.on("data", (chunk: Buffer | string) => capture("stderr", chunk))
+    proc.stdout?.on("error", (error: Error) => failAndReap("read", `stdout: ${error.message}`))
+    proc.stderr?.on("error", (error: Error) => failAndReap("read", `stderr: ${error.message}`))
+    proc.stdin?.on("error", (error: Error) => failAndReap("write", error.message))
+    proc.on("error", (error: Error) => finish({ ok: false, category: "spawn", detail: error.message }))
+    proc.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      if (pendingFailure) return finish(pendingFailure)
+      const stderrText = Buffer.concat(stderr).toString("utf8").trim()
+      if (signal) return finish({ ok: false, category: "signal", detail: `gateway terminated by ${signal}${stderrText ? `: ${stderrText}` : ""}` })
+      if (code !== 0) return finish({ ok: false, category: "nonzero", detail: `gateway exited ${String(code)}${stderrText ? `: ${stderrText}` : ""}` })
+      finish({
+        ok: true,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      })
+    })
+    if (!proc.stdin) {
+      failAndReap("write", "gateway stdin was unavailable")
+      return
+    }
+    proc.stdin.end(options.input, (error?: Error | null) => {
+      if (error) failAndReap("write", error.message)
+    })
+  })
 }
 
 function track(sid: string, proc: ChildProcess) {
@@ -168,6 +277,7 @@ const DEBOUNCE_MS = 2000
 // Track sessions we've already registered on the server so the first
 // tool execution for a new session triggers an immediate "active" report.
 const registeredSessions: Set<string> = new Set()
+const pendingSessionRegistrations: Set<string> = new Set()
 
 // On process exit, report all tracked sessions as ended so the dashboard
 // doesn't leave stale "active" / "idle" entries after opencode shuts down.
@@ -244,27 +354,24 @@ function spawnStatusReport(
 
   log("INFO", "spawnStatusReport", { sid, status })
 
-  const proc = spawn(
+  void runGatewayProcess({
     bin,
-    ["status-report", "--server", server, ...(token ? ["--token", token] : [])],
-    { stdio: ["pipe", "ignore", "pipe"] },
-  )
-
-  proc.stdin.end(payload)
-  let stderr = ""
-  proc.stderr?.on("data", (chunk: Buffer) => {
-    const next = appendBounded(stderr, chunk)
-    if (next === undefined) {
-      proc.kill("SIGKILL")
-    } else {
-      stderr = next
+    args: ["status-report", "--server", server, ...(token ? ["--token", token] : [])],
+    input: payload,
+    timeoutMs: SHORT_GATEWAY_OPERATION_TIMEOUT_MS,
+  }).then((result) => {
+    pendingSessionRegistrations.delete(sid)
+    if (!result.ok) {
+      registeredSessions.delete(sid)
+      log("WARN", "status report failed; later activity will retry", {
+        sid,
+        category: result.category,
+        detail: result.detail,
+      })
+      return
     }
-  })
-  proc.on("close", () => {
-    if (stderr) log("INFO", "status-report stderr", { output: stderr.trim() })
-  })
-  proc.on("error", (err: Error) => {
-    log("WARN", "status report spawn failed", { err: err.message })
+    if (status === "active") registeredSessions.add(sid)
+    if (result.stderr) log("INFO", "status-report stderr", { output: boundedUtf8(result.stderr.trim()) })
   })
 }
 
@@ -293,7 +400,7 @@ function spawnStatusReportSync(
   log("INFO", "spawnStatusReportSync", { sid, status })
 
   try {
-    spawnSync(
+    const result = spawnSync(
       bin,
       ["status-report", "--server", server, ...(token ? ["--token", token] : [])],
       {
@@ -303,8 +410,18 @@ function spawnStatusReportSync(
         maxBuffer: GATEWAY_OUTPUT_LIMIT_BYTES,
       },
     )
+    const stderr = boundedUtf8(result.stderr?.toString().trim() ?? "")
+    if (result.error || result.status !== 0 || result.signal) {
+      log("WARN", "sync status report failed", {
+        status: String(result.status),
+        signal: String(result.signal),
+        detail: boundedUtf8(result.error?.message || stderr || "unknown failure"),
+      })
+    } else if (stderr) {
+      log("INFO", "sync status-report stderr", { output: stderr })
+    }
   } catch (err: unknown) {
-    log("WARN", "sync status report failed", { err: String(err) })
+    log("WARN", "sync status report failed", { err: boundedUtf8(String(err)) })
   }
 }
 
@@ -313,9 +430,10 @@ function spawnStatusReportSync(
 // ---------------------------------------------------------------------------
 
 type GatewayResult = OpenCodeHookOutput
+class ExplicitDenial extends Error {}
 
-export const APPROVAL_TIMEOUT_MESSAGE = "Your approval request timed out because the operator was away. This is not a denial. Feel free to retry if you still need this."
-export const APPROVAL_PIPELINE_ERROR_MESSAGE = "There was an error in the approvals pipeline. This is a null answer: it is neither an approval nor a rejection of your intended action. Do not take this as a signal that your intended path is unwanted. Try again; if the error recurs, abort and report it to the operator."
+export const APPROVAL_TIMEOUT_MESSAGE = "Agent Hub denied this request because the approval request timed out before an operator decision."
+export const APPROVAL_PIPELINE_ERROR_MESSAGE = "Agent Hub denied this request because the approval pipeline failed."
 
 /** Validate that a parsed JSON value conforms to the OpenCodeHookOutput shape.
  *  The gateway is an external subprocess — we cannot trust its stdout blindly. */
@@ -343,89 +461,53 @@ async function callGatewayOnce(sid: string, payload: OpenCodeHookInput, executio
 
   log("INFO", "callGateway", { bin, config: config ?? "(none)", transport: APPROVAL_TRANSPORT.kind })
 
-  return new Promise((resolve) => {
-    const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: invocation.env })
-    track(sid, proc)
-
-    let stdout = ""
-    let stderr = ""
-    let outputExceeded = false
-    const capture = (current: string, chunk: Buffer): string => {
-      const next = appendBounded(current, chunk)
-      if (next === undefined) {
-        outputExceeded = true
-        proc.kill("SIGKILL")
-        return current
-      }
-      return next
-    }
-    proc.stdout.on("data", (chunk: Buffer) => { stdout = capture(stdout, chunk) })
-    proc.stderr.on("data", (chunk: Buffer) => { stderr = capture(stderr, chunk) })
-
-    proc.on("close", (code: number | null) => {
-      untrack(sid, proc)
-      if (outputExceeded) return resolve({ allowed: false, reason: "gateway: output exceeded limit" })
-      if (stderr) log("INFO", "gateway stderr", { output: stderr.trim() })
-      // Exit 1 is an approvals-pipeline failure from older gateway versions.
-      if (code === 1) {
-        log("WARN", "gateway approvals pipeline failure", { reason: stderr.trim() })
-        return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-      }
-      // Exit 2 = fail-closed local input or config error.
-      if (code === 2) return resolve({ allowed: false, reason: "gateway: fail-closed" })
-      if (code !== 0) return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-      try {
-        const parsed: unknown = JSON.parse(stdout.trim())
-        if (!isValidGatewayOutput(parsed)) {
-          log("ERROR", "gateway output failed validation", { stdout: stdout.trim() })
-          return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-        }
-        resolve(parsed)
-      } catch {
-        log("ERROR", "gateway invalid response", { stdout: stdout.trim() })
-        resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-      }
-    })
-
-    proc.on("error", (err: Error) => {
-      untrack(sid, proc)
-      log("ERROR", "gateway spawn error", { err: err.message, bin })
-      resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-    })
-
-    proc.stdin.end(JSON.stringify(payload))
+  const result = await runGatewayProcess({
+    bin,
+    args,
+    env: invocation.env as NodeJS.ProcessEnv,
+    input: JSON.stringify(payload),
+    timeoutMs: GATEWAY_OPERATION_TIMEOUT_MS,
+    sid,
   })
+  if (!result.ok) {
+    log("ERROR", "gateway approval failed", { category: result.category, detail: result.detail })
+    return { allowed: false, reason: pipelineDenial(result.category, result.detail) }
+  }
+  if (result.stderr) log("INFO", "gateway stderr", { output: boundedUtf8(result.stderr.trim()) })
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(result.stdout.trim())
+  } catch (error) {
+    const detail = boundedUtf8(`${String(error)}; stdout=${result.stdout.trim()}`)
+    log("ERROR", "gateway invalid response", { detail })
+    return { allowed: false, reason: pipelineDenial("malformed", detail) }
+  }
+  if (!isValidGatewayOutput(parsed)) {
+    const detail = boundedUtf8(`stdout=${result.stdout.trim()}`)
+    log("ERROR", "gateway output failed validation", { detail })
+    return { allowed: false, reason: pipelineDenial("schema", detail) }
+  }
+  return parsed.allowed
+    ? parsed
+    : { allowed: false, reason: boundedUtf8(parsed.reason ?? "Agent Hub denied tool execution") }
 }
 
 async function reportSupervision(transition: Record<string, unknown>): Promise<void> {
   if (APPROVAL_TRANSPORT.kind !== "attended_socket") return
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const invocation = gatewaySupervisionInvocation(APPROVAL_TRANSPORT, process.env)
-  await new Promise<void>((resolve, reject) => {
-    const proc = spawn(bin, invocation.args, { stdio: ["pipe", "ignore", "pipe"], env: invocation.env })
-    let stderr = ""
-    let exceeded = false
-    proc.stderr.on("data", (chunk: Buffer) => {
-      const next = appendBounded(stderr, chunk)
-      if (next === undefined) {
-        exceeded = true
-        proc.kill("SIGKILL")
-      } else {
-        stderr = next
-      }
-    })
-    proc.on("error", reject)
-    proc.on("close", (code) => {
-      if (exceeded) return reject(new Error("supervision gateway output exceeded limit"))
-      if (code !== 0) return reject(new Error(stderr.trim() || `supervision gateway exited ${code}`))
-      resolve()
-    })
-    proc.stdin.end(JSON.stringify({
+  const result = await runGatewayProcess({
+    bin,
+    args: invocation.args,
+    env: invocation.env as NodeJS.ProcessEnv,
+    timeoutMs: SHORT_GATEWAY_OPERATION_TIMEOUT_MS,
+    input: JSON.stringify({
       version: "attended_gateway_transition_v1",
       ...JSON.parse(APPROVAL_TRANSPORT.binding),
       ...transition,
-    }))
+    }),
   })
+  if (!result.ok) throw new Error(pipelineDenial(result.category, result.detail))
 }
 
 function executionTransition(record: ExecutionRecord, request: ExecutionRecord["requests"][number], transition: string) {
@@ -448,7 +530,8 @@ function executionTransition(record: ExecutionRecord, request: ExecutionRecord["
 /** Result from the gateway `question` subcommand. */
 type QuestionGatewayResult =
   | { answers: string[][] }
-  | { outcome: "rejected" | "timeout" | "pipeline-error" }
+  | { outcome: "rejected" | "timeout" }
+  | { outcome: "pipeline-error"; category: GatewayFailureCategory; detail: string }
 
 function isValidQuestionAnswers(value: unknown): value is string[][] {
   return Array.isArray(value) && value.every(
@@ -465,7 +548,7 @@ async function callGatewayQuestion(
       requestId: payload.question_request_id,
       transport: APPROVAL_TRANSPORT.kind,
     })
-    return { outcome: "pipeline-error" }
+    return { outcome: "pipeline-error", category: "schema", detail: "questions are unavailable in attended_socket mode" }
   }
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const server = process.env.AGENT_HUB_SERVER
@@ -479,76 +562,31 @@ async function callGatewayQuestion(
 
   const requestId = payload.question_request_id
 
-  return new Promise((resolve) => {
-    const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] })
-    track(sid, proc)
-    questionGatewayProcs.set(requestId, proc)
-
-    let stdout = ""
-    let stderr = ""
-    let outputExceeded = false
-    const capture = (current: string, chunk: Buffer): string => {
-      const next = appendBounded(current, chunk)
-      if (next === undefined) {
-        outputExceeded = true
-        proc.kill("SIGKILL")
-        return current
-      }
-      return next
-    }
-    proc.stdout.on("data", (chunk: Buffer) => { stdout = capture(stdout, chunk) })
-    proc.stderr.on("data", (chunk: Buffer) => { stderr = capture(stderr, chunk) })
-
-    proc.on("close", (code: number | null) => {
-      untrack(sid, proc)
-      questionGatewayProcs.delete(requestId)
-      if (outputExceeded) {
-        log("ERROR", "question gateway output exceeded limit", { requestId, bin })
-        return resolve({ outcome: "pipeline-error" })
-      }
-      if (stderr) log("INFO", "question gateway stderr", { output: stderr.trim() })
-
-      if (code === 0) {
-        try {
-          const parsed = JSON.parse(stdout.trim()) as QuestionGatewayOutput
-          if (!isValidQuestionAnswers(parsed.answers) || parsed.answers.length !== payload.questions.length) {
-            log("ERROR", "question gateway output failed validation", { stdout: stdout.trim() })
-            resolve({ outcome: "pipeline-error" })
-            return
-          }
-          resolve({ answers: parsed.answers })
-        } catch {
-          log("ERROR", "question gateway invalid JSON", { stdout: stdout.trim() })
-          resolve({ outcome: "pipeline-error" })
-        }
-        return
-      }
-
-      if (code === 1) {
-        log("INFO", "question gateway rejected", { reason: stderr.trim() })
-        resolve({ outcome: "rejected" })
-        return
-      }
-
-      if (code === 3) {
-        log("INFO", "question gateway timed out", { reason: stderr.trim() })
-        resolve({ outcome: "timeout" })
-        return
-      }
-
-      log("WARN", "question gateway pipeline failure", { code: String(code), stderr: stderr.trim() })
-      resolve({ outcome: "pipeline-error" })
-    })
-
-    proc.on("error", (err: Error) => {
-      untrack(sid, proc)
-      questionGatewayProcs.delete(requestId)
-      log("ERROR", "question gateway spawn error", { err: err.message, bin })
-      resolve({ outcome: "pipeline-error" })
-    })
-
-    proc.stdin.end(JSON.stringify(payload))
+  const result = await runGatewayProcess({
+    bin,
+    args,
+    input: JSON.stringify(payload),
+    timeoutMs: GATEWAY_OPERATION_TIMEOUT_MS,
+    sid,
+    onSpawn: (proc) => questionGatewayProcs.set(requestId, proc),
   })
+  questionGatewayProcs.delete(requestId)
+  if (!result.ok) {
+    const exit = /^gateway exited (\d+)/.exec(result.detail)?.[1]
+    if (result.category === "nonzero" && exit === "1") return { outcome: "rejected" }
+    if (result.category === "nonzero" && exit === "3") return { outcome: "timeout" }
+    return { outcome: "pipeline-error", category: result.category, detail: result.detail }
+  }
+  let parsed: QuestionGatewayOutput
+  try {
+    parsed = JSON.parse(result.stdout.trim()) as QuestionGatewayOutput
+  } catch (error) {
+    return { outcome: "pipeline-error", category: "malformed", detail: boundedUtf8(`${String(error)}; stdout=${result.stdout.trim()}`) }
+  }
+  if (!isValidQuestionAnswers(parsed.answers) || parsed.answers.length !== payload.questions.length) {
+    return { outcome: "pipeline-error", category: "schema", detail: boundedUtf8(`stdout=${result.stdout.trim()}`) }
+  }
+  return { answers: parsed.answers }
 }
 
 // ---------------------------------------------------------------------------
@@ -673,7 +711,10 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
   }
   const clientV2 = new OpencodeClientV2({ client: inProcessClient })
   initializeRunEvidence()
-  configInitialized = true
+  permissionOwnedSessions.clear()
+  registeredSessions.clear()
+  pendingSessionRegistrations.clear()
+  configInitialized = false
 
   async function routeTool(
     sid: string,
@@ -684,18 +725,23 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     if (!configInitialized) {
       const reason = "OpenCode executed a tool before the Agent Hub config hook took permission ownership"
       recordPermissionDenied(reason)
-      throw new Error(reason)
+      throw new ExplicitDenial(reason)
+    }
+    if (!permissionOwnedSessions.has(sid)) {
+      const reason = `Agent Hub denied tool execution because session '${sid}' has not transferred permission ownership to the approval pipeline`
+      recordPermissionDenied(reason)
+      throw new ExplicitDenial(boundedUtf8(reason))
     }
     if (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded) {
-      throw new Error("OpenCode tool execution attempted before host supervision readiness")
+      throw new ExplicitDenial("Agent Hub denied tool execution because host supervision was not ready")
     }
     if (executionRecords.has(callID)) {
       const reason = `OpenCode reused tool call ID '${callID}'`
       recordPermissionDenied(reason)
-      throw new Error(reason)
+      throw new ExplicitDenial(reason)
     }
-    if (!registeredSessions.has(sid)) {
-      registeredSessions.add(sid)
+    if (!registeredSessions.has(sid) && !pendingSessionRegistrations.has(sid)) {
+      pendingSessionRegistrations.add(sid)
       spawnStatusReport(sid, "active")
     }
 
@@ -707,7 +753,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       const reason = String(error)
       log("ERROR", "tool normalization failed closed", { err: reason })
       recordPermissionDenied(reason)
-      throw error
+      throw new ExplicitDenial(pipelineDenial("schema", reason))
     }
 
     const record: ExecutionRecord = {
@@ -746,7 +792,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         record.status = "denied"
         recordExecution(record)
         recordPermissionDenied(reason)
-        throw new Error(reason)
+        throw new ExplicitDenial(reason)
       }
     }
     if (request.postPolicyValidationError) {
@@ -756,22 +802,42 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       record.status = "denied"
       recordExecution(record)
       recordPermissionDenied(request.postPolicyValidationError)
-      throw new Error(request.postPolicyValidationError)
+      throw new ExplicitDenial(request.postPolicyValidationError)
     }
     record.status = "authorized"
     recordExecution(record)
   }
 
   return {
-    "chat.message": async (info) => {
-      const response = await clientV2.session.update({
-        sessionID: info.sessionID,
-        directory,
-        permission: [{ permission: "*", pattern: "*", action: "allow" }],
-      })
-      if (response.error) {
-        throw new Error(`OpenCode session permission ownership failed: ${JSON.stringify(response.error)}`)
+    config: async (config) => {
+      const mutable = config as any
+      mutable.permission = { "*": "deny" }
+      for (const agent of Object.values(mutable.agent ?? {}) as any[]) {
+        agent.permission = { "*": "deny" }
       }
+      configInitialized = true
+    },
+
+    "chat.message": async (info) => {
+      permissionOwnedSessions.delete(info.sessionID)
+      try {
+        const response = await clientV2.session.update({
+          sessionID: info.sessionID,
+          directory,
+          permission: SESSION_ALLOW_RULES,
+        })
+        if (response.error) {
+          throw new Error(`session.update returned ${JSON.stringify(response.error)}`)
+        }
+        if (JSON.stringify(response.data?.permission) !== JSON.stringify(SESSION_ALLOW_RULES)) {
+          throw new Error("session.update response did not prove the requested permission rules")
+        }
+      } catch (error) {
+        const reason = boundedUtf8(`OpenCode session permission ownership failed: ${String(error)}`)
+        log("ERROR", "session permission ownership failed", { sid: info.sessionID, detail: reason })
+        throw new Error(reason)
+      }
+      permissionOwnedSessions.add(info.sessionID)
       if (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded) {
         await reportSupervision({
           transition: "plugin_ready",
@@ -788,39 +854,55 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     },
 
     "tool.execute.before": async (info, output) => {
-      if (isStructuredOutputTool(info.tool)) {
-        if (!configInitialized
-          || (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded)
-          || executionRecords.has(info.callID)) {
-          const reason = `invalid StructuredOutput execution evidence for tool call '${info.callID}'`
-          recordPermissionDenied(reason)
-          throw new Error(reason)
+      try {
+        if (isStructuredOutputTool(info.tool)) {
+          if (!configInitialized
+            || !permissionOwnedSessions.has(info.sessionID)
+            || (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded)
+            || executionRecords.has(info.callID)) {
+            const reason = `invalid StructuredOutput execution evidence for tool call '${info.callID}'`
+            recordPermissionDenied(reason)
+            throw new ExplicitDenial(reason)
+          }
+          const record: ExecutionRecord = {
+            call_id: info.callID,
+            session_id: info.sessionID,
+            tool_name: info.tool,
+            runtime_tool_name: info.tool,
+            raw_args_digest: digest("agent-hub:opencode-raw-args:v1", output.args),
+            canonical_match_digests: [],
+            resolved_paths: [],
+            status: "transcript_only",
+            requests: [],
+          }
+          await reportSupervision({
+            transition: "transcript_only",
+            request_id: null,
+            call_id: record.call_id,
+            session_id: record.session_id,
+            tool_name: record.tool_name,
+            raw_args_digest: record.raw_args_digest,
+            canonical_args_digest: null,
+            plugin_nonce: null,
+          })
+          recordExecution(record)
+          return
         }
-        const record: ExecutionRecord = {
-          call_id: info.callID,
-          session_id: info.sessionID,
-          tool_name: info.tool,
-          runtime_tool_name: info.tool,
-          raw_args_digest: digest("agent-hub:opencode-raw-args:v1", output.args),
-          canonical_match_digests: [],
-          resolved_paths: [],
-          status: "transcript_only",
-          requests: [],
-        }
-        await reportSupervision({
-          transition: "transcript_only",
-          request_id: null,
-          call_id: record.call_id,
-          session_id: record.session_id,
-          tool_name: record.tool_name,
-          raw_args_digest: record.raw_args_digest,
-          canonical_args_digest: null,
-          plugin_nonce: null,
-        })
-        recordExecution(record)
-        return
+        await routeTool(info.sessionID, info.callID, info.tool, output.args as Record<string, unknown>)
+      } catch (error) {
+        const message = error instanceof ExplicitDenial
+          ? boundedUtf8(error.message)
+          : pipelineDenial("schema", String(error))
+        recordPermissionDenied(message)
+        throw new Error(message)
       }
-      await routeTool(info.sessionID, info.callID, info.tool, output.args as Record<string, unknown>)
+    },
+
+    "permission.ask": async (info, output) => {
+      const message = boundedUtf8(`Agent Hub denied leaked native permission prompt '${info.id}' for session '${info.sessionID}'; the approval pipeline must own every tool decision`)
+      output.status = "deny"
+      recordPermissionDenied(message)
+      log("ERROR", "denied leaked native permission prompt", { message })
     },
 
     "tool.execute.after": async (info) => {
@@ -954,7 +1036,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
               answers: result.answers,
             })
             if (resp.error) {
-              log("WARN", "question.reply failed", { sid, requestId, err: String(resp.error) })
+              throw new Error(`question.reply failed: ${JSON.stringify(resp.error)}`)
             }
             return
           }
@@ -966,27 +1048,49 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
               directory,
             })
             if (resp.error) {
-              log("WARN", "question.reject failed", { sid, requestId, err: String(resp.error) })
+              throw new Error(`question.reject failed: ${JSON.stringify(resp.error)}`)
             }
             return
           }
 
-          const message = result.outcome === "timeout"
-            ? APPROVAL_TIMEOUT_MESSAGE
-            : APPROVAL_PIPELINE_ERROR_MESSAGE
+          const message = result.outcome === "pipeline-error"
+            ? pipelineDenial(result.category, result.detail)
+            : APPROVAL_TIMEOUT_MESSAGE
           const resp = await clientV2.question.reply({
             requestID: requestId,
             directory,
             answers: questions.map(() => [message]),
           })
           if (resp.error) {
-            log("WARN", "synthetic question.reply failed", { sid, requestId, err: String(resp.error) })
+            throw new Error(`synthetic question.reply failed: ${JSON.stringify(resp.error)}`)
           }
         }
 
         callGatewayQuestion(sid, proxyReq).then(handleGatewayResult).catch(async (err: unknown) => {
-          log("WARN", "callGatewayQuestion threw", { sid, requestId, err: String(err) })
-          await handleGatewayResult({ outcome: "pipeline-error" })
+          const detail = boundedUtf8(String(err))
+          log("ERROR", "question approval pipeline callback failed", { sid, requestId, detail })
+          try {
+            const response = await clientV2.question.reply({
+              requestID: requestId,
+              directory,
+              answers: questions.map(() => [pipelineDenial("schema", detail)]),
+            })
+            if (response.error) throw new Error(JSON.stringify(response.error))
+          } catch (replyError) {
+            log("ERROR", "question pipeline error reply failed; rejecting question", {
+              sid,
+              requestId,
+              detail: boundedUtf8(String(replyError)),
+            })
+            try {
+              const response = await clientV2.question.reject({ requestID: requestId, directory })
+              if (response.error) throw new Error(JSON.stringify(response.error))
+            } catch (terminationError) {
+              const termination = boundedUtf8(`Agent Hub could neither answer nor terminate question '${requestId}' after an approval pipeline failure: ${String(terminationError)}`)
+              log("ERROR", "question pipeline termination failed", { sid, requestId, detail: termination })
+              throw new Error(termination)
+            }
+          }
         })
 
         return

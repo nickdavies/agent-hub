@@ -20,8 +20,9 @@ use uuid::Uuid;
 const APPROVAL_ID: Uuid = Uuid::from_u128(1);
 const QUESTION_ID: Uuid = Uuid::from_u128(2);
 // Black-box expectations duplicate the wire messages so production changes cannot silently update them.
-const TIMEOUT_REASON: &str = "Your approval request timed out because the operator was away. This is not a denial. Feel free to retry if you still need this.";
-const PIPELINE_REASON: &str = "There was an error in the approvals pipeline. This is a null answer: it is neither an approval nor a rejection of your intended action. Do not take this as a signal that your intended path is unwanted. Try again; if the error recurs, abort and report it to the operator.";
+const TIMEOUT_REASON: &str = "Agent Hub denied tool execution because the approval request timed out before an operator decision.";
+const PIPELINE_REASON: &str =
+    "Agent Hub denied tool execution because the approval pipeline failed (gateway):";
 
 #[derive(Clone, Copy, Debug)]
 enum Scenario {
@@ -436,7 +437,7 @@ async fn tool_approval_explicit_denial_preserves_operator_reason() {
 
 #[tokio::test]
 #[ignore = "loopback network integration; run explicitly with --ignored"]
-async fn tool_approval_healthy_wait_timeout_is_neutral_operator_away_response() {
+async fn tool_approval_healthy_wait_timeout_is_explicit_denial() {
     let server = TestServer::start(Scenario::ApprovalTimeout).await;
     let output = run_gateway(&server, "approval", &approval_input()).await;
     let state = server.state.clone();
@@ -464,16 +465,22 @@ async fn tool_approval_healthy_wait_timeout_is_neutral_operator_away_response() 
 
 #[tokio::test]
 #[ignore = "loopback network integration; run explicitly with --ignored"]
-async fn tool_approval_failed_wait_until_deadline_is_neutral_pipeline_response() {
+async fn tool_approval_failed_wait_until_deadline_is_explicit_pipeline_denial() {
     let server = TestServer::start(Scenario::ApprovalPipelineError).await;
     let output = run_gateway(&server, "approval", &approval_input()).await;
     let state = server.state.clone();
     server.stop().await;
 
     assert_exit(&output, 0);
-    assert_eq!(
-        output.stdout,
-        format!(r#"{{"allowed":false,"reason":"{PIPELINE_REASON}"}}"#),
+    assert!(
+        output.stdout.contains(PIPELINE_REASON),
+        "{}",
+        diagnostics(&output)
+    );
+    assert!(
+        output
+            .stdout
+            .contains("approval wait failed until the deadline"),
         "{}",
         diagnostics(&output)
     );

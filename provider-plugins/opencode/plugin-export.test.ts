@@ -54,6 +54,7 @@ describe("bundled plugin entrypoint", () => {
         "makeGlobToolInput",
         "makePayload",
         "makeReadToolInput",
+        "runGatewayProcess",
       ],
     })
   })

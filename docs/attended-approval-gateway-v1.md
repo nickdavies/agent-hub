@@ -124,8 +124,8 @@ to the existing approvals API:
 3. `POST /api/v1/approvals/{id}/resolve` with `{"decision":"cancel"}` for every
    pending request when the run is cancelled or the relay stops
 
-The host supplies optional bearer authentication only over HTTPS or literal
-loopback HTTP. Redirects are disabled. Registration, cancellation,
+The host may use HTTP or HTTPS with any syntactically valid host and optional
+bearer authentication. Redirects are disabled. Registration, cancellation,
 socket bind/chmod/removal, and recovery are recorded in the shared
 worker-neutral external-effect journal before mutation. Shutdown is awaited,
 the original socket inode is removed and proven absent, pending approvals are

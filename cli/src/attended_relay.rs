@@ -2128,19 +2128,18 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_rejects_credentials_and_insecure_bearer() {
+    fn endpoint_accepts_http_and_https_hosts_with_optional_bearer() {
         assert!(
             agent_hub_approval_client::validate_endpoint("https://token@example.test", false)
                 .is_err()
         );
         assert!(agent_hub_approval_client::validate_endpoint("file:///server", false).is_err());
-        assert!(agent_hub_approval_client::validate_endpoint("http://example.test", true).is_err());
-        assert!(
-            agent_hub_approval_client::validate_endpoint("http://example.test", false).is_err()
-        );
-        assert!(
-            agent_hub_approval_client::validate_endpoint("https://example.test", false).is_err()
-        );
+        agent_hub_approval_client::validate_endpoint("http://example.test", true).unwrap();
+        agent_hub_approval_client::validate_endpoint("http://example.test", false).unwrap();
+        agent_hub_approval_client::validate_endpoint("http://localhost:8080", false).unwrap();
+        agent_hub_approval_client::validate_endpoint("http://0.0.0.0:8080", false).unwrap();
+        agent_hub_approval_client::validate_endpoint("http://192.168.1.25:8080", false).unwrap();
+        agent_hub_approval_client::validate_endpoint("https://example.test", false).unwrap();
         agent_hub_approval_client::validate_endpoint("https://example.test/approvals", true)
             .unwrap();
         agent_hub_approval_client::validate_endpoint("http://127.0.0.1:8080", true).unwrap();

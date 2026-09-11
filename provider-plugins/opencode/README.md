@@ -38,7 +38,8 @@ Add to the shell profile that launches opencode (e.g. `~/.zshrc`):
 
 ```sh
 export AGENT_HUB_SERVER="https://hub.example.com"   # your server URL
-export AGENT_HUB_TOKEN="your-bearer-token"          # server auth token
+# Optional for HTTP or HTTPS — omit when the server does not require auth
+# export AGENT_HUB_TOKEN="your-bearer-token"
 # Optional — defaults to ~/.config/agent-hub/agent-hub-permissions.json
 # export AGENT_HUB_CONFIG="/path/to/agent-hub-permissions.json"
 # Optional — defaults to "agent-hub-gateway" on PATH
@@ -52,10 +53,11 @@ export AGENT_HUB_APPROVAL_MODE="attended_socket"
 export AGENT_HUB_ATTENDED_APPROVAL_SOCKET="/agent-hub/approval/approval.sock"
 export AGENT_HUB_ATTENDED_APPROVAL_BINDING='{"run_epoch":"...","authorization_digest":"...","environment_bundle_digest":"...","image_digest":"sha256:...","network_digest":"...","approval_bundle_digest":"..."}'
 export AGENT_HUB_ATTENDED_RUN_DEADLINE="2099-01-02T03:04:05Z"
+export AGENT_HUB_PLUGIN_RUN_NONCE="0123456789abcdef0123456789abcdef"
 export AGENT_HUB_CONFIG="/agent-hub/agent-hub-permissions.json"
 ```
 
-Sandbox mode is explicit and fail closed. All four values are required, and
+Sandbox mode is explicit and fail closed. All five transport values are required, and
 `AGENT_HUB_SERVER`, `AGENT_HUB_TOKEN`, `AGENT_HUB_APPROVALS_SERVER`, and
 `AGENT_HUB_APPROVALS_TOKEN` are forbidden. Without `AGENT_HUB_APPROVAL_MODE`,
 the plugin retains the existing host HTTP behavior and rejects stray attended
@@ -89,8 +91,10 @@ attest the relay executable or host identity, and PID values may be translated
 by namespaces. The immutable host-created mount and run binding remain the
 authority boundary.
 
-In host mode, server and token arguments are still supplied to the gateway even
-when decisions resolve locally. Socket mode supplies neither.
+In host mode, the server and optional token arguments are supplied to the
+gateway even when decisions resolve locally. HTTP and HTTPS endpoints may use
+localhost, wildcard/listener addresses, LAN names or IPs, or remote names.
+Socket mode supplies neither.
 
 ### 3. Create a rule config
 
@@ -120,29 +124,29 @@ See `agent-hub/gateway/config/tools.json` for a checked-in example and
 ### 4. Register the plugin with opencode
 
 Add the plugin to your project or global opencode config. The config file is
-`.opencode/config.json` in your project root, or
-`~/.config/opencode/config.json` for global use.
+`opencode.json` in your project root, or
+`~/.config/opencode/opencode.json` for global use.
 
-**Project config** (`.opencode/config.json`):
+**Project config** (`opencode.json`):
 ```json
 {
   "plugin": [
-    "file:///absolute/path/to/opencode-plugin"
+    "file:///absolute/path/to/provider-plugins/opencode/agent-hub.ts"
   ]
 }
 ```
 
-**Global config** (`~/.config/opencode/config.json`):
+**Global config** (`~/.config/opencode/opencode.json`):
 ```json
 {
   "plugin": [
-    "file:///home/you/workspaces/ai_environment/opencode-plugin"
+    "file:///home/you/code/agent-hub/provider-plugins/opencode/agent-hub.ts"
   ]
 }
 ```
 
-The path must be absolute and point to the `opencode-plugin/` directory in
-this workspace (the one that contains `package.json` and `agent-hub.ts`).
+The path must be absolute and point to `provider-plugins/opencode/agent-hub.ts`
+in this repository.
 Bundled single-file artifacts must preserve the default `{ id, server }`
 export required by OpenCode's v1 plugin module loader.
 
@@ -210,10 +214,10 @@ post-execution evidence and every exclusion is an exact StructuredOutput call.
 ## Caveats
 
 - **Permission ownership**: immutable supervised config starts with the exact
-  `{ "*": "ask" }` fail-closed fallback. Once the one exact bundled plugin is
-  initialized, its config hook replaces the top-level permission tree and every
-  configured agent-specific tree with `"allow"`. The awaited execution hook is
-  then the sole policy owner; any tool call observed before that transformation
-  fails closed.
+  `{ "*": "deny" }` fail-closed fallback at the top level and for every
+  configured agent. The plugin retains those native fallbacks and transfers one
+  session at a time to `"allow"` only after `session.update` returns the exact
+  requested permission rules. The awaited execution hook routes tools only for
+  sessions with that proof. Any leaked native prompt is explicitly denied.
 - **Multiple files**: the plugin calls the gateway once per canonical file. The
   first denied file stops evaluation immediately.

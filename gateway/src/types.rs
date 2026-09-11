@@ -125,11 +125,25 @@ pub enum DecisionStatus {
     Denied,
     DeniedWithReason(String),
     TimedOut,
-    PipelineError,
+    PipelineError(String),
 }
 
-pub const APPROVAL_TIMEOUT_MESSAGE: &str = "Your approval request timed out because the operator was away. This is not a denial. Feel free to retry if you still need this.";
-pub const APPROVAL_PIPELINE_ERROR_MESSAGE: &str = "There was an error in the approvals pipeline. This is a null answer: it is neither an approval nor a rejection of your intended action. Do not take this as a signal that your intended path is unwanted. Try again; if the error recurs, abort and report it to the operator.";
+pub const APPROVAL_TIMEOUT_MESSAGE: &str = "Agent Hub denied tool execution because the approval request timed out before an operator decision.";
+pub const APPROVAL_PIPELINE_ERROR_MESSAGE: &str =
+    "Agent Hub denied tool execution because the approval pipeline failed";
+
+pub fn bounded_gateway_message(value: &str) -> String {
+    let mut end = value.len().min(4096);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+pub fn approval_pipeline_error_message(detail: &str) -> String {
+    let value = format!("{APPROVAL_PIPELINE_ERROR_MESSAGE} (gateway): {detail}");
+    bounded_gateway_message(&value)
+}
 
 /// The final decision produced by the gateway's approval flow.
 ///

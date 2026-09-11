@@ -580,7 +580,7 @@ impl ApprovalClient {
     }
 }
 
-pub fn validate_endpoint(value: &str, has_token: bool) -> Result<Url, Error> {
+pub fn validate_endpoint(value: &str, _has_token: bool) -> Result<Url, Error> {
     let mut url = Url::parse(value)
         .map_err(|error| Error::endpoint(format!("server URL is invalid: {error}")))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -594,23 +594,8 @@ pub fn validate_endpoint(value: &str, has_token: bool) -> Result<Url, Error> {
             "server URL must not contain query or fragment",
         ));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| Error::endpoint("server URL has no host"))?
-        .trim_matches(['[', ']']);
-    let loopback = host
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|address| address.is_loopback());
-    if url.scheme() == "http" && !loopback {
-        return Err(Error::endpoint(
-            "HTTP is permitted only for a literal loopback address",
-        ));
-    }
-    if !loopback && !has_token {
-        return Err(Error::endpoint(
-            "non-loopback approval endpoints require HTTPS plus a bearer token",
-        ));
-    }
+    url.host_str()
+        .ok_or_else(|| Error::endpoint("server URL has no host"))?;
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
         url.set_path(&path);

@@ -1,6 +1,6 @@
 use crate::types::{
-    APPROVAL_PIPELINE_ERROR_MESSAGE, APPROVAL_TIMEOUT_MESSAGE, DecisionStatus, HookOutput,
-    ParseError, ToolHookEvent, build_display_name,
+    APPROVAL_TIMEOUT_MESSAGE, DecisionStatus, HookOutput, ParseError, ToolHookEvent,
+    approval_pipeline_error_message, bounded_gateway_message, build_display_name,
 };
 use config::normalize_path;
 use protocol::{OpenCodeHookInput, OpenCodeHookOutput, Tool, ToolCall};
@@ -50,10 +50,10 @@ impl TryFrom<OpenCodeHookInput> for ToolHookEvent {
 pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
     let allowed = matches!(decision.status, DecisionStatus::Approved);
     let reason = match &decision.status {
-        DecisionStatus::DeniedWithReason(r) => Some(r.clone()),
+        DecisionStatus::DeniedWithReason(r) => Some(bounded_gateway_message(r)),
         DecisionStatus::Denied => Some("denied by policy".to_string()),
         DecisionStatus::TimedOut => Some(APPROVAL_TIMEOUT_MESSAGE.to_string()),
-        DecisionStatus::PipelineError => Some(APPROVAL_PIPELINE_ERROR_MESSAGE.to_string()),
+        DecisionStatus::PipelineError(detail) => Some(approval_pipeline_error_message(detail)),
         DecisionStatus::Approved => None,
     };
     let output = OpenCodeHookOutput { allowed, reason };
@@ -97,8 +97,8 @@ mod tests {
                 crate::types::APPROVAL_TIMEOUT_MESSAGE,
             ),
             (
-                DecisionStatus::PipelineError,
-                crate::types::APPROVAL_PIPELINE_ERROR_MESSAGE,
+                DecisionStatus::PipelineError("connection refused".into()),
+                "Agent Hub denied tool execution because the approval pipeline failed (gateway): connection refused",
             ),
         ] {
             let output = HookOutput {

@@ -18,11 +18,13 @@ pub(crate) fn status_to_output(status: &ApprovalStatus) -> HookOutput {
             message: None,
         },
         ApprovalStatus::Cancelled => HookOutput {
-            status: DecisionStatus::PipelineError,
+            status: DecisionStatus::PipelineError(
+                "approval was cancelled without a decision".into(),
+            ),
             message: None,
         },
         ApprovalStatus::Pending => HookOutput {
-            status: DecisionStatus::PipelineError,
+            status: DecisionStatus::PipelineError("approval remained pending unexpectedly".into()),
             message: None,
         },
     }

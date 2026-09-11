@@ -454,12 +454,12 @@ fn validate_supervised_permission_tree(
     match value.as_object() {
         Some(entries)
             if entries.len() == 1
-                && entries.get("*").and_then(serde_json::Value::as_str) == Some("ask") =>
+                && entries.get("*").and_then(serde_json::Value::as_str) == Some("deny") =>
         {
             Ok(())
         }
         _ => Err(format!(
-            "supervised OpenCode {location} must be the exact fail-closed {{\"*\":\"ask\"}} startup fallback"
+            "supervised OpenCode {location} must be the exact fail-closed {{\"*\":\"deny\"}} startup fallback"
         )),
     }
 }
@@ -1084,17 +1084,18 @@ dippy_wheel_sha256 = "{}"
     #[test]
     fn approval_modes_require_fail_closed_supervision_or_non_interactive_auto_rules() {
         let supervised = serde_json::to_vec(&json!({
-            "permission":{"*":"ask"},
+            "permission":{"*":"deny"},
             "plugin":[APPROVAL_PLUGIN_URI],
-            "agent":{"review":{"permission":{"*":"ask"}}}
+            "agent":{"review":{"permission":{"*":"deny"}}}
         }))
         .unwrap();
         validate_supervised_opencode_config(&supervised).unwrap();
         for invalid in [
             json!({"permission":{"*":"allow"}}),
-            json!({"permission":{"*":"ask"},"plugin":["unexpected"]}),
-            json!({"permission":{"*":"ask"},"plugin":[APPROVAL_PLUGIN_URI],"agent":{"review":{"permission":{"bash":"allow"}}}}),
-            json!({"permission":{"*":"ask","bash":{"git *":"allow"}},"plugin":[APPROVAL_PLUGIN_URI]}),
+            json!({"permission":{"*":"deny"},"plugin":["unexpected"]}),
+            json!({"permission":{"*":"deny"},"plugin":[APPROVAL_PLUGIN_URI],"agent":{"review":{"permission":{"bash":"allow"}}}}),
+            json!({"permission":{"*":"deny","bash":{"git *":"allow"}},"plugin":[APPROVAL_PLUGIN_URI]}),
+            json!({"permission":{"*":"ask"},"plugin":[APPROVAL_PLUGIN_URI]}),
         ] {
             assert!(
                 validate_supervised_opencode_config(&serde_json::to_vec(&invalid).unwrap())

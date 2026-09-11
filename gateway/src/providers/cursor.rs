@@ -1,6 +1,6 @@
 use crate::types::{
-    APPROVAL_PIPELINE_ERROR_MESSAGE, APPROVAL_TIMEOUT_MESSAGE, DecisionStatus, HookOutput,
-    ParseError, ToolHookEvent, build_display_name,
+    APPROVAL_TIMEOUT_MESSAGE, DecisionStatus, HookOutput, ParseError, ToolHookEvent,
+    approval_pipeline_error_message, bounded_gateway_message, build_display_name,
 };
 use protocol::{CursorHookInput, CursorHookOutput, PermissionDecision, Tool, ToolCall};
 
@@ -40,12 +40,12 @@ pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
         DecisionStatus::Denied
         | DecisionStatus::DeniedWithReason(_)
         | DecisionStatus::TimedOut
-        | DecisionStatus::PipelineError => PermissionDecision::Deny,
+        | DecisionStatus::PipelineError(_) => PermissionDecision::Deny,
     };
     let msg = match &decision.status {
-        DecisionStatus::DeniedWithReason(r) => r.clone(),
+        DecisionStatus::DeniedWithReason(r) => bounded_gateway_message(r),
         DecisionStatus::TimedOut => APPROVAL_TIMEOUT_MESSAGE.to_string(),
-        DecisionStatus::PipelineError => APPROVAL_PIPELINE_ERROR_MESSAGE.to_string(),
+        DecisionStatus::PipelineError(detail) => approval_pipeline_error_message(detail),
         _ => decision
             .message
             .clone()
@@ -83,8 +83,8 @@ mod tests {
                 crate::types::APPROVAL_TIMEOUT_MESSAGE,
             ),
             (
-                DecisionStatus::PipelineError,
-                crate::types::APPROVAL_PIPELINE_ERROR_MESSAGE,
+                DecisionStatus::PipelineError("connection refused".into()),
+                "Agent Hub denied tool execution because the approval pipeline failed (gateway): connection refused",
             ),
         ] {
             let output = HookOutput {

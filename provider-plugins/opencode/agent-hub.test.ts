@@ -5,14 +5,25 @@ import path from "node:path"
 import type { OpenCodeHookInput } from "./generated/gateway-types"
 
 let approvalPayloads: OpenCodeHookInput[] = []
-let questionGatewayResults: Array<{
+type ProcessFixture = {
   code?: number
   stdout?: string
   stderr?: string
   spawnError?: string
-}> = []
+  readError?: string
+  writeError?: string
+  signal?: NodeJS.Signals
+  hang?: boolean
+}
+let approvalGatewayResults: ProcessFixture[] = []
+let questionGatewayResults: ProcessFixture[] = []
+let statusGatewayResults: ProcessFixture[] = []
+let statusGatewayCalls = 0
 let questionReplies: Array<{ requestID: string; directory: string; answers: string[][] }> = []
 let questionRejections: Array<{ requestID: string; directory: string }> = []
+let questionReplyResults: Array<Record<string, unknown>> = []
+let questionRejectResults: Array<Record<string, unknown>> = []
+let sessionUpdateResults: Array<Record<string, unknown>> = []
 
 const logRoot = path.resolve("../../target", `opencode-plugin-test-${crypto.randomUUID()}`)
 mkdirSync(path.join(logRoot, "opencode", "log"), { recursive: true })
@@ -22,14 +33,19 @@ afterAll(() => rmSync(logRoot, { recursive: true, force: true }))
 
 mock.module("@opencode-ai/sdk/v2", () => ({
   OpencodeClient: class {
+    session = {
+      update: async () => sessionUpdateResults.shift() ?? {
+        data: { permission: [{ permission: "*", pattern: "*", action: "allow" }] },
+      },
+    }
     question = {
       reply: async (input: { requestID: string; directory: string; answers: string[][] }) => {
         questionReplies.push(input)
-        return {}
+        return questionReplyResults.shift() ?? {}
       },
       reject: async (input: { requestID: string; directory: string }) => {
         questionRejections.push(input)
-        return {}
+        return questionRejectResults.shift() ?? {}
       },
     }
   },
@@ -38,46 +54,74 @@ mock.module("@opencode-ai/sdk/v2", () => ({
 mock.module("child_process", () => ({
   spawn: (_bin: string, args: string[]) => {
     const proc = new EventEmitter() as EventEmitter & {
-      stdin: { end: (payload: string) => void }
+      stdin: EventEmitter & { end: (payload: string, callback?: (error?: Error | null) => void) => void }
       stdout: EventEmitter
       stderr: EventEmitter
-      kill: () => boolean
+      kill: (signal?: NodeJS.Signals) => boolean
     }
     proc.stdout = new EventEmitter()
     proc.stderr = new EventEmitter()
-    proc.kill = () => true
-    proc.stdin = {
-      end: (payload: string) => {
+    let closed = false
+    proc.kill = (signal = "SIGTERM") => {
+      if (!closed) queueMicrotask(() => {
+        if (closed) return
+        closed = true
+        proc.emit("close", null, signal)
+      })
+      return true
+    }
+    proc.stdin = Object.assign(new EventEmitter(), {
+      end: (payload: string, callback?: (error?: Error | null) => void) => {
+        let result: ProcessFixture
         if (args[0] === "approval") {
           approvalPayloads.push(JSON.parse(payload) as OpenCodeHookInput)
-          queueMicrotask(() => {
-            proc.stdout.emit("data", Buffer.from('{"allowed":true}'))
-            proc.emit("close", 0)
-          })
+          result = approvalGatewayResults.shift() ?? { stdout: '{"allowed":true}' }
+        } else if (args[0] === "question") {
+          result = questionGatewayResults.shift() ?? { stdout: '{"answers":[]}' }
+        } else if (args[0] === "status-report") {
+          statusGatewayCalls += 1
+          result = statusGatewayResults.shift() ?? { code: 0 }
+        } else {
+          result = { code: 0 }
         }
-        if (args[0] === "question") {
-          const result = questionGatewayResults.shift()
-          if (!result) throw new Error("missing question gateway test result")
-          queueMicrotask(() => {
-            if (result.spawnError) {
-              proc.emit("error", new Error(result.spawnError))
-              return
-            }
-            if (result.stdout) proc.stdout.emit("data", Buffer.from(result.stdout))
-            if (result.stderr) proc.stderr.emit("data", Buffer.from(result.stderr))
-            proc.emit("close", result.code ?? 0)
-          })
-        }
+        if (result.writeError) callback?.(new Error(result.writeError))
+        else callback?.()
+        if (result.hang || result.writeError) return
+        queueMicrotask(() => {
+          if (closed) return
+          if (result.spawnError) {
+            proc.emit("error", new Error(result.spawnError))
+            return
+          }
+          if (result.stdout) proc.stdout.emit("data", Buffer.from(result.stdout))
+          if (result.stderr) proc.stderr.emit("data", Buffer.from(result.stderr))
+          if (result.readError) {
+            proc.stdout.emit("error", new Error(result.readError))
+            return
+          }
+          closed = true
+          proc.emit("close", result.signal ? null : result.code ?? 0, result.signal ?? null)
+        })
       },
-    }
+    })
     return proc
   },
-  spawnSync: () => ({ status: 0 }),
+  spawnSync: () => ({ status: 0, signal: null, stderr: Buffer.alloc(0) }),
 }))
 
 async function loadPlugin() {
   const { default: plugin } = await import(`./agent-hub.ts?test=${Date.now()}-${Math.random()}`)
   return typeof plugin === "function" ? plugin : plugin.server
+}
+
+async function initializedHooks(directory = "/home/user/project") {
+  const hooks = await (await loadPlugin())(pluginInput(directory))
+  await hooks.config!({ permission: { "*": "ask" }, agent: { review: { permission: { "*": "ask" } } } } as any)
+  return hooks
+}
+
+async function ownSession(hooks: Awaited<ReturnType<typeof initializedHooks>>, sid = "session-1") {
+  await hooks["chat.message"]!({ sessionID: sid } as any, {} as any)
 }
 
 function pluginInput(directory: string) {
@@ -120,6 +164,7 @@ const {
   makeGlobToolInput,
   makePayload,
   makeReadToolInput,
+  runGatewayProcess,
 } = await import("./agent-hub")
 
 describe("makePayload", () => {
@@ -235,12 +280,16 @@ describe("makeGlobToolInput", () => {
 describe("gateway cwd forwarding", () => {
   beforeEach(() => {
     approvalPayloads = []
+    approvalGatewayResults = []
+    sessionUpdateResults = []
   })
 
   test("forwards one absolute plugin directory unchanged for arbitrary MCP tool", async () => {
     const server = await loadPlugin()
     const directory = "/home/user/project/./crates/.."
     const hooks = await server(pluginInput(directory))
+    await hooks.config!({ permission: { "*": "deny" } } as any)
+    await ownSession(hooks)
 
     await hooks["tool.execute.before"]!(
       { sessionID: "session-1", callID: "call-1", tool: "mcp_weather_lookup" },
@@ -268,16 +317,145 @@ describe("gateway cwd forwarding", () => {
   })
 })
 
+describe("permission ownership and fail-closed routing", () => {
+  beforeEach(() => {
+    approvalGatewayResults = []
+    sessionUpdateResults = []
+    statusGatewayResults = []
+    statusGatewayCalls = 0
+  })
+
+  test("config installs deny fallbacks for top-level and every configured agent", async () => {
+    const hooks = await (await loadPlugin())(pluginInput("/home/user/project"))
+    const config = {
+      permission: { "*": "ask" },
+      agent: { build: {}, review: { permission: { bash: "allow" } } },
+    } as any
+
+    await hooks.config!(config)
+
+    expect(config.permission).toEqual({ "*": "deny" })
+    expect(config.agent.build.permission).toEqual({ "*": "deny" })
+    expect(config.agent.review.permission).toEqual({ "*": "deny" })
+  })
+
+  test("rejects tools for sessions without proven permission ownership", async () => {
+    const hooks = await initializedHooks()
+    await expect(hooks["tool.execute.before"]!(
+      { sessionID: "unowned", callID: "call-unowned", tool: "bash" },
+      { args: { command: "touch denied" } },
+    )).rejects.toThrow(/has not transferred permission ownership/)
+  })
+
+  test.each([
+    ["session update error", { error: { message: "update failed" } }],
+    ["session update missing proof", { data: { permission: [] } }],
+  ])("%s never establishes ownership", async (_name, response) => {
+    sessionUpdateResults.push(response)
+    const hooks = await initializedHooks()
+    await expect(ownSession(hooks)).rejects.toThrow(/ownership failed/)
+    await expect(hooks["tool.execute.before"]!(
+      { sessionID: "session-1", callID: "call-failed-owner", tool: "bash" },
+      { args: { command: "touch denied" } },
+    )).rejects.toThrow(/has not transferred permission ownership/)
+  })
+
+  test("always denies leaked native permission prompts", async () => {
+    const hooks = await initializedHooks()
+    const output: { status: "ask" | "deny" | "allow" } = { status: "ask" }
+    await hooks["permission.ask"]!({ id: "permission-1", sessionID: "session-1" } as any, output)
+    expect(output.status).toBe("deny")
+  })
+
+  test.each([
+    ["spawn", { spawnError: "binary missing" }, "spawn"],
+    ["read", { readError: "stdout broke" }, "read"],
+    ["write", { writeError: "stdin broke" }, "write"],
+    ["signal", { signal: "SIGTERM" as NodeJS.Signals }, "signal"],
+    ["nonzero", { code: 2, stderr: "invalid config detail" }, "nonzero"],
+    ["malformed", { stdout: "not-json" }, "malformed"],
+    ["oversized", { stdout: "界".repeat(400_000) }, "oversized"],
+    ["schema", { stdout: '{"allowed":"yes"}' }, "schema"],
+  ])("returns a bounded explicit denial for %s gateway failure", async (_name, fixture, category) => {
+    approvalGatewayResults.push(fixture)
+    const hooks = await initializedHooks()
+    await ownSession(hooks)
+    let message = ""
+    try {
+      await hooks["tool.execute.before"]!(
+        { sessionID: "session-1", callID: `call-${category}`, tool: "bash" },
+        { args: { command: "touch denied" } },
+      )
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message).toContain("Agent Hub denied tool execution because the approval pipeline failed")
+    expect(message).toContain(`(${category})`)
+    if (category === "nonzero") expect(message).toContain("invalid config detail")
+    expect(Buffer.byteLength(message)).toBeLessThanOrEqual(4096)
+  })
+
+  test("bounds and preserves an actual operator denial", async () => {
+    approvalGatewayResults.push({ stdout: JSON.stringify({ allowed: false, reason: "界".repeat(2000) }) })
+    const hooks = await initializedHooks()
+    await ownSession(hooks)
+    let message = ""
+    try {
+      await hooks["tool.execute.before"]!(
+        { sessionID: "session-1", callID: "call-operator-denial", tool: "bash" },
+        { args: { command: "touch denied" } },
+      )
+    } catch (error) {
+      message = (error as Error).message
+    }
+    expect(message.startsWith("界")).toBe(true)
+    expect(Buffer.byteLength(message)).toBeLessThanOrEqual(4096)
+  })
+
+  test("process timeout kills, reaps, and resolves once", async () => {
+    approvalGatewayResults.push({ hang: true })
+    const result = await runGatewayProcess({
+      bin: "gateway",
+      args: ["approval"],
+      input: "{}",
+      timeoutMs: 1,
+    })
+    expect(result).toMatchObject({ ok: false, category: "timeout" })
+  })
+
+  test.each([
+    ["nonzero", { code: 1, stderr: "status unavailable" }],
+    ["oversized", { stderr: "x".repeat(1024 * 1024 + 1) }],
+  ])("status %s failure is bounded, non-authoritative, and retried", async (_name, fixture) => {
+    statusGatewayResults.push(fixture)
+    const hooks = await initializedHooks()
+    await ownSession(hooks)
+    await hooks["tool.execute.before"]!(
+      { sessionID: "session-1", callID: `call-status-1-${_name}`, tool: "bash" },
+      { args: { command: "true" } },
+    )
+    await flushQuestionCallback()
+    await hooks["tool.execute.before"]!(
+      { sessionID: "session-1", callID: `call-status-2-${_name}`, tool: "bash" },
+      { args: { command: "true" } },
+    )
+    expect(statusGatewayCalls).toBe(2)
+  })
+
+})
+
 describe("question gateway outcomes", () => {
   beforeEach(() => {
     questionGatewayResults = []
     questionReplies = []
     questionRejections = []
+    questionReplyResults = []
+    questionRejectResults = []
   })
 
   test("explicit rejection calls reject and does not reply", async () => {
     questionGatewayResults.push({ code: 1 })
-    const hooks = await (await loadPlugin())(pluginInput("/home/user/project"))
+    const hooks = await initializedHooks()
 
     await hooks.event!(questionAsked())
     await flushQuestionCallback()
@@ -288,12 +466,12 @@ describe("question gateway outcomes", () => {
 
   test("timeout replies with one exact synthetic answer per question", async () => {
     questionGatewayResults.push({ code: 3 })
-    const hooks = await (await loadPlugin())(pluginInput("/home/user/project"))
+    const hooks = await initializedHooks()
 
     await hooks.event!(questionAsked(3))
     await flushQuestionCallback()
 
-    const message = "Your approval request timed out because the operator was away. This is not a denial. Feel free to retry if you still need this."
+    const message = "Agent Hub denied this request because the approval request timed out before an operator decision."
     expect(questionReplies).toHaveLength(1)
     expect(questionReplies[0]?.answers).toEqual([[message], [message], [message]])
     expect(questionRejections).toHaveLength(0)
@@ -307,17 +485,56 @@ describe("question gateway outcomes", () => {
     ["malformed output", { code: 0, stdout: "not json" }],
     ["answer cardinality mismatch", { code: 0, stdout: '{"answers":[["one answer"]]}' }],
     ["oversized output", { code: 0, stdout: "x".repeat(1024 * 1024 + 1) }],
-  ])("%s replies with neutral pipeline errors and never rejects", async (_name, result) => {
+  ])("%s replies with explicit pipeline denial and never rejects", async (_name, result) => {
     questionGatewayResults.push(result)
-    const hooks = await (await loadPlugin())(pluginInput("/home/user/project"))
+    const hooks = await initializedHooks()
 
     await hooks.event!(questionAsked(2))
     await flushQuestionCallback()
 
-    const message = "There was an error in the approvals pipeline. This is a null answer: it is neither an approval nor a rejection of your intended action. Do not take this as a signal that your intended path is unwanted. Try again; if the error recurs, abort and report it to the operator."
     expect(questionReplies).toHaveLength(1)
-    expect(questionReplies[0]?.answers).toEqual([[message], [message]])
+    expect(questionReplies[0]?.answers).toHaveLength(2)
+    expect(questionReplies[0]?.answers[0]?.[0]).toContain("Agent Hub denied tool execution because the approval pipeline failed")
+    expect(Buffer.byteLength(questionReplies[0]?.answers[0]?.[0] ?? "")).toBeLessThanOrEqual(4096)
     expect(questionRejections).toHaveLength(0)
+  })
+
+  test("unexpected question reply failure returns a visible pipeline error", async () => {
+    questionGatewayResults.push({ stdout: '{"answers":[["yes"],["no"]]}' })
+    questionReplyResults.push({ error: { message: "reply failed" } })
+    const hooks = await initializedHooks()
+
+    await hooks.event!(questionAsked(2))
+    await flushQuestionCallback()
+
+    expect(questionReplies).toHaveLength(2)
+    expect(questionReplies[1]?.answers[0]?.[0]).toContain("approval pipeline failed")
+  })
+
+  test("unexpected question reject failure returns a visible pipeline error", async () => {
+    questionGatewayResults.push({ code: 1 })
+    questionRejectResults.push({ error: { message: "reject failed" } })
+    const hooks = await initializedHooks()
+
+    await hooks.event!(questionAsked(2))
+    await flushQuestionCallback()
+
+    expect(questionRejections).toHaveLength(1)
+    expect(questionReplies[0]?.answers[0]?.[0]).toContain("approval pipeline failed")
+  })
+
+  test("failed visible pipeline reply terminates the question", async () => {
+    questionGatewayResults.push({ spawnError: "gateway missing" })
+    questionReplyResults.push(
+      { error: { message: "reply failed" } },
+      { error: { message: "fallback reply failed" } },
+    )
+    const hooks = await initializedHooks()
+
+    await hooks.event!(questionAsked(2))
+    await flushQuestionCallback()
+
+    expect(questionRejections).toEqual([{ requestID: "question-1", directory: "/home/user/project" }])
   })
 })
 

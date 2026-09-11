@@ -174,12 +174,15 @@ impl ApprovalFlowError {
         if let Self::Pipeline(reason) | Self::FailClosed(reason) = &self {
             eprintln!("[error] approvals pipeline failed: {reason}");
         }
-        HookOutput {
-            status: match self {
-                Self::Timeout => DecisionStatus::TimedOut,
-                Self::Pipeline(_) | Self::FailClosed(_) => DecisionStatus::PipelineError,
+        match self {
+            Self::Timeout => HookOutput {
+                status: DecisionStatus::TimedOut,
+                message: None,
             },
-            message: None,
+            Self::Pipeline(reason) | Self::FailClosed(reason) => HookOutput {
+                status: DecisionStatus::PipelineError(reason),
+                message: None,
+            },
         }
     }
 
@@ -359,7 +362,7 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
                 DecisionStatus::Denied | DecisionStatus::DeniedWithReason(_) => {
                     protocol::AgentHubRunDecision::Deny
                 }
-                DecisionStatus::TimedOut | DecisionStatus::PipelineError => {
+                DecisionStatus::TimedOut | DecisionStatus::PipelineError(_) => {
                     eprintln!("agent-hub-gateway: approval authority returned no decision");
                     return ExitCode::from(1);
                 }
@@ -841,7 +844,7 @@ async fn run(
                     Some(protocol::AttendedGatewayTransitionKind::LocalDeny)
                 }
             }
-            DecisionStatus::TimedOut | DecisionStatus::PipelineError => None,
+            DecisionStatus::TimedOut | DecisionStatus::PipelineError(_) => None,
         };
         if let Some(transition) = transition {
             report_execution_transition(args, event, transition).await?;
@@ -1355,7 +1358,7 @@ mod tests {
         for status in [ApprovalStatus::Cancelled, ApprovalStatus::Pending] {
             assert!(matches!(
                 status_to_output(&status).status,
-                DecisionStatus::PipelineError
+                DecisionStatus::PipelineError(_)
             ));
         }
     }

@@ -7528,10 +7528,10 @@ exit 0
                 }
             }
         });
-        opencode_config["permission"] = serde_json::json!({"*":"allow"});
+        opencode_config["permission"] = serde_json::json!({"*":"deny"});
         if let Some(agents) = opencode_config["agent"].as_object_mut() {
             for agent in agents.values_mut() {
-                agent["permission"] = serde_json::json!({"*":"allow"});
+                agent["permission"] = serde_json::json!({"*":"deny"});
             }
         }
         std::fs::write(&opencode_config_path, serde_json::to_vec(&opencode_config)?)?;

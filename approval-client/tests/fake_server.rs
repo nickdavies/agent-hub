@@ -58,22 +58,35 @@ async fn server(
 }
 
 #[test]
-fn endpoint_rules_require_secure_authenticated_remote_or_literal_loopback() {
+fn endpoint_rules_accept_http_and_https_hosts_with_optional_authentication() {
     for endpoint in [
-        "file:///server",
         "http://localhost:8080",
+        "http://0.0.0.0:8080",
+        "http://192.168.1.25:8080",
+        "http://approvals.lan",
         "http://example.test",
         "https://example.test",
+    ] {
+        validate_endpoint(endpoint, false).unwrap();
+        validate_endpoint(endpoint, true).unwrap();
+    }
+    for endpoint in [
+        "file:///server",
         "https://user@example.test",
         "https://example.test?query=yes",
         "https://example.test#fragment",
+        "https://:8080",
     ] {
         assert!(validate_endpoint(endpoint, false).is_err(), "{endpoint}");
     }
     validate_endpoint("http://127.0.0.1:8080/base", false).unwrap();
     validate_endpoint("http://[::1]:8080", false).unwrap();
-    validate_endpoint("https://127.0.0.1:8080", false).unwrap();
-    validate_endpoint("https://example.test/base", true).unwrap();
+    assert_eq!(
+        validate_endpoint("https://example.test/base", false)
+            .unwrap()
+            .as_str(),
+        "https://example.test/base/"
+    );
 }
 
 #[tokio::test]
