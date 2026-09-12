@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "description": "opencode plugin: routes tool execution through agent-hub-gateway",
   "type": "module",
-  "main": "agent-hub.ts",
-  "oc-plugin": ["server"],
+  "main": "index.ts",
+  "oc-plugin": ["default"],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "generate:schemas": "cd ../.. && cargo run -p protocol --bin generate_schemas -- provider-plugins/opencode/generated",
