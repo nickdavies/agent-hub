@@ -859,7 +859,17 @@ export async function createPluginInstance(
         if (response.error) {
           throw new Error(`session.update returned ${JSON.stringify(response.error)}`)
         }
-        if (JSON.stringify(response.data?.permission) !== JSON.stringify(SESSION_ALLOW_RULES)) {
+        const permissions = response.data?.permission
+        const validRules = Array.isArray(permissions) && permissions.every((rule) =>
+          rule !== null
+          && typeof rule === "object"
+          && !Array.isArray(rule)
+          && typeof rule.permission === "string"
+          && typeof rule.pattern === "string"
+          && (rule.action === "allow" || rule.action === "ask" || rule.action === "deny"))
+        // Session updates append rules; OpenCode uses the last matching rule.
+        const lastRule = validRules ? permissions.at(-1) : undefined
+        if (lastRule?.permission !== "*" || lastRule.pattern !== "*" || lastRule.action !== "allow") {
           throw new Error("session.update response did not prove the requested permission rules")
         }
       } catch (error) {

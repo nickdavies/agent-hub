@@ -353,6 +353,9 @@ describe("permission ownership and fail-closed routing", () => {
 
   test.each([
     ["session update error", { error: { message: "update failed" } }],
+    ["session update error with proof", { error: { message: "update failed" }, data: { permission: [{ permission: "*", pattern: "*", action: "allow" }] } }],
+    ["session update missing data", {}],
+    ["session update missing permissions", { data: {} }],
     ["session update missing proof", { data: { permission: [] } }],
     ["session update rejection", new Error("update rejected")],
   ])("%s never establishes ownership", async (_name, response) => {
@@ -361,6 +364,62 @@ describe("permission ownership and fail-closed routing", () => {
     await expect(ownSession(hooks)).rejects.toThrow(/ownership failed/)
     await expect(hooks["tool.execute.before"]!(
       { sessionID: "session-1", callID: "call-failed-owner", tool: "bash" },
+      { args: { command: "touch denied" } },
+    )).rejects.toThrow(/has not transferred permission ownership/)
+  })
+
+  test.each([
+    ["seeded child denies", [
+      { permission: "todowrite", pattern: "*", action: "deny" },
+      { permission: "task", pattern: "*", action: "deny" },
+      { permission: "read", pattern: "*", action: "ask" },
+      { permission: "*", pattern: "*", action: "allow" },
+    ]],
+    ["reordered rule fields", [{ action: "allow", pattern: "*", permission: "*" }]],
+  ])("accepts %s and still routes tools through the gateway", async (_name, permission) => {
+    sessionUpdateResults.push({ data: { permission } })
+    const hooks = await initializedHooks()
+    await ownSession(hooks)
+    approvalGatewayResults.push({ stdout: '{"allowed":false,"reason":"gateway denied"}' })
+    await expect(hooks["tool.execute.before"]!(
+      { sessionID: "session-1", callID: "call-owned", tool: "bash" },
+      { args: { command: "touch denied" } },
+    )).rejects.toThrow("gateway denied")
+  })
+
+  test("repeated chat messages accept accumulated wildcard allows", async () => {
+    const hooks = await initializedHooks()
+    const permission = [{ permission: "task", pattern: "*", action: "deny" }]
+    for (let index = 0; index < 3; index++) {
+      permission.push({ permission: "*", pattern: "*", action: "allow" })
+      sessionUpdateResults.push({ data: { permission: [...permission] } })
+      await ownSession(hooks)
+      await hooks["tool.execute.before"]!(
+        { sessionID: "session-1", callID: `call-repeat-${index}`, tool: "bash" },
+        { args: { command: "true" } },
+      )
+    }
+  })
+
+  test.each([
+    ["null ruleset", null],
+    ["non-array ruleset", { permission: "*", pattern: "*", action: "allow" }],
+    ["null rule", [null, { permission: "*", pattern: "*", action: "allow" }]],
+    ["array rule", [[], { permission: "*", pattern: "*", action: "allow" }]],
+    ["missing permission", [{ pattern: "*", action: "deny" }, { permission: "*", pattern: "*", action: "allow" }]],
+    ["non-string pattern", [{ permission: "bash", pattern: 42, action: "deny" }, { permission: "*", pattern: "*", action: "allow" }]],
+    ["invalid action", [{ permission: "bash", pattern: "*", action: "invalid" }, { permission: "*", pattern: "*", action: "allow" }]],
+    ["non-wildcard permission", [{ permission: "bash", pattern: "*", action: "allow" }]],
+    ["non-wildcard pattern", [{ permission: "*", pattern: "git *", action: "allow" }]],
+    ["trailing deny", [{ permission: "*", pattern: "*", action: "allow" }, { permission: "bash", pattern: "*", action: "deny" }]],
+    ["trailing ask", [{ permission: "*", pattern: "*", action: "allow" }, { permission: "*", pattern: "*", action: "ask" }]],
+  ])("rejects %s and invalidates prior ownership", async (_name, permission) => {
+    const hooks = await initializedHooks()
+    await ownSession(hooks)
+    sessionUpdateResults.push({ data: { permission } })
+    await expect(ownSession(hooks)).rejects.toThrow(/ownership failed/)
+    await expect(hooks["tool.execute.before"]!(
+      { sessionID: "session-1", callID: "call-invalidated-owner", tool: "bash" },
       { args: { command: "touch denied" } },
     )).rejects.toThrow(/has not transferred permission ownership/)
   })
