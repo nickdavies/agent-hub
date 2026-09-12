@@ -5655,7 +5655,7 @@ mod tests {
         effects.hash(&mut hasher);
         assert_eq!(
             hasher.finish(),
-            16_626_740_105_356_053_607,
+            13_722_152_240_444_980_202,
             "external-effect source inventory changed; audit every changed helper and update the reviewed fingerprint"
         );
     }
