@@ -38,9 +38,6 @@ import { approvalTransport, gatewayApprovalInvocation, gatewaySupervisionInvocat
 import { isStructuredOutputTool, normalizeToolExecution } from "./permission-normalization"
 
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
-let readinessRecorded = false
-let configInitialized = false
-const permissionOwnedSessions = new Set<string>()
 const SESSION_ALLOW_RULES = [{ permission: "*", pattern: "*", action: "allow" as const }]
 
 type ExecutionStatus = "routing" | "authorized" | "completed" | "denied" | "transcript_only"
@@ -56,7 +53,21 @@ interface ExecutionRecord {
   requests: { requestID: string; canonicalDigest: string }[]
 }
 
-const executionRecords = new Map<string, ExecutionRecord>()
+interface PluginInstanceState {
+  readinessRecorded: boolean
+  configInitialized: boolean
+  permissionOwnedSessions: Set<string>
+  executionRecords: Map<string, ExecutionRecord>
+  procs: Map<string, Set<ChildProcess>>
+  questionGatewayProcs: Map<string, ChildProcess>
+  locallyAnsweredQuestions: Set<string>
+  statusTimers: Map<string, NodeJS.Timeout>
+  registeredSessions: Set<string>
+  pendingSessionRegistrations: Set<string>
+  exitHandled: boolean
+  titles: Map<string, string>
+  lastLogTime: number
+}
 
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical)
@@ -72,12 +83,12 @@ function digest(domain: string, value: unknown): string {
   return createHash("sha256").update(`${domain}\0`).update(JSON.stringify(canonical(value))).digest("hex")
 }
 
-function initializeRunEvidence() {
-  executionRecords.clear()
+function initializeRunEvidence(state: PluginInstanceState) {
+  state.executionRecords.clear()
 }
 
-function recordExecution(record: ExecutionRecord) {
-  executionRecords.set(record.call_id, record)
+function recordExecution(state: PluginInstanceState, record: ExecutionRecord) {
+  state.executionRecords.set(record.call_id, record)
 }
 
 function recordPermissionDenied(_reason?: string) {}
@@ -96,11 +107,10 @@ const logfile = path.join(
 
 type LogLevel = "INFO" | "WARN" | "ERROR"
 
-let last = Date.now()
-function log(level: LogLevel, msg: string, extra?: Record<string, string>) {
+function log(state: PluginInstanceState, level: LogLevel, msg: string, extra?: Record<string, string>) {
   const now = Date.now()
-  const diff = now - last
-  last = now
+  const diff = now - state.lastLogTime
+  state.lastLogTime = now
   const ts = new Date(now).toISOString().split(".")[0]
   const kv = Object.entries({ service: "agent-hub-plugin", ...extra })
     .map(([k, v]) => `${k}=${v}`)
@@ -113,19 +123,14 @@ function log(level: LogLevel, msg: string, extra?: Record<string, string>) {
 // Gateway subprocess tracking — kill on session abort
 // ---------------------------------------------------------------------------
 
-const procs: Map<string, Set<ChildProcess>> = new Map()
-
 // Per-question gateway process tracking — keyed by opencode question requestId.
 // Used to detect when the OpenCode TUI answers a question locally (i.e. before
 // the agent-hub gateway gets a chance to answer it), so we can cancel the
 // in-flight gateway and clean up the pending question on the server.
-const questionGatewayProcs: Map<string, ChildProcess> = new Map()
-
 // Set of requestIds that were answered locally in the OpenCode TUI before the
 // gateway had a chance to answer.  When the gateway process exits (due to
 // SIGTERM from our kill) with code 1, the callGatewayQuestion callback checks
 // this set and skips the question.reject call to avoid a double-resolve error.
-const locallyAnsweredQuestions: Set<string> = new Set()
 const GATEWAY_OUTPUT_LIMIT_BYTES = 1024 * 1024
 const DENIAL_LIMIT_BYTES = 4096
 const GATEWAY_OPERATION_TIMEOUT_MS = 86_410_000
@@ -159,7 +164,6 @@ export function runGatewayProcess(options: {
   input: string
   timeoutMs: number
   env?: NodeJS.ProcessEnv
-  sid?: string
   onSpawn?: (proc: ChildProcess) => void
 }): Promise<GatewayProcessResult> {
   return new Promise((resolve) => {
@@ -171,7 +175,6 @@ export function runGatewayProcess(options: {
       return
     }
 
-    if (options.sid) track(options.sid, proc)
     options.onSpawn?.(proc)
     let settled = false
     let pendingFailure: Exclude<GatewayProcessResult, { ok: true }> | undefined
@@ -184,7 +187,6 @@ export function runGatewayProcess(options: {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      if (options.sid) untrack(options.sid, proc)
       resolve(result.ok ? result : { ...result, detail: boundedUtf8(result.detail) })
     }
     const failAndReap = (category: GatewayFailureCategory, detail: string) => {
@@ -240,29 +242,29 @@ export function runGatewayProcess(options: {
   })
 }
 
-function track(sid: string, proc: ChildProcess) {
-  let set = procs.get(sid)
+function track(state: PluginInstanceState, sid: string, proc: ChildProcess) {
+  let set = state.procs.get(sid)
   if (!set) {
     set = new Set()
-    procs.set(sid, set)
+    state.procs.set(sid, set)
   }
   set.add(proc)
 }
 
-function untrack(sid: string, proc: ChildProcess) {
-  const set = procs.get(sid)
+function untrack(state: PluginInstanceState, sid: string, proc: ChildProcess) {
+  const set = state.procs.get(sid)
   if (!set) return
   set.delete(proc)
-  if (set.size === 0) procs.delete(sid)
+  if (set.size === 0) state.procs.delete(sid)
 }
 
-function killGateways(sid: string) {
-  const set = procs.get(sid)
+function killGateways(state: PluginInstanceState, sid: string) {
+  const set = state.procs.get(sid)
   if (!set || set.size === 0) return
-  log("INFO", "killing gateway subprocesses on abort", { sid, count: String(set.size) })
+  log(state, "INFO", "killing gateway subprocesses on abort", { sid, count: String(set.size) })
   for (const proc of set) {
     try { proc.kill("SIGTERM") } catch (err: unknown) {
-      log("WARN", "failed to kill gateway subprocess", { sid, err: String(err) })
+      log(state, "WARN", "failed to kill gateway subprocess", { sid, err: String(err) })
     }
   }
 }
@@ -271,68 +273,56 @@ function killGateways(sid: string) {
 // Status reporting — fire-and-forget via gateway status-report subcommand
 // ---------------------------------------------------------------------------
 
-const statusTimers: Map<string, NodeJS.Timeout> = new Map()
 const DEBOUNCE_MS = 2000
 
 // Track sessions we've already registered on the server so the first
 // tool execution for a new session triggers an immediate "active" report.
-const registeredSessions: Set<string> = new Set()
-const pendingSessionRegistrations: Set<string> = new Set()
-
 // On process exit, report all tracked sessions as ended so the dashboard
 // doesn't leave stale "active" / "idle" entries after opencode shuts down.
 // Uses spawnSync so the reports are delivered before the process terminates —
 // async spawn() in an exit handler is unreliable because stdin writes may not
 // flush before the parent dies.
-let exitHandled = false
-function onExit() {
-  if (exitHandled) return
-  exitHandled = true
-  for (const sid of registeredSessions) {
+function onExit(state: PluginInstanceState) {
+  if (state.exitHandled) return
+  state.exitHandled = true
+  for (const sid of state.registeredSessions) {
     // Cancel any pending debounced reports — we want "ended" immediately.
-    const pending = statusTimers.get(sid)
+    const pending = state.statusTimers.get(sid)
     if (pending) clearTimeout(pending)
-    statusTimers.delete(sid)
-    spawnStatusReportSync(sid, "ended")
+    state.statusTimers.delete(sid)
+    spawnStatusReportSync(state, sid, "ended")
   }
-  registeredSessions.clear()
+  state.registeredSessions.clear()
 }
-process.on("exit", onExit)
-process.on("SIGINT", () => {
-  onExit()
-  process.exit(130)
-})
-process.on("SIGTERM", () => {
-  onExit()
-  process.exit(143)
-})
 
 function reportStatus(
+  state: PluginInstanceState,
   sid: string,
   status: SessionStatus,
   opts?: { waitingReason?: string; displayName?: string },
 ) {
   // "ended" should fire immediately — no debounce
   if (status === "ended") {
-    const existing = statusTimers.get(sid)
+    const existing = state.statusTimers.get(sid)
     if (existing) clearTimeout(existing)
-    statusTimers.delete(sid)
-    spawnStatusReport(sid, status, opts)
+    state.statusTimers.delete(sid)
+    spawnStatusReport(state, sid, status, opts)
     return
   }
 
-  const existing = statusTimers.get(sid)
+  const existing = state.statusTimers.get(sid)
   if (existing) clearTimeout(existing)
 
   const timer = setTimeout(() => {
-    statusTimers.delete(sid)
-    spawnStatusReport(sid, status, opts)
+    state.statusTimers.delete(sid)
+    spawnStatusReport(state, sid, status, opts)
   }, DEBOUNCE_MS)
 
-  statusTimers.set(sid, timer)
+  state.statusTimers.set(sid, timer)
 }
 
 function spawnStatusReport(
+  state: PluginInstanceState,
   sid: string,
   status: SessionStatus,
   opts?: { waitingReason?: string; displayName?: string },
@@ -352,7 +342,7 @@ function spawnStatusReport(
   }
   const payload = JSON.stringify(report)
 
-  log("INFO", "spawnStatusReport", { sid, status })
+  log(state, "INFO", "spawnStatusReport", { sid, status })
 
   void runGatewayProcess({
     bin,
@@ -360,24 +350,25 @@ function spawnStatusReport(
     input: payload,
     timeoutMs: SHORT_GATEWAY_OPERATION_TIMEOUT_MS,
   }).then((result) => {
-    pendingSessionRegistrations.delete(sid)
+    state.pendingSessionRegistrations.delete(sid)
     if (!result.ok) {
-      registeredSessions.delete(sid)
-      log("WARN", "status report failed; later activity will retry", {
+      state.registeredSessions.delete(sid)
+      log(state, "WARN", "status report failed; later activity will retry", {
         sid,
         category: result.category,
         detail: result.detail,
       })
       return
     }
-    if (status === "active") registeredSessions.add(sid)
-    if (result.stderr) log("INFO", "status-report stderr", { output: boundedUtf8(result.stderr.trim()) })
+    if (status === "active") state.registeredSessions.add(sid)
+    if (result.stderr) log(state, "INFO", "status-report stderr", { output: boundedUtf8(result.stderr.trim()) })
   })
 }
 
 /** Synchronous variant used only during process exit to ensure the report
  *  is delivered before the Node.js process terminates. */
 function spawnStatusReportSync(
+  state: PluginInstanceState,
   sid: string,
   status: SessionStatus,
   opts?: { waitingReason?: string; displayName?: string },
@@ -397,7 +388,7 @@ function spawnStatusReportSync(
   }
   const payload = JSON.stringify(report)
 
-  log("INFO", "spawnStatusReportSync", { sid, status })
+  log(state, "INFO", "spawnStatusReportSync", { sid, status })
 
   try {
     const result = spawnSync(
@@ -412,16 +403,16 @@ function spawnStatusReportSync(
     )
     const stderr = boundedUtf8(result.stderr?.toString().trim() ?? "")
     if (result.error || result.status !== 0 || result.signal) {
-      log("WARN", "sync status report failed", {
+      log(state, "WARN", "sync status report failed", {
         status: String(result.status),
         signal: String(result.signal),
         detail: boundedUtf8(result.error?.message || stderr || "unknown failure"),
       })
     } else if (stderr) {
-      log("INFO", "sync status-report stderr", { output: stderr })
+      log(state, "INFO", "sync status-report stderr", { output: stderr })
     }
   } catch (err: unknown) {
-    log("WARN", "sync status report failed", { err: boundedUtf8(String(err)) })
+    log(state, "WARN", "sync status report failed", { err: boundedUtf8(String(err)) })
   }
 }
 
@@ -447,11 +438,11 @@ function isValidGatewayOutput(v: unknown): v is OpenCodeHookOutput {
 
 type ExecutionBinding = Readonly<{ callID: string; requestID: string; rawDigest: string; canonicalDigest: string }>
 
-async function callGateway(sid: string, payload: OpenCodeHookInput, execution: ExecutionBinding): Promise<GatewayResult> {
-  return callGatewayOnce(sid, payload, execution)
+async function callGateway(state: PluginInstanceState, sid: string, payload: OpenCodeHookInput, execution: ExecutionBinding): Promise<GatewayResult> {
+  return callGatewayOnce(state, sid, payload, execution)
 }
 
-async function callGatewayOnce(sid: string, payload: OpenCodeHookInput, execution: ExecutionBinding): Promise<GatewayResult> {
+async function callGatewayOnce(state: PluginInstanceState, sid: string, payload: OpenCodeHookInput, execution: ExecutionBinding): Promise<GatewayResult> {
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const config = process.env.AGENT_HUB_CONFIG
 
@@ -459,32 +450,37 @@ async function callGatewayOnce(sid: string, payload: OpenCodeHookInput, executio
   const args = invocation.args
   if (config) args.push("--config", config)
 
-  log("INFO", "callGateway", { bin, config: config ?? "(none)", transport: APPROVAL_TRANSPORT.kind })
+  log(state, "INFO", "callGateway", { bin, config: config ?? "(none)", transport: APPROVAL_TRANSPORT.kind })
 
+  let childProcess: ChildProcess | undefined
   const result = await runGatewayProcess({
     bin,
     args,
     env: invocation.env as NodeJS.ProcessEnv,
     input: JSON.stringify(payload),
     timeoutMs: GATEWAY_OPERATION_TIMEOUT_MS,
-    sid,
+    onSpawn: (spawned) => {
+      childProcess = spawned
+      track(state, sid, spawned)
+    },
   })
+  if (childProcess) untrack(state, sid, childProcess)
   if (!result.ok) {
-    log("ERROR", "gateway approval failed", { category: result.category, detail: result.detail })
+    log(state, "ERROR", "gateway approval failed", { category: result.category, detail: result.detail })
     return { allowed: false, reason: pipelineDenial(result.category, result.detail) }
   }
-  if (result.stderr) log("INFO", "gateway stderr", { output: boundedUtf8(result.stderr.trim()) })
+  if (result.stderr) log(state, "INFO", "gateway stderr", { output: boundedUtf8(result.stderr.trim()) })
   let parsed: unknown
   try {
     parsed = JSON.parse(result.stdout.trim())
   } catch (error) {
     const detail = boundedUtf8(`${String(error)}; stdout=${result.stdout.trim()}`)
-    log("ERROR", "gateway invalid response", { detail })
+    log(state, "ERROR", "gateway invalid response", { detail })
     return { allowed: false, reason: pipelineDenial("malformed", detail) }
   }
   if (!isValidGatewayOutput(parsed)) {
     const detail = boundedUtf8(`stdout=${result.stdout.trim()}`)
-    log("ERROR", "gateway output failed validation", { detail })
+    log(state, "ERROR", "gateway output failed validation", { detail })
     return { allowed: false, reason: pipelineDenial("schema", detail) }
   }
   return parsed.allowed
@@ -492,7 +488,7 @@ async function callGatewayOnce(sid: string, payload: OpenCodeHookInput, executio
     : { allowed: false, reason: boundedUtf8(parsed.reason ?? "Agent Hub denied tool execution") }
 }
 
-async function reportSupervision(transition: Record<string, unknown>): Promise<void> {
+async function reportSupervision(state: PluginInstanceState, transition: Record<string, unknown>): Promise<void> {
   if (APPROVAL_TRANSPORT.kind !== "attended_socket") return
   const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
   const invocation = gatewaySupervisionInvocation(APPROVAL_TRANSPORT, process.env)
@@ -540,11 +536,12 @@ function isValidQuestionAnswers(value: unknown): value is string[][] {
 }
 
 async function callGatewayQuestion(
+  state: PluginInstanceState,
   sid: string,
   payload: QuestionProxyRequest,
 ): Promise<QuestionGatewayResult> {
   if (APPROVAL_TRANSPORT.kind === "attended_socket") {
-    log("ERROR", "question gateway unavailable for approval transport", {
+    log(state, "ERROR", "question gateway unavailable for approval transport", {
       requestId: payload.question_request_id,
       transport: APPROVAL_TRANSPORT.kind,
     })
@@ -558,7 +555,7 @@ async function callGatewayQuestion(
   args.push("--server", server ?? "http://127.0.0.1:8080")
   if (token) args.push("--token", token)
 
-  log("INFO", "callGatewayQuestion", { bin, requestId: payload.question_request_id })
+  log(state, "INFO", "callGatewayQuestion", { bin, requestId: payload.question_request_id })
 
   const requestId = payload.question_request_id
 
@@ -567,10 +564,14 @@ async function callGatewayQuestion(
     args,
     input: JSON.stringify(payload),
     timeoutMs: GATEWAY_OPERATION_TIMEOUT_MS,
-    sid,
-    onSpawn: (proc) => questionGatewayProcs.set(requestId, proc),
+    onSpawn: (proc) => {
+      track(state, sid, proc)
+      state.questionGatewayProcs.set(requestId, proc)
+    },
   })
-  questionGatewayProcs.delete(requestId)
+  const childProcess = state.questionGatewayProcs.get(requestId)
+  if (childProcess) untrack(state, sid, childProcess)
+  state.questionGatewayProcs.delete(requestId)
   if (!result.ok) {
     const exit = /^gateway exited (\d+)/.exec(result.detail)?.[1]
     if (result.category === "nonzero" && exit === "1") return { outcome: "rejected" }
@@ -658,20 +659,19 @@ export const DEFAULT_TITLE_RE = /^(New session - |Child session - )\d{4}-\d{2}-\
  *  so we track upstream changes automatically. */
 type PluginClient = PluginInput["client"]
 
-const titles: Map<string, string> = new Map()
-
 async function fetchTitle(
+  state: PluginInstanceState,
   client: PluginClient,
   sid: string,
   dir: string,
 ): Promise<string | undefined> {
-  const cached = titles.get(sid)
+  const cached = state.titles.get(sid)
   if (cached) {
-    log("INFO", "fetchTitle cache hit", { sid, title: cached })
+    log(state, "INFO", "fetchTitle cache hit", { sid, title: cached })
     return cached
   }
 
-  log("INFO", "fetchTitle calling session.get", { sid, directory: dir })
+  log(state, "INFO", "fetchTitle calling session.get", { sid, directory: dir })
   try {
     // The plugin client is v1 — uses { path: { id }, query: { directory } }
     // and URL template /session/{id}.
@@ -679,18 +679,18 @@ async function fetchTitle(
       path: { id: sid },
       query: { directory: dir },
     })
-    log("INFO", "fetchTitle raw response", { sid, keys: Object.keys(res).join(","), hasData: String(!!res.data) })
+    log(state, "INFO", "fetchTitle raw response", { sid, keys: Object.keys(res).join(","), hasData: String(!!res.data) })
     const title = res.data?.title
-    log("INFO", "fetchTitle got response", { sid, title: title ?? "(none)", hasData: String(!!res.data) })
+    log(state, "INFO", "fetchTitle got response", { sid, title: title ?? "(none)", hasData: String(!!res.data) })
     if (title && !DEFAULT_TITLE_RE.test(title)) {
-      titles.set(sid, title)
-      log("INFO", "fetchTitle cached title", { sid, title })
+      state.titles.set(sid, title)
+      log(state, "INFO", "fetchTitle cached title", { sid, title })
       return title
     }
-    log("INFO", "fetchTitle title is default/empty, skipping cache", { sid })
+    log(state, "INFO", "fetchTitle title is default/empty, skipping cache", { sid })
     return undefined
   } catch (err) {
-    log("WARN", "failed to fetch session title", { sid, err: String(err) })
+    log(state, "WARN", "failed to fetch session title", { sid, err: String(err) })
     return undefined
   }
 }
@@ -701,7 +701,10 @@ async function fetchTitle(
 
 const id = "agent-hub"
 
-const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
+export async function createPluginInstance(
+  input: PluginInput,
+  options: { registerProcessHandlers?: boolean } = {},
+): Promise<Hooks> {
   const client = input.client
   const { directory, worktree } = input
   validatePluginDirectory(directory)
@@ -710,11 +713,37 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     throw new Error("OpenCode runtime does not expose the in-process plugin client")
   }
   const clientV2 = new OpencodeClientV2({ client: inProcessClient })
-  initializeRunEvidence()
-  permissionOwnedSessions.clear()
-  registeredSessions.clear()
-  pendingSessionRegistrations.clear()
-  configInitialized = false
+  const state: PluginInstanceState = {
+    readinessRecorded: false,
+    configInitialized: false,
+    permissionOwnedSessions: new Set(),
+    executionRecords: new Map(),
+    procs: new Map(),
+    questionGatewayProcs: new Map(),
+    locallyAnsweredQuestions: new Set(),
+    statusTimers: new Map(),
+    registeredSessions: new Set(),
+    pendingSessionRegistrations: new Set(),
+    exitHandled: false,
+    titles: new Map(),
+    lastLogTime: Date.now(),
+  }
+  initializeRunEvidence(state)
+
+  const exit = () => onExit(state)
+  const sigint = () => {
+    onExit(state)
+    process.exit(130)
+  }
+  const sigterm = () => {
+    onExit(state)
+    process.exit(143)
+  }
+  if (options.registerProcessHandlers !== false) {
+    process.on("exit", exit)
+    process.on("SIGINT", sigint)
+    process.on("SIGTERM", sigterm)
+  }
 
   async function routeTool(
     sid: string,
@@ -722,36 +751,36 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
     toolName: string,
     args: Record<string, unknown>,
   ) {
-    if (!configInitialized) {
+    if (!state.configInitialized) {
       const reason = "OpenCode executed a tool before the Agent Hub config hook took permission ownership"
       recordPermissionDenied(reason)
       throw new ExplicitDenial(reason)
     }
-    if (!permissionOwnedSessions.has(sid)) {
+    if (!state.permissionOwnedSessions.has(sid)) {
       const reason = `Agent Hub denied tool execution because session '${sid}' has not transferred permission ownership to the approval pipeline`
       recordPermissionDenied(reason)
       throw new ExplicitDenial(boundedUtf8(reason))
     }
-    if (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded) {
+    if (APPROVAL_TRANSPORT.kind === "attended_socket" && !state.readinessRecorded) {
       throw new ExplicitDenial("Agent Hub denied tool execution because host supervision was not ready")
     }
-    if (executionRecords.has(callID)) {
+    if (state.executionRecords.has(callID)) {
       const reason = `OpenCode reused tool call ID '${callID}'`
       recordPermissionDenied(reason)
       throw new ExplicitDenial(reason)
     }
-    if (!registeredSessions.has(sid) && !pendingSessionRegistrations.has(sid)) {
-      pendingSessionRegistrations.add(sid)
-      spawnStatusReport(sid, "active")
+    if (!state.registeredSessions.has(sid) && !state.pendingSessionRegistrations.has(sid)) {
+      state.pendingSessionRegistrations.add(sid)
+      spawnStatusReport(state, sid, "active")
     }
 
-    const title = await fetchTitle(client, sid, directory)
+    const title = await fetchTitle(state, client, sid, directory)
     let request
     try {
       request = normalizeToolExecution(toolName, args, directory, worktree)
     } catch (error) {
       const reason = String(error)
-      log("ERROR", "tool normalization failed closed", { err: reason })
+      log(state, "ERROR", "tool normalization failed closed", { err: reason })
       recordPermissionDenied(reason)
       throw new ExplicitDenial(pipelineDenial("schema", reason))
     }
@@ -767,7 +796,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       status: "routing",
       requests: [],
     }
-    recordExecution(record)
+    recordExecution(state, record)
     for (const matchInput of request.matchInputs) {
       const requestID = randomUUID()
       const canonicalDigest = digest("agent-hub:opencode-match-input:v1", matchInput)
@@ -778,8 +807,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         canonicalDigest,
       }
       record.requests.push({ requestID, canonicalDigest })
-      await reportSupervision(executionTransition(record, record.requests.at(-1)!, "created"))
+      await reportSupervision(state, executionTransition(record, record.requests.at(-1)!, "created"))
       const result = await callGateway(
+        state,
         sid,
         makePayload(sid, request.tool, request.rawArgs, matchInput, directory, worktree, title),
         execution,
@@ -787,25 +817,25 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       if (!result.allowed) {
         const reason = result.reason ?? "Agent Hub denied tool execution"
         for (const prior of record.requests.slice(0, -1)) {
-          await reportSupervision(executionTransition(record, prior, "failed"))
+          await reportSupervision(state, executionTransition(record, prior, "failed"))
         }
         record.status = "denied"
-        recordExecution(record)
+        recordExecution(state, record)
         recordPermissionDenied(reason)
         throw new ExplicitDenial(reason)
       }
     }
     if (request.postPolicyValidationError) {
       for (const routed of record.requests) {
-        await reportSupervision(executionTransition(record, routed, "failed"))
+        await reportSupervision(state, executionTransition(record, routed, "failed"))
       }
       record.status = "denied"
-      recordExecution(record)
+      recordExecution(state, record)
       recordPermissionDenied(request.postPolicyValidationError)
       throw new ExplicitDenial(request.postPolicyValidationError)
     }
     record.status = "authorized"
-    recordExecution(record)
+    recordExecution(state, record)
   }
 
   return {
@@ -815,11 +845,11 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       for (const agent of Object.values(mutable.agent ?? {}) as any[]) {
         agent.permission = { "*": "deny" }
       }
-      configInitialized = true
+      state.configInitialized = true
     },
 
     "chat.message": async (info) => {
-      permissionOwnedSessions.delete(info.sessionID)
+      state.permissionOwnedSessions.delete(info.sessionID)
       try {
         const response = await clientV2.session.update({
           sessionID: info.sessionID,
@@ -834,12 +864,12 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         }
       } catch (error) {
         const reason = boundedUtf8(`OpenCode session permission ownership failed: ${String(error)}`)
-        log("ERROR", "session permission ownership failed", { sid: info.sessionID, detail: reason })
+        log(state, "ERROR", "session permission ownership failed", { sid: info.sessionID, detail: reason })
         throw new Error(reason)
       }
-      permissionOwnedSessions.add(info.sessionID)
-      if (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded) {
-        await reportSupervision({
+      state.permissionOwnedSessions.add(info.sessionID)
+      if (APPROVAL_TRANSPORT.kind === "attended_socket" && !state.readinessRecorded) {
+        await reportSupervision(state, {
           transition: "plugin_ready",
           request_id: null,
           call_id: null,
@@ -849,17 +879,17 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           canonical_args_digest: null,
           plugin_nonce: APPROVAL_TRANSPORT.nonce,
         })
-        readinessRecorded = true
+        state.readinessRecorded = true
       }
     },
 
     "tool.execute.before": async (info, output) => {
       try {
         if (isStructuredOutputTool(info.tool)) {
-          if (!configInitialized
-            || !permissionOwnedSessions.has(info.sessionID)
-            || (APPROVAL_TRANSPORT.kind === "attended_socket" && !readinessRecorded)
-            || executionRecords.has(info.callID)) {
+          if (!state.configInitialized
+            || !state.permissionOwnedSessions.has(info.sessionID)
+            || (APPROVAL_TRANSPORT.kind === "attended_socket" && !state.readinessRecorded)
+            || state.executionRecords.has(info.callID)) {
             const reason = `invalid StructuredOutput execution evidence for tool call '${info.callID}'`
             recordPermissionDenied(reason)
             throw new ExplicitDenial(reason)
@@ -875,7 +905,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
             status: "transcript_only",
             requests: [],
           }
-          await reportSupervision({
+          await reportSupervision(state, {
             transition: "transcript_only",
             request_id: null,
             call_id: record.call_id,
@@ -885,7 +915,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
             canonical_args_digest: null,
             plugin_nonce: null,
           })
-          recordExecution(record)
+          recordExecution(state, record)
           return
         }
         await routeTool(info.sessionID, info.callID, info.tool, output.args as Record<string, unknown>)
@@ -902,11 +932,11 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       const message = boundedUtf8(`Agent Hub denied leaked native permission prompt '${info.id}' for session '${info.sessionID}'; the approval pipeline must own every tool decision`)
       output.status = "deny"
       recordPermissionDenied(message)
-      log("ERROR", "denied leaked native permission prompt", { message })
+      log(state, "ERROR", "denied leaked native permission prompt", { message })
     },
 
     "tool.execute.after": async (info) => {
-      const record = executionRecords.get(info.callID)
+      const record = state.executionRecords.get(info.callID)
       if (!record) {
         const reason = `OpenCode completed unrouted tool call '${info.callID}'`
         recordPermissionDenied(reason)
@@ -916,7 +946,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       if (record.session_id !== info.sessionID || record.runtime_tool_name !== info.tool || record.raw_args_digest !== afterDigest) {
         if (record.status === "authorized") {
           for (const request of record.requests) {
-            await reportSupervision(executionTransition(record, request, "failed"))
+            await reportSupervision(state, executionTransition(record, request, "failed"))
           }
         }
         const reason = `OpenCode before/after evidence mismatch for tool call '${info.callID}'`
@@ -930,10 +960,10 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         throw new Error(reason)
       }
       for (const request of record.requests) {
-        await reportSupervision(executionTransition(record, request, "completed"))
+        await reportSupervision(state, executionTransition(record, request, "completed"))
       }
       record.status = "completed"
-      recordExecution(record)
+      recordExecution(state, record)
     },
 
     event: async ({ event: _event }) => {
@@ -947,7 +977,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         const sid = event.properties.sessionID
         // opencode emits "idle", "busy", "retry"; map to agent-hub terms
         const mapped = event.properties.status.type === "idle" ? "idle" as const : "active" as const
-        reportStatus(sid, mapped)
+        reportStatus(state, sid, mapped)
         return
       }
 
@@ -956,7 +986,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // is the primary signal that the agent has finished working.
       if (event.type === "session.idle") {
         const sid = event.properties.sessionID
-        reportStatus(sid, "idle")
+        reportStatus(state, sid, "idle")
         return
       }
 
@@ -965,9 +995,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         if (event.properties.error?.name !== "MessageAbortedError") return
         const sid = event.properties.sessionID
         if (sid) {
-          registeredSessions.delete(sid)
-          killGateways(sid)
-          reportStatus(sid, "ended")
+          state.registeredSessions.delete(sid)
+          killGateways(state, sid)
+          reportStatus(state, sid, "ended")
         }
         return
       }
@@ -984,16 +1014,16 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
         const header = firstQuestion.header
 
         // Immediately report Waiting (bypass debounce — time-sensitive)
-        const existing = statusTimers.get(sid)
+        const existing = state.statusTimers.get(sid)
         if (existing) clearTimeout(existing)
-        statusTimers.delete(sid)
-        spawnStatusReport(sid, "waiting", { waitingReason: `Plan question: ${header}` })
+        state.statusTimers.delete(sid)
+        spawnStatusReport(state, sid, "waiting", { waitingReason: `Plan question: ${header}` })
 
         // Build the gateway request
         const proxyReq: QuestionProxyRequest = {
           id: `${sid}-${requestId}`,
           session_id: sid,
-          session_display_name: titles.get(sid) ?? sid,
+          session_display_name: state.titles.get(sid) ?? sid,
           cwd: directory,
           question_request_id: requestId,
           questions: [
@@ -1023,13 +1053,13 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           // was in-flight, we killed the gateway (SIGTERM) which causes it to
           // exit without an answer. Skip the gateway callback here because the
           // question is already resolved and a second response would fail.
-          if (locallyAnsweredQuestions.has(requestId)) {
-            log("INFO", "question already answered locally, skipping gateway callback", { sid, requestId })
-            locallyAnsweredQuestions.delete(requestId)
+          if (state.locallyAnsweredQuestions.has(requestId)) {
+            log(state, "INFO", "question already answered locally, skipping gateway callback", { sid, requestId })
+            state.locallyAnsweredQuestions.delete(requestId)
             return
           }
           if ("answers" in result) {
-            log("INFO", "question answered via gateway, calling question.reply", { sid, requestId })
+            log(state, "INFO", "question answered via gateway, calling question.reply", { sid, requestId })
             const resp = await clientV2.question.reply({
               requestID: requestId,
               directory,
@@ -1042,7 +1072,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           }
 
           if (result.outcome === "rejected") {
-            log("INFO", "question rejected via gateway, calling question.reject", { sid, requestId })
+            log(state, "INFO", "question rejected via gateway, calling question.reject", { sid, requestId })
             const resp = await clientV2.question.reject({
               requestID: requestId,
               directory,
@@ -1066,9 +1096,9 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
           }
         }
 
-        callGatewayQuestion(sid, proxyReq).then(handleGatewayResult).catch(async (err: unknown) => {
+        callGatewayQuestion(state, sid, proxyReq).then(handleGatewayResult).catch(async (err: unknown) => {
           const detail = boundedUtf8(String(err))
-          log("ERROR", "question approval pipeline callback failed", { sid, requestId, detail })
+          log(state, "ERROR", "question approval pipeline callback failed", { sid, requestId, detail })
           try {
             const response = await clientV2.question.reply({
               requestID: requestId,
@@ -1077,7 +1107,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
             })
             if (response.error) throw new Error(JSON.stringify(response.error))
           } catch (replyError) {
-            log("ERROR", "question pipeline error reply failed; rejecting question", {
+            log(state, "ERROR", "question pipeline error reply failed; rejecting question", {
               sid,
               requestId,
               detail: boundedUtf8(String(replyError)),
@@ -1087,7 +1117,7 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
               if (response.error) throw new Error(JSON.stringify(response.error))
             } catch (terminationError) {
               const termination = boundedUtf8(`Agent Hub could neither answer nor terminate question '${requestId}' after an approval pipeline failure: ${String(terminationError)}`)
-              log("ERROR", "question pipeline termination failed", { sid, requestId, detail: termination })
+              log(state, "ERROR", "question pipeline termination failed", { sid, requestId, detail: termination })
               throw new Error(termination)
             }
           }
@@ -1103,15 +1133,15 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // pending question on the agent-hub server.
       if (event.type === "question.replied") {
         const reqId = event.properties.requestID
-        const gwProc = questionGatewayProcs.get(reqId)
+        const gwProc = state.questionGatewayProcs.get(reqId)
         if (gwProc) {
-          log("INFO", "question answered locally, cancelling agent-hub gateway", { reqId })
-          locallyAnsweredQuestions.add(reqId)
+          log(state, "INFO", "question answered locally, cancelling agent-hub gateway", { reqId })
+          state.locallyAnsweredQuestions.add(reqId)
           try { gwProc.kill("SIGTERM") } catch (err: unknown) {
-            log("WARN", "failed to kill question gateway", { reqId, err: String(err) })
+            log(state, "WARN", "failed to kill question gateway", { reqId, err: String(err) })
           }
         }
-        reportStatus(event.properties.sessionID, "active")
+        reportStatus(state, event.properties.sessionID, "active")
         return
       }
 
@@ -1119,19 +1149,31 @@ const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
       // cleanup: kill the in-flight gateway if present so the server entry is cancelled.
       if (event.type === "question.rejected") {
         const reqId = event.properties.requestID
-        const gwProc = questionGatewayProcs.get(reqId)
+        const gwProc = state.questionGatewayProcs.get(reqId)
         if (gwProc) {
-          log("INFO", "question rejected locally, cancelling agent-hub gateway", { reqId })
-          locallyAnsweredQuestions.add(reqId)
+          log(state, "INFO", "question rejected locally, cancelling agent-hub gateway", { reqId })
+          state.locallyAnsweredQuestions.add(reqId)
           try { gwProc.kill("SIGTERM") } catch (err: unknown) {
-            log("WARN", "failed to kill question gateway", { reqId, err: String(err) })
+            log(state, "WARN", "failed to kill question gateway", { reqId, err: String(err) })
           }
         }
-        reportStatus(event.properties.sessionID, "active")
+        reportStatus(state, event.properties.sessionID, "active")
         return
       }
     },
+    dispose: async () => {
+      if (options.registerProcessHandlers !== false) {
+        process.off("exit", exit)
+        process.off("SIGINT", sigint)
+        process.off("SIGTERM", sigterm)
+      }
+      for (const timer of state.statusTimers.values()) clearTimeout(timer)
+      state.statusTimers.clear()
+      for (const sid of state.procs.keys()) killGateways(state, sid)
+    },
   }
 }
+
+const server: Plugin = (input) => createPluginInstance(input)
 
 export default server

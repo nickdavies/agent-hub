@@ -60,6 +60,16 @@ pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
     serde_json::to_string(&output).expect("OpenCodeHookOutput is always serializable")
 }
 
+pub fn format_blocking_denial(_raw: &str, reason: &str) -> Option<String> {
+    Some(
+        serde_json::to_string(&OpenCodeHookOutput {
+            allowed: false,
+            reason: Some(bounded_gateway_message(reason)),
+        })
+        .expect("OpenCodeHookOutput is always serializable"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +132,14 @@ mod tests {
             serde_json::from_str(&format_output(&test_event(), &output)).unwrap();
         assert_eq!(value["allowed"], false);
         assert_eq!(value["reason"], "operator denied this action");
+    }
+
+    #[test]
+    fn opencode_minimal_denial_does_not_require_event_fields() {
+        let value: serde_json::Value =
+            serde_json::from_str(&format_blocking_denial("", "invalid input").unwrap()).unwrap();
+        assert_eq!(value["allowed"], false);
+        assert_eq!(value["reason"], "invalid input");
     }
 
     #[test]

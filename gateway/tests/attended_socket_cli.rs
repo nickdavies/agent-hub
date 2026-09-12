@@ -152,7 +152,16 @@ fn attended_gateway_rejects_unknown_permission_fields_and_versions() {
             .write_all(br#"{"session_id":"strict","tool_name":"custom","tool_input":{},"cwd":"/workspace"}"#)
             .unwrap();
         let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        assert!(output.status.success());
+        let decision: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(decision["allowed"], false);
+        assert!(
+            decision["reason"]
+                .as_str()
+                .unwrap()
+                .contains("approval pipeline failed")
+        );
+        assert!(output.stderr.len() <= protocol::AGENT_HUB_RUN_MAX_REASON_BYTES);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("unknown field")

@@ -50,6 +50,7 @@ describe("bundled plugin entrypoint", () => {
         "APPROVAL_PIPELINE_ERROR_MESSAGE",
         "APPROVAL_TIMEOUT_MESSAGE",
         "DEFAULT_TITLE_RE",
+        "createPluginInstance",
         "default",
         "makeGlobToolInput",
         "makePayload",

@@ -46,7 +46,8 @@ pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
         DecisionStatus::DeniedWithReason(r) => bounded_gateway_message(r),
         DecisionStatus::TimedOut => APPROVAL_TIMEOUT_MESSAGE.to_string(),
         DecisionStatus::PipelineError(detail) => approval_pipeline_error_message(detail),
-        _ => decision
+        DecisionStatus::Denied => "denied by policy".to_string(),
+        DecisionStatus::Approved => decision
             .message
             .clone()
             .unwrap_or_else(|| "resolved via remote approval".to_string()),
@@ -57,6 +58,18 @@ pub fn format_output(_event: &ToolHookEvent, decision: &HookOutput) -> String {
         agent_message: msg,
     };
     serde_json::to_string(&output).expect("CursorHookOutput is always serializable")
+}
+
+pub fn format_blocking_denial(_raw: &str, reason: &str) -> Option<String> {
+    let message = bounded_gateway_message(reason);
+    Some(
+        serde_json::to_string(&CursorHookOutput {
+            permission: PermissionDecision::Deny,
+            user_message: message.clone(),
+            agent_message: message,
+        })
+        .expect("CursorHookOutput is always serializable"),
+    )
 }
 
 #[cfg(test)]
@@ -110,5 +123,28 @@ mod tests {
         assert_eq!(value["permission"], "deny");
         assert_eq!(value["user_message"], "operator denied this action");
         assert_eq!(value["agent_message"], "operator denied this action");
+    }
+
+    #[test]
+    fn cursor_reasonless_local_denial_uses_policy_wording() {
+        let value: serde_json::Value = serde_json::from_str(&format_output(
+            &test_event(),
+            &HookOutput {
+                status: DecisionStatus::Denied,
+                message: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(value["user_message"], "denied by policy");
+        assert_eq!(value["agent_message"], "denied by policy");
+    }
+
+    #[test]
+    fn cursor_minimal_denial_does_not_require_event_fields() {
+        let value: serde_json::Value =
+            serde_json::from_str(&format_blocking_denial("", "invalid input").unwrap()).unwrap();
+        assert_eq!(value["permission"], "deny");
+        assert_eq!(value["user_message"], "invalid input");
+        assert_eq!(value["agent_message"], "invalid input");
     }
 }

@@ -34,7 +34,11 @@ impl TryFrom<ClaudeCodeHookInput> for ToolHookEvent {
 
 /// Format a HookOutput into Claude Code's wire format (stdout JSON).
 pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
-    match event.hook_event_name.to_ascii_lowercase().as_str() {
+    format_for_event(&event.hook_event_name, decision)
+}
+
+fn format_for_event(hook_event_name: &str, decision: &HookOutput) -> String {
+    match hook_event_name.to_ascii_lowercase().as_str() {
         "permissionrequest" => {
             let (behavior, message) = match &decision.status {
                 DecisionStatus::Approved => (PermissionDecision::Allow, None),
@@ -88,12 +92,29 @@ pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
     }
 }
 
+pub fn format_blocking_denial(raw: &str, reason: &str) -> Option<String> {
+    let hook_event_name = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()?
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("PreToolUse")
+        .to_string();
+    Some(format_for_event(
+        &hook_event_name,
+        &HookOutput {
+            status: DecisionStatus::DeniedWithReason(bounded_gateway_message(reason)),
+            message: None,
+        },
+    ))
+}
+
 fn deny_message(decision: &HookOutput) -> String {
     match &decision.status {
+        DecisionStatus::Denied => "denied by policy".to_string(),
         DecisionStatus::DeniedWithReason(r) => bounded_gateway_message(r),
         DecisionStatus::TimedOut => APPROVAL_TIMEOUT_MESSAGE.to_string(),
         DecisionStatus::PipelineError(detail) => approval_pipeline_error_message(detail),
-        _ => decision
+        DecisionStatus::Approved => decision
             .message
             .clone()
             .unwrap_or_else(|| "denied via remote approval".to_string()),
@@ -232,5 +253,42 @@ mod tests {
             };
             assert_eq!(reason, "operator denied this action");
         }
+    }
+
+    #[test]
+    fn claude_reasonless_local_denial_uses_policy_wording_for_both_hooks() {
+        for event_name in ["PreToolUse", "PermissionRequest"] {
+            let value: serde_json::Value =
+                serde_json::from_str(&format_output(&test_event(event_name), &denied())).unwrap();
+            let reason = if event_name == "PreToolUse" {
+                &value["hookSpecificOutput"]["permissionDecisionReason"]
+            } else {
+                &value["hookSpecificOutput"]["decision"]["message"]
+            };
+            assert_eq!(reason, "denied by policy");
+        }
+    }
+
+    #[test]
+    fn claude_minimal_denial_uses_event_name_when_json_is_available() {
+        let permission: serde_json::Value = serde_json::from_str(
+            &format_blocking_denial(
+                r#"{"hook_event_name":"PermissionRequest"}"#,
+                "invalid input",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            permission["hookSpecificOutput"]["decision"]["behavior"],
+            "deny"
+        );
+
+        let pre_tool: serde_json::Value = serde_json::from_str(
+            &format_blocking_denial(r#"{"tool_name":"Bash"}"#, "invalid input").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pre_tool["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(format_blocking_denial("not-json", "invalid input").is_none());
     }
 }

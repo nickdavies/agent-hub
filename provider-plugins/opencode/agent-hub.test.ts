@@ -23,7 +23,7 @@ let questionReplies: Array<{ requestID: string; directory: string; answers: stri
 let questionRejections: Array<{ requestID: string; directory: string }> = []
 let questionReplyResults: Array<Record<string, unknown>> = []
 let questionRejectResults: Array<Record<string, unknown>> = []
-let sessionUpdateResults: Array<Record<string, unknown>> = []
+let sessionUpdateResults: Array<Record<string, unknown> | Error> = []
 
 const logRoot = path.resolve("../../target", `opencode-plugin-test-${crypto.randomUUID()}`)
 mkdirSync(path.join(logRoot, "opencode", "log"), { recursive: true })
@@ -34,8 +34,12 @@ afterAll(() => rmSync(logRoot, { recursive: true, force: true }))
 mock.module("@opencode-ai/sdk/v2", () => ({
   OpencodeClient: class {
     session = {
-      update: async () => sessionUpdateResults.shift() ?? {
-        data: { permission: [{ permission: "*", pattern: "*", action: "allow" }] },
+      update: async () => {
+        const result = sessionUpdateResults.shift()
+        if (result instanceof Error) throw result
+        return result ?? {
+          data: { permission: [{ permission: "*", pattern: "*", action: "allow" }] },
+        }
       },
     }
     question = {
@@ -110,8 +114,8 @@ mock.module("child_process", () => ({
 }))
 
 async function loadPlugin() {
-  const { default: plugin } = await import(`./agent-hub.ts?test=${Date.now()}-${Math.random()}`)
-  return typeof plugin === "function" ? plugin : plugin.server
+  const module = await import(`./agent-hub.ts?test=${Date.now()}-${Math.random()}`)
+  return (input: any) => module.createPluginInstance(input, { registerProcessHandlers: false })
 }
 
 async function initializedHooks(directory = "/home/user/project") {
@@ -350,6 +354,7 @@ describe("permission ownership and fail-closed routing", () => {
   test.each([
     ["session update error", { error: { message: "update failed" } }],
     ["session update missing proof", { data: { permission: [] } }],
+    ["session update rejection", new Error("update rejected")],
   ])("%s never establishes ownership", async (_name, response) => {
     sessionUpdateResults.push(response)
     const hooks = await initializedHooks()
@@ -365,6 +370,31 @@ describe("permission ownership and fail-closed routing", () => {
     const output: { status: "ask" | "deny" | "allow" } = { status: "ask" }
     await hooks["permission.ask"]!({ id: "permission-1", sessionID: "session-1" } as any, output)
     expect(output.status).toBe("deny")
+  })
+
+  test("multiple plugin instances do not clear or share mutable state", async () => {
+    const create = await loadPlugin()
+    const first = await create(pluginInput("/home/user/project"))
+    await first.config!({ permission: { "*": "deny" } } as any)
+    await ownSession(first, "shared-session")
+
+    const second = await create(pluginInput("/home/user/project"))
+    await expect(second["tool.execute.before"]!(
+      { sessionID: "shared-session", callID: "same-call", tool: "bash" },
+      { args: { command: "true" } },
+    )).rejects.toThrow(/config hook/)
+
+    await first["tool.execute.before"]!(
+      { sessionID: "shared-session", callID: "same-call", tool: "bash" },
+      { args: { command: "true" } },
+    )
+
+    await second.config!({ permission: { "*": "deny" } } as any)
+    await ownSession(second, "shared-session")
+    await second["tool.execute.before"]!(
+      { sessionID: "shared-session", callID: "same-call", tool: "bash" },
+      { args: { command: "true" } },
+    )
   })
 
   test.each([
