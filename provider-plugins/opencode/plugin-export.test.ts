@@ -25,7 +25,7 @@ describe("bundled plugin entrypoint", () => {
     const inspection = Bun.spawnSync([
       "node",
       "--eval",
-      `import(${JSON.stringify(pathToFileURL(artifact).href)}).then((module) => console.log(JSON.stringify({defaultType: typeof module.default, keys: Object.keys(module).sort()})))`,
+      `import(${JSON.stringify(pathToFileURL(artifact).href)}).then((module) => console.log(JSON.stringify({defaultType: typeof module.default, serverType: typeof module.server, keys: Object.keys(module).sort()})))`,
     ], {
       env: {
         ...process.env,
@@ -46,6 +46,7 @@ describe("bundled plugin entrypoint", () => {
     expect(inspection.exitCode).toBe(0)
     expect(JSON.parse(inspection.stdout.toString())).toEqual({
       defaultType: "function",
+      serverType: "function",
       keys: [
         "APPROVAL_PIPELINE_ERROR_MESSAGE",
         "APPROVAL_TIMEOUT_MESSAGE",
@@ -56,6 +57,7 @@ describe("bundled plugin entrypoint", () => {
         "makePayload",
         "makeReadToolInput",
         "runGatewayProcess",
+        "server",
       ],
     })
   })

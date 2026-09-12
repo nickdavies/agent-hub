@@ -1174,6 +1174,6 @@ export async function createPluginInstance(
   }
 }
 
-const server: Plugin = (input) => createPluginInstance(input)
+export const server: Plugin = (input) => createPluginInstance(input)
 
 export default server
