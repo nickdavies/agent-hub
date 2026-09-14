@@ -5,6 +5,39 @@ use std::process::{Command, Output};
 const IMAGE_TAG: &str = "agent-hub/job-code:2026-09-09";
 
 #[test]
+fn host_preview_requires_a_valid_host_home() {
+    use std::os::unix::ffi::OsStringExt as _;
+    for (home, error) in [
+        (None, "HOME is required"),
+        (Some("".into()), "trusted host HOME must be absolute"),
+        (
+            Some("relative".into()),
+            "trusted host HOME must be absolute",
+        ),
+        (
+            Some(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml").into()),
+            "trusted host HOME must be an existing directory",
+        ),
+        (
+            Some(std::ffi::OsString::from_vec(vec![b'/', 0xff])),
+            "HOME is required and must be UTF-8",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-hub"));
+        command
+            .env_clear()
+            .args(["local", "preview", "--request-stdin"]);
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(error));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn one_step_invalid_input_prints_a_bounded_failure_envelope_before_nonzero() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hub"))
         .args([
@@ -38,7 +71,7 @@ fn one_step_invalid_input_prints_a_bounded_failure_envelope_before_nonzero() {
 #[test]
 fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() {
     let root = temp_root();
-    let config = root.join("config");
+    let config = root.join("home/config");
     let workspace = root.join("workspace");
     let state = root.join("state");
     let docker_marker = root.join("docker.calls");
@@ -523,6 +556,75 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         );
     }
 
+    let real_gateway = executable.with_file_name("agent-hub-gateway");
+    assert!(
+        real_gateway.is_file(),
+        "build the real gateway first: cargo build -p agent-hub-gateway"
+    );
+    let policy = serde_json::json!({
+        "version": 1,
+        "default": "deny",
+        "rules": [
+            {"tools": ["internal_tool"], "in_cwds": ["~/config"], "action": "deny"},
+            {"tools": ["agent_hub_run_resolved"], "in_cwds": ["~/config"],
+             "input": {"timeout_secs": 31}, "action": "deny"},
+            {"tools": ["agent_hub_run_resolved"], "in_cwds": ["~/config"], "action": "allow"}
+        ]
+    });
+    let policy_bytes = serde_json::to_vec(&policy).unwrap();
+    std::fs::write(&gateway_config, &policy_bytes).unwrap();
+    let mut real_host_config = baseline_host_config.clone();
+    real_host_config["gateway"] = pin(&real_gateway, "runtime:agent-hub-gateway");
+    real_host_config["policy"] = pin(&gateway_config, "policy:agent-hub-run");
+    std::fs::write(
+        &host_config_path,
+        serde_json::to_vec(&real_host_config).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(root.join("slow-launch")).unwrap();
+    for (timeout, expected) in [(30, "allow"), (31, "deny")] {
+        let mut request = launch.clone();
+        request["timeout_secs"] = timeout.into();
+        let preview = invoke(
+            &root,
+            &fake_bin,
+            &state,
+            &["local", "preview", "--request-stdin"],
+            Some(&request.to_string()),
+        );
+        assert_success(&preview);
+        let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+        assert_eq!(preview["matched_action"], expected);
+        let run = invoke(
+            &root,
+            &fake_bin,
+            &state,
+            &[
+                "local",
+                "run",
+                "--request-stdin",
+                "--internal-invocation-id",
+                &uuid::Uuid::new_v4().to_string(),
+            ],
+            Some(&request.to_string()),
+        );
+        if expected == "allow" {
+            assert_success(&run);
+        } else {
+            assert!(!run.status.success());
+        }
+        let run: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+        assert_eq!(run["approval_receipt"]["receipt"]["decision"], expected);
+        assert_eq!(run["approval_receipt"]["receipt"]["authority"], "automatic");
+        assert_eq!(std::fs::read(&gateway_config).unwrap(), policy_bytes);
+    }
+    std::fs::write(&gateway_config, "{}").unwrap();
+    std::fs::write(
+        &host_config_path,
+        serde_json::to_vec(&baseline_host_config).unwrap(),
+    )
+    .unwrap();
+
     std::fs::write(&gateway_config, "tampered\n").unwrap();
     let tampered = invoke(
         &root,
@@ -808,8 +910,10 @@ fn invoke_with_env(
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-hub"));
     command
         .args(args)
+        .env_clear()
         .current_dir(root)
         .env("AGENT_HUB_ATTENDED_STATE", state)
+        .env("HOST_ENV_MUST_NOT_LEAK", "sentinel")
         .env("HOME", root.join("home"))
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .stdin(if stdin.is_some() {
@@ -956,9 +1060,13 @@ fn write_fake_run_gateway(path: &Path, decision: &Path, state: &Path, docker_mar
         path,
         format!(
             concat!(
-                "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = --preview ]; then exec /usr/bin/python3 -c 'import json,sys; r=json.load(sys.stdin)[\"tool_input\"]; print(json.dumps({{\"schema\":\"agent_hub_run_policy_preview_v1\",\"projection\":r[\"policy_projection\"],\"matched_action\":\"allow\"}}))'; fi; done\n",
+                "#!/bin/sh\n[ \"$HOME\" = '{}' ] || {{ echo 'wrong gateway HOME' >&2; exit 2; }}\n[ -z \"${{HOST_ENV_MUST_NOT_LEAK+x}}\" ] && [ -z \"${{AGENT_HUB_ATTENDED_STATE+x}}\" ] || {{ echo 'host environment leaked' >&2; exit 2; }}\n",
+                "case \"$PATH\" in *'{}'*) echo 'host PATH leaked' >&2; exit 2;; esac\n",
+                "for arg in \"$@\"; do if [ \"$arg\" = --preview ]; then exec /usr/bin/python3 -c 'import json,sys; r=json.load(sys.stdin)[\"tool_input\"]; print(json.dumps({{\"schema\":\"agent_hub_run_policy_preview_v1\",\"projection\":r[\"policy_projection\"],\"matched_action\":\"allow\"}}))'; fi; done\n",
                 "[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; pending*) echo $$ > '{}'; printf entered > '{}'; trap 'printf confirmed > \"{}\"; exit 1' TERM INT; while :; do sleep 1; done;; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; p=open(\"{}\").read().split(); d,a=p[:2]; mode=p[2] if len(p)>2 else \"\"; digest=\"0\"*64 if mode==\"wrong\" else r[\"canonical_digest\"]; expiry=\"2000-01-01T00:00:00Z\" if mode==\"expired\" else r[\"expires_at\"]; approval=\"018f0f21-76c0-7b37-a446-31f82a5e7601\" if a==\"human\" else r[\"invocation_id\"]; print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":digest,\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":approval,\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":expiry}}))'\n",
             ),
+            state.parent().unwrap().join("home").display(),
+            path.parent().unwrap().display(),
             state.display(),
             state.display(),
             decision.display(),

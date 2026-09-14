@@ -63,9 +63,19 @@ pub(crate) struct HostRunOptions {
 }
 
 pub(crate) fn default_host_config() -> anyhow::Result<PathBuf> {
-    let home =
-        std::env::var_os("HOME").context("HOME is required for trusted host configuration")?;
-    Ok(PathBuf::from(home).join(".config/agent-hub/host-run.json"))
+    Ok(trusted_host_home()?.join(".config/agent-hub/host-run.json"))
+}
+
+fn trusted_host_home() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .context("HOME is required and must be UTF-8 for trusted host configuration")?;
+    let home = PathBuf::from(home);
+    ensure!(home.is_absolute(), "trusted host HOME must be absolute");
+    ensure!(
+        home.is_dir(),
+        "trusted host HOME must be an existing directory"
+    );
+    Ok(home)
 }
 
 /// Canonical preparation only. It performs no state mutation or execution.
@@ -793,6 +803,7 @@ async fn request_gateway(
     command
         .kill_on_drop(true)
         .env_clear()
+        .env("HOME", trusted_host_home()?)
         .arg("agent-hub-run-resolved")
         .arg("--server")
         .arg(&options.approvals_server)
@@ -834,6 +845,7 @@ async fn request_gateway_preview(
     command
         .kill_on_drop(true)
         .env_clear()
+        .env("HOME", trusted_host_home()?)
         .arg("agent-hub-run-resolved")
         .arg("--server")
         .arg("http://127.0.0.1:1")
