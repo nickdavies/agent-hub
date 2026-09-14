@@ -1,6 +1,7 @@
 # opencode-plugin-agent-hub
 
-opencode plugin that connects `tool.execute.before` to `agent-hub-gateway`.
+opencode plugin that connects `tool.execute.before` to `agent-hub-gateway` and
+provides the host-only `agent_hub_run` attended-sandbox launch tool.
 
 Every capability-bearing OpenCode 1.18.18 execution is awaited in
 `tool.execute.before` and evaluated by the gateway before the tool can run.
@@ -44,6 +45,8 @@ export AGENT_HUB_SERVER="https://hub.example.com"   # your server URL
 # export AGENT_HUB_CONFIG="/path/to/agent-hub-permissions.json"
 # Optional — defaults to "agent-hub-gateway" on PATH
 # export AGENT_HUB_GATEWAY="/absolute/path/to/agent-hub-gateway"
+# Required to execute agent_hub_run in host mode
+# export AGENT_HUB_BIN="/absolute/path/to/agent-hub"
 ```
 
 For a sandboxed attended run, the trusted launcher sets the complete transport:
@@ -69,6 +72,7 @@ captured binding as CLI arguments. Missing gateway binaries, malformed OpenCode
 permissions, unavailable sockets, invalid decisions, and relay loss deny the
 tool request. HTTP status and question subprocesses are disabled in attended
 socket mode; no host-network route or proxy exception is required.
+The host launch tool is not registered in attended socket mode.
 
 ### Host relay protocol v1
 
@@ -130,8 +134,9 @@ Add the plugin to your project or global opencode config. The config file is
 **Project config** (`opencode.json`):
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "file:///absolute/path/to/provider-plugins/opencode/agent-hub.ts"
+    "file:///absolute/path/to/provider-plugins/opencode/index.ts"
   ]
 }
 ```
@@ -139,16 +144,55 @@ Add the plugin to your project or global opencode config. The config file is
 **Global config** (`~/.config/opencode/opencode.json`):
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "file:///home/you/code/agent-hub/provider-plugins/opencode/agent-hub.ts"
+    "file:///home/you/code/agent-hub/provider-plugins/opencode/index.ts"
   ]
 }
 ```
 
-The path must be absolute and point to `provider-plugins/opencode/agent-hub.ts`
-in this repository.
-Bundled single-file artifacts must preserve the default `{ id, server }`
-export required by OpenCode's v1 plugin module loader.
+The path must be absolute and point to `provider-plugins/opencode/index.ts`
+in this repository. This entrypoint exports exactly one default `Plugin`
+function returning the gateway hooks and, in host mode, the launch tool.
+Bundle from `index.ts`, not the helper modules; bundled single-file artifacts
+must retain that sole default function export. Install only this plugin, not
+an additional config-repository copy of the launch tool. Quit and restart
+opencode after changing the plugin installation.
+
+### Host launch authorization
+
+`agent_hub_run` accepts structured `agent_hub_run_intent_v1` input. The ordinary
+gateway execution hook authorizes that exact input before the host executable
+can run. For example, a rule in the gateway permission config can require review:
+
+```json
+{ "tools": ["agent_hub_run"], "action": "ask" }
+```
+
+The tool does not call `context.ask`, does not use a synthetic
+`agent_hub_run(local)` permission, and never falls back to a native prompt.
+The trusted host independently resolves the intent and requires a bound
+`agent_hub_run_resolved` authorization; the ordinary tool rule cannot replace
+that decision. Host policy, credentials, executable, and authority are not
+model-controlled tool arguments. The tool runs the configured absolute
+`AGENT_HUB_BIN` with exactly `local run --request-stdin`, canonical JSON stdin,
+and trusted OpenCode session and tool-call identities.
+
+Cancellation and output overflow signal the owned host process with SIGTERM
+and await its exit, allowing the host's cancellation/cleanup lifecycle to run.
+Plugin disposal also cancels and awaits its active host launches. SIGINT and
+SIGTERM await all registered plugin instances before exiting the parent process;
+shutdown rejects further launches. A host that does not cooperate keeps shutdown
+pending: there is no timeout that abandons the cleanup owner or reports success.
+Overflow output is drained without retaining bytes beyond the bound. A tool
+error is not evidence of successful sandbox cleanup; there is no forced-kill
+fallback or additional host cleanup command. Success requires a consistent
+terminal, approved, complete, successful, cleaned result.
+
+Approval-bundle producers must record
+`sources.agent_hub.plugin_entrypoint = "provider-plugins/opencode/index.ts"`.
+Regenerate bundles and their source/artifact digest pins together when adopting
+this package; manifests naming the helper module are rejected.
 
 ### 5. Verify
 
@@ -216,8 +260,8 @@ post-execution evidence and every exclusion is an exact StructuredOutput call.
 - **Permission ownership**: immutable supervised config starts with the exact
   `{ "*": "deny" }` fail-closed fallback at the top level and for every
   configured agent. The plugin retains those native fallbacks and transfers one
-  session at a time to `"allow"` only after `session.update` returns the exact
-  requested permission rules. The awaited execution hook routes tools only for
+   session at a time to `"allow"` only after `session.update` returns valid rules
+   ending in the requested wildcard allow rule (updates append rules). The awaited execution hook routes tools only for
   sessions with that proof. Any leaked native prompt is explicitly denied.
 - **Multiple files**: the plugin calls the gateway once per canonical file. The
   first denied file stops evaluation immediately.

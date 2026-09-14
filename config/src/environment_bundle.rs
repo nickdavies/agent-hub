@@ -577,7 +577,7 @@ fn validate_approval_manifest(manifest: &ApprovalBundleManifest) -> Result<(), S
     if manifest.schema != "agent-hub.approval-bundle"
         || manifest.version != 1
         || manifest.protocol != APPROVAL_BUNDLE_PROTOCOL
-        || manifest.sources.agent_hub.plugin_entrypoint != "provider-plugins/opencode/agent-hub.ts"
+        || manifest.sources.agent_hub.plugin_entrypoint != "provider-plugins/opencode/index.ts"
         || manifest
             .artifacts
             .keys()
@@ -889,7 +889,7 @@ mod tests {
             "version":1,
             "protocol":APPROVAL_BUNDLE_PROTOCOL,
             "sources":{
-                "agent_hub":{"repository":"https://example.com/agent-hub.git","commit":"a".repeat(40),"tree":"b".repeat(40),"archive_sha256":"c".repeat(64),"plugin_entrypoint":"provider-plugins/opencode/agent-hub.ts"},
+                "agent_hub":{"repository":"https://example.com/agent-hub.git","commit":"a".repeat(40),"tree":"b".repeat(40),"archive_sha256":"c".repeat(64),"plugin_entrypoint":"provider-plugins/opencode/index.ts"},
                 "dippy":{"repository":"https://example.com/dippy.git","commit":"d".repeat(40),"tree":"e".repeat(40),"archive_sha256":"f".repeat(64)}
             },
             "build":{"dippy":"uv build","plugin":"bun build"},

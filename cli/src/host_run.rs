@@ -34,7 +34,6 @@ struct HostConfig {
     self_binary: HostArtifactPin,
     gateway: HostArtifactPin,
     policy: HostArtifactPin,
-    opencode_plugin_install: HostArtifactPin,
     image_digests: std::collections::BTreeMap<String, String>,
 }
 
@@ -436,8 +435,7 @@ fn load_host_config(path: &Path) -> anyhow::Result<(HostConfig, (u64, u64))> {
         Path::new(&config.config_root).is_absolute()
             && Path::new(&config.self_binary.path).is_absolute()
             && Path::new(&config.gateway.path).is_absolute()
-            && Path::new(&config.policy.path).is_absolute()
-            && Path::new(&config.opencode_plugin_install.path).is_absolute(),
+            && Path::new(&config.policy.path).is_absolute(),
         "host run config paths must be absolute"
     );
     ensure!(
@@ -462,13 +460,6 @@ fn verify_host_installation(config: &HostConfig) -> anyhow::Result<Vec<VerifiedF
         verify_pin(&config.self_binary, "runtime:agent-hub")?,
         verify_pin(&config.gateway, "runtime:agent-hub-gateway")?,
         verify_pin(&config.policy, "policy:agent-hub-run")?,
-        verify_pin(
-            &config.opencode_plugin_install,
-            &format!(
-                "plugin:opencode-{}",
-                config::AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION
-            ),
-        )?,
     ];
     ensure!(
         !config.config_artifacts.is_empty() && config.config_artifacts.len() <= 128,

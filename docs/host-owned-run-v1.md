@@ -10,13 +10,12 @@ credential, invocation identity, or installation provenance.
 The trusted host adapter loads `~/.config/agent-hub/host-run.json`. The strict
 `agent_hub_run_host_v1` object fixes the canonical config-root device/inode,
 immutable image identities, and a non-empty list of config artifacts. It also
-pins the absolute host executable, gateway, policy, and reviewed OpenCode plugin
-installation using path, SHA-256, device, inode, and a role-bound source
+pins the absolute host executable, gateway, and policy
+using path, SHA-256, device, inode, and a role-bound source
 identity of the form `<role>:sha256:<digest>`. Each config pin instead uses
 `config:<canonical-relative-path>:sha256:<digest>`. The pin set must exactly
 cover every regular file below the authoritative config root; duplicate paths,
-path aliases, omissions, extras, and digest mismatches fail closed. Plugin
-installation provenance is host configuration, never public tool input. A
+path aliases, omissions, extras, and digest mismatches fail closed. A
 manual `--host-config` is available, but `local run` permits automatic rules
 only when its open nofollow file identity equals the trusted default.
 
@@ -33,8 +32,16 @@ Each executable or file entry has this shape:
 ```
 
 The host object contains `config_root`, `config_root_identity`,
-`config_artifacts`, `self_binary`, `gateway`, `policy`,
-`opencode_plugin_install`, and `image_digests`. Missing pins hard-fail.
+`config_artifacts`, `self_binary`, `gateway`, `policy`, and `image_digests`.
+Missing required pins hard-fail. Plugin installation is not a host authorization
+input: preparation, preview, and per-attempt checks do not inspect the host
+plugin's files, SDK version, or release identity through a plugin-specific pin.
+Host plugin release artifacts must stay outside the authoritative config root
+to remain independent of its generic exact-file inventory. Supervised sandbox
+approval-bundle verification is a separate runtime contract.
+The config schema remains
+`agent_hub_run_host_v1` with strict unknown-field rejection; generators must omit
+`opencode_plugin_install`, and existing configs containing it must be regenerated.
 
 The host performs these steps in order:
 
@@ -105,11 +112,8 @@ The canonical Rust contracts include `AgentHubRunIntentV1`,
 `AgentHubRunDecisionV1`, and `AgentHubRunOutputV1`. Generated public schemas and
 TypeScript definitions are under `provider-plugins/opencode/generated`.
 
-The host `agent_hub_run` plugin package directly pins both
-`@opencode-ai/plugin` and the imported `@opencode-ai/sdk` to 1.18.26 so install
-provenance cannot silently select a different SDK revision. Its host pin source
-identity is therefore `plugin:opencode-1.18.26:sha256:<digest>`. This SDK
-identity is distinct from the sandbox's supervised OpenCode runtime identity:
-image manifests, environment launch validation, and preflight require OpenCode
-1.18.18 and reject the plugin SDK version in its place. Supervised E2E evidence
-records both version identities alongside the plugin and image digests.
+The host plugin communicates through strict versioned interfaces and the configured
+endpoint transport/authentication; there is no matching plugin/server release
+requirement. Package dependency pins and release provenance are build concerns,
+not runtime authorization evidence. The sandbox's supervised OpenCode runtime
+remains independently validated by image manifests and preflight.

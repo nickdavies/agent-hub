@@ -15,7 +15,7 @@
  *   AGENT_HUB_CONFIG    path to agent-hub-permissions.json rule config (optional)
  *
  * Installation: add to opencode.json:
- *   { "plugin": ["file:///path/to/agent-hub.ts"] }
+ *   { "plugin": ["file:///path/to/provider-plugins/opencode/index.ts"] }
  */
 
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
@@ -36,9 +36,23 @@ import type {
 } from "./generated/gateway-types"
 import { approvalTransport, gatewayApprovalInvocation, gatewaySupervisionInvocation } from "./approval-transport"
 import { isStructuredOutputTool, normalizeToolExecution } from "./permission-normalization"
+import { createAgentHubRunTool, openCodeToolCallIdentity, requestSchema } from "./agent-hub-run"
 
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
 const SESSION_ALLOW_RULES = [{ permission: "*", pattern: "*", action: "allow" as const }]
+// Process exit must await every instance, not just the first signal listener's launches.
+const processShutdowns = new Set<() => Promise<void>>()
+let processShutdown: Promise<void> | undefined
+
+function exitAfterShutdown(code: number): Promise<void> {
+  processShutdown ??= (async () => {
+    const results = await Promise.allSettled([...processShutdowns].map((shutdown) => shutdown()))
+    const failures = results.filter((result) => result.status === "rejected")
+    for (const failure of failures) console.error("Agent Hub shutdown failed:", failure.reason)
+    process.exit(failures.length > 0 ? 1 : code)
+  })()
+  return processShutdown
+}
 
 type ExecutionStatus = "routing" | "authorized" | "completed" | "denied" | "transcript_only"
 interface ExecutionRecord {
@@ -50,6 +64,7 @@ interface ExecutionRecord {
   canonical_match_digests: string[]
   resolved_paths: string[]
   status: ExecutionStatus
+  host_launch_started?: boolean
   requests: { requestID: string; canonicalDigest: string }[]
 }
 
@@ -705,6 +720,7 @@ export async function createPluginInstance(
   input: PluginInput,
   options: { registerProcessHandlers?: boolean } = {},
 ): Promise<Hooks> {
+  if (processShutdown) throw new Error("Agent Hub plugin cannot initialize during process shutdown")
   const client = input.client
   const { directory, worktree } = input
   validatePluginDirectory(directory)
@@ -730,16 +746,35 @@ export async function createPluginInstance(
   }
   initializeRunEvidence(state)
 
+  const shutdown = new AbortController()
+  const hostLaunches = new Set<Promise<unknown>>()
+  let disposal: Promise<void> | undefined
+  function dispose(): Promise<void> {
+    disposal ??= (async () => {
+      shutdown.abort()
+      // Tool callers retain their outcomes; settlement alone does not attest sandbox cleanup success.
+      await Promise.allSettled([...hostLaunches])
+      if (options.registerProcessHandlers !== false) {
+        process.off("exit", exit)
+        process.off("SIGINT", sigint)
+        process.off("SIGTERM", sigterm)
+        processShutdowns.delete(stopForExit)
+      }
+      for (const timer of state.statusTimers.values()) clearTimeout(timer)
+      state.statusTimers.clear()
+      for (const sid of state.procs.keys()) killGateways(state, sid)
+    })()
+    return disposal
+  }
+  const stopForExit = async () => {
+    await dispose()
+    onExit(state)
+  }
   const exit = () => onExit(state)
-  const sigint = () => {
-    onExit(state)
-    process.exit(130)
-  }
-  const sigterm = () => {
-    onExit(state)
-    process.exit(143)
-  }
+  const sigint = () => { void exitAfterShutdown(130) }
+  const sigterm = () => { void exitAfterShutdown(143) }
   if (options.registerProcessHandlers !== false) {
+    processShutdowns.add(stopForExit)
     process.on("exit", exit)
     process.on("SIGINT", sigint)
     process.on("SIGTERM", sigterm)
@@ -751,6 +786,7 @@ export async function createPluginInstance(
     toolName: string,
     args: Record<string, unknown>,
   ) {
+    if (shutdown.signal.aborted) throw new ExplicitDenial("Agent Hub denied tool execution during plugin shutdown")
     if (!state.configInitialized) {
       const reason = "OpenCode executed a tool before the Agent Hub config hook took permission ownership"
       recordPermissionDenied(reason)
@@ -838,7 +874,36 @@ export async function createPluginInstance(
     recordExecution(state, record)
   }
 
+  const hostRunTool = createAgentHubRunTool()
   return {
+    ...(APPROVAL_TRANSPORT.kind === "http" ? {
+      tool: {
+        agent_hub_run: {
+          ...hostRunTool,
+          async execute(args, context) {
+            const { callID } = openCodeToolCallIdentity(context)
+            const record = state.executionRecords.get(callID)
+            if (shutdown.signal.aborted || !record || record.status !== "authorized" || record.host_launch_started
+              || !state.permissionOwnedSessions.has(context.sessionID)
+              || record.session_id !== context.sessionID || record.runtime_tool_name !== "agent_hub_run"
+              || record.raw_args_digest !== digest("agent-hub:opencode-raw-args:v1", args)) {
+              throw new Error("Agent Hub denied host launch because matching gateway authorization is missing or already consumed")
+            }
+            record.host_launch_started = true
+            const launch = hostRunTool.execute(requestSchema.parse(args), {
+              ...context,
+              abort: AbortSignal.any([context.abort, shutdown.signal]),
+            })
+            hostLaunches.add(launch)
+            try {
+              return await launch
+            } finally {
+              hostLaunches.delete(launch)
+            }
+          },
+        },
+      },
+    } : {}),
     config: async (config) => {
       const mutable = config as any
       mutable.permission = { "*": "deny" }
@@ -942,7 +1007,6 @@ export async function createPluginInstance(
       const message = boundedUtf8(`Agent Hub denied leaked native permission prompt '${info.id}' for session '${info.sessionID}'; the approval pipeline must own every tool decision`)
       output.status = "deny"
       recordPermissionDenied(message)
-      log(state, "ERROR", "denied leaked native permission prompt", { message })
     },
 
     "tool.execute.after": async (info) => {
@@ -1171,16 +1235,7 @@ export async function createPluginInstance(
         return
       }
     },
-    dispose: async () => {
-      if (options.registerProcessHandlers !== false) {
-        process.off("exit", exit)
-        process.off("SIGINT", sigint)
-        process.off("SIGTERM", sigterm)
-      }
-      for (const timer of state.statusTimers.values()) clearTimeout(timer)
-      state.statusTimers.clear()
-      for (const sid of state.procs.keys()) killGateways(state, sid)
-    },
+    dispose,
   }
 }
 

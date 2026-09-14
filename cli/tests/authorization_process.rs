@@ -57,7 +57,6 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     let gateway_config = host_dir.join("permissions.json");
     std::fs::write(&gateway_config, "{}").unwrap();
     let plugin_install = host_dir.join("opencode-plugin.js");
-    std::fs::write(&plugin_install, "export default {}\n").unwrap();
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_agent-hub"));
     let config_root = std::fs::canonicalize(&config).unwrap();
     let config_metadata = std::fs::metadata(&config_root).unwrap();
@@ -100,13 +99,6 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
             "self_binary":pin(&executable, "runtime:agent-hub"),
             "gateway":pin(&gateway_script, "runtime:agent-hub-gateway"),
             "policy":pin(&gateway_config, "policy:agent-hub-run"),
-            "opencode_plugin_install":pin(
-                &plugin_install,
-                &format!(
-                    "plugin:opencode-{}",
-                    config::AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION
-                )
-            ),
             "image_digests":{"test":format!("sha256:{}", "a".repeat(64))}
         }))
         .unwrap(),
@@ -173,14 +165,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
             "second-same-role-missing",
         ),
         ("018f0f21-76c0-7b37-a446-31f82a5e7620", "digest"),
-        (
-            "018f0f21-76c0-7b37-a446-31f82a5e7621",
-            "plugin-runtime-version",
-        ),
-        (
-            "018f0f21-76c0-7b37-a446-31f82a5e7622",
-            "plugin-sdk-mismatch",
-        ),
+        ("018f0f21-76c0-7b37-a446-31f82a5e7621", "stale-plugin-field"),
     ] {
         let mut changed = baseline_host_config.clone();
         match mutate {
@@ -229,19 +214,8 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
                 pin["source_identity"] =
                     format!("config:environments/test/environment.toml:sha256:{digest}").into();
             }
-            "plugin-runtime-version" => {
-                let pin = &mut changed["opencode_plugin_install"];
-                let digest = pin["sha256"].as_str().unwrap();
-                pin["source_identity"] = format!(
-                    "plugin:opencode-{}:sha256:{digest}",
-                    config::SUPERVISED_OPENCODE_RUNTIME_VERSION
-                )
-                .into();
-            }
-            "plugin-sdk-mismatch" => {
-                let pin = &mut changed["opencode_plugin_install"];
-                let digest = pin["sha256"].as_str().unwrap();
-                pin["source_identity"] = format!("plugin:opencode-1.18.25:sha256:{digest}").into();
+            "stale-plugin-field" => {
+                changed["opencode_plugin_install"] = serde_json::json!({});
             }
             _ => unreachable!(),
         }
@@ -262,6 +236,11 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         assert!(!rejected.status.success());
         let output: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
         assert_eq!(output["approval_receipt"]["status"], "unavailable");
+        if mutate == "stale-plugin-field" {
+            assert!(
+                output["error"].as_str().unwrap().contains("unknown field `opencode_plugin_install`")
+            );
+        }
         assert!(
             !state
                 .join(format!("authorizations/records/{invocation}.json"))
@@ -298,6 +277,32 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
             .contains("pinned config artifact coverage mismatch")
     );
     std::fs::remove_file(unexpected_config).unwrap();
+
+    for contents in [
+        None,
+        Some("independent plugin release"),
+        Some("replacement plugin release"),
+    ] {
+        if let Some(contents) = contents {
+            let replacement = host_dir.join("replacement-plugin.js");
+            std::fs::write(&replacement, contents).unwrap();
+            std::fs::rename(replacement, &plugin_install).unwrap();
+        }
+        for operation in ["inspect", "preview"] {
+            let output = invoke(
+                &root,
+                &fake_bin,
+                &state,
+                &["local", operation, "--request-stdin"],
+                Some(&launch.to_string()),
+            );
+            assert_success(&output);
+        }
+        assert!(!state.join("runs").exists());
+        assert!(!state.join("authorizations").exists());
+        assert!(!docker_marker.exists());
+    }
+    std::fs::remove_file(&plugin_install).unwrap();
 
     std::fs::write(&decision, "pending automatic").unwrap();
     let pending_invocation = "018f0f21-76c0-7b37-a446-31f82a5e7613";
@@ -518,7 +523,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         );
     }
 
-    std::fs::write(&plugin_install, "tampered\n").unwrap();
+    std::fs::write(&gateway_config, "tampered\n").unwrap();
     let tampered = invoke(
         &root,
         &fake_bin,
@@ -534,7 +539,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
             .unwrap()
             .contains("pinned artifact hash mismatch")
     );
-    std::fs::write(&plugin_install, "export default {}\n").unwrap();
+    std::fs::write(&gateway_config, "{}").unwrap();
 
     let replacement = host_dir.join("replacement-policy.json");
     std::fs::write(&replacement, "{}").unwrap();
@@ -950,7 +955,10 @@ fn write_fake_run_gateway(path: &Path, decision: &Path, state: &Path, docker_mar
     std::fs::write(
         path,
         format!(
-            "#!/bin/sh\n[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; pending*) echo $$ > '{}'; printf entered > '{}'; trap 'printf confirmed > \"{}\"; exit 1' TERM INT; while :; do sleep 1; done;; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; p=open(\"{}\").read().split(); d,a=p[:2]; mode=p[2] if len(p)>2 else \"\"; digest=\"0\"*64 if mode==\"wrong\" else r[\"canonical_digest\"]; expiry=\"2000-01-01T00:00:00Z\" if mode==\"expired\" else r[\"expires_at\"]; approval=\"018f0f21-76c0-7b37-a446-31f82a5e7601\" if a==\"human\" else r[\"invocation_id\"]; print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":digest,\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":approval,\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":expiry}}))'\n",
+            concat!(
+                "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = --preview ]; then exec /usr/bin/python3 -c 'import json,sys; r=json.load(sys.stdin)[\"tool_input\"]; print(json.dumps({{\"schema\":\"agent_hub_run_policy_preview_v1\",\"projection\":r[\"policy_projection\"],\"matched_action\":\"allow\"}}))'; fi; done\n",
+                "[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; pending*) echo $$ > '{}'; printf entered > '{}'; trap 'printf confirmed > \"{}\"; exit 1' TERM INT; while :; do sleep 1; done;; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; p=open(\"{}\").read().split(); d,a=p[:2]; mode=p[2] if len(p)>2 else \"\"; digest=\"0\"*64 if mode==\"wrong\" else r[\"canonical_digest\"]; expiry=\"2000-01-01T00:00:00Z\" if mode==\"expired\" else r[\"expires_at\"]; approval=\"018f0f21-76c0-7b37-a446-31f82a5e7601\" if a==\"human\" else r[\"invocation_id\"]; print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":digest,\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":approval,\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":expiry}}))'\n",
+            ),
             state.display(),
             state.display(),
             decision.display(),

@@ -15,17 +15,20 @@ describe("bundled plugin entrypoint", () => {
       format: "esm",
       minify: true,
       target: "node",
-      write: false,
     })
     expect(build.success).toBe(true)
     expect(build.outputs).toHaveLength(1)
     const artifact = path.join(fixtureRoot, "agent-hub-opencode-plugin.js")
-    writeFileSync(artifact, await build.outputs[0].arrayBuffer())
+    writeFileSync(artifact, new Uint8Array(await build.outputs[0].arrayBuffer()))
 
     const inspection = Bun.spawnSync([
       "node",
       "--eval",
-      `import(${JSON.stringify(pathToFileURL(artifact).href)}).then((module) => console.log(JSON.stringify({defaultType: typeof module.default, keys: Object.keys(module).sort()})))`,
+      `import(${JSON.stringify(pathToFileURL(artifact).href)}).then(async (module) => {
+        const hooks = await module.default({ directory: "/work", worktree: "/work", client: { _client: {} } });
+        console.log(JSON.stringify({defaultType: typeof module.default, keys: Object.keys(module).sort(), tools: Object.keys(hooks.tool ?? {})}));
+        await hooks.dispose();
+      })`,
     ], {
       env: {
         ...process.env,
@@ -47,6 +50,7 @@ describe("bundled plugin entrypoint", () => {
     expect(JSON.parse(inspection.stdout.toString())).toEqual({
       defaultType: "function",
       keys: ["default"],
+      tools: [],
     })
   })
 })

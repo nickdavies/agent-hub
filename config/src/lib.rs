@@ -11,7 +11,6 @@ mod tools;
 pub mod triage;
 pub mod triage_mounts;
 
-pub const AGENT_HUB_RUN_PLUGIN_SDK_OPENCODE_VERSION: &str = "1.18.26";
 pub const SUPERVISED_OPENCODE_RUNTIME_VERSION: &str = "1.18.18";
 
 pub use deployment_validation::{

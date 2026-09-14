@@ -1,4 +1,6 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test"
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test"
+import fs from "fs"
+import { defaultRuntime, requestSchema } from "./agent-hub-run"
 import { EventEmitter } from "events"
 import { mkdirSync, rmSync } from "node:fs"
 import path from "node:path"
@@ -427,8 +429,80 @@ describe("permission ownership and fail-closed routing", () => {
   test("always denies leaked native permission prompts", async () => {
     const hooks = await initializedHooks()
     const output: { status: "ask" | "deny" | "allow" } = { status: "ask" }
-    await hooks["permission.ask"]!({ id: "permission-1", sessionID: "session-1" } as any, output)
-    expect(output.status).toBe("deny")
+    const logger = spyOn(fs, "appendFileSync").mockImplementation(() => { throw new Error("log unavailable") })
+    try {
+      await hooks["permission.ask"]!({ id: "permission-1", sessionID: "session-1" } as any, output)
+      expect(output.status).toBe("deny")
+      expect(logger).not.toHaveBeenCalled()
+    } finally {
+      logger.mockRestore()
+    }
+  })
+
+  test("host launch requires gateway authorization bound to the exact session, call, and structured input", async () => {
+    const hooks = await initializedHooks()
+    await ownSession(hooks)
+    const launch = hooks.tool?.agent_hub_run
+    expect(launch).toBeDefined()
+    const args = requestSchema.parse({
+      schema: "agent_hub_run_intent_v1", environment: "code-auto", image_family: "job-code",
+      network_class: "none", tool_approval: "auto", timeout_secs: 60, prompt: "test",
+      workspaces: [{ alias: "source", path: "/work/source", access: "read_write" }], primary_workspace: "source",
+    })
+    const context = {
+      sessionID: "session-1", callID: "host-call", abort: new AbortController().signal,
+      metadata: () => {}, ask: async () => { throw new Error("native prompt must not run") },
+    } as any
+    const priorBinary = process.env.AGENT_HUB_BIN
+    process.env.AGENT_HUB_BIN = "/fixed/agent-hub"
+    const executable = spyOn(defaultRuntime, "assertExecutable").mockResolvedValue(undefined)
+    const execute = spyOn(defaultRuntime, "execute").mockRejectedValue(new Error("host reached"))
+    try {
+      await expect(launch!.execute(args, context)).rejects.toThrow(/authorization/)
+      expect(executable).not.toHaveBeenCalled()
+      approvalGatewayResults = [{ stdout: '{"allowed":false,"reason":"operator denied launch"}' }]
+      await expect(hooks["tool.execute.before"]!(
+        { sessionID: context.sessionID, callID: context.callID, tool: "agent_hub_run" }, { args },
+      )).rejects.toThrow("operator denied launch")
+      await expect(launch!.execute(args, context)).rejects.toThrow(/authorization/)
+      expect(execute).not.toHaveBeenCalled()
+
+      context.callID = "transport-failed-host-call"
+      approvalGatewayResults = [{ spawnError: "gateway unavailable" }]
+      await expect(hooks["tool.execute.before"]!(
+        { sessionID: context.sessionID, callID: context.callID, tool: "agent_hub_run" }, { args },
+      )).rejects.toThrow(/pipeline failed/)
+      await expect(launch!.execute(args, context)).rejects.toThrow(/authorization/)
+      expect(executable).not.toHaveBeenCalled()
+      expect(execute).not.toHaveBeenCalled()
+
+      context.callID = "allowed-host-call"
+      await hooks["tool.execute.before"]!(
+        { sessionID: context.sessionID, callID: context.callID, tool: "agent_hub_run" }, { args },
+      )
+      expect(approvalPayloads.at(-1)?.tool_name).toBe("agent_hub_run")
+      expect(approvalPayloads.at(-1)?.tool_input).toEqual(args)
+      expect(approvalPayloads.at(-1)?.tool_match_input).toEqual(args)
+      await expect(launch!.execute({ ...args, prompt: "changed" }, context)).rejects.toThrow(/authorization/)
+      await expect(launch!.execute(args, { ...context, sessionID: "other" })).rejects.toThrow(/authorization/)
+      await expect(launch!.execute(args, { ...context, callID: "other" })).rejects.toThrow(/authorization/)
+      sessionUpdateResults = [{ error: "ownership lost" }]
+      await expect(ownSession(hooks)).rejects.toThrow(/ownership failed/)
+      await expect(launch!.execute(args, context)).rejects.toThrow(/authorization/)
+      expect(executable).not.toHaveBeenCalled()
+      expect(execute).not.toHaveBeenCalled()
+      await ownSession(hooks)
+      await expect(launch!.execute(args, context)).rejects.toThrow("host reached")
+      expect(execute).toHaveBeenCalledTimes(1)
+      await expect(launch!.execute(args, context)).rejects.toThrow(/authorization/)
+      expect(execute).toHaveBeenCalledTimes(1)
+    } finally {
+      executable.mockRestore()
+      execute.mockRestore()
+      if (priorBinary === undefined) delete process.env.AGENT_HUB_BIN
+      else process.env.AGENT_HUB_BIN = priorBinary
+      await hooks.dispose?.()
+    }
   })
 
   test("multiple plugin instances do not clear or share mutable state", async () => {
