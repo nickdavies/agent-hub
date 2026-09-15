@@ -124,14 +124,32 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
         let cfg = by_name[image_name];
         let tag = &cfg.tag;
         println!("[{}/{}] Building image {}...", index + 1, total, tag);
+        let candidate_identity_path = (image_name == "job-code").then(|| {
+            config_root.join("artifacts/build-contexts").join(format!(
+                "job-code-candidate-{}-{}.iid",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ))
+        });
+        let candidate_reference = (image_name == "job-code").then(|| {
+            format!(
+                "agent-hub/job-code-build-candidate:{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            )
+        });
 
         let mut command = Command::new("docker");
-        command
-            .arg("build")
-            .arg("-f")
-            .arg(&dockerfile)
-            .arg("-t")
-            .arg(tag);
+        command.arg("build").arg("-f").arg(&dockerfile);
+        if let Some(identity_path) = &candidate_identity_path {
+            command
+                .arg("--iidfile")
+                .arg(identity_path)
+                .arg("-t")
+                .arg(candidate_reference.as_ref().expect("candidate reference"));
+        } else {
+            command.arg("-t").arg(tag);
+        }
         if image_name == "job-code" {
             let context = &cfg.build_contexts["agent-hub-source"];
             let materialized = match materialize_git_build_context(config_root, image_name, context)
@@ -146,31 +164,114 @@ fn build_images(config_root: &Path, system: &config::SystemConfig) -> (bool, Vec
                 .arg("--build-context")
                 .arg(format!("agent-hub-source={}", materialized.display()));
         }
+        if let Some(reference) = &candidate_reference
+            && let Err(error) = claim_candidate_reference(reference)
+        {
+            eprintln!("[FAIL] {error}");
+            return (false, built);
+        }
         let status = command.arg(&image_dir).status();
 
-        match status {
+        let build_result = match status {
             Ok(status) if status.success() => {
-                if image_name == "job-code"
-                    && let Err(error) = run_job_code_preflight(tag, config_root)
-                {
-                    eprintln!("[FAIL] job-code preflight failed for {tag}: {error}");
-                    return (false, built);
+                if let Some(identity_path) = &candidate_identity_path {
+                    let qualification =
+                        qualify_and_publish_job_code_candidate(identity_path, tag, config_root);
+                    let _ = std::fs::remove_file(identity_path);
+                    if let Err(error) = qualification {
+                        Err(format!("job-code qualification failed for {tag}: {error}"))
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
                 }
+            }
+            Ok(status) => {
+                if let Some(identity_path) = &candidate_identity_path {
+                    let _ = std::fs::remove_file(identity_path);
+                }
+                Err(format!("docker build failed for {tag} (exit: {status})"))
+            }
+            Err(err) => {
+                if let Some(identity_path) = &candidate_identity_path {
+                    let _ = std::fs::remove_file(identity_path);
+                }
+                Err(format!("failed to run docker build for {tag}: {err}"))
+            }
+        };
+        let candidate_cleanup = candidate_reference
+            .as_deref()
+            .map_or(Ok(()), remove_candidate_reference);
+        match (build_result, candidate_cleanup) {
+            (Ok(()), Ok(())) => {
                 println!("[OK]   built {}", tag);
                 built.push(tag.clone());
             }
-            Ok(status) => {
-                eprintln!("[FAIL] docker build failed for {} (exit: {})", tag, status);
+            (Err(error), Ok(())) => {
+                eprintln!("[FAIL] {error}");
                 ok = false;
             }
-            Err(err) => {
-                eprintln!("[FAIL] failed to run docker build for {}: {}", tag, err);
+            (Ok(()), Err(cleanup)) => {
+                eprintln!("[FAIL] {cleanup}");
+                ok = false;
+            }
+            (Err(error), Err(cleanup)) => {
+                eprintln!("[FAIL] {error}; {cleanup}");
                 ok = false;
             }
         }
     }
 
     (ok, built)
+}
+
+fn claim_candidate_reference(reference: &str) -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(["image", "inspect", reference])
+        .output()
+        .map_err(|error| format!("failed to establish candidate reference ownership: {error}"))?;
+    if output.status.success() {
+        return Err(format!(
+            "generated candidate image reference already exists: {reference}"
+        ));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !docker_reports_no_such_image(&stderr, reference) {
+        return Err(format!(
+            "failed to establish candidate reference ownership (exit: {}): {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn remove_candidate_reference(reference: &str) -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(["image", "rm", reference])
+        .output()
+        .map_err(|error| {
+            format!("failed to remove owned candidate reference {reference}: {error}")
+        })?;
+    if output.status.success()
+        || docker_reports_no_such_image(&String::from_utf8_lossy(&output.stderr), reference)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "failed to remove owned candidate reference {reference} (exit: {}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn docker_reports_no_such_image(stderr: &str, reference: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim();
+        line.strip_prefix("Error response from daemon: No such image: ") == Some(reference)
+            || line.strip_prefix("Error: No such image: ") == Some(reference)
+    })
 }
 
 fn materialize_git_build_context(
@@ -284,7 +385,71 @@ fn canonical_git_url(value: &str) -> String {
     normalized
 }
 
-fn run_job_code_preflight(image: &str, representative_path: &Path) -> Result<(), String> {
+fn qualify_and_publish_job_code_candidate(
+    identity_path: &Path,
+    release_tag: &str,
+    representative_path: &Path,
+) -> Result<(), String> {
+    let candidate_identity = std::fs::read_to_string(identity_path).map_err(|error| {
+        format!(
+            "failed to read candidate image identity from {}: {error}",
+            identity_path.display()
+        )
+    })?;
+    let candidate_identity = candidate_identity.trim();
+    validate_image_identity(candidate_identity)?;
+    let inspected_identity = inspect_image_identity(candidate_identity)?;
+    if inspected_identity != candidate_identity {
+        return Err(format!(
+            "candidate image identity changed: expected {candidate_identity}, got {inspected_identity}"
+        ));
+    }
+    run_job_code_preflight(candidate_identity, representative_path)?;
+    let status = Command::new("docker")
+        .args(["image", "tag", candidate_identity, release_tag])
+        .status()
+        .map_err(|error| format!("failed to publish qualified image tag: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "failed to publish qualified image tag {release_tag} (exit: {status})"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_image_identity(identity: &str) -> Result<(), String> {
+    let digest = identity
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "candidate image identity is not a canonical sha256 digest".to_string())?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("candidate image identity is not a canonical sha256 digest".to_string());
+    }
+    Ok(())
+}
+
+fn inspect_image_identity(image: &str) -> Result<String, String> {
+    let inspect = Command::new("docker")
+        .args(["image", "inspect", "--format={{.Id}}", image])
+        .output()
+        .map_err(|error| format!("failed to inspect built image identity: {error}"))?;
+    if !inspect.status.success() {
+        return Err(format!(
+            "failed to inspect built image identity: {}",
+            String::from_utf8_lossy(&inspect.stderr).trim()
+        ));
+    }
+    let identity = String::from_utf8(inspect.stdout)
+        .map_err(|error| format!("built image identity is not UTF-8: {error}"))?;
+    let identity = identity.trim();
+    validate_image_identity(identity)?;
+    Ok(identity.to_string())
+}
+
+fn run_job_code_preflight(image_identity: &str, representative_path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     let (uid, gid) = {
         use std::os::unix::fs::MetadataExt;
@@ -300,19 +465,6 @@ fn run_job_code_preflight(image: &str, representative_path: &Path) -> Result<(),
     #[cfg(not(unix))]
     return Err("job-code preflight requires a Unix runtime UID and GID".to_string());
 
-    let inspect = Command::new("docker")
-        .args(["image", "inspect", "--format={{.Id}}", image])
-        .output()
-        .map_err(|error| format!("failed to inspect built image identity: {error}"))?;
-    if !inspect.status.success() {
-        return Err(format!(
-            "failed to inspect built image identity: {}",
-            String::from_utf8_lossy(&inspect.stderr).trim()
-        ));
-    }
-    let image_identity = String::from_utf8(inspect.stdout)
-        .map_err(|error| format!("built image identity is not UTF-8: {error}"))?;
-    let image_identity = image_identity.trim();
     let args = config::job_code_preflight_docker_args(
         image_identity,
         uid,
@@ -331,8 +483,12 @@ fn run_job_code_preflight(image: &str, representative_path: &Path) -> Result<(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let report =
-        config::validate_job_code_preflight_report(&output.stdout, image_identity, uid, gid)?;
+    let report = config::validate_supervised_opencode_preflight_report(
+        &output.stdout,
+        image_identity,
+        uid,
+        gid,
+    )?;
     println!("[OK]   job-code preflight {}", report);
     Ok(())
 }
@@ -1232,6 +1388,40 @@ mod tests {
             canonical_git_url("git@github.com:nickdavies/agent-hub.git"),
             canonical_git_url("https://github.com/nickdavies/agent-hub.git")
         );
+    }
+
+    #[test]
+    fn candidate_image_identity_must_be_canonical() {
+        assert!(validate_image_identity(&format!("sha256:{}", "a".repeat(64))).is_ok());
+        for invalid in [
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+            "job-code:latest".to_string(),
+        ] {
+            assert!(
+                validate_image_identity(&invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_explicit_matching_no_such_image_is_absence() {
+        let reference = "agent-hub/job-code-build-candidate:test";
+        for stderr in [
+            format!("Error response from daemon: No such image: {reference}\n"),
+            format!("Error: No such image: {reference}\n"),
+        ] {
+            assert!(docker_reports_no_such_image(&stderr, reference));
+        }
+        for stderr in [
+            "permission denied: no such image".to_string(),
+            "Cannot connect to the Docker daemon".to_string(),
+            "Error response from daemon: No such object: test".to_string(),
+            "Error response from daemon: No such image: another:tag".to_string(),
+        ] {
+            assert!(!docker_reports_no_such_image(&stderr, reference));
+        }
     }
 
     const LOCKED_DOCKERFILE: &str = r#"FROM debian:bookworm-slim@sha256:abc

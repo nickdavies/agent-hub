@@ -12,7 +12,7 @@ use agent_hub_executor::{
         PreparedRestrictedEgress, ProxyRuntimeSpec, ResolverRuntimeSpec, RestrictedEgressRequest,
         RestrictedPolicy,
     },
-    execute_output_cancellable, execute_process, inspect_image_identity, verify_image_identity,
+    execute_process, inspect_image_identity, verify_image_identity,
 };
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
@@ -429,6 +429,31 @@ impl AttendedCleanupEvidence {
             runtime_data: absent(),
             effects: absent(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryCleanupProof {
+    Unproven,
+    ProvenAbsent,
+}
+
+impl PrimaryCleanupProof {
+    fn requires_fallback(self) -> bool {
+        self != Self::ProvenAbsent
+    }
+}
+
+fn incorporate_primary_cleanup_fallback(
+    evidence: &mut CleanupCheck,
+    fallback: &anyhow::Result<()>,
+) {
+    if evidence.status != "failed" {
+        *evidence = CleanupCheck::from_result(fallback);
+    } else if let Err(error) = fallback
+        && let Some(inner_error) = evidence.error.as_mut()
+    {
+        inner_error.push_str(&format!("; container cleanup failed: {error:#}"));
     }
 }
 
@@ -887,6 +912,7 @@ pub async fn run(
                     &active_record.ownership,
                     relay_endpoint.as_ref(),
                     &expected,
+                    false,
                 )
                 .await
                 .context("reconcile interrupted attended attempt")?;
@@ -1074,6 +1100,7 @@ pub async fn run(
     let mut captured_process_status = None;
     let mut captured_permission_outcome = None;
     let mut captured_cleanup_evidence = None;
+    let mut primary_cleanup_proof = PrimaryCleanupProof::Unproven;
     let host_redaction_values = relay_endpoint
         .as_ref()
         .and_then(|endpoint| endpoint.token.as_ref())
@@ -1086,12 +1113,12 @@ pub async fn run(
         .then(|| host_redaction_values.clone());
     let result = async {
     let cancel_marker = store.path(&cancel_path(&id))?;
-    let cancelled_before_preflight = cancel_marker.exists();
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(cancelled_before_preflight);
+    let cancelled_before_startup = cancel_marker.exists();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(cancelled_before_startup);
     let cancellation = Cancellation::new(cancel_rx);
     ensure!(
-        !cancelled_before_preflight,
-        "execution was cancelled before preflight"
+        !cancelled_before_startup,
+        "execution was cancelled before startup"
     );
     let poll_cancel_tx = cancel_tx.clone();
     let polled_cancel_marker = cancel_marker.clone();
@@ -1126,43 +1153,6 @@ pub async fn run(
             "attended relay socket UID is incompatible with the sandbox runtime UID"
         );
     }
-    let preflight_args = config::job_code_preflight_docker_args(
-        &image_identity,
-        runtime_uid,
-        runtime_gid,
-        request.execution.approved.pids_limit,
-    )
-    .map_err(anyhow::Error::msg)?;
-    let preflight = execute_output_cancellable(
-        &docker_path,
-        &preflight_args,
-        &deadline,
-        &cancellation,
-        "job-code preflight",
-    )
-    .await?;
-    ensure!(
-        preflight.status.success(),
-        "job-code preflight failed: {}",
-        String::from_utf8_lossy(&preflight.stderr).trim()
-    );
-    if request.proposal.tool_approval == ToolApprovalMode::Dippy {
-        config::validate_supervised_opencode_preflight_report(
-            &preflight.stdout,
-            &image_identity,
-            runtime_uid,
-            runtime_gid,
-        )
-    } else {
-        config::validate_job_code_preflight_report(
-            &preflight.stdout,
-            &image_identity,
-            runtime_uid,
-            runtime_gid,
-        )
-    }
-    .map_err(anyhow::Error::msg)?;
-    attended_fault("preflight_complete")?;
     ensure!(
         !cancellation.requested(),
         "execution was cancelled before owner publication"
@@ -1697,6 +1687,9 @@ pub async fn run(
                 "primary containment blocked by unsettled helper: {error:#}"
             )),
         };
+        if helper_cleanup.is_ok() && primary_cleanup.is_ok() {
+            primary_cleanup_proof = PrimaryCleanupProof::ProvenAbsent;
+        }
         let credential_cleanup = credential_cleanup.cleanup();
         let containment_absent = relay_cleanup.is_ok() && helper_cleanup.is_ok()
             && primary_cleanup.is_ok()
@@ -1778,7 +1771,6 @@ pub async fn run(
         )
     }
     .await;
-    record.finished_at = Some(Utc::now());
     let mut cleanup_evidence = captured_cleanup_evidence.unwrap_or_default();
     match result {
         Ok(result) => {
@@ -1837,39 +1829,46 @@ pub async fn run(
     record.process_status = captured_process_status;
     record.permission_outcome =
         captured_permission_outcome.unwrap_or(PermissionOutcome::NotApplicable);
-    let outer_container_cleanup = async {
-        let effects = if run_dir.join("effects").exists() {
-            Some(agent_hub_executor::ExecutionCancellationContext::new(
-                &run_dir.join("effects"),
-                Cancellation::never(),
-            )?)
+    if primary_cleanup_proof.requires_fallback() {
+        let outer_container_cleanup = async {
+            let effects = if run_dir.join("effects").exists() {
+                Some(agent_hub_executor::ExecutionCancellationContext::new(
+                    &run_dir.join("effects"),
+                    Cancellation::never(),
+                )?)
+            } else {
+                None
+            };
+            if let Some(effects) = &effects {
+                effects.settle_process_helpers().await?;
+            }
+            let mut docker = DockerCli::new(&docker_path);
+            if let Some(effects) = effects {
+                docker = docker.with_effects(effects);
+            }
+            docker
+                .remove_owned(
+                    &container_name,
+                    &DockerOwnership::new(ownership.clone())?,
+                    PRIMARY_CLEANUP_TIMEOUT,
+                )
+                .await
+        }
+        .await;
+        incorporate_primary_cleanup_fallback(
+            &mut cleanup_evidence.container,
+            &outer_container_cleanup,
+        );
+        if let Err(error) = outer_container_cleanup {
+            record.status = RunStatus::CleanupFailed;
+            let container_error = format!("container cleanup failed: {error:#}");
+            record.error = Some(match record.error.take() {
+                Some(existing) => format!("{existing}; {container_error}"),
+                None => container_error,
+            });
         } else {
-            None
-        };
-        if let Some(effects) = &effects {
-            effects.settle_process_helpers().await?;
+            primary_cleanup_proof = PrimaryCleanupProof::ProvenAbsent;
         }
-        let mut docker = DockerCli::new(&docker_path);
-        if let Some(effects) = effects {
-            docker = docker.with_effects(effects);
-        }
-        docker
-            .remove_owned(
-                &container_name,
-                &DockerOwnership::new(ownership.clone())?,
-                PRIMARY_CLEANUP_TIMEOUT,
-            )
-            .await
-    }
-    .await;
-    cleanup_evidence.container = CleanupCheck::from_result(&outer_container_cleanup);
-    if let Err(error) = outer_container_cleanup {
-        record.status = RunStatus::CleanupFailed;
-        let container_error = format!("container cleanup failed: {error:#}");
-        record.error = Some(match record.error.take() {
-            Some(existing) => format!("{existing}; {container_error}"),
-            None => container_error,
-        });
     }
     let prelaunch_reconciliation =
         if record.launch_state == LaunchState::Preparing && run_dir.exists() {
@@ -1881,6 +1880,7 @@ pub async fn run(
                 &ownership,
                 relay_endpoint.as_ref(),
                 &owner_marker_for_record(&record),
+                primary_cleanup_proof == PrimaryCleanupProof::ProvenAbsent,
             )
             .await
         } else {
@@ -1910,6 +1910,7 @@ pub async fn run(
             ExecutionOutcome::TimedOut => RunStatus::TimedOut,
         };
     }
+    record.finished_at = Some(Utc::now());
     if cleanup_complete {
         attended_fault("cleanup_complete")?;
     }
@@ -3281,6 +3282,7 @@ pub async fn cleanup(
         &record.ownership,
         Some(&relay_endpoint),
         &owner_marker,
+        false,
     )
     .await;
     record.finished_at = Some(Utc::now());
@@ -3485,6 +3487,7 @@ async fn recover_owned_run_resources(
     ownership: &BTreeMap<String, String>,
     relay_endpoint: Option<&RelayEndpoint>,
     owner_marker: &RunOwnerMarker,
+    primary_absence_proven: bool,
 ) -> anyhow::Result<()> {
     verify_run_owner_marker(run_dir, owner_marker)?;
     let mut failures = Vec::new();
@@ -3506,15 +3509,17 @@ async fn recover_owned_run_resources(
     if let Some(effects) = &effects {
         docker_cli = docker_cli.with_effects(effects.clone());
     }
-    if let Err(error) = docker_cli
-        .remove_owned(
-            container_name,
-            &DockerOwnership::new(ownership.clone())?,
-            PRIMARY_CLEANUP_TIMEOUT,
-        )
-        .await
-    {
-        failures.push(format!("primary container: {error:#}"));
+    if !primary_absence_proven {
+        if let Err(error) = docker_cli
+            .remove_owned(
+                container_name,
+                &DockerOwnership::new(ownership.clone())?,
+                PRIMARY_CLEANUP_TIMEOUT,
+            )
+            .await
+        {
+            failures.push(format!("primary container: {error:#}"));
+        }
     }
     if run_dir.exists()
         && let Err(error) = agent_hub_executor::egress::recover_restricted_egress(
@@ -6383,13 +6388,14 @@ fn set_private_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AbortTask, AttendedExecutionOutcome, FinalizationError, RelayEndpoint, RelayEpochState,
-        RunOwnerMarker, RunRecord, RunStatus, apply_git_runtime_environment,
-        attended_execution_outcome, merge_execution_cleanup, network_class_within_ceiling,
-        provider_retry_proofs_complete, resolve_network_resources, selector_resources,
-        serialize_pretty_bounded, verify_exact_relay_mount, verify_host_only_approval_environment,
-        verify_recovery_relay_endpoint, verify_run_owner_marker, verify_tool_approval,
-        write_new_private_durable,
+        AbortTask, AttendedExecutionOutcome, CleanupCheck, FinalizationError, PrimaryCleanupProof,
+        RelayEndpoint, RelayEpochState, RunOwnerMarker, RunRecord, RunStatus,
+        apply_git_runtime_environment, attended_execution_outcome,
+        incorporate_primary_cleanup_fallback, merge_execution_cleanup,
+        network_class_within_ceiling, provider_retry_proofs_complete, resolve_network_resources,
+        selector_resources, serialize_pretty_bounded, verify_exact_relay_mount,
+        verify_host_only_approval_environment, verify_recovery_relay_endpoint,
+        verify_run_owner_marker, verify_tool_approval, write_new_private_durable,
     };
     use crate::state::StateStore;
     use agent_hub_executor::CleanupStatus;
@@ -8129,6 +8135,106 @@ grep -qx 'ready\|ready\.' real-llm.log
         assert!(error.contains("materialization failed"));
         assert!(error.contains("owned egress remains"));
         assert!(error.contains("credential file remains"));
+    }
+
+    #[test]
+    fn successful_primary_cleanup_proof_skips_fallback() {
+        assert!(!PrimaryCleanupProof::ProvenAbsent.requires_fallback());
+    }
+
+    #[test]
+    fn missing_or_failed_primary_cleanup_proof_requires_fallback() {
+        assert!(PrimaryCleanupProof::Unproven.requires_fallback());
+    }
+
+    #[test]
+    fn successful_fallback_does_not_erase_failed_primary_cleanup() {
+        let mut evidence = CleanupCheck::from_result(&Err(anyhow::anyhow!("inner proof failed")));
+        incorporate_primary_cleanup_fallback(&mut evidence, &Ok(()));
+        assert_eq!(evidence.status, "failed");
+        assert!(evidence.error.unwrap().contains("inner proof failed"));
+    }
+
+    #[test]
+    fn failed_fallback_aggregates_both_primary_cleanup_failures() {
+        let mut evidence = CleanupCheck::from_result(&Err(anyhow::anyhow!("inner proof failed")));
+        incorporate_primary_cleanup_fallback(
+            &mut evidence,
+            &Err(anyhow::anyhow!("fallback proof failed")),
+        );
+        let error = evidence.error.unwrap();
+        assert!(error.contains("inner proof failed"));
+        assert!(error.contains("fallback proof failed"));
+    }
+
+    #[tokio::test]
+    async fn successful_primary_absence_is_not_reobserved_during_recovery() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-primary-proof-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let run_dir = root.join("run");
+        let docker = root.join("docker");
+        let events = root.join("events");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nif [ \"$1 $2\" = 'container inspect' ]; then [ \"$5\" != container ] || printf 'primary-inspect\\n' >> '{}'; printf 'No such container\\n' >&2; exit 1; fi\nif [ \"$1 $2\" = 'network inspect' ]; then printf 'No such network\\n' >&2; exit 1; fi\nexit 2\n",
+                events.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = RunOwnerMarker {
+            run_id: "run-id".into(),
+            attempt_id: "attempt-id".into(),
+            authorization_id: "authorization-id".into(),
+            receipt_id: "receipt-id".into(),
+            authorization_digest: "a".repeat(64),
+            nonce: "nonce".into(),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            mode: "attended".into(),
+            ancestry: Vec::new(),
+        };
+        super::create_owned_run_directory(&run_dir, &marker).unwrap();
+        let ownership = BTreeMap::from([("owner".into(), "test".into())]);
+        super::recover_owned_run_resources(
+            &docker,
+            &run_dir,
+            "run-id",
+            "container",
+            &ownership,
+            None,
+            &marker,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&events)
+                .unwrap()
+                .contains("primary-inspect")
+        );
+        std::fs::write(&events, "between\n").unwrap();
+        super::recover_owned_run_resources(
+            &docker,
+            &run_dir,
+            "run-id",
+            "container",
+            &ownership,
+            None,
+            &marker,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&events).unwrap(), "between\n");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

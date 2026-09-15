@@ -271,7 +271,10 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         assert_eq!(output["approval_receipt"]["status"], "unavailable");
         if mutate == "stale-plugin-field" {
             assert!(
-                output["error"].as_str().unwrap().contains("unknown field `opencode_plugin_install`")
+                output["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown field `opencode_plugin_install`")
             );
         }
         assert!(
@@ -454,7 +457,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         allowed_invocation_id,
     ];
     std::fs::write(&decision, "allow human").unwrap();
-    std::fs::write(root.join("fail-preflight-once"), "fail").unwrap();
+    std::fs::write(root.join("fail-image-inspect-once"), "fail").unwrap();
     let allowed = invoke(
         &root,
         &fake_bin,
@@ -482,6 +485,27 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     )
     .unwrap();
     assert_eq!(record["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(record["attempts"][0]["retry_class"], "prelaunch");
+    assert_eq!(record["attempts"][0]["retry_eligible"], true);
+    let first_run_id = record["attempts"][0]["run_id"].as_str().unwrap();
+    let first_run: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(state.join(format!("executions/{first_run_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    let finished_at =
+        chrono::DateTime::parse_from_rfc3339(first_run["finished_at"].as_str().unwrap())
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+    let cleanup_events = std::fs::read_to_string(root.join("cleanup.events")).unwrap();
+    let first_container = first_run["container_name"].as_str().unwrap();
+    let observed = cleanup_events
+        .lines()
+        .filter(|line| line.contains(first_container))
+        .map(|line| line.split_once(' ').unwrap().0.parse::<i64>().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!observed.is_empty());
+    assert!(observed.into_iter().all(|event| event <= finished_at));
     assert_eq!(
         record["receipt_id"],
         output["approval_receipt"]["receipt"]["approval_id"]
@@ -489,6 +513,16 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     assert_eq!(
         record["decision_receipt"],
         output["approval_receipt"]["receipt"]
+    );
+    let docker_calls = std::fs::read_to_string(&docker_marker).unwrap();
+    assert!(
+        docker_calls
+            .lines()
+            .any(|call| call.starts_with("image inspect "))
+    );
+    assert!(
+        !docker_calls.contains("agent-hub-job-code-preflight"),
+        "attended startup still ran the comprehensive image preflight: {docker_calls}"
     );
     let repeated = invoke(
         &root,
@@ -888,6 +922,233 @@ fn initialize_repository(path: &Path) {
     ]);
 }
 
+#[test]
+fn release_image_producer_qualifies_before_publish_and_cleans_only_candidate_reference() {
+    let fixture = build_image_fixture("success");
+    let output = invoke_image_build(&fixture);
+    assert_success(&output);
+    let events = std::fs::read_to_string(fixture.join("docker.events")).unwrap();
+    let preflight = events.find("run ").unwrap();
+    let publish = events.find("image tag ").unwrap();
+    assert!(
+        preflight < publish,
+        "qualification did not precede publication: {events}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("docker-state.json")).unwrap()).unwrap();
+    assert_eq!(state["release"], format!("sha256:{}", "a".repeat(64)));
+    assert_eq!(state["shared"], format!("sha256:{}", "a".repeat(64)));
+    assert!(state["candidate"].is_null());
+    assert!(!events.contains(&format!("image rm sha256:{}", "a".repeat(64))));
+    std::fs::remove_dir_all(fixture).unwrap();
+}
+
+#[test]
+fn release_image_producer_preserves_old_tag_on_qualification_failure() {
+    let fixture = build_image_fixture("qualification-fail");
+    let output = invoke_image_build(&fixture);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected qualification failure"));
+    let events = std::fs::read_to_string(fixture.join("docker.events")).unwrap();
+    assert!(!events.contains("image tag "));
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.join("docker-state.json")).unwrap()).unwrap();
+    assert_eq!(state["release"], format!("sha256:{}", "b".repeat(64)));
+    assert_eq!(state["shared"], format!("sha256:{}", "a".repeat(64)));
+    assert!(state["candidate"].is_null());
+    std::fs::remove_dir_all(fixture).unwrap();
+}
+
+#[test]
+fn release_image_producer_refuses_occupied_candidate_without_removing_it() {
+    let fixture = build_image_fixture("occupied");
+    let output = invoke_image_build(&fixture);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("candidate image reference already exists")
+    );
+    let events = std::fs::read_to_string(fixture.join("docker.events")).unwrap();
+    assert!(!events.contains("build "));
+    assert!(!events.contains("image rm "));
+    assert!(!events.contains("run "));
+    std::fs::remove_dir_all(fixture).unwrap();
+}
+
+#[test]
+fn release_image_producer_treats_explicit_missing_candidate_as_clean() {
+    let fixture = build_image_fixture("build-fail");
+    let output = invoke_image_build(&fixture);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("docker build failed"));
+    assert!(!stderr.contains("failed to remove owned candidate reference"));
+    let events = std::fs::read_to_string(fixture.join("docker.events")).unwrap();
+    assert!(events.contains("image rm agent-hub/job-code-build-candidate:"));
+    std::fs::remove_dir_all(fixture).unwrap();
+}
+
+fn build_image_fixture(mode: &str) -> PathBuf {
+    let root = temp_root();
+    let fake_bin = root.join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    std::fs::create_dir_all(root.join("images/job-code")).unwrap();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let commit = git(&["rev-parse", "HEAD"]);
+    let archive = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["archive", "--format=tar", &commit])
+        .output()
+        .unwrap();
+    assert!(archive.status.success());
+    let archive_sha256 = config::sha256_hex(&archive.stdout);
+    std::fs::write(
+        root.join("system.toml"),
+        "[system]\noperator='test'\nbot_identity='test'\n[system.images]\ninstalled=['job-code']\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("images/job-code/image.toml"),
+        format!(
+            "[image]\nname='job-code'\ntag='{IMAGE_TAG}'\ndescription='test'\n[image.build_contexts.agent-hub-source]\ntype='git'\nurl='https://github.com/nickdavies/agent-hub.git'\ncommit='{commit}'\narchive_sha256='{archive_sha256}'\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("images/job-code/Dockerfile"),
+        LOCKED_BUILD_DOCKERFILE,
+    )
+    .unwrap();
+    let report = preflight_report(unsafe { libc::geteuid() }, unsafe { libc::getegid() });
+    std::fs::write(
+        root.join("preflight.json"),
+        serde_json::to_vec(&report).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("docker-state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "release": format!("sha256:{}", "b".repeat(64)),
+            "shared": format!("sha256:{}", "a".repeat(64)),
+            "candidate": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let docker = fake_bin.join("docker");
+    let script = FAKE_BUILD_DOCKER
+        .replace("@ROOT@", &root.display().to_string())
+        .replace("@MODE@", mode);
+    std::fs::write(&docker, script).unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+    root
+}
+
+fn invoke_image_build(root: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_agent-hub"))
+        .args(["build", "--config-root"])
+        .arg(root)
+        .arg("images")
+        .env_clear()
+        .env("HOME", root.join("home"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("fake-bin").display()),
+        )
+        .output()
+        .unwrap()
+}
+
+const FAKE_BUILD_DOCKER: &str = r#"#!/usr/bin/python3
+import json, pathlib, sys
+root = pathlib.Path('@ROOT@')
+mode = '@MODE@'
+args = sys.argv[1:]
+events = root / 'docker.events'
+with events.open('a') as handle:
+    handle.write(' '.join(args) + '\n')
+state_path = root / 'docker-state.json'
+state = json.loads(state_path.read_text())
+new = 'sha256:' + 'a' * 64
+if args[:2] == ['image', 'inspect'] and not any(value.startswith('--format=') for value in args):
+    reference = args[2]
+    if mode == 'occupied':
+        print(new)
+        raise SystemExit(0)
+    print(f'Error response from daemon: No such image: {reference}', file=sys.stderr)
+    raise SystemExit(1)
+if args and args[0] == 'build':
+    if mode == 'build-fail':
+        print('injected build failure', file=sys.stderr)
+        raise SystemExit(75)
+    iidfile = pathlib.Path(args[args.index('--iidfile') + 1])
+    candidate = args[args.index('-t') + 1]
+    iidfile.write_text(new + '\n')
+    state['candidate'] = candidate
+    state_path.write_text(json.dumps(state))
+    raise SystemExit(0)
+if args[:2] == ['image', 'inspect']:
+    print(new)
+    raise SystemExit(0)
+if args and args[0] == 'run':
+    if state['release'] != 'sha256:' + 'b' * 64:
+        print('release tag moved before qualification', file=sys.stderr)
+        raise SystemExit(76)
+    if mode == 'qualification-fail':
+        print('injected qualification failure', file=sys.stderr)
+        raise SystemExit(75)
+    print((root / 'preflight.json').read_text(), end='')
+    raise SystemExit(0)
+if args[:2] == ['image', 'tag']:
+    state['release'] = args[2]
+    state_path.write_text(json.dumps(state))
+    raise SystemExit(0)
+if args[:2] == ['image', 'rm']:
+    reference = args[2]
+    if state['candidate'] == reference:
+        state['candidate'] = None
+        state_path.write_text(json.dumps(state))
+        raise SystemExit(0)
+    print(f'Error response from daemon: No such image: {reference}', file=sys.stderr)
+    raise SystemExit(1)
+print('unexpected docker invocation: ' + ' '.join(args), file=sys.stderr)
+raise SystemExit(2)
+"#;
+
+const LOCKED_BUILD_DOCKERFILE: &str = r#"FROM debian:bookworm-slim@sha256:abc
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_SNAPSHOT=20260803T000000Z
+RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s bookworm main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
+    && printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/%s bookworm-security main\n' "$DEBIAN_SNAPSHOT" >> /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::AllowInsecureRepositories=false -o Acquire::AllowDowngradeToInsecureRepositories=false -o APT::Get::AllowUnauthenticated=false -o Acquire::Check-Valid-Until=false update \
+    && apt-get -o Acquire::AllowInsecureRepositories=false -o Acquire::AllowDowngradeToInsecureRepositories=false -o APT::Get::AllowUnauthenticated=false install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s bookworm main\n' "$DEBIAN_SNAPSHOT" > /etc/apt/sources.list \
+    && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/%s bookworm-security main\n' "$DEBIAN_SNAPSHOT" >> /etc/apt/sources.list
+RUN apt-get -o Acquire::AllowInsecureRepositories=false -o Acquire::AllowDowngradeToInsecureRepositories=false -o APT::Get::AllowUnauthenticated=false -o Acquire::Check-Valid-Until=false update \
+    && apt-get -o Acquire::AllowInsecureRepositories=false -o Acquire::AllowDowngradeToInsecureRepositories=false -o APT::Get::AllowUnauthenticated=false install -y --no-install-recommends curl git \
+    && rm -rf /var/lib/apt/lists/*
+ENV TOOL_VERSION=1.0
+ENV TOOL_SHA256=abc
+RUN curl -fsSL "https://example.com/tool-${TOOL_VERSION}" -o /tmp/tool \
+    && printf '%s  %s\n' "$TOOL_SHA256" /tmp/tool | sha256sum -c -
+COPY --from=agent-hub-source / /opt/src/agent-hub
+RUN cd /opt/src/agent-hub && cargo build --locked --release -p agent-hub-gateway
+"#;
+
 fn invoke(
     root: &Path,
     fake_bin: &Path,
@@ -1024,9 +1285,12 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
     std::fs::write(
         path,
         format!(
-             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'image inspect' ]; then printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\nif [ \"$1 $2\" = 'network inspect' ]; then printf '%s\\n' 'No such network' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then rm '{}'; printf '%s\\n' '{}'; printf 'Error: Service Unavailable\\n' >&2; exit 75; fi; if [ -f '{}' ]; then printf 'entered\\n' > '{}'; sync '{}'; sleep 10; fi; printf '%s\\n' '{}' ;; esac\n",
-            marker.display(),
-            "a".repeat(64),
+             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1 $2\" in 'container inspect'|'network inspect') printf '%s %s\\n' \"$(date +%s%N)\" \"$*\" >> '{}';; esac\nif [ \"$1 $2\" = 'image inspect' ]; then if [ -f '{}' ]; then rm '{}'; printf 'injected image inspection failure\\n' >&2; exit 75; fi; printf '%s\\n' 'sha256:{}'; exit 0; fi\nif [ \"$1 $2\" = 'container inspect' ]; then printf '%s\\n' 'No such container' >&2; exit 1; fi\nif [ \"$1 $2\" = 'network inspect' ]; then printf '%s\\n' 'No such network' >&2; exit 1; fi\ncase \"$*\" in *agent-hub-job-code-preflight*) if [ -f '{}' ]; then rm '{}'; printf 'injected preflight failure\\n' >&2; exit 75; fi; cat '{}' ;; *) if [ -f '{}' ]; then rm '{}'; printf '%s\\n' '{}'; printf 'Error: Service Unavailable\\n' >&2; exit 75; fi; if [ -f '{}' ]; then printf 'entered\\n' > '{}'; sync '{}'; sleep 10; fi; printf '%s\\n' '{}' ;; esac\n",
+             marker.display(),
+             root.join("cleanup.events").display(),
+             root.join("fail-image-inspect-once").display(),
+             root.join("fail-image-inspect-once").display(),
+             "a".repeat(64),
             root.join("fail-preflight-once").display(),
             root.join("fail-preflight-once").display(),
              report_path.display(),
@@ -1115,7 +1379,14 @@ fn preflight_report(uid: u32, gid: u32) -> serde_json::Value {
         "yarn",
     ]
     .into_iter()
-    .map(|name| (name.to_string(), serde_json::json!(format!("{name} 1.0"))))
+    .map(|name| {
+        let version = if name == "opencode" {
+            "1.18.18".to_string()
+        } else {
+            format!("{name} 1.0")
+        };
+        (name.to_string(), serde_json::json!(version))
+    })
     .collect::<serde_json::Map<_, _>>();
     let sources = [
         "agent_hub",

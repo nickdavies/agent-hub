@@ -172,6 +172,45 @@ async fn docker_removal_requires_exact_ownership_and_proves_absence() {
 }
 
 #[tokio::test]
+async fn docker_absence_proof_restarts_when_owned_container_reappears() {
+    let root = temp_root("docker-reappearance");
+    let command = root.join("docker");
+    let count = root.join("inspect-count");
+    let events = root.join("events");
+    std::fs::write(
+        &command,
+        format!(
+            "#!/bin/sh\ncount='{}'\nevents='{}'\nif [ \"$1\" = container ]; then n=0; [ ! -f \"$count\" ] || n=$(cat \"$count\"); n=$((n + 1)); printf '%s' \"$n\" > \"$count\"; printf 'inspect-%s\\n' \"$n\" >> \"$events\"; if [ \"$n\" -eq 1 ] || [ \"$n\" -ge 3 ]; then echo 'No such container' >&2; exit 1; fi; printf '%s' '{{\"a.example/owner\":\"first\"}}'; exit 0; fi\nif [ \"$1\" = rm ]; then printf 'remove\\n' >> \"$events\"; exit 0; fi\nexit 2\n",
+            count.display(),
+            events.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&command);
+    let expected = DockerOwnership::new(BTreeMap::from([(
+        "a.example/owner".to_string(),
+        "first".to_string(),
+    )]))
+    .unwrap();
+    DockerCli::new(&command)
+        .with_absence_quiescence(Duration::from_millis(100))
+        .remove_owned("reappearing-container", &expected, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let events = std::fs::read_to_string(events).unwrap();
+    let events = events.lines().collect::<Vec<_>>();
+    assert_eq!(
+        &events[..4],
+        ["inspect-1", "inspect-2", "remove", "inspect-3"]
+    );
+    assert!(
+        events.len() > 4,
+        "absence was not observed after reappearance"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn process_execution_persists_streams_and_reports_containment() {
     let root = temp_root("process-output");
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
