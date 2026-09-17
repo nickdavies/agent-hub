@@ -37,6 +37,13 @@ import type {
 import { approvalTransport, gatewayApprovalInvocation, gatewaySupervisionInvocation } from "./approval-transport"
 import { isStructuredOutputTool, normalizeToolExecution } from "./permission-normalization"
 import { createAgentHubRunTool, openCodeToolCallIdentity, requestSchema } from "./agent-hub-run"
+import {
+  AgentHubCatalogService,
+  catalogRequestSchema,
+  createAgentHubCatalogTool,
+  renderRunDescription,
+  unavailableRunDescription,
+} from "./agent-hub-catalog"
 
 const APPROVAL_TRANSPORT = approvalTransport(process.env)
 const SESSION_ALLOW_RULES = [{ permission: "*", pattern: "*", action: "allow" as const }]
@@ -748,10 +755,12 @@ export async function createPluginInstance(
 
   const shutdown = new AbortController()
   const hostLaunches = new Set<Promise<unknown>>()
+  const catalogService = APPROVAL_TRANSPORT.kind === "http" ? new AgentHubCatalogService() : undefined
   let disposal: Promise<void> | undefined
   function dispose(): Promise<void> {
     disposal ??= (async () => {
       shutdown.abort()
+      await catalogService?.dispose()
       // Tool callers retain their outcomes; settlement alone does not attest sandbox cleanup success.
       await Promise.allSettled([...hostLaunches])
       if (options.registerProcessHandlers !== false) {
@@ -875,6 +884,7 @@ export async function createPluginInstance(
   }
 
   const hostRunTool = createAgentHubRunTool()
+  const catalogTool = catalogService ? createAgentHubCatalogTool(catalogService) : undefined
   return {
     ...(APPROVAL_TRANSPORT.kind === "http" ? {
       tool: {
@@ -900,6 +910,21 @@ export async function createPluginInstance(
             } finally {
               hostLaunches.delete(launch)
             }
+          },
+        },
+        agent_hub_catalog: {
+          ...catalogTool!,
+          async execute(args, context) {
+            const { callID } = openCodeToolCallIdentity(context)
+            const record = state.executionRecords.get(callID)
+            if (shutdown.signal.aborted || !record || record.status !== "authorized" || record.host_launch_started
+              || !state.permissionOwnedSessions.has(context.sessionID)
+              || record.session_id !== context.sessionID || record.runtime_tool_name !== "agent_hub_catalog"
+              || record.raw_args_digest !== digest("agent-hub:opencode-raw-args:v1", args)) {
+              throw new Error("Agent Hub denied catalog detail because matching gateway authorization is missing or already consumed")
+            }
+            record.host_launch_started = true
+            return catalogTool!.execute(catalogRequestSchema.parse(args), context)
           },
         },
       },
@@ -1000,6 +1025,15 @@ export async function createPluginInstance(
           : pipelineDenial("schema", String(error))
         recordPermissionDenied(message)
         throw new Error(message)
+      }
+    },
+
+    "tool.definition": async (info, output) => {
+      if (info.toolID !== "agent_hub_run" || !catalogService) return
+      try {
+        output.description = renderRunDescription(await catalogService.get())
+      } catch (error) {
+        output.description = unavailableRunDescription(error)
       }
     },
 

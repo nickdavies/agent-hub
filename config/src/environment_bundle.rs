@@ -519,7 +519,54 @@ fn collect_approval_bundle(
     {
         return Err("approval bundle file inventory is not exact".into());
     }
-    let manifest_bytes = captured.get("manifest.json").expect("inventory checked");
+    let identity = approval_bundle_identity_from_captured(name, &captured, system)?;
+    for (path, bytes) in &captured {
+        insert_file(files, &format!("approval/{path}"), bytes.clone(), false)?;
+    }
+    Ok(identity)
+}
+
+pub fn validate_captured_approval_bundle(
+    files: &BTreeMap<String, Vec<u8>>,
+    name: &str,
+    system: &SystemConfig,
+) -> Result<ApprovalBundleIdentity, String> {
+    validate_name(name, "approval bundle")?;
+    let prefix = format!("shared/approval-bundles/{name}/");
+    let captured = files
+        .iter()
+        .filter_map(|(path, bytes)| {
+            path.strip_prefix(&prefix)
+                .map(|relative| (relative.to_string(), bytes.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if captured.keys().any(|path| path.contains('/')) {
+        return Err("approval bundle file inventory is not exact".into());
+    }
+    let expected = BTreeMap::from_iter(
+        std::iter::once("manifest.json")
+            .chain(APPROVAL_FILES)
+            .map(|name| (name.to_string(), ())),
+    );
+    if captured
+        .keys()
+        .map(|name| (name.clone(), ()))
+        .collect::<BTreeMap<_, _>>()
+        != expected
+    {
+        return Err("approval bundle file inventory is not exact".into());
+    }
+    approval_bundle_identity_from_captured(name, &captured, system)
+}
+
+fn approval_bundle_identity_from_captured(
+    name: &str,
+    captured: &BTreeMap<String, Vec<u8>>,
+    system: &SystemConfig,
+) -> Result<ApprovalBundleIdentity, String> {
+    let manifest_bytes = captured
+        .get("manifest.json")
+        .ok_or_else(|| "approval bundle file inventory is not exact".to_string())?;
     let manifest_sha256 = hex::encode(Sha256::digest(manifest_bytes));
     let manifest: ApprovalBundleManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|error| format!("failed to parse approval bundle manifest: {error}"))?;
@@ -538,9 +585,6 @@ fn collect_approval_bundle(
         .map_err(|error| format!("Dippy policy is not UTF-8: {error}"))?;
     if !policy.starts_with("dippy-policy 1\n") {
         return Err("approval bundle Dippy policy version is unsupported".into());
-    }
-    for (path, bytes) in &captured {
-        insert_file(files, &format!("approval/{path}"), bytes.clone(), false)?;
     }
     let digest = digest_named_files(&captured);
     let identity = ApprovalBundleIdentity {
@@ -943,6 +987,27 @@ dippy_wheel_sha256 = "{}"
         assert_eq!(identity.protocol, APPROVAL_BUNDLE_PROTOCOL);
         assert_eq!(files.len(), 5);
         assert!(files.contains_key("approval/agent-hub-opencode-plugin.js"));
+        let captured = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    format!(
+                        "shared/approval-bundles/test/{}",
+                        path.strip_prefix("approval/").unwrap()
+                    ),
+                    bytes.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            validate_captured_approval_bundle(&captured, "test", &system)
+                .unwrap()
+                .digest,
+            identity.digest
+        );
+        let mut incomplete = captured;
+        incomplete.remove("shared/approval-bundles/test/dippy.policy");
+        assert!(validate_captured_approval_bundle(&incomplete, "test", &system).is_err());
 
         let mut tampered_trust = system.clone();
         tampered_trust

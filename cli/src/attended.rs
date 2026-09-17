@@ -28,6 +28,13 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::attended_compat::selector_resources;
+use crate::attended_compat::{
+    ensure_unique_resources, image_family, network_class_within_ceiling,
+    requested_tool_approval_mode, resolve_network_resources, tool_approval_mode,
+    tool_approval_name, tool_approval_within_ceiling,
+};
 use crate::attended_relay::{
     AttendedRelay, AttendedRelayConfig, RelaySocketLocation, SupervisionOutcome,
     host_relay_socket_location, recover_attended_relay,
@@ -5327,44 +5334,6 @@ fn resolve_image_family(
     Ok(family)
 }
 
-fn image_family(image: &str) -> String {
-    let without_digest = image.split('@').next().unwrap_or(image);
-    let slash = without_digest.rfind('/');
-    match without_digest.rfind(':') {
-        Some(colon) if slash.is_none_or(|slash| colon > slash) => {
-            without_digest[..colon].to_string()
-        }
-        _ => without_digest.to_string(),
-    }
-}
-
-fn tool_approval_mode(value: &str) -> anyhow::Result<ToolApprovalMode> {
-    match value {
-        "auto" => Ok(ToolApprovalMode::Auto),
-        "gateway" => Ok(ToolApprovalMode::Dippy),
-        other => anyhow::bail!("unsupported attended tool approval mode '{other}'"),
-    }
-}
-
-fn requested_tool_approval_mode(value: &str) -> anyhow::Result<ToolApprovalMode> {
-    match value {
-        "auto" => Ok(ToolApprovalMode::Auto),
-        "dippy" => Ok(ToolApprovalMode::Dippy),
-        other => anyhow::bail!("unsupported attended tool approval selector '{other}'"),
-    }
-}
-
-fn tool_approval_within_ceiling(selected: ToolApprovalMode, ceiling: ToolApprovalMode) -> bool {
-    selected == ToolApprovalMode::Dippy || ceiling == ToolApprovalMode::Auto
-}
-
-fn tool_approval_name(value: ToolApprovalMode) -> &'static str {
-    match value {
-        ToolApprovalMode::Auto => "auto",
-        ToolApprovalMode::Dippy => "dippy",
-    }
-}
-
 fn attended_approval_bundle_identity(
     bundle: &config::EnvironmentBundle,
     mode: ToolApprovalMode,
@@ -5390,64 +5359,6 @@ fn attended_approval_bundle_identity(
             dippy_wheel_sha256: identity.dippy_wheel_sha256.clone(),
         })),
     }
-}
-
-fn canonical_resources(mut resources: Vec<NetworkResourceKind>) -> Vec<NetworkResourceKind> {
-    resources.sort_by_key(ToString::to_string);
-    resources.dedup();
-    resources
-}
-
-fn ensure_unique_resources(resources: &[NetworkResourceKind]) -> anyhow::Result<()> {
-    let mut canonical = resources.to_vec();
-    canonical.sort_by_key(ToString::to_string);
-    ensure!(
-        !canonical.windows(2).any(|pair| pair[0] == pair[1]),
-        "duplicate network resource selector"
-    );
-    Ok(())
-}
-
-fn selector_resources(selector: &str) -> anyhow::Result<Vec<NetworkResourceKind>> {
-    let resources = match selector {
-        "none" => vec![],
-        "llm-only" => vec![NetworkResourceKind::Llm],
-        "build" => vec![
-            NetworkResourceKind::Llm,
-            NetworkResourceKind::Github,
-            NetworkResourceKind::GoRegistry,
-            NetworkResourceKind::CratesRegistry,
-            NetworkResourceKind::PypiRegistry,
-            NetworkResourceKind::NpmRegistry,
-        ],
-        "guarded-web" => vec![NetworkResourceKind::GuardedWeb],
-        other => anyhow::bail!("unsupported attended network selector '{other}'"),
-    };
-    Ok(canonical_resources(resources))
-}
-
-fn network_class_within_ceiling(selected: &str, ceiling: &str) -> anyhow::Result<bool> {
-    let selected = selector_resources(selected)?;
-    let ceiling = selector_resources(ceiling)?;
-    Ok(selected.iter().all(|resource| ceiling.contains(resource)))
-}
-
-fn resolve_network_resources(
-    selector: &str,
-    requested: Vec<NetworkResourceKind>,
-) -> anyhow::Result<Vec<NetworkResourceKind>> {
-    let ceiling = selector_resources(selector)?;
-    ensure_unique_resources(&requested)?;
-    let requested = canonical_resources(requested);
-    ensure!(
-        !requested.contains(&NetworkResourceKind::GuardedWeb) || requested.len() == 1,
-        "guarded_web cannot be combined with other network resources"
-    );
-    ensure!(
-        requested.iter().all(|resource| ceiling.contains(resource)),
-        "requested network resources exceed '{selector}' environment ceiling"
-    );
-    Ok(requested)
 }
 
 fn network_request(resources: &[NetworkResourceKind]) -> NetworkResourceRequest {

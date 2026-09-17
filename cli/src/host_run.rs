@@ -9,7 +9,7 @@ use protocol::{
     AgentHubRunDecision, AgentHubRunDecisionV1, AgentHubRunIntentV1, AgentHubRunReceiptV1,
     AgentHubRunResolvedV1,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::attended::{
@@ -19,6 +19,10 @@ use crate::local::{RequestedContextRoot, RequestedWorkspace};
 use crate::state::StateStore;
 
 const HOST_CONFIG_SCHEMA: &str = "agent_hub_run_host_v1";
+const MAX_CONFIG_FILES: usize = 128;
+const MAX_CONFIG_DIRECTORIES: usize = 128;
+const MAX_CONFIG_TRAVERSAL_ENTRIES: usize = MAX_CONFIG_FILES + MAX_CONFIG_DIRECTORIES;
+const MAX_CATALOG_CACHE_WATCH_ENTRIES: usize = MAX_CONFIG_FILES + MAX_CONFIG_DIRECTORIES + 2;
 const MAX_APPROVAL_TIMEOUT_SECS: u64 = 600;
 const ONE_STEP_RESULT_DOCUMENT_LIMIT_BYTES: u64 = 128 * 1024;
 const GATEWAY_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -49,6 +53,31 @@ struct HostArtifactPin {
 
 struct VerifiedFile {
     file: File,
+}
+
+pub(crate) struct CatalogConfigSnapshot {
+    pub files: std::collections::BTreeMap<String, Vec<u8>>,
+    pub image_digests: std::collections::BTreeMap<String, String>,
+    pub cache_identity: Option<CatalogCacheIdentity>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct CatalogCacheIdentity {
+    pub schema: &'static str,
+    pub watch: Vec<CatalogWatchStamp>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct CatalogWatchStamp {
+    pub path: String,
+    pub device: String,
+    pub inode: String,
+    pub mode: u32,
+    #[serde(rename = "type")]
+    pub file_type: &'static str,
+    pub size: String,
+    pub modified_ns: String,
+    pub changed_ns: String,
 }
 
 #[derive(Clone)]
@@ -422,6 +451,11 @@ async fn cancel_invocation(store: &StateStore, invocation_id: &str) -> anyhow::R
 }
 
 fn load_host_config(path: &Path) -> anyhow::Result<(HostConfig, (u64, u64))> {
+    let (config, identity, _) = load_host_config_file(path)?;
+    Ok((config, identity))
+}
+
+fn load_host_config_file(path: &Path) -> anyhow::Result<(HostConfig, (u64, u64), VerifiedFile)> {
     ensure!(path.is_absolute(), "host config path must be absolute");
     let verified = open_regular_nofollow(path)?;
     ensure!(
@@ -456,7 +490,7 @@ fn load_host_config(path: &Path) -> anyhow::Result<(HostConfig, (u64, u64))> {
         config.config_root_identity.canonical_path == config.config_root,
         "host config root identity path differs from config root"
     );
-    Ok((config, identity))
+    Ok((config, identity, verified))
 }
 
 fn verify_host_installation(config: &HostConfig) -> anyhow::Result<Vec<VerifiedFile>> {
@@ -471,27 +505,138 @@ fn verify_host_installation(config: &HostConfig) -> anyhow::Result<Vec<VerifiedF
         verify_pin(&config.gateway, "runtime:agent-hub-gateway")?,
         verify_pin(&config.policy, "policy:agent-hub-run")?,
     ];
+    verified.extend(
+        verify_config_inventory(config)?
+            .0
+            .into_iter()
+            .map(|(_, _, file)| file),
+    );
+    Ok(verified)
+}
+
+fn verify_config_inventory(
+    config: &HostConfig,
+) -> anyhow::Result<(
+    Vec<(String, String, VerifiedFile)>,
+    std::collections::BTreeMap<String, std::fs::Metadata>,
+)> {
     ensure!(
-        !config.config_artifacts.is_empty() && config.config_artifacts.len() <= 128,
+        !config.config_artifacts.is_empty() && config.config_artifacts.len() <= MAX_CONFIG_FILES,
         "host config requires a bounded non-empty config artifact set"
     );
+    verify_directory_identity(&config.config_root_identity)?;
+    let mut verified = Vec::new();
     let mut paths = std::collections::BTreeSet::new();
     let mut relative_paths = std::collections::BTreeSet::new();
     for pin in &config.config_artifacts {
         ensure!(paths.insert(&pin.path), "duplicate pinned config artifact");
         let (relative_path, file) = verify_config_pin(config, pin)?;
         ensure!(
-            relative_paths.insert(relative_path),
+            relative_paths.insert(relative_path.clone()),
             "duplicate pinned config artifact relative path"
         );
-        verified.push(file);
+        verified.push((relative_path, pin.sha256.clone(), file));
     }
-    let authoritative_paths = config_root_files(Path::new(&config.config_root))?;
+    let (authoritative_paths, directories) = config_root_inventory(Path::new(&config.config_root))?;
     ensure!(
         relative_paths == authoritative_paths,
         "pinned config artifact coverage mismatch: expected {authoritative_paths:?}, found {relative_paths:?}"
     );
-    Ok(verified)
+    Ok((verified, directories))
+}
+
+/// Capture only the fully pinned authoritative config inventory. The optional
+/// cache identity additionally verifies the running executable; neither path
+/// performs execution preparation.
+pub(crate) fn load_catalog_config(
+    host_config: &Path,
+    include_cache_identity: bool,
+) -> anyhow::Result<CatalogConfigSnapshot> {
+    let (config, _, host_config_file) = load_host_config_file(host_config)?;
+    let (inventory, directories) = verify_config_inventory(&config)?;
+    let mut files = std::collections::BTreeMap::new();
+    let mut watch = std::collections::BTreeMap::new();
+    if include_cache_identity {
+        watch.insert(
+            path_string(host_config)?,
+            catalog_watch_stamp(host_config, &host_config_file.file.metadata()?, "file")?,
+        );
+        for (path, metadata) in directories {
+            watch.insert(
+                path.clone(),
+                catalog_watch_stamp(Path::new(&path), &metadata, "directory")?,
+            );
+        }
+    }
+    for (relative, expected_digest, mut verified) in inventory {
+        let mut bytes = Vec::new();
+        verified.file.read_to_end(&mut bytes)?;
+        ensure!(
+            protocol::sha256_hex(&bytes) == expected_digest,
+            "captured config artifact changed after verification"
+        );
+        ensure!(
+            files.insert(relative.clone(), bytes).is_none(),
+            "duplicate captured config artifact"
+        );
+        if include_cache_identity {
+            let path = Path::new(&config.config_root).join(relative);
+            watch.insert(
+                path_string(&path)?,
+                catalog_watch_stamp(&path, &verified.file.metadata()?, "file")?,
+            );
+        }
+    }
+    if include_cache_identity {
+        let executable = verify_pin(&config.self_binary, "runtime:agent-hub")?;
+        let current_exe = std::env::current_exe()?.canonicalize()?;
+        ensure!(
+            current_exe == Path::new(&config.self_binary.path),
+            "running executable differs from the pinned host executable"
+        );
+        watch.insert(
+            path_string(&current_exe)?,
+            catalog_watch_stamp(&current_exe, &executable.file.metadata()?, "file")?,
+        );
+        ensure!(
+            watch.len() <= MAX_CATALOG_CACHE_WATCH_ENTRIES,
+            "catalog cache watch inventory exceeds limit"
+        );
+    }
+    Ok(CatalogConfigSnapshot {
+        files,
+        image_digests: config.image_digests,
+        cache_identity: include_cache_identity.then(|| CatalogCacheIdentity {
+            schema: "agent_hub_catalog_cache_identity_v1",
+            watch: watch.into_values().collect(),
+        }),
+    })
+}
+
+fn catalog_watch_stamp(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    file_type: &'static str,
+) -> anyhow::Result<CatalogWatchStamp> {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = path_string(path)?;
+    ensure!(
+        Path::new(&path).is_absolute() && path.len() <= 4096 && !path.chars().any(char::is_control),
+        "catalog cache watch path is outside its bounds"
+    );
+    let nanoseconds = |seconds: i64, nanos: i64| {
+        (i128::from(seconds) * 1_000_000_000 + i128::from(nanos)).to_string()
+    };
+    Ok(CatalogWatchStamp {
+        path,
+        device: metadata.dev().to_string(),
+        inode: metadata.ino().to_string(),
+        mode: metadata.mode(),
+        file_type,
+        size: metadata.size().to_string(),
+        modified_ns: nanoseconds(metadata.mtime(), metadata.mtime_nsec()),
+        changed_ns: nanoseconds(metadata.ctime(), metadata.ctime_nsec()),
+    })
 }
 
 fn verify_directory_identity(identity: &protocol::HostDirectoryIdentity) -> anyhow::Result<()> {
@@ -582,13 +727,45 @@ fn verify_config_pin(
     ))
 }
 
-fn config_root_files(root: &Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
+fn config_root_inventory(
+    root: &Path,
+) -> anyhow::Result<(
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeMap<String, std::fs::Metadata>,
+)> {
+    const MAX_DEPTH: usize = 16;
+
     fn collect(
         root: &Path,
         directory: &Path,
+        depth: usize,
+        entries_seen: &mut usize,
         files: &mut std::collections::BTreeSet<String>,
+        directories: &mut std::collections::BTreeMap<String, std::fs::Metadata>,
     ) -> anyhow::Result<()> {
-        let mut entries = std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+        ensure!(
+            depth <= MAX_DEPTH,
+            "authoritative config root exceeds depth limit"
+        );
+        let metadata = std::fs::symlink_metadata(directory)?;
+        ensure!(
+            metadata.is_dir(),
+            "authoritative config directory is invalid"
+        );
+        directories.insert(path_string(directory)?, metadata);
+        ensure!(
+            directories.len() <= MAX_CONFIG_DIRECTORIES,
+            "authoritative config root exceeds directory limit"
+        );
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            *entries_seen += 1;
+            ensure!(
+                *entries_seen <= MAX_CONFIG_TRAVERSAL_ENTRIES,
+                "authoritative config root exceeds entry limit"
+            );
+            entries.push(entry?);
+        }
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let path = entry.path();
@@ -599,7 +776,7 @@ fn config_root_files(root: &Path) -> anyhow::Result<std::collections::BTreeSet<S
                 path.display()
             );
             if file_type.is_dir() {
-                collect(root, &path, files)?;
+                collect(root, &path, depth + 1, entries_seen, files, directories)?;
             } else {
                 ensure!(
                     file_type.is_file(),
@@ -615,7 +792,7 @@ fn config_root_files(root: &Path) -> anyhow::Result<std::collections::BTreeSet<S
                     "duplicate authoritative config relative path"
                 );
                 ensure!(
-                    files.len() <= 128,
+                    files.len() <= MAX_CONFIG_FILES,
                     "authoritative config root exceeds file limit"
                 );
             }
@@ -624,8 +801,17 @@ fn config_root_files(root: &Path) -> anyhow::Result<std::collections::BTreeSet<S
     }
 
     let mut files = std::collections::BTreeSet::new();
-    collect(root, root, &mut files)?;
-    Ok(files)
+    let mut directories = std::collections::BTreeMap::new();
+    let mut entries_seen = 0;
+    collect(
+        root,
+        root,
+        0,
+        &mut entries_seen,
+        &mut files,
+        &mut directories,
+    )?;
+    Ok((files, directories))
 }
 
 fn verify_pin_coverage(
@@ -1093,6 +1279,7 @@ fn path_string(path: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt as _;
 
     fn test_path(name: &str) -> PathBuf {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1114,6 +1301,224 @@ mod tests {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         command.spawn().unwrap()
+    }
+
+    #[test]
+    fn catalog_cache_identity_is_bounded_safe_and_uses_only_catalog_inputs() {
+        let root = test_path("catalog-cache");
+        let config_root = root.join("config");
+        let nested = config_root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let config_file = nested.join("system.toml");
+        std::fs::write(
+            &config_file,
+            b"[system]\noperator='test'\nbot_identity='test'\n",
+        )
+        .unwrap();
+        let config_root = std::fs::canonicalize(config_root).unwrap();
+        let config_file = std::fs::canonicalize(config_file).unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+
+        let pin = |path: &Path, source: &str| {
+            let metadata = std::fs::metadata(path).unwrap();
+            let digest = protocol::sha256_hex(&std::fs::read(path).unwrap());
+            serde_json::json!({
+                "path": path,
+                "sha256": digest,
+                "source_identity": format!("{source}:sha256:{digest}"),
+                "device": metadata.dev(),
+                "inode": metadata.ino(),
+            })
+        };
+        let root_metadata = std::fs::metadata(&config_root).unwrap();
+        let host_config = root.join("host-run.json");
+        std::fs::write(
+            &host_config,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": HOST_CONFIG_SCHEMA,
+                "config_root": config_root,
+                "config_root_identity": {
+                    "canonical_path": config_root,
+                    "device": root_metadata.dev(),
+                    "inode": root_metadata.ino(),
+                },
+                "config_artifacts": [pin(&config_file, "config:nested/system.toml")],
+                "self_binary": pin(&executable, "runtime:agent-hub"),
+                "gateway": {
+                    "path": root.join("must-not-open-gateway"),
+                    "sha256": "0".repeat(64),
+                    "source_identity": format!("runtime:agent-hub-gateway:sha256:{}", "0".repeat(64)),
+                    "device": 0,
+                    "inode": 0
+                },
+                "policy": {
+                    "path": root.join("must-not-open-policy"),
+                    "sha256": "0".repeat(64),
+                    "source_identity": format!("policy:agent-hub-run:sha256:{}", "0".repeat(64)),
+                    "device": 0,
+                    "inode": 0
+                },
+                "image_digests": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let host_config = std::fs::canonicalize(host_config).unwrap();
+
+        let public = load_catalog_config(&host_config, false).unwrap();
+        assert!(public.cache_identity.is_none());
+        let internal = load_catalog_config(&host_config, true).unwrap();
+        let cache = internal.cache_identity.unwrap();
+        assert_eq!(cache.schema, "agent_hub_catalog_cache_identity_v1");
+        assert!(cache.watch.len() <= MAX_CATALOG_CACHE_WATCH_ENTRIES);
+        let paths = cache
+            .watch
+            .iter()
+            .map(|stamp| stamp.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+        for stamp in &cache.watch {
+            assert!(Path::new(&stamp.path).is_absolute());
+            assert!(stamp.path.len() <= 4096);
+            assert!(!stamp.path.chars().any(char::is_control));
+            assert!(matches!(stamp.file_type, "file" | "directory"));
+        }
+        for expected in [&host_config, &config_root, &config_file, &executable] {
+            assert!(paths.contains(&expected.to_str().unwrap()));
+        }
+        let serialized = serde_json::to_string(&cache).unwrap();
+        assert!(!serialized.contains("must-not-open-gateway"));
+        assert!(!serialized.contains("must-not-open-policy"));
+
+        let metadata = std::fs::metadata(&host_config).unwrap();
+        assert!(catalog_watch_stamp(Path::new("relative"), &metadata, "file").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_inventory_rejects_wide_and_deep_directory_trees_during_walk() {
+        let wide = test_path("catalog-wide");
+        std::fs::create_dir_all(&wide).unwrap();
+        for index in 0..=256 {
+            std::fs::create_dir(wide.join(format!("entry-{index:03}"))).unwrap();
+        }
+        let error = config_root_inventory(&wide).unwrap_err();
+        assert!(error.to_string().contains("entry limit"), "{error:#}");
+        std::fs::remove_dir_all(wide).unwrap();
+
+        let deep = test_path("catalog-deep");
+        let mut current = deep.clone();
+        for _ in 0..=17 {
+            current.push("nested");
+            std::fs::create_dir_all(&current).unwrap();
+        }
+        let error = config_root_inventory(&deep).unwrap_err();
+        assert!(error.to_string().contains("depth limit"), "{error:#}");
+        std::fs::remove_dir_all(deep).unwrap();
+    }
+
+    #[test]
+    fn config_inventory_accepts_realistic_bounded_tree() {
+        let root = test_path("catalog-realistic");
+        for relative in [
+            "system.toml",
+            "images/job-code/image.toml",
+            "environments/code-auto/environment.toml",
+            "shared/agents/coder.md",
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let (files, directories) = config_root_inventory(&root).unwrap();
+        assert_eq!(files.len(), 4);
+        assert_eq!(directories.len(), 7);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn catalog_cache_accepts_the_maximum_valid_inventory_and_rejects_each_excess() {
+        let root = test_path("catalog-max-boundary");
+        let config_root = root.join("config");
+        std::fs::create_dir_all(&config_root).unwrap();
+        let mut config_files = Vec::new();
+        let root_file = config_root.join("root.toml");
+        std::fs::write(&root_file, b"fixture").unwrap();
+        config_files.push(root_file);
+        for index in 0..127 {
+            let directory = config_root.join(format!("directory-{index:03}"));
+            std::fs::create_dir(&directory).unwrap();
+            let file = directory.join("artifact.toml");
+            std::fs::write(&file, b"fixture").unwrap();
+            config_files.push(file);
+        }
+        let config_root = std::fs::canonicalize(config_root).unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let pin = |path: &Path, source: String| {
+            let metadata = std::fs::metadata(path).unwrap();
+            let digest = protocol::sha256_hex(&std::fs::read(path).unwrap());
+            serde_json::json!({
+                "path": path,
+                "sha256": digest,
+                "source_identity": format!("{source}:sha256:{digest}"),
+                "device": metadata.dev(),
+                "inode": metadata.ino(),
+            })
+        };
+        let artifacts = config_files
+            .iter()
+            .map(|path| {
+                let relative = path.strip_prefix(&config_root).unwrap().to_str().unwrap();
+                pin(path, format!("config:{relative}"))
+            })
+            .collect::<Vec<_>>();
+        let root_metadata = std::fs::metadata(&config_root).unwrap();
+        let host_config = root.join("host-run.json");
+        std::fs::write(
+            &host_config,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": HOST_CONFIG_SCHEMA,
+                "config_root": config_root,
+                "config_root_identity": {
+                    "canonical_path": config_root,
+                    "device": root_metadata.dev(),
+                    "inode": root_metadata.ino(),
+                },
+                "config_artifacts": artifacts,
+                "self_binary": pin(&executable, "runtime:agent-hub".into()),
+                "gateway": pin(&executable, "runtime:agent-hub-gateway".into()),
+                "policy": pin(&executable, "policy:agent-hub-run".into()),
+                "image_digests": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let host_config = std::fs::canonicalize(host_config).unwrap();
+
+        let snapshot = load_catalog_config(&host_config, true).unwrap();
+        assert_eq!(snapshot.files.len(), 128);
+        assert_eq!(
+            snapshot.cache_identity.unwrap().watch.len(),
+            MAX_CATALOG_CACHE_WATCH_ENTRIES
+        );
+
+        let excess_file_root = root.join("excess-file");
+        std::fs::create_dir(&excess_file_root).unwrap();
+        for index in 0..129 {
+            std::fs::write(excess_file_root.join(format!("file-{index:03}")), b"x").unwrap();
+        }
+        let error = config_root_inventory(&excess_file_root).unwrap_err();
+        assert!(error.to_string().contains("file limit"), "{error:#}");
+
+        let excess_directory_root = root.join("excess-directory");
+        std::fs::create_dir(&excess_directory_root).unwrap();
+        for index in 0..128 {
+            std::fs::create_dir(excess_directory_root.join(format!("directory-{index:03}")))
+                .unwrap();
+        }
+        let error = config_root_inventory(&excess_directory_root).unwrap_err();
+        assert!(error.to_string().contains("directory limit"), "{error:#}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn assert_reaped(pid_path: &Path) {

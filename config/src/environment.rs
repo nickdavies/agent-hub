@@ -28,6 +28,8 @@ pub struct EnvironmentConfig {
     /// agent-hub-configs/environments/<env>/environment.toml.
     #[serde(default)]
     pub runtime: Option<String>,
+    #[serde(default)]
+    pub discovery: Option<protocol::DiscoveryMetadata>,
     #[serde(default = "default_max_timeout_secs")]
     pub max_timeout_secs: u64,
 }
@@ -46,6 +48,9 @@ impl EnvironmentConfig {
     pub fn from_toml(raw: &str, label: &str) -> Result<Self, String> {
         let wrapped: EnvironmentTomlFile = toml::from_str(raw)
             .map_err(|e| format!("failed to parse environment config {label}: {e}"))?;
+        if let Some(discovery) = &wrapped.environment.discovery {
+            discovery.validate()?;
+        }
         Ok(wrapped.environment)
     }
 }
@@ -71,6 +76,12 @@ approval_mode = "gateway"
                 .max_timeout_secs,
             86_400
         );
+        assert!(
+            EnvironmentConfig::from_toml(ENVIRONMENT, "test")
+                .unwrap()
+                .discovery
+                .is_none()
+        );
         assert_eq!(
             EnvironmentConfig::from_toml(
                 &format!("{ENVIRONMENT}\nmax_timeout_secs = 900\n"),
@@ -88,5 +99,21 @@ approval_mode = "gateway"
             EnvironmentConfig::from_toml(&format!("unknown = true\n{ENVIRONMENT}"), "test")
                 .is_err()
         );
+        let discovered = EnvironmentConfig::from_toml(
+            &format!(
+                "{ENVIRONMENT}\n[environment.discovery]\nrecommended_for = ['Routine implementation, refactoring, and test changes with automatic tool use']\nselection_notes = ['Choose a GitHub overlay only when the task needs authenticated repository access', 'Use a supervised environment when tool calls require human review']\n"
+            ),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            discovered.discovery.unwrap().recommended_for,
+            ["Routine implementation, refactoring, and test changes with automatic tool use"]
+        );
+        assert!(EnvironmentConfig::from_toml(
+            &format!("{ENVIRONMENT}\n[environment.discovery]\nrecommended_for = []\nselection_notes = ['note']\n"),
+            "test",
+        )
+        .is_err());
     }
 }

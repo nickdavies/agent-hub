@@ -16,19 +16,21 @@ pub const SUPERVISED_OPENCODE_RUNTIME_VERSION: &str = "1.18.18";
 pub use deployment_validation::{
     CapturedAuthoritativeFile, GithubOverlayAccess, GithubOverlayConfig, ValidatedDeployment,
     ValidatedImageManifest, ValidatedNetworkPolicy, ValidatedOverlay, ValidatedOverlayRegistry,
-    ValidatedTriagePrompt, ValidatedTriagePromptContent, validate_authoritative_config_root,
+    ValidatedTriagePrompt, ValidatedTriagePromptContent, parse_overlay_registry,
+    validate_authoritative_config_root,
 };
 pub use environment::EnvironmentConfig;
 pub use environment_bundle::{
     DURABLE_OPENCODE_IMAGE, DURABLE_OPENCODE_MODEL, EnvironmentBundle, EnvironmentBundleFile,
     OPENCODE_CONFIG_SENTINEL, OPENCODE_CONFIG_SENTINEL_SHA256, materialize_environment_bundle,
     materialize_environment_bundle_with_snapshot, materialize_environment_bundle_with_system,
-    validate_durable_opencode_config,
+    validate_captured_approval_bundle, validate_durable_opencode_config,
 };
 pub use image::{
-    ImageBuildContext, ImageConfig, JOB_CODE_PREFLIGHT_PATH, JOB_CODE_TOOL_MANIFEST_PATH,
-    job_code_preflight_docker_args, job_code_tool_manifest_sha256, resolve_build_order, sha256_hex,
-    validate_job_code_preflight_report, validate_supervised_opencode_preflight_report,
+    ImageBuildContext, ImageConfig, ImageToolFactsManifest, JOB_CODE_PREFLIGHT_PATH,
+    JOB_CODE_TOOL_MANIFEST_PATH, job_code_preflight_docker_args, job_code_tool_manifest_sha256,
+    resolve_build_order, sha256_hex, validate_job_code_preflight_report,
+    validate_supervised_opencode_preflight_report,
 };
 pub use network_policy::{
     FlattenedPolicy, NetworkPolicyConfig, PolicyAllowRule, canonical_policy_hosts, flatten_policy,

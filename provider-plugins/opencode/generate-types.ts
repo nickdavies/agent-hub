@@ -159,6 +159,17 @@ async function main() {
 
   const deduplicated = deduplicateDeclarations(tsBlocks)
 
+  // The per-schema compiler can reference these shared primitive aliases from
+  // a later block after its declaration was nested under a duplicate $def that
+  // the lightweight declaration deduplicator removed. Keep the public aliases
+  // explicit and deterministic in the combined file.
+  const requiredAliases = [
+    ["AgentHubRunIntentSchema", '"agent_hub_run_intent_v1"'],
+    ["WorkspaceAccess", '"read_only" | "read_write"'],
+  ].filter(([name]) => !new RegExp(`^export type ${name}\\s*=`, "m").test(deduplicated))
+    .map(([name, definition]) => `export type ${name} = ${definition}`)
+    .join("\n")
+
   // Add the known tool values as a string literal union type + array constant.
   // OpenCodeTool from the schema is just `string`; this provides autocomplete.
   const knownTools = [
@@ -173,7 +184,7 @@ async function main() {
     "",
   ].join("\n")
 
-  await writeFile(OUTPUT_FILE, header + "\n" + deduplicated + "\n" + knownTools)
+  await writeFile(OUTPUT_FILE, header + "\n" + requiredAliases + (requiredAliases ? "\n\n" : "") + deduplicated + "\n" + knownTools)
   console.log(`Wrote ${OUTPUT_FILE}`)
 }
 

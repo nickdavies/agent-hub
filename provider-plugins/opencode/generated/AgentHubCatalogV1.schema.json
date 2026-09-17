@@ -1,0 +1,537 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentHubCatalogV1",
+  "type": "object",
+  "properties": {
+    "environments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentHubCatalogEnvironmentV1"
+      },
+      "maxItems": 64
+    },
+    "fingerprint": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64
+    },
+    "guidance": {
+      "$ref": "#/$defs/AgentHubCatalogGuidanceV1"
+    },
+    "images": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentHubCatalogImageV1"
+      },
+      "maxItems": 64
+    },
+    "overlays": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AgentHubCatalogOverlayV1"
+      },
+      "maxItems": 64
+    },
+    "schema": {
+      "$ref": "#/$defs/AgentHubCatalogSchema"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "fingerprint",
+    "environments",
+    "images",
+    "overlays",
+    "guidance"
+  ],
+  "$defs": {
+    "AgentHubCatalogCredentialPrerequisite": {
+      "type": "string",
+      "enum": [
+        "host_command",
+        "host_configuration",
+        "configured_mcp_bridge"
+      ]
+    },
+    "AgentHubCatalogEnvironmentV1": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "discovery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiscoveryMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "image_family": {
+          "$ref": "#/$defs/AgentHubRunImageFamily"
+        },
+        "max_timeout_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 86400,
+          "minimum": 1
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "network_options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentHubCatalogNetworkOptionV1"
+          },
+          "maxItems": 128,
+          "minItems": 1
+        },
+        "overlays": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "maxItems": 16
+        },
+        "tool_approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentHubRunToolApproval"
+          },
+          "maxItems": 2,
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "description",
+        "image_family",
+        "network_options",
+        "tool_approvals",
+        "overlays",
+        "max_timeout_secs"
+      ]
+    },
+    "AgentHubCatalogGuidanceV1": {
+      "type": "object",
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/AgentHubCatalogLimitsV1"
+        },
+        "outputs": {
+          "$ref": "#/$defs/AgentHubCatalogOutputsV1"
+        },
+        "workspace": {
+          "$ref": "#/$defs/AgentHubCatalogWorkspaceGuidanceV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "limits",
+        "outputs",
+        "workspace"
+      ]
+    },
+    "AgentHubCatalogImageV1": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "discovery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiscoveryMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "family": {
+          "$ref": "#/$defs/AgentHubRunImageFamily"
+        },
+        "tool_facts": {
+          "$ref": "#/$defs/AgentHubCatalogToolFactsV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "description",
+        "tool_facts"
+      ]
+    },
+    "AgentHubCatalogLimitsV1": {
+      "type": "object",
+      "properties": {
+        "max_context_roots": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_overlays": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_prompt_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_workspaces": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_prompt_bytes",
+        "max_workspaces",
+        "max_context_roots",
+        "max_overlays"
+      ]
+    },
+    "AgentHubCatalogNetworkOptionV1": {
+      "type": "object",
+      "properties": {
+        "network_class": {
+          "$ref": "#/$defs/AgentHubRunNetworkClass"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NetworkResourceKind"
+          },
+          "maxItems": 7
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "network_class",
+        "resources"
+      ]
+    },
+    "AgentHubCatalogOutputsV1": {
+      "type": "object",
+      "properties": {
+        "artifact_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "artifact_manifest": {
+          "type": "boolean"
+        },
+        "cleanup_result": {
+          "type": "boolean"
+        },
+        "repository_result": {
+          "type": "boolean"
+        },
+        "stderr_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stdout_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "structured_result": {
+          "type": "boolean"
+        },
+        "transcript_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "structured_result",
+        "artifact_manifest",
+        "repository_result",
+        "cleanup_result",
+        "stdout_bytes",
+        "stderr_bytes",
+        "transcript_bytes",
+        "artifact_bytes"
+      ]
+    },
+    "AgentHubCatalogOverlayPrerequisitesV1": {
+      "type": "object",
+      "properties": {
+        "credential": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentHubCatalogCredentialPrerequisite"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "network_resources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NetworkResourceKind"
+          },
+          "maxItems": 2
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "maxItems": 4
+        },
+        "repository": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentHubCatalogRepositoryPrerequisite"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "network_resources"
+      ]
+    },
+    "AgentHubCatalogOverlayV1": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        },
+        "discovery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiscoveryMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "prerequisites": {
+          "$ref": "#/$defs/AgentHubCatalogOverlayPrerequisitesV1"
+        },
+        "provider": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "maxItems": 8,
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "provider",
+        "scopes",
+        "prerequisites"
+      ]
+    },
+    "AgentHubCatalogRepositoryPrerequisite": {
+      "type": "string",
+      "enum": [
+        "matching_remote_host"
+      ]
+    },
+    "AgentHubCatalogSchema": {
+      "type": "string",
+      "enum": [
+        "agent_hub_catalog_v1"
+      ]
+    },
+    "AgentHubCatalogToolFactV1": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "AgentHubCatalogToolFactsV1": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "available"
+            },
+            "tools": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/AgentHubCatalogToolFactV1"
+              },
+              "maxItems": 128,
+              "minItems": 1
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "tools"
+          ]
+        }
+      ]
+    },
+    "AgentHubCatalogWorkspaceGuidanceV1": {
+      "type": "object",
+      "properties": {
+        "context_roots_read_only": {
+          "type": "boolean"
+        },
+        "primary_workspace_required": {
+          "type": "boolean"
+        },
+        "workspace_export_is_untrusted": {
+          "type": "boolean"
+        },
+        "workspace_export_supported": {
+          "type": "boolean"
+        },
+        "workspace_required": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspace_required",
+        "primary_workspace_required",
+        "context_roots_read_only",
+        "workspace_export_supported",
+        "workspace_export_is_untrusted"
+      ]
+    },
+    "AgentHubRunImageFamily": {
+      "type": "string",
+      "enum": [
+        "job-code"
+      ]
+    },
+    "AgentHubRunNetworkClass": {
+      "type": "string",
+      "enum": [
+        "none",
+        "llm-only",
+        "build",
+        "guarded-web"
+      ]
+    },
+    "AgentHubRunToolApproval": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "dippy"
+      ]
+    },
+    "DiscoveryMetadata": {
+      "type": "object",
+      "properties": {
+        "recommended_for": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 160,
+            "minLength": 1
+          },
+          "maxItems": 6,
+          "minItems": 1
+        },
+        "selection_notes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 160,
+            "minLength": 1
+          },
+          "maxItems": 6,
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "recommended_for",
+        "selection_notes"
+      ]
+    },
+    "NetworkResourceKind": {
+      "type": "string",
+      "enum": [
+        "llm",
+        "github",
+        "go_registry",
+        "crates_registry",
+        "pypi_registry",
+        "npm_registry",
+        "guarded_web"
+      ]
+    }
+  }
+}

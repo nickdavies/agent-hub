@@ -292,6 +292,9 @@ fn materialize_git_build_context(
     if resolved.trim() != context.commit {
         return Err("configured Agent Hub source commit is unavailable locally".into());
     }
+    let tree_expression = format!("{}^{{tree}}", context.commit);
+    let actual_tree = git_output(repository, &["rev-parse", &tree_expression])?;
+    validate_source_tree(context, actual_tree.trim())?;
     let archive = Command::new("git")
         .arg("-C")
         .arg(repository)
@@ -334,6 +337,18 @@ fn materialize_git_build_context(
         return Err(format!("source archive extraction failed with {status}"));
     }
     Ok(destination)
+}
+
+fn validate_source_tree(
+    context: &config::ImageBuildContext,
+    actual_tree: &str,
+) -> Result<(), String> {
+    if let Some(expected_tree) = &context.tree
+        && actual_tree != expected_tree
+    {
+        return Err("configured Agent Hub source tree does not match the resolved commit".into());
+    }
+    Ok(())
 }
 
 fn verify_source_archive(bytes: &[u8], context: &config::ImageBuildContext) -> Result<(), String> {
@@ -1376,10 +1391,26 @@ mod tests {
             context_type: "git".into(),
             url: "https://example.com/agent-hub.git".into(),
             commit: "a".repeat(40),
+            tree: None,
             archive_sha256: config::sha256_hex(b"expected"),
         };
         assert!(verify_source_archive(b"expected", &context).is_ok());
         assert!(verify_source_archive(b"tampered", &context).is_err());
+    }
+
+    #[test]
+    fn declared_source_tree_must_match_resolved_commit_tree() {
+        let mut context = config::ImageBuildContext {
+            context_type: "git".into(),
+            url: "https://example.com/agent-hub.git".into(),
+            commit: "a".repeat(40),
+            tree: Some("b".repeat(40)),
+            archive_sha256: config::sha256_hex(b"expected"),
+        };
+        assert!(validate_source_tree(&context, &"b".repeat(40)).is_ok());
+        assert!(validate_source_tree(&context, &"c".repeat(40)).is_err());
+        context.tree = None;
+        assert!(validate_source_tree(&context, &"c".repeat(40)).is_ok());
     }
 
     #[test]

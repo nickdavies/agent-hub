@@ -9,6 +9,7 @@
 pub mod approval;
 pub mod attended;
 pub mod attended_gateway;
+pub mod catalog;
 pub mod config;
 pub mod gateway;
 pub mod hooks;
@@ -53,6 +54,15 @@ pub use attended_gateway::{
     attended_approval_bundle_digest, attended_network_digest, decode_attended_gateway_payload,
     encode_attended_gateway_frame, opencode_match_input_digest, opencode_raw_args_digest,
     tool_input_digest,
+};
+pub use catalog::{
+    AGENT_HUB_CATALOG_MAX_BYTES, AGENT_HUB_CATALOG_SCHEMA_V1,
+    AgentHubCatalogCredentialPrerequisite, AgentHubCatalogEnvironmentV1, AgentHubCatalogGuidanceV1,
+    AgentHubCatalogImageV1, AgentHubCatalogLimitsV1, AgentHubCatalogNetworkOptionV1,
+    AgentHubCatalogOutputsV1, AgentHubCatalogOverlayPrerequisitesV1, AgentHubCatalogOverlayV1,
+    AgentHubCatalogRepositoryPrerequisite, AgentHubCatalogSchema, AgentHubCatalogToolFactV1,
+    AgentHubCatalogToolFactsV1, AgentHubCatalogV1, AgentHubCatalogWorkspaceGuidanceV1,
+    DiscoveryMetadata,
 };
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{

@@ -33,6 +33,7 @@ fn executable_local_help_has_the_complete_command_contract() {
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
     for command in [
+        "catalog",
         "run",
         "inspect",
         "list",
@@ -77,6 +78,7 @@ fn executable_local_help_has_the_complete_command_contract() {
         .lines()
         .filter(|line| {
             line.trim_start().starts_with("run ")
+                || line.trim_start().starts_with("catalog ")
                 || line.trim_start().starts_with("inspect ")
                 || line.trim_start().starts_with("preview ")
                 || line.trim_start().starts_with("list ")
@@ -94,8 +96,27 @@ fn executable_local_help_has_the_complete_command_contract() {
         .join("\n");
     assert_eq!(
         command_snapshot,
-        "run             Host-owned one-step prepare, approve, and execute path (structured JSON on stdin)\ninspect         Debug canonical preparation without requesting permission or executing\npreview         Preview trusted projection and matched rule without side effects\nlist            List local attended executions\nstatus          Show one execution record\nlogs            Print an execution log\nresult          Print an execution result\nartifacts       Print the bounded artifact manifest\nrepositories    Print the bounded repository result document\ncleanup-result  Print the bounded cleanup result document\ncancel          Cancel an owned running execution\ncleanup         Explicitly remove owned execution resources and artifacts"
+        "catalog         Print the bounded public capability catalog without preparing a run\nrun             Host-owned one-step prepare, approve, and execute path (structured JSON on stdin)\ninspect         Debug canonical preparation without requesting permission or executing\npreview         Preview trusted projection and matched rule without side effects\nlist            List local attended executions\nstatus          Show one execution record\nlogs            Print an execution log\nresult          Print an execution result\nartifacts       Print the bounded artifact manifest\nrepositories    Print the bounded repository result document\ncleanup-result  Print the bounded cleanup result document\ncancel          Cancel an owned running execution\ncleanup         Explicitly remove owned execution resources and artifacts"
     );
+}
+
+#[test]
+fn catalog_help_exposes_only_optional_trusted_host_input() {
+    let help = agent_hub(&["local", "catalog", "--help"]);
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout).unwrap();
+    assert!(stdout.contains("--host-config"));
+    assert!(!stdout.contains("--include-cache-identity"));
+    for forbidden in ["--config-root", "--image", "--policy", "--command"] {
+        assert!(
+            !stdout.contains(forbidden),
+            "unexpected catalog input {forbidden}"
+        );
+    }
+
+    let relative = agent_hub(&["local", "catalog", "--host-config", "relative"]);
+    assert!(!relative.status.success());
+    assert!(String::from_utf8_lossy(&relative.stderr).contains("absolute path"));
 }
 
 #[test]

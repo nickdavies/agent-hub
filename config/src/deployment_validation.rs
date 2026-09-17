@@ -46,6 +46,7 @@ struct ImageFile {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OverlayFile {
     overlays: Vec<ValidatedOverlay>,
 }
@@ -96,6 +97,7 @@ struct CapturedImageContext {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ValidatedOverlay {
     pub name: String,
     pub provider: String,
@@ -103,6 +105,8 @@ pub struct ValidatedOverlay {
     pub config: serde_json::Value,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub discovery: Option<protocol::DiscoveryMetadata>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -161,6 +165,23 @@ impl ValidatedOverlay {
         }
         Ok(Some(config))
     }
+}
+
+pub fn parse_overlay_registry(raw: &str, label: &str) -> Result<Vec<ValidatedOverlay>, String> {
+    let parsed: OverlayFile = toml::from_str(raw)
+        .map_err(|error| format!("failed to parse overlay registry '{label}': {error}"))?;
+    let mut names = BTreeSet::new();
+    for overlay in &parsed.overlays {
+        validate_component(&overlay.name, "overlay")?;
+        if !names.insert(overlay.name.clone()) {
+            return Err(format!("duplicate overlay '{}'", overlay.name));
+        }
+        if let Some(discovery) = &overlay.discovery {
+            discovery.validate()?;
+        }
+        overlay.github_config()?;
+    }
+    Ok(parsed.overlays)
 }
 
 #[derive(Debug, Clone)]
@@ -375,24 +396,13 @@ pub fn validate_authoritative_config_root(root: &Path) -> Result<ValidatedDeploy
         .and_then(|overlays| overlays.registry.as_deref())
         .map(|path| {
             let file = capture_file(root, path)?;
-            let parsed: OverlayFile = toml::from_str(
+            let overlays = parse_overlay_registry(
                 std::str::from_utf8(&file.bytes)
                     .map_err(|error| format!("overlay registry is not UTF-8: {error}"))?,
-            )
-            .map_err(|error| format!("failed to parse overlay registry '{path}': {error}"))?;
-            let mut names = BTreeSet::new();
-            for overlay in &parsed.overlays {
-                validate_component(&overlay.name, "overlay")?;
-                if !names.insert(overlay.name.clone()) {
-                    return Err(format!("duplicate overlay '{}'", overlay.name));
-                }
-                overlay.github_config()?;
-            }
+                path,
+            )?;
             authoritative_paths.insert(file.relative_path.clone());
-            Ok(ValidatedOverlayRegistry {
-                file,
-                overlays: parsed.overlays,
-            })
+            Ok::<_, String>(ValidatedOverlayRegistry { file, overlays })
         })
         .transpose()?;
 
@@ -639,6 +649,7 @@ mod tests {
             provider: "github".into(),
             config,
             description: None,
+            discovery: None,
         };
         overlay(valid.clone()).github_config().unwrap().unwrap();
         let mut read = valid.clone();
@@ -657,6 +668,31 @@ mod tests {
         let mut unknown = valid;
         unknown["unknown"] = serde_json::json!(true);
         assert!(overlay(unknown).github_config().is_err());
+    }
+
+    #[test]
+    fn overlay_discovery_is_optional_and_strict() {
+        let old = "[[overlays]]\nname='local'\nprovider='command'\n";
+        assert!(
+            parse_overlay_registry(old, "test").unwrap()[0]
+                .discovery
+                .is_none()
+        );
+        let discovered = "[[overlays]]\nname='local'\nprovider='command'\ndescription='AWS CLI with read-only credentials'\n[overlays.discovery]\nrecommended_for=['AWS inspection, inventory, and diagnosis that must not mutate resources']\nselection_notes=['Prefer this over aws:readwrite whenever read-only API calls are sufficient']\n";
+        assert_eq!(
+            parse_overlay_registry(discovered, "test").unwrap()[0]
+                .discovery
+                .as_ref()
+                .and_then(|metadata| metadata.recommended_for.first())
+                .map(String::as_str),
+            Some("AWS inspection, inventory, and diagnosis that must not mutate resources")
+        );
+        assert!(parse_overlay_registry(&format!("{old}unknown=true\n"), "test").is_err());
+        assert!(parse_overlay_registry(
+            "[[overlays]]\nname='local'\nprovider='command'\n[overlays.discovery]\nunknown=true\n",
+            "test"
+        )
+        .is_err());
     }
 
     #[test]

@@ -72,7 +72,9 @@ pub enum AgentHubRunIntentSchema {
     V1,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum AgentHubRunImageFamily {
     #[serde(rename = "job-code")]
     JobCode,
@@ -84,7 +86,9 @@ impl AgentHubRunImageFamily {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentHubRunNetworkClass {
     None,
@@ -104,7 +108,9 @@ impl AgentHubRunNetworkClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentHubRunToolApproval {
     Auto,

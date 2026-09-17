@@ -4,7 +4,9 @@ import { defaultRuntime, requestSchema } from "./agent-hub-run"
 import { EventEmitter } from "events"
 import { mkdirSync, rmSync } from "node:fs"
 import path from "node:path"
+import { createHash } from "node:crypto"
 import type { OpenCodeHookInput } from "./generated/gateway-types"
+import { AgentHubCatalogService, catalogRequestSchema, validateCatalog } from "./agent-hub-catalog"
 
 let approvalPayloads: OpenCodeHookInput[] = []
 type ProcessFixture = {
@@ -140,6 +142,37 @@ function pluginInput(directory: string) {
     worktree: directory,
     serverUrl: new URL("http://localhost:4096"),
   } as any
+}
+
+function testCatalog() {
+  const value = {
+    schema: "agent_hub_catalog_v1",
+    fingerprint: "",
+    environments: [{
+      name: "code-auto",
+      description: "Code safely",
+      image_family: "job-code",
+      network_options: [{ network_class: "none", resources: [] }],
+      tool_approvals: ["auto"],
+      overlays: [],
+      max_timeout_secs: 600,
+    }],
+    images: [{ family: "job-code", description: "Job image", tool_facts: { status: "unavailable" } }],
+    overlays: [],
+    guidance: {
+      limits: { max_prompt_bytes: 131072, max_workspaces: 16, max_context_roots: 16, max_overlays: 16 },
+      outputs: {
+        structured_result: true, artifact_manifest: true, repository_result: true, cleanup_result: true,
+        stdout_bytes: 16777216, stderr_bytes: 16777216, transcript_bytes: 33554432, artifact_bytes: 4194304,
+      },
+      workspace: {
+        workspace_required: true, primary_workspace_required: true, context_roots_read_only: true,
+        workspace_export_supported: true, workspace_export_is_untrusted: true,
+      },
+    },
+  }
+  value.fingerprint = createHash("sha256").update("agent-hub:catalog:v1\0").update(JSON.stringify(value)).digest("hex")
+  return validateCatalog(value)
 }
 
 function questionAsked(questionCount = 2) {
@@ -325,6 +358,7 @@ describe("gateway cwd forwarding", () => {
 
 describe("permission ownership and fail-closed routing", () => {
   beforeEach(() => {
+    approvalPayloads = []
     approvalGatewayResults = []
     sessionUpdateResults = []
     statusGatewayResults = []
@@ -501,6 +535,82 @@ describe("permission ownership and fail-closed routing", () => {
       execute.mockRestore()
       if (priorBinary === undefined) delete process.env.AGENT_HUB_BIN
       else process.env.AGENT_HUB_BIN = priorBinary
+      await hooks.dispose?.()
+    }
+  })
+
+  test("registers catalog only in HTTP mode and menu lookup uses only toolID without gateway routing", async () => {
+    const lookup = spyOn(AgentHubCatalogService.prototype, "get").mockResolvedValue(testCatalog())
+    const hooks = await initializedHooks()
+    try {
+      expect(Object.keys(hooks.tool ?? {}).sort()).toEqual(["agent_hub_catalog", "agent_hub_run"])
+      const output = { description: "generic", args: {} } as any
+      await hooks["tool.definition"]!({ toolID: "agent_hub_run" } as any, output)
+      expect(output.description).toContain('"code-auto"')
+      expect(approvalPayloads).toHaveLength(0)
+      expect(lookup).toHaveBeenCalledTimes(1)
+
+      await hooks["tool.definition"]!({ toolID: "bash" } as any, output)
+      expect(lookup).toHaveBeenCalledTimes(1)
+    } finally {
+      lookup.mockRestore()
+      await hooks.dispose?.()
+    }
+  })
+
+  test("catalog detail stays behind ownership and gateway authorization and consumes allow once before cache access", async () => {
+    const lookup = spyOn(AgentHubCatalogService.prototype, "get").mockResolvedValue(testCatalog())
+    const hooks = await initializedHooks()
+    await ownSession(hooks)
+    const detail = hooks.tool?.agent_hub_catalog
+    const args = catalogRequestSchema.parse({
+      operation: "detail",
+      sections: ["environments"], selectors: [{ kind: "environment", name: "code-auto" }],
+    })
+    const context = {
+      sessionID: "session-1", callID: "catalog-no-route", abort: new AbortController().signal,
+      metadata: () => {}, ask: async () => { throw new Error("native prompt must not run") },
+    } as any
+    try {
+      await expect(detail!.execute(args, context)).rejects.toThrow(/authorization/)
+      expect(lookup).not.toHaveBeenCalled()
+
+      context.callID = "catalog-denied"
+      approvalGatewayResults.push({ stdout: '{"allowed":false,"reason":"catalog denied"}' })
+      await expect(hooks["tool.execute.before"]!(
+        { sessionID: context.sessionID, callID: context.callID, tool: "agent_hub_catalog" }, { args },
+      )).rejects.toThrow("catalog denied")
+      await expect(detail!.execute(args, context)).rejects.toThrow(/authorization/)
+      expect(lookup).not.toHaveBeenCalled()
+
+      context.callID = "catalog-allowed"
+      await hooks["tool.execute.before"]!(
+        { sessionID: context.sessionID, callID: context.callID, tool: "agent_hub_catalog" }, { args },
+      )
+      expect(approvalPayloads.at(-1)?.tool_name).toBe("agent_hub_catalog")
+      expect(JSON.parse(String(await detail!.execute(args, context))).environments[0].name).toBe("code-auto")
+      expect(lookup).toHaveBeenCalledTimes(1)
+      expect(lookup).toHaveBeenCalledWith(context.abort)
+      await expect(detail!.execute(args, context)).rejects.toThrow(/already consumed/)
+      expect(lookup).toHaveBeenCalledTimes(1)
+    } finally {
+      lookup.mockRestore()
+      await hooks.dispose?.()
+    }
+  })
+
+  test("menu hook replaces generic text with explicit catalog-unavailable text", async () => {
+    const lookup = spyOn(AgentHubCatalogService.prototype, "get").mockRejectedValue(new Error("missing trusted catalog"))
+    const hooks = await initializedHooks()
+    try {
+      const output = { description: "generic", args: {} } as any
+      await hooks["tool.definition"]!({ toolID: "agent_hub_run" } as any, output)
+      expect(output.description).toContain("catalog unavailable")
+      expect(output.description).not.toContain("missing trusted catalog")
+      expect(output.description).toContain("No cached or fallback capability menu")
+      expect(output.description).not.toBe("generic")
+    } finally {
+      lookup.mockRestore()
       await hooks.dispose?.()
     }
   })

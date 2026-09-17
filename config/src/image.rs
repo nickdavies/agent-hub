@@ -407,6 +407,17 @@ pub struct ImageConfig {
     pub extends: Option<String>,
     #[serde(default)]
     pub build_contexts: BTreeMap<String, ImageBuildContext>,
+    #[serde(default)]
+    pub discovery: Option<protocol::DiscoveryMetadata>,
+    #[serde(default)]
+    pub tool_facts: Option<ImageToolFactsManifest>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageToolFactsManifest {
+    pub path: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -416,6 +427,8 @@ pub struct ImageBuildContext {
     pub context_type: String,
     pub url: String,
     pub commit: String,
+    #[serde(default)]
+    pub tree: Option<String>,
     pub archive_sha256: String,
 }
 
@@ -424,6 +437,10 @@ impl ImageBuildContext {
         if self.context_type != "git"
             || !self.url.starts_with("https://")
             || !is_canonical_digest(&self.commit, 40)
+            || self
+                .tree
+                .as_deref()
+                .is_some_and(|tree| !is_canonical_digest(tree, 40))
             || !is_canonical_digest(&self.archive_sha256, 64)
         {
             return Err("image source build context identity is invalid".into());
@@ -438,7 +455,39 @@ impl ImageConfig {
             .map_err(|e| format!("failed to read image config {}: {e}", path.display()))?;
         let wrapped: ImageTomlFile = toml::from_str(&raw)
             .map_err(|e| format!("failed to parse image config {}: {e}", path.display()))?;
+        wrapped.image.validate_metadata()?;
         Ok(wrapped.image)
+    }
+
+    pub fn from_toml(raw: &str, label: &str) -> Result<Self, String> {
+        let wrapped: ImageTomlFile = toml::from_str(raw)
+            .map_err(|error| format!("failed to parse image config {label}: {error}"))?;
+        wrapped.image.validate_metadata()?;
+        Ok(wrapped.image)
+    }
+
+    fn validate_metadata(&self) -> Result<(), String> {
+        if let Some(discovery) = &self.discovery {
+            discovery.validate()?;
+        }
+        for context in self.build_contexts.values() {
+            context.validate()?;
+        }
+        if let Some(manifest) = &self.tool_facts {
+            let path = Path::new(&manifest.path);
+            if manifest.path.is_empty()
+                || manifest.path.len() > 1024
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                || path.to_string_lossy().replace('\\', "/") != manifest.path
+                || !is_canonical_digest(&manifest.sha256, 64)
+            {
+                return Err("image tool facts manifest metadata is invalid".to_string());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -514,17 +563,69 @@ url = "https://github.com/nickdavies/agent-hub.git"
 commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 "#;
-        let parsed: ImageTomlFile = toml::from_str(valid).unwrap();
-        parsed.image.build_contexts["agent-hub-source"]
+        let parsed = ImageConfig::from_toml(valid, "old image config").unwrap();
+        assert!(parsed.discovery.is_none());
+        assert!(parsed.tool_facts.is_none());
+        parsed.build_contexts["agent-hub-source"]
             .validate()
             .unwrap();
-        assert!(toml::from_str::<ImageTomlFile>(&format!("{valid}\nunknown = true\n")).is_err());
-        let mut mismatched = parsed.image.build_contexts["agent-hub-source"].clone();
+        assert!(
+            ImageConfig::from_toml(
+                &format!("{valid}\nunknown = true\n"),
+                "unknown image config"
+            )
+            .is_err()
+        );
+        let mut mismatched = parsed.build_contexts["agent-hub-source"].clone();
         mismatched.archive_sha256 = "not-a-digest".into();
         assert!(mismatched.validate().is_err());
-        let mut floating = parsed.image.build_contexts["agent-hub-source"].clone();
+        let mut floating = parsed.build_contexts["agent-hub-source"].clone();
         floating.commit = "latest".into();
         assert!(floating.validate().is_err());
+
+        let with_discovery = r#"
+[image]
+name = "job-code"
+tag = "agent-hub/job-code:2026-09-09"
+description = "test"
+[image.discovery]
+recommended_for = ["Code, research, and infrastructure environments that need the pinned general-purpose toolchain"]
+selection_notes = ["This is the reviewed image family used by all installed environments", "Environment policy and overlays still determine network and credential access"]
+[image.build_contexts.agent-hub-source]
+type = "git"
+url = "https://github.com/nickdavies/agent-hub.git"
+commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+tree = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+archive_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+"#;
+        let parsed = ImageConfig::from_toml(with_discovery, "test").unwrap();
+        assert_eq!(
+            parsed.discovery.unwrap().recommended_for,
+            [
+                "Code, research, and infrastructure environments that need the pinned general-purpose toolchain"
+            ]
+        );
+        assert_eq!(
+            parsed.build_contexts["agent-hub-source"].tree.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+
+        let with_tool_facts = format!(
+            "{valid}\n[image.tool_facts]\npath = 'images/job-code/tool-facts.json'\nsha256 = '{}'\n",
+            "d".repeat(64)
+        );
+        let metadata = ImageConfig::from_toml(&with_tool_facts, "tool facts")
+            .unwrap()
+            .tool_facts
+            .unwrap();
+        assert_eq!(metadata.path, "images/job-code/tool-facts.json");
+        for invalid in [
+            with_tool_facts.replace("images/job-code/tool-facts.json", "/private/facts.json"),
+            with_tool_facts.replace(&"d".repeat(64), "not-a-digest"),
+            format!("{with_tool_facts}unknown = true\n"),
+        ] {
+            assert!(ImageConfig::from_toml(&invalid, "invalid tool facts").is_err());
+        }
     }
 
     #[test]
@@ -581,7 +682,6 @@ archive_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             1001,
         )
         .unwrap();
-
         for pointer in [
             "/extra",
             "/image/extra",

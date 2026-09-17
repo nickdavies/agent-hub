@@ -5,6 +5,249 @@
 //   cargo run -p protocol --bin generate_schemas -- provider-plugins/opencode/generated
 //   bun run generate-types.ts
 
+export type AgentHubRunIntentSchema = "agent_hub_run_intent_v1"
+export type WorkspaceAccess = "read_only" | "read_write"
+
+export type AgentHubRunImageFamily = "job-code"
+export type AgentHubRunNetworkClass = "none" | "llm-only" | "build" | "guarded-web"
+export type NetworkResourceKind =
+  | "llm"
+  | "github"
+  | "go_registry"
+  | "crates_registry"
+  | "pypi_registry"
+  | "npm_registry"
+  | "guarded_web"
+export type AgentHubRunToolApproval = "auto" | "dippy"
+export type AgentHubCatalogToolFactsV1 =
+  | {
+      status: "unavailable"
+    }
+  | {
+      status: "available"
+      /**
+       * @minItems 1
+       * @maxItems 128
+       */
+      tools: [AgentHubCatalogToolFactV1, ...AgentHubCatalogToolFactV1[]]
+    }
+export type AgentHubCatalogCredentialPrerequisite = "host_command" | "host_configuration" | "configured_mcp_bridge"
+export type AgentHubCatalogRepositoryPrerequisite = "matching_remote_host"
+export type AgentHubCatalogSchema = "agent_hub_catalog_v1"
+
+export interface AgentHubCatalogV1 {
+  /**
+   * @maxItems 64
+   */
+  environments: AgentHubCatalogEnvironmentV1[]
+  fingerprint: string
+  guidance: AgentHubCatalogGuidanceV1
+  /**
+   * @maxItems 64
+   */
+  images: AgentHubCatalogImageV1[]
+  /**
+   * @maxItems 64
+   */
+  overlays: AgentHubCatalogOverlayV1[]
+  schema: AgentHubCatalogSchema
+}
+export interface AgentHubCatalogEnvironmentV1 {
+  description: string
+  discovery?: DiscoveryMetadata | null
+  image_family: AgentHubRunImageFamily
+  max_timeout_secs: number
+  name: string
+  /**
+   * @minItems 1
+   * @maxItems 128
+   */
+  network_options: [AgentHubCatalogNetworkOptionV1, ...AgentHubCatalogNetworkOptionV1[]]
+  /**
+   * @maxItems 16
+   */
+  overlays:
+    | []
+    | [string]
+    | [string, string]
+    | [string, string, string]
+    | [string, string, string, string]
+    | [string, string, string, string, string]
+    | [string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string, string, string, string, string, string, string]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string
+      ]
+    | [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string
+      ]
+  /**
+   * @minItems 1
+   * @maxItems 2
+   */
+  tool_approvals: [AgentHubRunToolApproval] | [AgentHubRunToolApproval, AgentHubRunToolApproval]
+}
+export interface DiscoveryMetadata {
+  /**
+   * @minItems 1
+   * @maxItems 6
+   */
+  recommended_for:
+    | [string]
+    | [string, string]
+    | [string, string, string]
+    | [string, string, string, string]
+    | [string, string, string, string, string]
+    | [string, string, string, string, string, string]
+  /**
+   * @minItems 1
+   * @maxItems 6
+   */
+  selection_notes:
+    | [string]
+    | [string, string]
+    | [string, string, string]
+    | [string, string, string, string]
+    | [string, string, string, string, string]
+    | [string, string, string, string, string, string]
+}
+export interface AgentHubCatalogNetworkOptionV1 {
+  network_class: AgentHubRunNetworkClass
+  /**
+   * @maxItems 7
+   */
+  resources:
+    | []
+    | [NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind, NetworkResourceKind]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+    | [
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind,
+        NetworkResourceKind
+      ]
+}
+export interface AgentHubCatalogGuidanceV1 {
+  limits: AgentHubCatalogLimitsV1
+  outputs: AgentHubCatalogOutputsV1
+  workspace: AgentHubCatalogWorkspaceGuidanceV1
+}
+export interface AgentHubCatalogLimitsV1 {
+  max_context_roots: number
+  max_overlays: number
+  max_prompt_bytes: number
+  max_workspaces: number
+}
+export interface AgentHubCatalogOutputsV1 {
+  artifact_bytes: number
+  artifact_manifest: boolean
+  cleanup_result: boolean
+  repository_result: boolean
+  stderr_bytes: number
+  stdout_bytes: number
+  structured_result: boolean
+  transcript_bytes: number
+}
+export interface AgentHubCatalogWorkspaceGuidanceV1 {
+  context_roots_read_only: boolean
+  primary_workspace_required: boolean
+  workspace_export_is_untrusted: boolean
+  workspace_export_supported: boolean
+  workspace_required: boolean
+}
+export interface AgentHubCatalogImageV1 {
+  description: string
+  discovery?: DiscoveryMetadata | null
+  family: AgentHubRunImageFamily
+  tool_facts: AgentHubCatalogToolFactsV1
+}
+export interface AgentHubCatalogToolFactV1 {
+  name: string
+  version: string
+}
+export interface AgentHubCatalogOverlayV1 {
+  description?: string | null
+  discovery?: DiscoveryMetadata | null
+  name: string
+  prerequisites: AgentHubCatalogOverlayPrerequisitesV1
+  provider: string
+  /**
+   * @minItems 1
+   * @maxItems 8
+   */
+  scopes:
+    | [string]
+    | [string, string]
+    | [string, string, string]
+    | [string, string, string, string]
+    | [string, string, string, string, string]
+    | [string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string]
+    | [string, string, string, string, string, string, string, string]
+}
+export interface AgentHubCatalogOverlayPrerequisitesV1 {
+  credential?: AgentHubCatalogCredentialPrerequisite | null
+  /**
+   * @maxItems 2
+   */
+  network_resources: [] | [NetworkResourceKind] | [NetworkResourceKind, NetworkResourceKind]
+  /**
+   * @maxItems 4
+   */
+  notes?: [] | [string] | [string, string] | [string, string, string] | [string, string, string, string]
+  repository?: AgentHubCatalogRepositoryPrerequisite | null
+}
+
 export type AgentHubRunDecisionAuthority = "automatic" | "human"
 export type AgentHubRunDecision = "allow" | "deny"
 
@@ -24,20 +267,6 @@ export interface AgentHubRunDecisionV1 {
   request_digest: string
   schema: string
 }
-
-export type AgentHubRunImageFamily = "job-code"
-export type AgentHubRunNetworkClass = "none" | "llm-only" | "build" | "guarded-web"
-export type NetworkResourceKind =
-  | "llm"
-  | "github"
-  | "go_registry"
-  | "crates_registry"
-  | "pypi_registry"
-  | "npm_registry"
-  | "guarded_web"
-export type AgentHubRunIntentSchema = "agent_hub_run_intent_v1"
-export type AgentHubRunToolApproval = "auto" | "dippy"
-export type WorkspaceAccess = "read_only" | "read_write"
 
 /**
  * Public tool input. It contains requested capabilities only; config identity,

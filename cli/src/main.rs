@@ -1,6 +1,8 @@
 mod attended;
+mod attended_compat;
 mod attended_relay;
 mod build;
+mod catalog;
 mod client;
 mod git_view;
 mod host_run;
@@ -107,6 +109,15 @@ enum BuildTarget {
 
 #[derive(Subcommand)]
 enum LocalCommand {
+    /// Print the bounded public capability catalog without preparing a run
+    Catalog {
+        /// Optional absolute path to a pinned host-run config
+        #[arg(long, value_parser = validate_absolute_path)]
+        host_config: Option<PathBuf>,
+        /// INTERNAL: include verified cache watch identity metadata
+        #[arg(long, hide = true)]
+        include_cache_identity: bool,
+    },
     /// Host-owned one-step prepare, approve, and execute path (structured JSON on stdin)
     #[command(name = "run", alias = "agent-hub-run")]
     AgentHubRun {
@@ -245,6 +256,25 @@ fn main() -> anyhow::Result<()> {
 
 async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
     match command {
+        LocalCommand::Catalog {
+            host_config,
+            include_cache_identity,
+        } => {
+            let host_config = match host_config {
+                Some(path) => path,
+                None => host_run::default_host_config()?,
+            };
+            if include_cache_identity {
+                let output = serde_json::to_string(&catalog::build_internal(&host_config)?)?;
+                anyhow::ensure!(
+                    output.len() <= catalog::INTERNAL_CATALOG_MAX_BYTES,
+                    "internal catalog envelope exceeds its output bound"
+                );
+                println!("{output}");
+            } else {
+                println!("{}", serde_json::to_string(&catalog::build(&host_config)?)?);
+            }
+        }
         LocalCommand::AgentHubRun {
             request_stdin: _,
             host_config,
@@ -651,6 +681,14 @@ fn validate_run_id(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+fn validate_absolute_path(value: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if value.is_empty() || !path.is_absolute() || value.chars().any(char::is_control) {
+        return Err("path must be a non-empty absolute path".to_string());
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 fn validate_cli_mount_path(path: &str) -> Result<(), String> {
     if path.is_empty()
@@ -871,6 +909,24 @@ mod attended_cli_tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn catalog_host_config_must_be_absolute() {
+        assert!(
+            Cli::try_parse_from(["agent-hub", "local", "catalog", "--host-config", "relative"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-hub",
+                "local",
+                "catalog",
+                "--host-config",
+                "/absolute/host-run.json"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

@@ -54,6 +54,9 @@ fn main() {
     write_schema::<protocol::AgentHubRunDecisionV1>(&out_dir, "AgentHubRunDecisionV1");
     write_schema::<protocol::AgentHubRunOutputV1>(&out_dir, "AgentHubRunOutputV1");
 
+    // -- Read-only capability discovery contract --
+    write_schema::<protocol::AgentHubCatalogV1>(&out_dir, "AgentHubCatalogV1");
+
     // -- Status reporting types --
     write_schema::<protocol::StatusReport>(&out_dir, "StatusReport");
 

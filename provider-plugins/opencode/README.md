@@ -189,6 +189,41 @@ error is not evidence of successful sandbox cleanup; there is no forced-kill
 fallback or additional host cleanup command. Success requires a consistent
 terminal, approved, complete, successful, cleaned result.
 
+### Capability catalog
+
+Catalog discovery is an opt-in host feature enabled by setting absolute
+`AGENT_HUB_BIN` while using the HTTP approval transport. The plugin registers
+`agent_hub_catalog` only in HTTP mode and invokes the fixed executable as
+exactly `local catalog`; it never supplies a model-controlled or plugin-selected
+host-config argument. The CLI derives the trusted
+`$HOME/.config/agent-hub/host-run.json` configuration itself.
+
+The `tool.definition` hook loads the public `AgentHubCatalogV1` projection and
+replaces the `agent_hub_run` description with a bounded environment menu. This
+read-only menu lookup is not a tool execution and does not route through the
+gateway. It includes public purpose, image/tool facts, exact approval and
+network choices, timeout limits, and a pointer to typed details. Network access
+and overlay credential prerequisites are described separately. If discovery
+fails, the description explicitly says the catalog is unavailable rather than
+retaining generic launch guidance.
+
+Agents request typed detail through `agent_hub_catalog` using the required,
+bounded `sections` array and matching explicit `selectors`. Unknown fields,
+sections, selectors, names, malformed contracts, invalid references/order, and
+fingerprint mismatches fail closed. Unlike menu lookup, this explicit tool call
+uses the normal permission-ownership and gateway route, and one matching allow
+is consumed even when the catalog data is already cached.
+
+Successful catalogs are cached only while internal `lstat` snapshots of the
+configured binary, trusted host config, authoritative config root, pinned files,
+and relevant config directories remain identical. Concurrent loads are
+singleflight. Missing, malformed, oversized, or mutated inputs invalidate the
+cache before reload; failures never fall back to stale data. Inputs are captured
+before and after the bounded subprocess, with one retry for a race. Timeout,
+cancellation, or disposal sends SIGTERM, escalates to SIGKILL after a short
+grace period, and waits for process reaping. Filesystem watch inventory is
+private and is never included in tool output or descriptions.
+
 Approval-bundle producers must record
 `sources.agent_hub.plugin_entrypoint = "provider-plugins/opencode/index.ts"`.
 Regenerate bundles and their source/artifact digest pins together when adopting
