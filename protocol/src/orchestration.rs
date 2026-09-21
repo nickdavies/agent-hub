@@ -3068,7 +3068,19 @@ pub enum PlannedPermissionTier {
 }
 
 #[derive(
-    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash, Display, EnumString,
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Display,
+    EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]

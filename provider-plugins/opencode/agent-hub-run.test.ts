@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { ToolContext } from "@opencode-ai/plugin"
+import { createHash } from "node:crypto"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -10,9 +11,30 @@ import {
   localResultV2Schema,
   readBounded,
   requestSchema,
+  trustedInvocationID,
   type AgentHubRunRequest,
   type AgentHubRuntime,
 } from "./agent-hub-run"
+
+const DEFAULT_CALL_ID = "call_01JZZZZZZZZZZZZZZZZZZZZZZZ"
+
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical)
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, nested]) => [key, canonical(nested)]))
+  }
+  return value
+}
+
+function signReceipt<T extends { checksum: string }>(receipt: T): void {
+  const { checksum: _checksum, ...decision } = receipt
+  receipt.checksum = createHash("sha256")
+    .update("agent-hub:agent-hub-run-receipt:v1\0")
+    .update(JSON.stringify(canonical(decision)))
+    .digest("hex")
+}
 
 const validRequest: AgentHubRunRequest = {
   schema: "agent_hub_run_intent_v1",
@@ -31,7 +53,7 @@ const validRequest: AgentHubRunRequest = {
 }
 
 function successfulOutput(
-  invocationID = "00000000-0000-4000-8000-000000000001",
+  invocationID = trustedInvocationID("session", DEFAULT_CALL_ID),
   runID = "run",
 ) {
   const reference = {
@@ -43,7 +65,7 @@ function successfulOutput(
     truncated: false,
   }
   const document = { reference, document: {}, parse_error: null }
-  return {
+  const output = {
     schema: "agent_hub_run_output_v1",
     invocation_id: invocationID,
     approval_receipt: {
@@ -56,11 +78,11 @@ function successfulOutput(
         request_digest: "b".repeat(64),
         decision: "allow",
         authority: "automatic",
-        approval_id: invocationIDToken(invocationID),
+        approval_id: invocationID,
         reason: null,
         decided_at: "2026-09-03T12:00:00Z",
-        expires_at: "2026-09-03T13:00:00Z",
-        checksum: "c".repeat(64),
+        expires_at: "2099-09-03T13:00:00Z",
+        checksum: "",
       },
     },
     local_result_v2: {
@@ -96,24 +118,34 @@ function successfulOutput(
       transcript: reference,
     },
   }
+  signReceipt(output.approval_receipt.receipt)
+  return output
 }
 
-function invocationIDToken(invocationID: string): string {
-  return invocationID.replace("-4000-", "-4001-")
-}
+test("receipt checksum matches the Rust golden", () => {
+  const output = successfulOutput()
+  expect(output.invocation_id).toBe("7697e2a3-3afc-81ca-b119-970017dd1eca")
+  expect(output.approval_receipt.receipt.checksum).toBe(
+    "0d13310bb0c9dc973ca1c593fa96eb0beb06d172ce0cc392ded5aba70f9a6462",
+  )
+})
 
 function runtime(overrides: Partial<AgentHubRuntime> = {}): AgentHubRuntime {
   return {
     env: { AGENT_HUB_BIN: "/opt/agent-hub/bin/agent-hub" },
     assertExecutable: async () => {},
-    execute: async () => ({ stdout: JSON.stringify(successfulOutput()), stderr: "", exitCode: 0 }),
+    execute: async (_binary, _argv, _stdin, _signal, identity) => ({
+      stdout: JSON.stringify(successfulOutput(trustedInvocationID(identity.sessionID, identity.toolCallID))),
+      stderr: "",
+      exitCode: 0,
+    }),
     ...overrides,
   }
 }
 
 function context(
   signal: AbortSignal = new AbortController().signal,
-  callID: string = "call_01JZZZZZZZZZZZZZZZZZZZZZZZ",
+  callID: string = DEFAULT_CALL_ID,
 ): ToolContext {
   return {
     sessionID: "session",
@@ -204,11 +236,75 @@ describe("agent_hub_run contract", () => {
     expect(JSON.parse(text)).toEqual(successfulOutput())
   })
 
+  test("derives the exact Rust trusted invocation UUIDv8 vector", () => {
+    expect(trustedInvocationID("session", "call")).toBe("22356e2a-8bf3-841c-a45a-4aaf1ab6c463")
+  })
+
+  test("accepts automatic and human receipts with valid Rust-domain checksums", async () => {
+    for (const authority of ["automatic", "human"] as const) {
+      const output = successfulOutput()
+      output.approval_receipt.receipt.authority = authority
+      if (authority === "human") output.approval_receipt.receipt.approval_id = "00000000-0000-0000-0000-000000000007"
+      signReceipt(output.approval_receipt.receipt)
+      const instance = createAgentHubRunTool(runtime({ execute: async () => ({
+        stdout: JSON.stringify(output), stderr: "", exitCode: 0,
+      }) }))
+      await expect(instance.execute({ ...validRequest }, context())).resolves.toBeTruthy()
+    }
+  })
+
+  test("accepts a receipt that was valid at call start but expires during the subprocess", async () => {
+    const instance = createAgentHubRunTool(runtime({ execute: async () => {
+      const output = successfulOutput()
+      output.approval_receipt.receipt.decided_at = new Date(Date.now() - 1_000).toISOString()
+      output.approval_receipt.receipt.expires_at = new Date(Date.now() + 100).toISOString()
+      signReceipt(output.approval_receipt.receipt)
+      await Bun.sleep(200)
+      return { stdout: JSON.stringify(output), stderr: "", exitCode: 0 }
+    } }))
+    await expect(instance.execute({ ...validRequest }, context())).resolves.toBeTruthy()
+  })
+
+  test("rejects untrusted bindings, noncanonical fields, invalid authority, time, and checksum", async () => {
+    const otherInvocation = "00000000-0000-0000-0000-000000000009"
+    const mutations: Array<(output: ReturnType<typeof successfulOutput>) => void> = [
+      (output) => { output.invocation_id = otherInvocation },
+      (output) => {
+        output.approval_receipt.receipt.invocation_id = otherInvocation
+        output.approval_receipt.receipt.approval_id = otherInvocation
+        signReceipt(output.approval_receipt.receipt)
+      },
+      (output) => { output.approval_receipt.receipt.canonical_digest = "A".repeat(64) },
+      (output) => { output.approval_receipt.receipt.checksum = "A".repeat(64) },
+      (output) => { output.approval_receipt.receipt.checksum = "0".repeat(64) },
+      (output) => {
+        output.approval_receipt.receipt.approval_id = otherInvocation
+        signReceipt(output.approval_receipt.receipt)
+      },
+      (output) => {
+        output.approval_receipt.receipt.decided_at = new Date(Date.now() + 60_000).toISOString()
+        signReceipt(output.approval_receipt.receipt)
+      },
+      (output) => {
+        output.approval_receipt.receipt.expires_at = new Date(Date.now() - 1).toISOString()
+        signReceipt(output.approval_receipt.receipt)
+      },
+    ]
+    for (const mutate of mutations) {
+      const output = successfulOutput()
+      mutate(output)
+      const instance = createAgentHubRunTool(runtime({ execute: async () => ({
+        stdout: JSON.stringify(output), stderr: "", exitCode: 0,
+      }) }))
+      await expect(instance.execute({ ...validRequest }, context())).rejects.toThrow()
+    }
+  })
+
   test("gives identical calls in one message distinct invocations, approvals, and runs", async () => {
     const calls: string[] = []
     const invocationIDs = [
-      "00000000-0000-4000-8000-000000000011",
-      "00000000-0000-4000-8000-000000000012",
+      trustedInvocationID("session", "call_same_message_1"),
+      trustedInvocationID("session", "call_same_message_2"),
     ]
     const instance = createAgentHubRunTool(
       runtime({
@@ -236,7 +332,7 @@ describe("agent_hub_run contract", () => {
       results.map(
         (result) => JSON.parse(typeof result === "string" ? result : result.output).approval_receipt.receipt.approval_id,
       ),
-    ).toEqual(invocationIDs.map(invocationIDToken))
+    ).toEqual(invocationIDs)
     expect(
       results.map((result) => JSON.parse(typeof result === "string" ? result : result.output).local_result_v2.run_id),
     ).toEqual(["run-1", "run-2"])
@@ -248,7 +344,7 @@ describe("agent_hub_run contract", () => {
       runtime({
         execute: async (_binary, _argv, stdin, _signal, trustedIdentity) => {
           calls.push({ toolCallID: trustedIdentity.toolCallID, prompt: JSON.parse(stdin).prompt })
-          const invocationID = `00000000-0000-4000-8000-00000000002${calls.length}`
+          const invocationID = trustedInvocationID("session", trustedIdentity.toolCallID)
           return { stdout: JSON.stringify(successfulOutput(invocationID, `run-${calls.length}`)), stderr: "", exitCode: 0 }
         },
       }),
@@ -269,8 +365,8 @@ describe("agent_hub_run contract", () => {
         return [output.invocation_id, output.approval_receipt.receipt.approval_id, output.local_result_v2.run_id]
       }),
     ).toEqual([
-      ["00000000-0000-4000-8000-000000000021", "00000000-0000-4001-8000-000000000021", "run-1"],
-      ["00000000-0000-4000-8000-000000000022", "00000000-0000-4001-8000-000000000022", "run-2"],
+      [trustedInvocationID("session", "call_different_1"), trustedInvocationID("session", "call_different_1"), "run-1"],
+      [trustedInvocationID("session", "call_different_2"), trustedInvocationID("session", "call_different_2"), "run-2"],
     ])
   })
 
@@ -283,7 +379,11 @@ describe("agent_hub_run contract", () => {
           agentHubEntries++
           internalAttempts.push(trustedIdentity.toolCallID)
           internalAttempts.push(trustedIdentity.toolCallID)
-          return { stdout: JSON.stringify(successfulOutput()), stderr: "", exitCode: 0 }
+          return {
+            stdout: JSON.stringify(successfulOutput(trustedInvocationID("session", trustedIdentity.toolCallID))),
+            stderr: "",
+            exitCode: 0,
+          }
         },
       }),
     )
@@ -335,12 +435,13 @@ describe("agent_hub_run contract", () => {
       (value: ReturnType<typeof successfulOutput>) =>
         Object.assign(value.approval_receipt.receipt!, { invocation_id: "00000000-0000-4000-8000-000000000099" }),
     ]) {
-      const output = successfulOutput()
+      const callID = crypto.randomUUID()
+      const output = successfulOutput(trustedInvocationID("session", callID))
       mutate(output)
       const instance = createAgentHubRunTool(
         runtime({ execute: async () => ({ stdout: JSON.stringify(output), stderr: "", exitCode: 0 }) }),
       )
-      await expect(instance.execute({ ...validRequest }, context(undefined, crypto.randomUUID()))).rejects.toThrow()
+      await expect(instance.execute({ ...validRequest }, context(undefined, callID))).rejects.toThrow()
     }
   })
 
@@ -352,7 +453,10 @@ describe("agent_hub_run contract", () => {
         { schema: "local_result_v2", execution_outcome: "succeeded", result_outcome: "succeeded", cleanup_outcome: "succeeded" },
       ]) {
         const output = { ...successfulOutput(), error: denial ? null : "host failed", local_result_v2: result }
-        if (denial) output.approval_receipt.receipt.decision = "deny"
+        if (denial) {
+          output.approval_receipt.receipt.decision = "deny"
+          signReceipt(output.approval_receipt.receipt)
+        }
         const instance = createAgentHubRunTool(
           runtime({ execute: async () => ({ stdout: JSON.stringify(output), stderr: "", exitCode: 1 }) }),
         )
@@ -374,6 +478,7 @@ describe("agent_hub_run contract", () => {
       local_result_v2: { schema: "local_result_v2", run_id: null, status: "failed", cleanup_outcome: "unknown" },
     }
     denied.approval_receipt.receipt.decision = "deny"
+    signReceipt(denied.approval_receipt.receipt)
     for (const failure of [output, denied]) {
       const instance = createAgentHubRunTool(
         runtime({ execute: async () => ({ stdout: JSON.stringify(failure), stderr: "", exitCode: 1 }) }),
@@ -419,7 +524,7 @@ describe("agent_hub_run contract", () => {
   test("returns a structured failure from a non-zero Agent Hub exit", async () => {
     const failure = {
       schema: "agent_hub_run_output_v1",
-      invocation_id: "00000000-0000-4000-8000-000000000001",
+      invocation_id: trustedInvocationID("session", "call_failure"),
       approval_receipt: {
         schema: "agent_hub_run_approval_receipt_v1",
         status: "unavailable",

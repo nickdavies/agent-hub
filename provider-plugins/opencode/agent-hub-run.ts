@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { constants } from "node:fs"
 import { access, stat } from "node:fs/promises"
 import { isAbsolute, join } from "node:path"
@@ -10,6 +11,10 @@ const schema = tool.schema
 const MAX_STDOUT_BYTES = 1024 * 1024
 const MAX_STDERR_BYTES = 64 * 1024
 const MAX_OPENCODE_ID_BYTES = 1024
+const TRUSTED_INVOCATION_DOMAIN = "agent-hub:trusted-one-step-invocation:v1\0"
+const RECEIPT_DOMAIN = "agent-hub:agent-hub-run-receipt:v1\0"
+const LOWERCASE_SHA256 = /^[0-9a-f]{64}$/
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const boundedString = (maximum: number) =>
   schema
@@ -123,19 +128,21 @@ const agentResultSchema = schema
     }
   })
 
+const canonicalUuidSchema = schema.string().regex(CANONICAL_UUID, "must be a canonical lowercase UUID")
+const lowercaseSha256Schema = schema.string().regex(LOWERCASE_SHA256, "must be lowercase SHA-256")
 const runReceiptSchema = schema
   .object({
     schema: schema.literal("agent_hub_run_decision_v1"),
-    invocation_id: schema.uuid(),
-    canonical_digest: boundedString(64).length(64),
-    request_digest: boundedString(64).length(64),
+    invocation_id: canonicalUuidSchema,
+    canonical_digest: lowercaseSha256Schema,
+    request_digest: lowercaseSha256Schema,
     decision: schema.enum(["allow", "deny"]),
     authority: schema.enum(["automatic", "human"]),
-    approval_id: schema.uuid(),
+    approval_id: canonicalUuidSchema,
     reason: boundedString(4096).nullable().optional(),
     decided_at: schema.iso.datetime(),
     expires_at: schema.iso.datetime(),
-    checksum: schema.string(),
+    checksum: lowercaseSha256Schema,
   })
   .strict()
 
@@ -254,7 +261,7 @@ const localResultEnvelopeSchema = schema
 export const hostRunOutputSchema = schema
   .object({
     schema: schema.literal("agent_hub_run_output_v1"),
-    invocation_id: schema.uuid(),
+    invocation_id: canonicalUuidSchema,
     approval_receipt: approvalReceiptSchema,
     local_result_v2: localResultEnvelopeSchema,
     error: boundedString(4096).nullable().optional(),
@@ -293,6 +300,56 @@ export function openCodeToolCallIdentity(context: ToolContext): { sessionID: str
     sessionID: validateOpenCodeID(context.sessionID, "session ID"),
     callID: validateOpenCodeID(callID, "tool call ID"),
   }
+}
+
+export function trustedInvocationID(sessionID: string, toolCallID: string): string {
+  const bytes = createHash("sha256")
+    .update(TRUSTED_INVOCATION_DOMAIN)
+    .update(sessionID)
+    .update("\0")
+    .update(toolCallID)
+    .digest()
+    .subarray(0, 16)
+  bytes[6] = (bytes[6]! & 0x0f) | 0x80
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80
+  const hex = bytes.toString("hex")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson)
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, nested]) => [key, canonicalJson(nested)]),
+    )
+  }
+  return value
+}
+
+function validateReceipt(
+  receipt: z.infer<typeof runReceiptSchema>,
+  trustedInvocation: string,
+  callStartedAt: Date,
+): void {
+  if (receipt.invocation_id !== trustedInvocation) {
+    throw new Error("Agent Hub approval receipt does not match the trusted invocation")
+  }
+  const decidedAt = new Date(receipt.decided_at)
+  const expiresAt = new Date(receipt.expires_at)
+  if (decidedAt > new Date() || expiresAt <= callStartedAt || decidedAt >= expiresAt) {
+    throw new Error("Agent Hub approval receipt timestamps are invalid or were expired at call start")
+  }
+  if (receipt.authority === "automatic" && receipt.approval_id !== receipt.invocation_id) {
+    throw new Error("Agent Hub automatic approval receipt ID is invalid")
+  }
+  const { checksum, ...decision } = receipt
+  const expected = createHash("sha256")
+    .update(RECEIPT_DOMAIN)
+    .update(JSON.stringify(canonicalJson({ ...decision, reason: decision.reason ?? null })))
+    .digest("hex")
+  if (checksum !== expected) throw new Error("Agent Hub approval receipt checksum mismatch")
 }
 
 export async function readBounded(
@@ -397,7 +454,13 @@ export function canonicalIntent(input: AgentHubRunRequest): AgentHubRunIntentV1 
   return intent
 }
 
-function parseOutput(stdout: string, stderr: string, exitCode: number): string {
+function parseOutput(
+  stdout: string,
+  stderr: string,
+  exitCode: number,
+  trustedInvocation: string,
+  callStartedAt: Date,
+): string {
   let value: unknown
   try {
     value = JSON.parse(stdout)
@@ -405,11 +468,11 @@ function parseOutput(stdout: string, stderr: string, exitCode: number): string {
     throw new Error("Agent Hub returned invalid JSON", { cause: error })
   }
   const output = hostRunOutputSchema.parse(value)
-  if (
-    output.approval_receipt.status === "issued" &&
-    output.approval_receipt.receipt?.invocation_id !== output.invocation_id
-  ) {
-    throw new Error("Agent Hub approval receipt does not match the output invocation")
+  if (output.invocation_id !== trustedInvocation) {
+    throw new Error("Agent Hub output does not match the trusted invocation")
+  }
+  if (output.approval_receipt.status === "issued") {
+    validateReceipt(output.approval_receipt.receipt!, trustedInvocation, callStartedAt)
   }
   if (exitCode === 0) {
     if (output.error != null || output.approval_receipt.status !== "issued") {
@@ -471,6 +534,8 @@ export function createAgentHubRunTool(runtime: AgentHubRuntime = defaultRuntime)
       }
       await runtime.assertExecutable(binary)
       context.metadata({ title: `Agent Hub: ${intent.environment}`, metadata: { intent } })
+      const invocationID = trustedInvocationID(trustedIdentity.sessionID, trustedIdentity.callID)
+      const callStartedAt = new Date()
       const output = await runtime.execute(
         binary,
         ["local", "run", "--request-stdin"],
@@ -478,7 +543,7 @@ export function createAgentHubRunTool(runtime: AgentHubRuntime = defaultRuntime)
         context.abort,
         { sessionID: trustedIdentity.sessionID, toolCallID: trustedIdentity.callID },
       )
-      return parseOutput(output.stdout, output.stderr, output.exitCode)
+      return parseOutput(output.stdout, output.stderr, output.exitCode, invocationID, callStartedAt)
     },
   })
 }

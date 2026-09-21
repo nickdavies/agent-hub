@@ -48,11 +48,12 @@ fn approval_request(id: &str) -> String {
     .unwrap()
 }
 
-fn launch_request(id: &str) -> String {
+fn launch_request(_id: &str) -> String {
     let canonical: protocol::AttendedAuthorizationRequestV3 = serde_json::from_slice(
         include_bytes!("../../protocol/tests/fixtures/attended_authorization_v3.json"),
     )
     .unwrap();
+    let canonical = protocol::AttendedAuthorizationRequestV4::from(canonical);
     let resolved = protocol::AgentHubRunResolvedV1::new(
         "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
         canonical.canonical_artifact().unwrap(),
@@ -60,11 +61,24 @@ fn launch_request(id: &str) -> String {
         "2099-01-01T00:00:00Z".parse().unwrap(),
     )
     .unwrap();
-    let mut request: ApprovalRequest = serde_json::from_str(&approval_request(id)).unwrap();
-    request.request_digest = Some(resolved.canonical_digest.clone());
-    request.tool = serde_json::from_value(serde_json::json!("agent_hub_run_resolved")).unwrap();
-    request.tool_input = serde_json::to_value(resolved).unwrap();
-    request.provider = "agent-hub-host-launch".into();
+    let event = resolved.gateway_event().unwrap();
+    let request = ApprovalRequest {
+        id: resolved.invocation_id.clone(),
+        request_digest: Some(resolved.permission_scope_digest().unwrap()),
+        session_id: event.session_id,
+        session_display_name: event.session_title.unwrap(),
+        cwd: event.cwd,
+        tool: event.tool.into(),
+        tool_input: event.tool_input,
+        provider: "agent-hub-host-launch".into(),
+        request_type: RequestType::ToolUse,
+        context: ApprovalContext {
+            workspace_roots: event.workspace_roots.unwrap(),
+            hook_event_name: event.hook_event_name.into(),
+            extra: None,
+            attended: None,
+        },
+    };
     serde_json::to_string(&request).unwrap()
 }
 
@@ -229,4 +243,73 @@ async fn strict_one_step_review_accepts_canonical_payload_and_rejects_unknown_fi
     invalid["tool_input"]["unexpected"] = true.into();
     let (status, _) = request(&app, "POST", "/api/v1/hooks/approval", invalid.to_string()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let mut legacy_digest: serde_json::Value =
+        serde_json::from_str(&launch_request("legacy-digest")).unwrap();
+    legacy_digest["request_digest"] = legacy_digest["tool_input"]["canonical_digest"].clone();
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v1/hooks/approval",
+        legacy_digest.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    for (field, value) in [
+        ("id", serde_json::json!(Uuid::new_v4())),
+        ("session_id", serde_json::json!("wrong-session")),
+        ("session_display_name", serde_json::json!("wrong title")),
+        ("cwd", serde_json::json!("/wrong/cwd")),
+        ("provider", serde_json::json!("opencode")),
+        ("request_type", serde_json::json!("plan_question")),
+    ] {
+        let mut invalid: serde_json::Value =
+            serde_json::from_str(&launch_request("invalid-envelope")).unwrap();
+        invalid[field] = value;
+        let (status, _) =
+            request(&app, "POST", "/api/v1/hooks/approval", invalid.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "field {field}");
+    }
+
+    let mut invalid_context: serde_json::Value =
+        serde_json::from_str(&launch_request("invalid-context")).unwrap();
+    invalid_context["context"]["hook_event_name"] = "permission.ask".into();
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v1/hooks/approval",
+        invalid_context.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let mut invalid_roots: serde_json::Value =
+        serde_json::from_str(&launch_request("invalid-roots")).unwrap();
+    invalid_roots["context"]["workspace_roots"] = serde_json::json!(["/wrong/root"]);
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v1/hooks/approval",
+        invalid_roots.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let mut invalid_extra: serde_json::Value =
+        serde_json::from_str(&launch_request("invalid-extra")).unwrap();
+    invalid_extra["context"]["extra"] = serde_json::json!({"dippy_reason": "not canonical"});
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v1/hooks/approval",
+        invalid_extra.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let mut generic: serde_json::Value = serde_json::from_str(&approval_request("opaque")).unwrap();
+    generic["request_digest"] = "opaque-producer-value".into();
+    let (status, body) = request(&app, "POST", "/api/v1/hooks/approval", generic.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

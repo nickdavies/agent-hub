@@ -180,6 +180,10 @@ export interface AgentHubCatalogNetworkOptionV1 {
 export interface AgentHubCatalogGuidanceV1 {
   limits: AgentHubCatalogLimitsV1
   outputs: AgentHubCatalogOutputsV1
+  /**
+   * Discovery is configuration metadata, not a live Docker/network/credential probe.
+   */
+  runtime_readiness_checked: boolean
   workspace: AgentHubCatalogWorkspaceGuidanceV1
 }
 export interface AgentHubCatalogLimitsV1 {
@@ -859,11 +863,13 @@ export interface AgentHubRunReceiptV1 {
   schema: string
 }
 
+export type AttendedNetworkGrantModeV1 = "hosts" | "guarded_web"
 /**
  * Strict policy surface derived from a verified canonical execution. Policy
  * matching never receives the canonical transport or public intent fields.
  */
-export interface AgentHubRunPolicyProjectionV1 {
+export interface AgentHubRunPolicyProjectionV2 {
+  approval_rules?: ApprovalRuleSet | null
   /**
    * @maxItems 64
    */
@@ -1032,9 +1038,169 @@ export interface AgentHubRunPolicyProjectionV1 {
         AgentHubRunRootProjectionV1,
         AgentHubRunRootProjectionV1
       ]
+  cpu_limit?: string | null
+  /**
+   * @maxItems 16
+   */
+  effective_network_grants:
+    | []
+    | [AttendedNetworkGrantV1]
+    | [AttendedNetworkGrantV1, AttendedNetworkGrantV1]
+    | [AttendedNetworkGrantV1, AttendedNetworkGrantV1, AttendedNetworkGrantV1]
+    | [AttendedNetworkGrantV1, AttendedNetworkGrantV1, AttendedNetworkGrantV1, AttendedNetworkGrantV1]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
+    | [
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1,
+        AttendedNetworkGrantV1
+      ]
   environment: string
   image_family: string
-  image_id: string
+  memory_limit?: string | null
   network_class: string
   /**
    * @maxItems 16
@@ -1189,7 +1355,7 @@ export interface AgentHubRunPolicyProjectionV1 {
         NetworkResourceKind,
         NetworkResourceKind
       ]
-  output: AttendedOutputContract
+  output_limits: AttendedOutputLimits
   /**
    * @maxItems 16
    */
@@ -1354,7 +1520,10 @@ export interface AgentHubRunPolicyProjectionV1 {
         AgentHubRunCapabilityProjectionV1,
         AgentHubRunCapabilityProjectionV1
       ]
+  permissions: AgentHubRunPermissionSetV2
+  pids_limit: number
   prompt_digest: string
+  repository_claims: PlannedRepoClaim[]
   retry: AttendedRetryConstraints
   review: AgentHubRunReviewProjectionV1
   schema: string
@@ -1525,23 +1694,41 @@ export interface AgentHubRunPolicyProjectionV1 {
         AgentHubRunRootProjectionV1
       ]
 }
+export interface ApprovalRuleSet {
+  /**
+   * Tools that are auto-approved for this job
+   */
+  auto_approve?: string[]
+  /**
+   * Tools that are denied entirely
+   */
+  deny?: string[]
+  /**
+   * Tools that always escalate to human for this job
+   */
+  escalate?: string[]
+}
 export interface AgentHubRunCapabilityProjectionV1 {
   access: string
+  constraints?: {
+    [k: string]: string
+  }
   name: string
+  /**
+   * @maxItems 32
+   */
+  targets?: string[]
 }
 export interface AgentHubRunRootProjectionV1 {
   access: WorkspaceAccess
   alias: string
   path: string
-  root_identity: string
 }
-export interface AttendedOutputContract {
-  artifacts: string
-  cleanup: string
-  limits: AttendedOutputLimits
-  repositories: string
-  result: string
-  transcript: string
+export interface AttendedNetworkGrantV1 {
+  hosts: string[]
+  mode: AttendedNetworkGrantModeV1
+  provider?: string | null
+  resource: NetworkResourceKind
 }
 export interface AttendedOutputLimits {
   artifact_bytes: number
@@ -1549,15 +1736,31 @@ export interface AttendedOutputLimits {
   stdout_bytes: number
   transcript_bytes: number
 }
+export interface AgentHubRunPermissionSetV2 {
+  auto_approve_tools: string[]
+  aws_access?: string | null
+  can_access_network: boolean
+  can_read_workspace: boolean
+  can_run_shell: boolean
+  can_write_workspace: boolean
+  escalate_tools: string[]
+  kubernetes_access?: string | null
+  tier: string
+}
+export interface PlannedRepoClaim {
+  base_ref: string
+  branch_name?: string | null
+  claim_type?: string
+  read_only?: boolean
+  repo_url: string
+  target_branch?: string | null
+}
 export interface AttendedRetryConstraints {
   max_attempts: number
   max_prelaunch_retries: number
   max_provider_unavailable_retries: number
 }
 export interface AgentHubRunReviewProjectionV1 {
-  approval_bundle_digest: string
-  config_digest: string
-  environment_bundle_digest: string
   primary_workspace: string
   workspace_export_root?: string | null
 }
@@ -1570,7 +1773,7 @@ export interface AgentHubRunResolvedV1 {
   canonical_execution: AgentHubRunCanonicalArtifactV1
   expires_at: string
   invocation_id: string
-  policy_projection: AgentHubRunPolicyProjectionV1
+  policy_projection: AgentHubRunPolicyProjectionV2
   request_digest: string
   requested_at: string
   schema: string

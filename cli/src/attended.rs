@@ -12,14 +12,15 @@ use agent_hub_executor::{
         PreparedRestrictedEgress, ProxyRuntimeSpec, ResolverRuntimeSpec, RestrictedEgressRequest,
         RestrictedPolicy,
     },
-    execute_process, inspect_image_identity, verify_image_identity,
+    execute_process,
 };
 use anyhow::{Context, ensure};
 use chrono::{DateTime, Utc};
 use protocol::{
-    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ApprovedExecutionSpec,
-    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV3,
-    AttendedExecutionSpec, AttendedLifecycleContract, AttendedOutputContract, AttendedProposal,
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V4, ApprovedExecutionSpec,
+    AttendedApprovalBundleIdentity, AttendedAuthorizationArtifact, AttendedAuthorizationRequestV4,
+    AttendedExecutionSpec, AttendedLifecycleContract, AttendedNetworkGrantModeV1,
+    AttendedNetworkGrantV1, AttendedOutputContract, AttendedProposal,
     AttendedWorkspaceExportContract, AuthorizedCredentialProvider, AuthorizedOverlay,
     CanonicalRuntimeSpec, ExecutionMode, NetworkResourceKind, NetworkResourceRequest,
     PlannedEnvironmentTier, PromptRef, ResolvedAuthorizationBehavior, ToolApprovalMode,
@@ -31,9 +32,9 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use crate::attended_compat::selector_resources;
 use crate::attended_compat::{
-    ensure_unique_resources, image_family, network_class_within_ceiling,
-    requested_tool_approval_mode, resolve_network_resources, tool_approval_mode,
-    tool_approval_name, tool_approval_within_ceiling,
+    ensure_unique_resources, network_class_within_ceiling, requested_tool_approval_mode,
+    resolve_network_resources, tool_approval_mode, tool_approval_name,
+    tool_approval_within_ceiling,
 };
 use crate::attended_relay::{
     AttendedRelay, AttendedRelayConfig, RelaySocketLocation, SupervisionOutcome,
@@ -41,6 +42,7 @@ use crate::attended_relay::{
 };
 use crate::local::{
     ApprovedRoots, RequestedContextRoot, RequestedWorkspace, ResolvedMounts, resolve_mounts,
+    resolve_mounts_with_protected,
 };
 use crate::state::StateStore;
 
@@ -88,6 +90,7 @@ pub struct ProposalInput {
     pub context_roots: Vec<RequestedContextRoot>,
     pub primary_workspace: String,
     pub workspace_export_root: Option<PathBuf>,
+    pub protected_paths: Vec<PathBuf>,
 }
 
 pub struct AuthorizationSelectors<'a> {
@@ -469,17 +472,19 @@ struct BundleNetworkPolicy {
     name: String,
 }
 
-/// Prepare canonical V3 execution bytes from a trusted host image identity.
-pub(crate) async fn prepare_canonical_execution(
+/// Prepare canonical execution bytes from a validated deployment and trusted image identity.
+pub(crate) async fn prepare_canonical_execution_from_deployment(
     input: ProposalInput,
     image_identity: String,
+    deployment: &config::ValidatedDeployment,
 ) -> anyhow::Result<AttendedAuthorizationArtifact> {
-    build_proposal_resolved(input, image_identity).await
+    build_proposal_resolved(input, image_identity, deployment).await
 }
 
 async fn build_proposal_resolved(
     input: ProposalInput,
     image_id: String,
+    deployment: &config::ValidatedDeployment,
 ) -> anyhow::Result<AttendedAuthorizationArtifact> {
     ensure!(
         !input.prompt.is_empty(),
@@ -489,8 +494,6 @@ async fn build_proposal_resolved(
     let prompt = prompt_with_result_contract(&input.prompt);
     let config_root = std::fs::canonicalize(&input.config_root)
         .with_context(|| format!("canonicalize config root {}", input.config_root.display()))?;
-    let deployment =
-        config::validate_authoritative_config_root(&config_root).map_err(anyhow::Error::msg)?;
     let bundle = deployment
         .environment_bundles
         .get(&input.environment)
@@ -501,7 +504,7 @@ async fn build_proposal_resolved(
         "environment selector does not match the resolved environment"
     );
     ensure!(
-        resolve_image_family(&deployment, &environment.image)? == input.image_family,
+        resolve_image_family(deployment, &environment.image)? == input.image_family,
         "image family selector does not match the resolved environment"
     );
     ensure!(
@@ -544,11 +547,12 @@ async fn build_proposal_resolved(
         );
     }
     let approved_roots = approved_roots(&deployment.local_agent)?;
-    let mut mounts = resolve_mounts(
+    let mut mounts = resolve_mounts_with_protected(
         &approved_roots,
         &input.workspaces,
         &input.context_roots,
         &input.primary_workspace,
+        &input.protected_paths,
     )?;
     let workspace_export = resolve_workspace_export_contract(
         input.workspace_export_root.as_deref(),
@@ -592,16 +596,52 @@ async fn build_proposal_resolved(
         "attended execution does not support runner host mounts or MCP bridges"
     );
     let overlay_descriptors = authorized_overlays(
-        &deployment,
+        deployment,
         &overlays,
         &mounts.repositories,
         &network_resources,
     )?;
-    validate_credential_descriptors(&deployment, &runner, &overlays)?;
-    let credential_providers = authorized_credential_providers(&deployment, &runner, &overlays)?;
+    validate_credential_descriptors(deployment, &runner, &overlays)?;
+    let credential_providers = authorized_credential_providers(deployment, &runner, &overlays)?;
+    let mut credential_paths = Vec::new();
+    for provider in &credential_providers {
+        for value in [Some(provider.source.as_str()), provider.command.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let path = Path::new(value);
+            if path.is_absolute() && path.exists() {
+                let canonical = std::fs::canonicalize(path)?;
+                reject_credential_path_aliases(
+                    &canonical,
+                    provider.command.as_deref() == Some(value),
+                )?;
+                credential_paths.push(canonical);
+            } else if provider.command.as_deref() == Some(value)
+                && let Ok(resolved) = which::which(value)
+            {
+                let canonical = resolved.canonicalize()?;
+                reject_credential_path_aliases(&canonical, true)?;
+                credential_paths.push(canonical);
+            }
+        }
+    }
+    crate::local::reject_protected_mounts(
+        mounts
+            .workspaces
+            .iter()
+            .map(|item| Path::new(&item.host_path))
+            .chain(
+                mounts
+                    .context_roots
+                    .iter()
+                    .map(|item| Path::new(&item.host_path)),
+            ),
+        credential_paths.iter().map(PathBuf::as_path),
+    )?;
     let prompt_digest =
         protocol::sha256_hex_with_domain(b"agent-hub:attended-prompt:v1\0", prompt.as_bytes());
-    let policy_environment = network_policy_environment(&deployment, &input.network_class)?;
+    let policy_environment = network_policy_environment(deployment, &input.network_class)?;
     let behavior = ResolvedAuthorizationBehavior {
         execution_kind: "agent".to_string(),
         runner_profile: serde_json::to_value(&runner)?,
@@ -618,6 +658,8 @@ async fn build_proposal_resolved(
         triage: false,
         allow_remote_credentials: !credential_providers.is_empty(),
     };
+    let effective_network_grants =
+        resolve_effective_network_grants(deployment, &network_resources, &behavior.env)?;
     let approval_bundle = attended_approval_bundle_identity(bundle, tool_approval)?;
     let approval_bundle_digest = approval_bundle
         .as_ref()
@@ -629,8 +671,8 @@ async fn build_proposal_resolved(
             }))
             .map_err(anyhow::Error::msg)?,
         );
-    AttendedAuthorizationRequestV3 {
-        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3.to_string(),
+    AttendedAuthorizationRequestV4 {
+        version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V4.to_string(),
         proposal: AttendedProposal {
             environment: input.environment,
             image_family: input.image_family,
@@ -646,8 +688,8 @@ async fn build_proposal_resolved(
         },
         execution: AttendedExecutionSpec {
             config_root: path_string(&config_root)?,
-            config_digest: attended_config_digest(&deployment)?,
-            config_provenance: attended_config_provenance(&deployment)?,
+            config_digest: attended_config_digest(deployment)?,
+            config_provenance: attended_config_provenance(deployment)?,
             environment_bundle_digest: bundle.digest.clone(),
             approved: ApprovedExecutionSpec {
                 runtime,
@@ -655,6 +697,7 @@ async fn build_proposal_resolved(
                 pids_limit: protocol::APPROVED_EXECUTION_PIDS_LIMIT,
             },
             credential_providers,
+            effective_network_grants,
             overlays: overlay_descriptors,
             workspaces: mounts.workspaces,
             context_roots: mounts.context_roots,
@@ -674,6 +717,21 @@ async fn build_proposal_resolved(
     }
     .canonical_artifact()
     .map_err(anyhow::Error::msg)
+}
+
+fn reject_credential_path_aliases(path: &Path, executable: bool) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_file() && metadata.nlink() > 1 {
+        let safe_system_executable =
+            executable && metadata.uid() == 0 && metadata.permissions().mode() & 0o022 == 0;
+        ensure!(
+            safe_system_executable,
+            "protected credential path '{}' has multiple filesystem aliases",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn prompt_with_result_contract(prompt: &str) -> String {
@@ -745,7 +803,7 @@ fn omit_workspace_export_paths(
 }
 
 fn verify_authorization_selectors(
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
     artifact: &AttendedAuthorizationArtifact,
     selectors: &AuthorizationSelectors<'_>,
 ) -> anyhow::Result<()> {
@@ -792,7 +850,7 @@ pub async fn run(
     relay_override: RelayEndpointOverride,
 ) -> anyhow::Result<RunRecord> {
     let (supplied, supplied_path) = read_authorization_file(artifact_path)?;
-    let request = supplied.verify_v3().map_err(anyhow::Error::msg)?;
+    let request = supplied.verify_v4().map_err(anyhow::Error::msg)?;
     let digest = supplied.digest.clone();
     verify_authorization_selectors(&request, &supplied, &selectors)?;
     let authorization_key = authorization_key.unwrap_or(&digest);
@@ -818,10 +876,9 @@ pub async fn run(
             "attended authorization was already consumed"
         );
     }
-    verify_execution_inputs(&request)?;
-    let deployment =
-        config::validate_authoritative_config_root(Path::new(&request.execution.config_root))
-            .map_err(anyhow::Error::msg)?;
+    // Keep and execute the exact deployment snapshot validated here. No later
+    // reload may select credential commands or egress grants.
+    let deployment = verify_execution_inputs(&request)?;
     // Automatic executions never use the approval relay. Do not execute a
     // configured host credential provider for an unused endpoint.
     let relay_endpoint = if request.proposal.tool_approval == ToolApprovalMode::Dippy {
@@ -911,16 +968,16 @@ pub async fn run(
         } else {
             if active_dir.exists() {
                 verify_run_owner_marker(&active_dir, &expected)?;
-                recover_owned_run_resources(
-                    &docker_path,
-                    &active_dir,
-                    &active_record.id,
-                    &active_record.container_name,
-                    &active_record.ownership,
-                    relay_endpoint.as_ref(),
-                    &expected,
-                    false,
-                )
+                recover_owned_run_resources(OwnedRunRecoveryContext {
+                    docker: &docker_path,
+                    run_dir: &active_dir,
+                    id: &active_record.id,
+                    container_name: &active_record.container_name,
+                    ownership: &active_record.ownership,
+                    relay_endpoint: relay_endpoint.as_ref(),
+                    owner_marker: &expected,
+                    primary_absence_proven: false,
+                })
                 .await
                 .context("reconcile interrupted attended attempt")?;
             }
@@ -1141,17 +1198,9 @@ pub async fn run(
     store.ensure_directory(Path::new("runs"))?;
 
     let deadline = Deadline::new(request.execution.runtime.environment.timeout_secs)?;
-    let configured_image = request
-        .execution
-        .runtime
-        .environment
-        .container_image
-        .as_deref()
-        .context("authorized runtime has no container image")?;
+    // The trusted host resolved the managed reference once before approval.
+    // Retries launch the captured immutable ID and never re-resolve a tag.
     let image_identity = request.proposal.image_id.clone();
-    let current_identity =
-        inspect_image_identity(&docker_path, configured_image, &deadline, &cancellation).await?;
-    verify_image_identity(&image_identity, &current_identity)?;
     let (runtime_uid, runtime_gid) = runtime_identity(&request)?;
     #[cfg(unix)]
     if request.proposal.tool_approval == ToolApprovalMode::Dippy {
@@ -1183,9 +1232,6 @@ pub async fn run(
             .then(|| uuid::Uuid::new_v4().simple().to_string());
         let prompt_path = run_dir.join("prompt.txt");
         write_private_durable(&prompt_path, request.proposal.prompt.as_bytes())?;
-        let deployment =
-            config::validate_authoritative_config_root(Path::new(&request.execution.config_root))
-                .map_err(anyhow::Error::msg)?;
         deployment.environment_bundles[&request.proposal.environment]
             .write_to(&bundle_dir)
             .map_err(anyhow::Error::msg)?;
@@ -1879,16 +1925,16 @@ pub async fn run(
     }
     let prelaunch_reconciliation =
         if record.launch_state == LaunchState::Preparing && run_dir.exists() {
-            recover_owned_run_resources(
-                &docker_path,
-                &run_dir,
-                &id,
-                &container_name,
-                &ownership,
-                relay_endpoint.as_ref(),
-                &owner_marker_for_record(&record),
-                primary_cleanup_proof == PrimaryCleanupProof::ProvenAbsent,
-            )
+            recover_owned_run_resources(OwnedRunRecoveryContext {
+                docker: &docker_path,
+                run_dir: &run_dir,
+                id: &id,
+                container_name: &container_name,
+                ownership: &ownership,
+                relay_endpoint: relay_endpoint.as_ref(),
+                owner_marker: &owner_marker_for_record(&record),
+                primary_absence_proven: primary_cleanup_proof == PrimaryCleanupProof::ProvenAbsent,
+            })
             .await
         } else {
             Ok(())
@@ -3281,16 +3327,16 @@ pub async fn cleanup(
     }
     let docker = which::which("docker")?;
     let owner_marker = owner_marker_for_record(&record);
-    let containment = recover_owned_run_resources(
-        &docker,
-        &run_dir,
+    let containment = recover_owned_run_resources(OwnedRunRecoveryContext {
+        docker: &docker,
+        run_dir: &run_dir,
         id,
-        &record.container_name,
-        &record.ownership,
-        Some(&relay_endpoint),
-        &owner_marker,
-        false,
-    )
+        container_name: &record.container_name,
+        ownership: &record.ownership,
+        relay_endpoint: Some(&relay_endpoint),
+        owner_marker: &owner_marker,
+        primary_absence_proven: false,
+    })
     .await;
     record.finished_at = Some(Utc::now());
     if let Err(error) = containment {
@@ -3486,16 +3532,28 @@ fn host_ledger_summary(path: &Path) -> anyhow::Result<HostLedgerSummary> {
     })
 }
 
-async fn recover_owned_run_resources(
-    docker: &Path,
-    run_dir: &Path,
-    id: &str,
-    container_name: &str,
-    ownership: &BTreeMap<String, String>,
-    relay_endpoint: Option<&RelayEndpoint>,
-    owner_marker: &RunOwnerMarker,
+struct OwnedRunRecoveryContext<'a> {
+    docker: &'a Path,
+    run_dir: &'a Path,
+    id: &'a str,
+    container_name: &'a str,
+    ownership: &'a BTreeMap<String, String>,
+    relay_endpoint: Option<&'a RelayEndpoint>,
+    owner_marker: &'a RunOwnerMarker,
     primary_absence_proven: bool,
-) -> anyhow::Result<()> {
+}
+
+async fn recover_owned_run_resources(context: OwnedRunRecoveryContext<'_>) -> anyhow::Result<()> {
+    let OwnedRunRecoveryContext {
+        docker,
+        run_dir,
+        id,
+        container_name,
+        ownership,
+        relay_endpoint,
+        owner_marker,
+        primary_absence_proven,
+    } = context;
     verify_run_owner_marker(run_dir, owner_marker)?;
     let mut failures = Vec::new();
     let effects = if run_dir.join("effects").exists() {
@@ -3516,17 +3574,16 @@ async fn recover_owned_run_resources(
     if let Some(effects) = &effects {
         docker_cli = docker_cli.with_effects(effects.clone());
     }
-    if !primary_absence_proven {
-        if let Err(error) = docker_cli
+    if !primary_absence_proven
+        && let Err(error) = docker_cli
             .remove_owned(
                 container_name,
                 &DockerOwnership::new(ownership.clone())?,
                 PRIMARY_CLEANUP_TIMEOUT,
             )
             .await
-        {
-            failures.push(format!("primary container: {error:#}"));
-        }
+    {
+        failures.push(format!("primary container: {error:#}"));
     }
     if run_dir.exists()
         && let Err(error) = agent_hub_executor::egress::recover_restricted_egress(
@@ -3620,7 +3677,9 @@ fn verify_recovery_relay_endpoint(
     Ok(state)
 }
 
-fn verify_execution_inputs(request: &AttendedAuthorizationRequestV3) -> anyhow::Result<()> {
+fn verify_execution_inputs(
+    request: &AttendedAuthorizationRequestV4,
+) -> anyhow::Result<config::ValidatedDeployment> {
     let config_root = Path::new(&request.execution.config_root);
     ensure!(
         std::fs::canonicalize(config_root)? == config_root,
@@ -3692,6 +3751,14 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV3) -> anyhow::
             && request.execution.runtime.environment.network_resources
                 == Some(network_request(&request.proposal.network_resources)),
         "authorized network selector, resources, or ceiling changed"
+    );
+    ensure!(
+        resolve_effective_network_grants(
+            &deployment,
+            &request.proposal.network_resources,
+            &request.execution.behavior.env,
+        )? == request.execution.effective_network_grants,
+        "effective network grants changed after authorization"
     );
     ensure!(
         tool_approval_within_ceiling(
@@ -3802,20 +3869,47 @@ fn verify_execution_inputs(request: &AttendedAuthorizationRequestV3) -> anyhow::
         )? == request.workspace_export,
         "workspace export root identity changed after authorization"
     );
-    Ok(())
+    Ok(deployment)
 }
 
 fn verify_mount_filesystem_identity(
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
 ) -> anyhow::Result<()> {
-    verify_execution_inputs(request)
-        .context("revalidate attended filesystem identity immediately before launch")
+    for root in request
+        .execution
+        .workspaces
+        .iter()
+        .map(|root| root.host_path.as_str())
+        .chain(
+            request
+                .execution
+                .context_roots
+                .iter()
+                .map(|root| root.host_path.as_str()),
+        )
+    {
+        ensure!(
+            std::fs::canonicalize(root)? == Path::new(root),
+            "attended mount filesystem identity changed before launch"
+        );
+    }
+    if let Some(export) = &request.workspace_export {
+        crate::git_view::verify_directory_identity(&export.workspace_identity)?;
+    }
+    for view in &request.git_views {
+        crate::git_view::verify_directory_identity(&view.git_dir)?;
+        crate::git_view::verify_directory_identity(&view.common_dir)?;
+        for store in &view.object_stores {
+            crate::git_view::verify_directory_identity(&store.identity)?;
+        }
+    }
+    Ok(())
 }
 
 fn provider_unavailable_retry_evidence(
     record: &RunRecord,
     run_dir: &Path,
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
 ) -> anyhow::Result<bool> {
     let stderr = read_optional_bounded(
         &run_dir.join("stderr.log"),
@@ -3906,7 +4000,7 @@ fn is_provider_service_unavailable(stdout: &[u8], retained_failure: &str) -> boo
 fn supervised_provider_retry_evidence(
     record: &RunRecord,
     run_dir: &Path,
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
 ) -> anyhow::Result<bool> {
     if !provider_retry_output_evidence(record, run_dir, request)? {
         return Ok(false);
@@ -3947,7 +4041,7 @@ fn supervision_ledger_has_only_plugin_ready(run_dir: &Path) -> anyhow::Result<bo
 fn automatic_provider_retry_evidence(
     record: &RunRecord,
     run_dir: &Path,
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
 ) -> anyhow::Result<bool> {
     if run_dir.join("supervision-transitions.jsonl").exists() {
         return Ok(false);
@@ -3958,7 +4052,7 @@ fn automatic_provider_retry_evidence(
 fn provider_retry_output_evidence(
     record: &RunRecord,
     run_dir: &Path,
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
 ) -> anyhow::Result<bool> {
     if record.process_outcome != ProcessOutcome::Failed
         || record.process_status != Some(RunStatus::Failed)
@@ -4073,7 +4167,7 @@ fn bundle_environment(
 
 async fn resolve_attended_credentials(
     deployment: &config::ValidatedDeployment,
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
     valid_through: Option<std::time::SystemTime>,
     credential_dir: &Path,
     cancellation: &agent_hub_executor::ExecutionCancellationContext,
@@ -4091,9 +4185,7 @@ async fn resolve_attended_credentials(
                 )
             })?;
             ensure!(
-                provider.name() == descriptor.name
-                    && provider.provider_type() == descriptor.provider_type
-                    && provider.targets() == descriptor.targets,
+                authorized_credential_provider(&provider)? == *descriptor,
                 "credential provider '{}' does not match its authorized descriptor",
                 descriptor.name
             );
@@ -4110,7 +4202,7 @@ async fn resolve_attended_credentials(
 }
 
 fn validate_credential_runtime_conflicts(
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
     runner: &config::ResolvedRunnerProfile,
 ) -> anyhow::Result<()> {
     let mut environment = request
@@ -4262,7 +4354,7 @@ fn project_config_mask_mounts(
 }
 
 fn verify_materialized_credential_identities(
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
     credentials: &agent_hub_executor::credential_provider::ResolvedCredentials,
 ) -> anyhow::Result<()> {
     for (name, identity) in &credentials.source_identities {
@@ -4505,17 +4597,26 @@ fn authorized_credential_provider(
             host_auth_path,
             safety_margin_secs,
             ..
-        } => (
-            host_auth_path.clone(),
-            None,
-            Vec::new(),
-            Some("must exceed authorized deadline".to_string()),
-            "read_only".to_string(),
-            BTreeMap::from([(
-                "safety_margin_secs".to_string(),
-                safety_margin_secs.to_string(),
-            )]),
-        ),
+        } => {
+            let identity = agent_hub_executor::credential_provider::private_file_identity(
+                host_auth_path,
+                "OpenCode OAuth credential",
+            )?;
+            (
+                identity.canonical_path,
+                None,
+                Vec::new(),
+                Some("must exceed authorized deadline".to_string()),
+                "read_only".to_string(),
+                BTreeMap::from([
+                    (
+                        "safety_margin_secs".to_string(),
+                        safety_margin_secs.to_string(),
+                    ),
+                    ("source_sha256".to_string(), identity.sha256),
+                ]),
+            )
+        }
         CredentialProvider::GithubToken {
             host,
             api_base_url,
@@ -5185,7 +5286,7 @@ struct AttendedEgressPreparation<'a> {
 
 async fn prepare_execution_egress(
     deployment: &config::ValidatedDeployment,
-    request: &AttendedAuthorizationRequestV3,
+    request: &AttendedAuthorizationRequestV4,
     docker: &Path,
     deadline: &Deadline,
     preparation: AttendedEgressPreparation<'_>,
@@ -5194,13 +5295,6 @@ async fn prepare_execution_egress(
     if request.proposal.network_resources.is_empty() {
         return Ok(None);
     }
-    let system = config::SystemConfig::from_toml(&deployment.system_toml, "captured system.toml")
-        .map_err(anyhow::Error::msg)?;
-    let policies = deployment
-        .network_policies
-        .iter()
-        .map(|(name, policy)| (name.clone(), policy.policy.clone()))
-        .collect::<HashMap<_, _>>();
     let egress: AttendedEgressConfig = serde_json::from_value(
         deployment
             .local_agent
@@ -5210,63 +5304,10 @@ async fn prepare_execution_egress(
     )
     .context("parse attended egress configuration")?;
     let mut restricted_policies = Vec::new();
-    for resource in &request.proposal.network_resources {
-        let name = policy_name(resource);
-        let policy =
-            config::flatten_policy(name, &policies, &system).map_err(anyhow::Error::msg)?;
-        ensure!(
-            !policy.unrestricted,
-            "typed attended resource '{resource}' resolved to unrestricted egress"
-        );
-        ensure!(
-            policy.docker_network.is_none(),
-            "typed attended resources must use executor-managed Docker networks"
-        );
-        restricted_policies.push(if *resource == NetworkResourceKind::GuardedWeb {
-            ensure!(
-                policy.hosts.is_empty(),
-                "guarded-web policy must not declare hosts"
-            );
-            RestrictedPolicy::GuardedWeb
-        } else if *resource == NetworkResourceKind::Llm {
-            let provider = request
-                .execution
-                .behavior
-                .env
-                .get("AGENT_LLM_PROVIDER")
-                .or_else(|| request.execution.behavior.env.get("LLM_PROVIDER"))
-                .map(String::as_str)
-                .unwrap_or(&egress.llm.default_provider)
-                .trim()
-                .to_ascii_lowercase();
-            ensure!(!provider.is_empty(), "attended LLM provider is empty");
-            let hosts = egress
-                .llm
-                .providers
-                .get(&provider)
-                .with_context(|| format!("unknown attended LLM provider '{provider}'"))?;
-            let hosts = config::canonical_policy_hosts(hosts).map_err(anyhow::Error::msg)?;
-            let system_hosts = system
-                .llm_providers
-                .iter()
-                .find(|configured| configured.name.eq_ignore_ascii_case(&provider))
-                .with_context(|| format!("system LLM provider '{provider}' is unavailable"))?;
-            ensure!(
-                config::canonical_policy_hosts(&system_hosts.hosts).map_err(anyhow::Error::msg)?
-                    == hosts,
-                "system and attended LLM provider hosts differ"
-            );
-            ensure!(
-                hosts.iter().all(|host| policy.hosts.contains(host)),
-                "llm-only policy does not include the exact selected provider hosts"
-            );
-            RestrictedPolicy::Hosts(hosts)
-        } else {
-            ensure!(
-                !policy.hosts.is_empty(),
-                "typed attended resource '{resource}' resolved to an empty host set"
-            );
-            RestrictedPolicy::Hosts(policy.hosts)
+    for grant in &request.execution.effective_network_grants {
+        restricted_policies.push(match grant.mode {
+            AttendedNetworkGrantModeV1::GuardedWeb => RestrictedPolicy::GuardedWeb,
+            AttendedNetworkGrantModeV1::Hosts => RestrictedPolicy::Hosts(grant.hosts.clone()),
         });
     }
     ensure!(
@@ -5301,6 +5342,101 @@ async fn prepare_execution_egress(
     .map(Some)
 }
 
+fn resolve_effective_network_grants(
+    deployment: &config::ValidatedDeployment,
+    resources: &[NetworkResourceKind],
+    behavior_environment: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<AttendedNetworkGrantV1>> {
+    if resources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let system = config::SystemConfig::from_toml(&deployment.system_toml, "captured system.toml")
+        .map_err(anyhow::Error::msg)?;
+    let policies = deployment
+        .network_policies
+        .iter()
+        .map(|(name, policy)| (name.clone(), policy.policy.clone()))
+        .collect::<HashMap<_, _>>();
+    let egress: AttendedEgressConfig = serde_json::from_value(
+        deployment
+            .local_agent
+            .get("egress")
+            .cloned()
+            .context("local-agent egress configuration is unavailable")?,
+    )
+    .context("parse attended egress configuration")?;
+    let mut grants = Vec::with_capacity(resources.len());
+    for resource in resources {
+        let policy = config::flatten_policy(policy_name(resource), &policies, &system)
+            .map_err(anyhow::Error::msg)?;
+        ensure!(
+            !policy.unrestricted,
+            "typed attended resource '{resource}' resolved to unrestricted egress"
+        );
+        ensure!(
+            policy.docker_network.is_none(),
+            "typed attended resources must use executor-managed Docker networks"
+        );
+        let (mode, hosts, provider) = if *resource == NetworkResourceKind::GuardedWeb {
+            ensure!(
+                policy.hosts.is_empty(),
+                "guarded-web policy must not declare hosts"
+            );
+            (AttendedNetworkGrantModeV1::GuardedWeb, Vec::new(), None)
+        } else if *resource == NetworkResourceKind::Llm {
+            let provider = behavior_environment
+                .get("AGENT_LLM_PROVIDER")
+                .or_else(|| behavior_environment.get("LLM_PROVIDER"))
+                .map(String::as_str)
+                .unwrap_or(&egress.llm.default_provider)
+                .trim()
+                .to_ascii_lowercase();
+            ensure!(!provider.is_empty(), "attended LLM provider is empty");
+            let hosts = config::canonical_policy_hosts(
+                egress
+                    .llm
+                    .providers
+                    .get(&provider)
+                    .with_context(|| format!("unknown attended LLM provider '{provider}'"))?,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let system_hosts = system
+                .llm_providers
+                .iter()
+                .find(|configured| configured.name.eq_ignore_ascii_case(&provider))
+                .with_context(|| format!("system LLM provider '{provider}' is unavailable"))?;
+            ensure!(
+                config::canonical_policy_hosts(&system_hosts.hosts).map_err(anyhow::Error::msg)?
+                    == hosts,
+                "system and attended LLM provider hosts differ"
+            );
+            ensure!(
+                hosts.iter().all(|host| policy.hosts.contains(host)),
+                "llm-only policy does not include the exact selected provider hosts"
+            );
+            (AttendedNetworkGrantModeV1::Hosts, hosts, Some(provider))
+        } else {
+            ensure!(
+                !policy.hosts.is_empty(),
+                "typed attended resource '{resource}' resolved to an empty host set"
+            );
+            (
+                AttendedNetworkGrantModeV1::Hosts,
+                config::canonical_policy_hosts(&policy.hosts).map_err(anyhow::Error::msg)?,
+                None,
+            )
+        };
+        grants.push(AttendedNetworkGrantV1 {
+            resource: *resource,
+            mode,
+            hosts,
+            provider,
+        });
+    }
+    grants.sort_by_key(|grant| grant.resource.to_string());
+    Ok(grants)
+}
+
 fn policy_name(resource: &NetworkResourceKind) -> &'static str {
     match resource {
         NetworkResourceKind::Llm => "llm-only",
@@ -5317,21 +5453,19 @@ fn resolve_image_family(
     deployment: &config::ValidatedDeployment,
     image: &str,
 ) -> anyhow::Result<String> {
-    let family = image_family(image)
-        .rsplit('/')
-        .next()
-        .context("configured image has no family")?
-        .to_string();
-    let manifest = deployment
-        .images
-        .get(&family)
-        .with_context(|| format!("image family '{family}' is not installed"))?;
-    ensure!(
-        manifest.image.get("name").and_then(|value| value.as_str()) == Some(family.as_str())
-            && manifest.image.get("tag").and_then(|value| value.as_str()) == Some(image),
-        "installed image manifest does not resolve family '{family}' to '{image}'"
-    );
-    Ok(family)
+    config::resolve_installed_image_reference(
+        image,
+        None,
+        deployment.images.iter().map(|(family, manifest)| {
+            (
+                family.as_str(),
+                manifest.image.get("name").and_then(|value| value.as_str()),
+                manifest.image.get("tag").and_then(|value| value.as_str()),
+            )
+        }),
+    )
+    .map(|resolved| resolved.family)
+    .map_err(anyhow::Error::msg)
 }
 
 fn attended_approval_bundle_identity(
@@ -6155,7 +6289,7 @@ fn sync_private_tree(root: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn runtime_identity(request: &AttendedAuthorizationRequestV3) -> anyhow::Result<(u32, u32)> {
+fn runtime_identity(request: &AttendedAuthorizationRequestV4) -> anyhow::Result<(u32, u32)> {
     use std::os::unix::fs::MetadataExt;
 
     let path = request
@@ -6270,7 +6404,7 @@ fn verify_host_only_approval_environment(
 }
 
 #[cfg(not(unix))]
-fn runtime_identity(_request: &AttendedAuthorizationRequestV3) -> anyhow::Result<(u32, u32)> {
+fn runtime_identity(_request: &AttendedAuthorizationRequestV4) -> anyhow::Result<(u32, u32)> {
     anyhow::bail!("attended job-code preflight requires Unix ownership metadata")
 }
 
@@ -6544,7 +6678,7 @@ mod tests {
             primary_workspace: "primary".into(),
         })
         .await?;
-        let request = artifact.verify_v3().map_err(anyhow::Error::msg)?;
+        let request = artifact.verify_v4().map_err(anyhow::Error::msg)?;
         anyhow::ensure!(request.proposal.network_resources == [NetworkResourceKind::Github]);
         anyhow::ensure!(request.proposal.overlays == [overlay.clone()]);
         anyhow::ensure!(request.git_views.len() == 2);
@@ -8114,16 +8248,16 @@ grep -qx 'ready\|ready\.' real-llm.log
         };
         super::create_owned_run_directory(&run_dir, &marker).unwrap();
         let ownership = BTreeMap::from([("owner".into(), "test".into())]);
-        super::recover_owned_run_resources(
-            &docker,
-            &run_dir,
-            "run-id",
-            "container",
-            &ownership,
-            None,
-            &marker,
-            false,
-        )
+        super::recover_owned_run_resources(super::OwnedRunRecoveryContext {
+            docker: &docker,
+            run_dir: &run_dir,
+            id: "run-id",
+            container_name: "container",
+            ownership: &ownership,
+            relay_endpoint: None,
+            owner_marker: &marker,
+            primary_absence_proven: false,
+        })
         .await
         .unwrap();
         assert!(
@@ -8132,16 +8266,16 @@ grep -qx 'ready\|ready\.' real-llm.log
                 .contains("primary-inspect")
         );
         std::fs::write(&events, "between\n").unwrap();
-        super::recover_owned_run_resources(
-            &docker,
-            &run_dir,
-            "run-id",
-            "container",
-            &ownership,
-            None,
-            &marker,
-            true,
-        )
+        super::recover_owned_run_resources(super::OwnedRunRecoveryContext {
+            docker: &docker,
+            run_dir: &run_dir,
+            id: "run-id",
+            container_name: "container",
+            ownership: &ownership,
+            relay_endpoint: None,
+            owner_marker: &marker,
+            primary_absence_proven: true,
+        })
         .await
         .unwrap();
         assert_eq!(std::fs::read_to_string(&events).unwrap(), "between\n");
@@ -8484,7 +8618,7 @@ grep -qx 'ready\|ready\.' real-llm.log
                     .unwrap();
             }
             let artifact = protocol::AttendedAuthorizationArtifact {
-                version: protocol::ATTENDED_AUTHORIZATION_VERSION_V3,
+                version: protocol::ATTENDED_AUTHORIZATION_VERSION_V4,
                 digest: record.authorization_digest.clone(),
                 canonical_bytes: vec![],
             };

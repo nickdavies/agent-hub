@@ -702,9 +702,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("network_policies/none")).unwrap();
         std::fs::create_dir_all(root.join("environments/test")).unwrap();
+        std::fs::create_dir_all(root.join("images/job-code")).unwrap();
         std::fs::write(
             root.join("system.toml"),
-            "[system]\noperator='test'\nbot_identity='test'\n[system.environments]\ninstalled=['test']\ntriage_environment='test'\n[system.network_policies]\ninstalled=['none']\n",
+            "[system]\noperator='test'\nbot_identity='test'\n[system.environments]\ninstalled=['test']\ntriage_environment='test'\n[system.network_policies]\ninstalled=['none']\n[system.images]\ninstalled=['job-code']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("images/job-code/image.toml"),
+            "[image]\nname='job-code'\ntag='agent-hub/job-code:2026-09-09'\ndescription='test image'\n",
         )
         .unwrap();
         std::fs::write(

@@ -144,6 +144,12 @@ optional non-authoritative workspace export contract. The V1 and V2 request
 shapes, artifact versions, canonical bytes, and domain parsers remain
 unchanged.
 
+New host-owned launches use the private `attended_authorization_request_v4`
+contract and `agent-hub:attended-authorization:v4\0` domain. V4 requires the
+captured effective network grants used by restricted egress and by permission
+scope V2. Frozen V1-V3 artifacts remain readable, but they cannot authorize a
+new scope-V2 launch because they do not bind those grants.
+
 ## Operator result guide
 
 `agent-hub local status --run-id UUID` prints the persisted execution record.

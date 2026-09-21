@@ -33,6 +33,7 @@ fn executable_local_help_has_the_complete_command_contract() {
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
     for command in [
+        "capabilities",
         "catalog",
         "run",
         "inspect",
@@ -78,6 +79,7 @@ fn executable_local_help_has_the_complete_command_contract() {
         .lines()
         .filter(|line| {
             line.trim_start().starts_with("run ")
+                || line.trim_start().starts_with("capabilities ")
                 || line.trim_start().starts_with("catalog ")
                 || line.trim_start().starts_with("inspect ")
                 || line.trim_start().starts_with("preview ")
@@ -96,7 +98,7 @@ fn executable_local_help_has_the_complete_command_contract() {
         .join("\n");
     assert_eq!(
         command_snapshot,
-        "catalog         Print the bounded public capability catalog without preparing a run\nrun             Host-owned one-step prepare, approve, and execute path (structured JSON on stdin)\ninspect         Debug canonical preparation without requesting permission or executing\npreview         Preview trusted projection and matched rule without side effects\nlist            List local attended executions\nstatus          Show one execution record\nlogs            Print an execution log\nresult          Print an execution result\nartifacts       Print the bounded artifact manifest\nrepositories    Print the bounded repository result document\ncleanup-result  Print the bounded cleanup result document\ncancel          Cancel an owned running execution\ncleanup         Explicitly remove owned execution resources and artifacts"
+        "capabilities    Verify the pinned gateway and approval service support agent_hub_run_v1\ncatalog         Print the bounded public capability catalog without preparing a run\nrun             Host-owned one-step prepare, approve, and execute path (structured JSON on stdin)\ninspect         Debug canonical preparation without requesting permission or executing\npreview         Preview trusted projection and matched rule without side effects\nlist            List local attended executions\nstatus          Show one execution record\nlogs            Print an execution log\nresult          Print an execution result\nartifacts       Print the bounded artifact manifest\nrepositories    Print the bounded repository result document\ncleanup-result  Print the bounded cleanup result document\ncancel          Cancel an owned running execution\ncleanup         Explicitly remove owned execution resources and artifacts"
     );
 }
 
@@ -115,6 +117,23 @@ fn catalog_help_exposes_only_optional_trusted_host_input() {
     }
 
     let relative = agent_hub(&["local", "catalog", "--host-config", "relative"]);
+    assert!(!relative.status.success());
+    assert!(String::from_utf8_lossy(&relative.stderr).contains("absolute path"));
+}
+
+#[test]
+fn capabilities_help_exposes_only_trusted_peer_configuration() {
+    let help = agent_hub(&["local", "capabilities", "--help"]);
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout).unwrap();
+    for expected in ["--host-config", "--approvals-server", "--approvals-token"] {
+        assert!(stdout.contains(expected), "missing {expected}");
+    }
+    for forbidden in ["--gateway", "--insecure", "--follow-redirects", "--write"] {
+        assert!(!stdout.contains(forbidden), "unexpected input {forbidden}");
+    }
+
+    let relative = agent_hub(&["local", "capabilities", "--host-config", "relative"]);
     assert!(!relative.status.success());
     assert!(String::from_utf8_lossy(&relative.stderr).contains("absolute path"));
 }

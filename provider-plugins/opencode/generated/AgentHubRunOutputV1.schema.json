@@ -103,7 +103,9 @@
           "minLength": 64
         },
         "checksum": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64
         },
         "decided_at": {
           "type": "string",

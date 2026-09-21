@@ -1,6 +1,78 @@
 use crate::local::{
-    ApprovedRoots, RequestedContextRoot, RequestedWorkspace, WorkspaceAccess, resolve_mounts,
+    ApprovedRoots, RequestedContextRoot, RequestedWorkspace, WorkspaceAccess,
+    canonicalize_existing_ancestor, reject_protected_mounts, resolve_mounts,
 };
+use std::path::Path;
+
+#[cfg(unix)]
+#[test]
+fn missing_protected_path_resolves_symlinked_existing_ancestor() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/test-tmp")
+        .join(format!("protected-missing-{}", uuid::Uuid::new_v4()));
+    let real = root.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, root.join("alias")).unwrap();
+    let resolved = canonicalize_existing_ancestor(&root.join("alias/missing/state")).unwrap();
+    assert_eq!(resolved, real.canonicalize().unwrap().join("missing/state"));
+    assert!(canonicalize_existing_ancestor(&root.join("alias/../escape")).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn protected_control_plane_rejects_equal_parent_descendant_and_symlink_mounts() {
+    let root = std::env::temp_dir().join(format!(
+        "agent-hub-protected-paths-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let trusted = root.join("deployment/config");
+    let child = trusted.join("credentials");
+    let state = root.join("state");
+    let bin = root.join("deployment/bin");
+    let ordinary = root.join("worktrees/task");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&ordinary).unwrap();
+    let executable = bin.join("agent-hub");
+    let credential = child.join("token");
+    std::fs::write(&executable, "binary").unwrap();
+    std::fs::write(&credential, "secret").unwrap();
+    let root_path = root.canonicalize().unwrap();
+    let trusted = trusted.canonicalize().unwrap();
+    let child = child.canonicalize().unwrap();
+    let state = state.canonicalize().unwrap();
+    let bin = bin.canonicalize().unwrap();
+    let executable = executable.canonicalize().unwrap();
+    let credential = credential.canonicalize().unwrap();
+    let ordinary = ordinary.canonicalize().unwrap();
+
+    for mount in [&root_path, &trusted, &child] {
+        assert!(reject_protected_mounts([mount.as_path()], [trusted.as_path()]).is_err());
+    }
+    let protected = [
+        trusted.as_path(),
+        state.as_path(),
+        executable.as_path(),
+        credential.as_path(),
+    ];
+    for mount in [&state, &bin, &child] {
+        assert!(reject_protected_mounts([mount.as_path()], protected).is_err());
+    }
+    assert!(reject_protected_mounts([ordinary.as_path()], protected).is_ok());
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&ordinary, root.join("workspace-link")).unwrap();
+        assert!(
+            reject_protected_mounts([root.join("workspace-link").as_path()], [trusted.as_path()])
+                .is_err()
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 fn initialize_repository(path: &std::path::Path) {
     std::fs::create_dir_all(path).unwrap();

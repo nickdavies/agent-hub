@@ -1,13 +1,15 @@
 #[cfg(unix)]
 #[test]
-fn catalog_process_uses_only_pinned_config_and_never_invokes_runtime_helpers() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    use std::path::Path;
+fn catalog_process_uses_only_published_config_and_never_invokes_runtime_helpers() {
+    use std::os::unix::fs::PermissionsExt as _;
 
-    let root = std::env::temp_dir().join(format!(
-        "agent-hub-catalog-read-only-{}",
-        uuid::Uuid::new_v4()
-    ));
+    const REFERENCE: &str = "agent-hub/job-code-qualification:4d596913-2cc2-4068-a842-3db326aa6f1c";
+    const REVISION: &str = "test-revision-1";
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/test-scratch/2026-09-18")
+        .join(format!("catalog-read-only-{}", uuid::Uuid::new_v4()));
     let config_root = root.join("config");
     let environment_names = [
         "code-auto",
@@ -31,19 +33,32 @@ fn catalog_process_uses_only_pinned_config_and_never_invokes_runtime_helpers() {
         ),
     )
     .unwrap();
-    let environments = environment_names.map(|name| {
+    for name in environment_names {
         let path = config_root.join(format!("environments/{name}/environment.toml"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            format!("[environment]\nname='{name}'\ndescription='Purpose-specific {name} work'\nimage='agent-hub/job-code:2026-09-09'\nnetwork_policy='none'\napproval_mode='auto'\n[environment.discovery]\nrecommended_for=['Use {name} for its configured workflow']\nselection_notes=['Choose only when the task matches this environment']\n"),
+            format!("[environment]\nname='{name}'\ndescription='Purpose-specific {name} work'\nimage='{REFERENCE}'\nnetwork_policy='none'\napproval_mode='auto'\n[environment.discovery]\nrecommended_for=['Use {name} for its configured workflow']\nselection_notes=['Choose only when the task matches this environment']\n"),
         )
         .unwrap();
-        path
-    });
+    }
+    let identity = format!("sha256:{}", "a".repeat(64));
+    let facts = serde_json::to_vec(&serde_json::json!({
+        "schema": "agent_hub_image_tool_facts_v1",
+        "image_reference": REFERENCE,
+        "backend_metadata_revision": REVISION,
+        "image_identity": identity,
+        "tools": [{"name": "cargo", "version": "1.89.0"}],
+    }))
+    .unwrap();
+    let facts_path = config_root.join("images/job-code/tool-facts.json");
+    std::fs::write(&facts_path, &facts).unwrap();
     std::fs::write(
         &image,
-        "[image]\nname='job-code'\ntag='agent-hub/job-code:2026-09-09'\ndescription='Pinned tools'\n",
+        format!(
+            "[image]\nname='job-code'\ntag='{REFERENCE}'\ndescription='Pinned tools'\n[image.tool_facts]\npath='images/job-code/tool-facts.json'\nsha256='{}'\nimage_reference='{REFERENCE}'\nbackend_metadata_revision='{REVISION}'\nimage_identity='{identity}'\n",
+            protocol::sha256_hex(&facts)
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -55,43 +70,15 @@ fn catalog_process_uses_only_pinned_config_and_never_invokes_runtime_helpers() {
     permissions.set_mode(0o700);
     std::fs::set_permissions(&helper, permissions).unwrap();
 
-    let pin = |path: &Path, relative: &str| {
-        let bytes = std::fs::read(path).unwrap();
-        let metadata = std::fs::metadata(path).unwrap();
-        let digest = protocol::sha256_hex(&bytes);
-        serde_json::json!({
-            "path": path,
-            "sha256": digest,
-            "source_identity": format!("config:{relative}:sha256:{digest}"),
-            "device": metadata.dev(),
-            "inode": metadata.ino(),
-        })
-    };
-    let config_pins = environments
-        .iter()
-        .zip(environment_names)
-        .map(|(path, name)| pin(path, &format!("environments/{name}/environment.toml")))
-        .chain([
-            pin(&image, "images/job-code/image.toml"),
-            pin(&system, "system.toml"),
-        ])
-        .collect::<Vec<_>>();
-    let config_metadata = std::fs::metadata(&config_root).unwrap();
     std::fs::write(
         &host_config,
         serde_json::to_vec(&serde_json::json!({
-            "schema": "agent_hub_run_host_v1",
+            "schema": "agent_hub_run_host_v2",
             "config_root": config_root,
-            "config_root_identity": {
-                "canonical_path": config_root,
-                "device": config_metadata.dev(),
-                "inode": config_metadata.ino(),
-            },
-            "config_artifacts": config_pins,
-            "self_binary": {"path": helper, "sha256": "0".repeat(64), "source_identity": "unused", "device": 0, "inode": 0},
-            "gateway": {"path": helper, "sha256": "0".repeat(64), "source_identity": "unused", "device": 0, "inode": 0},
-            "policy": {"path": helper, "sha256": "0".repeat(64), "source_identity": "unused", "device": 0, "inode": 0},
-            "image_digests": environment_names.into_iter().map(|name| (name, format!("sha256:{}", "a".repeat(64)))).collect::<std::collections::BTreeMap<_, _>>(),
+            "gateway": {"path": helper},
+            "policy": {"path": helper},
+            "managed_images": {"job-code": REFERENCE},
+            "backend_metadata_revision": REVISION,
         }))
         .unwrap(),
     )
@@ -121,6 +108,12 @@ fn catalog_process_uses_only_pinned_config_and_never_invokes_runtime_helpers() {
     catalog.validate().unwrap();
     assert_eq!(catalog.environments.len(), 5);
     assert_eq!(catalog.environments[0].name, "code-auto");
+    assert_eq!(catalog.environments[0].image_family.as_str(), "job-code");
+    assert!(matches!(
+        &catalog.images[0].tool_facts,
+        protocol::AgentHubCatalogToolFactsV1::Available { tools }
+            if tools.len() == 1 && tools[0].name == "cargo"
+    ));
     println!(
         "agent-hub-catalog-process-measurement command='target/debug/agent-hub local catalog --host-config <synthetic>' profile=debug iterations=2 cold_ms={:.3} repeat_ms={:.3} payload_bytes={} environments=5",
         elapsed[0].as_secs_f64() * 1000.0,

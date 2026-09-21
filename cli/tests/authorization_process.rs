@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const IMAGE_TAG: &str = "agent-hub/job-code:2026-09-09";
+const QUALIFICATION_IMAGE_TAG: &str =
+    "agent-hub/job-code-qualification:4d596913-2cc2-4068-a842-3db326aa6f1c";
 
 #[test]
 fn host_preview_requires_a_valid_host_home() {
@@ -83,8 +85,17 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     initialize_repository(&workspace);
     std::fs::create_dir(&fake_bin).unwrap();
     write_config(&config, &workspace);
+    for path in [
+        config.join("environments/test/environment.toml"),
+        config.join("images/job-code/image.toml"),
+    ] {
+        let body = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(IMAGE_TAG, QUALIFICATION_IMAGE_TAG);
+        std::fs::write(path, body).unwrap();
+    }
     write_fake_docker(&fake_bin.join("docker"), &docker_marker, &workspace, &root);
-    write_fake_run_gateway(&gateway_script, &decision, &state, &docker_marker);
+    write_fake_run_gateway(&gateway_script, &decision, &state);
     let host_dir = root.join("home/.config/agent-hub");
     std::fs::create_dir_all(&host_dir).unwrap();
     let gateway_config = host_dir.join("permissions.json");
@@ -92,51 +103,22 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     let plugin_install = host_dir.join("opencode-plugin.js");
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_agent-hub"));
     let config_root = std::fs::canonicalize(&config).unwrap();
-    let config_metadata = std::fs::metadata(&config_root).unwrap();
-    use std::os::unix::fs::MetadataExt as _;
-    let pin = |path: &Path, source: &str| {
-        let metadata = std::fs::metadata(path).unwrap();
-        let sha256 = protocol::sha256_hex(&std::fs::read(path).unwrap());
-        serde_json::json!({
-            "path":std::fs::canonicalize(path).unwrap(),
-            "sha256":sha256,
-            "source_identity":format!("{source}:sha256:{sha256}"),
-            "device":metadata.dev(),
-            "inode":metadata.ino(),
-        })
-    };
-    let config_artifacts = [
-        "system.toml",
-        "local-agent.json",
-        "network_policies/none/policy.toml",
-        "environments/test/environment.toml",
-        "environments/test/agent-hub-permissions.json",
-        "environments/test/dippy.conf",
-        "environments/test/opencode.json",
-        "images/job-code/image.toml",
-    ]
-    .into_iter()
-    .map(|relative| pin(&config.join(relative), &format!("config:{relative}")))
-    .collect::<Vec<_>>();
     std::fs::write(
         host_dir.join("host-run.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schema":"agent_hub_run_host_v1",
+            "schema":"agent_hub_run_host_v2",
             "config_root":config_root,
-            "config_root_identity":{
-                "canonical_path":config_root,
-                "device":config_metadata.dev(),
-                "inode":config_metadata.ino()
-            },
-            "config_artifacts":config_artifacts,
-            "self_binary":pin(&executable, "runtime:agent-hub"),
-            "gateway":pin(&gateway_script, "runtime:agent-hub-gateway"),
-            "policy":pin(&gateway_config, "policy:agent-hub-run"),
-            "image_digests":{"test":format!("sha256:{}", "a".repeat(64))}
+            "gateway":{"path":std::fs::canonicalize(&gateway_script).unwrap()},
+            "policy":{"path":std::fs::canonicalize(&gateway_config).unwrap()},
+            "managed_images":{"job-code":QUALIFICATION_IMAGE_TAG},
+            "backend_metadata_revision":"integration-test-1"
         }))
         .unwrap(),
     )
     .unwrap();
+    let host_config_path = host_dir.join("host-run.json");
+    let baseline_host_config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&host_config_path).unwrap()).unwrap();
     let launch = serde_json::json!({
         "schema":"agent_hub_run_intent_v1",
         "environment":"test",
@@ -182,138 +164,6 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     );
     assert!(!state.exists());
 
-    let host_config_path = host_dir.join("host-run.json");
-    let baseline_host_config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&host_config_path).unwrap()).unwrap();
-    for (invocation, mutate) in [
-        ("018f0f21-76c0-7b37-a446-31f82a5e7610", "missing"),
-        ("018f0f21-76c0-7b37-a446-31f82a5e7611", "extra"),
-        ("018f0f21-76c0-7b37-a446-31f82a5e7612", "source"),
-        ("018f0f21-76c0-7b37-a446-31f82a5e7614", "same-role-missing"),
-        ("018f0f21-76c0-7b37-a446-31f82a5e7615", "path"),
-        ("018f0f21-76c0-7b37-a446-31f82a5e7616", "alias"),
-        ("018f0f21-76c0-7b37-a446-31f82a5e7617", "duplicate-relative"),
-        (
-            "018f0f21-76c0-7b37-a446-31f82a5e7618",
-            "second-same-role-missing",
-        ),
-        ("018f0f21-76c0-7b37-a446-31f82a5e7620", "digest"),
-        ("018f0f21-76c0-7b37-a446-31f82a5e7621", "stale-plugin-field"),
-    ] {
-        let mut changed = baseline_host_config.clone();
-        match mutate {
-            "missing" => {
-                changed["config_artifacts"].as_array_mut().unwrap().pop();
-            }
-            "extra" => {
-                let pin = &mut changed["config_artifacts"].as_array_mut().unwrap()[3];
-                let digest = pin["sha256"].as_str().unwrap();
-                pin["source_identity"] = format!("config:unexpected:sha256:{digest}").into();
-            }
-            "source" => {
-                changed["gateway"]["source_identity"] = "unbound-source".into();
-            }
-            "same-role-missing" => {
-                changed["config_artifacts"]
-                    .as_array_mut()
-                    .unwrap()
-                    .remove(4);
-            }
-            "path" => {
-                let pins = changed["config_artifacts"].as_array_mut().unwrap();
-                pins[3]["path"] = pins[4]["path"].clone();
-            }
-            "alias" => {
-                let pin = &mut changed["config_artifacts"].as_array_mut().unwrap()[3];
-                let path = pin["path"].as_str().unwrap();
-                pin["path"] = path.replace("/environments/", "/environments/./").into();
-            }
-            "duplicate-relative" => {
-                let pins = changed["config_artifacts"].as_array_mut().unwrap();
-                let digest = pins[4]["sha256"].as_str().unwrap();
-                pins[4]["source_identity"] =
-                    format!("config:environments/test/environment.toml:sha256:{digest}").into();
-            }
-            "second-same-role-missing" => {
-                changed["config_artifacts"]
-                    .as_array_mut()
-                    .unwrap()
-                    .remove(5);
-            }
-            "digest" => {
-                let pin = &mut changed["config_artifacts"].as_array_mut().unwrap()[3];
-                let digest = "0".repeat(64);
-                pin["sha256"] = digest.clone().into();
-                pin["source_identity"] =
-                    format!("config:environments/test/environment.toml:sha256:{digest}").into();
-            }
-            "stale-plugin-field" => {
-                changed["opencode_plugin_install"] = serde_json::json!({});
-            }
-            _ => unreachable!(),
-        }
-        std::fs::write(&host_config_path, serde_json::to_vec(&changed).unwrap()).unwrap();
-        let rejected = invoke(
-            &root,
-            &fake_bin,
-            &state,
-            &[
-                "local",
-                "run",
-                "--request-stdin",
-                "--internal-invocation-id",
-                invocation,
-            ],
-            Some(&launch.to_string()),
-        );
-        assert!(!rejected.status.success());
-        let output: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
-        assert_eq!(output["approval_receipt"]["status"], "unavailable");
-        if mutate == "stale-plugin-field" {
-            assert!(
-                output["error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("unknown field `opencode_plugin_install`")
-            );
-        }
-        assert!(
-            !state
-                .join(format!("authorizations/records/{invocation}.json"))
-                .exists()
-        );
-    }
-    std::fs::write(
-        &host_config_path,
-        serde_json::to_vec(&baseline_host_config).unwrap(),
-    )
-    .unwrap();
-
-    let unexpected_config = config.join("environments/test/unexpected.conf");
-    std::fs::write(&unexpected_config, "unexpected\n").unwrap();
-    let rejected = invoke(
-        &root,
-        &fake_bin,
-        &state,
-        &[
-            "local",
-            "run",
-            "--request-stdin",
-            "--internal-invocation-id",
-            "018f0f21-76c0-7b37-a446-31f82a5e7619",
-        ],
-        Some(&launch.to_string()),
-    );
-    assert!(!rejected.status.success());
-    let output: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
-    assert!(
-        output["error"]
-            .as_str()
-            .unwrap()
-            .contains("pinned config artifact coverage mismatch")
-    );
-    std::fs::remove_file(unexpected_config).unwrap();
-
     for contents in [
         None,
         Some("independent plugin release"),
@@ -336,7 +186,8 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         }
         assert!(!state.join("runs").exists());
         assert!(!state.join("authorizations").exists());
-        assert!(!docker_marker.exists());
+        assert!(docker_marker.exists());
+        std::fs::remove_file(&docker_marker).unwrap();
     }
     std::fs::remove_file(&plugin_install).unwrap();
 
@@ -384,7 +235,13 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
             .join(format!("authorizations/records/{pending_invocation}.json"))
             .exists()
     );
-    assert!(!docker_marker.exists());
+    assert!(
+        std::fs::read_to_string(&docker_marker)
+            .unwrap()
+            .lines()
+            .all(|line| line.starts_with("image inspect --format {{.Id}} "))
+    );
+    std::fs::remove_file(&docker_marker).unwrap();
     assert!(
         root.join("gateway-cancel-confirmed").is_file(),
         "host returned before the gateway confirmed waiter cancellation"
@@ -410,7 +267,13 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         assert_eq!(failure["local_result_v2"]["status"], "failed");
         assert!(!state.join("authorizations/records").exists());
         assert!(!state.join("runs").exists());
-        assert!(!docker_marker.exists());
+        assert!(
+            std::fs::read_to_string(&docker_marker)
+                .unwrap()
+                .lines()
+                .all(|line| line.starts_with("image inspect --format {{.Id}} "))
+        );
+        std::fs::remove_file(&docker_marker).unwrap();
     }
 
     std::fs::write(&decision, "deny automatic").unwrap();
@@ -422,13 +285,17 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         String::from_utf8_lossy(&denied.stderr)
     );
     assert!(
-        !docker_marker.exists(),
-        "denied one-step launch invoked Docker"
+        std::fs::read_to_string(&docker_marker)
+            .unwrap()
+            .lines()
+            .all(|line| line.starts_with("image inspect --format {{.Id}} ")),
+        "denied one-step launch performed a Docker operation beyond managed image resolution"
     );
+    std::fs::remove_file(&docker_marker).unwrap();
     let denied_json: serde_json::Value = serde_json::from_slice(&denied.stdout).unwrap();
     assert_eq!(
-        denied_json["approval_receipt"]["receipt"]["decision"],
-        "deny"
+        denied_json["approval_receipt"]["receipt"]["decision"], "deny",
+        "{denied_json:#}"
     );
     assert_eq!(
         denied_json["approval_receipt"]["receipt"]["authority"],
@@ -457,7 +324,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         allowed_invocation_id,
     ];
     std::fs::write(&decision, "allow human").unwrap();
-    std::fs::write(root.join("fail-image-inspect-once"), "fail").unwrap();
+    std::fs::write(root.join("provider-503-once"), "fail").unwrap();
     let allowed = invoke(
         &root,
         &fake_bin,
@@ -485,7 +352,10 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     )
     .unwrap();
     assert_eq!(record["attempts"].as_array().unwrap().len(), 2);
-    assert_eq!(record["attempts"][0]["retry_class"], "prelaunch");
+    assert_eq!(
+        record["attempts"][0]["retry_class"],
+        "provider_service_unavailable"
+    );
     assert_eq!(record["attempts"][0]["retry_eligible"], true);
     let first_run_id = record["attempts"][0]["run_id"].as_str().unwrap();
     let first_run: serde_json::Value = serde_json::from_slice(
@@ -519,6 +389,17 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         docker_calls
             .lines()
             .any(|call| call.starts_with("image inspect "))
+    );
+    assert!(
+        docker_calls
+            .lines()
+            .filter(|call| !call.starts_with("image inspect "))
+            .all(|call| !call.contains(QUALIFICATION_IMAGE_TAG)),
+        "mutable managed tag escaped image resolution into launch: {docker_calls}"
+    );
+    assert!(
+        docker_calls.contains(&format!("sha256:{}", "a".repeat(64))),
+        "captured immutable image ID was not used by Docker create: {docker_calls}"
     );
     assert!(
         !docker_calls.contains("agent-hub-job-code-preflight"),
@@ -590,11 +471,15 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         );
     }
 
-    let real_gateway = executable.with_file_name("agent-hub-gateway");
+    let built_gateway = executable.with_file_name("agent-hub-gateway");
     assert!(
-        real_gateway.is_file(),
+        built_gateway.is_file(),
         "build the real gateway first: cargo build -p agent-hub-gateway"
     );
+    // Cargo may hard-link top-level binaries to hashed build artifacts. Copy the
+    // fixture executable so protected-path validation sees a deployment-like inode.
+    let real_gateway = root.join("real-agent-hub-gateway");
+    std::fs::copy(built_gateway, &real_gateway).unwrap();
     let policy = serde_json::json!({
         "version": 1,
         "default": "deny",
@@ -608,8 +493,8 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     let policy_bytes = serde_json::to_vec(&policy).unwrap();
     std::fs::write(&gateway_config, &policy_bytes).unwrap();
     let mut real_host_config = baseline_host_config.clone();
-    real_host_config["gateway"] = pin(&real_gateway, "runtime:agent-hub-gateway");
-    real_host_config["policy"] = pin(&gateway_config, "policy:agent-hub-run");
+    real_host_config["gateway"] = serde_json::json!({"path": real_gateway});
+    real_host_config["policy"] = serde_json::json!({"path": gateway_config});
     std::fs::write(
         &host_config_path,
         serde_json::to_vec(&real_host_config).unwrap(),
@@ -659,24 +544,6 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
     )
     .unwrap();
 
-    std::fs::write(&gateway_config, "tampered\n").unwrap();
-    let tampered = invoke(
-        &root,
-        &fake_bin,
-        &state,
-        &allowed_args,
-        Some(&launch.to_string()),
-    );
-    assert!(!tampered.status.success());
-    let tampered: serde_json::Value = serde_json::from_slice(&tampered.stdout).unwrap();
-    assert!(
-        tampered["error"]
-            .as_str()
-            .unwrap()
-            .contains("pinned artifact hash mismatch")
-    );
-    std::fs::write(&gateway_config, "{}").unwrap();
-
     let replacement = host_dir.join("replacement-policy.json");
     std::fs::write(&replacement, "{}").unwrap();
     std::fs::remove_file(&gateway_config).unwrap();
@@ -694,7 +561,7 @@ fn one_step_host_run_decides_before_side_effects_and_reuses_receipt_for_retry() 
         replaced["error"]
             .as_str()
             .unwrap()
-            .contains("without following links")
+            .contains("path must be canonical")
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -1255,7 +1122,7 @@ fn write_config(root: &Path, workspace: &Path) {
     .unwrap();
     std::fs::write(
         root.join("images/job-code/image.toml"),
-        format!("[image]\nname='job-code'\ntag='{IMAGE_TAG}'\n"),
+        format!("[image]\nname='job-code'\ntag='{IMAGE_TAG}'\ndescription='test'\n"),
     )
     .unwrap();
 }
@@ -1319,7 +1186,7 @@ fn write_fake_docker(path: &Path, marker: &Path, workspace: &Path, root: &Path) 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn write_fake_run_gateway(path: &Path, decision: &Path, state: &Path, docker_marker: &Path) {
+fn write_fake_run_gateway(path: &Path, decision: &Path, state: &Path) {
     std::fs::write(
         path,
         format!(
@@ -1327,14 +1194,13 @@ fn write_fake_run_gateway(path: &Path, decision: &Path, state: &Path, docker_mar
                 "#!/bin/sh\n[ \"$HOME\" = '{}' ] || {{ echo 'wrong gateway HOME' >&2; exit 2; }}\n[ -z \"${{HOST_ENV_MUST_NOT_LEAK+x}}\" ] && [ -z \"${{AGENT_HUB_ATTENDED_STATE+x}}\" ] || {{ echo 'host environment leaked' >&2; exit 2; }}\n",
                 "case \"$PATH\" in *'{}'*) echo 'host PATH leaked' >&2; exit 2;; esac\n",
                 "for arg in \"$@\"; do if [ \"$arg\" = --preview ]; then exec /usr/bin/python3 -c 'import json,sys; r=json.load(sys.stdin)[\"tool_input\"]; print(json.dumps({{\"schema\":\"agent_hub_run_policy_preview_v1\",\"projection\":r[\"policy_projection\"],\"matched_action\":\"allow\"}}))'; fi; done\n",
-                "[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in deny*) [ ! -e '{}' ] || {{ echo 'docker ran before deny decision' >&2; exit 2; }};; pending*) echo $$ > '{}'; printf entered > '{}'; trap 'printf confirmed > \"{}\"; exit 1' TERM INT; while :; do sleep 1; done;; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; p=open(\"{}\").read().split(); d,a=p[:2]; mode=p[2] if len(p)>2 else \"\"; digest=\"0\"*64 if mode==\"wrong\" else r[\"canonical_digest\"]; expiry=\"2000-01-01T00:00:00Z\" if mode==\"expired\" else r[\"expires_at\"]; approval=\"018f0f21-76c0-7b37-a446-31f82a5e7601\" if a==\"human\" else r[\"invocation_id\"]; print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":digest,\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":approval,\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":expiry}}))'\n",
+                "[ ! -e '{}/authorizations' ] && [ ! -e '{}/runs' ] || true\ncase \"$(cat '{}')\" in pending*) echo $$ > '{}'; printf entered > '{}'; trap 'printf confirmed > \"{}\"; exit 1' TERM INT; while :; do sleep 1; done;; esac\nexec /usr/bin/python3 -c 'import datetime,json,sys; h=json.load(sys.stdin); r=h[\"tool_input\"]; p=open(\"{}\").read().split(); d,a=p[:2]; mode=p[2] if len(p)>2 else \"\"; digest=\"0\"*64 if mode==\"wrong\" else r[\"canonical_digest\"]; expiry=\"2000-01-01T00:00:00Z\" if mode==\"expired\" else r[\"expires_at\"]; approval=\"018f0f21-76c0-7b37-a446-31f82a5e7601\" if a==\"human\" else r[\"invocation_id\"]; print(json.dumps({{\"schema\":\"agent_hub_run_decision_v1\",\"invocation_id\":r[\"invocation_id\"],\"canonical_digest\":digest,\"request_digest\":r[\"request_digest\"],\"decision\":d,\"authority\":a,\"approval_id\":approval,\"reason\":None,\"decided_at\":datetime.datetime.now(datetime.timezone.utc).isoformat().replace(\"+00:00\",\"Z\"),\"expires_at\":expiry}}))'\n",
             ),
             state.parent().unwrap().join("home").display(),
             path.parent().unwrap().display(),
             state.display(),
             state.display(),
             decision.display(),
-            docker_marker.display(),
             state.parent().unwrap().join("gateway.pid").display(),
             state.parent().unwrap().join("gateway-entered").display(),
             state

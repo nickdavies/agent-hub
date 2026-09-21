@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::Utc;
 use protocol::{
     AgentHubRunDecision, AgentHubRunDecisionAuthority, AgentHubRunDecisionV1,
-    AgentHubRunResolvedV1, AttendedAuthorizationRequestV3,
+    AgentHubRunResolvedV1, AttendedAuthorizationRequestV3, AttendedAuthorizationRequestV4,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -17,6 +17,7 @@ fn request() -> AgentHubRunResolvedV1 {
         "../../protocol/tests/fixtures/attended_authorization_v3.json"
     ))
     .unwrap();
+    let request = AttendedAuthorizationRequestV4::from(request);
     let requested_at = Utc::now();
     AgentHubRunResolvedV1::new(
         Uuid::new_v4().to_string(),
@@ -25,6 +26,80 @@ fn request() -> AgentHubRunResolvedV1 {
         requested_at + chrono::Duration::minutes(5),
     )
     .unwrap()
+}
+
+#[test]
+fn permission_scope_separates_capabilities_from_execution_audit_identity() {
+    let original: AttendedAuthorizationRequestV3 = serde_json::from_slice(include_bytes!(
+        "../../protocol/tests/fixtures/attended_authorization_v3.json"
+    ))
+    .unwrap();
+    let original = AttendedAuthorizationRequestV4::from(original);
+    let now = Utc::now();
+    let resolved = |execution: AttendedAuthorizationRequestV4| {
+        AgentHubRunResolvedV1::new(
+            Uuid::new_v4().to_string(),
+            execution.canonical_artifact().unwrap(),
+            now,
+            now + chrono::Duration::minutes(5),
+        )
+        .unwrap()
+    };
+    let first = resolved(original.clone());
+    let mut rebuilt = original;
+    rebuilt.proposal.image_id = format!("sha256:{}", "b".repeat(64));
+    rebuilt.execution.config_digest = "implementation-build-b".into();
+    for provider in &mut rebuilt.execution.credential_providers {
+        provider.source = "/different/trusted/provider/location".into();
+        provider.command = Some("/different/trusted/provider".into());
+    }
+    let second = resolved(rebuilt);
+    assert_ne!(first.canonical_digest, second.canonical_digest);
+    assert_eq!(
+        first.permission_scope_digest().unwrap(),
+        second.permission_scope_digest().unwrap()
+    );
+
+    let scope = first.policy_projection.clone();
+    let scope_json = serde_json::to_string(&scope).unwrap();
+    assert!(!scope_json.contains(&first.canonical_execution.digest));
+    assert!(!scope_json.contains(&format!("sha256:{}", "a".repeat(64))));
+    assert!(!scope_json.contains("config-digest"));
+    let baseline = scope.permission_scope_digest().unwrap();
+    let mut network = scope.clone();
+    network
+        .effective_network_grants
+        .iter_mut()
+        .find(|grant| grant.resource == protocol::NetworkResourceKind::NpmRegistry)
+        .unwrap()
+        .hosts
+        .push("registry.yarnpkg.com".into());
+    assert_ne!(baseline, network.permission_scope_digest().unwrap());
+    let mut mount = scope.clone();
+    mount
+        .workspaces
+        .iter_mut()
+        .find(|item| item.access == protocol::WorkspaceAccess::ReadWrite)
+        .unwrap()
+        .access = protocol::WorkspaceAccess::ReadOnly;
+    assert_ne!(baseline, mount.permission_scope_digest().unwrap());
+    let mut capability = scope.clone();
+    capability
+        .capabilities
+        .push(protocol::AgentHubRunCapabilityProjectionV1 {
+            name: "repository-token".into(),
+            access: "read_only".into(),
+            targets: vec!["owner/repository".into()],
+            constraints: Default::default(),
+        });
+    assert_ne!(baseline, capability.permission_scope_digest().unwrap());
+    let mut limits = scope;
+    limits.output_limits.stdout_bytes += 1;
+    assert_ne!(baseline, limits.permission_scope_digest().unwrap());
+    let mut resource_limits = first.policy_projection.clone();
+    resource_limits.pids_limit += 1;
+    resource_limits.cpu_limit = Some("1.5".into());
+    assert_ne!(baseline, resource_limits.permission_scope_digest().unwrap());
 }
 
 fn invoke(config: &std::path::Path, server: &str, input: &Value) -> Output {
@@ -73,7 +148,7 @@ fn config(dir: &tempfile::TempDir, action: &str) -> std::path::PathBuf {
             "rules": [{
                 "tools": ["agent_hub_run_resolved"],
                 "input": {
-                    "schema": "agent_hub_run_policy_projection_v1"
+                    "schema": "agent_hub_run_policy_projection_v2"
                 },
                 "action": action
             }]
@@ -203,9 +278,10 @@ fn ask_retries_identical_registration_and_preserves_wire_bindings() {
     assert_eq!(bodies[0], bodies[1]);
     let approval: protocol::ApprovalRequest = serde_json::from_slice(&bodies[0]).unwrap();
     assert_eq!(approval.id, request.invocation_id);
+    let scope_digest = request.permission_scope_digest().unwrap();
     assert_eq!(
         approval.request_digest.as_deref(),
-        Some(request.canonical_digest.as_str())
+        Some(scope_digest.as_str())
     );
     assert_eq!(approval.tool_input, serde_json::to_value(&request).unwrap());
 }

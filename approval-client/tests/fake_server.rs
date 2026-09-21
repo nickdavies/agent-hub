@@ -117,6 +117,43 @@ async fn success_statuses_and_bearer_auth_are_compatible() {
 }
 
 #[tokio::test]
+async fn capabilities_uses_authenticated_bounded_json_path() {
+    let body = serde_json::to_vec(&protocol::AgentHubCapabilitiesV1::current()).unwrap();
+    let (endpoint, authorization, _) = server(StatusCode::OK, body, Duration::ZERO).await;
+    let client = ApprovalClient::with_options(
+        &endpoint,
+        Some(Secret::new("secret")),
+        ClientOptions {
+            operation_timeout: Duration::from_secs(1),
+            response_limit: protocol::AGENT_HUB_CAPABILITIES_MAX_BYTES,
+        },
+    )
+    .unwrap();
+
+    let response = client.capabilities().await.unwrap();
+
+    assert_eq!(response.status, StatusCode::OK.as_u16());
+    assert_eq!(response.value, protocol::AgentHubCapabilitiesV1::current());
+    assert_eq!(
+        authorization.lock().unwrap().as_deref(),
+        Some("Bearer secret")
+    );
+
+    let invalid = serde_json::json!({
+        "schema": "agent_hub_capabilities_v1",
+        "capabilities": ["z", "a"]
+    })
+    .to_string();
+    let (endpoint, _, _) = server(StatusCode::OK, invalid, Duration::ZERO).await;
+    let error = ApprovalClient::new(&endpoint, None)
+        .unwrap()
+        .capabilities()
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidResponse);
+}
+
+#[tokio::test]
 async fn classifies_client_server_conflict_and_payload_failures() {
     for (status, kind) in [
         (StatusCode::BAD_REQUEST, ErrorKind::ClientResponse),

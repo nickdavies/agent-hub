@@ -2,10 +2,11 @@ use std::fmt;
 use std::time::Duration;
 
 use protocol::{
-    Approval, ApprovalRequest, ApprovalResolveRequest, ApprovalResponse, ApprovalWaitResponse,
-    ApprovalWaiterCancelRequest, ConfigResponse, NotifyConfig, NotifyConfigUpdate, PendingQuestion,
-    QuestionProxyRequest, QuestionProxyResponse, QuestionResolveRequest, QuestionWaitResponse,
-    Secret, SessionConfigUpdate, SessionId, SessionNotifyConfig, SessionView, StatusReport,
+    AgentHubCapabilitiesV1, Approval, ApprovalRequest, ApprovalResolveRequest, ApprovalResponse,
+    ApprovalWaitResponse, ApprovalWaiterCancelRequest, ConfigResponse, NotifyConfig,
+    NotifyConfigUpdate, PendingQuestion, QuestionProxyRequest, QuestionProxyResponse,
+    QuestionResolveRequest, QuestionWaitResponse, Secret, SessionConfigUpdate, SessionId,
+    SessionNotifyConfig, SessionView, StatusReport,
 };
 use reqwest::{RequestBuilder, Response, Url, redirect::Policy};
 use serde::Serialize;
@@ -380,6 +381,19 @@ impl ApprovalClient {
 
     pub async fn list_sessions(&self) -> Result<ApiResponse<Vec<SessionView>>, Error> {
         self.get_json("api/v1/sessions", "session list").await
+    }
+
+    pub async fn capabilities(&self) -> Result<ApiResponse<AgentHubCapabilitiesV1>, Error> {
+        let response: ApiResponse<AgentHubCapabilitiesV1> = self
+            .get_json("api/v1/capabilities", "capability discovery")
+            .await?;
+        response.value.validate().map_err(|detail| Error {
+            kind: ErrorKind::InvalidResponse,
+            operation: "capability discovery",
+            status: Some(response.status),
+            detail,
+        })?;
+        Ok(response)
     }
 
     pub async fn session_status(&self) -> Result<u16, Error> {

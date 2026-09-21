@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 import { describe, expect, test } from "bun:test"
 import {
   AgentHubCatalogService,
@@ -15,6 +15,7 @@ import {
 } from "./agent-hub-catalog"
 
 const guidance = {
+  runtime_readiness_checked: false,
   limits: { max_prompt_bytes: 131072, max_workspaces: 16, max_context_roots: 16, max_overlays: 16 },
   outputs: {
     structured_result: true,
@@ -111,16 +112,13 @@ async function fixture() {
   await writeFile(policy, "{}")
   await writeFile(system, "[system]\n")
   await writeFile(environment, "[environment]\n")
-  const pin = (path: string) => ({ path, sha256: "a".repeat(64), source_identity: "fixture", device: 1, inode: 1 })
   await writeFile(hostConfig, JSON.stringify({
-    schema: "agent_hub_run_host_v1",
+    schema: "agent_hub_run_host_v2",
     config_root: configRoot,
-    config_root_identity: { canonical_path: configRoot, device: 1, inode: 1 },
-    config_artifacts: [pin(system), pin(environment)],
-    self_binary: pin(binary),
-    gateway: pin(gateway),
-    policy: pin(policy),
-    image_digests: {},
+    gateway: { path: gateway },
+    policy: { path: policy },
+    managed_images: { "job-code": "agent-hub/job-code:test" },
+    backend_metadata_revision: "fixture-1",
   }))
   return { root, home, hostConfig, configRoot, environmentDirectory, binary, gateway, policy, system, environment }
 }
@@ -144,7 +142,7 @@ async function envelope(files: Fixture, value = catalog(), watchedBinary = files
       changed_ns: metadata.ctimeNs.toString(),
     }
   }))
-  return JSON.stringify({ schema: "agent_hub_catalog_internal_v1", catalog: value, cache_identity: { schema: "agent_hub_catalog_cache_identity_v1", watch } })
+  return JSON.stringify({ schema: "agent_hub_catalog_internal_v1", catalog: value, cache_identity: { schema: "agent_hub_catalog_cache_identity_v2", backend_metadata_revision: "fixture-1", watch } })
 }
 
 describe("catalog validation and projection", () => {
@@ -563,7 +561,16 @@ describe("catalog process lifecycle", () => {
       const marker = join(root, "pid")
       const controller = new AbortController()
       try {
-        const running = runCatalogProcess("/usr/local/bin/node", ["-e", `
+        const nodeOnPath = Bun.which("node")
+        if (nodeOnPath === null) throw new Error("catalog lifecycle test requires node on PATH")
+        if (!isAbsolute(nodeOnPath)) {
+          throw new Error(`catalog lifecycle test resolved a non-absolute node path: ${nodeOnPath}`)
+        }
+        const node = await realpath(nodeOnPath)
+        if (!isAbsolute(node)) {
+          throw new Error(`catalog lifecycle test resolved a non-absolute real node path: ${node}`)
+        }
+        const running = runCatalogProcess(node, ["-e", `
           import { writeFileSync } from "node:fs";
           writeFileSync(${JSON.stringify(marker)}, String(process.pid));
           process.on("SIGTERM", () => {});

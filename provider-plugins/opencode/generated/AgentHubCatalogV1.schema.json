@@ -131,12 +131,17 @@
         "outputs": {
           "$ref": "#/$defs/AgentHubCatalogOutputsV1"
         },
+        "runtime_readiness_checked": {
+          "description": "Discovery is configuration metadata, not a live Docker/network/credential probe.",
+          "type": "boolean"
+        },
         "workspace": {
           "$ref": "#/$defs/AgentHubCatalogWorkspaceGuidanceV1"
         }
       },
       "additionalProperties": false,
       "required": [
+        "runtime_readiness_checked",
         "limits",
         "outputs",
         "workspace"

@@ -51,6 +51,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print supported read-only protocol capabilities
+    Capabilities,
     /// Process a tool-use approval hook (reads hook payload from stdin)
     Approval(ApprovalArgs),
     /// Report session status to the server (reads status JSON from stdin)
@@ -222,12 +224,21 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Capabilities => run_capabilities(),
         Command::Approval(args) => run_approval(args).await,
         Command::StatusReport(args) => run_status_report(args).await,
         Command::Question(args) => question::run(args).await,
         Command::Supervision(args) => run_supervision(args).await,
         Command::AgentHubRunResolved(args) => run_agent_hub_run_resolved(args).await,
     }
+}
+
+fn run_capabilities() -> ExitCode {
+    let encoded = serde_json::to_vec(&protocol::AgentHubCapabilitiesV1::current())
+        .expect("static capabilities serialize");
+    debug_assert!(encoded.len() <= protocol::AGENT_HUB_CAPABILITIES_MAX_BYTES);
+    print!("{}", String::from_utf8(encoded).expect("JSON is UTF-8"));
+    ExitCode::SUCCESS
 }
 
 #[derive(Debug)]
@@ -355,12 +366,19 @@ async fn run_agent_hub_run_resolved(args: AgentHubRunResolvedArgs) -> ExitCode {
     };
     let config_path = expand_tilde(&approval.config);
     let waiter_id = Uuid::new_v4();
+    let permission_scope_digest = match permission.permission_scope_digest() {
+        Ok(digest) => digest,
+        Err(error) => {
+            eprintln!("agent-hub-gateway: invalid agent_hub_run permission scope: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let resolution = run(
         &approval,
         "agent-hub-host-launch",
         &event,
         &config_path,
-        Some(&permission.canonical_digest),
+        Some(&permission_scope_digest),
         Some(deadline),
         Some(waiter_id),
     )
@@ -1394,6 +1412,16 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_is_argument_free() {
+        let cli = Cli::try_parse_from(["agent-hub-gateway", "capabilities"]).unwrap();
+        assert!(matches!(cli.command, Command::Capabilities));
+        assert!(
+            Cli::try_parse_from(["agent-hub-gateway", "capabilities", "--server", "unused"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn approval_default_timeout_is_24_hours() {

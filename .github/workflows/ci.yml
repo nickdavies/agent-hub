@@ -21,14 +21,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: Format
-        run: cargo fmt --check
+      - name: Standard native lint
+        run: make lint
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test
+      - name: Standard native tests
+        run: make test
 
   gateway-network:
     runs-on: ubuntu-latest

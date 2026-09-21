@@ -92,6 +92,20 @@ fn request() -> AttendedAuthorizationRequestV1 {
                 pids_limit: protocol::APPROVED_EXECUTION_PIDS_LIMIT,
             },
             credential_providers: vec![],
+            effective_network_grants: vec![
+                protocol::AttendedNetworkGrantV1 {
+                    resource: protocol::NetworkResourceKind::NpmRegistry,
+                    mode: protocol::AttendedNetworkGrantModeV1::Hosts,
+                    hosts: vec!["registry.npmjs.org".into()],
+                    provider: None,
+                },
+                protocol::AttendedNetworkGrantV1 {
+                    resource: protocol::NetworkResourceKind::PypiRegistry,
+                    mode: protocol::AttendedNetworkGrantModeV1::Hosts,
+                    hosts: vec!["pypi.org".into()],
+                    provider: None,
+                },
+            ],
             overlays: vec![],
             workspaces: vec![
                 WorkspaceSpec {
@@ -196,7 +210,7 @@ fn with_github_overlay(
 #[test]
 fn github_credentials_require_matching_network_and_host() {
     let github = with_github_overlay(request());
-    let mut without_network = request_v3();
+    let mut without_network = request_v4();
     without_network.proposal = github.proposal.clone();
     without_network.execution = github.execution.clone();
     assert!(without_network.clone().normalize().is_err());
@@ -206,6 +220,15 @@ fn github_credentials_require_matching_network_and_host() {
         .proposal
         .network_resources
         .push(protocol::NetworkResourceKind::Github);
+    host_mismatch
+        .execution
+        .effective_network_grants
+        .push(protocol::AttendedNetworkGrantV1 {
+            resource: protocol::NetworkResourceKind::Github,
+            mode: protocol::AttendedNetworkGrantModeV1::Hosts,
+            hosts: vec!["api.github.com".into(), "github.com".into()],
+            provider: None,
+        });
     host_mismatch
         .execution
         .runtime
@@ -219,13 +242,22 @@ fn github_credentials_require_matching_network_and_host() {
     host_mismatch.execution.overlays[0].config = serde_json::to_string(&binding).unwrap();
     assert!(host_mismatch.normalize().is_err());
 
-    let mut valid = request_v3();
+    let mut valid = request_v4();
     valid.proposal = github.proposal;
     valid.execution = github.execution;
     valid
         .proposal
         .network_resources
         .push(protocol::NetworkResourceKind::Github);
+    valid
+        .execution
+        .effective_network_grants
+        .push(protocol::AttendedNetworkGrantV1 {
+            resource: protocol::NetworkResourceKind::Github,
+            mode: protocol::AttendedNetworkGrantModeV1::Hosts,
+            hosts: vec!["api.github.com".into(), "github.com".into()],
+            provider: None,
+        });
     valid.execution.runtime.environment.network_resources = Some(
         protocol::NetworkResourceRequest::Resources(valid.proposal.network_resources.clone()),
     );
@@ -258,6 +290,19 @@ fn github_credentials_require_matching_network_and_host() {
     valid.execution.credential_providers[0].name = "github:github.com:read".into();
     valid.execution.credential_providers[0].access = "read".into();
     assert!(valid.normalize().is_err());
+}
+
+#[test]
+fn semantic_image_family_accepts_an_opaque_managed_reference() {
+    let reference = "registry.example:5443/platform/job-code-qualification@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut request = request();
+    request.proposal.image_tag = reference.into();
+    request.execution.runtime.environment.container_image = Some(reference.into());
+
+    assert_eq!(
+        request.normalize().unwrap().proposal.image_family,
+        "job-code"
+    );
 }
 
 fn request_v2() -> AttendedAuthorizationRequestV2 {
@@ -365,9 +410,13 @@ fn request_v3() -> protocol::AttendedAuthorizationRequestV3 {
     }
 }
 
+fn request_v4() -> protocol::AttendedAuthorizationRequestV4 {
+    request_v3().into()
+}
+
 #[test]
 fn agent_hub_run_receipts_bind_decision_digest_invocation_and_expiry() {
-    let artifact = request_v3().canonical_artifact().unwrap();
+    let artifact = request_v4().canonical_artifact().unwrap();
     let now = chrono::Utc::now();
     let invocation = uuid::Uuid::new_v4().to_string();
     let request = protocol::AgentHubRunResolvedV1::new(
@@ -730,7 +779,13 @@ fn attended_v3_binds_isolated_git_views_without_accepting_v1_or_v2_domains() {
 #[test]
 fn attended_v3_digest_snapshot_is_stable() {
     let artifact = request_v3().canonical_artifact().unwrap();
-    let frozen_bytes = include_bytes!("fixtures/attended_authorization_v3.json");
+    let frozen_file = include_bytes!("fixtures/attended_authorization_v3.json");
+    let mut frozen: serde_json::Value = serde_json::from_slice(frozen_file).unwrap();
+    frozen["execution"]
+        .as_object_mut()
+        .unwrap()
+        .remove("effective_network_grants");
+    let frozen_bytes = serde_json::to_vec(&frozen).unwrap();
     assert_eq!(artifact.canonical_bytes, frozen_bytes);
     assert_eq!(
         artifact.digest,
@@ -739,12 +794,34 @@ fn attended_v3_digest_snapshot_is_stable() {
     let frozen = AttendedAuthorizationArtifact {
         version: protocol::ATTENDED_AUTHORIZATION_VERSION_V3,
         digest: artifact.digest,
-        canonical_bytes: frozen_bytes.to_vec(),
+        canonical_bytes: frozen_bytes,
     };
     assert_eq!(
         frozen.verify_v3().unwrap(),
         request_v3().normalize().unwrap()
     );
+}
+
+#[test]
+fn private_v4_requires_and_binds_effective_network_grants() {
+    let artifact = request_v4().canonical_artifact().unwrap();
+    assert_eq!(
+        artifact.version,
+        protocol::ATTENDED_AUTHORIZATION_VERSION_V4
+    );
+    assert!(artifact.verify_v3().is_err());
+    assert!(artifact.verify_v4().is_ok());
+
+    let mut missing = request_v4();
+    missing.execution.effective_network_grants.clear();
+    assert!(missing.canonical_artifact().is_err());
+
+    let mut broader = request_v4();
+    broader.execution.effective_network_grants[0]
+        .hosts
+        .push("registry.yarnpkg.com".into());
+    let broader = broader.canonical_artifact().unwrap();
+    assert_ne!(artifact.digest, broader.digest);
 }
 
 #[test]
@@ -823,6 +900,7 @@ fn attended_network_resources_must_fit_the_explicit_class() {
 
     let mut no_authority = request();
     no_authority.proposal.network_resources.clear();
+    no_authority.execution.effective_network_grants.clear();
     no_authority.execution.runtime.environment.network_resources =
         Some(protocol::NetworkResourceRequest::None);
     assert!(no_authority.canonical_artifact().is_ok());

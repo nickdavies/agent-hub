@@ -160,6 +160,7 @@ function testCatalog() {
     images: [{ family: "job-code", description: "Job image", tool_facts: { status: "unavailable" } }],
     overlays: [],
     guidance: {
+      runtime_readiness_checked: false,
       limits: { max_prompt_bytes: 131072, max_workspaces: 16, max_context_roots: 16, max_overlays: 16 },
       outputs: {
         structured_result: true, artifact_manifest: true, repository_result: true, cleanup_result: true,

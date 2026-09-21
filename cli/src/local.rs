@@ -147,6 +147,22 @@ pub fn resolve_mounts(
     requested_contexts: &[RequestedContextRoot],
     primary_workspace: &str,
 ) -> anyhow::Result<ResolvedMounts> {
+    resolve_mounts_with_protected(
+        roots,
+        requested_workspaces,
+        requested_contexts,
+        primary_workspace,
+        &[],
+    )
+}
+
+pub(crate) fn resolve_mounts_with_protected(
+    roots: &ApprovedRoots,
+    requested_workspaces: &[RequestedWorkspace],
+    requested_contexts: &[RequestedContextRoot],
+    primary_workspace: &str,
+    protected_paths: &[PathBuf],
+) -> anyhow::Result<ResolvedMounts> {
     ensure!(
         !requested_workspaces.is_empty(),
         "attended execution requires a workspace"
@@ -170,6 +186,10 @@ pub fn resolve_mounts(
             WorkspaceAccess::ReadWrite => RootRole::WorkspaceRw,
         };
         let (root, host) = roots.resolve(&requested.path, role)?;
+        reject_protected_mounts(
+            [host.as_path()],
+            protected_paths.iter().map(PathBuf::as_path),
+        )?;
         reject_host_overlap(&hosts, &host)?;
         hosts.push(host.clone());
         let container_path = format!("/workspace/{}", requested.alias);
@@ -232,6 +252,10 @@ pub fn resolve_mounts(
             requested.alias
         );
         let (root, host) = roots.resolve(&requested.path, RootRole::ContextRo)?;
+        reject_protected_mounts(
+            [host.as_path()],
+            protected_paths.iter().map(PathBuf::as_path),
+        )?;
         reject_host_overlap(&hosts, &host)?;
         hosts.push(host.clone());
         context_roots.push(ContextRootSpec {
@@ -325,6 +349,64 @@ fn reject_host_overlap(existing: &[PathBuf], candidate: &Path) -> anyhow::Result
         );
     }
     Ok(())
+}
+
+/// Reject any mount that could expose or modify a trusted control-plane path.
+/// Ancestors are rejected as well as descendants: a broad workspace mount must
+/// not make a protected child reachable inside the sandbox.
+pub(crate) fn reject_protected_mounts<'a>(
+    mounts: impl IntoIterator<Item = &'a Path>,
+    protected: impl IntoIterator<Item = &'a Path>,
+) -> anyhow::Result<()> {
+    let protected = protected
+        .into_iter()
+        .map(canonicalize_existing_ancestor)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for mount in mounts {
+        ensure_canonical_input_path(mount)?;
+        for path in &protected {
+            ensure!(
+                !mount.starts_with(path) && !path.starts_with(mount),
+                "requested mount '{}' intersects protected control-plane path",
+                mount.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize the longest existing prefix and append only normal missing
+/// components. This prevents a not-yet-created state path from hiding beneath
+/// a symlinked ancestor.
+pub(crate) fn canonicalize_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
+    ensure!(path.is_absolute(), "protected path must be absolute");
+    ensure!(
+        path.components().all(|component| matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )),
+        "protected path contains traversal or a noncanonical component"
+    );
+    let mut missing = Vec::new();
+    let mut existing = path;
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .context("protected path has no existing ancestor")?;
+        ensure!(
+            name != "." && name != "..",
+            "protected path contains traversal"
+        );
+        missing.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .context("protected path has no existing ancestor")?;
+    }
+    let mut canonical = std::fs::canonicalize(existing)?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 pub(crate) fn canonical_remote_identity(remote: &str) -> anyhow::Result<String> {

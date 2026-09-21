@@ -1,9 +1,13 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use protocol::{AgentHubRunResolvedV1, Approval, ApprovalRequest, AttendedAuthorizationRequestV3};
+use protocol::{
+    AgentHubRunResolvedV1, Approval, ApprovalContext, ApprovalRequest,
+    AttendedAuthorizationRequestV4, RequestType,
+};
 
 const AGENT_HUB_RUN_TOOL: &str = "agent_hub_run_resolved";
+const AGENT_HUB_RUN_PROVIDER: &str = "agent-hub-host-launch";
 const MAX_REVIEW_VALUE_CHARS: usize = 4096;
 const MAX_RAW_STRING_CHARS: usize = 64 * 1024;
 const MAX_RAW_ARRAY_ITEMS: usize = 256;
@@ -41,11 +45,36 @@ impl ApprovalReview {
 
 pub fn validate_request(request: &ApprovalRequest) -> Result<(), String> {
     if request.tool.as_str() == AGENT_HUB_RUN_TOOL {
-        parse_launch(
+        let (resolved, _) = parse_launch(
             &request.tool_input,
             request.request_digest.as_deref(),
             Utc::now(),
         )?;
+        let event = resolved.gateway_event()?;
+        let expected = ApprovalRequest {
+            id: resolved.invocation_id.clone(),
+            request_digest: Some(resolved.permission_scope_digest()?),
+            session_id: event.session_id,
+            session_display_name: event
+                .session_title
+                .ok_or_else(|| "agent_hub_run canonical gateway event has no title".to_string())?,
+            cwd: event.cwd,
+            tool: event.tool.into(),
+            tool_input: event.tool_input,
+            provider: AGENT_HUB_RUN_PROVIDER.to_string(),
+            request_type: RequestType::ToolUse,
+            context: ApprovalContext {
+                workspace_roots: event.workspace_roots.ok_or_else(|| {
+                    "agent_hub_run canonical gateway event has no workspace roots".to_string()
+                })?,
+                hook_event_name: event.hook_event_name.into(),
+                extra: None,
+                attended: None,
+            },
+        };
+        if request != &expected {
+            return Err("agent_hub_run_resolved approval envelope binding mismatch".to_string());
+        }
     }
     Ok(())
 }
@@ -62,6 +91,7 @@ fn launch_review(approval: &Approval) -> Result<Option<LaunchReview>, String> {
     let proposal = &execution.proposal;
     let approved = &execution.execution;
     let runtime = &approved.runtime;
+    let permission_scope_digest = request.permission_scope_digest()?;
 
     let sections = vec![
         section(
@@ -83,6 +113,7 @@ fn launch_review(approval: &Approval) -> Result<Option<LaunchReview>, String> {
             "Digests",
             serde_json::json!({
                 "approval_request_digest": approval.request_digest,
+                "permission_scope_digest": permission_scope_digest,
                 "resolved_request_digest": request.request_digest,
                 "canonical_digest": request.canonical_digest,
                 "canonical_execution_digest": request.canonical_execution.digest,
@@ -194,14 +225,15 @@ fn parse_launch(
     value: &serde_json::Value,
     approval_request_digest: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<(AgentHubRunResolvedV1, AttendedAuthorizationRequestV3), String> {
+) -> Result<(AgentHubRunResolvedV1, AttendedAuthorizationRequestV4), String> {
     let request: AgentHubRunResolvedV1 = serde_json::from_value(value.clone())
         .map_err(|error| format!("invalid agent_hub_run_resolved payload: {error}"))?;
     request.validate(now)?;
-    if approval_request_digest != Some(request.canonical_digest.as_str()) {
+    let permission_scope_digest = request.permission_scope_digest()?;
+    if approval_request_digest != Some(permission_scope_digest.as_str()) {
         return Err("agent_hub_run_resolved digest binding mismatch".to_string());
     }
-    let execution = request.canonical_execution.decode()?.verify_v3()?;
+    let execution = request.canonical_execution.decode()?.verify_v4()?;
     Ok((request, execution))
 }
 

@@ -1,9 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "AgentHubRunPolicyProjectionV1",
+  "title": "AgentHubRunPolicyProjectionV2",
   "description": "Strict policy surface derived from a verified canonical execution. Policy\nmatching never receives the canonical transport or public intent fields.",
   "type": "object",
   "properties": {
+    "approval_rules": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ApprovalRuleSet"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "capabilities": {
       "type": "array",
       "items": {
@@ -18,6 +28,19 @@
       },
       "maxItems": 16
     },
+    "cpu_limit": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "effective_network_grants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AttendedNetworkGrantV1"
+      },
+      "maxItems": 16
+    },
     "environment": {
       "type": "string",
       "maxLength": 128,
@@ -28,10 +51,11 @@
       "maxLength": 64,
       "minLength": 1
     },
-    "image_id": {
-      "type": "string",
-      "maxLength": 71,
-      "minLength": 71
+    "memory_limit": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "network_class": {
       "type": "string",
@@ -45,8 +69,8 @@
       },
       "maxItems": 16
     },
-    "output": {
-      "$ref": "#/$defs/AttendedOutputContract"
+    "output_limits": {
+      "$ref": "#/$defs/AttendedOutputLimits"
     },
     "overlays": {
       "type": "array",
@@ -55,8 +79,22 @@
       },
       "maxItems": 16
     },
+    "permissions": {
+      "$ref": "#/$defs/AgentHubRunPermissionSetV2"
+    },
+    "pids_limit": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
     "prompt_digest": {
       "type": "string"
+    },
+    "repository_claims": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PlannedRepoClaim"
+      }
     },
     "retry": {
       "$ref": "#/$defs/AttendedRetryConstraints"
@@ -92,9 +130,9 @@
     "schema",
     "environment",
     "image_family",
-    "image_id",
     "network_class",
     "network_resources",
+    "effective_network_grants",
     "tool_approval",
     "workspaces",
     "context_roots",
@@ -102,7 +140,10 @@
     "capabilities",
     "timeout_secs",
     "retry",
-    "output",
+    "output_limits",
+    "pids_limit",
+    "permissions",
+    "repository_claims",
     "prompt_digest",
     "review"
   ],
@@ -115,10 +156,25 @@
           "maxLength": 64,
           "minLength": 1
         },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "name": {
           "type": "string",
           "maxLength": 128,
           "minLength": 1
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "maxItems": 32
         }
       },
       "additionalProperties": false,
@@ -127,24 +183,63 @@
         "access"
       ]
     },
+    "AgentHubRunPermissionSetV2": {
+      "type": "object",
+      "properties": {
+        "auto_approve_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "aws_access": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "can_access_network": {
+          "type": "boolean"
+        },
+        "can_read_workspace": {
+          "type": "boolean"
+        },
+        "can_run_shell": {
+          "type": "boolean"
+        },
+        "can_write_workspace": {
+          "type": "boolean"
+        },
+        "escalate_tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "kubernetes_access": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tier": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tier",
+        "can_read_workspace",
+        "can_write_workspace",
+        "can_run_shell",
+        "can_access_network",
+        "auto_approve_tools",
+        "escalate_tools"
+      ]
+    },
     "AgentHubRunReviewProjectionV1": {
       "type": "object",
       "properties": {
-        "approval_bundle_digest": {
-          "type": "string",
-          "maxLength": 128,
-          "minLength": 1
-        },
-        "config_digest": {
-          "type": "string",
-          "maxLength": 128,
-          "minLength": 1
-        },
-        "environment_bundle_digest": {
-          "type": "string",
-          "maxLength": 128,
-          "minLength": 1
-        },
         "primary_workspace": {
           "type": "string",
           "maxLength": 63,
@@ -161,9 +256,6 @@
       },
       "additionalProperties": false,
       "required": [
-        "config_digest",
-        "environment_bundle_digest",
-        "approval_bundle_digest",
         "primary_workspace"
       ]
     },
@@ -182,51 +274,79 @@
           "type": "string",
           "maxLength": 1024,
           "minLength": 1
-        },
-        "root_identity": {
-          "type": "string",
-          "maxLength": 128,
-          "minLength": 1
         }
       },
       "additionalProperties": false,
       "required": [
         "alias",
         "path",
-        "access",
-        "root_identity"
+        "access"
       ]
     },
-    "AttendedOutputContract": {
+    "ApprovalRuleSet": {
       "type": "object",
       "properties": {
-        "artifacts": {
-          "type": "string"
+        "auto_approve": {
+          "description": "Tools that are auto-approved for this job",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
-        "cleanup": {
-          "type": "string"
+        "deny": {
+          "description": "Tools that are denied entirely",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
-        "limits": {
-          "$ref": "#/$defs/AttendedOutputLimits"
+        "escalate": {
+          "description": "Tools that always escalate to human for this job",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AttendedNetworkGrantModeV1": {
+      "type": "string",
+      "enum": [
+        "hosts",
+        "guarded_web"
+      ]
+    },
+    "AttendedNetworkGrantV1": {
+      "type": "object",
+      "properties": {
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
-        "repositories": {
-          "type": "string"
+        "mode": {
+          "$ref": "#/$defs/AttendedNetworkGrantModeV1"
         },
-        "result": {
-          "type": "string"
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "transcript": {
-          "type": "string"
+        "resource": {
+          "$ref": "#/$defs/NetworkResourceKind"
         }
       },
       "additionalProperties": false,
       "required": [
-        "transcript",
-        "result",
-        "artifacts",
-        "repositories",
-        "cleanup",
-        "limits"
+        "resource",
+        "mode",
+        "hosts"
       ]
     },
     "AttendedOutputLimits": {
@@ -297,6 +417,43 @@
         "pypi_registry",
         "npm_registry",
         "guarded_web"
+      ]
+    },
+    "PlannedRepoClaim": {
+      "type": "object",
+      "properties": {
+        "base_ref": {
+          "type": "string"
+        },
+        "branch_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "claim_type": {
+          "type": "string",
+          "default": ""
+        },
+        "read_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "repo_url": {
+          "type": "string"
+        },
+        "target_branch": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "repo_url",
+        "base_ref"
       ]
     },
     "WorkspaceAccess": {

@@ -4,17 +4,6 @@ use protocol::{
     NetworkResourceKind, ToolApprovalMode,
 };
 
-pub(crate) fn image_family(image: &str) -> String {
-    let without_digest = image.split('@').next().unwrap_or(image);
-    let slash = without_digest.rfind('/');
-    match without_digest.rfind(':') {
-        Some(colon) if slash.is_none_or(|slash| colon > slash) => {
-            without_digest[..colon].to_string()
-        }
-        _ => without_digest.to_string(),
-    }
-}
-
 pub(crate) fn tool_approval_mode(value: &str) -> anyhow::Result<ToolApprovalMode> {
     match value {
         "auto" => Ok(ToolApprovalMode::Auto),
@@ -125,7 +114,7 @@ pub(crate) fn compatible_network_options(
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| mask & (1 << index) != 0)
-                .map(|(_, resource)| resource.clone())
+                .map(|(_, resource)| *resource)
                 .collect::<Vec<_>>();
             compatible.push(AgentHubCatalogNetworkOptionV1 {
                 network_class: class,

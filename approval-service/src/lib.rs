@@ -44,9 +44,9 @@ use sessions::{EffectiveSessionStatus, SessionConfigUpdate, SessionRegistry, Ses
 
 // Import protocol types used directly in this module's handlers.
 use protocol::{
-    ApprovalDecision, ApprovalModeResponse, ApprovalResolveRequest, ApprovalWaitResponse,
-    ApprovalWaiterCancelRequest, ConfigResponse, QuestionDecision, QuestionResolveRequest,
-    QuestionWaitResponse, SessionId,
+    AgentHubCapabilitiesV1, ApprovalDecision, ApprovalModeResponse, ApprovalResolveRequest,
+    ApprovalWaitResponse, ApprovalWaiterCancelRequest, ConfigResponse, QuestionDecision,
+    QuestionResolveRequest, QuestionWaitResponse, SessionId,
 };
 
 pub struct AppState<N: Notifier> {
@@ -219,6 +219,7 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
     );
 
     let mut api_v1 = Router::new()
+        .route("/capabilities", get(handle_capabilities))
         .route("/hooks/stop", post(hooks::stop::<N>))
         .route("/hooks/notification", post(hooks::notification::<N>))
         .route("/hooks/session-end", post(hooks::session_end::<N>))
@@ -322,6 +323,10 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn handle_capabilities() -> Json<AgentHubCapabilitiesV1> {
+    Json(AgentHubCapabilitiesV1::current())
 }
 
 async fn persist_after_mutation<N: Notifier>(
@@ -929,33 +934,54 @@ mod integration_tests {
         if let Some(config_digest) = config_digest {
             canonical_execution["execution"]["config_digest"] = config_digest.into();
         }
+        canonical_execution["proposal"]["prompt"] = prompt.into();
+        canonical_execution["proposal"]["prompt_digest"] =
+            protocol::sha256_hex_with_domain(b"agent-hub:attended-prompt:v1\0", prompt.as_bytes())
+                .into();
+        canonical_execution["execution"]["behavior"]["prompt"]["user"] = prompt.into();
         let canonical_execution: protocol::AttendedAuthorizationRequestV3 =
             serde_json::from_value(canonical_execution).unwrap();
+        let canonical_execution =
+            protocol::AttendedAuthorizationRequestV4::from(canonical_execution);
+        let invocation_id = launch_invocation_id(id);
         let resolved = protocol::AgentHubRunResolvedV1::new(
-            "018f0f21-76c0-7b37-a446-31f82a5e7602".into(),
+            invocation_id,
             canonical_execution.canonical_artifact().unwrap(),
             "2026-01-01T00:00:00Z".parse().unwrap(),
             "2099-01-01T00:00:00Z".parse().unwrap(),
         )
         .unwrap();
-        let request_digest = request_digest.unwrap_or(&resolved.canonical_digest);
-        serde_json::json!({
-            "id": id,
-            "request_digest": request_digest,
-            "session_id": "launch-session",
-            "session_display_name": prompt,
-            "cwd": "/workspace/repo",
-            "tool_name": "agent_hub_run_resolved",
-            "tool_input": resolved,
-            "provider": "agent-hub-host-launch",
-            "request_type": "tool_use",
-            "context": {
-                "workspace_roots": ["/workspace/repo"],
-                "hook_event_name": "agent_hub_run.host.before",
-                "extra": null
-            }
+        let derived_scope_digest = resolved.permission_scope_digest().unwrap();
+        let request_digest = request_digest.unwrap_or(&derived_scope_digest);
+        let event = resolved.gateway_event().unwrap();
+        serde_json::to_string(&protocol::ApprovalRequest {
+            id: resolved.invocation_id.clone(),
+            request_digest: Some(request_digest.to_string()),
+            session_id: event.session_id,
+            session_display_name: event.session_title.unwrap(),
+            cwd: event.cwd,
+            tool: event.tool.into(),
+            tool_input: event.tool_input,
+            provider: "agent-hub-host-launch".into(),
+            request_type: protocol::RequestType::ToolUse,
+            context: protocol::ApprovalContext {
+                workspace_roots: event.workspace_roots.unwrap(),
+                hook_event_name: event.hook_event_name.into(),
+                extra: None,
+                attended: None,
+            },
         })
-        .to_string()
+        .unwrap()
+    }
+
+    fn launch_invocation_id(id: &str) -> String {
+        use std::hash::{Hash, Hasher};
+
+        let mut first = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut first);
+        let mut second = std::collections::hash_map::DefaultHasher::new();
+        (id, "agent-hub-run").hash(&mut second);
+        Uuid::from_u128(((first.finish() as u128) << 64) | second.finish() as u128).to_string()
     }
 
     async fn create_launch(app: &Router, id: &str, prompt: &str) -> serde_json::Value {
@@ -978,6 +1004,52 @@ mod integration_tests {
             .await
             .unwrap();
         (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn capabilities_is_static_available_when_approvals_are_disabled_and_authenticated() {
+        let disabled = test_app_with_mode(ApprovalFeatureMode::Disabled);
+        let (status, body) = get_json(&disabled, "/api/v1/capabilities").await;
+        assert_eq!(status, AxumStatus::OK);
+        assert_eq!(
+            serde_json::from_str::<AgentHubCapabilitiesV1>(&body).unwrap(),
+            AgentHubCapabilitiesV1::current()
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "schema": "agent_hub_capabilities_v1",
+                "capabilities": ["agent_hub_run_v1"]
+            })
+        );
+        let (health_status, health_body) = get_json(&disabled, "/health").await;
+        assert_eq!(health_status, AxumStatus::OK);
+        assert_eq!(health_body, "ok");
+
+        let config = ServerConfig {
+            auth_mode: AuthMode::Token,
+            tokens: vec![Token {
+                label: "capabilities".into(),
+                secret: protocol::Secret::new("secret"),
+            }],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode: ApprovalFeatureMode::Disabled,
+            base_url: None,
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        let authenticated = router(AppState::new(config, NullNotifier, None));
+        let (status, _) = get_json(&authenticated, "/api/v1/capabilities").await;
+        assert_eq!(status, AxumStatus::UNAUTHORIZED);
+        let request = Request::builder()
+            .uri("/api/v1/capabilities")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = authenticated.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), AxumStatus::OK);
     }
 
     #[tokio::test]
@@ -1044,10 +1116,12 @@ mod integration_tests {
         let (status, record) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
         assert_eq!(status, AxumStatus::OK);
         let record: serde_json::Value = serde_json::from_str(&record).unwrap();
-        assert_eq!(record["request_id"], "launch-api-1");
+        assert_eq!(record["request_id"], launch_invocation_id("launch-api-1"));
+        let resolved: protocol::AgentHubRunResolvedV1 =
+            serde_json::from_value(record["tool_input"].clone()).unwrap();
         assert_eq!(
             record["request_digest"],
-            record["tool_input"]["canonical_digest"]
+            resolved.permission_scope_digest().unwrap()
         );
         assert_eq!(record["tool_input"]["requested_at"], "2026-01-01T00:00:00Z");
         assert_eq!(record["tool_input"]["schema"], "agent_hub_run_resolved_v1");
@@ -1114,7 +1188,7 @@ mod integration_tests {
         )
         .await;
         assert_eq!(status, AxumStatus::CONFLICT);
-        assert!(conflict.contains("launch-idempotent"));
+        assert!(conflict.contains(&launch_invocation_id("launch-idempotent")));
 
         let (status, _) = post_json_response(
             &app,
@@ -1242,6 +1316,7 @@ mod integration_tests {
         create_launch(&app, "side-effect-conflict", "original").await;
         let mut conflict: serde_json::Value =
             serde_json::from_str(&launch_request("side-effect-conflict", "changed")).unwrap();
+        conflict["tool_name"] = "custom_generic_tool".into();
         conflict["session_id"] = "unregistered-conflict-session".into();
         conflict["session_display_name"] = "must not be cached".into();
         let (status, _) = post_json_response(
@@ -1417,7 +1492,7 @@ mod integration_tests {
         assert!(body.contains("id=\"agent-hub-run-resolved\""));
         assert!(body.contains("aria-label=\"Full approval record\""));
         assert!(body.contains("request_id"));
-        assert!(body.contains("launch-ui-1"));
+        assert!(body.contains(&launch_invocation_id("launch-ui-1")));
         assert!(body.contains("status"));
         assert!(body.contains("approval_request_digest"));
         assert!(body.contains("resolved_request_digest"));
@@ -1443,9 +1518,8 @@ mod integration_tests {
         let app = test_app();
         let attack = "</script><script>window.pwned=true</script>";
         let long_tail = format!("{attack}{}UNRENDERED_TAIL", "x".repeat(5000));
-        let mut request: serde_json::Value =
+        let request: serde_json::Value =
             serde_json::from_str(&launch_request("launch-hostile", &long_tail)).unwrap();
-        request["session_display_name"] = attack.into();
         let (status, created) = post_json_response(
             &app,
             "/api/v1/hooks/approval",
@@ -1461,7 +1535,7 @@ mod integration_tests {
         assert!(!body.contains("UNRENDERED_TAIL</code>"));
         assert!(!body.contains(attack));
         assert!(body.contains("window.pwned=true"));
-        assert!(body.contains(r"\u003c/script\u003e\u003cscript\u003ewindow.pwned=true"));
+        assert!(body.contains("&#60;/script&#62;&#60;script&#62;window.pwned=true"));
     }
 
     #[tokio::test]

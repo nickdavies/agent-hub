@@ -1,4 +1,5 @@
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde_json::Value;
 
@@ -22,6 +23,13 @@ const PROVIDERS: [ProviderFixture; 3] = [
         payload: r#"{"conversation_id":"session","tool_name":"Shell","tool_input":{"command":"true"},"cwd":"/workspace","hook_event_name":"preToolUse"}"#,
     },
 ];
+
+fn installed_fixture_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn config(root: &std::path::Path, name: &str, action: &str, command: Option<&str>) -> String {
     let path = root.join(name);
@@ -120,6 +128,10 @@ fn assert_native_denial(fixture: ProviderFixture, output: &Output) {
 
 #[test]
 fn installed_gateway_emits_native_denials_for_post_parse_failures() {
+    // Keep fixture writes from overlapping any fixture spawn. A process forked
+    // by another test can briefly inherit a CLOEXEC write descriptor and make
+    // the executable backed by that descriptor fail to exec with ETXTBSY.
+    let _fixture_guard = installed_fixture_lock();
     let root = tempfile::tempdir().unwrap();
     let gateway = install_gateway(root.path());
     let allow = config(root.path(), "allow.json", "allow", None);
@@ -199,6 +211,7 @@ fn installed_gateway_emits_native_denials_for_post_parse_failures() {
 
 #[test]
 fn installed_gateway_preparse_failure_contract_blocks_every_provider() {
+    let _fixture_guard = installed_fixture_lock();
     let root = tempfile::tempdir().unwrap();
     let gateway = install_gateway(root.path());
     for fixture in PROVIDERS {
@@ -226,4 +239,61 @@ fn installed_gateway_preparse_failure_contract_blocks_every_provider() {
     assert!(permission_request.status.success());
     let value: Value = serde_json::from_slice(&permission_request.stdout).unwrap();
     assert_eq!(value["hookSpecificOutput"]["decision"]["behavior"], "deny");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forked_fixture_process_can_temporarily_keep_peer_executable_busy() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let _fixture_guard = installed_fixture_lock();
+    let root = tempfile::tempdir().unwrap();
+    let first = install_gateway(&root.path().join("first"));
+    let second = install_gateway(&root.path().join("second"));
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&second)
+        .unwrap();
+    let (mut ready_reader, ready_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (release_reader, mut release_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+
+    let first_process = std::thread::spawn(move || {
+        let mut command = Command::new(first);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        // SAFETY: read(2) and write(2) are async-signal-safe, and the closure
+        // only uses pre-created descriptors between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                let ready = [1_u8];
+                if libc::write(ready_writer.as_raw_fd(), ready.as_ptr().cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut release = [0_u8];
+                if libc::read(release_reader.as_raw_fd(), release.as_mut_ptr().cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    });
+
+    let mut ready = [0_u8];
+    ready_reader.read_exact(&mut ready).unwrap();
+    drop(writer);
+    let mut second_command = Command::new(&second);
+    second_command.stdout(Stdio::null()).stderr(Stdio::null());
+    let second_result = second_command.spawn();
+    release_writer.write_all(&[1]).unwrap();
+    first_process.join().unwrap().wait().unwrap();
+    let error = match second_result {
+        Err(error) => error,
+        Ok(mut child) => {
+            child.wait().unwrap();
+            panic!("peer executable unexpectedly spawned while its writer was inherited")
+        }
+    };
+    assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY));
 }

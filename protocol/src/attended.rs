@@ -16,12 +16,15 @@ pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2: &str = "attended_authorizat
 pub const ATTENDED_AUTHORIZATION_VERSION_V2: u32 = 2;
 pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3: &str = "attended_authorization_request_v3";
 pub const ATTENDED_AUTHORIZATION_VERSION_V3: u32 = 3;
+pub const ATTENDED_AUTHORIZATION_REQUEST_VERSION_V4: &str = "attended_authorization_request_v4";
+pub const ATTENDED_AUTHORIZATION_VERSION_V4: u32 = 4;
 pub const APPROVAL_BUNDLE_PROTOCOL: &str = "attended_approval_bundle_v1";
 pub const APPROVED_EXECUTION_PIDS_LIMIT: u32 = 512;
 pub const AGENT_RESULT_V1_SCHEMA: &str = "agent_result_v1";
 const ATTENDED_AUTHORIZATION_DOMAIN_V1: &[u8] = b"agent-hub:attended-authorization:v1\0";
 const ATTENDED_AUTHORIZATION_DOMAIN_V2: &[u8] = b"agent-hub:attended-authorization:v2\0";
 const ATTENDED_AUTHORIZATION_DOMAIN_V3: &[u8] = b"agent-hub:attended-authorization:v3\0";
+const ATTENDED_AUTHORIZATION_DOMAIN_V4: &[u8] = b"agent-hub:attended-authorization:v4\0";
 
 pub fn canonical_context_root_path(alias: &str) -> Option<&'static str> {
     match alias {
@@ -84,6 +87,47 @@ pub struct AttendedAuthorizationRequestV3 {
     pub workspace_export: Option<AttendedWorkspaceExportContract>,
     pub lifecycle: AttendedLifecycleContract,
     pub retry: AttendedRetryConstraints,
+}
+
+/// Private host-side authorization contract. V4 extends the frozen V3 wire
+/// contract with captured effective network grants.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedAuthorizationRequestV4 {
+    pub version: String,
+    pub proposal: AttendedProposal,
+    pub execution: AttendedExecutionSpec,
+    pub roots: Vec<ResolvedRoot>,
+    pub workspace_root_identities: BTreeMap<String, String>,
+    pub context_root_identities: BTreeMap<String, String>,
+    pub git_views: Vec<GitViewSpec>,
+    pub approval_bundle_digest: String,
+    pub approval_bundle: Option<AttendedApprovalBundleIdentity>,
+    pub output: AttendedOutputContract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_export: Option<AttendedWorkspaceExportContract>,
+    pub lifecycle: AttendedLifecycleContract,
+    pub retry: AttendedRetryConstraints,
+}
+
+impl From<AttendedAuthorizationRequestV3> for AttendedAuthorizationRequestV4 {
+    fn from(request: AttendedAuthorizationRequestV3) -> Self {
+        Self {
+            version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V4.into(),
+            proposal: request.proposal,
+            execution: request.execution,
+            roots: request.roots,
+            workspace_root_identities: request.workspace_root_identities,
+            context_root_identities: request.context_root_identities,
+            git_views: request.git_views,
+            approval_bundle_digest: request.approval_bundle_digest,
+            approval_bundle: request.approval_bundle,
+            output: request.output,
+            workspace_export: request.workspace_export,
+            lifecycle: request.lifecycle,
+            retry: request.retry,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -150,11 +194,34 @@ pub struct AttendedExecutionSpec {
     #[serde(flatten)]
     pub approved: ApprovedExecutionSpec,
     pub credential_providers: Vec<AuthorizedCredentialProvider>,
+    /// Canonical grants consumed by the restricted-egress executor. These are
+    /// resolved from the same policy snapshot used to authorize the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_network_grants: Vec<AttendedNetworkGrantV1>,
     pub overlays: Vec<AuthorizedOverlay>,
     pub workspaces: Vec<WorkspaceSpec>,
     pub context_roots: Vec<ContextRootSpec>,
     pub repositories: Vec<RepositoryMountSpec>,
     pub primary_workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct AttendedNetworkGrantV1 {
+    pub resource: NetworkResourceKind,
+    pub mode: AttendedNetworkGrantModeV1,
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AttendedNetworkGrantModeV1 {
+    Hosts,
+    GuardedWeb,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
@@ -474,12 +541,13 @@ pub struct AttendedAuthorizationArtifact {
 
 impl AttendedAuthorizationRequestV1 {
     pub fn normalize(self) -> Result<Self, String> {
-        self.normalize_with_legacy_context_roots(true)
+        self.normalize_for_version(true, false)
     }
 
-    fn normalize_with_legacy_context_roots(
+    fn normalize_for_version(
         mut self,
         require_legacy_context_roots: bool,
+        require_effective_network_grants: bool,
     ) -> Result<Self, String> {
         if self.version != ATTENDED_AUTHORIZATION_REQUEST_VERSION {
             return Err(format!(
@@ -538,9 +606,6 @@ impl AttendedAuthorizationRequestV1 {
             .container_image
             .as_deref()
             .ok_or_else(|| "attended execution requires an exact image".to_string())?;
-        if image_family(image) != self.proposal.image_family {
-            return Err("attended image selector does not match the exact image".into());
-        }
         if image != self.proposal.image_tag {
             return Err("attended exact image tag does not match the canonical runtime".into());
         }
@@ -586,6 +651,15 @@ impl AttendedAuthorizationRequestV1 {
             }
         }) {
             return Err("attended network resources exceed the selected network class".into());
+        }
+        if require_effective_network_grants {
+            normalize_effective_network_grants(&self.proposal, &mut self.execution)?;
+        } else {
+            // V1-V3 predate captured grants. Discarding this in-memory field
+            // keeps their normalization and canonical bytes frozen, and a
+            // non-canonical legacy payload containing the field is rejected by
+            // artifact verification.
+            self.execution.effective_network_grants.clear();
         }
         if self.output != AttendedOutputContract::default()
             || self.lifecycle != AttendedLifecycleContract::default()
@@ -755,6 +829,49 @@ impl AttendedAuthorizationRequestV1 {
     }
 }
 
+fn normalize_effective_network_grants(
+    proposal: &AttendedProposal,
+    execution: &mut AttendedExecutionSpec,
+) -> Result<(), String> {
+    execution
+        .effective_network_grants
+        .sort_by_key(|grant| grant.resource.to_string());
+    if execution.effective_network_grants.len() != proposal.network_resources.len()
+        || execution
+            .effective_network_grants
+            .iter()
+            .map(|grant| grant.resource)
+            .collect::<Vec<_>>()
+            != proposal.network_resources
+    {
+        return Err("attended effective network grants do not match requested resources".into());
+    }
+    for grant in &execution.effective_network_grants {
+        if grant.hosts.windows(2).any(|pair| pair[0] >= pair[1])
+            || grant.hosts.iter().any(|host| {
+                host.is_empty() || host.len() > 512 || host.chars().any(char::is_control)
+            })
+            || grant.provider.as_ref().is_some_and(|provider| {
+                provider.is_empty()
+                    || provider.len() > 128
+                    || provider.chars().any(char::is_control)
+            })
+        {
+            return Err("attended effective network grant is not canonical".into());
+        }
+        match (grant.resource, grant.mode) {
+            (NetworkResourceKind::GuardedWeb, AttendedNetworkGrantModeV1::GuardedWeb)
+                if grant.hosts.is_empty() && grant.provider.is_none() => {}
+            (NetworkResourceKind::Llm, AttendedNetworkGrantModeV1::Hosts)
+                if !grant.hosts.is_empty() && grant.provider.is_some() => {}
+            (_, AttendedNetworkGrantModeV1::Hosts)
+                if !grant.hosts.is_empty() && grant.provider.is_none() => {}
+            _ => return Err("attended effective network grant mode is invalid".into()),
+        }
+    }
+    Ok(())
+}
+
 fn resolved_root_for_mount<'a>(
     roots: &'a [ResolvedRoot],
     identity: &str,
@@ -868,12 +985,13 @@ fn remote_host(remote: &str) -> Option<String> {
 
 impl AttendedAuthorizationRequestV2 {
     pub fn normalize(self) -> Result<Self, String> {
-        self.normalize_with_legacy_context_roots(true)
+        self.normalize_for_version(true, false)
     }
 
-    fn normalize_with_legacy_context_roots(
+    fn normalize_for_version(
         mut self,
         require_legacy_context_roots: bool,
+        require_effective_network_grants: bool,
     ) -> Result<Self, String> {
         if self.version != ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2 {
             return Err(format!(
@@ -929,7 +1047,10 @@ impl AttendedAuthorizationRequestV2 {
             output: self.output,
             lifecycle: self.lifecycle,
         }
-        .normalize_with_legacy_context_roots(require_legacy_context_roots)?;
+        .normalize_for_version(
+            require_legacy_context_roots,
+            require_effective_network_grants,
+        )?;
         self.proposal = normalized.proposal;
         self.execution = normalized.execution;
         self.approval_bundle_digest = approval_bundle_digest;
@@ -967,7 +1088,7 @@ impl AttendedAuthorizationRequestV3 {
             output: self.output,
             lifecycle: self.lifecycle,
         }
-        .normalize_with_legacy_context_roots(false)?;
+        .normalize_for_version(false, false)?;
         self.proposal = normalized.proposal;
         self.execution = normalized.execution;
         self.approval_bundle_digest = normalized.approval_bundle_digest;
@@ -1162,6 +1283,63 @@ impl AttendedAuthorizationRequestV3 {
     }
 }
 
+impl AttendedAuthorizationRequestV4 {
+    pub fn normalize(self) -> Result<Self, String> {
+        if self.version != ATTENDED_AUTHORIZATION_REQUEST_VERSION_V4 {
+            return Err(format!(
+                "unsupported attended authorization schema {}",
+                self.version
+            ));
+        }
+        let grants = self.execution.effective_network_grants.clone();
+        let normalized = AttendedAuthorizationRequestV3 {
+            version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3.into(),
+            proposal: self.proposal,
+            execution: self.execution,
+            roots: self.roots,
+            workspace_root_identities: self.workspace_root_identities,
+            context_root_identities: self.context_root_identities,
+            git_views: self.git_views,
+            approval_bundle_digest: self.approval_bundle_digest,
+            approval_bundle: self.approval_bundle,
+            output: self.output,
+            workspace_export: self.workspace_export,
+            lifecycle: self.lifecycle,
+            retry: self.retry,
+        }
+        .normalize()?;
+        let mut execution = normalized.execution;
+        execution.effective_network_grants = grants;
+        normalize_effective_network_grants(&normalized.proposal, &mut execution)?;
+        Ok(Self {
+            version: ATTENDED_AUTHORIZATION_REQUEST_VERSION_V4.into(),
+            proposal: normalized.proposal,
+            execution,
+            roots: normalized.roots,
+            workspace_root_identities: normalized.workspace_root_identities,
+            context_root_identities: normalized.context_root_identities,
+            git_views: normalized.git_views,
+            approval_bundle_digest: normalized.approval_bundle_digest,
+            approval_bundle: normalized.approval_bundle,
+            output: normalized.output,
+            workspace_export: normalized.workspace_export,
+            lifecycle: normalized.lifecycle,
+            retry: normalized.retry,
+        })
+    }
+
+    pub fn canonical_artifact(&self) -> Result<AttendedAuthorizationArtifact, String> {
+        let normalized = self.clone().normalize()?;
+        let bytes =
+            canonical_json_bytes(serde_json::to_value(normalized).map_err(|e| e.to_string())?)?;
+        Ok(AttendedAuthorizationArtifact {
+            version: ATTENDED_AUTHORIZATION_VERSION_V4,
+            digest: sha256_hex_with_domain(ATTENDED_AUTHORIZATION_DOMAIN_V4, &bytes),
+            canonical_bytes: bytes,
+        })
+    }
+}
+
 fn is_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -1248,6 +1426,29 @@ impl AttendedAuthorizationArtifact {
         }
         Ok(normalized)
     }
+
+    pub fn verify_v4(&self) -> Result<AttendedAuthorizationRequestV4, String> {
+        if self.version != ATTENDED_AUTHORIZATION_VERSION_V4 {
+            return Err(format!(
+                "unsupported attended authorization version {}",
+                self.version
+            ));
+        }
+        let expected =
+            sha256_hex_with_domain(ATTENDED_AUTHORIZATION_DOMAIN_V4, &self.canonical_bytes);
+        if self.digest != expected {
+            return Err("attended authorization digest mismatch".into());
+        }
+        let parsed: AttendedAuthorizationRequestV4 = serde_json::from_slice(&self.canonical_bytes)
+            .map_err(|e| format!("invalid attended authorization: {e}"))?;
+        let normalized = parsed.normalize()?;
+        let canonical =
+            canonical_json_bytes(serde_json::to_value(&normalized).map_err(|e| e.to_string())?)?;
+        if canonical != self.canonical_bytes {
+            return Err("attended authorization payload is not canonical".into());
+        }
+        Ok(normalized)
+    }
 }
 
 fn validate_alias(alias: &str) -> Result<(), String> {
@@ -1281,16 +1482,6 @@ fn validate_absolute_path(value: &str, label: &str) -> Result<(), String> {
         return Err(format!("attended {label} path is not canonical"));
     }
     Ok(())
-}
-
-fn image_family(image: &str) -> String {
-    let without_digest = image.split('@').next().unwrap_or(image);
-    let slash = without_digest.rfind('/');
-    let family = match without_digest.rfind(':') {
-        Some(colon) if slash.is_none_or(|slash| colon > slash) => &without_digest[..colon],
-        _ => without_digest,
-    };
-    family.rsplit('/').next().unwrap_or(family).to_string()
 }
 
 fn reject_duplicate_by<'a, T, F>(items: &'a [T], key: F, label: &str) -> Result<(), String>

@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{EnvironmentConfig, NetworkPolicyConfig, SystemConfig, flatten_policy};
+use crate::{
+    EnvironmentConfig, ImageConfig, NetworkPolicyConfig, SystemConfig, flatten_policy,
+    resolve_installed_image_reference,
+};
 
 pub const DURABLE_OPENCODE_MODEL: &str = "openai/gpt-5.6-sol";
 pub const DURABLE_OPENCODE_IMAGE: &str = "agent-hub/job-code:2026-09-09";
@@ -201,13 +204,18 @@ pub fn materialize_environment_bundle_with_snapshot(
             environment.name
         ));
     }
-    if environment.image != DURABLE_OPENCODE_IMAGE {
-        return Err(format!(
-            "environment '{}' must use pinned OpenCode image '{DURABLE_OPENCODE_IMAGE}'",
-            environment.name
-        ));
-    }
-
+    let images = load_installed_images(config_root, system)?;
+    resolve_installed_image_reference(
+        &environment.image,
+        None,
+        images.iter().map(|(family, image)| {
+            (
+                family.as_str(),
+                Some(image.name.as_str()),
+                Some(image.tag.as_str()),
+            )
+        }),
+    )?;
     let flattened = flatten_policy(&environment.network_policy, policies, system)?;
     let network_policy = serde_json::to_vec_pretty(&json!({
         "name": flattened.name,
@@ -586,7 +594,7 @@ fn approval_bundle_identity_from_captured(
     if !policy.starts_with("dippy-policy 1\n") {
         return Err("approval bundle Dippy policy version is unsupported".into());
     }
-    let digest = digest_named_files(&captured);
+    let digest = digest_named_files(captured);
     let identity = ApprovalBundleIdentity {
         name: name.to_string(),
         digest,
@@ -781,6 +789,24 @@ fn load_network_policies(
     Ok(policies)
 }
 
+fn load_installed_images(
+    config_root: &Path,
+    system: &SystemConfig,
+) -> Result<BTreeMap<String, ImageConfig>, String> {
+    let mut images = BTreeMap::new();
+    if let Some(configured) = &system.images {
+        for name in &configured.installed {
+            validate_name(name, "image")?;
+            let image =
+                ImageConfig::load(&config_root.join("images").join(name).join("image.toml"))?;
+            if images.insert(name.clone(), image).is_some() {
+                return Err(format!("duplicate installed image '{name}'"));
+            }
+        }
+    }
+    Ok(images)
+}
+
 fn collect_directory(
     source: &Path,
     destination: &str,
@@ -901,6 +927,134 @@ fn digest_files(files: &[EnvironmentBundleFile]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn direct_materialization_fixture(
+        label: &str,
+        environment_image: &str,
+        installed_images: &[(&str, &str, &str)],
+    ) -> (PathBuf, SystemConfig, HashMap<String, NetworkPolicyConfig>) {
+        let root = std::env::temp_dir().join(format!(
+            "agent-hub-direct-materialization-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("environments/test")).unwrap();
+        let installed = installed_images
+            .iter()
+            .map(|(family, _, _)| format!("\"{family}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let system = SystemConfig::from_toml(
+            &format!(
+                "[system]\noperator = \"test\"\nbot_identity = \"test\"\n[system.images]\ninstalled = [{installed}]\n"
+            ),
+            "direct materialization system",
+        )
+        .unwrap();
+        for (family, manifest_name, reference) in installed_images {
+            let directory = root.join("images").join(family);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("image.toml"),
+                format!(
+                    "[image]\nname = \"{manifest_name}\"\ntag = \"{reference}\"\ndescription = \"test image\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("environments/test/environment.toml"),
+            format!(
+                "[environment]\nname = \"test\"\ndescription = \"test\"\nimage = \"{environment_image}\"\nnetwork_policy = \"none\"\napproval_mode = \"auto\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("environments/test/opencode.json"),
+            serde_json::to_vec(&json!({
+                "model": DURABLE_OPENCODE_MODEL,
+                "small_model": DURABLE_OPENCODE_MODEL,
+                "enabled_providers": ["openai"],
+                "permission": {"*":"allow"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let policies = HashMap::from([(
+            "none".to_string(),
+            NetworkPolicyConfig::from_toml(
+                "[policy]\nname = \"none\"\ndescription = \"none\"\ndocker_network = \"none\"\n",
+                "direct materialization policy",
+            )
+            .unwrap(),
+        )]);
+        (root, system, policies)
+    }
+
+    fn direct_materialization_result(
+        label: &str,
+        environment_image: &str,
+        installed_images: &[(&str, &str, &str)],
+    ) -> Result<EnvironmentBundle, String> {
+        let (root, system, policies) =
+            direct_materialization_fixture(label, environment_image, installed_images);
+        let result =
+            materialize_environment_bundle_with_snapshot(&root, "test", &system, &policies);
+        std::fs::remove_dir_all(root).unwrap();
+        result
+    }
+
+    #[test]
+    fn direct_materialization_rejects_unknown_image_reference() {
+        let error = direct_materialization_result(
+            "unknown-image",
+            "registry.example/job-code:unreviewed",
+            &[("job-code", "job-code", "registry.example/job-code:reviewed")],
+        )
+        .unwrap_err();
+        assert!(error.contains("not installed"), "{error}");
+    }
+
+    #[test]
+    fn direct_materialization_rejects_misnamed_image_manifest() {
+        let reference = "registry.example/job-code:reviewed";
+        let error = direct_materialization_result(
+            "misnamed-manifest",
+            reference,
+            &[("job-code", "other-family", reference)],
+        )
+        .unwrap_err();
+        assert!(error.contains("does not match manifest name"), "{error}");
+    }
+
+    #[test]
+    fn direct_materialization_rejects_ambiguous_image_reference() {
+        let reference = "registry.example/shared:candidate";
+        let error = direct_materialization_result(
+            "ambiguous-reference",
+            reference,
+            &[
+                ("job-code", "job-code", reference),
+                ("job-other", "job-other", reference),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguously matches"), "{error}");
+    }
+
+    #[test]
+    fn direct_materialization_accepts_registered_qualified_repository_reference() {
+        let reference = "agent-hub/job-code-qualification:4d596913-2cc2-4068-a842-3db326aa6f1c";
+        direct_materialization_result(
+            "qualified-reference",
+            reference,
+            &[("job-code", "job-code", reference)],
+        )
+        .unwrap();
+    }
 
     fn write_test_approval_bundle(
         root: &Path,
@@ -1211,6 +1365,7 @@ dippy_wheel_sha256 = "{}"
         ));
         for directory in [
             "environments/test",
+            "images/job-code",
             "network_policies/none",
             "shared/skills/example",
             "shared/agents",
@@ -1222,11 +1377,22 @@ dippy_wheel_sha256 = "{}"
             r#"[system]
 operator = "test"
 bot_identity = "test"
+[system.images]
+installed = ["job-code"]
 [system.network_policies]
 installed = ["none"]
 [system.environments]
 installed = ["test"]
 triage_environment = "test"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("images/job-code/image.toml"),
+            r#"[image]
+name = "job-code"
+tag = "agent-hub/job-code:2026-09-09"
+description = "test image"
 "#,
         )
         .unwrap();

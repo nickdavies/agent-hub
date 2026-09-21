@@ -9,6 +9,7 @@
 pub mod approval;
 pub mod attended;
 pub mod attended_gateway;
+pub mod capabilities;
 pub mod catalog;
 pub mod config;
 pub mod gateway;
@@ -33,11 +34,13 @@ pub use approval::{
 pub use attended::{
     AGENT_RESULT_V1_SCHEMA, APPROVAL_BUNDLE_PROTOCOL, APPROVED_EXECUTION_PIDS_LIMIT,
     ATTENDED_AUTHORIZATION_REQUEST_VERSION, ATTENDED_AUTHORIZATION_REQUEST_VERSION_V2,
-    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ATTENDED_AUTHORIZATION_VERSION,
-    ATTENDED_AUTHORIZATION_VERSION_V2, ATTENDED_AUTHORIZATION_VERSION_V3, AgentAcceptanceResult,
+    ATTENDED_AUTHORIZATION_REQUEST_VERSION_V3, ATTENDED_AUTHORIZATION_REQUEST_VERSION_V4,
+    ATTENDED_AUTHORIZATION_VERSION, ATTENDED_AUTHORIZATION_VERSION_V2,
+    ATTENDED_AUTHORIZATION_VERSION_V3, ATTENDED_AUTHORIZATION_VERSION_V4, AgentAcceptanceResult,
     AgentArtifactReference, AgentResultV1, ApprovedExecutionSpec, AttendedApprovalBundleIdentity,
     AttendedAuthorizationArtifact, AttendedAuthorizationRequestV1, AttendedAuthorizationRequestV2,
-    AttendedAuthorizationRequestV3, AttendedExecutionSpec, AttendedLifecycleContract,
+    AttendedAuthorizationRequestV3, AttendedAuthorizationRequestV4, AttendedExecutionSpec,
+    AttendedLifecycleContract, AttendedNetworkGrantModeV1, AttendedNetworkGrantV1,
     AttendedOutputContract, AttendedOutputLimits, AttendedProposal, AttendedRetryConstraints,
     AttendedWorkspaceExportContract, AuthorizedCredentialProvider, AuthorizedOverlay,
     ContextRootSpec, GitObjectStoreSpec, GitRepositoryType, GitViewSpec, GithubOverlayBinding,
@@ -54,6 +57,11 @@ pub use attended_gateway::{
     attended_approval_bundle_digest, attended_network_digest, decode_attended_gateway_payload,
     encode_attended_gateway_frame, opencode_match_input_digest, opencode_raw_args_digest,
     tool_input_digest,
+};
+pub use capabilities::{
+    AGENT_HUB_CAPABILITIES_MAX_BYTES, AGENT_HUB_CAPABILITIES_MAX_COUNT,
+    AGENT_HUB_CAPABILITIES_SCHEMA_V1, AGENT_HUB_CAPABILITY_MAX_BYTES, AGENT_HUB_RUN_CAPABILITY_V1,
+    AgentHubCapabilitiesV1,
 };
 pub use catalog::{
     AGENT_HUB_CATALOG_MAX_BYTES, AGENT_HUB_CATALOG_SCHEMA_V1,
@@ -79,14 +87,14 @@ pub use host_run::{
     AGENT_HUB_RUN_MAX_CANONICAL_BYTES, AGENT_HUB_RUN_MAX_GATEWAY_INPUT_BYTES,
     AGENT_HUB_RUN_MAX_GATEWAY_OUTPUT_BYTES, AGENT_HUB_RUN_MAX_POLICY_PROJECTION_BYTES,
     AGENT_HUB_RUN_MAX_REASON_BYTES, AGENT_HUB_RUN_OUTPUT_SCHEMA_V1, AGENT_HUB_RUN_PERMISSION_NAME,
-    AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V1, AGENT_HUB_RUN_RESOLVED_SCHEMA_V1,
+    AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V2, AGENT_HUB_RUN_RESOLVED_SCHEMA_V1,
     AgentHubRunApprovalReceiptStatus, AgentHubRunApprovalReceiptV1, AgentHubRunCanonicalArtifactV1,
     AgentHubRunCapabilityProjectionV1, AgentHubRunContextRootV1, AgentHubRunDecision,
     AgentHubRunDecisionAuthority, AgentHubRunDecisionV1, AgentHubRunImageFamily,
     AgentHubRunIntentSchema, AgentHubRunIntentV1, AgentHubRunNetworkClass, AgentHubRunOutputV1,
-    AgentHubRunPolicyProjectionV1, AgentHubRunReceiptV1, AgentHubRunResolvedV1,
-    AgentHubRunReviewProjectionV1, AgentHubRunRootProjectionV1, AgentHubRunToolApproval,
-    AgentHubRunWorkspaceV1,
+    AgentHubRunPermissionSetV2, AgentHubRunPolicyProjectionV2, AgentHubRunReceiptV1,
+    AgentHubRunResolvedV1, AgentHubRunReviewProjectionV1, AgentHubRunRootProjectionV1,
+    AgentHubRunToolApproval, AgentHubRunWorkspaceV1,
 };
 pub use job_events::{JOB_EVENT_SCHEMA_NAME, JobEvent, JobEventKind};
 pub use orchestration::{

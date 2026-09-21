@@ -29,8 +29,8 @@ pub use environment_bundle::{
 pub use image::{
     ImageBuildContext, ImageConfig, ImageToolFactsManifest, JOB_CODE_PREFLIGHT_PATH,
     JOB_CODE_TOOL_MANIFEST_PATH, job_code_preflight_docker_args, job_code_tool_manifest_sha256,
-    resolve_build_order, sha256_hex, validate_job_code_preflight_report,
-    validate_supervised_opencode_preflight_report,
+    resolve_build_order, resolve_installed_image_reference, resolve_managed_image_reference,
+    sha256_hex, validate_job_code_preflight_report, validate_supervised_opencode_preflight_report,
 };
 pub use network_policy::{
     FlattenedPolicy, NetworkPolicyConfig, PolicyAllowRule, canonical_policy_hosts, flatten_policy,

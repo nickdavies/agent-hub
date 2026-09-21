@@ -1,7 +1,14 @@
-.PHONY: build build-job-image build-job-images build-environments build-all dev-up dev-down bootstrap-vikunja run-local-agent test-approval-client-fast test-approval-service-fast test-server-fast test-api-fast test-gateway-fast test-gateway-network test-executor-slow test-local-agent-faults
+.PHONY: lint test build build-job-image build-job-images build-environments build-all dev-up dev-down bootstrap-vikunja run-local-agent test-approval-client-fast test-approval-service-fast test-server-fast test-api-fast test-gateway-fast test-gateway-network test-executor-slow test-local-agent-faults
+
+lint:
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets --locked -- -D warnings
+
+test:
+	cargo test --workspace --all-targets --locked
 
 build:
-	cargo build
+	cargo build --workspace --locked
 
 build-job-image:
 	$(MAKE) build-job-images

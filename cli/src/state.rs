@@ -25,6 +25,10 @@ impl Drop for StateLock {
 }
 
 impl StateStore {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn open(root: PathBuf) -> anyhow::Result<Self> {
         ensure!(!root.as_os_str().is_empty(), "state root path is empty");
         ensure!(root.is_absolute(), "state root path must be absolute");

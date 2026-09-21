@@ -418,6 +418,15 @@ pub struct ImageConfig {
 pub struct ImageToolFactsManifest {
     pub path: String,
     pub sha256: String,
+    pub image_reference: String,
+    pub backend_metadata_revision: String,
+    pub image_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedImageReference {
+    pub family: String,
+    pub reference: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -483,12 +492,94 @@ impl ImageConfig {
                     .any(|component| !matches!(component, std::path::Component::Normal(_)))
                 || path.to_string_lossy().replace('\\', "/") != manifest.path
                 || !is_canonical_digest(&manifest.sha256, 64)
+                || manifest.image_reference.is_empty()
+                || manifest.image_reference != self.tag
+                || manifest.image_reference.len() > 512
+                || manifest.image_reference.chars().any(char::is_control)
+                || manifest.backend_metadata_revision.is_empty()
+                || manifest.backend_metadata_revision.len() > 128
+                || manifest
+                    .backend_metadata_revision
+                    .chars()
+                    .any(char::is_control)
+                || !is_sha256_identity(&manifest.image_identity)
             {
                 return Err("image tool facts manifest metadata is invalid".to_string());
             }
         }
         Ok(())
     }
+}
+
+pub fn resolve_installed_image_reference<'a>(
+    reference: &str,
+    expected_family: Option<&str>,
+    installed: impl IntoIterator<Item = (&'a str, Option<&'a str>, Option<&'a str>)>,
+) -> Result<ResolvedImageReference, String> {
+    let mut matches = Vec::new();
+    for (family, manifest_name, manifest_reference) in installed {
+        let manifest_name = manifest_name.ok_or_else(|| {
+            format!("installed image family '{family}' manifest has no declared name")
+        })?;
+        let manifest_reference = manifest_reference.ok_or_else(|| {
+            format!("installed image family '{family}' manifest has no declared reference")
+        })?;
+        if family != manifest_name {
+            return Err(format!(
+                "installed image family '{family}' does not match manifest name '{manifest_name}'"
+            ));
+        }
+        if manifest_reference == reference {
+            matches.push(family);
+        }
+    }
+    let family = match matches.as_slice() {
+        [] => return Err(format!("image reference '{reference}' is not installed")),
+        [family] => *family,
+        _ => {
+            return Err(format!(
+                "image reference '{reference}' ambiguously matches installed families: {}",
+                matches.join(", ")
+            ));
+        }
+    };
+    if let Some(expected) = expected_family
+        && expected != family
+    {
+        return Err(format!(
+            "expected image family '{expected}' does not match installed family '{family}' for reference '{reference}'"
+        ));
+    }
+    Ok(ResolvedImageReference {
+        family: family.to_string(),
+        reference: reference.to_string(),
+    })
+}
+
+pub fn resolve_managed_image_reference<'a>(
+    reference: &str,
+    expected_family: Option<&str>,
+    installed: impl IntoIterator<Item = (&'a str, Option<&'a str>, Option<&'a str>)>,
+    managed_images: &BTreeMap<String, String>,
+) -> Result<ResolvedImageReference, String> {
+    let resolved = resolve_installed_image_reference(reference, expected_family, installed)?;
+    if managed_images.get(&resolved.family).map(String::as_str) != Some(reference) {
+        return Err(format!(
+            "managed image alias for family '{}' does not match installed reference '{reference}'",
+            resolved.family
+        ));
+    }
+    let aliases = managed_images
+        .iter()
+        .filter_map(|(family, candidate)| (candidate == reference).then_some(family.as_str()))
+        .collect::<Vec<_>>();
+    if aliases.len() != 1 {
+        return Err(format!(
+            "managed image reference '{reference}' ambiguously maps to families: {}",
+            aliases.join(", ")
+        ));
+    }
+    Ok(resolved)
 }
 
 pub fn resolve_build_order(configs: &[ImageConfig]) -> Result<Vec<String>, String> {
@@ -549,6 +640,144 @@ fn visit_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image(name: &str, tag: &str) -> ImageConfig {
+        ImageConfig::from_toml(
+            &format!("[image]\nname='{name}'\ntag='{tag}'\ndescription='test'\n"),
+            "test image",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn managed_image_resolution_uses_declared_family_and_opaque_reference() {
+        for reference in [
+            "agent-hub/job-code:2026-09-09",
+            "registry.example:5443/platform/qualification:candidate",
+            "registry.example:5443/platform/qualification@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let job_code = image("job-code", reference);
+            let installed = BTreeMap::from([("job-code".to_string(), job_code)]);
+            let managed = BTreeMap::from([("job-code".to_string(), reference.to_string())]);
+            let resolved = resolve_managed_image_reference(
+                reference,
+                Some("job-code"),
+                installed.iter().map(|(family, image)| {
+                    (
+                        family.as_str(),
+                        Some(image.name.as_str()),
+                        Some(image.tag.as_str()),
+                    )
+                }),
+                &managed,
+            )
+            .unwrap();
+            assert_eq!(resolved.family, "job-code");
+            assert_eq!(resolved.reference, reference);
+        }
+    }
+
+    #[test]
+    fn managed_image_resolution_rejects_unknown_ambiguous_and_mismatched_bindings() {
+        let reference = "registry.example:5443/platform/qualification:candidate";
+        let job_code = image("job-code", reference);
+        let job_other = image("job-other", reference);
+        let one = BTreeMap::from([("job-code".to_string(), job_code.clone())]);
+        let managed = BTreeMap::from([("job-code".to_string(), reference.to_string())]);
+
+        assert!(
+            resolve_managed_image_reference(
+                "registry.example/unknown:tag",
+                Some("job-code"),
+                one.iter().map(|(family, image)| {
+                    (
+                        family.as_str(),
+                        Some(image.name.as_str()),
+                        Some(image.tag.as_str()),
+                    )
+                }),
+                &managed,
+            )
+            .unwrap_err()
+            .contains("not installed")
+        );
+        let ambiguous = BTreeMap::from([
+            ("job-code".to_string(), job_code),
+            ("job-other".to_string(), job_other),
+        ]);
+        assert!(
+            resolve_managed_image_reference(
+                reference,
+                Some("job-code"),
+                ambiguous.iter().map(|(family, image)| {
+                    (
+                        family.as_str(),
+                        Some(image.name.as_str()),
+                        Some(image.tag.as_str()),
+                    )
+                }),
+                &managed,
+            )
+            .unwrap_err()
+            .contains("ambiguously matches")
+        );
+        assert!(
+            resolve_managed_image_reference(
+                reference,
+                Some("job-other"),
+                one.iter().map(|(family, image)| {
+                    (
+                        family.as_str(),
+                        Some(image.name.as_str()),
+                        Some(image.tag.as_str()),
+                    )
+                }),
+                &managed,
+            )
+            .unwrap_err()
+            .contains("expected image family")
+        );
+        let wrong_managed = BTreeMap::from([(
+            "job-code".to_string(),
+            "registry.example/wrong:tag".to_string(),
+        )]);
+        assert!(
+            resolve_managed_image_reference(
+                reference,
+                Some("job-code"),
+                one.iter().map(|(family, image)| {
+                    (
+                        family.as_str(),
+                        Some(image.name.as_str()),
+                        Some(image.tag.as_str()),
+                    )
+                }),
+                &wrong_managed,
+            )
+            .unwrap_err()
+            .contains("managed image alias")
+        );
+        let duplicate_managed = BTreeMap::from([
+            ("job-code".to_string(), reference.to_string()),
+            ("job-other".to_string(), reference.to_string()),
+        ]);
+        assert!(
+            resolve_managed_image_reference(
+                reference,
+                Some("job-code"),
+                one.iter().map(|(family, image)| {
+                    (
+                        family.as_str(),
+                        Some(image.name.as_str()),
+                        Some(image.tag.as_str()),
+                    )
+                }),
+                &duplicate_managed,
+            )
+            .unwrap_err()
+            .contains("ambiguously maps")
+        );
+    }
 
     #[test]
     fn image_source_context_requires_exact_archive_identity_and_rejects_unknown_fields() {
@@ -611,8 +840,9 @@ archive_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
         );
 
         let with_tool_facts = format!(
-            "{valid}\n[image.tool_facts]\npath = 'images/job-code/tool-facts.json'\nsha256 = '{}'\n",
-            "d".repeat(64)
+            "{valid}\n[image.tool_facts]\npath = 'images/job-code/tool-facts.json'\nsha256 = '{}'\nimage_reference = 'agent-hub/job-code:2026-09-09'\nbackend_metadata_revision = 'revision-1'\nimage_identity = 'sha256:{}'\n",
+            "d".repeat(64),
+            "e".repeat(64),
         );
         let metadata = ImageConfig::from_toml(&with_tool_facts, "tool facts")
             .unwrap()
@@ -622,6 +852,8 @@ archive_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
         for invalid in [
             with_tool_facts.replace("images/job-code/tool-facts.json", "/private/facts.json"),
             with_tool_facts.replace(&"d".repeat(64), "not-a-digest"),
+            with_tool_facts.replace("revision-1", ""),
+            with_tool_facts.replace(&format!("sha256:{}", "e".repeat(64)), "not-an-identity"),
             format!("{with_tool_facts}unknown = true\n"),
         ] {
             assert!(ImageConfig::from_toml(&invalid, "invalid tool facts").is_err());

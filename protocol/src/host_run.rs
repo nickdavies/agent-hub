@@ -7,8 +7,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AttendedAuthorizationArtifact, AttendedOutputContract, AttendedRetryConstraints,
-    NetworkResourceKind, WorkspaceAccess, sha256_hex_with_domain,
+    ApprovalRuleSet, AttendedAuthorizationArtifact, AttendedNetworkGrantV1, AttendedOutputLimits,
+    AttendedRetryConstraints, NetworkResourceKind, PlannedRepoClaim, WorkspaceAccess,
+    sha256_hex_with_domain,
 };
 
 pub const AGENT_HUB_RUN_PERMISSION_NAME: &str = "agent_hub_run_resolved";
@@ -29,9 +30,10 @@ pub const AGENT_HUB_RUN_MAX_POLICY_PROJECTION_BYTES: usize = 128 * 1024;
 pub const AGENT_HUB_RUN_MAX_REASON_BYTES: usize = 4096;
 pub const AGENT_HUB_RUN_MAX_OVERLAY_NAME_BYTES: usize = 128;
 pub const AGENT_HUB_RUN_MAX_APPROVAL_TIMEOUT_SECS: u64 = 600;
-pub const AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V1: &str = "agent_hub_run_policy_projection_v1";
+pub const AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V2: &str = "agent_hub_run_policy_projection_v2";
 const RESOLVED_DOMAIN: &[u8] = b"agent-hub:agent-hub-run-resolved:v1\0";
 const RECEIPT_DOMAIN: &[u8] = b"agent-hub:agent-hub-run-receipt:v1\0";
+const PERMISSION_SCOPE_DOMAIN: &[u8] = b"agent-hub:agent-hub-run-permission-scope:v1\0";
 
 /// Public tool input. It contains requested capabilities only; config identity,
 /// image identity, provider commands, and gateway transport are host-owned.
@@ -226,8 +228,6 @@ pub struct AgentHubRunRootProjectionV1 {
     #[schemars(length(min = 1, max = 1024))]
     pub path: String,
     pub access: WorkspaceAccess,
-    #[schemars(length(min = 1, max = 128))]
-    pub root_identity: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
@@ -237,17 +237,16 @@ pub struct AgentHubRunCapabilityProjectionV1 {
     pub name: String,
     #[schemars(length(min = 1, max = 64))]
     pub access: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 32), inner(length(min = 1, max = 256)))]
+    pub targets: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub constraints: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHubRunReviewProjectionV1 {
-    #[schemars(length(min = 1, max = 128))]
-    pub config_digest: String,
-    #[schemars(length(min = 1, max = 128))]
-    pub environment_bundle_digest: String,
-    #[schemars(length(min = 1, max = 128))]
-    pub approval_bundle_digest: String,
     #[schemars(length(min = 1, max = 63))]
     pub primary_workspace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,22 +254,36 @@ pub struct AgentHubRunReviewProjectionV1 {
     pub workspace_export_root: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHubRunPermissionSetV2 {
+    pub tier: String,
+    pub can_read_workspace: bool,
+    pub can_write_workspace: bool,
+    pub can_run_shell: bool,
+    pub can_access_network: bool,
+    pub auto_approve_tools: Vec<String>,
+    pub escalate_tools: Vec<String>,
+    pub kubernetes_access: Option<String>,
+    pub aws_access: Option<String>,
+}
+
 /// Strict policy surface derived from a verified canonical execution. Policy
 /// matching never receives the canonical transport or public intent fields.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AgentHubRunPolicyProjectionV1 {
+pub struct AgentHubRunPolicyProjectionV2 {
     pub schema: String,
     #[schemars(length(min = 1, max = 128))]
     pub environment: String,
     #[schemars(length(min = 1, max = 64))]
     pub image_family: String,
-    #[schemars(length(min = 71, max = 71))]
-    pub image_id: String,
     #[schemars(length(min = 1, max = 32))]
     pub network_class: String,
     #[schemars(length(max = 16))]
     pub network_resources: Vec<NetworkResourceKind>,
+    #[schemars(length(max = 16))]
+    pub effective_network_grants: Vec<AttendedNetworkGrantV1>,
     #[schemars(length(min = 1, max = 16))]
     pub tool_approval: String,
     #[schemars(length(min = 1, max = 16))]
@@ -284,28 +297,20 @@ pub struct AgentHubRunPolicyProjectionV1 {
     #[schemars(range(min = 1, max = 86400))]
     pub timeout_secs: u64,
     pub retry: AttendedRetryConstraints,
-    pub output: AttendedOutputContract,
+    pub output_limits: AttendedOutputLimits,
+    pub memory_limit: Option<String>,
+    pub cpu_limit: Option<String>,
+    pub pids_limit: u32,
+    pub permissions: AgentHubRunPermissionSetV2,
+    pub approval_rules: Option<ApprovalRuleSet>,
+    pub repository_claims: Vec<PlannedRepoClaim>,
     pub prompt_digest: String,
     pub review: AgentHubRunReviewProjectionV1,
 }
 
-impl AgentHubRunPolicyProjectionV1 {
+impl AgentHubRunPolicyProjectionV2 {
     pub fn derive(artifact: &AttendedAuthorizationArtifact) -> Result<Self, String> {
-        let request = artifact.verify_v3()?;
-        let workspace_identity = |alias: &str| {
-            request
-                .workspace_root_identities
-                .get(alias)
-                .cloned()
-                .ok_or_else(|| format!("workspace {alias} has no root identity"))
-        };
-        let context_identity = |alias: &str| {
-            request
-                .context_root_identities
-                .get(alias)
-                .cloned()
-                .ok_or_else(|| format!("context root {alias} has no root identity"))
-        };
+        let request = artifact.verify_v4()?;
         let mut workspaces = request
             .execution
             .workspaces
@@ -315,7 +320,6 @@ impl AgentHubRunPolicyProjectionV1 {
                     alias: root.alias.clone(),
                     path: root.host_path.clone(),
                     access: root.access,
-                    root_identity: workspace_identity(&root.alias)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -328,7 +332,6 @@ impl AgentHubRunPolicyProjectionV1 {
                     alias: root.alias.clone(),
                     path: root.host_path.clone(),
                     access: WorkspaceAccess::ReadOnly,
-                    root_identity: context_identity(&root.alias)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -348,6 +351,18 @@ impl AgentHubRunPolicyProjectionV1 {
                 Ok(AgentHubRunCapabilityProjectionV1 {
                     name: overlay.name.clone(),
                     access: access.to_string(),
+                    targets: Vec::new(),
+                    constraints: config
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(name, _)| *name != "credential_provider")
+                        .map(|(name, value)| {
+                            serde_json::to_string(value)
+                                .map(|value| (name.clone(), value))
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<_, _>>()?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -356,9 +371,22 @@ impl AgentHubRunPolicyProjectionV1 {
             .execution
             .credential_providers
             .iter()
-            .map(|capability| AgentHubRunCapabilityProjectionV1 {
-                name: capability.name.clone(),
-                access: capability.access.clone(),
+            .map(|capability| {
+                let mut targets = capability.targets.clone();
+                targets.sort();
+                targets.dedup();
+                let constraints = capability
+                    .constraints
+                    .iter()
+                    .filter(|(name, _)| name.as_str() != "source_sha256")
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                AgentHubRunCapabilityProjectionV1 {
+                    name: capability.name.clone(),
+                    access: capability.access.clone(),
+                    targets,
+                    constraints,
+                }
             })
             .collect::<Vec<_>>();
         capabilities.extend(request.execution.runtime.github_capabilities.iter().map(
@@ -374,21 +402,41 @@ impl AgentHubRunPolicyProjectionV1 {
                 } else {
                     "read_only"
                 };
+                let mut targets = capability
+                    .operations
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                targets.sort();
+                targets.dedup();
                 AgentHubRunCapabilityProjectionV1 {
                     name: format!("github:{}", capability.repository),
                     access: access.into(),
+                    targets,
+                    constraints: std::collections::BTreeMap::new(),
                 }
             },
         ));
         capabilities.sort();
         capabilities.dedup();
+        let mut auto_approve_tools = request
+            .execution
+            .runtime
+            .permissions
+            .auto_approve_tools
+            .clone();
+        auto_approve_tools.sort();
+        auto_approve_tools.dedup();
+        let mut escalate_tools = request.execution.runtime.permissions.escalate_tools.clone();
+        escalate_tools.sort();
+        escalate_tools.dedup();
         let projection = Self {
-            schema: AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V1.into(),
+            schema: AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V2.into(),
             environment: request.proposal.environment.clone(),
             image_family: request.proposal.image_family.clone(),
-            image_id: request.proposal.image_id.clone(),
             network_class: request.proposal.network_class.clone(),
             network_resources: request.proposal.network_resources.clone(),
+            effective_network_grants: request.execution.effective_network_grants.clone(),
             tool_approval: match request.proposal.tool_approval {
                 crate::ToolApprovalMode::Auto => "auto",
                 crate::ToolApprovalMode::Dippy => "dippy",
@@ -400,12 +448,34 @@ impl AgentHubRunPolicyProjectionV1 {
             capabilities,
             timeout_secs: request.proposal.timeout_secs,
             retry: request.retry.clone(),
-            output: request.output.clone(),
+            output_limits: request.output.limits.clone(),
+            memory_limit: request.execution.runtime.environment.memory_limit.clone(),
+            cpu_limit: request.execution.runtime.environment.cpu_limit.clone(),
+            pids_limit: request.execution.pids_limit,
+            permissions: AgentHubRunPermissionSetV2 {
+                tier: serde_json::to_value(&request.execution.runtime.permissions.tier)
+                    .map_err(|error| error.to_string())?
+                    .as_str()
+                    .ok_or_else(|| "permission tier did not serialize as a string".to_string())?
+                    .to_string(),
+                can_read_workspace: request.execution.runtime.permissions.can_read_workspace,
+                can_write_workspace: request.execution.runtime.permissions.can_write_workspace,
+                can_run_shell: request.execution.runtime.permissions.can_run_shell,
+                can_access_network: request.execution.runtime.permissions.can_access_network,
+                auto_approve_tools,
+                escalate_tools,
+                kubernetes_access: request
+                    .execution
+                    .runtime
+                    .permissions
+                    .kubernetes_access
+                    .clone(),
+                aws_access: request.execution.runtime.permissions.aws_access.clone(),
+            },
+            approval_rules: request.execution.runtime.approval_rules.clone(),
+            repository_claims: request.execution.runtime.repos.clone(),
             prompt_digest: request.proposal.prompt_digest.clone(),
             review: AgentHubRunReviewProjectionV1 {
-                config_digest: request.execution.config_digest.clone(),
-                environment_bundle_digest: request.execution.environment_bundle_digest.clone(),
-                approval_bundle_digest: request.approval_bundle_digest.clone(),
                 primary_workspace: request.execution.primary_workspace.clone(),
                 workspace_export_root: request
                     .workspace_export
@@ -418,7 +488,7 @@ impl AgentHubRunPolicyProjectionV1 {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V1
+        if self.schema != AGENT_HUB_RUN_POLICY_PROJECTION_SCHEMA_V2
             || self.environment.is_empty()
             || self.environment.len() > 128
             || self.image_family.is_empty()
@@ -429,19 +499,53 @@ impl AgentHubRunPolicyProjectionV1 {
             || self.workspaces.len() > AGENT_HUB_RUN_MAX_MOUNTS
             || self.context_roots.len() > AGENT_HUB_RUN_MAX_MOUNTS
             || self.network_resources.len() > AGENT_HUB_RUN_MAX_SELECTORS
+            || self.effective_network_grants.len() > AGENT_HUB_RUN_MAX_SELECTORS
             || self.overlays.len() > AGENT_HUB_RUN_MAX_SELECTORS
             || self.capabilities.len() > 64
+            || self
+                .permissions
+                .auto_approve_tools
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .permissions
+                .escalate_tools
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
             || self.prompt_digest.len() != 64
             || !(1..=AGENT_HUB_RUN_MAX_TIMEOUT_SECS).contains(&self.timeout_secs)
         {
             return Err("agent_hub_run policy projection exceeds a required bound".into());
         }
+        if self
+            .effective_network_grants
+            .windows(2)
+            .any(|pair| pair[0].resource.to_string() >= pair[1].resource.to_string())
+            || self.effective_network_grants.iter().any(|grant| {
+                grant.hosts.windows(2).any(|pair| pair[0] >= pair[1])
+                    || grant
+                        .hosts
+                        .iter()
+                        .any(|host| host.is_empty() || host.len() > 512)
+                    || match grant.mode {
+                        crate::AttendedNetworkGrantModeV1::GuardedWeb => {
+                            !grant.hosts.is_empty() || grant.provider.is_some()
+                        }
+                        crate::AttendedNetworkGrantModeV1::Hosts => grant.hosts.is_empty(),
+                    }
+            })
+            || self
+                .effective_network_grants
+                .iter()
+                .map(|grant| grant.resource)
+                .collect::<Vec<_>>()
+                != self.network_resources
+        {
+            return Err("agent_hub_run effective network grants are invalid".into());
+        }
         for root in self.workspaces.iter().chain(&self.context_roots) {
             validate_alias(&root.alias)?;
             validate_absolute_path(&root.path)?;
-            if root.root_identity.is_empty() || root.root_identity.len() > 128 {
-                return Err("agent_hub_run root identity exceeds a required bound".into());
-            }
         }
         if self
             .workspaces
@@ -459,6 +563,16 @@ impl AgentHubRunPolicyProjectionV1 {
                 || item.name.len() > 128
                 || item.access.is_empty()
                 || item.access.len() > 64
+                || item.targets.len() > 32
+                || item
+                    .targets
+                    .iter()
+                    .any(|target| target.is_empty() || target.len() > 256)
+                || item.targets.windows(2).any(|pair| pair[0] >= pair[1])
+                || item.constraints.len() > 32
+                || item.constraints.iter().any(|(name, value)| {
+                    name.is_empty() || name.len() > 128 || value.is_empty() || value.len() > 4096
+                })
         }) || self.overlays.windows(2).any(|items| items[0] == items[1])
             || self
                 .capabilities
@@ -468,18 +582,8 @@ impl AgentHubRunPolicyProjectionV1 {
             return Err("agent_hub_run capability projection is invalid".into());
         }
         validate_digest(&self.prompt_digest)?;
-        if !self.image_id.starts_with("sha256:") {
-            return Err("agent_hub_run image identity must be sha256".into());
-        }
-        validate_digest(&self.image_id[7..])?;
-        if self.review.config_digest.is_empty()
-            || self.review.config_digest.len() > 128
-            || self.review.environment_bundle_digest.is_empty()
-            || self.review.environment_bundle_digest.len() > 128
-            || self.review.approval_bundle_digest.is_empty()
-            || self.review.approval_bundle_digest.len() > 128
-        {
-            return Err("agent_hub_run review projection exceeds a required bound".into());
+        if self.pids_limit == 0 {
+            return Err("agent_hub_run PID limit must be non-zero".into());
         }
         validate_alias(&self.review.primary_workspace)?;
         if let Some(path) = &self.review.workspace_export_root {
@@ -493,6 +597,16 @@ impl AgentHubRunPolicyProjectionV1 {
             return Err("agent_hub_run policy projection exceeds encoded limit".into());
         }
         Ok(())
+    }
+
+    /// Stable authorization identity. This intentionally excludes executable,
+    /// provider implementation, config serialization, and resolved image bytes.
+    pub fn permission_scope_digest(&self) -> Result<String, String> {
+        self.validate()?;
+        Ok(sha256_hex_with_domain(
+            PERMISSION_SCOPE_DOMAIN,
+            &canonical_json_bytes(serde_json::to_value(self).map_err(|e| e.to_string())?)?,
+        ))
     }
 }
 
@@ -543,12 +657,15 @@ pub struct AgentHubRunResolvedV1 {
     #[schemars(length(min = 64, max = 64))]
     pub request_digest: String,
     pub canonical_execution: AgentHubRunCanonicalArtifactV1,
-    pub policy_projection: AgentHubRunPolicyProjectionV1,
+    pub policy_projection: AgentHubRunPolicyProjectionV2,
     pub requested_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
 
 impl AgentHubRunResolvedV1 {
+    pub fn permission_scope_digest(&self) -> Result<String, String> {
+        self.policy_projection.permission_scope_digest()
+    }
     pub fn new(
         invocation_id: String,
         canonical_execution: AttendedAuthorizationArtifact,
@@ -560,7 +677,7 @@ impl AgentHubRunResolvedV1 {
             invocation_id,
             canonical_digest: canonical_execution.digest.clone(),
             request_digest: String::new(),
-            policy_projection: AgentHubRunPolicyProjectionV1::derive(&canonical_execution)?,
+            policy_projection: AgentHubRunPolicyProjectionV2::derive(&canonical_execution)?,
             canonical_execution: AgentHubRunCanonicalArtifactV1::encode(&canonical_execution)?,
             requested_at,
             expires_at,
@@ -589,8 +706,8 @@ impl AgentHubRunResolvedV1 {
             return Err("agent_hub_run canonical digest binding mismatch".into());
         }
         let artifact = self.canonical_execution.decode()?;
-        artifact.verify_v3()?;
-        let projection = AgentHubRunPolicyProjectionV1::derive(&artifact)?;
+        artifact.verify_v4()?;
+        let projection = AgentHubRunPolicyProjectionV2::derive(&artifact)?;
         if projection != self.policy_projection {
             return Err("agent_hub_run policy projection binding mismatch".into());
         }
@@ -624,7 +741,7 @@ impl AgentHubRunResolvedV1 {
 
     pub fn gateway_event(&self) -> Result<crate::OpenCodeHookInput, String> {
         let artifact = self.canonical_execution.decode()?;
-        let execution = artifact.verify_v3()?;
+        let execution = artifact.verify_v4()?;
         let value = serde_json::to_value(self).expect("resolved request serializes");
         let mut workspace_roots = execution
             .execution
@@ -737,6 +854,7 @@ impl AgentHubRunDecisionV1 {
 pub struct AgentHubRunReceiptV1 {
     #[serde(flatten)]
     decision: AgentHubRunDecisionV1,
+    #[schemars(length(min = 64, max = 64))]
     pub checksum: String,
 }
 
@@ -826,6 +944,20 @@ impl AgentHubRunOutputV1 {
         {
             return Err("invalid or oversized agent_hub_run output envelope".into());
         }
+        match &self.approval_receipt.receipt {
+            Some(receipt) => {
+                if receipt.invocation_id() != self.invocation_id {
+                    return Err("agent_hub_run receipt invocation differs from output".into());
+                }
+                receipt.verify_integrity()?;
+            }
+            None => {
+                let error = self.approval_receipt.error.as_deref().unwrap_or_default();
+                if error.is_empty() || error.len() > AGENT_HUB_RUN_MAX_REASON_BYTES {
+                    return Err("agent_hub_run unavailable receipt error is invalid".into());
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -865,6 +997,10 @@ impl AgentHubRunReceiptV1 {
         {
             return Err("agent_hub_run receipt binding mismatch or expired".into());
         }
+        self.verify_integrity()?;
+        Ok(())
+    }
+    pub fn verify_integrity(&self) -> Result<(), String> {
         let invocation_id = uuid::Uuid::parse_str(&self.decision.invocation_id)
             .map_err(|_| "agent_hub_run invocation ID is not a UUID".to_string())?;
         if invocation_id.to_string() != self.decision.invocation_id {
@@ -1039,7 +1175,21 @@ fn validate_digest(value: &str) -> Result<(), String> {
     Ok(())
 }
 fn canonical_json_bytes(value: serde_json::Value) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&value).map_err(|e| e.to_string())
+    fn normalize(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(normalize).collect())
+            }
+            serde_json::Value::Object(values) => serde_json::Value::Object(
+                values
+                    .into_iter()
+                    .map(|(key, value)| (key, normalize(value)))
+                    .collect(),
+            ),
+            value => value,
+        }
+    }
+    serde_json::to_vec(&normalize(value)).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1066,6 +1216,28 @@ mod tests {
             primary_workspace: "primary".into(),
             workspace_export_root: None,
         }
+    }
+
+    #[test]
+    fn receipt_checksum_matches_cross_language_golden() {
+        let receipt: AgentHubRunReceiptV1 = serde_json::from_value(serde_json::json!({
+            "schema": "agent_hub_run_decision_v1",
+            "invocation_id": "7697e2a3-3afc-81ca-b119-970017dd1eca",
+            "canonical_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "request_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "decision": "allow",
+            "authority": "automatic",
+            "approval_id": "7697e2a3-3afc-81ca-b119-970017dd1eca",
+            "reason": null,
+            "decided_at": "2026-09-03T12:00:00Z",
+            "expires_at": "2099-09-03T13:00:00Z",
+            "checksum": "0d13310bb0c9dc973ca1c593fa96eb0beb06d172ce0cc392ded5aba70f9a6462"
+        }))
+        .unwrap();
+        receipt.verify_integrity().unwrap();
+        let mut invalid = receipt.clone();
+        invalid.checksum = "0".repeat(64);
+        assert!(invalid.verify_integrity().is_err());
     }
 
     #[test]

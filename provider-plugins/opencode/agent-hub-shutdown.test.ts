@@ -27,14 +27,26 @@ for (const shutdown of ["dispose", "SIGINT", "SIGTERM"] as const) {
     await writeFile(gateway, `#!${process.execPath}\nawait new Response(Bun.stdin).text(); console.log('{"allowed":true}');`)
     await chmod(gateway, 0o700)
     await writeFile(binary, `#!${process.execPath}
+      import { createHash } from "node:crypto";
       import { existsSync, writeFileSync } from "node:fs";
       const prefix = ${JSON.stringify(root)} + "/" + process.env.AGENT_HUB_TRUSTED_TOOL_CALL_ID;
+      const invocationBytes = createHash("sha256")
+        .update("agent-hub:trusted-one-step-invocation:v1\\0")
+        .update(process.env.AGENT_HUB_TRUSTED_SESSION_ID)
+        .update("\\0")
+        .update(process.env.AGENT_HUB_TRUSTED_TOOL_CALL_ID)
+        .digest().subarray(0, 16);
+      invocationBytes[6] = (invocationBytes[6] & 0x0f) | 0x80;
+      invocationBytes[8] = (invocationBytes[8] & 0x3f) | 0x80;
+      const invocationHex = invocationBytes.toString("hex");
+      const invocationID = invocationHex.slice(0, 8) + "-" + invocationHex.slice(8, 12) + "-" +
+        invocationHex.slice(12, 16) + "-" + invocationHex.slice(16, 20) + "-" + invocationHex.slice(20);
       process.once("SIGTERM", async () => {
         writeFileSync(prefix + ".cancelled", "cancelled");
         while (!existsSync(prefix + ".release")) await Bun.sleep(10);
         writeFileSync(prefix + ".cleanup", "cleanup complete");
         console.log(JSON.stringify({
-          schema: "agent_hub_run_output_v1", invocation_id: "00000000-0000-4000-8000-000000000001",
+          schema: "agent_hub_run_output_v1", invocation_id: invocationID,
           approval_receipt: { schema: "agent_hub_run_approval_receipt_v1", status: "unavailable", error: "cancelled" },
           local_result_v2: { schema: "local_result_v2", status: "cancelled", cleanup_outcome: "succeeded" },
           error: "cancelled"

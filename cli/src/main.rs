@@ -109,6 +109,22 @@ enum BuildTarget {
 
 #[derive(Subcommand)]
 enum LocalCommand {
+    /// Verify the pinned gateway and approval service support agent_hub_run_v1
+    Capabilities {
+        /// Optional absolute path to a pinned host-run config
+        #[arg(long, value_parser = validate_absolute_path)]
+        host_config: Option<PathBuf>,
+        /// Host-only approvals endpoint queried with the existing secure HTTP client
+        #[arg(
+            long,
+            env = "AGENT_HUB_SERVER",
+            default_value = "http://localhost:8080"
+        )]
+        approvals_server: String,
+        /// Host-only bearer credential
+        #[arg(long, env = "AGENT_HUB_TOKEN")]
+        approvals_token: Option<String>,
+    },
     /// Print the bounded public capability catalog without preparing a run
     Catalog {
         /// Optional absolute path to a pinned host-run config
@@ -256,6 +272,23 @@ fn main() -> anyhow::Result<()> {
 
 async fn run_local(command: LocalCommand) -> anyhow::Result<()> {
     match command {
+        LocalCommand::Capabilities {
+            host_config,
+            approvals_server,
+            approvals_token,
+        } => {
+            let host_config = match host_config {
+                Some(path) => path,
+                None => host_run::default_host_config()?,
+            };
+            let capabilities = host_run::capabilities(
+                &host_config,
+                &approvals_server,
+                approvals_token.map(protocol::Secret::new),
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&capabilities)?);
+        }
         LocalCommand::Catalog {
             host_config,
             include_cache_identity,
@@ -924,6 +957,32 @@ mod attended_cli_tests {
                 "catalog",
                 "--host-config",
                 "/absolute/host-run.json"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn capabilities_accepts_only_an_absolute_host_config() {
+        assert!(
+            Cli::try_parse_from([
+                "agent-hub",
+                "local",
+                "capabilities",
+                "--host-config",
+                "relative"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-hub",
+                "local",
+                "capabilities",
+                "--host-config",
+                "/absolute/host-run.json",
+                "--approvals-server",
+                "https://approvals.example.test"
             ])
             .is_ok()
         );

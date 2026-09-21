@@ -85,6 +85,7 @@ const overlaySchema = z.object({
   }).strict(),
 }).strict()
 const guidanceSchema = z.object({
+  runtime_readiness_checked: z.literal(false),
   limits: z.object({
     max_prompt_bytes: uint,
     max_workspaces: uint,
@@ -120,6 +121,7 @@ export const catalogSchema = z.object({
 }).strict()
 
 const CANONICAL_GUIDANCE = {
+  runtime_readiness_checked: false,
   limits: { max_prompt_bytes: 128 * 1024, max_workspaces: 16, max_context_roots: 16, max_overlays: 16 },
   outputs: {
     structured_result: true,
@@ -264,7 +266,8 @@ const watchStampSchema = z.object({
 }).strict()
 
 const cacheIdentitySchema = z.object({
-  schema: z.literal("agent_hub_catalog_cache_identity_v1"),
+  schema: z.literal("agent_hub_catalog_cache_identity_v2"),
+  backend_metadata_revision: canonicalText(128, 1),
   watch: z.array(watchStampSchema).min(1).max(CACHE_WATCH_MAX_ENTRIES),
 }).strict()
 

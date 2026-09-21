@@ -7,3 +7,5 @@ server/tasks/*.json
 dev-data/
 .env
 docker/opencode-bin/
+/.agent-hub/validation-scratch/
+/.agent-hub/runs/

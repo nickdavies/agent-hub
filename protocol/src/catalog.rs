@@ -165,6 +165,8 @@ pub enum AgentHubCatalogRepositoryPrerequisite {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHubCatalogGuidanceV1 {
+    /// Discovery is configuration metadata, not a live Docker/network/credential probe.
+    pub runtime_readiness_checked: bool,
     pub limits: AgentHubCatalogLimitsV1,
     pub outputs: AgentHubCatalogOutputsV1,
     pub workspace: AgentHubCatalogWorkspaceGuidanceV1,
@@ -206,6 +208,7 @@ impl Default for AgentHubCatalogGuidanceV1 {
     fn default() -> Self {
         let output = AttendedOutputContract::default().limits;
         Self {
+            runtime_readiness_checked: false,
             limits: AgentHubCatalogLimitsV1 {
                 max_prompt_bytes: AGENT_HUB_RUN_MAX_PROMPT_BYTES as u64,
                 max_workspaces: AGENT_HUB_RUN_MAX_MOUNTS as u32,

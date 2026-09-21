@@ -17,6 +17,8 @@ pub(crate) const INTERNAL_CATALOG_MAX_BYTES: usize = 512 * 1024;
 #[serde(deny_unknown_fields)]
 struct ToolFactsManifest {
     schema: String,
+    image_reference: String,
+    backend_metadata_revision: String,
     image_identity: String,
     tools: Vec<ToolFact>,
 }
@@ -28,11 +30,15 @@ struct ToolFact {
     version: String,
 }
 
-use crate::attended_compat::{compatible_network_options, compatible_tool_approvals, image_family};
+use crate::attended_compat::{compatible_network_options, compatible_tool_approvals};
 
 pub(crate) fn build(host_config: &Path) -> anyhow::Result<AgentHubCatalogV1> {
     let snapshot = crate::host_run::load_catalog_config(host_config, false)?;
-    build_from_snapshot(&snapshot.files, &snapshot.image_digests)
+    build_from_snapshot(
+        &snapshot.files,
+        &snapshot.managed_images,
+        &snapshot.backend_metadata_revision,
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -46,7 +52,11 @@ pub(crate) fn build_internal(host_config: &Path) -> anyhow::Result<InternalCatal
     let snapshot = crate::host_run::load_catalog_config(host_config, true)?;
     Ok(InternalCatalogEnvelope {
         schema: "agent_hub_catalog_internal_v1",
-        catalog: build_from_snapshot(&snapshot.files, &snapshot.image_digests)?,
+        catalog: build_from_snapshot(
+            &snapshot.files,
+            &snapshot.managed_images,
+            &snapshot.backend_metadata_revision,
+        )?,
         cache_identity: snapshot
             .cache_identity
             .context("catalog cache identity was not captured")?,
@@ -55,7 +65,8 @@ pub(crate) fn build_internal(host_config: &Path) -> anyhow::Result<InternalCatal
 
 fn build_from_snapshot(
     files: &BTreeMap<String, Vec<u8>>,
-    image_digests: &BTreeMap<String, String>,
+    managed_images: &BTreeMap<String, String>,
+    backend_metadata_revision: &str,
 ) -> anyhow::Result<AgentHubCatalogV1> {
     let system_bytes = files
         .get("system.toml")
@@ -109,25 +120,10 @@ fn build_from_snapshot(
         .map(|configured| configured.installed.as_slice())
         .unwrap_or_default();
     ensure_unique(installed_environments, "installed environment")?;
-    let expected_image_digests = installed_environments
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let actual_image_digests = image_digests.keys().cloned().collect::<BTreeSet<_>>();
-    ensure!(
-        actual_image_digests == expected_image_digests,
-        "trusted host image identity inventory mismatch: expected {expected_image_digests:?}, found {actual_image_digests:?}"
-    );
-    for identity in image_digests.values() {
-        ensure!(
-            valid_image_identity(identity),
-            "trusted host image identity is not sha256"
-        );
-    }
     let mut environments = Vec::new();
     let mut referenced_overlays = BTreeSet::new();
     let mut job_code_image = None;
-    let mut job_code_image_identities = BTreeSet::new();
+    let mut referenced_families = BTreeSet::new();
     for name in installed_environments {
         let path = format!("environments/{name}/environment.toml");
         let bytes = files
@@ -175,23 +171,25 @@ fn build_from_snapshot(
             );
         }
 
-        let family = image_family(&environment.image)
-            .rsplit('/')
-            .next()
-            .context("configured image has no family")?
-            .to_string();
-        let image = image_configs
-            .get(&family)
-            .with_context(|| format!("image family '{family}' is not installed"))?;
-        ensure!(
-            image.tag == environment.image,
-            "installed image manifest does not resolve family '{family}' to '{}'",
-            environment.image
-        );
+        let resolved = config::resolve_managed_image_reference(
+            &environment.image,
+            None,
+            image_configs.iter().map(|(family, image)| {
+                (
+                    family.as_str(),
+                    Some(image.name.as_str()),
+                    Some(image.tag.as_str()),
+                )
+            }),
+            managed_images,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let family = resolved.family;
+        let image = &image_configs[&family];
+        referenced_families.insert(family.clone());
         if family != AgentHubRunImageFamily::JobCode.as_str() {
             continue;
         }
-        job_code_image_identities.insert(&image_digests[name]);
         for overlay in &environment.allowed_overlays {
             referenced_overlays.insert(overlay.clone());
         }
@@ -210,7 +208,11 @@ fn build_from_snapshot(
 
     let images = job_code_image
         .map(|image| {
-            let tool_facts = project_tool_facts(files, image, &job_code_image_identities)?;
+            let image_reference = managed_images
+                .get(AgentHubRunImageFamily::JobCode.as_str())
+                .context("managed job-code image reference is missing")?;
+            let tool_facts =
+                project_tool_facts(files, image, image_reference, backend_metadata_revision)?;
             Ok(AgentHubCatalogImageV1 {
                 family: AgentHubRunImageFamily::JobCode,
                 description: image.description.clone(),
@@ -236,20 +238,29 @@ fn build_from_snapshot(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    ensure!(
+        managed_images.keys().cloned().collect::<BTreeSet<_>>() == referenced_families,
+        "managed image alias inventory does not exactly cover configured image families"
+    );
     AgentHubCatalogV1::new(environments, images, overlays).map_err(anyhow::Error::msg)
 }
 
 fn project_tool_facts(
     files: &BTreeMap<String, Vec<u8>>,
     image: &config::ImageConfig,
-    image_identities: &BTreeSet<&String>,
+    image_reference: &str,
+    backend_metadata_revision: &str,
 ) -> anyhow::Result<AgentHubCatalogToolFactsV1> {
     let Some(metadata) = &image.tool_facts else {
         return Ok(AgentHubCatalogToolFactsV1::Unavailable);
     };
     ensure!(
-        image_identities.len() == 1,
-        "declared image tool facts require one exact pinned image identity"
+        metadata.image_reference == image_reference,
+        "declared image tool facts reference does not match the managed image reference"
+    );
+    ensure!(
+        metadata.backend_metadata_revision == backend_metadata_revision,
+        "declared image tool facts publication is stale for the backend metadata revision"
     );
     let bytes = files.get(&metadata.path).with_context(|| {
         format!(
@@ -268,7 +279,15 @@ fn project_tool_facts(
         "declared image tool facts manifest schema is unsupported"
     );
     ensure!(
-        image_identities.contains(&manifest.image_identity),
+        manifest.image_reference == metadata.image_reference,
+        "declared image tool facts manifest image reference mismatch"
+    );
+    ensure!(
+        manifest.backend_metadata_revision == metadata.backend_metadata_revision,
+        "declared image tool facts manifest backend metadata revision mismatch"
+    );
+    ensure!(
+        manifest.image_identity == metadata.image_identity,
         "declared image tool facts manifest image identity mismatch"
     );
     let mut tools = manifest
@@ -328,15 +347,6 @@ fn overlay_projection(
     ))
 }
 
-fn valid_image_identity(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|digest| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
-}
-
 fn ensure_unique(values: &[String], label: &str) -> anyhow::Result<()> {
     let mut seen = BTreeSet::new();
     for value in values {
@@ -349,6 +359,9 @@ fn ensure_unique(values: &[String], label: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IMAGE_REFERENCE: &str = "agent-hub/job-code:2026-09-09";
+    const BACKEND_METADATA_REVISION: &str = "revision-1";
 
     fn files() -> BTreeMap<String, Vec<u8>> {
         BTreeMap::from([
@@ -391,17 +404,37 @@ description='Image'
         ])
     }
 
-    fn image_identities() -> BTreeMap<String, String> {
-        BTreeMap::from([("code".into(), format!("sha256:{}", "a".repeat(64)))])
+    fn managed_images() -> BTreeMap<String, String> {
+        BTreeMap::from([("job-code".into(), IMAGE_REFERENCE.into())])
+    }
+
+    fn image_identity() -> String {
+        format!("sha256:{}", "a".repeat(64))
     }
 
     fn declare_tool_facts(files: &mut BTreeMap<String, Vec<u8>>, manifest: &[u8]) {
+        declare_tool_facts_publication(
+            files,
+            manifest,
+            IMAGE_REFERENCE,
+            BACKEND_METADATA_REVISION,
+            &image_identity(),
+        );
+    }
+
+    fn declare_tool_facts_publication(
+        files: &mut BTreeMap<String, Vec<u8>>,
+        manifest: &[u8],
+        image_reference: &str,
+        backend_metadata_revision: &str,
+        image_identity: &str,
+    ) {
         files.insert("images/job-code/tool-facts.json".into(), manifest.to_vec());
         files.insert(
             "images/job-code/image.toml".into(),
             format!(
-                "[image]\nname='job-code'\ntag='agent-hub/job-code:2026-09-09'\ndescription='Image'\n[image.tool_facts]\npath='images/job-code/tool-facts.json'\nsha256='{}'\n",
-                protocol::sha256_hex(manifest)
+                "[image]\nname='job-code'\ntag='{IMAGE_REFERENCE}'\ndescription='Image'\n[image.tool_facts]\npath='images/job-code/tool-facts.json'\nsha256='{}'\nimage_reference='{image_reference}'\nbackend_metadata_revision='{backend_metadata_revision}'\nimage_identity='{image_identity}'\n",
+                protocol::sha256_hex(manifest),
             )
             .into_bytes(),
         );
@@ -409,11 +442,8 @@ description='Image'
 
     #[test]
     fn catalog_projects_only_public_launchable_metadata() {
-        let catalog = build_from_snapshot(
-            &files(),
-            &BTreeMap::from([("code".into(), format!("sha256:{}", "a".repeat(64)))]),
-        )
-        .unwrap();
+        let catalog =
+            build_from_snapshot(&files(), &managed_images(), BACKEND_METADATA_REVISION).unwrap();
         assert_eq!(catalog.environments.len(), 1);
         assert_eq!(catalog.images.len(), 1);
         assert_eq!(catalog.environments[0].network_options.len(), 67);
@@ -437,21 +467,43 @@ description='Image'
     }
 
     #[test]
-    fn catalog_rejects_missing_and_extra_trusted_image_identities() {
-        assert!(build_from_snapshot(&files(), &BTreeMap::new()).is_err());
-        let identities = BTreeMap::from([
-            ("code".into(), format!("sha256:{}", "a".repeat(64))),
-            ("extra".into(), format!("sha256:{}", "b".repeat(64))),
-        ]);
-        assert!(build_from_snapshot(&files(), &identities).is_err());
+    fn catalog_resolves_semantic_family_from_declared_qualification_reference() {
+        let reference = "agent-hub/job-code-qualification:4d596913-2cc2-4068-a842-3db326aa6f1c";
+        let mut files = files();
+        for path in [
+            "environments/code/environment.toml",
+            "images/job-code/image.toml",
+        ] {
+            let body = String::from_utf8(files[path].clone())
+                .unwrap()
+                .replace(IMAGE_REFERENCE, reference);
+            files.insert(path.into(), body.into_bytes());
+        }
+        let managed = BTreeMap::from([("job-code".into(), reference.into())]);
+
+        let catalog = build_from_snapshot(&files, &managed, BACKEND_METADATA_REVISION).unwrap();
+        assert_eq!(catalog.environments[0].image_family.as_str(), "job-code");
+        assert_eq!(catalog.images[0].family.as_str(), "job-code");
+    }
+
+    #[test]
+    fn catalog_rejects_missing_and_extra_managed_image_aliases() {
+        assert!(
+            build_from_snapshot(&files(), &BTreeMap::new(), BACKEND_METADATA_REVISION).is_err()
+        );
+        let mut images = managed_images();
+        images.insert("extra".into(), "agent-hub/extra:tag".into());
+        assert!(build_from_snapshot(&files(), &images, BACKEND_METADATA_REVISION).is_err());
     }
 
     #[test]
     fn declared_tool_facts_are_exactly_bound_and_project_only_public_pairs() {
-        let identity = format!("sha256:{}", "a".repeat(64));
+        let identity = image_identity();
         let manifest = serde_json::to_vec(&serde_json::json!({
             "schema": TOOL_FACTS_SCHEMA,
-            "image_identity": identity,
+            "image_reference": IMAGE_REFERENCE,
+            "backend_metadata_revision": BACKEND_METADATA_REVISION,
+            "image_identity": &identity,
             "tools": [
                 {"name":"rustc", "version":"1.91.0 (public build)"},
                 {"name":"cargo", "version":"1.91.0"}
@@ -460,7 +512,8 @@ description='Image'
         .unwrap();
         let mut files = files();
         declare_tool_facts(&mut files, &manifest);
-        let catalog = build_from_snapshot(&files, &image_identities()).unwrap();
+        let catalog =
+            build_from_snapshot(&files, &managed_images(), BACKEND_METADATA_REVISION).unwrap();
         let AgentHubCatalogToolFactsV1::Available { tools } = &catalog.images[0].tool_facts else {
             panic!("expected available tool facts");
         };
@@ -474,6 +527,8 @@ description='Image'
         let public = serde_json::to_string(&catalog).unwrap();
         for private in [
             "images/job-code/tool-facts.json",
+            IMAGE_REFERENCE,
+            BACKEND_METADATA_REVISION,
             &identity,
             &protocol::sha256_hex(&manifest),
             TOOL_FACTS_SCHEMA,
@@ -487,10 +542,12 @@ description='Image'
 
     #[test]
     fn declared_tool_facts_fail_closed_for_missing_malformed_digest_and_image() {
-        let identity = format!("sha256:{}", "a".repeat(64));
+        let identity = image_identity();
         let valid = serde_json::to_vec(&serde_json::json!({
             "schema": TOOL_FACTS_SCHEMA,
-            "image_identity": identity,
+            "image_reference": IMAGE_REFERENCE,
+            "backend_metadata_revision": BACKEND_METADATA_REVISION,
+            "image_identity": &identity,
             "tools": [{"name":"cargo", "version":"1.91.0"}]
         }))
         .unwrap();
@@ -498,11 +555,15 @@ description='Image'
         let mut missing = files();
         declare_tool_facts(&mut missing, &valid);
         missing.remove("images/job-code/tool-facts.json");
-        assert!(build_from_snapshot(&missing, &image_identities()).is_err());
+        assert!(
+            build_from_snapshot(&missing, &managed_images(), BACKEND_METADATA_REVISION).is_err()
+        );
 
         let mut malformed = files();
         declare_tool_facts(&mut malformed, b"not-json");
-        assert!(build_from_snapshot(&malformed, &image_identities()).is_err());
+        assert!(
+            build_from_snapshot(&malformed, &managed_images(), BACKEND_METADATA_REVISION).is_err()
+        );
 
         let mut wrong_digest = files();
         declare_tool_facts(&mut wrong_digest, &valid);
@@ -510,17 +571,22 @@ description='Image'
             .unwrap()
             .replace(&protocol::sha256_hex(&valid), &"b".repeat(64));
         wrong_digest.insert("images/job-code/image.toml".into(), image.into_bytes());
-        assert!(build_from_snapshot(&wrong_digest, &image_identities()).is_err());
+        assert!(
+            build_from_snapshot(&wrong_digest, &managed_images(), BACKEND_METADATA_REVISION)
+                .is_err()
+        );
 
-        let wrong_image = serde_json::to_vec(&serde_json::json!({
-            "schema": TOOL_FACTS_SCHEMA,
-            "image_identity": format!("sha256:{}", "b".repeat(64)),
+        let wrong_schema = serde_json::to_vec(&serde_json::json!({
+            "schema": "unsupported_tool_facts",
+            "image_reference": IMAGE_REFERENCE,
+            "backend_metadata_revision": BACKEND_METADATA_REVISION,
+            "image_identity": identity,
             "tools": [{"name":"cargo", "version":"1.91.0"}]
         }))
         .unwrap();
         let mut files = files();
-        declare_tool_facts(&mut files, &wrong_image);
-        assert!(build_from_snapshot(&files, &image_identities()).is_err());
+        declare_tool_facts(&mut files, &wrong_schema);
+        assert!(build_from_snapshot(&files, &managed_images(), BACKEND_METADATA_REVISION).is_err());
     }
 
     #[test]
@@ -528,24 +594,32 @@ description='Image'
         for manifest in [
             serde_json::json!({
                 "schema": TOOL_FACTS_SCHEMA,
-                "image_identity": format!("sha256:{}", "a".repeat(64)),
+                "image_reference": IMAGE_REFERENCE,
+                "backend_metadata_revision": BACKEND_METADATA_REVISION,
+                "image_identity": image_identity(),
                 "tools": [{"name":"cargo", "version":"1", "private_path":"/secret"}]
             }),
             serde_json::json!({
                 "schema": TOOL_FACTS_SCHEMA,
-                "image_identity": format!("sha256:{}", "a".repeat(64)),
+                "image_reference": IMAGE_REFERENCE,
+                "backend_metadata_revision": BACKEND_METADATA_REVISION,
+                "image_identity": image_identity(),
                 "tools": [{"name":"private/path", "version":"1"}]
             }),
             serde_json::json!({
                 "schema": TOOL_FACTS_SCHEMA,
-                "image_identity": format!("sha256:{}", "a".repeat(64)),
+                "image_reference": IMAGE_REFERENCE,
+                "backend_metadata_revision": BACKEND_METADATA_REVISION,
+                "image_identity": image_identity(),
                 "tools": [{"name":"cargo", "version":"x".repeat(257)}]
             }),
         ] {
             let manifest = serde_json::to_vec(&manifest).unwrap();
             let mut files = files();
             declare_tool_facts(&mut files, &manifest);
-            assert!(build_from_snapshot(&files, &image_identities()).is_err());
+            assert!(
+                build_from_snapshot(&files, &managed_images(), BACKEND_METADATA_REVISION).is_err()
+            );
         }
     }
 
@@ -564,13 +638,92 @@ approval_bundle='missing'
 "#
             .to_vec(),
         );
-        let identities = BTreeMap::from([("code".into(), format!("sha256:{}", "a".repeat(64)))]);
+        let identities = managed_images();
         assert!(
-            build_from_snapshot(&files, &identities)
+            build_from_snapshot(&files, &identities, BACKEND_METADATA_REVISION)
                 .unwrap_err()
                 .to_string()
                 .contains("approval bundle file inventory")
         );
+    }
+
+    #[test]
+    fn declared_tool_facts_reject_stale_or_mismatched_publication_bindings() {
+        let identity = image_identity();
+        let manifest = |image_reference: &str, revision: &str, image_identity: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": TOOL_FACTS_SCHEMA,
+                "image_reference": image_reference,
+                "backend_metadata_revision": revision,
+                "image_identity": image_identity,
+                "tools": [{"name":"cargo", "version":"1.91.0"}]
+            }))
+            .unwrap()
+        };
+
+        let valid = manifest(IMAGE_REFERENCE, BACKEND_METADATA_REVISION, &identity);
+        let mut stale = files();
+        declare_tool_facts(&mut stale, &valid);
+        assert!(build_from_snapshot(&stale, &managed_images(), "revision-2").is_err());
+
+        let mut wrong_reference = files();
+        declare_tool_facts_publication(
+            &mut wrong_reference,
+            &valid,
+            "agent-hub/job-code:stale",
+            BACKEND_METADATA_REVISION,
+            &identity,
+        );
+        assert!(
+            build_from_snapshot(
+                &wrong_reference,
+                &managed_images(),
+                BACKEND_METADATA_REVISION
+            )
+            .is_err()
+        );
+
+        for mismatched_manifest in [
+            manifest(
+                "agent-hub/job-code:stale",
+                BACKEND_METADATA_REVISION,
+                &identity,
+            ),
+            manifest(IMAGE_REFERENCE, "revision-2", &identity),
+            manifest(
+                IMAGE_REFERENCE,
+                BACKEND_METADATA_REVISION,
+                &format!("sha256:{}", "b".repeat(64)),
+            ),
+        ] {
+            let mut files = files();
+            declare_tool_facts(&mut files, &mismatched_manifest);
+            assert!(
+                build_from_snapshot(&files, &managed_images(), BACKEND_METADATA_REVISION).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn declared_tool_facts_accept_complete_republication_at_new_revision() {
+        let identity = image_identity();
+        let revision = "revision-2";
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schema": TOOL_FACTS_SCHEMA,
+            "image_reference": IMAGE_REFERENCE,
+            "backend_metadata_revision": revision,
+            "image_identity": &identity,
+            "tools": [{"name":"cargo", "version":"1.91.0"}]
+        }))
+        .unwrap();
+        let mut files = files();
+        declare_tool_facts_publication(&mut files, &manifest, IMAGE_REFERENCE, revision, &identity);
+
+        let catalog = build_from_snapshot(&files, &managed_images(), revision).unwrap();
+        assert!(matches!(
+            catalog.images[0].tool_facts,
+            AgentHubCatalogToolFactsV1::Available { .. }
+        ));
     }
 
     fn add_nonselectable_environment(files: &mut BTreeMap<String, Vec<u8>>, body: &[u8]) {
@@ -609,9 +762,10 @@ network_policy='unknown-policy'
 approval_mode='auto'
 "#,
         );
-        let mut identities = image_identities();
-        identities.insert("infra".into(), format!("sha256:{}", "b".repeat(64)));
-        let error = build_from_snapshot(&files, &identities).unwrap_err();
+        let mut identities = managed_images();
+        identities.insert("job-infra".into(), "agent-hub/job-infra:2026-09-09".into());
+        let error =
+            build_from_snapshot(&files, &identities, BACKEND_METADATA_REVISION).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -634,9 +788,9 @@ approval_mode='auto'
 "#,
         );
         install_infra_image(&mut files, "agent-hub/job-infra:2026-09-09");
-        let mut identities = image_identities();
-        identities.insert("infra".into(), format!("sha256:{}", "b".repeat(64)));
-        let catalog = build_from_snapshot(&files, &identities).unwrap();
+        let mut identities = managed_images();
+        identities.insert("job-infra".into(), "agent-hub/job-infra:2026-09-09".into());
+        let catalog = build_from_snapshot(&files, &identities, BACKEND_METADATA_REVISION).unwrap();
         assert_eq!(
             catalog
                 .environments
@@ -659,18 +813,17 @@ approval_mode='auto'
 
         let mut missing = files();
         add_nonselectable_environment(&mut missing, environment);
-        let mut identities = image_identities();
-        identities.insert("infra".into(), format!("sha256:{}", "b".repeat(64)));
-        let error = build_from_snapshot(&missing, &identities).unwrap_err();
+        let mut identities = managed_images();
+        identities.insert("job-infra".into(), "agent-hub/job-infra:2026-09-09".into());
+        let error =
+            build_from_snapshot(&missing, &identities, BACKEND_METADATA_REVISION).unwrap_err();
         assert!(error.to_string().contains("not installed"), "{error:#}");
 
         let mut wrong_tag = missing;
         install_infra_image(&mut wrong_tag, "agent-hub/job-infra:typo");
-        let error = build_from_snapshot(&wrong_tag, &identities).unwrap_err();
-        assert!(
-            error.to_string().contains("does not resolve family"),
-            "{error:#}"
-        );
+        let error =
+            build_from_snapshot(&wrong_tag, &identities, BACKEND_METADATA_REVISION).unwrap_err();
+        assert!(error.to_string().contains("not installed"), "{error:#}");
     }
 
     #[test]
