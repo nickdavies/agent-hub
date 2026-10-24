@@ -80,6 +80,10 @@ pub struct DisplaySpec {
     #[serde(default)]
     pub heading: Option<String>,
     pub fields: Vec<DisplayField>,
+    /// `tool_input` keys whose values, in order, form the one-line summary in
+    /// the dashboard queue. Empty means the default summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summary: Vec<String>,
 }
 
 /// One `tool_input` field, in display order.
@@ -109,7 +113,8 @@ pub enum FieldFormat {
 }
 
 impl DisplaySpec {
-    /// Check that every field refers to a top-level key of `tool_input`.
+    /// Check that every field and summary key refers to a top-level key of
+    /// `tool_input`.
     pub fn validate(&self, tool_input: &serde_json::Value) -> Result<(), String> {
         let obj = tool_input
             .as_object()
@@ -117,6 +122,11 @@ impl DisplaySpec {
         for field in &self.fields {
             if !obj.contains_key(&field.key) {
                 return Err(format!("display field '{}' not in tool_input", field.key));
+            }
+        }
+        for key in &self.summary {
+            if !obj.contains_key(key) {
+                return Err(format!("display summary key '{key}' not in tool_input"));
             }
         }
         Ok(())

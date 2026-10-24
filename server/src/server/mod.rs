@@ -1432,7 +1432,8 @@ mod integration_tests {
             {"key": "title", "label": "Title"},
             {"key": "start", "label": "Start", "format": "datetime"},
             {"key": "attendees", "format": "list"}
-        ]
+        ],
+        "summary": ["title", "start"]
     }"#;
 
     #[tokio::test]
@@ -1484,6 +1485,20 @@ mod integration_tests {
             "/api/v1/hooks/approval",
             None,
             Some(&unknown_key),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST, "{body}");
+
+        let unknown_summary = external_body(
+            "ext-bad-summary",
+            r#", "display": {"fields": [], "summary": ["nope"]}"#,
+        );
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&unknown_summary),
         )
         .await;
         assert_eq!(status, AxumStatus::BAD_REQUEST, "{body}");
@@ -1568,5 +1583,41 @@ mod integration_tests {
         let approval: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(approval["tool_input"].is_null(), "got: {body}");
         assert!(approval.get("display").is_none(), "got: {body}");
+    }
+
+    /// Approval JSON embedded in the dashboard and detail pages must not be
+    /// able to close its <script> tag.
+    #[tokio::test]
+    async fn embedded_approval_json_cannot_close_script_tag() {
+        let app = test_app();
+        let payload = "</script><script>alert(1)</script>";
+        let body = format!(
+            r#"{{
+                "id": "xss-1",
+                "session_id": "ses_xss",
+                "session_display_name": "x",
+                "cwd": "/tmp/x",
+                "tool_name": "Bash",
+                "tool_input": {{"command": "{payload}"}},
+                "provider": "claude-code",
+                "request_type": "tool_use",
+                "context": {{"workspace_roots": [], "hook_event_name": "PreToolUse"}}
+            }}"#
+        );
+        let (_, body) = send(&app, "POST", "/api/v1/hooks/approval", None, Some(&body)).await;
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for path in [format!("/approvals/{id}"), "/approvals".to_string()] {
+            let (status, html) = get_json(&app, &path).await;
+            assert_eq!(status, AxumStatus::OK, "{path}");
+            assert!(!html.contains(payload), "{path} embeds raw payload");
+            assert!(
+                html.contains(r"\u003c/script\u003e\u003cscript\u003ealert(1)"),
+                "{path} should embed escaped payload"
+            );
+        }
     }
 }
