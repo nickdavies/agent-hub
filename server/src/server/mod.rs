@@ -102,7 +102,10 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
             .route("/approvals/{id}/wait", get(handle_approval_wait::<N>))
             .route(
                 "/approvals/{id}/resolve",
-                post(handle_approval_resolve::<N>),
+                post(handle_approval_resolve::<N>).layer(from_fn_with_state(
+                    state.clone(),
+                    require_approval_readwrite::<N>,
+                )),
             )
             .route("/questions/pending", get(handle_list_questions::<N>))
             .route("/questions/{id}", get(handle_get_question::<N>))
@@ -170,6 +173,24 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Read-only review must not be bypassable by calling resolution APIs directly.
+async fn require_approval_readwrite<N: Notifier>(
+    axum::extract::State(state): axum::extract::State<AppState<N>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if state.config.approval_mode != ApprovalFeatureMode::Readwrite {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "approval resolution is disabled in read-only mode",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Resolve the effective status for a session by combining its stored status
@@ -618,6 +639,146 @@ mod integration_tests {
         assert!(body.contains("aria-keyshortcuts=\"a\""));
         assert!(body.contains("aria-keyshortcuts=\"d\""));
         assert!(body.contains("/api/v1/approvals/pending"));
+    }
+
+    /// Register ordinary review data through the existing hook API.
+    async fn create_review(app: &Router, kind: &str, tool_input: serde_json::Value) -> String {
+        let body = if kind == "approvals" {
+            serde_json::json!({
+                "id": "review-test", "session_id": "review-session",
+                "session_display_name": "Test Session", "cwd": "/tmp/proj",
+                "tool_name": "Bash", "tool_input": tool_input,
+                "provider": "opencode", "request_type": "tool_use",
+                "context": {"workspace_roots": ["/tmp/proj"], "hook_event_name": "permission.ask"}
+            })
+        } else {
+            serde_json::json!({
+                "id": "review-test", "session_id": "review-session",
+                "session_display_name": "Test Session", "cwd": "/tmp/proj",
+                "question_request_id": "question-test",
+                "questions": [{"question": "Continue?", "header": "Plan", "options": []}],
+                "provider": "opencode"
+            })
+        };
+        let hook = if kind == "approvals" {
+            "approval"
+        } else {
+            "question"
+        };
+        assert_eq!(
+            post_json(app, &format!("/api/v1/hooks/{hook}"), &body.to_string()).await,
+            AxumStatus::OK
+        );
+        let (status, pending) = get_json(app, &format!("/api/v1/{kind}/pending")).await;
+        assert_eq!(status, AxumStatus::OK);
+        let pending: serde_json::Value = serde_json::from_str(&pending).unwrap();
+        pending[0]["id"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn approval_detail_inline_json_round_trips_without_script_breakout() {
+        for input in [
+            serde_json::json!({"command": "ls", "nested": {"enabled": true}, "count": 2}),
+            serde_json::json!({
+                "command": "</script><script>window.pwned=true</script>&<>\u{2028}\u{2029}",
+                "nested": [null, true, {"</script>": "literal \\u003c"}]
+            }),
+        ] {
+            let app = test_app();
+            let id = create_review(&app, "approvals", input.clone()).await;
+            let (status, record) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
+            assert_eq!(status, AxumStatus::OK);
+            let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+            let (status, html) = get_json(&app, &format!("/approvals/{id}")).await;
+            assert_eq!(status, AxumStatus::OK);
+            let embedded = html
+                .split_once("<script type=\"application/json\" id=\"approval-data\">")
+                .unwrap()
+                .1
+                .split_once("</script>")
+                .unwrap()
+                .0;
+            assert!(!embedded.contains(['<', '>', '&', '\u{2028}', '\u{2029}']));
+            let parsed: serde_json::Value = serde_json::from_str(embedded).unwrap();
+            assert_eq!(parsed, record);
+            assert_eq!(parsed["tool_input"], input);
+            assert!(!html.contains("</script><script>window.pwned=true</script>"));
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_approval_api_rejects_all_decisions_without_mutation() {
+        for (kind, decisions) in [("approvals", ["approve", "deny", "cancel"])] {
+            let app = test_app_with_mode(ApprovalFeatureMode::Readonly);
+            let id = create_review(&app, kind, serde_json::json!({"command": "ls"})).await;
+            for decision in decisions {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/{kind}/{id}/resolve"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"decision": decision}).to_string(),
+                    ))
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), AxumStatus::FORBIDDEN);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    body.as_ref(),
+                    b"approval resolution is disabled in read-only mode"
+                );
+                let (status, record) = get_json(&app, &format!("/api/v1/{kind}/{id}")).await;
+                assert_eq!(status, AxumStatus::OK);
+                let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+                assert_eq!(record["status"]["type"], "pending");
+                let (status, pending) = get_json(&app, &format!("/api/v1/{kind}/pending")).await;
+                assert_eq!(status, AxumStatus::OK);
+                let pending: Vec<serde_json::Value> = serde_json::from_str(&pending).unwrap();
+                assert_eq!(pending.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn readwrite_resolution_apis_allow_all_decisions() {
+        for (kind, decisions) in [
+            (
+                "approvals",
+                [
+                    ("approve", "approved"),
+                    ("deny", "denied"),
+                    ("cancel", "cancelled"),
+                ],
+            ),
+            (
+                "questions",
+                [
+                    ("answer", "answered"),
+                    ("reject", "rejected"),
+                    ("cancel", "cancelled"),
+                ],
+            ),
+        ] {
+            for (decision, expected) in decisions {
+                let app = test_app();
+                let id = create_review(&app, kind, serde_json::json!({"command": "ls"})).await;
+                assert_eq!(
+                    post_json(
+                        &app,
+                        &format!("/api/v1/{kind}/{id}/resolve"),
+                        &serde_json::json!({"decision": decision}).to_string()
+                    )
+                    .await,
+                    AxumStatus::OK
+                );
+                let (status, record) = get_json(&app, &format!("/api/v1/{kind}/{id}")).await;
+                assert_eq!(status, AxumStatus::OK);
+                let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+                assert_eq!(record["status"]["type"], expected);
+            }
+        }
     }
 
     #[tokio::test]
