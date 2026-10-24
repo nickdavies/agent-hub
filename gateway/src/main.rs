@@ -154,7 +154,9 @@ async fn run_approval(args: ApprovalArgs) -> ExitCode {
         )
         .await
     } else {
-        eprintln!("agent-hub-gateway: one of --claude, --cursor, or --opencode is required");
+        write_bounded_stderr(
+            "agent-hub-gateway: one of --claude, --cursor, or --opencode is required",
+        );
         ExitCode::from(2)
     }
 }
@@ -314,7 +316,7 @@ where
 async fn run_status_report(args: StatusReportArgs) -> ExitCode {
     let mut input = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-        eprintln!("agent-hub-gateway: failed to read stdin: {e}");
+        write_bounded_stderr(&format!("agent-hub-gateway: failed to read stdin: {e}"));
         return ExitCode::from(2);
     }
 
@@ -322,13 +324,24 @@ async fn run_status_report(args: StatusReportArgs) -> ExitCode {
     let report: StatusReport = match serde_json::from_str(&input) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("agent-hub-gateway: invalid status report JSON: {e}");
+            write_bounded_stderr(&format!(
+                "agent-hub-gateway: invalid status report JSON: {e}"
+            ));
             return ExitCode::from(2);
         }
     };
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/v1/hooks/status", args.server.trim_end_matches('/'));
+    let (client, base) = match gateway_http_client(&args.server) {
+        Ok(value) => value,
+        Err(error) => {
+            write_bounded_stderr(&format!("agent-hub-gateway: {error}"));
+            return ExitCode::from(2);
+        }
+    };
+    let url = format!(
+        "{}/api/v1/hooks/status",
+        base.as_str().trim_end_matches('/')
+    );
 
     match authenticated(args.token.as_ref(), client.post(&url))
         .json(&report)
@@ -338,14 +351,14 @@ async fn run_status_report(args: StatusReportArgs) -> ExitCode {
     {
         Ok(resp) if resp.status().is_success() => ExitCode::SUCCESS,
         Ok(resp) => {
-            eprintln!(
+            write_bounded_stderr(&format!(
                 "agent-hub-gateway: status report returned {}",
                 resp.status()
-            );
+            ));
             ExitCode::from(1)
         }
         Err(e) => {
-            eprintln!("agent-hub-gateway: status report failed: {e}");
+            write_bounded_stderr(&format!("agent-hub-gateway: status report failed: {e}"));
             ExitCode::from(1)
         }
     }
@@ -601,11 +614,11 @@ async fn escalate_to_server(
     event: &ToolHookEvent,
     extra: Option<ExtraContext>,
 ) -> Result<HookOutput, ApprovalFlowError> {
-    let client = reqwest::Client::new();
     let server = args.server.as_deref().ok_or_else(|| {
         ApprovalFlowError::Pipeline("approval server is required for central approval".to_string())
     })?;
-    let base = server.trim_end_matches('/');
+    let (client, base) = gateway_http_client(server).map_err(ApprovalFlowError::Pipeline)?;
+    let base = base.as_str().trim_end_matches('/');
 
     let context = ApprovalContext {
         workspace_roots: event.workspace_roots.clone(),
@@ -648,7 +661,10 @@ async fn escalate_to_server(
         )));
     }
 
-    let approval: ApprovalResponse = register_resp.json().await.map_err(|e| {
+    let body = read_response_body(register_resp)
+        .await
+        .map_err(ApprovalFlowError::Pipeline)?;
+    let approval: ApprovalResponse = serde_json::from_str(&body).map_err(|e| {
         ApprovalFlowError::Pipeline(format!("failed to parse approval response: {e}"))
     })?;
 
@@ -761,7 +777,9 @@ async fn poll_for_decision(
             continue;
         }
 
-        let body = await_approval_deadline(deadline, last_wait_was_healthy, resp.text()).await?;
+        let body =
+            await_approval_deadline(deadline, last_wait_was_healthy, read_response_body(resp))
+                .await?;
         let body = match body {
             Ok(b) => b,
             Err(e) => {
@@ -836,6 +854,57 @@ fn authenticated(
         Some(token) => request.bearer_auth(token.expose()),
         None => request,
     }
+}
+
+const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
+
+fn validate_endpoint(value: &str) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(value).map_err(|e| format!("server URL is invalid: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("server URL must use HTTP or HTTPS".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("server URL must not contain credentials".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("server URL must not contain query or fragment".into());
+    }
+    url.host_str().ok_or("server URL has no host")?;
+    if !url.path().ends_with('/') {
+        url.set_path(&format!("{}/", url.path()));
+    }
+    Ok(url)
+}
+
+fn gateway_http_client(server: &str) -> Result<(reqwest::Client, reqwest::Url), String> {
+    let endpoint = validate_endpoint(server)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("cannot build HTTP client: {e}"))?;
+    Ok((client, endpoint))
+}
+
+async fn read_response_body(mut response: reqwest::Response) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_HTTP_RESPONSE_BYTES as u64)
+    {
+        return Err("response exceeds limit".into());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("failed to read response: {e}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_BYTES {
+            return Err("response exceeds limit".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|e| format!("response is not UTF-8: {e}"))
 }
 
 fn deadline_error(last_wait_was_healthy: bool) -> ApprovalFlowError {
@@ -922,6 +991,28 @@ fn status_to_output(status: &ApprovalStatus) -> HookOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_endpoints_accept_http_without_a_loopback_or_token_restriction() {
+        for endpoint in [
+            "http://0.0.0.0:8080",
+            "http://localhost:8080",
+            "http://example.test/base",
+            "https://example.test",
+            "http://[::1]:8080",
+        ] {
+            assert!(validate_endpoint(endpoint).is_ok());
+        }
+        for endpoint in [
+            "ftp://example.test",
+            "http://user:password@example.test",
+            "https://example.test?query=value",
+            "https://example.test/#fragment",
+            "not a URL",
+        ] {
+            assert!(validate_endpoint(endpoint).is_err());
+        }
+    }
 
     #[test]
     fn approval_default_timeout_is_24_hours() {

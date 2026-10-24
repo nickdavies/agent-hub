@@ -8,6 +8,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -15,11 +16,19 @@ use uuid::Uuid;
 
 type HttpCall = (String, Option<String>, Value);
 
+#[derive(Clone)]
+struct HttpReply {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: String,
+}
+
 #[derive(Clone, Default)]
 struct HttpState {
     calls: Arc<Mutex<Vec<HttpCall>>>,
     unauthorized: bool,
     denial: Arc<Mutex<Option<String>>>,
+    reply: Arc<Mutex<Option<HttpReply>>>,
 }
 
 struct Server {
@@ -55,7 +64,7 @@ async fn handle(
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
-) -> (StatusCode, Json<Value>) {
+) -> Response {
     let payload = if body.is_empty() {
         Value::Null
     } else {
@@ -68,11 +77,15 @@ async fn handle(
             .map(|h| h.to_str().unwrap().into()),
         payload,
     ));
+    if let Some(reply) = state.reply.lock().unwrap().clone() {
+        return (reply.status, reply.headers, reply.body).into_response();
+    }
     if state.unauthorized {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"invalid credentials"})),
-        );
+        )
+            .into_response();
     }
     let response = match uri.path() {
         "/api/v1/hooks/approval" | "/api/v1/hooks/question" => {
@@ -90,7 +103,7 @@ async fn handle(
         "/api/v1/hooks/status" => json!({}),
         path => panic!("unexpected HTTP request {path}"),
     };
-    (StatusCode::OK, Json(response))
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 struct Policy(PathBuf);
@@ -182,6 +195,152 @@ fn question_input() -> Value {
 
 fn status_input() -> Value {
     json!({"session_id":"host-http", "cwd":"/workspace", "status":"idle"})
+}
+
+#[tokio::test]
+async fn host_http_never_follows_redirects_or_forwards_credentials_to_the_target() {
+    let source = Server::start(false).await;
+    let target = Server::start(false).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "location",
+        format!("{}/api/v1/hooks/approval", target.url)
+            .parse()
+            .unwrap(),
+    );
+    *source.state.reply.lock().unwrap() = Some(HttpReply {
+        status: StatusCode::TEMPORARY_REDIRECT,
+        headers,
+        body: String::new(),
+    });
+    let policy = Policy::new("ask");
+    let output = policy
+        .run(
+            "approval",
+            Some(&source.url),
+            Some("test-token"),
+            approval_input(),
+        )
+        .await;
+    native_denial(&output, "--opencode", "tool.execute.before");
+    for (command, input, code) in [
+        ("question", question_input(), 4),
+        ("status-report", status_input(), 1),
+    ] {
+        assert_eq!(
+            policy
+                .run(command, Some(&source.url), Some("test-token"), input)
+                .await
+                .status
+                .code(),
+            Some(code)
+        );
+    }
+    assert_eq!(source.state.calls.lock().unwrap().len(), 3);
+    assert!(target.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn oversized_registration_bodies_fail_closed_for_approvals_and_questions() {
+    let server = Server::start(false).await;
+    *server.state.reply.lock().unwrap() = Some(HttpReply {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        body: " ".repeat(1024 * 1024 + 1),
+    });
+    let policy = Policy::new("ask");
+    let output = policy
+        .run("approval", Some(&server.url), None, approval_input())
+        .await;
+    assert!(
+        native_denial(&output, "--opencode", "tool.execute.before")
+            .contains("response exceeds limit")
+    );
+    let output = policy
+        .run("question", Some(&server.url), None, question_input())
+        .await;
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.len() <= 4096);
+}
+
+#[tokio::test]
+async fn chunked_body_limit_never_parses_an_allow_prefix_as_the_complete_response() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let _ = stream.read(&mut request).await.unwrap();
+        let body = format!(
+            "{}{}",
+            json!({"id":Uuid::from_u128(1),"type":"approved","message":null}),
+            " ".repeat(1024 * 1024)
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    });
+    let policy = Policy::new("ask");
+    let output = policy
+        .run("approval", Some(&url), None, approval_input())
+        .await;
+    assert!(
+        native_denial(&output, "--opencode", "tool.execute.before")
+            .contains("response exceeds limit")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn stalled_or_truncated_wait_bodies_cannot_return_a_late_allow() {
+    use tokio::io::AsyncReadExt;
+    for stalled in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for registration in [true, false] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body = if registration {
+                    json!({"id":Uuid::from_u128(1),"type":"pending"}).to_string()
+                } else {
+                    json!({"type":"approved","message":null}).to_string()
+                };
+                if registration {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(reply.as_bytes()).await.unwrap();
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len() + if stalled { 0 } else { 100 }
+                    );
+                    stream.write_all(header.as_bytes()).await.unwrap();
+                    if stalled {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    let _ = stream.write_all(body.as_bytes()).await;
+                }
+            }
+        });
+        let policy = Policy::new("ask");
+        let started = tokio::time::Instant::now();
+        let output = policy
+            .run("approval", Some(&url), None, approval_input())
+            .await;
+        native_denial(&output, "--opencode", "tool.execute.before");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        server.abort();
+    }
 }
 
 fn native_denial(output: &Output, provider: &str, hook: &str) -> String {

@@ -42,24 +42,28 @@ pub struct QuestionArgs {
 pub async fn run(args: QuestionArgs) -> ExitCode {
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
-        eprintln!("agent-hub-gateway question: failed to read stdin: {e}");
+        crate::write_bounded_stderr(&format!(
+            "agent-hub-gateway question: failed to read stdin: {e}"
+        ));
         return ExitCode::from(2);
     }
 
     let req: QuestionProxyRequest = match serde_json::from_str(&raw) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("agent-hub-gateway question: invalid request JSON: {e}");
+            crate::write_bounded_stderr(&format!(
+                "agent-hub-gateway question: invalid request JSON: {e}"
+            ));
             return ExitCode::from(2);
         }
     };
 
-    eprintln!(
+    crate::write_bounded_stderr(&format!(
         "[info] question: session={} questions={} request_id={}",
         req.session_id,
         req.questions.len(),
         req.question_request_id
-    );
+    ));
 
     match proxy_question(&args, &req).await {
         Ok(answers) => {
@@ -69,15 +73,15 @@ pub async fn run(args: QuestionArgs) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(QuestionFlowError::Rejected(reason)) => {
-            eprintln!("agent-hub-gateway question: {reason}");
+            crate::write_bounded_stderr(&format!("agent-hub-gateway question: {reason}"));
             ExitCode::from(1)
         }
         Err(QuestionFlowError::Timeout) => {
-            eprintln!("agent-hub-gateway question: question timed out");
+            crate::write_bounded_stderr("agent-hub-gateway question: question timed out");
             ExitCode::from(3)
         }
         Err(QuestionFlowError::Pipeline(reason)) => {
-            eprintln!("agent-hub-gateway question: {reason}");
+            crate::write_bounded_stderr(&format!("agent-hub-gateway question: {reason}"));
             ExitCode::from(4)
         }
     }
@@ -95,15 +99,16 @@ async fn proxy_question(
     args: &QuestionArgs,
     req: &QuestionProxyRequest,
 ) -> Result<Vec<Vec<String>>, QuestionFlowError> {
-    let client = reqwest::Client::new();
-    let base = args.server.trim_end_matches('/');
+    let (client, base) =
+        crate::gateway_http_client(&args.server).map_err(QuestionFlowError::Pipeline)?;
+    let base = base.as_str().trim_end_matches('/');
 
     let register_url = format!("{base}/api/v1/hooks/question");
-    eprintln!(
+    crate::write_bounded_stderr(&format!(
         "[info] registering question: session={} questions={}",
         req.session_id,
         req.questions.len()
-    );
+    ));
 
     let register_resp = crate::authenticated(args.token.as_ref(), client.post(&register_url))
         .json(req)
@@ -119,7 +124,10 @@ async fn proxy_question(
         )));
     }
 
-    let proxy_resp: QuestionProxyResponse = register_resp.json().await.map_err(|e| {
+    let body = crate::read_response_body(register_resp)
+        .await
+        .map_err(QuestionFlowError::Pipeline)?;
+    let proxy_resp: QuestionProxyResponse = serde_json::from_str(&body).map_err(|e| {
         QuestionFlowError::Pipeline(format!("failed to parse question response: {e}"))
     })?;
 
@@ -132,15 +140,15 @@ async fn proxy_question(
     let wait_url = format!("{base}/api/v1/questions/{}/wait", proxy_resp.id);
     let cancel_url = format!("{base}/api/v1/questions/{}/resolve", proxy_resp.id);
 
-    eprintln!(
+    crate::write_bounded_stderr(&format!(
         "[info] waiting for question answer (id={}, timeout={}s)",
         proxy_resp.id, args.timeout
-    );
+    ));
 
     tokio::select! {
         result = poll_for_answer(&client, &wait_url, args.token.as_ref(), deadline, args.timeout) => result,
         _ = shutdown_signal() => {
-            eprintln!("[info] received shutdown signal, cancelling question {}", proxy_resp.id);
+            crate::write_bounded_stderr(&format!("[info] received shutdown signal, cancelling question {}", proxy_resp.id));
             let _ = crate::authenticated(args.token.as_ref(), client.post(&cancel_url))
                 .json(&QuestionResolveRequest {
                     decision: QuestionDecision::Cancel,
@@ -168,7 +176,9 @@ async fn poll_for_answer(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            eprintln!("[error] question timed out after {timeout_secs}s with no answer");
+            crate::write_bounded_stderr(&format!(
+                "[error] question timed out after {timeout_secs}s with no answer"
+            ));
             return Err(question_deadline_error(last_wait_was_healthy));
         }
 
@@ -186,7 +196,9 @@ async fn poll_for_answer(
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[warn] question wait failed (attempt {attempt}, retrying in 2s): {e}");
+                crate::write_bounded_stderr(&format!(
+                    "[warn] question wait failed (attempt {attempt}, retrying in 2s): {e}"
+                ));
                 last_wait_was_healthy = false;
                 await_question_deadline(
                     deadline,
@@ -206,9 +218,9 @@ async fn poll_for_answer(
                     "server returned {http_status} for question wait"
                 )));
             }
-            eprintln!(
+            crate::write_bounded_stderr(&format!(
                 "[warn] server returned {http_status} for question wait (attempt {attempt}, retrying in 2s)"
-            );
+            ));
             last_wait_was_healthy = false;
             await_question_deadline(
                 deadline,
@@ -219,14 +231,18 @@ async fn poll_for_answer(
             continue;
         }
 
-        let body = match await_question_deadline(deadline, last_wait_was_healthy, resp.text())
-            .await?
+        let body = match await_question_deadline(
+            deadline,
+            last_wait_was_healthy,
+            crate::read_response_body(resp),
+        )
+        .await?
         {
             Ok(b) => b,
             Err(e) => {
-                eprintln!(
+                crate::write_bounded_stderr(&format!(
                     "[warn] failed to read question wait body (attempt {attempt}, retrying in 2s): {e}"
-                );
+                ));
                 last_wait_was_healthy = false;
                 await_question_deadline(
                     deadline,
@@ -241,9 +257,9 @@ async fn poll_for_answer(
         let wait: QuestionWaitResponse = match serde_json::from_str(&body) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!(
+                crate::write_bounded_stderr(&format!(
                     "[warn] failed to parse question wait response (attempt {attempt}, retrying in 2s): {e}"
-                );
+                ));
                 last_wait_was_healthy = false;
                 await_question_deadline(
                     deadline,
@@ -265,7 +281,9 @@ async fn poll_for_answer(
             }
             last_wait_was_healthy = true;
             let secs = remaining.as_secs();
-            eprintln!("[info] question still pending (attempt {attempt}, {secs}s remaining)");
+            crate::write_bounded_stderr(&format!(
+                "[info] question still pending (attempt {attempt}, {secs}s remaining)"
+            ));
             continue;
         }
 
