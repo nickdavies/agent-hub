@@ -72,20 +72,14 @@ those types to the installed v2 host contract.
 | `task`, `todowrite` | `Task`, `TodoWrite` | Complete arguments |
 | Unknown/MCP | Exact runtime name | Complete arguments, unchanged |
 
-This historical extraction checkpoint preserves file/edit/patch path resolution
-against the worktree; search roots and LSP paths resolve against the instance
-directory. Path handling is lexical, not symlink resolution. Malformed native
-arguments fail closed before gateway approval.
-
-Patch operation headers now use the pinned host's prefix matching and trimmed
-paths, including no-space headers and move destinations. Every extracted target
-must approve before the patch can execute; the first denial stops authorization.
-
-**Remaining historical security limit — do not deploy yet.** Relative
-file/edit/patch paths still use the worktree instead of the native execution
-directory when these differ. This original-source bug is retained here until
-the second standalone security follow-up, which must land before main is pushed
-or deployed. The historical extraction checkpoint itself precedes both fixes.
+File/edit/patch paths and search roots resolve against the host instance/plugin
+directory, **not** the repository worktree. This follows the pinned native
+read/write/edit/apply_patch/glob/grep/LSP implementations. Patch operation headers
+use the host's prefix matching and trimmed paths, including no-space headers and
+move destinations. Path handling is
+lexical, not symlink resolution. Patch authorization stops at the first denial;
+the tool cannot execute any portion unless all source/destination paths approve.
+Malformed native arguments fail closed before gateway approval.
 
 ## Failure handling and lifecycle
 

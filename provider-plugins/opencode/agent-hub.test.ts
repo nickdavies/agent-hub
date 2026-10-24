@@ -366,6 +366,44 @@ describe("offline provider contracts with the actual main gateway", () => {
     expect(f.calls().filter((call) => call.args[0] === "approval").at(-1).payload.tool_match_input.path).toBe(args.filePath)
   })
 
+  test("distinct instance directory and worktree match actual native paths through real local policy", async () => {
+    const f = await realGatewayFixture()
+    expect(f.input.directory).not.toBe(f.input.worktree)
+    const policyPath = path.join(f.dir, "policy.json")
+    const policy = JSON.parse(readFileSync(policyPath, "utf8"))
+    // LSP has structured metadata, not a native file-rule category.
+    policy.rules.push({ tools: ["Lsp"], action: "allow", input: { metadata: { filePath: path.join(f.input.directory, "secrets") } } })
+    writeFileSync(policyPath, JSON.stringify(policy))
+    const tools: Array<[string, Record<string, unknown>]> = [
+      ["read", { filePath: "secrets" }],
+      ["write", { filePath: "secrets", content: "new" }],
+      ["edit", { filePath: "secrets", oldString: "old", newString: "new" }],
+      ["multiedit", { filePath: "secrets", edits: [{ oldString: "old", newString: "new" }] }],
+      ["glob", { pattern: "**/*.ts" }],
+      ["glob", { pattern: "**/*.ts", path: "nested" }],
+      ["grep", { pattern: "not/a/path" }],
+      ["grep", { pattern: "text", path: "nested" }],
+      ["list", { path: "nested" }],
+      ["lsp", { operation: "references", filePath: "secrets" }],
+    ]
+    for (const [index, [tool, args]] of tools.entries()) {
+      await f.before(`native-${index}`, args, tool)
+      const payload = f.calls().filter((call) => call.args[0] === "approval").at(-1).payload
+      const expected = path.resolve(f.input.directory, (args.filePath ?? args.path ?? ".") as string)
+      expect(tool === "lsp" ? payload.tool_match_input.metadata.filePath : payload.tool_match_input[tool === "glob" ? "target_directory" : "path"]).toBe(expected)
+      expect(payload.tool_input).toEqual(args)
+      expect(payload.cwd).toBe(f.input.directory)
+    }
+    for (const tool of ["read", "write", "lsp", "glob", "grep"]) {
+      const args = tool === "glob" || tool === "grep"
+        ? { path: "../secrets", pattern: "selector" }
+        : { filePath: "../secrets", content: "new", operation: "references" }
+      await expect(f.before(`traversal-${tool}`, args, tool)).rejects.toThrow("blocked")
+      const canonical = f.calls().filter((call) => call.args[0] === "approval").at(-1).payload.tool_match_input
+      expect(tool === "lsp" ? canonical.metadata.filePath : canonical[tool === "glob" ? "target_directory" : "path"]).toBe(path.resolve(f.input.directory, "../secrets"))
+    }
+  })
+
   test("mixed patch header whitespace never hides a denied target or completes the hook", async () => {
     const f = await realGatewayFixture()
     let index = 0
@@ -393,6 +431,25 @@ describe("offline provider contracts with the actual main gateway", () => {
         expect(existsSync(outside)).toBe(false)
       }
     }
+  })
+
+  test("relative patch source and move destination use the instance directory, including traversal denial", async () => {
+    const f = await realGatewayFixture()
+    const patchText = "*** Begin Patch\n*** Update File: source\n*** Move to: destination\n@@\n-old\n+new\n*** End Patch"
+    const args = { patchText }
+    await f.before("move", args, "apply_patch")
+    await f.after("move", args, "apply_patch")
+    expect(f.calls().filter((call) => call.args[0] === "approval").map((call) => call.payload.tool_match_input.path)).toEqual([
+      path.join(f.input.directory, "source"), path.join(f.input.directory, "destination"),
+    ])
+    const denied = { patchText: patchText.replace("destination", "../secrets") }
+    await expect(f.before("move-outside", denied, "apply_patch")).rejects.toThrow("blocked")
+    expect(f.calls().filter((call) => call.args[0] === "approval").at(-1).payload.tool_match_input.path).toBe(path.join(f.input.worktree, "secrets"))
+    await expect(f.after("move-outside", denied, "apply_patch")).rejects.toThrow("unauthorized")
+    const deniedSource = { patchText: patchText.replace("source", "../secrets") }
+    const start = f.calls().filter((call) => call.args[0] === "approval").length
+    await expect(f.before("source-outside", deniedSource, "apply_patch")).rejects.toThrow("blocked")
+    expect(f.calls().filter((call) => call.args[0] === "approval").slice(start).map((call) => call.payload.tool_match_input.path)).toEqual([path.join(f.input.worktree, "secrets")])
   })
 
   test("both Write wire spellings are accepted as known Write tools by the actual gateway", async () => {

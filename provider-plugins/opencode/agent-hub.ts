@@ -120,7 +120,7 @@ interface Execution {
 
 /** All mutable state, timers, children and process listeners belong to this instance. */
 export async function createPluginInstance(input: PluginInput, options: { registerProcessHandlers?: boolean } = {}): Promise<Hooks> {
-  const { client, directory, worktree } = input
+  const { client, directory } = input
   if (!directory || !path.isAbsolute(directory)) throw new Error("Plugin directory must be absolute")
   // Reuse the host's generated client, including its in-process transport. No TCP server is required.
   // The plugin publishes a v1 client with a protected field; the host's v2 API
@@ -307,7 +307,7 @@ export async function createPluginInstance(input: PluginInput, options: { regist
       }
       records.set(info.callID, record)
       try {
-        const request = normalizeToolExecution(info.tool, output.args, directory, worktree)
+        const request = normalizeToolExecution(info.tool, output.args, directory)
         if (!registered.has(info.sessionID) && !registering.has(info.sessionID)) {
           registering.add(info.sessionID)
           void sendStatus(info.sessionID, "active")

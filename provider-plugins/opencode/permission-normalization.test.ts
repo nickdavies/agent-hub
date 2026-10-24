@@ -31,6 +31,20 @@ test("patch headers mirror host prefix and trimmed-path semantics, including no-
     expect(() => normalize("apply_patch", { patchText: `*** Add File: allowed\n${prefix}\t ` }, "/project")).toThrow("invalid path")
   }
 })
+test("all relative file and patch source/destination paths use the instance directory, including traversal", () => {
+  for (const filePath of ["secrets", "../secrets", "../../outside/secrets", "/outside/secrets"]) {
+    const expected = new URL(filePath, "file:///repo/sub/").pathname
+    for (const name of ["read", "write", "edit", "multiedit"]) {
+      const result = normalize(name, { filePath, oldString: "old", newString: "new", edits: [] }, "/repo/sub")
+      expect(result.matchInputs[0].path).toBe(expected)
+    }
+    const result = normalize("apply_patch", { patchText: `*** Update File:${filePath}\n*** Move to:../destination` }, "/repo/sub")
+    expect(result.matchInputs).toEqual([{ path: expected }, { path: "/repo/destination" }])
+    expect(normalize("glob", { path: filePath, pattern: "**/*.ts" }, "/repo/sub").matchInputs).toEqual([{ target_directory: expected }])
+    expect(normalize("grep", { path: filePath, pattern: "../selector" }, "/repo/sub").matchInputs).toEqual([{ path: expected, pattern: "../selector" }])
+    expect(normalize("lsp", { filePath, operation: "references" }, "/repo/sub").matchInputs).toEqual([{ name: "references", metadata: { filePath: expected, operation: "references" } }])
+  }
+})
 test("patch normalizes every source, destination, add and delete path", () => {
   const patchText = "*** Begin Patch\r\n*** Update File: src\r\n*** Move to: /external/dest\r\n*** Delete File: old\r\n*** Add File: new\r\n+x\r\n*** End Patch"
   expect(normalize("apply_patch", { patchText }, "/project").matchInputs).toEqual([

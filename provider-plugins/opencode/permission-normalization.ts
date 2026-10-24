@@ -35,7 +35,6 @@ export function normalizeToolExecution(
   toolName: string,
   args: unknown,
   directory: string,
-  worktree = directory,
 ): NormalizedExecution {
   const rawArgs = objectArgs(args)
   const tool = TOOL_NAMES[toolName] ?? toolName
@@ -44,7 +43,7 @@ export function normalizeToolExecution(
   const one = (input: Record<string, unknown>): NormalizedExecution => ({ tool, rawArgs, matchInputs: [input] })
 
   if (["read", "write", "edit", "multiedit"].includes(toolName)) {
-    const target = absolute(required("filePath"), worktree)
+    const target = absolute(required("filePath"))
     // Preserve the deployed Write policy identity. Replacements are fragments,
     // not whole-file content, and empty replacement strings are valid inputs.
     if (toolName === "edit" && (typeof rawArgs.oldString !== "string" || typeof rawArgs.newString !== "string")) {
@@ -72,7 +71,7 @@ export function normalizeToolExecution(
       if (!prefix) continue
       const target = line.slice(prefix.length).trim()
       if (!target || target.includes("\0")) throw new Error("OpenCode apply_patch contains an invalid path")
-      paths.add(absolute(target, worktree))
+      paths.add(absolute(target))
     }
     if (!paths.size) throw new Error("OpenCode apply_patch contains no file operations")
     return { tool, rawArgs, matchInputs: [...paths].map((target) => ({ path: target })) }
