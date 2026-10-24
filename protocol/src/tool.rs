@@ -87,6 +87,7 @@ pub enum Tool {
     Grep,
     Glob,
     SemanticSearch,
+    List,
 
     // File write
     Write,
@@ -119,6 +120,7 @@ impl Tool {
             Tool::Grep => "Grep",
             Tool::Glob => "Glob",
             Tool::SemanticSearch => "SemanticSearch",
+            Tool::List => "List",
             Tool::Write => "Write",
             Tool::StrReplace => "StrReplace",
             Tool::Delete => "Delete",
@@ -140,7 +142,7 @@ impl Tool {
     /// which is the key advantage over the old `TOOL_DEFS` table.
     pub fn category(&self) -> Option<ToolCategory> {
         match self {
-            Tool::Read | Tool::Grep | Tool::Glob | Tool::SemanticSearch => {
+            Tool::Read | Tool::Grep | Tool::Glob | Tool::SemanticSearch | Tool::List => {
                 Some(ToolCategory::FileRead)
             }
             Tool::Write
@@ -173,7 +175,7 @@ impl Tool {
     /// and that no known tool is missing from its category's list.
     pub fn tools_in_category(cat: ToolCategory) -> &'static [&'static str] {
         match cat {
-            ToolCategory::FileRead => &["Read", "Grep", "Glob", "SemanticSearch"],
+            ToolCategory::FileRead => &["Read", "Grep", "Glob", "SemanticSearch", "List"],
             ToolCategory::FileWrite => &[
                 "Write",
                 "StrReplace",
@@ -195,6 +197,7 @@ impl Tool {
             "Grep" => Tool::Grep,
             "Glob" => Tool::Glob,
             "SemanticSearch" => Tool::SemanticSearch,
+            "List" => Tool::List,
             "Write" => Tool::Write,
             "StrReplace" => Tool::StrReplace,
             "Delete" => Tool::Delete,
@@ -251,7 +254,7 @@ impl JsonSchema for Tool {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "Canonical tool name. Known values: Read, Grep, Glob, SemanticSearch, Write, StrReplace, Delete, Edit, MultiEdit, EditNotebook, NotebookEdit, Bash, Task, TodoWrite, WebFetch. Arbitrary strings are accepted for unknown/MCP tools."
+            "description": "Canonical tool name. Known values: Read, Grep, Glob, SemanticSearch, List, Write, StrReplace, Delete, Edit, MultiEdit, EditNotebook, NotebookEdit, Bash, Task, TodoWrite, WebFetch. Arbitrary strings are accepted for unknown/MCP tools."
         })
     }
 }

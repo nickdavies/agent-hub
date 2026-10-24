@@ -187,6 +187,64 @@ async fn delegate_receives_claude_pre_tool_use_event_with_original_input() {
 }
 
 #[tokio::test]
+async fn canonical_paths_match_policy_while_delegation_and_review_keep_original_arguments() {
+    let policy = Policy::new("deny");
+    policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["@file_read"],"action":"allow","in_workspace":true,"in_paths":["/workspace"]}]}));
+    for name in ["read", "list"] {
+        let mut input = approval_input();
+        input["tool_name"] = json!(name);
+        input["tool_input"] = json!({"filePath":"native-relative", "providerField":true});
+        input["tool_match_input"] = json!({"path":"/workspace/file"});
+        let result = policy.run("approval", None, None, input.clone()).await;
+        assert!(result.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result.stdout).unwrap()["allowed"],
+            true
+        );
+        input["tool_match_input"] = json!({"path":"/outside/file"});
+        let result = policy.run("approval", None, None, input).await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result.stdout).unwrap()["allowed"],
+            false
+        );
+    }
+    let mut input = approval_input();
+    input["tool_name"] = json!("read");
+    input["tool_input"] = json!({"filePath":"native-relative", "offset":2});
+    input["tool_match_input"] = json!({"path":"/workspace/file"});
+    let script = policy.0.join("delegate.sh");
+    let capture = policy.0.join("raw-delegate.json");
+    std::fs::write(
+        &script,
+        "cat > \"$1\"\nprintf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"allow\"}}'\n",
+    )
+    .unwrap();
+    policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["Read"],"action":"delegate","command":format!("sh {} {}", script.display(), capture.display())}]}));
+    assert!(
+        policy
+            .run("approval", None, None, input.clone())
+            .await
+            .status
+            .success()
+    );
+    let delegated: Value = serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+    assert_eq!(delegated["tool_input"], input["tool_input"]);
+    let server = Server::start(false).await;
+    policy.write(json!({"version":1,"default":"ask","rules":[]}));
+    assert!(
+        policy
+            .run("approval", Some(&server.url), None, input.clone())
+            .await
+            .status
+            .success()
+    );
+    assert_eq!(
+        server.state.calls.lock().unwrap()[0].2["tool_input"],
+        input["tool_input"]
+    );
+}
+
+#[tokio::test]
 async fn pure_local_routing_needs_neither_server_nor_token_but_ask_fails_closed_without_server() {
     let policy = Policy::new("allow");
     let output = policy.run("approval", None, None, approval_input()).await;

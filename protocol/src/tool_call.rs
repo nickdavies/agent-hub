@@ -40,6 +40,9 @@ pub enum ToolCallKind {
     SemanticSearch {
         target_directories: Vec<String>,
     },
+    List {
+        path: String,
+    },
 
     // File write
     Write {
@@ -107,9 +110,25 @@ pub struct MultiEditEntry {
 pub struct ToolCall {
     kind: ToolCallKind,
     raw: Value,
+    policy_input: Value,
 }
 
 impl ToolCall {
+    /// Preserve provider arguments separately from canonical matching fields.
+    pub fn from_raw_and_match_input(
+        tool: Tool,
+        raw: Value,
+        match_input: Option<Value>,
+    ) -> Result<Self, ToolCallParseError> {
+        let policy_input = match_input.unwrap_or_else(|| raw.clone());
+        let kind = parse_kind(&tool, &policy_input)?;
+        Ok(Self {
+            kind,
+            raw,
+            policy_input,
+        })
+    }
+
     /// The canonical tool identity derived from the typed variant.
     pub fn tool(&self) -> Tool {
         match &self.kind {
@@ -117,6 +136,7 @@ impl ToolCall {
             ToolCallKind::Grep { .. } => Tool::Grep,
             ToolCallKind::Glob { .. } => Tool::Glob,
             ToolCallKind::SemanticSearch { .. } => Tool::SemanticSearch,
+            ToolCallKind::List { .. } => Tool::List,
             ToolCallKind::Write { .. } => Tool::Write,
             ToolCallKind::StrReplace { .. } => Tool::StrReplace,
             ToolCallKind::Delete { .. } => Tool::Delete,
@@ -142,6 +162,7 @@ impl ToolCall {
             ToolCallKind::Grep { .. } => "Grep",
             ToolCallKind::Glob { .. } => "Glob",
             ToolCallKind::SemanticSearch { .. } => "SemanticSearch",
+            ToolCallKind::List { .. } => "List",
             ToolCallKind::Write { .. } => "Write",
             ToolCallKind::StrReplace { .. } => "StrReplace",
             ToolCallKind::Delete { .. } => "Delete",
@@ -160,6 +181,11 @@ impl ToolCall {
     /// The original raw JSON blob from the provider (display/passthrough only).
     pub fn raw_input(&self) -> &Value {
         &self.raw
+    }
+
+    /// Host-derived input used for structural policy matching and review.
+    pub fn policy_input(&self) -> &Value {
+        &self.policy_input
     }
 
     /// The typed variant — all gateway logic should branch on this.
@@ -187,6 +213,7 @@ impl ToolCall {
             ToolCallKind::SemanticSearch { target_directories } => {
                 target_directories.iter().map(String::as_str).collect()
             }
+            ToolCallKind::List { path } => vec![path.as_str()],
 
             // File write — single path arg (some are optional)
             ToolCallKind::Write { path, .. } => vec![path.as_str()],
@@ -245,8 +272,7 @@ impl TryFrom<(Tool, Value)> for ToolCall {
     type Error = ToolCallParseError;
 
     fn try_from((tool, raw): (Tool, Value)) -> Result<Self, Self::Error> {
-        let kind = parse_kind(&tool, &raw)?;
-        Ok(ToolCall { kind, raw })
+        Self::from_raw_and_match_input(tool, raw, None)
     }
 }
 
@@ -295,6 +321,11 @@ fn parse_kind(tool: &Tool, raw: &Value) -> Result<ToolCallKind, ToolCallParseErr
                 path: input.path,
                 content: input.content,
             })
+        }
+        Tool::List => {
+            let input: PathInput =
+                serde_json::from_value(raw.clone()).map_err(|e| err(e.to_string()))?;
+            Ok(ToolCallKind::List { path: input.path })
         }
         Tool::StrReplace => {
             let input: StrReplaceInput =
@@ -365,6 +396,12 @@ fn parse_kind(tool: &Tool, raw: &Value) -> Result<ToolCallKind, ToolCallParseErr
 #[derive(Deserialize)]
 struct ReadInput {
     #[serde(alias = "file_path")]
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathInput {
     path: String,
 }
 
@@ -446,6 +483,44 @@ struct WebFetchInput {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn raw_and_canonical_policy_inputs_remain_separate() {
+        let raw = json!({"filePath":"relative.txt", "offset":2, "providerField":true});
+        let canonical = json!({"path":"/workspace/relative.txt"});
+        let call =
+            ToolCall::from_raw_and_match_input(Tool::Read, raw.clone(), Some(canonical.clone()))
+                .unwrap();
+        assert_eq!(call.raw_input(), &raw);
+        assert_eq!(call.policy_input(), &canonical);
+        assert_eq!(call.matchable_args(), ["/workspace/relative.txt"]);
+        assert!(ToolCall::from_raw_and_match_input(Tool::Read, raw, Some(json!({}))).is_err());
+        let unknown = ToolCall::try_from((
+            Tool::Unknown("MCP.resource/read".into()),
+            json!({"opaque":true}),
+        ))
+        .unwrap();
+        assert_eq!(unknown.raw_input(), unknown.policy_input());
+        assert!(unknown.matchable_args().is_empty());
+    }
+
+    #[test]
+    fn list_is_a_strict_canonical_path_tool_in_read_groups() {
+        let call = ToolCall::try_from((Tool::List, json!({"path":"/workspace"}))).unwrap();
+        assert_eq!(call.tool_name(), "List");
+        assert_eq!(call.matchable_args(), ["/workspace"]);
+        assert_eq!(call.tool().category(), Some(crate::ToolCategory::FileRead));
+        for group in ["@file", "@file_read"] {
+            assert!(crate::expand_tool_group(group).unwrap().contains(&"List"));
+        }
+        for raw in [
+            json!({}),
+            json!({"path":1}),
+            json!({"path":"/workspace", "extra":true}),
+        ] {
+            assert!(ToolCall::try_from((Tool::List, raw)).is_err());
+        }
+    }
 
     // --- Construction: known tools ---
 

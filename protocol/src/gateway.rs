@@ -56,6 +56,7 @@ pub enum OpenCodeTool {
     Edit, // maps to Tool::Write
     Glob,
     Grep,
+    List,
     MultiEdit,
     Read,
     Task,
@@ -72,6 +73,7 @@ impl OpenCodeTool {
             OpenCodeTool::Edit => "edit",
             OpenCodeTool::Glob => "glob",
             OpenCodeTool::Grep => "grep",
+            OpenCodeTool::List => "list",
             OpenCodeTool::MultiEdit => "multiedit",
             OpenCodeTool::Read => "read",
             OpenCodeTool::Task => "task",
@@ -88,6 +90,7 @@ impl OpenCodeTool {
             "edit" => OpenCodeTool::Edit,
             "glob" => OpenCodeTool::Glob,
             "grep" => OpenCodeTool::Grep,
+            "list" => OpenCodeTool::List,
             "multiedit" => OpenCodeTool::MultiEdit,
             "read" => OpenCodeTool::Read,
             "task" => OpenCodeTool::Task,
@@ -100,6 +103,7 @@ impl OpenCodeTool {
                 "Bash" => OpenCodeTool::Bash,
                 "Glob" => OpenCodeTool::Glob,
                 "Grep" => OpenCodeTool::Grep,
+                "List" => OpenCodeTool::List,
                 "MultiEdit" => OpenCodeTool::MultiEdit,
                 "Read" => OpenCodeTool::Read,
                 "Task" => OpenCodeTool::Task,
@@ -120,6 +124,7 @@ impl From<OpenCodeTool> for Tool {
             OpenCodeTool::Edit => Tool::Write, // opencode "edit" = canonical "Write"
             OpenCodeTool::Glob => Tool::Glob,
             OpenCodeTool::Grep => Tool::Grep,
+            OpenCodeTool::List => Tool::List,
             OpenCodeTool::MultiEdit => Tool::MultiEdit,
             OpenCodeTool::Read => Tool::Read,
             OpenCodeTool::Task => Tool::Task,
@@ -158,7 +163,7 @@ impl JsonSchema for OpenCodeTool {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "description": "Tool name as sent by OpenCode (lowercase). Known: bash, edit, glob, grep, multiedit, read, task, todowrite, webfetch, write."
+            "description": "Tool name as sent by OpenCode (lowercase). Known: bash, edit, glob, grep, list, multiedit, read, task, todowrite, webfetch, write."
         })
     }
 }
@@ -427,6 +432,10 @@ pub struct OpenCodeHookInput {
     pub tool: OpenCodeTool,
     #[serde(default)]
     pub tool_input: serde_json::Value,
+    /// Canonical fields for typed policy matching. Original arguments remain
+    /// intact for delegation and human review.
+    #[serde(default)]
+    pub tool_match_input: Option<serde_json::Value>,
     pub cwd: String,
     #[serde(default)]
     pub workspace_roots: Option<Vec<String>>,

@@ -20,7 +20,8 @@ impl TryFrom<OpenCodeHookInput> for ToolHookEvent {
 
         let tool: Tool = input.tool.into();
         let tool_call =
-            ToolCall::try_from((tool, input.tool_input)).map_err(|e| ParseError(e.to_string()))?;
+            ToolCall::from_raw_and_match_input(tool, input.tool_input, input.tool_match_input)
+                .map_err(|e| ParseError(e.to_string()))?;
 
         // OpenCode sends workspace_roots; fall back to cwd
         let workspace_roots = input
