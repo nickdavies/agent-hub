@@ -20,7 +20,7 @@ pub struct QuestionArgs {
 
     /// Bearer token for server auth
     #[arg(long, env = "AGENT_HUB_TOKEN")]
-    pub token: Secret,
+    pub token: Option<Secret>,
 
     /// Maximum time to wait for an answer in seconds
     #[arg(long, default_value = "86400")]
@@ -105,9 +105,7 @@ async fn proxy_question(
         req.questions.len()
     );
 
-    let register_resp = client
-        .post(&register_url)
-        .bearer_auth(args.token.expose())
+    let register_resp = crate::authenticated(args.token.as_ref(), client.post(&register_url))
         .json(req)
         .timeout(Duration::from_secs(10))
         .send()
@@ -140,12 +138,10 @@ async fn proxy_question(
     );
 
     tokio::select! {
-        result = poll_for_answer(&client, &wait_url, &args.token, deadline, args.timeout) => result,
+        result = poll_for_answer(&client, &wait_url, args.token.as_ref(), deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal, cancelling question {}", proxy_resp.id);
-            let _ = client
-                .post(&cancel_url)
-                .bearer_auth(args.token.expose())
+            let _ = crate::authenticated(args.token.as_ref(), client.post(&cancel_url))
                 .json(&QuestionResolveRequest {
                     decision: QuestionDecision::Cancel,
                     answers: None,
@@ -163,7 +159,7 @@ async fn proxy_question(
 async fn poll_for_answer(
     client: &reqwest::Client,
     wait_url: &str,
-    token: &Secret,
+    token: Option<&Secret>,
     deadline: tokio::time::Instant,
     timeout_secs: u64,
 ) -> Result<Vec<Vec<String>>, QuestionFlowError> {
@@ -181,9 +177,7 @@ async fn poll_for_answer(
         let resp = await_question_deadline(
             deadline,
             last_wait_was_healthy,
-            client
-                .get(wait_url)
-                .bearer_auth(token.expose())
+            crate::authenticated(token, client.get(wait_url))
                 .timeout(Duration::from_secs(60))
                 .send(),
         )

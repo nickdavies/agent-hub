@@ -57,11 +57,11 @@ struct ApprovalArgs {
 
     /// Server URL (e.g. https://hub.example.com)
     #[arg(long, env = "AGENT_HUB_SERVER")]
-    server: String,
+    server: Option<String>,
 
     /// Bearer token for server auth
     #[arg(long, env = "AGENT_HUB_TOKEN")]
-    token: Secret,
+    token: Option<Secret>,
 
     /// Maximum time to wait for approval in seconds
     #[arg(long, default_value = "86400")]
@@ -80,7 +80,7 @@ struct StatusReportArgs {
 
     /// Bearer token for server auth
     #[arg(long, env = "AGENT_HUB_TOKEN")]
-    token: Secret,
+    token: Option<Secret>,
 }
 
 // --- Entrypoint ---
@@ -230,9 +230,7 @@ async fn run_status_report(args: StatusReportArgs) -> ExitCode {
     let client = reqwest::Client::new();
     let url = format!("{}/api/v1/hooks/status", args.server.trim_end_matches('/'));
 
-    match client
-        .post(&url)
-        .bearer_auth(args.token.expose())
+    match authenticated(args.token.as_ref(), client.post(&url))
         .json(&report)
         .timeout(Duration::from_secs(10))
         .send()
@@ -485,7 +483,10 @@ async fn escalate_to_server(
     extra: Option<ExtraContext>,
 ) -> Result<HookOutput, ApprovalFlowError> {
     let client = reqwest::Client::new();
-    let base = args.server.trim_end_matches('/');
+    let server = args.server.as_deref().ok_or_else(|| {
+        ApprovalFlowError::Pipeline("approval server is required for central approval".to_string())
+    })?;
+    let base = server.trim_end_matches('/');
 
     let context = ApprovalContext {
         workspace_roots: event.workspace_roots.clone(),
@@ -500,9 +501,7 @@ async fn escalate_to_server(
         event.tool_call.tool_name(),
         event.session_id
     );
-    let register_resp = client
-        .post(&register_url)
-        .bearer_auth(args.token.expose())
+    let register_resp = authenticated(args.token.as_ref(), client.post(&register_url))
         .json(&ApprovalRequest {
             id: request_id,
             session_id: event.session_id.clone(),
@@ -556,13 +555,11 @@ async fn escalate_to_server(
     let cancel_url = format!("{base}/api/v1/approvals/{}/resolve", approval.id);
 
     tokio::select! {
-        result = poll_for_decision(&client, &wait_url, &args.token, deadline, args.timeout) => result,
+        result = poll_for_decision(&client, &wait_url, args.token.as_ref(), deadline, args.timeout) => result,
         _ = shutdown_signal() => {
             eprintln!("[info] received shutdown signal, cancelling approval {}", approval.id);
             // Best-effort cancel — don't let this block shutdown for long.
-            let _ = client
-                .post(&cancel_url)
-                .bearer_auth(args.token.expose())
+            let _ = authenticated(args.token.as_ref(), client.post(&cancel_url))
                 .json(&serde_json::json!({"decision": "cancel"}))
                 .timeout(Duration::from_secs(5))
                 .send()
@@ -576,7 +573,7 @@ async fn escalate_to_server(
 async fn poll_for_decision(
     client: &reqwest::Client,
     wait_url: &str,
-    token: &Secret,
+    token: Option<&Secret>,
     deadline: tokio::time::Instant,
     timeout_secs: u64,
 ) -> Result<HookOutput, ApprovalFlowError> {
@@ -594,9 +591,7 @@ async fn poll_for_decision(
         let resp = await_approval_deadline(
             deadline,
             last_wait_was_healthy,
-            client
-                .get(wait_url)
-                .bearer_auth(token.expose())
+            authenticated(token, client.get(wait_url))
                 .timeout(Duration::from_secs(60))
                 .send(),
         )
@@ -703,6 +698,16 @@ async fn poll_for_decision(
 
         eprintln!("[info] approval resolved: status={:?}", wait.status);
         return Ok(status_to_output(&wait.status));
+    }
+}
+
+fn authenticated(
+    token: Option<&Secret>,
+    request: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    match token {
+        Some(token) => request.bearer_auth(token.expose()),
+        None => request,
     }
 }
 
