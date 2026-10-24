@@ -112,7 +112,10 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
             .route("/questions/{id}/wait", get(handle_question_wait::<N>))
             .route(
                 "/questions/{id}/resolve",
-                post(handle_question_resolve::<N>),
+                post(handle_question_resolve::<N>).layer(from_fn_with_state(
+                    state.clone(),
+                    require_approval_readwrite::<N>,
+                )),
             )
             .route(
                 "/sessions/{id}/approval-mode",
@@ -707,8 +710,11 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn readonly_approval_api_rejects_all_decisions_without_mutation() {
-        for (kind, decisions) in [("approvals", ["approve", "deny", "cancel"])] {
+    async fn readonly_resolution_apis_reject_all_decisions_without_mutation() {
+        for (kind, decisions) in [
+            ("approvals", ["approve", "deny", "cancel"]),
+            ("questions", ["answer", "reject", "cancel"]),
+        ] {
             let app = test_app_with_mode(ApprovalFeatureMode::Readonly);
             let id = create_review(&app, kind, serde_json::json!({"command": "ls"})).await;
             for decision in decisions {
