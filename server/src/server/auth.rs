@@ -2,19 +2,41 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
+use subtle::ConstantTimeEq;
 use tower_sessions::Session;
 use tracing::debug;
 
 use super::AppState;
+use super::config::Role;
 use super::notifier::Notifier;
 use super::oauth;
 
+/// The authenticated caller, inserted into request extensions by
+/// [`require_auth`] (or as a fixed anonymous reviewer when `AUTH_MODE=none`).
+#[derive(Clone, Debug)]
+pub struct Principal {
+    /// Token label, or email for OIDC/basic sessions.
+    pub label: String,
+    pub role: Role,
+}
+
+impl Principal {
+    /// Used when `AUTH_MODE=none`: everyone has full access.
+    pub fn anonymous() -> Self {
+        Self {
+            label: "anonymous".into(),
+            role: Role::Reviewer,
+        }
+    }
+}
+
 /// API auth middleware: validates Bearer token against configured tokens.
-/// Also accepts valid session cookies (for web UI calling API endpoints).
+/// Also accepts valid session cookies (for web UI calling API endpoints),
+/// which are always treated as reviewers.
 pub async fn require_auth<N: Notifier>(
     state: axum::extract::State<AppState<N>>,
     session: Session,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Try Bearer token first
@@ -32,14 +54,19 @@ pub async fn require_auth<N: Notifier>(
             .config
             .tokens
             .iter()
-            .find(|t| t.secret.expose() == token)
+            .find(|t| bool::from(t.secret.expose().as_bytes().ct_eq(token.as_bytes())))
             .ok_or(StatusCode::UNAUTHORIZED)?;
 
         debug!(
             label = matched.label,
+            role = ?matched.role,
             path = request.uri().path(),
             "authenticated via bearer token"
         );
+        request.extensions_mut().insert(Principal {
+            label: matched.label.clone(),
+            role: matched.role,
+        });
         return Ok(next.run(request).await);
     }
 
@@ -50,10 +77,24 @@ pub async fn require_auth<N: Notifier>(
             path = request.uri().path(),
             "authenticated via session"
         );
+        request.extensions_mut().insert(Principal {
+            label: email,
+            role: Role::Reviewer,
+        });
         return Ok(next.run(request).await);
     }
 
     Err(StatusCode::UNAUTHORIZED)
+}
+
+/// Route layer for reviewer-only endpoints. Must run inside [`require_auth`]
+/// (or the anonymous `Principal` extension layer).
+pub async fn require_reviewer(request: Request, next: Next) -> Result<Response, StatusCode> {
+    match request.extensions().get::<Principal>() {
+        Some(p) if p.role == Role::Reviewer => Ok(next.run(request).await),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
 }
 
 /// Web auth middleware: session cookie only, redirects to login on failure.

@@ -14,7 +14,8 @@ set -euo pipefail
 
 WEBHOOK_PORT=9999
 SERVER_PORT=8080
-TOKEN="test-token-$(head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
+AGENT_TOKEN="agent-token-$(head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
+REVIEWER_TOKEN="reviewer-token-$(head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
 BASE_URL="http://localhost:${SERVER_PORT}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -41,7 +42,7 @@ sleep 0.3
 
 # --- Start server ---
 echo "Starting agent-hub-server on :${SERVER_PORT}..."
-export AGENT_HUB_TOKENS="test:${TOKEN}"
+export AGENT_HUB_TOKENS="agent:${AGENT_TOKEN}:agent,cli:${REVIEWER_TOKEN}:reviewer"
 export LISTEN_ADDR="127.0.0.1:${SERVER_PORT}"
 export APPROVAL_MODE=readwrite
 export BASE_URL
@@ -72,7 +73,8 @@ echo "============================================================"
 echo ""
 echo "  Web UI:    ${BASE_URL}/auth/login"
 echo "  Health:    ${BASE_URL}/health"
-echo "  Token:     ${TOKEN}"
+echo "  Agent:     ${AGENT_TOKEN}  (raise/wait/cancel only)"
+echo "  Reviewer:  ${REVIEWER_TOKEN}  (can approve/deny)"
 echo "  Login:     admin / admin"
 echo ""
 echo "--- Simulate a hook binary (register an approval) ----------"
@@ -80,7 +82,7 @@ echo ""
 cat <<CURL
   # 1. Register an approval
   curl -s -X POST ${BASE_URL}/api/v1/hooks/approval \\
-    -H "Authorization: Bearer ${TOKEN}" \\
+    -H "Authorization: Bearer ${AGENT_TOKEN}" \\
     -H "Content-Type: application/json" \\
     -d '{
       "request_id": "test-req-1",
@@ -95,17 +97,18 @@ cat <<CURL
   #    Copy the "id" from step 1 into APPROVAL_ID
   APPROVAL_ID=<id-from-step-1>
   curl -s ${BASE_URL}/api/v1/approvals/\${APPROVAL_ID}/wait \\
-    -H "Authorization: Bearer ${TOKEN}" | python3 -m json.tool
+    -H "Authorization: Bearer ${AGENT_TOKEN}" | python3 -m json.tool
 
-  # 3. Resolve via API (or use the web UI instead)
+  # 3. Resolve via API with the reviewer token (or use the web UI instead).
+  #    The agent token gets 403 here.
   curl -s -X POST ${BASE_URL}/api/v1/approvals/\${APPROVAL_ID}/resolve \\
-    -H "Authorization: Bearer ${TOKEN}" \\
+    -H "Authorization: Bearer ${REVIEWER_TOKEN}" \\
     -H "Content-Type: application/json" \\
     -d '{"decision": "approve", "message": "looks good"}' | python3 -m json.tool
 
   # 4. Check session approval mode
   curl -s ${BASE_URL}/api/v1/sessions/test-session-1/approval-mode \\
-    -H "Authorization: Bearer ${TOKEN}" | python3 -m json.tool
+    -H "Authorization: Bearer ${AGENT_TOKEN}" | python3 -m json.tool
 
 CURL
 echo ""
@@ -114,7 +117,7 @@ echo ""
 cat <<CURL2
   # Report a session as active (e.g. agent working)
   curl -s -X POST ${BASE_URL}/api/v1/hooks/status \\
-    -H "Authorization: Bearer ${TOKEN}" \\
+    -H "Authorization: Bearer ${AGENT_TOKEN}" \\
     -H "Content-Type: application/json" \\
     -d '{
       "session_id": "test-session-1",
@@ -125,7 +128,7 @@ cat <<CURL2
 
   # Report idle (agent finished working, waiting for user)
   curl -s -X POST ${BASE_URL}/api/v1/hooks/status \\
-    -H "Authorization: Bearer ${TOKEN}" \\
+    -H "Authorization: Bearer ${AGENT_TOKEN}" \\
     -H "Content-Type: application/json" \\
     -d '{
       "session_id": "test-session-1",
@@ -136,7 +139,7 @@ cat <<CURL2
 
   # Report ended (session closed)
   curl -s -X POST ${BASE_URL}/api/v1/hooks/status \\
-    -H "Authorization: Bearer ${TOKEN}" \\
+    -H "Authorization: Bearer ${AGENT_TOKEN}" \\
     -H "Content-Type: application/json" \\
     -d '{
       "session_id": "test-session-1",
@@ -151,9 +154,9 @@ echo "--- Automated session simulator ------------------------------"
 echo ""
 echo "  For a full lifecycle test (active → idle → ended), use:"
 echo ""
-echo "    ./dev/simulate-session.sh --token ${TOKEN}"
-echo "    ./dev/simulate-session.sh --token ${TOKEN} --fast"
-echo "    ./dev/simulate-session.sh --token ${TOKEN} --with-approval"
+echo "    ./dev/simulate-session.sh --token ${AGENT_TOKEN}"
+echo "    ./dev/simulate-session.sh --token ${AGENT_TOKEN} --fast"
+echo "    ./dev/simulate-session.sh --token ${AGENT_TOKEN} --with-approval"
 echo ""
 echo "--- What to test -------------------------------------------"
 echo ""

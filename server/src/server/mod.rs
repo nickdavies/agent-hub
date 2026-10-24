@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use tokio::sync::RwLock;
 use tower_sessions::{MemoryStore, SessionManagerLayer};
 use uuid::Uuid;
@@ -26,7 +26,7 @@ use crate::error::AppError;
 use crate::mcp;
 use approvals::{ApprovalRegistry, ApprovalStatus};
 use config::{
-    ApprovalFeatureMode, AuthMode, NotifyConfig, NotifyConfigUpdate, ServerConfig,
+    ApprovalFeatureMode, AuthMode, NotifyConfig, NotifyConfigUpdate, Role, ServerConfig,
     SharedNotifyConfig,
 };
 use hooks::PendingNotifications;
@@ -40,6 +40,7 @@ use sessions::{EffectiveSessionStatus, SessionConfigUpdate, SessionRegistry, Ses
 use protocol::{
     ApprovalDecision, ApprovalModeResponse, ApprovalResolveRequest, ApprovalWaitResponse,
     ConfigResponse, QuestionDecision, QuestionResolveRequest, QuestionWaitResponse, SessionId,
+    WhoAmIResponse,
 };
 
 pub struct AppState<N: Notifier> {
@@ -78,33 +79,37 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
         Arc::clone(&state.presence),
     );
 
-    let mut api_v1 = Router::new()
+    // Routes any authenticated principal may call. Agents raise, monitor and
+    // cancel requests here; the resolve handlers enforce per-decision roles.
+    let mut agent_api = Router::new()
         .route("/hooks/stop", post(hooks::stop::<N>))
         .route("/hooks/notification", post(hooks::notification::<N>))
         .route("/hooks/session-end", post(hooks::session_end::<N>))
         .route("/hooks/status", post(hooks::status::<N>))
+        .route("/whoami", get(handle_whoami))
+        .nest_service("/mcp", mcp_service);
+
+    // Routes only reviewers (humans, CLI) may call.
+    let mut reviewer_api = Router::new()
         .route("/presence", post(handle_presence_update::<N>))
         .route("/sessions", get(handle_list_sessions::<N>))
         .route("/sessions/{id}", put(handle_update_session::<N>))
         .route(
             "/config",
             get(handle_get_config::<N>).put(handle_put_config::<N>),
-        )
-        .nest_service("/mcp", mcp_service);
+        );
 
     // Mount approval API routes only when approval mode is not disabled
     if state.config.approval_mode != ApprovalFeatureMode::Disabled {
-        api_v1 = api_v1
+        agent_api = agent_api
             .route("/hooks/approval", post(hooks::approval::<N>))
             .route("/hooks/question", post(hooks::question::<N>))
-            .route("/approvals/pending", get(handle_list_pending::<N>))
             .route("/approvals/{id}", get(handle_get_approval::<N>))
             .route("/approvals/{id}/wait", get(handle_approval_wait::<N>))
             .route(
                 "/approvals/{id}/resolve",
                 post(handle_approval_resolve::<N>),
             )
-            .route("/questions/pending", get(handle_list_questions::<N>))
             .route("/questions/{id}", get(handle_get_question::<N>))
             .route("/questions/{id}/wait", get(handle_question_wait::<N>))
             .route(
@@ -115,10 +120,17 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
                 "/sessions/{id}/approval-mode",
                 get(handle_get_approval_mode::<N>),
             );
+        reviewer_api = reviewer_api
+            .route("/approvals/pending", get(handle_list_pending::<N>))
+            .route("/questions/pending", get(handle_list_questions::<N>));
     }
 
+    let api_v1 = agent_api.merge(reviewer_api.route_layer(from_fn(auth::require_reviewer)));
+
     let api_v1 = if state.config.auth_mode == AuthMode::None {
-        api_v1.with_state(state.clone())
+        api_v1
+            .layer(Extension(auth::Principal::anonymous()))
+            .with_state(state.clone())
     } else {
         api_v1
             .layer(from_fn_with_state(state.clone(), auth::require_auth::<N>))
@@ -262,6 +274,24 @@ async fn build_session_views<N: Notifier>(state: &AppState<N>) -> Vec<sessions::
     views
 }
 
+async fn handle_whoami(Extension(principal): Extension<auth::Principal>) -> Json<WhoAmIResponse> {
+    Json(WhoAmIResponse {
+        label: principal.label,
+        role: principal.role,
+    })
+}
+
+/// Agents may only cancel requests; resolving them requires a reviewer.
+fn ensure_can_resolve(principal: &auth::Principal, is_cancel: bool) -> Result<(), AppError> {
+    if is_cancel || principal.role == Role::Reviewer {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(format!(
+        "'{}' has role {:?} and may only cancel",
+        principal.label, principal.role
+    )))
+}
+
 async fn handle_presence_update<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
     Json(body): Json<PresenceUpdate>,
@@ -379,8 +409,11 @@ async fn handle_approval_wait<N: Notifier>(
 async fn handle_approval_resolve<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Extension(principal): Extension<auth::Principal>,
     Json(req): Json<ApprovalResolveRequest>,
 ) -> Result<Json<approvals::Approval>, AppError> {
+    ensure_can_resolve(&principal, req.decision == ApprovalDecision::Cancel)?;
+
     let new_status = match req.decision {
         ApprovalDecision::Approve => ApprovalStatus::Approved {
             message: req.message,
@@ -480,8 +513,11 @@ async fn handle_question_wait<N: Notifier>(
 async fn handle_question_resolve<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Extension(principal): Extension<auth::Principal>,
     Json(req): Json<QuestionResolveRequest>,
 ) -> Result<Json<questions::PendingQuestion>, AppError> {
+    ensure_can_resolve(&principal, req.decision == QuestionDecision::Cancel)?;
+
     let new_status = match req.decision {
         QuestionDecision::Answer => questions::QuestionStatus::Answered {
             answers: req.answers.unwrap_or_default(),
@@ -580,6 +616,64 @@ mod integration_tests {
         test_app_with_mode(ApprovalFeatureMode::Readwrite)
     }
 
+    const AGENT_TOKEN: &str = "agent-secret";
+    const REVIEWER_TOKEN: &str = "reviewer-secret";
+
+    /// Build a test router with token auth: one agent and one reviewer token.
+    fn test_app_with_tokens() -> Router {
+        let config = ServerConfig {
+            auth_mode: AuthMode::Token,
+            tokens: vec![
+                Token {
+                    label: "agent".into(),
+                    secret: protocol::Secret::new(AGENT_TOKEN),
+                    role: Role::Agent,
+                },
+                Token {
+                    label: "cli".into(),
+                    secret: protocol::Secret::new(REVIEWER_TOKEN),
+                    role: Role::Reviewer,
+                },
+            ],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode: ApprovalFeatureMode::Readwrite,
+            base_url: Some("http://localhost:8080".into()),
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        router(AppState::new(config, NullNotifier, None))
+    }
+
+    /// Helper: send a request with an optional bearer token and JSON body;
+    /// return (status_code, body_string).
+    async fn send(
+        app: &Router,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (AxumStatus, String) {
+        let mut req = Request::builder().method(method).uri(path);
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
     /// Helper: POST JSON to a path and return the status code.
     async fn post_json(app: &Router, path: &str, body: &str) -> AxumStatus {
         let req = Request::builder()
@@ -634,21 +728,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn mobile_approval_queue_requires_web_auth() {
-        let config = ServerConfig {
-            auth_mode: AuthMode::Token,
-            tokens: vec![Token {
-                label: "test".into(),
-                secret: protocol::Secret::new("secret"),
-            }],
-            listen_addr: "127.0.0.1:0".into(),
-            presence_ttl_secs: 120,
-            session_ttl_secs: 7200,
-            notification_delay_secs: 0,
-            approval_mode: ApprovalFeatureMode::Readwrite,
-            base_url: Some("http://localhost:8080".into()),
-            default_approval_mode: SessionApprovalMode::Remote,
-        };
-        let app = router(AppState::new(config, NullNotifier, None));
+        let app = test_app_with_tokens();
 
         let request = Request::builder()
             .uri("/approvals/queue")
@@ -1035,5 +1115,240 @@ mod integration_tests {
             sess.waiting_reason.is_none(),
             "waiting_reason should be cleared after reset"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Token roles — agents raise/monitor/cancel, reviewers resolve
+    // ---------------------------------------------------------------
+
+    /// Register an approval with the given token and return its id.
+    async fn register_approval(app: &Router, token: &str, request_id: &str) -> String {
+        let body = format!(
+            r#"{{
+                "id": "{request_id}",
+                "session_id": "ses_roles",
+                "session_display_name": "Roles",
+                "cwd": "/tmp/proj",
+                "tool_name": "Bash",
+                "tool_input": {{"command": "ls"}},
+                "provider": "opencode",
+                "request_type": "tool_use",
+                "context": {{"workspace_roots": ["/tmp/proj"], "hook_event_name": "permission.ask"}}
+            }}"#
+        );
+        let (status, body) = send(
+            app,
+            "POST",
+            "/api/v1/hooks/approval",
+            Some(token),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            AxumStatus::OK,
+            "approval registration failed: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    /// Register a question with the given token and return its id.
+    async fn register_question(app: &Router, token: &str, request_id: &str) -> String {
+        let body = format!(
+            r#"{{
+                "id": "{request_id}",
+                "session_id": "ses_roles",
+                "session_display_name": "Roles",
+                "cwd": "/tmp/proj",
+                "question_request_id": "oc-{request_id}",
+                "questions": [{{"question":"Continue?","header":"Plan","options":[{{"label":"Yes","description":"Go"}}]}}],
+                "provider": "opencode"
+            }}"#
+        );
+        let (status, body) = send(
+            app,
+            "POST",
+            "/api/v1/hooks/question",
+            Some(token),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            AxumStatus::OK,
+            "question registration failed: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_token_is_unauthorized() {
+        let app = test_app_with_tokens();
+
+        let (status, _) = send(&app, "GET", "/api/v1/whoami", None, None).await;
+        assert_eq!(status, AxumStatus::UNAUTHORIZED);
+
+        let (status, _) = send(&app, "GET", "/api/v1/whoami", Some("wrong"), None).await;
+        assert_eq!(status, AxumStatus::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_token_role() {
+        let app = test_app_with_tokens();
+
+        let (status, body) = send(&app, "GET", "/api/v1/whoami", Some(AGENT_TOKEN), None).await;
+        assert_eq!(status, AxumStatus::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["label"], "agent");
+        assert_eq!(v["role"], "agent");
+
+        let (_, body) = send(&app, "GET", "/api/v1/whoami", Some(REVIEWER_TOKEN), None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["role"], "reviewer");
+    }
+
+    #[tokio::test]
+    async fn agent_cannot_resolve_approval_but_can_cancel() {
+        let app = test_app_with_tokens();
+        let id = register_approval(&app, AGENT_TOKEN, "req-agent-1").await;
+        let resolve = format!("/api/v1/approvals/{id}/resolve");
+
+        for decision in ["approve", "deny"] {
+            let body = format!(r#"{{"decision":"{decision}"}}"#);
+            let (status, _) = send(&app, "POST", &resolve, Some(AGENT_TOKEN), Some(&body)).await;
+            assert_eq!(status, AxumStatus::FORBIDDEN, "agent must not {decision}");
+        }
+
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/approvals/{id}"),
+            Some(AGENT_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["status"]["type"], "pending",
+            "approval must still be pending: {body}"
+        );
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            &resolve,
+            Some(AGENT_TOKEN),
+            Some(r#"{"decision":"cancel"}"#),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn reviewer_can_approve() {
+        let app = test_app_with_tokens();
+        let id = register_approval(&app, AGENT_TOKEN, "req-agent-2").await;
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/approvals/{id}/resolve"),
+            Some(REVIEWER_TOKEN),
+            Some(r#"{"decision":"approve"}"#),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn agent_cannot_answer_question_but_can_cancel() {
+        let app = test_app_with_tokens();
+        let id = register_question(&app, AGENT_TOKEN, "req-agent-q1").await;
+        let resolve = format!("/api/v1/questions/{id}/resolve");
+
+        for body in [
+            r#"{"decision":"answer","answers":[["Yes"]]}"#,
+            r#"{"decision":"reject"}"#,
+        ] {
+            let (status, _) = send(&app, "POST", &resolve, Some(AGENT_TOKEN), Some(body)).await;
+            assert_eq!(
+                status,
+                AxumStatus::FORBIDDEN,
+                "agent must not resolve with {body}"
+            );
+        }
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            &resolve,
+            Some(AGENT_TOKEN),
+            Some(r#"{"decision":"cancel"}"#),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn reviewer_can_answer_question() {
+        let app = test_app_with_tokens();
+        let id = register_question(&app, AGENT_TOKEN, "req-agent-q2").await;
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/questions/{id}/resolve"),
+            Some(REVIEWER_TOKEN),
+            Some(r#"{"decision":"answer","answers":[["Yes"]]}"#),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn agent_is_forbidden_from_reviewer_routes() {
+        let app = test_app_with_tokens();
+
+        for (method, path, body) in [
+            ("GET", "/api/v1/approvals/pending", None),
+            ("GET", "/api/v1/questions/pending", None),
+            ("GET", "/api/v1/sessions", None),
+            (
+                "PUT",
+                "/api/v1/sessions/ses_roles",
+                Some(r#"{"stop_enabled":false}"#),
+            ),
+            ("GET", "/api/v1/config", None),
+            ("PUT", "/api/v1/config", Some(r#"{"stop_enabled":false}"#)),
+            ("POST", "/api/v1/presence", Some(r#"{"state":"away"}"#)),
+        ] {
+            let (status, _) = send(&app, method, path, Some(AGENT_TOKEN), body).await;
+            assert_eq!(status, AxumStatus::FORBIDDEN, "agent {method} {path}");
+
+            let (status, body) = send(&app, method, path, Some(REVIEWER_TOKEN), body).await;
+            assert_ne!(
+                status,
+                AxumStatus::FORBIDDEN,
+                "reviewer {method} {path}: {body}"
+            );
+            assert_ne!(
+                status,
+                AxumStatus::UNAUTHORIZED,
+                "reviewer {method} {path}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_none_grants_reviewer_access() {
+        let app = test_app();
+
+        let (status, body) = send(&app, "GET", "/api/v1/whoami", None, None).await;
+        assert_eq!(status, AxumStatus::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["role"], "reviewer");
     }
 }
