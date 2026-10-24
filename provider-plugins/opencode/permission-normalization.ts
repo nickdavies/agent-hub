@@ -63,11 +63,16 @@ export function normalizeToolExecution(
   }
   if (toolName === "apply_patch") {
     const paths = new Set<string>()
+    const prefixes = ["*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:"]
     for (const line of required("patchText").replaceAll("\r\n", "\n").split("\n")) {
-      const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/) ?? line.match(/^\*\*\* Move to: (.+)$/)
-      if (!match) continue
-      if (match[1].includes("\0")) throw new Error("OpenCode apply_patch contains an invalid path")
-      paths.add(absolute(match[1], worktree))
+      // Match the pinned host's startsWith(prefix) + slice(...).trim() semantics.
+      // In particular, no space after ':' is required, and extra spaces are not
+      // part of the path. Never silently skip a recognized operation header.
+      const prefix = prefixes.find((candidate) => line.startsWith(candidate))
+      if (!prefix) continue
+      const target = line.slice(prefix.length).trim()
+      if (!target || target.includes("\0")) throw new Error("OpenCode apply_patch contains an invalid path")
+      paths.add(absolute(target, worktree))
     }
     if (!paths.size) throw new Error("OpenCode apply_patch contains no file operations")
     return { tool, rawArgs, matchInputs: [...paths].map((target) => ({ path: target })) }

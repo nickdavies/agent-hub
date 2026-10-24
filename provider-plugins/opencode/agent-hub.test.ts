@@ -366,6 +366,35 @@ describe("offline provider contracts with the actual main gateway", () => {
     expect(f.calls().filter((call) => call.args[0] === "approval").at(-1).payload.tool_match_input.path).toBe(args.filePath)
   })
 
+  test("mixed patch header whitespace never hides a denied target or completes the hook", async () => {
+    const f = await realGatewayFixture()
+    let index = 0
+    for (const operation of ["Add File:", "Update File:", "Delete File:", "Move to:"]) {
+      for (const whitespace of ["", "  ", "\t"]) {
+        const outside = path.join(f.dir, "outside/secret")
+        // Absolute first targets keep this regression independent of relative-root resolution.
+        const first = path.join(f.input.directory, operation === "Move to:" ? "source" : "allowed")
+        const patchText = operation === "Move to:"
+          ? `*** Begin Patch\n*** Update File: ${first}\n*** ${operation}${whitespace}${outside}\t \n@@\n-old\n+new\n*** End Patch`
+          : `*** Begin Patch\n*** Add File: ${first}\n+ok\n*** ${operation}${whitespace}${outside}\t \n+secret\n*** End Patch`
+        const args = { patchText }
+        const id = `mixed-${index++}`
+        const start = f.calls().filter((call) => call.args[0] === "approval").length
+        let completed = false
+        const pending = f.before(id, args, "apply_patch").then(() => { completed = true })
+        await expect(pending).rejects.toThrow("blocked")
+        expect(completed).toBe(false)
+        await expect(f.after(id, args, "apply_patch")).rejects.toThrow("unauthorized")
+        const calls = f.calls().filter((call) => call.args[0] === "approval").slice(start)
+        expect(calls.map((call) => call.payload.tool_match_input.path)).toEqual([first, outside])
+        expect(calls.every((call) => JSON.stringify(call.payload.tool_input) === JSON.stringify(args))).toBe(true)
+        // No backend tool is invoked by this harness, whether approved or denied.
+        expect(existsSync(path.join(f.input.directory, "allowed"))).toBe(false)
+        expect(existsSync(outside)).toBe(false)
+      }
+    }
+  })
+
   test("both Write wire spellings are accepted as known Write tools by the actual gateway", async () => {
     const f = await realGatewayFixture()
     for (const spelling of ["Write", "write"]) {

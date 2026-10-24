@@ -20,6 +20,17 @@ test("native edit retains deployed Write identity and validates raw replacement 
     expect(() => normalize("edit", args, "/project/sub")).toThrow("oldString and newString")
   }
 })
+test("patch headers mirror host prefix and trimmed-path semantics, including no-space and move destinations", () => {
+  for (const prefix of ["*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:"]) {
+    for (const whitespace of ["", " ", "  ", "\t"]) {
+      const patchText = `*** Begin Patch\n*** Add File: allowed\n+ok\n${prefix}${whitespace}/outside/secret  \t\n*** End Patch`
+      expect(normalize("apply_patch", { patchText }, "/project/sub").matchInputs).toEqual([
+        { path: "/project/sub/allowed" }, { path: "/outside/secret" },
+      ])
+    }
+    expect(() => normalize("apply_patch", { patchText: `*** Add File: allowed\n${prefix}\t ` }, "/project")).toThrow("invalid path")
+  }
+})
 test("patch normalizes every source, destination, add and delete path", () => {
   const patchText = "*** Begin Patch\r\n*** Update File: src\r\n*** Move to: /external/dest\r\n*** Delete File: old\r\n*** Add File: new\r\n+x\r\n*** End Patch"
   expect(normalize("apply_patch", { patchText }, "/project").matchInputs).toEqual([

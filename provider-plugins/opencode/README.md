@@ -59,7 +59,7 @@ those types to the installed v2 host contract.
 | Runtime tool | Gateway tool | Canonical fields |
 | --- | --- | --- |
 | `read`, `write`, `edit` | `Read`, `Write`, `Write` | Absolute `path`; raw edit strings preserved |
-| `apply_patch` | `Write` | One `path` decision per recognized unique source **and** destination |
+| `apply_patch` | `Write` | One `path` decision per unique source **and** destination |
 | `multiedit` | `MultiEdit` | One absolute `path`, complete `edits` batch |
 | `glob` | `Glob` | `target_directory`; selectors remain in raw arguments |
 | `grep` | `Grep` | `path`, `pattern` |
@@ -77,15 +77,15 @@ against the worktree; search roots and LSP paths resolve against the instance
 directory. Path handling is lexical, not symlink resolution. Malformed native
 arguments fail closed before gateway approval.
 
-**Known historical security limits — do not deploy this checkpoint.** The source
-normalizer recognizes patch headers only with one literal space after the colon
-and does not trim the path. Other native-accepted header whitespace can skip or
-misidentify targets. Relative file/edit/patch paths also use the worktree instead
-of the native execution directory when these differ. These two original-source
-bugs are deliberately retained for the byte-identical legacy extraction
-checkpoint; two standalone security follow-ups must land before main is pushed
-or deployed. Patch authorization currently covers only the recognized paths and
-stops at the first denial, not necessarily every path the native parser accepts.
+Patch operation headers now use the pinned host's prefix matching and trimmed
+paths, including no-space headers and move destinations. Every extracted target
+must approve before the patch can execute; the first denial stops authorization.
+
+**Remaining historical security limit — do not deploy yet.** Relative
+file/edit/patch paths still use the worktree instead of the native execution
+directory when these differ. This original-source bug is retained here until
+the second standalone security follow-up, which must land before main is pushed
+or deployed. The historical extraction checkpoint itself precedes both fixes.
 
 ## Failure handling and lifecycle
 
