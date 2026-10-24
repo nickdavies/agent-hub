@@ -28,6 +28,7 @@ struct HttpState {
     calls: Arc<Mutex<Vec<HttpCall>>>,
     unauthorized: bool,
     denial: Arc<Mutex<Option<String>>>,
+    wait_approval_status: Arc<Mutex<Option<Value>>>,
     reply: Arc<Mutex<Option<HttpReply>>>,
 }
 
@@ -92,9 +93,12 @@ async fn handle(
             json!({"id":Uuid::from_u128(1), "type":"pending"})
         }
         path if path.starts_with("/api/v1/approvals/") => {
-            match state.denial.lock().unwrap().clone() {
-                Some(reason) => json!({"type":"denied", "reason":reason}),
-                None => json!({"type":"approved", "message":null}),
+            match state.wait_approval_status.lock().unwrap().clone() {
+                Some(status) => status,
+                None => match state.denial.lock().unwrap().clone() {
+                    Some(reason) => json!({"type":"denied", "reason":reason}),
+                    None => json!({"type":"approved", "message":null}),
+                },
             }
         }
         path if path.starts_with("/api/v1/questions/") => {
@@ -171,11 +175,15 @@ impl Policy {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(input).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(8), child.wait_with_output())
+        let written = child.stdin.take().unwrap().write_all(input).await;
+        let output = tokio::time::timeout(Duration::from_secs(8), child.wait_with_output())
             .await
             .unwrap()
-            .unwrap()
+            .unwrap();
+        if output.status.success() {
+            written.expect("successful hook process accepts its input");
+        }
+        output
     }
 }
 
@@ -385,6 +393,7 @@ async fn native_parser_config_and_delegate_failures_block_without_provider_branc
         ("--claude", "PermissionRequest"),
     ] {
         let policy = Policy::new("allow");
+        let server = Server::start(false).await;
         let mut input = approval_input();
         if provider != "--opencode" {
             input["tool_name"] = json!("Bash");
@@ -396,14 +405,14 @@ async fn native_parser_config_and_delegate_failures_block_without_provider_branc
             .run_native(
                 provider,
                 "approval",
-                None,
+                Some(&server.url),
                 None,
                 malformed.to_string().as_bytes(),
             )
             .await;
         assert!(native_denial(&output, provider, hook).contains("failed to parse provider input"));
         let output = policy
-            .run_native(provider, "approval", None, None, b"{")
+            .run_native(provider, "approval", Some(&server.url), None, b"{")
             .await;
         if provider == "--claude" {
             assert_eq!(output.status.code(), Some(2));
@@ -419,7 +428,7 @@ async fn native_parser_config_and_delegate_failures_block_without_provider_branc
             .run_native(
                 provider,
                 "approval",
-                None,
+                Some(&server.url),
                 None,
                 input.to_string().as_bytes(),
             )
@@ -433,7 +442,7 @@ async fn native_parser_config_and_delegate_failures_block_without_provider_branc
             .run_native(
                 provider,
                 "approval",
-                None,
+                Some(&server.url),
                 None,
                 input.to_string().as_bytes(),
             )
@@ -441,11 +450,12 @@ async fn native_parser_config_and_delegate_failures_block_without_provider_branc
         let reason = native_denial(&output, provider, hook);
         assert!(reason.contains("delegate exited"));
         assert!(reason.ends_with(" <truncated>"));
+        assert!(server.state.calls.lock().unwrap().is_empty());
     }
 }
 
 #[tokio::test]
-async fn policy_delegate_and_human_guidance_remains_on_wire_not_duplicated_in_logs() {
+async fn valid_human_guidance_and_local_redirections_remain_on_wire_not_duplicated_in_logs() {
     for reason in [
         "  Use \"git status\" instead.\nThen retry. 🦀\n ".to_string(),
         format!("Use another command.\n{}", "界🦀".repeat(3000)),
@@ -467,7 +477,9 @@ async fn policy_delegate_and_human_guidance_remains_on_wire_not_duplicated_in_lo
                 .run("approval", Some(&server.url), None, approval_input())
                 .await;
             let actual = native_denial(&output, "--opencode", "tool.execute.before");
-            if reason.len() <= 4096 {
+            if source == "human" && reason.len() > 4096 {
+                assert!(actual.contains("approval response reason exceeds required bounds"));
+            } else if reason.len() <= 4096 {
                 assert_eq!(actual, reason);
             } else {
                 assert!(actual.ends_with(" <truncated>"));
@@ -480,18 +492,21 @@ async fn policy_delegate_and_human_guidance_remains_on_wire_not_duplicated_in_lo
 #[tokio::test]
 async fn gateway_matches_structured_canonical_input_and_exact_custom_tool_identity() {
     let policy = Policy::new("deny");
+    let server = Server::start(false).await;
     policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["Read"],"action":"allow","in_paths":["/workspace"],"in_cwds":["/workspace"],"input":{"request":{"mode":"safe"},"targets":["one","two"]}}]}));
     let mut input = approval_input();
     input["tool_name"] = json!("read");
     input["tool_input"] = json!({"filePath":"provider-path", "request":{"mode":"unsafe"}});
     input["tool_match_input"] = json!({"path":"/workspace/file", "request":{"mode":"safe","extra":true},"targets":["one","two"]});
-    let output = policy.run("approval", None, None, input.clone()).await;
+    let output = policy
+        .run("approval", Some(&server.url), None, input.clone())
+        .await;
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
         true
     );
     input["tool_match_input"]["targets"] = json!(["two", "one"]);
-    let output = policy.run("approval", None, None, input).await;
+    let output = policy.run("approval", Some(&server.url), None, input).await;
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
         false
@@ -500,13 +515,15 @@ async fn gateway_matches_structured_canonical_input_and_exact_custom_tool_identi
     let mut input = approval_input();
     input["tool_name"] = json!("MCP.resource/read");
     input["tool_input"] = json!({"path":"relative-not-file-classified","operation":"read","options":{"safe":true,"extra":true}});
-    let output = policy.run("approval", None, None, input.clone()).await;
+    let output = policy
+        .run("approval", Some(&server.url), None, input.clone())
+        .await;
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
         true
     );
     input["tool_name"] = json!("mcp.resource/read");
-    let output = policy.run("approval", None, None, input).await;
+    let output = policy.run("approval", Some(&server.url), None, input).await;
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
         false
@@ -516,6 +533,7 @@ async fn gateway_matches_structured_canonical_input_and_exact_custom_tool_identi
 #[tokio::test]
 async fn delegate_receives_claude_pre_tool_use_event_with_original_input() {
     let policy = Policy::new("deny");
+    let server = Server::start(false).await;
     let script = policy.0.join("delegate.sh");
     let capture = policy.0.join("delegate-input.json");
     std::fs::write(
@@ -525,7 +543,9 @@ async fn delegate_receives_claude_pre_tool_use_event_with_original_input() {
     .unwrap();
     policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["Bash"],"action":"delegate","command":format!("sh {} {}", script.display(), capture.display())}]}));
     let raw = approval_input();
-    let result = policy.run("approval", None, None, raw.clone()).await;
+    let result = policy
+        .run("approval", Some(&server.url), None, raw.clone())
+        .await;
     assert!(result.status.success());
     let delegated: Value = serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
     assert_eq!(delegated["hook_event_name"], "PreToolUse");
@@ -536,20 +556,23 @@ async fn delegate_receives_claude_pre_tool_use_event_with_original_input() {
 #[tokio::test]
 async fn canonical_paths_match_policy_while_delegation_and_review_keep_original_arguments() {
     let policy = Policy::new("deny");
+    let server = Server::start(false).await;
     policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["@file_read"],"action":"allow","in_workspace":true,"in_paths":["/workspace"]}]}));
     for name in ["read", "list"] {
         let mut input = approval_input();
         input["tool_name"] = json!(name);
         input["tool_input"] = json!({"filePath":"native-relative", "providerField":true});
         input["tool_match_input"] = json!({"path":"/workspace/file"});
-        let result = policy.run("approval", None, None, input.clone()).await;
+        let result = policy
+            .run("approval", Some(&server.url), None, input.clone())
+            .await;
         assert!(result.status.success());
         assert_eq!(
             serde_json::from_slice::<Value>(&result.stdout).unwrap()["allowed"],
             true
         );
         input["tool_match_input"] = json!({"path":"/outside/file"});
-        let result = policy.run("approval", None, None, input).await;
+        let result = policy.run("approval", Some(&server.url), None, input).await;
         assert_eq!(
             serde_json::from_slice::<Value>(&result.stdout).unwrap()["allowed"],
             false
@@ -569,14 +592,14 @@ async fn canonical_paths_match_policy_while_delegation_and_review_keep_original_
     policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["Read"],"action":"delegate","command":format!("sh {} {}", script.display(), capture.display())}]}));
     assert!(
         policy
-            .run("approval", None, None, input.clone())
+            .run("approval", Some(&server.url), None, input.clone())
             .await
             .status
             .success()
     );
     let delegated: Value = serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
     assert_eq!(delegated["tool_input"], input["tool_input"]);
-    let server = Server::start(false).await;
+    assert!(server.state.calls.lock().unwrap().is_empty());
     policy.write(json!({"version":1,"default":"ask","rules":[]}));
     assert!(
         policy
@@ -592,21 +615,112 @@ async fn canonical_paths_match_policy_while_delegation_and_review_keep_original_
 }
 
 #[tokio::test]
-async fn pure_local_routing_needs_neither_server_nor_token_but_ask_fails_closed_without_server() {
+async fn ordinary_host_approval_requires_a_server_before_local_policy_can_allow() {
     let policy = Policy::new("allow");
-    let output = policy.run("approval", None, None, approval_input()).await;
+    for action in ["allow", "deny", "ask"] {
+        policy.write(json!({"version":1,"default":action,"rules":[]}));
+        for provider in ["--opencode", "--cursor", "--claude"] {
+            let output = policy
+                .run_native(
+                    provider,
+                    "approval",
+                    None,
+                    None,
+                    approval_input().to_string().as_bytes(),
+                )
+                .await;
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--server"));
+        }
+    }
+    let server = Server::start(false).await;
+    policy.write(json!({"version":1,"default":"allow","rules":[]}));
+    let output = policy
+        .run("approval", Some(&server.url), None, approval_input())
+        .await;
     assert!(output.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
         true
     );
-    policy.write(json!({"version":1, "default":"ask", "rules":[]}));
-    let output = policy.run("approval", None, None, approval_input()).await;
-    assert!(output.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
-        false
-    );
+    assert!(server.state.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_host_endpoint_is_denied_before_a_local_allow_rule() {
+    let policy = Policy::new("allow");
+    for endpoint in [
+        "not a URL",
+        "ftp://example.test",
+        "http://user:password@example.test",
+        "http://example.test?query=value",
+        "http://example.test/#fragment",
+    ] {
+        let output = policy
+            .run("approval", Some(endpoint), None, approval_input())
+            .await;
+        assert!(native_denial(&output, "--opencode", "tool.execute.before").contains("server URL"));
+    }
+}
+
+#[tokio::test]
+async fn terminal_approval_payloads_are_validated_at_registration_and_after_wait() {
+    for immediate in [true, false] {
+        for approved in [true, false] {
+            for reason in [
+                String::new(),
+                "valid guidance".into(),
+                "x".repeat(4096),
+                "x".repeat(4097),
+                format!("{}x", "界".repeat(1365)),
+                "界".repeat(1366),
+            ] {
+                let server = Server::start(false).await;
+                let policy = Policy::new("ask");
+                let status = if approved {
+                    json!({"type":"approved","message":reason})
+                } else {
+                    json!({"type":"denied","reason":reason})
+                };
+                if immediate {
+                    let mut response = status;
+                    response["id"] = json!(Uuid::from_u128(1));
+                    *server.state.reply.lock().unwrap() = Some(HttpReply {
+                        status: StatusCode::OK,
+                        headers: HeaderMap::new(),
+                        body: response.to_string(),
+                    });
+                } else {
+                    *server.state.wait_approval_status.lock().unwrap() = Some(status);
+                }
+                let output = policy
+                    .run("approval", Some(&server.url), None, approval_input())
+                    .await;
+                if reason.is_empty() || reason.len() > 4096 {
+                    assert!(
+                        native_denial(&output, "--opencode", "tool.execute.before")
+                            .contains("approval response reason exceeds required bounds")
+                    );
+                } else if approved {
+                    assert!(output.status.success());
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
+                        true
+                    );
+                } else {
+                    assert_eq!(
+                        native_denial(&output, "--opencode", "tool.execute.before"),
+                        reason
+                    );
+                }
+                assert_eq!(
+                    server.state.calls.lock().unwrap().len(),
+                    if immediate { 1 } else { 2 }
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

@@ -61,7 +61,7 @@ struct ApprovalArgs {
 
     /// Server URL (e.g. https://hub.example.com)
     #[arg(long, env = "AGENT_HUB_SERVER")]
-    server: Option<String>,
+    server: String,
 
     /// Bearer token for server auth
     #[arg(long, env = "AGENT_HUB_TOKEN")]
@@ -192,6 +192,10 @@ where
             );
         }
     };
+
+    if let Err(error) = gateway_http_client(&args.server) {
+        return emit_provider_denial(&event, &error, format_output);
+    }
 
     write_bounded_stderr(&format!(
         "[info] tool={} session={} cwd={}",
@@ -614,10 +618,7 @@ async fn escalate_to_server(
     event: &ToolHookEvent,
     extra: Option<ExtraContext>,
 ) -> Result<HookOutput, ApprovalFlowError> {
-    let server = args.server.as_deref().ok_or_else(|| {
-        ApprovalFlowError::Pipeline("approval server is required for central approval".to_string())
-    })?;
-    let (client, base) = gateway_http_client(server).map_err(ApprovalFlowError::Pipeline)?;
+    let (client, base) = gateway_http_client(&args.server).map_err(ApprovalFlowError::Pipeline)?;
     let base = base.as_str().trim_end_matches('/');
 
     let context = ApprovalContext {
@@ -667,6 +668,7 @@ async fn escalate_to_server(
     let approval: ApprovalResponse = serde_json::from_str(&body).map_err(|e| {
         ApprovalFlowError::Pipeline(format!("failed to parse approval response: {e}"))
     })?;
+    validate_approval_status(&approval.status)?;
 
     if matches!(approval.status, ApprovalStatus::Pending) {
         // Fall through to long-poll below
@@ -815,6 +817,7 @@ async fn poll_for_decision(
             }
         };
 
+        validate_approval_status(&wait.status)?;
         ensure_approval_before_deadline(deadline, last_wait_was_healthy)?;
 
         if http_status.as_u16() == 202 {
@@ -907,6 +910,22 @@ async fn read_response_body(mut response: reqwest::Response) -> Result<String, S
     String::from_utf8(body).map_err(|e| format!("response is not UTF-8: {e}"))
 }
 
+fn validate_approval_status(status: &ApprovalStatus) -> Result<(), ApprovalFlowError> {
+    let reason = match status {
+        ApprovalStatus::Approved { message } => message.as_deref(),
+        ApprovalStatus::Denied { reason } => Some(reason.as_str()),
+        ApprovalStatus::Pending | ApprovalStatus::Cancelled => None,
+    };
+    if reason.is_some_and(|reason| {
+        reason.is_empty() || reason.len() > types::MAX_GATEWAY_DIAGNOSTIC_BYTES
+    }) {
+        return Err(ApprovalFlowError::Pipeline(
+            "approval response reason exceeds required bounds".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn deadline_error(last_wait_was_healthy: bool) -> ApprovalFlowError {
     if last_wait_was_healthy {
         ApprovalFlowError::Timeout
@@ -991,6 +1010,38 @@ fn status_to_output(status: &ApprovalStatus) -> HookOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_status_uses_the_historical_optional_nonempty_byte_bounded_message_contract() {
+        for status in [
+            ApprovalStatus::Pending,
+            ApprovalStatus::Cancelled,
+            ApprovalStatus::Approved { message: None },
+            ApprovalStatus::Approved {
+                message: Some(" ".into()),
+            },
+            ApprovalStatus::Approved {
+                message: Some("x".repeat(4096)),
+            },
+            ApprovalStatus::Denied {
+                reason: format!("{}x", "界".repeat(1365)),
+            },
+        ] {
+            assert!(validate_approval_status(&status).is_ok());
+        }
+        for reason in [String::new(), "x".repeat(4097), "界".repeat(1366)] {
+            for status in [
+                ApprovalStatus::Approved {
+                    message: Some(reason.clone()),
+                },
+                ApprovalStatus::Denied {
+                    reason: reason.clone(),
+                },
+            ] {
+                assert!(validate_approval_status(&status).is_err());
+            }
+        }
+    }
 
     #[test]
     fn host_endpoints_accept_http_without_a_loopback_or_token_restriction() {
