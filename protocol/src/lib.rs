@@ -7,6 +7,7 @@
 //! be generated for TypeScript plugin consumption.
 
 pub mod approval;
+pub mod auth;
 pub mod config;
 pub mod gateway;
 pub mod hooks;
@@ -23,6 +24,7 @@ pub use approval::{
     ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, ExtraContext, HookEventName,
     KnownHookEvent, RequestType,
 };
+pub use auth::{Role, WhoAmIResponse};
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{
     ClaudeCodeHookInput, ClaudePermissionBehavior, ClaudePermissionRequestDecision,

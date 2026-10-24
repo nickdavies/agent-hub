@@ -12,7 +12,7 @@ src/
 ├── mcp.rs          # MCP over Streamable HTTP (rmcp), 3 tools
 └── server/
     ├── mod.rs      # Router, AppState, REST handlers
-    ├── auth.rs     # Bearer token middleware
+    ├── auth.rs     # Bearer token / session middleware, role checks
     ├── config.rs   # ServerConfig (env), NotifyConfig (runtime mutable)
     ├── hooks.rs    # /hooks/stop, /hooks/notification, /hooks/session-end
     ├── notifier.rs # Notifier trait — implement to add new backends
@@ -29,7 +29,7 @@ src/
 
 | Var | Description |
 |-----|-------------|
-| `AGENT_HUB_TOKENS` | Comma-separated `label:secret` pairs (e.g. `desktop:abc123,sensor:def456`) |
+| `AGENT_HUB_TOKENS` | Comma-separated `label:secret:role` entries, role is `agent` or `reviewer` (e.g. `desktop:abc123:agent,sensor:def456:reviewer`). See the Authentication section of the README. |
 | `PUSHOVER_TOKEN` | Pushover API token (if using `serve pushover`) |
 | `PUSHOVER_USER` | Pushover user key (if using `serve pushover`) |
 | `WEBHOOK_URL` | Webhook URL (if using `serve webhook`) |
@@ -69,7 +69,7 @@ command: ["serve", "webhook"]
 Set your server URL and a token:
 ```sh
 export URL="https://<your-server>"
-export TOKEN="<one-of-your-tokens>"
+export TOKEN="<a-reviewer-token>"  # agent tokens get 403 on /sessions, /presence, /config
 ```
 
 ```sh

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 // Re-export protocol types so existing `use super::config::X` imports work.
-pub use protocol::{NotifyConfig, NotifyConfigUpdate, Secret};
+pub use protocol::{NotifyConfig, NotifyConfigUpdate, Role, Secret};
 
 use super::sessions::SessionApprovalMode;
 use crate::error::AppError;
@@ -42,6 +42,7 @@ pub struct ServerConfig {
 pub struct Token {
     pub label: String,
     pub secret: Secret,
+    pub role: Role,
 }
 
 impl ServerConfig {
@@ -119,27 +120,43 @@ impl ServerConfig {
     }
 }
 
+/// Parse `label:secret:role` entries. The label ends at the first `:` and the
+/// role starts after the last, so secrets may contain `:`.
 fn parse_tokens(raw: &str) -> Result<Vec<Token>, AppError> {
     raw.split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|entry| {
-            if let Some((label, secret)) = entry.split_once(':') {
-                if secret.is_empty() {
+            let malformed = || {
+                AppError::Config(
+                    "AGENT_HUB_TOKENS entries must be 'label:secret:role' (role: agent|reviewer)"
+                        .into(),
+                )
+            };
+            let (label, rest) = entry.split_once(':').ok_or_else(malformed)?;
+            let (secret, role) = rest.rsplit_once(':').ok_or_else(malformed)?;
+            if label.is_empty() {
+                return Err(malformed());
+            }
+            if secret.is_empty() {
+                return Err(AppError::Config(format!(
+                    "token with label '{label}' has empty secret"
+                )));
+            }
+            let role = match role {
+                "agent" => Role::Agent,
+                "reviewer" => Role::Reviewer,
+                _ => {
                     return Err(AppError::Config(format!(
-                        "token with label '{label}' has empty secret"
+                        "token with label '{label}' has unknown role '{role}' (expected agent|reviewer)"
                     )));
                 }
-                Ok(Token {
-                    label: label.into(),
-                    secret: Secret::new(secret),
-                })
-            } else {
-                Ok(Token {
-                    label: entry.into(),
-                    secret: Secret::new(entry),
-                })
-            }
+            };
+            Ok(Token {
+                label: label.into(),
+                secret: Secret::new(secret),
+                role,
+            })
         })
         .collect()
 }
@@ -153,25 +170,43 @@ mod tests {
 
     #[test]
     fn parse_labeled_tokens() {
-        let tokens = parse_tokens("desktop:abc123,mobile:def456").unwrap();
+        let tokens = parse_tokens("desktop:abc123:agent,cli:def456:reviewer").unwrap();
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].label, "desktop");
         assert_eq!(tokens[0].secret.expose(), "abc123");
-        assert_eq!(tokens[1].label, "mobile");
+        assert_eq!(tokens[0].role, Role::Agent);
+        assert_eq!(tokens[1].label, "cli");
         assert_eq!(tokens[1].secret.expose(), "def456");
+        assert_eq!(tokens[1].role, Role::Reviewer);
     }
 
     #[test]
-    fn parse_plain_tokens() {
-        let tokens = parse_tokens("abc123,def456").unwrap();
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].label, "abc123");
-        assert_eq!(tokens[0].secret.expose(), "abc123");
+    fn parse_secret_containing_colon() {
+        let tokens = parse_tokens("desktop:abc:123:agent").unwrap();
+        assert_eq!(tokens[0].label, "desktop");
+        assert_eq!(tokens[0].secret.expose(), "abc:123");
+        assert_eq!(tokens[0].role, Role::Agent);
+    }
+
+    #[test]
+    fn parse_missing_role_fails() {
+        assert!(parse_tokens("abc123").is_err());
+        assert!(parse_tokens("desktop:abc123").is_err());
+    }
+
+    #[test]
+    fn parse_unknown_role_fails() {
+        assert!(parse_tokens("desktop:abc123:admin").is_err());
     }
 
     #[test]
     fn parse_empty_secret_fails() {
-        assert!(parse_tokens("desktop:").is_err());
+        assert!(parse_tokens("desktop::agent").is_err());
+    }
+
+    #[test]
+    fn parse_empty_label_fails() {
+        assert!(parse_tokens(":abc123:agent").is_err());
     }
 
     #[test]
