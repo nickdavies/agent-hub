@@ -3,7 +3,8 @@ mod tools;
 
 pub use rules::{
     ConfigAction, ConfigDecision, DefaultAction, RuleAction, RuleSummary, ToolConfig,
-    default_to_resolved, load_tool_config, resolve_action, validate_tool_config,
+    default_to_resolved, load_tool_config, resolve_action, resolve_action_with_input,
+    validate_tool_config,
 };
 pub use tools::{is_in_workspace, normalize_path, resolve_path};
 

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use strum::Display;
 
 use protocol::{Tool, expand_tool_group};
@@ -36,6 +37,18 @@ struct RuleJson {
     /// Tilde (~) is expanded and roots are lexically normalized at load time. Paths need not
     /// exist, and symlinks are not resolved through the filesystem.
     in_cwds: Option<Vec<String>>,
+    /// Required recursive object subset of canonical policy input.
+    #[serde(default, deserialize_with = "deserialize_optional_input")]
+    input: Option<Map<String, Value>>,
+}
+
+fn deserialize_optional_input<'de, D>(
+    deserializer: D,
+) -> Result<Option<Map<String, Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Map::deserialize(deserializer).map(Some)
 }
 
 // --- Compiled config types ---
@@ -133,6 +146,7 @@ pub(crate) struct Rule {
     pub(crate) in_workspace: Option<bool>,
     pub(crate) in_paths: Option<Vec<String>>,
     pub(crate) in_cwds: Option<Vec<String>>,
+    pub(crate) input: Option<Map<String, Value>>,
     pub(crate) source_json: String,
 }
 
@@ -301,6 +315,7 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
                 .in_paths
                 .map(|paths| paths.into_iter().map(|p| expand_tilde(&p)).collect()),
             in_cwds,
+            input: raw_rule.input,
             source_json,
         });
     }
@@ -363,6 +378,24 @@ pub fn resolve_action(
     cwd: Option<&str>,
     workspace_roots: Option<&[String]>,
 ) -> ConfigAction {
+    resolve_action_with_input(
+        config,
+        tool,
+        resolved_args,
+        &Value::Null,
+        cwd,
+        workspace_roots,
+    )
+}
+
+pub fn resolve_action_with_input(
+    config: &ToolConfig,
+    tool: &Tool,
+    resolved_args: &[String],
+    input: &Value,
+    cwd: Option<&str>,
+    workspace_roots: Option<&[String]>,
+) -> ConfigAction {
     let tool_name = tool.as_str();
     let is_path = tool.is_path_tool();
 
@@ -401,6 +434,12 @@ pub fn resolve_action(
             if !is_in_workspace(cwd, in_cwds) {
                 continue;
             }
+        }
+
+        if let Some(expected) = &rule.input
+            && !input_object_is_subset(expected, input)
+        {
+            continue;
         }
 
         if let Some(required) = rule.in_workspace {
@@ -446,6 +485,24 @@ pub fn resolve_action(
     }
     eprintln!("agent-hub-gateway: [debug] no rule matched, using default");
     default_to_resolved(&config.default)
+}
+
+fn input_object_is_subset(expected: &Map<String, Value>, actual: &Value) -> bool {
+    let Some(actual) = actual.as_object() else {
+        return false;
+    };
+    expected.iter().all(|(key, expected)| {
+        actual
+            .get(key)
+            .is_some_and(|actual| input_value_matches(expected, actual))
+    })
+}
+
+fn input_value_matches(expected: &Value, actual: &Value) -> bool {
+    match expected {
+        Value::Object(expected) => input_object_is_subset(expected, actual),
+        _ => expected == actual,
+    }
 }
 
 pub fn default_to_resolved(default: &DefaultAction) -> ConfigAction {
@@ -525,6 +582,139 @@ mod tests {
             );
         }
         assert!(parse(serde_json::json!({"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"delegate","command":"dippy"}]})).is_ok());
+    }
+
+    #[test]
+    fn structured_input_uses_recursive_object_subsets_but_exact_arrays_and_scalars() {
+        let expected = serde_json::json!({"request":{"mode":"safe"},"array":[{"id":1}],"number":1,"nullable":null});
+        let actual = serde_json::json!({"request":{"mode":"safe","extra":true},"array":[{"id":1}],"number":1,"nullable":null,"extra":true});
+        assert!(input_object_is_subset(
+            expected.as_object().unwrap(),
+            &actual
+        ));
+        for (field, value) in [
+            ("array", serde_json::json!([{"id":1,"extra":true}])),
+            ("array", serde_json::json!([{"id":1},{"id":1}])),
+            ("number", serde_json::json!(1.0)),
+            ("number", serde_json::json!("1")),
+            ("request", serde_json::json!({})),
+        ] {
+            let mut wrong = actual.clone();
+            wrong[field] = value;
+            assert!(!input_object_is_subset(
+                expected.as_object().unwrap(),
+                &wrong
+            ));
+        }
+        let mut missing = actual;
+        missing.as_object_mut().unwrap().remove("nullable");
+        assert!(!input_object_is_subset(
+            expected.as_object().unwrap(),
+            &missing
+        ));
+        for input in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!("x"),
+        ] {
+            let dto = serde_json::json!({"version":1,"default":"deny","rules":[{"tools":["custom"],"action":"allow","input":input}]});
+            assert!(serde_json::from_value::<ToolConfigJson>(dto).is_err());
+        }
+    }
+
+    #[test]
+    fn structured_input_intersects_path_cwd_and_first_match_order() {
+        let mut rule = make_rule(&["Read(**/*.rs)"], ResolvedAction::Allow);
+        rule.input = Some(
+            serde_json::json!({"mode":"safe"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        rule.in_paths = Some(vec!["/workspace/project".into()]);
+        rule.in_cwds = Some(vec!["/workspace/project".into()]);
+        let config = make_config(vec![rule], DefaultAction::Deny);
+        for (path, cwd, mode, allowed) in [
+            (
+                "/workspace/project/main.rs",
+                "/workspace/project",
+                "safe",
+                true,
+            ),
+            (
+                "/workspace/project/main.rs",
+                "/workspace/project-other",
+                "safe",
+                false,
+            ),
+            (
+                "/workspace/elsewhere/main.rs",
+                "/workspace/project",
+                "safe",
+                false,
+            ),
+            (
+                "/workspace/project/main.txt",
+                "/workspace/project",
+                "safe",
+                false,
+            ),
+            (
+                "/workspace/project/main.rs",
+                "/workspace/project",
+                "unsafe",
+                false,
+            ),
+        ] {
+            let result = resolve_action_with_input(
+                &config,
+                &Tool::Read,
+                &[path.into()],
+                &serde_json::json!({"mode":mode}),
+                Some(cwd),
+                None,
+            );
+            assert_eq!(
+                matches!(result, ConfigAction::Decision(ConfigDecision::Allow)),
+                allowed
+            );
+        }
+        let mut deny = make_rule(&["MCP.resource/read"], ResolvedAction::Deny);
+        deny.input = Some(
+            serde_json::json!({"operation":"delete"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let config = make_config(
+            vec![
+                deny,
+                make_rule(&["MCP.resource/read"], ResolvedAction::Allow),
+            ],
+            DefaultAction::Deny,
+        );
+        assert!(matches!(
+            resolve_action_with_input(
+                &config,
+                &Tool::Unknown("MCP.resource/read".into()),
+                &[],
+                &serde_json::json!({"operation":"delete","confirmed":true}),
+                None,
+                None
+            ),
+            ConfigAction::Decision(ConfigDecision::Deny(_))
+        ));
+        assert!(matches!(
+            resolve_action(
+                &config,
+                &Tool::Unknown("MCP.resource/read".into()),
+                &[],
+                None,
+                None
+            ),
+            ConfigAction::Decision(ConfigDecision::Allow)
+        ));
     }
 
     /// Test convenience: parse a tool name string into a `Tool` and call `resolve_action`.
@@ -652,6 +842,7 @@ mod tests {
             in_workspace: None,
             in_paths: None,
             in_cwds: None,
+            input: None,
             source_json: String::new(),
         }
     }
@@ -667,6 +858,7 @@ mod tests {
             in_workspace: None,
             in_paths: None,
             in_cwds: None,
+            input: None,
             source_json: String::new(),
         }
     }
@@ -686,6 +878,7 @@ mod tests {
             in_workspace,
             in_paths: None,
             in_cwds: None,
+            input: None,
             source_json: String::new(),
         }
     }
@@ -1018,6 +1211,7 @@ mod tests {
                     in_workspace: None,
                     in_paths: None,
                     in_cwds: None,
+                    input: None,
                     source_json: String::new(),
                 },
                 make_rule(&["Read", "Write"], ResolvedAction::Allow),
@@ -1424,6 +1618,7 @@ mod tests {
             in_workspace: None,
             in_paths: Some(dirs.iter().map(|s| s.to_string()).collect()),
             in_cwds: None,
+            input: None,
             source_json: String::new(),
         }
     }
@@ -1590,6 +1785,7 @@ mod tests {
                 in_workspace: Some(true),
                 in_paths: Some(vec!["/home/user/oss".to_string()]),
                 in_cwds: None,
+                input: None,
                 source_json: String::new(),
             }],
             DefaultAction::Ask,
@@ -1638,6 +1834,7 @@ mod tests {
                 in_workspace: None,
                 in_paths: Some(vec![expanded.clone()]),
                 in_cwds: None,
+                input: None,
                 source_json: String::new(),
             }],
             DefaultAction::Ask,

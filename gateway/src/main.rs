@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use config::{ConfigAction, expand_tilde, load_tool_config, resolve_action};
+use config::{ConfigAction, expand_tilde, load_tool_config, resolve_action_with_input};
 use protocol::{
     ApprovalContext, ApprovalRequest, ApprovalResponse, ApprovalStatus, ApprovalWaitResponse,
     ExtraContext, RequestType, Secret, StatusReport, ToolCallKind,
@@ -270,10 +270,11 @@ async fn run(
         .map(|a| config::resolve_path(a, &tool, Some(&event.cwd)))
         .collect();
 
-    let action = resolve_action(
+    let action = resolve_action_with_input(
         &config,
         &tool,
         &resolved_args,
+        event.tool_call.policy_input(),
         Some(&event.cwd),
         Some(&event.workspace_roots),
     );

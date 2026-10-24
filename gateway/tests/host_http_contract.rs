@@ -167,6 +167,42 @@ fn status_input() -> Value {
 }
 
 #[tokio::test]
+async fn gateway_matches_structured_canonical_input_and_exact_custom_tool_identity() {
+    let policy = Policy::new("deny");
+    policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["Read"],"action":"allow","in_paths":["/workspace"],"in_cwds":["/workspace"],"input":{"request":{"mode":"safe"},"targets":["one","two"]}}]}));
+    let mut input = approval_input();
+    input["tool_name"] = json!("read");
+    input["tool_input"] = json!({"filePath":"provider-path", "request":{"mode":"unsafe"}});
+    input["tool_match_input"] = json!({"path":"/workspace/file", "request":{"mode":"safe","extra":true},"targets":["one","two"]});
+    let output = policy.run("approval", None, None, input.clone()).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
+        true
+    );
+    input["tool_match_input"]["targets"] = json!(["two", "one"]);
+    let output = policy.run("approval", None, None, input).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
+        false
+    );
+    policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["MCP.resource/read"],"action":"allow","in_cwds":["/workspace"],"input":{"operation":"read","options":{"safe":true}}}]}));
+    let mut input = approval_input();
+    input["tool_name"] = json!("MCP.resource/read");
+    input["tool_input"] = json!({"path":"relative-not-file-classified","operation":"read","options":{"safe":true,"extra":true}});
+    let output = policy.run("approval", None, None, input.clone()).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
+        true
+    );
+    input["tool_name"] = json!("mcp.resource/read");
+    let output = policy.run("approval", None, None, input).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["allowed"],
+        false
+    );
+}
+
+#[tokio::test]
 async fn delegate_receives_claude_pre_tool_use_event_with_original_input() {
     let policy = Policy::new("deny");
     let script = policy.0.join("delegate.sh");
