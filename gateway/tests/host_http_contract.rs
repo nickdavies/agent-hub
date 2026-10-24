@@ -167,6 +167,26 @@ fn status_input() -> Value {
 }
 
 #[tokio::test]
+async fn delegate_receives_claude_pre_tool_use_event_with_original_input() {
+    let policy = Policy::new("deny");
+    let script = policy.0.join("delegate.sh");
+    let capture = policy.0.join("delegate-input.json");
+    std::fs::write(
+        &script,
+        "cat > \"$1\"\nprintf '%s' '{\"hookSpecificOutput\":{\"permissionDecision\":\"allow\"}}'\n",
+    )
+    .unwrap();
+    policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["Bash"],"action":"delegate","command":format!("sh {} {}", script.display(), capture.display())}]}));
+    let raw = approval_input();
+    let result = policy.run("approval", None, None, raw.clone()).await;
+    assert!(result.status.success());
+    let delegated: Value = serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+    assert_eq!(delegated["hook_event_name"], "PreToolUse");
+    assert_eq!(delegated["tool_name"], "Bash");
+    assert_eq!(delegated["tool_input"], raw["tool_input"]);
+}
+
+#[tokio::test]
 async fn pure_local_routing_needs_neither_server_nor_token_but_ask_fails_closed_without_server() {
     let policy = Policy::new("allow");
     let output = policy.run("approval", None, None, approval_input()).await;

@@ -9,14 +9,15 @@ use crate::{expand_tilde, normalize_path};
 // --- JSON deserialization types ---
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolConfigJson {
-    #[allow(dead_code)]
     version: u32,
     default: DefaultAction,
     rules: Vec<RuleJson>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuleJson {
     tools: Vec<String>,
     action: RuleAction,
@@ -241,6 +242,8 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
         std::fs::read_to_string(path).map_err(|e| format!("failed to read config {path}: {e}"))?;
     let raw: ToolConfigJson = serde_json::from_str(&contents)
         .map_err(|e| format!("failed to parse config {path}: {e}"))?;
+    validate_tool_config_dto(&raw)
+        .map_err(|error| format!("failed to parse config {path}: {error}"))?;
 
     let mut rules = Vec::with_capacity(raw.rules.len());
     for raw_rule in raw.rules {
@@ -306,6 +309,51 @@ pub fn load_tool_config(path: &str) -> Result<ToolConfig, String> {
         default: raw.default,
         rules,
     })
+}
+
+fn validate_tool_config_dto(config: &ToolConfigJson) -> Result<(), String> {
+    if config.version != 1 {
+        return Err("unsupported version".to_string());
+    }
+    for (index, rule) in config.rules.iter().enumerate() {
+        let number = index + 1;
+        if rule.tools.is_empty() || rule.tools.iter().any(|tool| tool.trim().is_empty()) {
+            return Err(format!("rule {number} has no tools"));
+        }
+        match (&rule.action, rule.command.as_deref()) {
+            (RuleAction::Delegate, Some(command)) if !command.trim().is_empty() => {}
+            (RuleAction::Delegate, _) => {
+                return Err(format!(
+                    "rule {number} has an invalid action/command combination"
+                ));
+            }
+            (_, None) => {}
+            _ => {
+                return Err(format!(
+                    "rule {number} has an invalid action/command combination"
+                ));
+            }
+        }
+        if rule.message.is_some() && rule.action != RuleAction::Deny {
+            return Err(format!("rule {number} has a message outside a deny action"));
+        }
+        for (name, value) in [("pattern", &rule.pattern), ("message", &rule.message)] {
+            if value.as_ref().is_some_and(|value| value.is_empty()) {
+                return Err(format!("rule {number} has invalid '{name}'"));
+            }
+        }
+        for (name, paths) in [("in_paths", &rule.in_paths), ("in_cwds", &rule.in_cwds)] {
+            if paths.as_ref().is_some_and(Vec::is_empty)
+                || (name == "in_paths"
+                    && paths
+                        .as_ref()
+                        .is_some_and(|paths| paths.iter().any(|path| path.trim().is_empty())))
+            {
+                return Err(format!("rule {number} has invalid '{name}'"));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn resolve_action(
@@ -436,73 +484,48 @@ impl ToolConfig {
     }
 }
 
-/// Validate a config file with stricter checks than `load_tool_config`.
-/// Returns `(config, warnings)` on success, or an error string on failure.
-///
-/// In addition to the standard `load_tool_config` checks (JSON syntax, schema,
-/// group expansion, pattern compilation, delegate-without-command), this function
-/// detects:
-/// - Unknown top-level fields (typos like `"defualt"`)
-/// - Unknown per-rule fields
-/// - Non-delegate rules that have a `"command"` field (likely a mistake)
+/// Validate the same strict policy schema used during gateway evaluation.
+/// Invalid or unknown fields are hard errors rather than advisory warnings.
 pub fn validate_tool_config(path: &str) -> Result<(ToolConfig, Vec<String>), String> {
     let config = load_tool_config(path)?;
-    let mut warnings = Vec::new();
-
-    // Re-read and parse as raw JSON to detect unknown fields
-    let contents =
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read config {path}: {e}"))?;
-    let raw: serde_json::Value = serde_json::from_str(&contents)
-        .map_err(|e| format!("failed to parse config {path}: {e}"))?;
-
-    // Check top-level fields
-    let known_top = ["version", "default", "rules"];
-    if let Some(obj) = raw.as_object() {
-        for key in obj.keys() {
-            if !known_top.contains(&key.as_str()) {
-                warnings.push(format!("unknown top-level field \"{key}\""));
-            }
-        }
-    }
-
-    // Check per-rule fields
-    let known_rule = [
-        "tools",
-        "action",
-        "command",
-        "message",
-        "pattern",
-        "in_workspace",
-        "in_paths",
-        "in_cwds",
-    ];
-    if let Some(rules) = raw.get("rules").and_then(|r| r.as_array()) {
-        for (i, rule) in rules.iter().enumerate() {
-            if let Some(obj) = rule.as_object() {
-                for key in obj.keys() {
-                    if !known_rule.contains(&key.as_str()) {
-                        warnings.push(format!("rule {}: unknown field \"{key}\"", i + 1));
-                    }
-                }
-                // Warn on non-delegate rule with command field
-                let is_delegate = obj.get("action").and_then(|a| a.as_str()) == Some("delegate");
-                if !is_delegate && obj.contains_key("command") {
-                    warnings.push(format!(
-                        "rule {}: has \"command\" but action is not \"delegate\"",
-                        i + 1
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok((config, warnings))
+    Ok((config, Vec::new()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use protocol::ToolCategory;
+
+    #[test]
+    fn policy_dto_rejects_unknown_fields_versions_and_invalid_actions() {
+        let parse = |value: serde_json::Value| -> Result<(), String> {
+            let dto: ToolConfigJson = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            validate_tool_config_dto(&dto)
+        };
+        for value in [
+            serde_json::json!({"version":2,"default":"allow","rules":[]}),
+            serde_json::json!({"version":1,"default":"allow","rules":[],"unexpected":true}),
+            serde_json::json!({"version":1,"default":"allow","rules":[{"tools":["Bash"],"action":"allow","unexpected":true}]}),
+        ] {
+            assert!(parse(value).is_err());
+        }
+        for rule in [
+            serde_json::json!({"tools":[],"action":"allow"}),
+            serde_json::json!({"tools":[" "],"action":"deny"}),
+            serde_json::json!({"tools":["Bash"],"action":"delegate"}),
+            serde_json::json!({"tools":["Bash"],"action":"delegate","command":" "}),
+            serde_json::json!({"tools":["Bash"],"action":"allow","command":"dippy"}),
+            serde_json::json!({"tools":["Bash"],"action":"ask","message":"unused"}),
+            serde_json::json!({"tools":["Bash"],"action":"deny","message":""}),
+            serde_json::json!({"tools":["Read"],"action":"allow","in_paths":[]}),
+            serde_json::json!({"tools":["Read"],"action":"allow","in_cwds":[]}),
+        ] {
+            assert!(
+                parse(serde_json::json!({"version":1,"default":"deny","rules":[rule]})).is_err()
+            );
+        }
+        assert!(parse(serde_json::json!({"version":1,"default":"ask","rules":[{"tools":["Bash"],"action":"delegate","command":"dippy"}]})).is_ok());
+    }
 
     /// Test convenience: parse a tool name string into a `Tool` and call `resolve_action`.
     /// Keeps test call sites concise without changing every occurrence.

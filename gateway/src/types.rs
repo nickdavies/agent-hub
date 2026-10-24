@@ -28,7 +28,7 @@ impl From<&ToolHookEvent> for protocol::DelegatePayload {
             tool: event.tool_call.tool(),
             tool_input: event.tool_call.raw_input().clone(),
             cwd: event.cwd.clone(),
-            hook_event_name: event.hook_event_name.clone(),
+            hook_event_name: "PreToolUse".to_string(),
         }
     }
 }
