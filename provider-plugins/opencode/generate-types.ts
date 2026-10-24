@@ -27,6 +27,7 @@ const KNOWN_OPENCODE_TOOLS = [
   "edit",
   "glob",
   "grep",
+  "list",
   "multiedit",
   "read",
   "task",

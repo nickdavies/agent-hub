@@ -1,906 +1,377 @@
-/**
- * Agent Hub opencode plugin.
- *
- * Routes every permission.ask decision through agent-hub-gateway so that
- * opencode's tool approvals run through the same rule engine and server
- * escalation path as Claude Code and Cursor.
- *
- * Environment variables (set in the shell that launches opencode):
- *   AGENT_HUB_GATEWAY   path to the gateway binary (default: "agent-hub-gateway")
- *   AGENT_HUB_SERVER    server URL (default: "http://localhost:8080")
- *   AGENT_HUB_TOKEN     bearer token for server auth (default: none)
- *   AGENT_HUB_CONFIG    path to agent-hub-permissions.json rule config (optional)
- *
- * Installation: add to .opencode/config.json:
- *   { "plugin": ["file:///path/to/opencode-plugin"] }
- */
-
+/** Generic HTTP gateway integration for the OpenCode 1.18.26 plugin contract. */
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
-import type { Event as EventV2, PermissionRequest } from "@opencode-ai/sdk/v2"
-import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import path from "path"
-import fs from "fs"
+import { OpencodeClient as OpencodeClientV2, type Event as EventV2, type Config as ConfigV2 } from "@opencode-ai/sdk/v2"
+import { createHash } from "crypto"
 import { spawn, spawnSync, type ChildProcess } from "child_process"
-import type {
-  OpenCodeHookInput,
-  OpenCodeHookOutput,
-  OpenCodeTool,
-  QuestionGatewayOutput,
-  QuestionProxyRequest,
-  SessionStatus,
-  StatusReport,
-} from "./generated/gateway-types"
+import fs from "fs"
+import path from "path"
+import type { OpenCodeHookInput, OpenCodeHookOutput, OpenCodeTool, QuestionProxyRequest, SessionStatus, StatusReport } from "./generated/gateway-types"
+import { normalizeToolExecution } from "./permission-normalization"
 
-// ---------------------------------------------------------------------------
-// Hook output type — extracted from Hooks["permission.ask"] so `apply()`
-// stays in sync with the SDK definition automatically.
-// ---------------------------------------------------------------------------
+const OUTPUT_LIMIT = 1024 * 1024
+const OPERATION_TIMEOUT = 86_410_000
+const SHORT_TIMEOUT = 15_000
+export const DEFAULT_TITLE_RE = /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T/
+export const APPROVAL_TIMEOUT_MESSAGE = "Agent Hub denied this request because approval timed out before an operator decision."
+export const APPROVAL_PIPELINE_ERROR_MESSAGE = "Agent Hub denied this request because the approval pipeline failed."
 
-// The published @opencode-ai/plugin types the hook output as { status },
-// but opencode's runtime also reads `message?: string` from the output
-// (see opencode/packages/opencode/src/permission/index.ts).  Extend the
-// SDK-derived type until the published types catch up.
-type PermissionOutputBase = NonNullable<Hooks["permission.ask"]> extends
-  (input: any, output: infer O) => any ? O : never
-type PermissionOutput = PermissionOutputBase & { message?: string }
-
-// ---------------------------------------------------------------------------
-// Minimal structured logger — writes to the same dev.log opencode uses.
-// Format matches opencode's Log.create output: LEVEL  ISO +Xms key=value msg
-// ---------------------------------------------------------------------------
-
-const logfile = path.join(
-  process.env.XDG_DATA_HOME ?? path.join(process.env.HOME ?? "~", ".local", "share"),
-  "opencode",
-  "log",
-  "dev.log",
-)
-
-type LogLevel = "INFO" | "WARN" | "ERROR"
-
-let last = Date.now()
-function log(level: LogLevel, msg: string, extra?: Record<string, string>) {
-  const now = Date.now()
-  const diff = now - last
-  last = now
-  const ts = new Date(now).toISOString().split(".")[0]
-  const kv = Object.entries({ service: "agent-hub-plugin", ...extra })
-    .map(([k, v]) => `${k}=${v}`)
-    .join(" ")
-  const pad = level === "INFO" || level === "WARN" ? " " : ""
-  fs.appendFileSync(logfile, `${level}${pad} ${ts} +${diff}ms ${kv} ${msg}\n`)
-}
-
-// ---------------------------------------------------------------------------
-// Permission name → gateway tool name (OpenCodeTool wire format).
-// The gateway's OpenCodeTool enum accepts both lowercase and PascalCase.
-// Values here use PascalCase to match the opencode tool.execute.before format.
-// ---------------------------------------------------------------------------
-
-const PERM_TO_TOOL: Record<string, OpenCodeTool> = {
-  bash: "Bash",
-  edit: "Write",
-  read: "Read",
-  webfetch: "WebFetch",
-}
-
-// ---------------------------------------------------------------------------
-// Gateway subprocess tracking — kill on session abort
-// ---------------------------------------------------------------------------
-
-const procs: Map<string, Set<ChildProcess>> = new Map()
-
-// Per-question gateway process tracking — keyed by opencode question requestId.
-// Used to detect when the OpenCode TUI answers a question locally (i.e. before
-// the agent-hub gateway gets a chance to answer it), so we can cancel the
-// in-flight gateway and clean up the pending question on the server.
-const questionGatewayProcs: Map<string, ChildProcess> = new Map()
-
-// Set of requestIds that were answered locally in the OpenCode TUI before the
-// gateway had a chance to answer.  When the gateway process exits (due to
-// SIGTERM from our kill) with code 1, the callGatewayQuestion callback checks
-// this set and skips the question.reject call to avoid a double-resolve error.
-const locallyAnsweredQuestions: Set<string> = new Set()
-
-function track(sid: string, proc: ChildProcess) {
-  let set = procs.get(sid)
-  if (!set) {
-    set = new Set()
-    procs.set(sid, set)
+function bounded(value: string): string {
+  if (Buffer.byteLength(value) <= 4096) return value
+  let result = ""
+  for (const character of value) {
+    if (Buffer.byteLength(result) + Buffer.byteLength(character) > 4096) break
+    result += character
   }
-  set.add(proc)
+  return result
 }
 
-function untrack(sid: string, proc: ChildProcess) {
-  const set = procs.get(sid)
-  if (!set) return
-  set.delete(proc)
-  if (set.size === 0) procs.delete(sid)
-}
+type ProcessResult = { ok: true; stdout: string } | { ok: false; category: string; detail: string; code?: number }
 
-function killGateways(sid: string) {
-  const set = procs.get(sid)
-  if (!set || set.size === 0) return
-  log("INFO", "killing gateway subprocesses on abort", { sid, count: String(set.size) })
-  for (const proc of set) {
-    try { proc.kill("SIGTERM") } catch (err: unknown) {
-      log("WARN", "failed to kill gateway subprocess", { sid, err: String(err) })
+/** Capture both pipes with bounded memory and a deadline; never interpret a failed child as approval. */
+export function runGatewayProcess(options: {
+  bin: string
+  args: string[]
+  input: string
+  timeoutMs: number
+  onSpawn?: (proc: ChildProcess) => void
+}): Promise<ProcessResult> {
+  return new Promise((resolve) => {
+    let proc: ChildProcess
+    try {
+      proc = spawn(options.bin, options.args, { stdio: ["pipe", "pipe", "pipe"] })
+    } catch (error) {
+      resolve({ ok: false, category: "spawn", detail: bounded(String(error)) })
+      return
     }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Status reporting — fire-and-forget via gateway status-report subcommand
-// ---------------------------------------------------------------------------
-
-const statusTimers: Map<string, NodeJS.Timeout> = new Map()
-const DEBOUNCE_MS = 2000
-
-// Track sessions we've already registered on the server so the first
-// permission.ask for a new session triggers an immediate "active" report.
-const registeredSessions: Set<string> = new Set()
-
-// On process exit, report all tracked sessions as ended so the dashboard
-// doesn't leave stale "active" / "idle" entries after opencode shuts down.
-// Uses spawnSync so the reports are delivered before the process terminates —
-// async spawn() in an exit handler is unreliable because stdin writes may not
-// flush before the parent dies.
-let exitHandled = false
-function onExit() {
-  if (exitHandled) return
-  exitHandled = true
-  for (const sid of registeredSessions) {
-    // Cancel any pending debounced reports — we want "ended" immediately.
-    const pending = statusTimers.get(sid)
-    if (pending) clearTimeout(pending)
-    statusTimers.delete(sid)
-    spawnStatusReportSync(sid, "ended")
-  }
-  registeredSessions.clear()
-}
-process.on("exit", onExit)
-process.on("SIGINT", onExit)
-process.on("SIGTERM", onExit)
-
-function reportStatus(
-  sid: string,
-  status: SessionStatus,
-  opts?: { waitingReason?: string; displayName?: string },
-) {
-  // "ended" should fire immediately — no debounce
-  if (status === "ended") {
-    const existing = statusTimers.get(sid)
-    if (existing) clearTimeout(existing)
-    statusTimers.delete(sid)
-    spawnStatusReport(sid, status, opts)
-    return
-  }
-
-  const existing = statusTimers.get(sid)
-  if (existing) clearTimeout(existing)
-
-  const timer = setTimeout(() => {
-    statusTimers.delete(sid)
-    spawnStatusReport(sid, status, opts)
-  }, DEBOUNCE_MS)
-
-  statusTimers.set(sid, timer)
-}
-
-function spawnStatusReport(
-  sid: string,
-  status: SessionStatus,
-  opts?: { waitingReason?: string; displayName?: string },
-) {
-  const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
-  const server = process.env.AGENT_HUB_SERVER ?? "http://localhost:8080"
-  const token = process.env.AGENT_HUB_TOKEN ?? ""
-
-  const report: StatusReport = {
-    session_id: sid,
-    cwd: process.cwd(),
-    status,
-    waiting_reason: opts?.waitingReason ?? null,
-    display_name: opts?.displayName ?? null,
-    editor_type: "opencode",
-  }
-  const payload = JSON.stringify(report)
-
-  log("INFO", "spawnStatusReport", { sid, status })
-
-  const proc = spawn(
-    bin,
-    ["status-report", "--server", server, "--token", token],
-    { stdio: ["pipe", "ignore", "pipe"] },
-  )
-
-  proc.stdin.end(payload)
-  proc.stderr?.on("data", (chunk: Buffer) => {
-    log("INFO", "status-report stderr", { output: chunk.toString().trim() })
-  })
-  proc.on("error", (err: Error) => {
-    log("WARN", "status report spawn failed", { err: err.message })
+    let settled = false
+    let failure: ProcessResult | undefined
+    const chunks: Buffer[] = []
+    const errors: Buffer[] = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    const finish = (result: ProcessResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+    const fail = (category: string, detail: string) => {
+      if (settled || failure) return
+      failure = { ok: false, category, detail: bounded(detail) }
+      proc.kill("SIGKILL")
+      // A descendant can retain inherited pipes after the direct child dies.
+      finish(failure)
+    }
+    const timer = setTimeout(() => fail("timeout", `gateway exceeded ${options.timeoutMs} ms`), options.timeoutMs)
+    const capture = (stream: "stdout" | "stderr", chunk: Buffer) => {
+      if (settled) return
+      if (stream === "stdout") stdoutBytes += chunk.length
+      else stderrBytes += chunk.length
+      if (stdoutBytes > OUTPUT_LIMIT || stderrBytes > OUTPUT_LIMIT) return fail("oversized", `${stream} exceeded ${OUTPUT_LIMIT} bytes`)
+      ;(stream === "stdout" ? chunks : errors).push(chunk)
+    }
+    proc.stdout?.on("data", (chunk: Buffer) => capture("stdout", chunk))
+    proc.stderr?.on("data", (chunk: Buffer) => capture("stderr", chunk))
+    proc.stdout?.on("error", (error) => fail("read", error.message))
+    proc.stderr?.on("error", (error) => fail("read", error.message))
+    proc.stdin?.on("error", (error) => fail("write", error.message))
+    proc.on("error", (error) => finish({ ok: false, category: "spawn", detail: bounded(error.message) }))
+    proc.on("close", (code, signal) => {
+      if (failure) return finish(failure)
+      if (signal) return finish({ ok: false, category: "signal", detail: `gateway terminated by ${signal}` })
+      if (code !== 0) return finish({ ok: false, category: "nonzero", code: code ?? undefined, detail: bounded(`gateway exited ${code}: ${Buffer.concat(errors).toString("utf8")}`) })
+      finish({ ok: true, stdout: Buffer.concat(chunks).toString("utf8") })
+    })
+    options.onSpawn?.(proc)
+    if (!proc.stdin) return fail("write", "gateway stdin unavailable")
+    proc.stdin.end(options.input)
   })
 }
-
-/** Synchronous variant used only during process exit to ensure the report
- *  is delivered before the Node.js process terminates. */
-function spawnStatusReportSync(
-  sid: string,
-  status: SessionStatus,
-  opts?: { waitingReason?: string; displayName?: string },
-) {
-  const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
-  const server = process.env.AGENT_HUB_SERVER ?? "http://localhost:8080"
-  const token = process.env.AGENT_HUB_TOKEN ?? ""
-
-  const report: StatusReport = {
-    session_id: sid,
-    cwd: process.cwd(),
-    status,
-    waiting_reason: opts?.waitingReason ?? null,
-    display_name: opts?.displayName ?? null,
-    editor_type: "opencode",
-  }
-  const payload = JSON.stringify(report)
-
-  log("INFO", "spawnStatusReportSync", { sid, status })
-
-  try {
-    spawnSync(
-      bin,
-      ["status-report", "--server", server, "--token", token],
-      { input: payload, stdio: ["pipe", "ignore", "pipe"], timeout: 5000 },
-    )
-  } catch (err: unknown) {
-    log("WARN", "sync status report failed", { err: String(err) })
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Single-pattern gateway call
-// ---------------------------------------------------------------------------
-
-type GatewayResult = OpenCodeHookOutput
-
-export const APPROVAL_TIMEOUT_MESSAGE = "Your approval request timed out because the operator was away. This is not a denial. Feel free to retry if you still need this."
-export const APPROVAL_PIPELINE_ERROR_MESSAGE = "There was an error in the approvals pipeline. This is a null answer: it is neither an approval nor a rejection of your intended action. Do not take this as a signal that your intended path is unwanted. Try again; if the error recurs, abort and report it to the operator."
-
-/** Validate that a parsed JSON value conforms to the OpenCodeHookOutput shape.
- *  The gateway is an external subprocess — we cannot trust its stdout blindly. */
-function isValidGatewayOutput(v: unknown): v is OpenCodeHookOutput {
-  if (typeof v !== "object" || v === null) return false
-  const obj = v as Record<string, unknown>
-  if (typeof obj.allowed !== "boolean") return false
-  if (obj.reason !== undefined && obj.reason !== null && typeof obj.reason !== "string") return false
-  return true
-}
-
-async function callGateway(sid: string, payload: OpenCodeHookInput): Promise<GatewayResult> {
-  const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
-  const server = process.env.AGENT_HUB_SERVER
-  const token = process.env.AGENT_HUB_TOKEN
-  const config = process.env.AGENT_HUB_CONFIG
-
-  const args: string[] = ["approval", "--opencode"]
-  args.push("--server", server ?? "http://localhost:8080")
-  args.push("--token", token ?? "")
-  if (config) args.push("--config", config)
-
-  log("INFO", "callGateway", { bin, config: config ?? "(none)" })
-
-  return new Promise((resolve) => {
-    const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] })
-    track(sid, proc)
-
-    let stdout = ""
-    let stderr = ""
-    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString() })
-    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString() })
-
-    proc.on("close", (code: number | null) => {
-      untrack(sid, proc)
-      if (stderr) log("INFO", "gateway stderr", { output: stderr.trim() })
-      // Exit 1 is an approvals-pipeline failure from older gateway versions.
-      if (code === 1) {
-        log("WARN", "gateway approvals pipeline failure", { reason: stderr.trim() })
-        return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-      }
-      // Exit 2 = fail-closed local input or config error.
-      if (code === 2) return resolve({ allowed: false, reason: "gateway: fail-closed" })
-      if (code !== 0) return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-      try {
-        const parsed: unknown = JSON.parse(stdout.trim())
-        if (!isValidGatewayOutput(parsed)) {
-          log("ERROR", "gateway output failed validation", { stdout: stdout.trim() })
-          return resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-        }
-        resolve(parsed)
-      } catch {
-        log("ERROR", "gateway invalid response", { stdout: stdout.trim() })
-        resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-      }
-    })
-
-    proc.on("error", (err: Error) => {
-      untrack(sid, proc)
-      log("ERROR", "gateway spawn error", { err: err.message, bin })
-      resolve({ allowed: false, reason: APPROVAL_PIPELINE_ERROR_MESSAGE })
-    })
-
-    proc.stdin.end(JSON.stringify(payload))
-  })
-}
-
-// ---------------------------------------------------------------------------
-// Question proxy — blocking gateway call for question.asked events
-// ---------------------------------------------------------------------------
-
-/** Result from the gateway `question` subcommand. */
-type QuestionGatewayResult =
-  | { answers: string[][] }
-  | { outcome: "rejected" | "timeout" | "pipeline-error" }
-
-function isValidQuestionAnswers(value: unknown): value is string[][] {
-  return Array.isArray(value) && value.every(
-    (answer) => Array.isArray(answer) && answer.every((item) => typeof item === "string"),
-  )
-}
-
-async function callGatewayQuestion(
-  sid: string,
-  payload: QuestionProxyRequest,
-): Promise<QuestionGatewayResult> {
-  const bin = process.env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
-  const server = process.env.AGENT_HUB_SERVER
-  const token = process.env.AGENT_HUB_TOKEN
-
-  const args: string[] = ["question", "--opencode"]
-  args.push("--server", server ?? "http://localhost:8080")
-  args.push("--token", token ?? "")
-
-  log("INFO", "callGatewayQuestion", { bin, requestId: payload.question_request_id })
-
-  const requestId = payload.question_request_id
-
-  return new Promise((resolve) => {
-    const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"] })
-    track(sid, proc)
-    questionGatewayProcs.set(requestId, proc)
-
-    let stdout = ""
-    let stderr = ""
-    proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString() })
-    proc.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString() })
-
-    proc.on("close", (code: number | null) => {
-      untrack(sid, proc)
-      questionGatewayProcs.delete(requestId)
-      if (stderr) log("INFO", "question gateway stderr", { output: stderr.trim() })
-
-      if (code === 0) {
-        try {
-          const parsed = JSON.parse(stdout.trim()) as QuestionGatewayOutput
-          if (!isValidQuestionAnswers(parsed.answers) || parsed.answers.length !== payload.questions.length) {
-            log("ERROR", "question gateway output failed validation", { stdout: stdout.trim() })
-            resolve({ outcome: "pipeline-error" })
-            return
-          }
-          resolve({ answers: parsed.answers })
-        } catch {
-          log("ERROR", "question gateway invalid JSON", { stdout: stdout.trim() })
-          resolve({ outcome: "pipeline-error" })
-        }
-        return
-      }
-
-      if (code === 1) {
-        log("INFO", "question gateway rejected", { reason: stderr.trim() })
-        resolve({ outcome: "rejected" })
-        return
-      }
-
-      if (code === 3) {
-        log("INFO", "question gateway timed out", { reason: stderr.trim() })
-        resolve({ outcome: "timeout" })
-        return
-      }
-
-      log("WARN", "question gateway pipeline failure", { code: String(code), stderr: stderr.trim() })
-      resolve({ outcome: "pipeline-error" })
-    })
-
-    proc.on("error", (err: Error) => {
-      untrack(sid, proc)
-      questionGatewayProcs.delete(requestId)
-      log("ERROR", "question gateway spawn error", { err: err.message, bin })
-      resolve({ outcome: "pipeline-error" })
-    })
-
-    proc.stdin.end(JSON.stringify(payload))
-  })
-}
-
-// ---------------------------------------------------------------------------
-// Build a gateway payload for a single tool_input value
-// ---------------------------------------------------------------------------
 
 export function makePayload(
   sessionId: string,
   tool: OpenCodeTool,
-  toolInput: Record<string, unknown>,
+  rawArgs: Record<string, unknown>,
+  matchInput: Record<string, unknown>,
   directory: string,
-  _worktree: string,
   title?: string,
 ): OpenCodeHookInput {
-  return {
-    session_id: sessionId,
-    tool_name: tool,
-    tool_input: toolInput,
-    cwd: directory,
-    hook_event_name: "permission.ask",
-    session_title: title ?? null,
+  return { session_id: sessionId, tool_name: tool, tool_input: rawArgs, tool_match_input: matchInput,
+    cwd: directory, hook_event_name: "tool.execute.before", session_title: title ?? null }
+}
+
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical)
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value)
+    .sort(([a], [b]) => a.localeCompare(b)).map(([key, nested]) => [key, canonical(nested)]))
+  return value
+}
+
+function digest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex")
+}
+
+interface Execution {
+  sessionID: string
+  tool: string
+  digest: string
+  status: "routing" | "authorized" | "denied" | "completed"
+}
+
+/** All mutable state, timers, children and process listeners belong to this instance. */
+export async function createPluginInstance(input: PluginInput, options: { registerProcessHandlers?: boolean } = {}): Promise<Hooks> {
+  const { client, directory, worktree } = input
+  if (!directory || !path.isAbsolute(directory)) throw new Error("Plugin directory must be absolute")
+  // Reuse the host's generated client, including its in-process transport. No TCP server is required.
+  // The plugin publishes a v1 client with a protected field; the host's v2 API
+  // uses that same generated transport. Isolate this SDK boundary cast here.
+  type Transport = NonNullable<ConstructorParameters<typeof OpencodeClientV2>[0]>["client"]
+  const transport = (client as unknown as { _client?: Transport })._client
+  if (!transport) throw new Error("OpenCode runtime does not expose the in-process plugin client")
+  const clientV2 = new OpencodeClientV2({ client: transport })
+  const env = { ...process.env }
+  const bin = env.AGENT_HUB_GATEWAY ?? "agent-hub-gateway"
+  const serverArgs = ["--server", env.AGENT_HUB_SERVER ?? "http://localhost:8080", ...(env.AGENT_HUB_TOKEN ? ["--token", env.AGENT_HUB_TOKEN] : [])]
+  const owned = new Set<string>()
+  const ownershipVersions = new Map<string, number>()
+  const records = new Map<string, Execution>()
+  const procs = new Map<string, Set<ChildProcess>>()
+  const questions = new Map<string, { sid: string; proc?: ChildProcess; cancelled: boolean }>()
+  const timers = new Map<string, ReturnType<typeof setTimeout>>()
+  const registered = new Set<string>()
+  const registering = new Set<string>()
+  const titles = new Map<string, string>()
+  let initialized = false
+  let disposed = false
+  const logfile = path.join(env.XDG_DATA_HOME ?? path.join(env.HOME ?? "~", ".local/share"), "opencode/log/dev.log")
+  const log = (message: string) => {
+    // Diagnostics must never change an approval or cleanup outcome.
+    try { fs.appendFileSync(logfile, `WARN ${new Date().toISOString()} service=agent-hub-plugin ${bounded(message)}\n`) } catch {}
   }
-}
-
-// Resolve a path value against base, but only if it is relative.
-function resolvePath(value: string, base: string): string {
-  return path.isAbsolute(value) ? value : path.resolve(base, value)
-}
-
-export function makeReadToolInput(pattern: string, worktree: string): Record<string, string> {
-  return { path: resolvePath(pattern, worktree) }
-}
-
-export function makeGlobToolInput(
-  metadata: Record<string, unknown>,
-  directory: string,
-): Record<string, string> {
-  const toolInput: Record<string, string> = {}
-  if (typeof metadata.pattern === "string") toolInput.pattern = metadata.pattern
-  if (typeof metadata.path === "string") {
-    toolInput.path = resolvePath(metadata.path, directory)
-  } else if (typeof metadata.directory === "string") {
-    toolInput.path = resolvePath(metadata.directory, directory)
-  } else {
-    toolInput.path = directory
+  const ensureLive = () => { if (disposed) throw new Error("Agent Hub plugin is disposed") }
+  const invoke = async (sid: string, args: string[], payload: unknown, timeoutMs = OPERATION_TIMEOUT,
+    onSpawn?: (proc: ChildProcess) => void): Promise<ProcessResult> => {
+    if (disposed) return { ok: false, category: "disposed", detail: "plugin disposed" }
+    let child: ChildProcess | undefined
+    const result = await runGatewayProcess({ bin, args, input: JSON.stringify(payload), timeoutMs, onSpawn: (proc) => {
+      child = proc
+      let set = procs.get(sid)
+      if (!set) procs.set(sid, set = new Set())
+      set.add(proc)
+      onSpawn?.(proc)
+    } })
+    if (child) procs.get(sid)?.delete(child)
+    if (!procs.get(sid)?.size) procs.delete(sid)
+    return result
   }
-  return toolInput
-}
-
-function validatePluginDirectory(directory: string) {
-  if (directory.length === 0) throw new Error("Plugin directory must not be empty")
-  if (!path.isAbsolute(directory)) throw new Error("Plugin directory must be absolute")
-}
-
-// Apply a GatewayResult to the hook output object.
-function apply(r: GatewayResult, output: PermissionOutput) {
-  output.status = r.allowed ? "allow" : "deny"
-  if (r.reason && !r.allowed) output.message = r.reason
-}
-
-// ---------------------------------------------------------------------------
-// Session title cache — avoids repeated SDK calls for the same session.
-// Stores the LLM-generated title once it's available; null means we haven't
-// fetched a non-default title yet and should retry next time.
-// ---------------------------------------------------------------------------
-
-export const DEFAULT_TITLE_RE = /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T/
-
-/** The plugin receives a v1 SDK client. Extract the type from PluginInput
- *  so we track upstream changes automatically. */
-type PluginClient = PluginInput["client"]
-
-const titles: Map<string, string> = new Map()
-
-async function fetchTitle(
-  client: PluginClient,
-  sid: string,
-  dir: string,
-): Promise<string | undefined> {
-  const cached = titles.get(sid)
-  if (cached) {
-    log("INFO", "fetchTitle cache hit", { sid, title: cached })
-    return cached
+  const kill = (sid: string) => {
+    for (const proc of procs.get(sid) ?? []) proc.kill("SIGKILL")
+    for (const question of questions.values()) if (question.sid === sid) question.cancelled = true
   }
-
-  log("INFO", "fetchTitle calling session.get", { sid, directory: dir })
-  try {
-    // The plugin client is v1 — uses { path: { id }, query: { directory } }
-    // and URL template /session/{id}.
-    const res = await client.session.get({
-      path: { id: sid },
-      query: { directory: dir },
-    })
-    log("INFO", "fetchTitle raw response", { sid, keys: Object.keys(res).join(","), hasData: String(!!res.data) })
-    const title = res.data?.title
-    log("INFO", "fetchTitle got response", { sid, title: title ?? "(none)", hasData: String(!!res.data) })
-    if (title && !DEFAULT_TITLE_RE.test(title)) {
-      titles.set(sid, title)
-      log("INFO", "fetchTitle cached title", { sid, title })
-      return title
+  const statusPayload = (sid: string, status: SessionStatus, waitingReason?: string): StatusReport => ({
+    session_id: sid, cwd: directory, status, waiting_reason: waitingReason ?? null,
+    display_name: titles.get(sid) ?? null, editor_type: "opencode",
+  })
+  const sendStatus = async (sid: string, status: SessionStatus, reason?: string) => {
+    const result = await invoke(sid, ["status-report", ...serverArgs], statusPayload(sid, status, reason), SHORT_TIMEOUT)
+    registering.delete(sid)
+    if (!disposed && result.ok && status !== "ended") registered.add(sid)
+    else registered.delete(sid)
+    if (!result.ok) log(`status report failed; later activity will retry: ${result.detail}`)
+  }
+  const reportStatus = (sid: string, status: SessionStatus) => {
+    clearTimeout(timers.get(sid))
+    if (disposed) return
+    timers.set(sid, setTimeout(() => { timers.delete(sid); void sendStatus(sid, status) }, 2000))
+  }
+  const fetchTitle = async (sid: string) => {
+    if (titles.has(sid)) return titles.get(sid)
+    try {
+      const response = await client.session.get({ path: { id: sid }, query: { directory } })
+      const title = response.error ? undefined : response.data?.title
+      if (title && !DEFAULT_TITLE_RE.test(title)) { titles.set(sid, title); return title }
+    } catch (error) { log(`session title unavailable: ${error}`) }
+    return undefined
+  }
+  const deny = (reason: string): never => { throw new Error(bounded(reason)) }
+  const shutdown = (reportEnded: boolean) => {
+    if (disposed) return
+    disposed = true
+    process.off("exit", exit)
+    process.off("SIGINT", sigint)
+    process.off("SIGTERM", sigterm)
+    for (const timer of timers.values()) clearTimeout(timer)
+    timers.clear()
+    for (const sid of procs.keys()) kill(sid)
+    if (reportEnded) for (const sid of registered) {
+      try {
+        spawnSync(bin, ["status-report", ...serverArgs], { input: JSON.stringify(statusPayload(sid, "ended")),
+          timeout: 5000, maxBuffer: OUTPUT_LIMIT, stdio: ["pipe", "ignore", "pipe"] })
+      } catch (error) { log(`exit status report failed: ${error}`) }
     }
-    log("INFO", "fetchTitle title is default/empty, skipping cache", { sid })
-    return undefined
-  } catch (err) {
-    log("WARN", "failed to fetch session title", { sid, err: String(err) })
-    return undefined
+    owned.clear(); ownershipVersions.clear(); records.clear(); titles.clear(); registered.clear(); registering.clear()
   }
-}
+  const exit = () => shutdown(true)
+  const sigint = () => { shutdown(true); process.exit(130) }
+  const sigterm = () => { shutdown(true); process.exit(143) }
+  if (options.registerProcessHandlers !== false) {
+    process.on("exit", exit); process.on("SIGINT", sigint); process.on("SIGTERM", sigterm)
+  }
 
-// ---------------------------------------------------------------------------
-// Plugin export
-// ---------------------------------------------------------------------------
-
-export const id = "agent-hub"
-
-const server: Plugin = async (input: PluginInput): Promise<Hooks> => {
-  const client = input.client
-  const { directory, worktree } = input
-  validatePluginDirectory(directory)
-
-  // Create the v2 SDK client once at plugin-init time.  We reuse the same
-  // in-process fetch that input.client uses (extracted via the internal
-  // _client property) so that the request is routed through the Hono app
-  // handler in-process rather than making a real TCP connection.  In the
-  // default TUI mode no TCP server is started at all, so a real TCP fetch
-  // to input.serverUrl would fail with ECONNREFUSED.
-  const inProcessFetch: typeof fetch | undefined =
-    (input.client as any)?._client?.getConfig?.()?.fetch
-  log("INFO", "init clientV2", {
-    serverUrl: input.serverUrl.toString(),
-    hasInProcessFetch: String(!!inProcessFetch),
-  })
-  const clientV2 = createOpencodeClient({
-    baseUrl: input.serverUrl.toString(),
-    ...(inProcessFetch ? { fetch: inProcessFetch } : {}),
-  })
+  const proxyQuestion = async (payload: QuestionProxyRequest) => {
+    const sid = payload.session_id
+    const id = payload.question_request_id
+    if (questions.has(id)) throw new Error(`Duplicate question '${id}'`)
+    const pending = { sid, cancelled: false, proc: undefined as ChildProcess | undefined }
+    questions.set(id, pending)
+    const reply = async (answers: string[][]) => {
+      const result = await clientV2.question.reply({ requestID: id, directory, answers })
+      if (result.error) throw new Error(`question.reply failed: ${JSON.stringify(result.error)}`)
+    }
+    const reject = async () => {
+      const result = await clientV2.question.reject({ requestID: id, directory })
+      if (result.error) throw new Error(`question.reject failed: ${JSON.stringify(result.error)}`)
+    }
+    try {
+      const result = await invoke(sid, ["question", "--opencode", ...serverArgs], payload, OPERATION_TIMEOUT, (proc) => { pending.proc = proc })
+      if (pending.cancelled || disposed) return
+      if (!result.ok) {
+        if (result.category === "nonzero" && result.code === 1) return await reject()
+        if (result.category === "nonzero" && result.code === 3) return await reply(payload.questions.map(() => [APPROVAL_TIMEOUT_MESSAGE]))
+        throw new Error(`${APPROVAL_PIPELINE_ERROR_MESSAGE} ${result.detail}`)
+      }
+      const parsed: unknown = JSON.parse(result.stdout)
+      const answers = (parsed as { answers?: unknown } | null)?.answers
+      if (!Array.isArray(answers) || answers.length !== payload.questions.length || !answers.every((answer) =>
+        Array.isArray(answer) && answer.every((item) => typeof item === "string"))) throw new Error("Malformed question answers")
+      await reply(answers)
+    } catch (error) {
+      if (pending.cancelled || disposed) return
+      const message = bounded(`${APPROVAL_PIPELINE_ERROR_MESSAGE} ${error}`)
+      log(message)
+      try { await reply(payload.questions.map(() => [message])) } catch (replyError) {
+        if (pending.cancelled || disposed) return
+        log(`question error reply failed: ${replyError}`)
+        await reject()
+      }
+    } finally { questions.delete(id) }
+  }
 
   return {
-    "permission.ask": async (_info, output) => {
-      // The published @opencode-ai/plugin types permission.ask input as the
-      // v1 Permission type, but opencode actually sends v2 PermissionRequest
-      // at runtime (with `permission`/`patterns` instead of `type`/`pattern`).
-      // This cast is safe and necessary until the published types catch up.
-      const info = _info as unknown as PermissionRequest
-      log("INFO", "permission.ask handler entered", { permission: info.permission ?? "?" })
-      // external_directory is opencode-internal — the in_workspace distinction
-      // is already handled by the gateway's in_workspace flag on file rules.
-      // Auto-approve it here; the subsequent read/write permission will be
-      // sent to the gateway with the correct path for rule evaluation.
-      if (info.permission === "external_directory") {
-        output.status = "allow"
-        return
-      }
-
-      const tool = PERM_TO_TOOL[info.permission] ?? info.permission
-      const sid = info.sessionID
-
-      // First tool call for this session — immediately register it on the
-      // server so it shows up in the session list right away, rather than
-      // waiting for a debounced session.status event or an approval escalation.
-      if (!registeredSessions.has(sid)) {
-        registeredSessions.add(sid)
-        spawnStatusReport(sid, "active")
-      }
-
-      log("INFO", "about to call fetchTitle", { sid, tool })
-      const title = await fetchTitle(client, sid, directory)
-      log("INFO", "fetchTitle returned", { sid, title: title ?? "(none)" })
-
-      // -----------------------------------------------------------------
-      // bash: use the raw unparsed command from metadata rather than the
-      // per-subcommand tree-sitter fragments in patterns.
-      // -----------------------------------------------------------------
-      if (info.permission === "bash" && typeof info.metadata.command === "string") {
-        const result = await callGateway(
-          sid, makePayload(sid, tool, { command: info.metadata.command }, directory, worktree, title),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // edit (write.ts / edit.ts / apply_patch.ts):
-      //   metadata.filepath is the absolute path (scalar, for write/edit).
-      //   metadata.files is an array of per-file objects (for apply_patch).
-      //   patterns contains worktree-relative paths as fallback.
-      // -----------------------------------------------------------------
-      if (info.permission === "edit") {
-        // apply_patch: rich per-file metadata
-        if (Array.isArray(info.metadata.files)) {
-          for (const entry of info.metadata.files) {
-            const filePath = typeof entry === "object" && entry !== null &&
-              "filePath" in entry && typeof (entry as Record<string, unknown>).filePath === "string"
-              ? (entry as Record<string, unknown>).filePath as string
-              : undefined
-            if (!filePath) continue
-            const result = await callGateway(
-              sid, makePayload(sid, tool, { path: filePath }, directory, worktree, title),
-            )
-            if (!result.allowed) {
-              apply(result, output)
-              return
-            }
-          }
-          output.status = "allow"
-          return
-        }
-
-        // write/edit: scalar filepath in metadata (already absolute)
-        if (typeof info.metadata.filepath === "string") {
-          const result = await callGateway(
-            sid, makePayload(sid, tool, { path: info.metadata.filepath }, directory, worktree, title),
-          )
-          apply(result, output)
-          return
-        }
-
-        // Fallback: patterns entries are worktree-relative — resolve against worktree
-        for (const pat of info.patterns) {
-          const result = await callGateway(
-            sid, makePayload(sid, tool, { path: resolvePath(pat, worktree) }, directory, worktree, title),
-          )
-          if (!result.allowed) {
-            apply(result, output)
-            return
-          }
-        }
-        output.status = "allow"
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // read: patterns[0] is worktree-relative.
-      // -----------------------------------------------------------------
-      if (info.permission === "read") {
-        const result = await callGateway(
-          sid, makePayload(
-            sid,
-            tool,
-            makeReadToolInput(info.patterns[0] ?? "", worktree),
-            directory,
-            worktree,
-            title,
-          ),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // webfetch: metadata.url is the canonical arg the gateway expects.
-      // -----------------------------------------------------------------
-      if (info.permission === "webfetch" && typeof info.metadata.url === "string") {
-        const result = await callGateway(
-          sid, makePayload(sid, tool, { url: info.metadata.url }, directory, worktree, title),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // grep: patterns[0] is the regex; metadata may carry path/directory.
-      // The gateway requires `pattern`; `path` is optional.
-      // -----------------------------------------------------------------
-      if (info.permission === "grep") {
-        log("INFO", "grep permission info", {
-          patterns: JSON.stringify(info.patterns),
-          metadata: JSON.stringify(info.metadata),
-        })
-        const toolInput: Record<string, string> = {}
-        if (info.patterns[0]) toolInput.pattern = info.patterns[0]
-        // Forward path/directory from metadata if present
-        if (typeof info.metadata.path === "string") {
-          toolInput.path = resolvePath(info.metadata.path, directory)
-        } else if (typeof info.metadata.directory === "string") {
-          toolInput.path = resolvePath(info.metadata.directory, directory)
-        }
-        const result = await callGateway(
-          sid, makePayload(sid, tool, toolInput, directory, worktree, title),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // glob: preserve metadata.pattern as raw selector context while policy
-      // matching uses only the target path from metadata.path/directory or cwd.
-      // -----------------------------------------------------------------
-      if (info.permission === "glob") {
-        log("INFO", "glob permission info", {
-          patterns: JSON.stringify(info.patterns),
-          metadata: JSON.stringify(info.metadata),
-        })
-        const toolInput = makeGlobToolInput(info.metadata, directory)
-        const result = await callGateway(
-          sid, makePayload(sid, tool, toolInput, directory, worktree, title),
-        )
-        apply(result, output)
-        return
-      }
-
-      // -----------------------------------------------------------------
-      // All other tools (websearch, codesearch, list, task, todowrite,
-      // lsp, skill, ...):
-      // Single call with empty tool_input. get_matchable_args returns []
-      // for tools not in TOOL_DEFS and the rule engine falls to the
-      // configured default (typically "ask", escalating to the server).
-      // -----------------------------------------------------------------
-      log("INFO", "fallback permission info", {
-        permission: info.permission,
-        patterns: JSON.stringify(info.patterns),
-        metadata: JSON.stringify(info.metadata),
-      })
-      const result = await callGateway(
-        sid, makePayload(sid, tool, {}, directory, worktree, title),
-      )
-      apply(result, output)
+    config: async (config) => {
+      ensureLive()
+      // The hook's published config type is v1; the host consumes v2 rules.
+      const runtimeConfig = config as unknown as ConfigV2
+      runtimeConfig.permission = { "*": "deny" }
+      for (const agent of Object.values(runtimeConfig.agent ?? {})) if (agent) agent.permission = { "*": "deny" }
+      owned.clear()
+      for (const [sid, version] of ownershipVersions) ownershipVersions.set(sid, version + 1)
+      initialized = true
     },
-
-    event: async ({ event: _event }) => {
-      // The published @opencode-ai/plugin types the event hook using the v1
-      // SDK Event union, which doesn't include question.* variants. Cast to
-      // the v2 Event type which does; the v2 bus is what fires at runtime.
-      const event = _event as unknown as EventV2
-
-      // session.status — map opencode statuses to agent-hub statuses
-      if (event.type === "session.status") {
-        const sid = event.properties.sessionID
-        // opencode emits "idle", "busy", "retry"; map to agent-hub terms
-        const mapped = event.properties.status.type === "idle" ? "idle" as const : "active" as const
-        reportStatus(sid, mapped)
-        return
+    "chat.message": async (info) => {
+      ensureLive()
+      const sid = info.sessionID
+      owned.delete(sid)
+      const version = (ownershipVersions.get(sid) ?? 0) + 1
+      ownershipVersions.set(sid, version)
+      if (!initialized) return deny("Agent Hub config hook has not taken permission ownership")
+      try {
+        const response = await clientV2.session.update({ sessionID: sid, directory,
+          permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+        if (response.error) throw new Error(JSON.stringify(response.error))
+        const rules = response.data?.permission
+        const valid = Array.isArray(rules) && rules.every((rule) => rule && typeof rule.permission === "string"
+          && typeof rule.pattern === "string" && ["allow", "ask", "deny"].includes(rule.action))
+        const last = valid ? rules.at(-1) : undefined
+        if (last?.permission !== "*" || last.pattern !== "*" || last.action !== "allow") throw new Error("session.update did not prove final wildcard allow rule")
+        ensureLive()
+        if (ownershipVersions.get(sid) !== version) throw new Error("Session ownership update superseded")
+        owned.add(sid)
+      } catch (error) { return deny(`OpenCode session permission ownership failed: ${error}`) }
+    },
+    "permission.ask": async (_info, output) => {
+      // Set the decision before diagnostics: a failed logger cannot expose a native approval UI.
+      output.status = "deny"
+      log("Denied leaked native permission prompt; Agent Hub must own every tool decision")
+    },
+    "tool.execute.before": async (info, output) => {
+      ensureLive()
+      if (!initialized || !owned.has(info.sessionID)) return deny("Agent Hub denied tool execution: session has not transferred permission ownership")
+      if (records.has(info.callID)) return deny(`OpenCode reused tool call ID '${info.callID}'`)
+      // Reserve before the first await, including title fetching and subprocess startup.
+      const record: Execution = { sessionID: info.sessionID, tool: info.tool, digest: digest(output.args), status: "routing" }
+      const ownershipVersion = ownershipVersions.get(info.sessionID)
+      const ensureOwnership = () => {
+        ensureLive()
+        if (!owned.has(info.sessionID) || ownershipVersions.get(info.sessionID) !== ownershipVersion) return deny("OpenCode session ownership changed during approval")
       }
-
-      // session.idle — dedicated idle event emitted when the session is
-      // waiting for user input. This is separate from session.status and
-      // is the primary signal that the agent has finished working.
-      if (event.type === "session.idle") {
-        const sid = event.properties.sessionID
-        reportStatus(sid, "idle")
-        return
+      records.set(info.callID, record)
+      try {
+        const request = normalizeToolExecution(info.tool, output.args, directory, worktree)
+        if (!registered.has(info.sessionID) && !registering.has(info.sessionID)) {
+          registering.add(info.sessionID)
+          void sendStatus(info.sessionID, "active")
+        }
+        const title = await fetchTitle(info.sessionID)
+        for (const matchInput of request.matchInputs) {
+          ensureOwnership()
+          const result = await invoke(info.sessionID, ["approval", "--opencode", ...serverArgs,
+            ...(env.AGENT_HUB_CONFIG ? ["--config", env.AGENT_HUB_CONFIG] : [])],
+          makePayload(info.sessionID, request.tool, request.rawArgs, matchInput, directory, title))
+          if (!result.ok) return deny(`${APPROVAL_PIPELINE_ERROR_MESSAGE} (${result.category}): ${result.detail}`)
+          const parsed: unknown = JSON.parse(result.stdout)
+          if (!parsed || typeof parsed !== "object" || typeof (parsed as OpenCodeHookOutput).allowed !== "boolean") return deny("Malformed gateway approval response")
+          const decision = parsed as OpenCodeHookOutput
+          if (decision.reason != null && typeof decision.reason !== "string") return deny("Malformed gateway approval reason")
+          if (!decision.allowed) return deny(decision.reason ?? "Agent Hub denied tool execution")
+        }
+        ensureOwnership()
+        if (digest(output.args) !== record.digest) return deny("OpenCode tool arguments changed during approval")
+        record.status = "authorized"
+      } catch (error) {
+        record.status = "denied"
+        return deny(`Agent Hub blocked tool execution: ${error}`)
       }
-
-      // session.error — abort / error; kill gateways and report ended
-      if (event.type === "session.error") {
-        if (event.properties.error?.name !== "MessageAbortedError") return
+    },
+    "tool.execute.after": async (info) => {
+      ensureLive()
+      const record = records.get(info.callID)
+      if (!record || record.status !== "authorized" || !owned.has(info.sessionID)) return deny(`OpenCode completed unauthorized or duplicate tool call '${info.callID}'`)
+      record.status = "denied"
+      if (record.sessionID !== info.sessionID || record.tool !== info.tool || record.digest !== digest(info.args)) return deny(`OpenCode before/after argument mismatch for '${info.callID}'`)
+      record.status = "completed"
+    },
+    event: async ({ event: rawEvent }) => {
+      if (disposed) return
+      const event = rawEvent as unknown as EventV2
+      if (event.type === "session.status") return reportStatus(event.properties.sessionID, event.properties.status.type === "idle" ? "idle" : "active")
+      if (event.type === "session.idle") return reportStatus(event.properties.sessionID, "idle")
+      if (event.type === "session.error" && event.properties.error?.name === "MessageAbortedError") {
         const sid = event.properties.sessionID
         if (sid) {
-          registeredSessions.delete(sid)
-          killGateways(sid)
-          reportStatus(sid, "ended")
+          owned.delete(sid); ownershipVersions.set(sid, (ownershipVersions.get(sid) ?? 0) + 1)
+          clearTimeout(timers.get(sid)); timers.delete(sid)
+          kill(sid)
+          void sendStatus(sid, "ended")
         }
-        return
       }
-
-      // question.asked — AI is blocked waiting for operator input.
-      // Proxy the question through the gateway so the operator can answer it
-      // from the web UI or TUI. Report Waiting immediately (bypass debounce).
       if (event.type === "question.asked") {
-        const sid = event.properties.sessionID
-        const requestId = event.properties.id
-        const questions = event.properties.questions
-        const header = questions[0]?.header ?? "Plan question"
-
-        // Immediately report Waiting (bypass debounce — time-sensitive)
-        const existing = statusTimers.get(sid)
-        if (existing) clearTimeout(existing)
-        statusTimers.delete(sid)
-        spawnStatusReport(sid, "waiting", { waitingReason: `Plan question: ${header}` })
-
-        // Build the gateway request
-        const proxyReq: QuestionProxyRequest = {
-          id: `${sid}-${requestId}`,
-          session_id: sid,
-          session_display_name: titles.get(sid) ?? sid,
-          cwd: directory,
-          question_request_id: requestId,
-          questions: questions.map((q) => ({
-            question: q.question,
-            header: q.header,
-            options: q.options.map((o) => ({ label: o.label, description: o.description })),
-            multiple: q.multiple,
-            custom: q.custom,
-          })),
-          provider: "opencode",
-        }
-
-        // Proxy through gateway (async — the event hook is fire-and-forget from
-        // opencode's perspective, but question.ask() awaits the Deferred internally
-        // so the reply can arrive at any time).
-        const handleGatewayResult = async (result: QuestionGatewayResult) => {
-          // If the question was answered locally in the TUI while the gateway
-          // was in-flight, we killed the gateway (SIGTERM) which causes it to
-          // exit without an answer. Skip the gateway callback here because the
-          // question is already resolved and a second response would fail.
-          if (locallyAnsweredQuestions.has(requestId)) {
-            log("INFO", "question already answered locally, skipping gateway callback", { sid, requestId })
-            locallyAnsweredQuestions.delete(requestId)
-            return
-          }
-          if ("answers" in result) {
-            log("INFO", "question answered via gateway, calling question.reply", { sid, requestId })
-            const resp = await clientV2.question.reply({
-              requestID: requestId,
-              directory,
-              answers: result.answers,
-            })
-            if (resp.error) {
-              log("WARN", "question.reply failed", { sid, requestId, err: String(resp.error) })
-            }
-            return
-          }
-
-          if (result.outcome === "rejected") {
-            log("INFO", "question rejected via gateway, calling question.reject", { sid, requestId })
-            const resp = await clientV2.question.reject({
-              requestID: requestId,
-              directory,
-            })
-            if (resp.error) {
-              log("WARN", "question.reject failed", { sid, requestId, err: String(resp.error) })
-            }
-            return
-          }
-
-          const message = result.outcome === "timeout"
-            ? APPROVAL_TIMEOUT_MESSAGE
-            : APPROVAL_PIPELINE_ERROR_MESSAGE
-          const resp = await clientV2.question.reply({
-            requestID: requestId,
-            directory,
-            answers: questions.map(() => [message]),
-          })
-          if (resp.error) {
-            log("WARN", "synthetic question.reply failed", { sid, requestId, err: String(resp.error) })
-          }
-        }
-
-        callGatewayQuestion(sid, proxyReq).then(handleGatewayResult).catch(async (err: unknown) => {
-          log("WARN", "callGatewayQuestion threw", { sid, requestId, err: String(err) })
-          await handleGatewayResult({ outcome: "pipeline-error" })
-        })
-
-        return
+        const { sessionID: sid, id, questions: items } = event.properties
+        clearTimeout(timers.get(sid)); timers.delete(sid)
+        void sendStatus(sid, "waiting", `Plan question: ${items[0]?.header ?? "Plan question"}`)
+        // Awaited so terminal SDK failures surface to the host rather than an unhandled detached rejection.
+        await proxyQuestion({ id: `${sid}-${id}`, session_id: sid, session_display_name: titles.get(sid) ?? sid,
+          cwd: directory, question_request_id: id, questions: items.map((item) => ({ ...item })), provider: "opencode" })
       }
-
-      // question.replied — question was answered (locally or via proxy).
-      // Restore active status so the dashboard reflects the agent is running again.
-      // If a gateway process is still in-flight for this requestId, the question was
-      // answered locally in the OpenCode TUI — kill the gateway so it cancels the
-      // pending question on the agent-hub server.
-      if (event.type === "question.replied") {
-        const reqId = event.properties.requestID
-        const gwProc = questionGatewayProcs.get(reqId)
-        if (gwProc) {
-          log("INFO", "question answered locally, cancelling agent-hub gateway", { reqId })
-          locallyAnsweredQuestions.add(reqId)
-          try { gwProc.kill("SIGTERM") } catch (err: unknown) {
-            log("WARN", "failed to kill question gateway", { reqId, err: String(err) })
-          }
-        }
+      if (event.type === "question.replied" || event.type === "question.rejected") {
+        const pending = questions.get(event.properties.requestID)
+        if (pending) { pending.cancelled = true; pending.proc?.kill("SIGKILL") }
         reportStatus(event.properties.sessionID, "active")
-        return
-      }
-
-      // question.rejected — question was dismissed in the OpenCode TUI. Same
-      // cleanup: kill the in-flight gateway if present so the server entry is cancelled.
-      if (event.type === "question.rejected") {
-        const reqId = event.properties.requestID
-        const gwProc = questionGatewayProcs.get(reqId)
-        if (gwProc) {
-          log("INFO", "question rejected locally, cancelling agent-hub gateway", { reqId })
-          locallyAnsweredQuestions.add(reqId)
-          try { gwProc.kill("SIGTERM") } catch (err: unknown) {
-            log("WARN", "failed to kill question gateway", { reqId, err: String(err) })
-          }
-        }
-        reportStatus(event.properties.sessionID, "active")
-        return
       }
     },
+    dispose: async () => shutdown(false),
   }
 }
 
-export default { id, server }
+const plugin: Plugin = (input) => createPluginInstance(input)
+export default plugin

@@ -24,6 +24,10 @@
     "tool_input": {
       "default": null
     },
+    "tool_match_input": {
+      "description": "Canonical fields for typed policy matching. Original arguments remain\nintact for delegation and human review.",
+      "default": null
+    },
     "tool_name": {
       "$ref": "#/$defs/OpenCodeTool"
     },
@@ -45,7 +49,7 @@
   ],
   "$defs": {
     "OpenCodeTool": {
-      "description": "Tool name as sent by OpenCode (lowercase). Known: bash, edit, glob, grep, multiedit, read, task, todowrite, webfetch, write.",
+      "description": "Tool name as sent by OpenCode (lowercase). Known: bash, edit, glob, grep, list, multiedit, read, task, todowrite, webfetch, write.",
       "type": "string"
     },
     "SessionId": {

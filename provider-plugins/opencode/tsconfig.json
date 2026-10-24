@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["node", "bun"]
   },
-  "include": ["agent-hub.ts", "agent-hub.test.ts", "generated/gateway-types.ts"]
+  "include": ["*.ts", "generated/gateway-types.ts"]
 }
