@@ -952,6 +952,15 @@ fn build_expanded_lines(
                 kind: LineKind::Normal,
             });
         }
+    } else if let (Some(display), serde_json::Value::Object(input)) =
+        (&approval.display, &approval.tool_input)
+    {
+        for line in format_display(display, input).lines() {
+            lines.push(ExpandedLine {
+                text: truncate_str(line, max_line_width),
+                kind: LineKind::Normal,
+            });
+        }
     } else {
         // Parse into a typed ToolCall to avoid manual JSON introspection.
         let tool_call =
@@ -1071,14 +1080,70 @@ fn format_tool_input(input: &serde_json::Value) -> String {
         serde_json::Value::Object(map) => {
             let mut lines = Vec::new();
             for (key, value) in map {
-                let val_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                lines.push(format!("{key}: {val_str}"));
+                lines.push(format!("{key}: {}", json_value_str(value)));
             }
             lines.join("\n")
         }
+        other => other.to_string(),
+    }
+}
+
+/// Format an external request's input through its DisplaySpec: listed fields
+/// first, then every unlisted key so nothing in the input is hidden.
+fn format_display(
+    display: &protocol::DisplaySpec,
+    input: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(heading) = &display.heading {
+        lines.push(heading.clone());
+    }
+    let mut listed = std::collections::HashSet::new();
+    for field in &display.fields {
+        let Some(value) = input.get(&field.key) else {
+            continue;
+        };
+        listed.insert(field.key.as_str());
+        let label = field.label.as_deref().unwrap_or(&field.key);
+        match (field.format, value) {
+            (protocol::FieldFormat::Datetime, serde_json::Value::String(s)) => {
+                match chrono::DateTime::parse_from_rfc3339(s) {
+                    Ok(dt) => lines.push(format!(
+                        "{label}: {} ({s})",
+                        dt.with_timezone(&chrono::Local).format("%a %Y-%m-%d %H:%M")
+                    )),
+                    Err(_) => lines.push(format!("{label}: {s}")),
+                }
+            }
+            (protocol::FieldFormat::List, serde_json::Value::Array(items)) => {
+                lines.push(format!("{label}:"));
+                for item in items {
+                    lines.push(format!("  - {}", json_value_str(item)));
+                }
+            }
+            (protocol::FieldFormat::Multiline, serde_json::Value::String(s)) => {
+                lines.push(format!("{label}:"));
+                lines.extend(s.lines().map(|l| format!("  {l}")));
+            }
+            _ => lines.push(format!("{label}: {}", json_value_str(value))),
+        }
+    }
+    let others: Vec<_> = input
+        .iter()
+        .filter(|(key, _)| !listed.contains(key.as_str()))
+        .collect();
+    if !others.is_empty() {
+        lines.push("Other fields:".to_string());
+        for (key, value) in others {
+            lines.push(format!("{key}: {}", json_value_str(value)));
+        }
+    }
+    lines.join("\n")
+}
+
+fn json_value_str(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     }
 }

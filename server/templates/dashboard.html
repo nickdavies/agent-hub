@@ -93,7 +93,7 @@
                     {% endif %}
                 </td>
             </tr>
-            <tr class="tool-preview" data-id="{{ a.id }}" data-tool-input="{{ a.tool_input }}">
+            <tr class="tool-preview" data-id="{{ a.id }}">
                 <td colspan="5"><code></code></td>
             </tr>
             {% endfor %}
@@ -170,6 +170,7 @@
     </div>
 </div>
 
+<script type="application/json" id="approvals-data">{{ pending_approvals|json|safe }}</script>
 <script>
 (function() {
     const READWRITE = {{ readwrite }};
@@ -178,8 +179,18 @@
     let selectedIdx = -1;
     let denyActiveId = null;
 
-    function inputSummary(input) {
+    // One-line preview of an approval's input. A DisplaySpec summary picks the
+    // keys; otherwise fall back to the command or the first string value.
+    function inputSummary(input, display) {
         if (input == null) return '';
+        if (display && display.summary && display.summary.length && typeof input === 'object') {
+            const formats = {};
+            for (const field of display.fields || []) formats[field.key] = field.format;
+            const parts = display.summary
+                .filter(key => Object.prototype.hasOwnProperty.call(input, key))
+                .map(key => summaryValue(input[key], formats[key]));
+            return truncDetail(parts.join(' · '));
+        }
         if (typeof input === 'string') return truncDetail(input);
         if (typeof input !== 'object' || Array.isArray(input)) return truncDetail(JSON.stringify(input));
         if ('command' in input && typeof input.command === 'string') return truncDetail(input.command);
@@ -188,19 +199,26 @@
         return truncDetail(JSON.stringify(input));
     }
 
+    function summaryValue(value, format) {
+        if (format === 'datetime' && typeof value === 'string') {
+            const date = new Date(value);
+            if (!isNaN(date.getTime())) return date.toLocaleString();
+        }
+        if (Array.isArray(value)) {
+            return value.map(v => typeof v === 'string' ? v : JSON.stringify(v)).join(', ');
+        }
+        return typeof value === 'string' ? value : JSON.stringify(value);
+    }
+
     function truncDetail(s) {
         return s.length > MAX_DETAIL_LEN ? s.slice(0, MAX_DETAIL_LEN) + '…' : s;
     }
 
     // Fill in content for server-rendered preview rows
-    document.querySelectorAll('tr.tool-preview[data-tool-input]').forEach(row => {
-        const code = row.querySelector('code');
-        if (!code) return;
-        try {
-            const input = JSON.parse(row.dataset.toolInput);
-            code.textContent = inputSummary(input);
-        } catch(e) {}
-    });
+    for (const a of JSON.parse(document.getElementById('approvals-data').textContent)) {
+        const code = document.querySelector(`tr.tool-preview[data-id="${a.id}"] code`);
+        if (code) code.textContent = inputSummary(a.tool_input, a.display);
+    }
 
     // Auto-select first approval on page load
     if (getMetaRows().length > 0) {
@@ -271,7 +289,7 @@
         const prevRow = document.createElement('tr');
         prevRow.className = sel ? 'tool-preview selected visible' : 'tool-preview';
         prevRow.dataset.id = a.id;
-        prevRow.innerHTML = `<td colspan="5"><code>${esc(inputSummary(a.tool_input))}</code></td>`;
+        prevRow.innerHTML = `<td colspan="5"><code>${esc(inputSummary(a.tool_input, a.display))}</code></td>`;
 
         return { metaRow, prevRow };
     }

@@ -98,7 +98,7 @@
     </div>
 </div>
 
-<script type="application/json" id="approval-data">{{ approval_json|safe }}</script>
+<script type="application/json" id="approval-data">{{ approval|json|safe }}</script>
 <script>
 (function() {
     const READWRITE = {{ readwrite }};
@@ -108,20 +108,55 @@
     let resolved = {{ approval.status.is_resolved() }};
 
     // --- Smart formatting ---
-    function formatSmartView(input) {
+    function formatEntry(label, value) {
+        if (typeof value === 'string') {
+            return '<dt>' + esc(label) + '</dt><dd>' + esc(value) + '</dd>';
+        }
+        return '<dt>' + esc(label) + '</dt><dd><pre style="margin:0"><code>' + esc(JSON.stringify(value, null, 2)) + '</code></pre></dd>';
+    }
+
+    // Format a value per a DisplaySpec field format. The result is always
+    // derived from the value itself, so the display never diverges from input.
+    function formatDisplayEntry(label, value, format) {
+        if (format === 'datetime' && typeof value === 'string') {
+            const date = new Date(value);
+            return formatEntry(label, isNaN(date.getTime()) ? value : date.toLocaleString() + ' (' + value + ')');
+        }
+        if ((format === 'list' && Array.isArray(value)) || (format === 'multiline' && typeof value === 'string')) {
+            const text = Array.isArray(value)
+                ? value.map(v => typeof v === 'string' ? v : JSON.stringify(v)).join('\n')
+                : value;
+            return '<dt>' + esc(label) + '</dt><dd><pre style="margin:0"><code>' + esc(text) + '</code></pre></dd>';
+        }
+        return formatEntry(label, value);
+    }
+
+    function formatSmartView(input, display) {
         if (typeof input !== 'object' || input === null || Array.isArray(input)) {
             return '<pre><code>' + esc(JSON.stringify(input, null, 2)) + '</code></pre>';
         }
-        let html = '<dl>';
-        for (const [key, value] of Object.entries(input)) {
-            html += '<dt>' + esc(key) + '</dt>';
-            if (typeof value === 'string') {
-                html += '<dd>' + esc(value) + '</dd>';
-            } else {
-                html += '<dd><pre style="margin:0"><code>' + esc(JSON.stringify(value, null, 2)) + '</code></pre></dd>';
-            }
+        if (!display) {
+            let html = '<dl>';
+            for (const [key, value] of Object.entries(input)) html += formatEntry(key, value);
+            return html + '</dl>';
+        }
+        // External request: listed fields first, then every unlisted key so
+        // nothing in the input is hidden.
+        let html = display.heading ? '<h5>' + esc(display.heading) + '</h5>' : '';
+        const listed = new Set();
+        html += '<dl>';
+        for (const field of display.fields) {
+            if (!Object.prototype.hasOwnProperty.call(input, field.key)) continue;
+            listed.add(field.key);
+            html += formatDisplayEntry(field.label || field.key, input[field.key], field.format);
         }
         html += '</dl>';
+        const others = Object.entries(input).filter(([key]) => !listed.has(key));
+        if (others.length > 0) {
+            html += '<p><small>Other fields</small></p><dl>';
+            for (const [key, value] of others) html += formatEntry(key, value);
+            html += '</dl>';
+        }
         return html;
     }
 
@@ -133,7 +168,7 @@
 
     // Initial smart view render
     const initialData = JSON.parse(document.getElementById('approval-data').textContent);
-    document.getElementById('smart-view').innerHTML = formatSmartView(initialData.tool_input);
+    document.getElementById('smart-view').innerHTML = formatSmartView(initialData.tool_input, initialData.display);
 
     window.toggleView = function() {
         rawMode = !rawMode;
@@ -175,7 +210,7 @@
         // Update raw view
         const pretty = JSON.stringify(approval.tool_input, null, 2);
         document.querySelector('#raw-view code').textContent = pretty;
-        document.getElementById('smart-view').innerHTML = formatSmartView(approval.tool_input);
+        document.getElementById('smart-view').innerHTML = formatSmartView(approval.tool_input, approval.display);
     }
 
     function onResolved() {
