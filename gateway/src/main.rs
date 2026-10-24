@@ -17,11 +17,15 @@ use uuid::Uuid;
 
 use types::{DecisionStatus, HookDecision, HookOutput, ParseError, ToolHookEvent};
 
+type FormatOutput = fn(&ToolHookEvent, &HookOutput) -> String;
+type FormatBlockingDenial = fn(&str, &str) -> Option<String>;
+
 /// Agent Hub gateway — provider-agnostic tool approval hook.
 ///
 /// Approval exit codes:
 ///   0 = provider decision written to stdout
-///   2 = fail-closed local input or config error
+///   2 = blocking hook error when malformed input cannot identify Claude's hook shape
+/// Native denial shapes are emitted for parser, policy, delegate, and HTTP failures.
 ///
 /// Other subcommands document their own exit codes.
 #[derive(Parser)]
@@ -99,12 +103,14 @@ enum ApprovalFlowError {
 impl ApprovalFlowError {
     fn into_output(self) -> HookOutput {
         if let Self::Pipeline(reason) = &self {
-            eprintln!("[error] approvals pipeline failed: {reason}");
+            write_bounded_stderr(&format!("[error] approvals pipeline failed: {reason}"));
         }
         HookOutput {
             status: match self {
                 Self::Timeout => DecisionStatus::TimedOut,
-                Self::Pipeline(_) => DecisionStatus::PipelineError,
+                Self::Pipeline(reason) => {
+                    DecisionStatus::PipelineError(types::bounded_gateway_message(&reason))
+                }
             },
             message: None,
         }
@@ -128,16 +134,23 @@ async fn run_approval(args: ApprovalArgs) -> ExitCode {
             args,
             "claude-code",
             providers::claude_code::format_output,
+            providers::claude_code::format_blocking_denial,
         )
         .await
     } else if args.cursor {
-        run_hook::<protocol::CursorHookInput>(args, "cursor", providers::cursor::format_output)
-            .await
+        run_hook::<protocol::CursorHookInput>(
+            args,
+            "cursor",
+            providers::cursor::format_output,
+            providers::cursor::format_blocking_denial,
+        )
+        .await
     } else if args.opencode {
         run_hook::<protocol::OpenCodeHookInput>(
             args,
             "opencode",
             providers::opencode::format_output,
+            providers::opencode::format_blocking_denial,
         )
         .await
     } else {
@@ -152,51 +165,138 @@ async fn run_approval(args: ApprovalArgs) -> ExitCode {
 async fn run_hook<I>(
     args: ApprovalArgs,
     provider_name: &str,
-    format_output: fn(&ToolHookEvent, &HookOutput) -> String,
+    format_output: FormatOutput,
+    format_blocking_denial: FormatBlockingDenial,
 ) -> ExitCode
 where
     I: serde::de::DeserializeOwned + TryInto<ToolHookEvent, Error = ParseError>,
 {
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
-        eprintln!("agent-hub-gateway: failed to read stdin: {e}");
-        return ExitCode::from(2);
+        return emit_preparse_denial(
+            &raw,
+            &format!("failed to read provider input: {e}"),
+            format_blocking_denial,
+        );
     }
 
     let event = match parse_input::<I>(&raw) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("agent-hub-gateway: failed to parse hook payload: {e}");
-            return ExitCode::from(2);
+            return emit_preparse_denial(
+                &raw,
+                &format!("failed to parse provider input: {e}"),
+                format_blocking_denial,
+            );
         }
     };
 
-    eprintln!(
+    write_bounded_stderr(&format!(
         "[info] tool={} session={} cwd={}",
         event.tool_call.tool_name(),
         event.session_id,
         event.cwd
-    );
+    ));
 
     let config_path = expand_tilde(&args.config);
 
     match run(&args, provider_name, &event, &config_path).await {
         Ok(decision) => {
-            eprintln!(
-                "[info] final decision for tool={}: {:?}",
+            write_bounded_stderr(&format!(
+                "[info] final decision for tool={}: {}",
                 event.tool_call.tool_name(),
-                decision.status
-            );
-            // If the provider cannot block inline, the server was notified for
-            // observability but the agent will proceed regardless.
+                decision_status_kind(&decision.status)
+            ));
             let output = format_output(&event, &decision);
             print!("{output}");
             ExitCode::SUCCESS
         }
-        Err(RunError::FailClosed(e)) => {
-            eprintln!("agent-hub-gateway: {e}");
-            ExitCode::from(2)
+        Err(RunError::FailClosed(e)) => emit_provider_denial(&event, &e, format_output),
+    }
+}
+
+fn emit_preparse_denial(
+    raw: &str,
+    detail: &str,
+    format_blocking_denial: FormatBlockingDenial,
+) -> ExitCode {
+    let reason = types::approval_pipeline_error_message(detail);
+    write_bounded_stderr(&format!("agent-hub-gateway: {reason}"));
+    match format_blocking_denial(raw, &reason) {
+        Some(output) => {
+            print!("{output}");
+            ExitCode::SUCCESS
         }
+        None => ExitCode::from(2),
+    }
+}
+
+fn emit_provider_denial(
+    event: &ToolHookEvent,
+    detail: &str,
+    format_output: FormatOutput,
+) -> ExitCode {
+    let detail = types::bounded_gateway_message(detail);
+    write_bounded_stderr(&format!("agent-hub-gateway: {detail}"));
+    let decision = HookOutput {
+        status: DecisionStatus::PipelineError(detail),
+        message: None,
+    };
+    print!("{}", format_output(event, &decision));
+    ExitCode::SUCCESS
+}
+
+fn write_bounded_stderr(message: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+    let mut written = WRITTEN.load(Ordering::Relaxed);
+    loop {
+        let remaining = types::MAX_GATEWAY_DIAGNOSTIC_BYTES.saturating_sub(written);
+        if remaining == 0 {
+            return;
+        }
+        let line = types::bounded_message(&format!("{message}\n"), remaining);
+        if line.is_empty() {
+            return;
+        }
+        match WRITTEN.compare_exchange_weak(
+            written,
+            written + line.len(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                eprint!("{line}");
+                return;
+            }
+            Err(actual) => written = actual,
+        }
+    }
+}
+
+fn hook_decision_kind(decision: &HookDecision) -> &'static str {
+    match decision {
+        HookDecision::Allow => "allow",
+        HookDecision::Deny(_) => "deny",
+        HookDecision::Ask(_) => "ask",
+    }
+}
+
+fn decision_status_kind(status: &DecisionStatus) -> &'static str {
+    match status {
+        DecisionStatus::Approved => "approved",
+        DecisionStatus::Denied | DecisionStatus::DeniedWithReason(_) => "denied",
+        DecisionStatus::TimedOut => "timed_out",
+        DecisionStatus::PipelineError(_) => "pipeline_error",
+    }
+}
+
+fn approval_status_kind(status: &ApprovalStatus) -> &'static str {
+    match status {
+        ApprovalStatus::Pending => "pending",
+        ApprovalStatus::Approved { .. } => "approved",
+        ApprovalStatus::Denied { .. } => "denied",
+        ApprovalStatus::Cancelled => "cancelled",
     }
 }
 
@@ -279,21 +379,29 @@ async fn run(
         Some(&event.workspace_roots),
     );
 
-    eprintln!("[info] resolved action: {:?}", action);
+    write_bounded_stderr(&format!(
+        "[info] resolved action: {}",
+        match &action {
+            ConfigAction::Decision(_) => "decision",
+            ConfigAction::Delegation(_) => "delegation",
+        }
+    ));
 
     // Resolve config action (+ optional delegation) to a HookDecision.
     let hook_decision = match action {
         ConfigAction::Decision(d) => {
             let hd = HookDecision::from(d);
-            eprintln!("[info] config decision: {:?}", hd);
+            write_bounded_stderr(&format!(
+                "[info] config decision: {}",
+                hook_decision_kind(&hd)
+            ));
             hd
         }
         ConfigAction::Delegation(ref command) => {
-            eprintln!(
-                "[info] delegating tool={} to: {}",
-                event.tool_call.tool_name(),
-                command
-            );
+            write_bounded_stderr(&format!(
+                "[info] delegating tool={}",
+                event.tool_call.tool_name()
+            ));
             let delegate_payload: protocol::DelegatePayload = event.into();
             let delegate_input = serde_json::to_string(&delegate_payload).map_err(|e| {
                 RunError::FailClosed(format!("failed to serialise delegate payload: {e}"))
@@ -301,7 +409,10 @@ async fn run(
             let hd = spawn_delegate(command, &delegate_input)
                 .await
                 .map_err(RunError::FailClosed)?;
-            eprintln!("[info] delegate returned: {:?}", hd);
+            write_bounded_stderr(&format!(
+                "[info] delegate returned: {}",
+                hook_decision_kind(&hd)
+            ));
             hd
         }
     };
@@ -309,18 +420,21 @@ async fn run(
     // Act on the decision.
     let output = match hook_decision {
         HookDecision::Allow => {
-            eprintln!("[info] allowing tool={}", event.tool_call.tool_name());
+            write_bounded_stderr(&format!(
+                "[info] allowing tool={}",
+                event.tool_call.tool_name()
+            ));
             HookOutput {
                 status: DecisionStatus::Approved,
                 message: None,
             }
         }
         HookDecision::Deny(reason) => {
-            eprintln!(
-                "[info] denying tool={} reason={:?}",
+            write_bounded_stderr(&format!(
+                "[info] denying tool={} reason_present={}",
                 event.tool_call.tool_name(),
-                reason
-            );
+                reason.is_some()
+            ));
             HookOutput {
                 status: match reason {
                     Some(r) => DecisionStatus::DeniedWithReason(r),
@@ -330,10 +444,10 @@ async fn run(
             }
         }
         HookDecision::Ask(delegate_reason) => {
-            eprintln!(
+            write_bounded_stderr(&format!(
                 "[info] escalating tool={} to server for human approval",
                 event.tool_call.tool_name()
-            );
+            ));
             let extra = collect_extra(&event.tool_call, delegate_reason.as_deref());
             match escalate_to_server(args, provider_name, event, extra).await {
                 Ok(output) => output,
@@ -360,7 +474,7 @@ async fn spawn_delegate(command: &str, input: &str) -> Result<HookDecision, Stri
         .args(cmd_args.iter())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn delegate '{cmd}': {e}"))?;
 
@@ -382,7 +496,11 @@ async fn spawn_delegate(command: &str, input: &str) -> Result<HookDecision, Stri
     }
 
     if !output.status.success() {
-        return Err(format!("delegate exited with status {}", output.status));
+        return Err(types::bounded_gateway_message(&format!(
+            "delegate exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
 
     let stdout = String::from_utf8(output.stdout)
@@ -497,11 +615,11 @@ async fn escalate_to_server(
 
     let request_id = Uuid::new_v4().to_string();
     let register_url = format!("{base}/api/v1/hooks/approval");
-    eprintln!(
+    write_bounded_stderr(&format!(
         "[info] registering approval request: tool={} session={}",
         event.tool_call.tool_name(),
         event.session_id
-    );
+    ));
     let register_resp = authenticated(args.token.as_ref(), client.post(&register_url))
         .json(&ApprovalRequest {
             id: request_id,
@@ -520,10 +638,10 @@ async fn escalate_to_server(
         .map_err(|e| ApprovalFlowError::Pipeline(format!("failed to register approval: {e}")))?;
 
     if !register_resp.status().is_success() {
-        eprintln!(
+        write_bounded_stderr(&format!(
             "[error] server returned {} for approval registration",
             register_resp.status()
-        );
+        ));
         return Err(ApprovalFlowError::Pipeline(format!(
             "server returned {} for approval registration",
             register_resp.status()
@@ -537,10 +655,10 @@ async fn escalate_to_server(
     if matches!(approval.status, ApprovalStatus::Pending) {
         // Fall through to long-poll below
     } else {
-        eprintln!(
-            "[info] approval immediately resolved: status={:?}",
-            approval.status
-        );
+        write_bounded_stderr(&format!(
+            "[info] approval immediately resolved: status={}",
+            approval_status_kind(&approval.status)
+        ));
         return Ok(status_to_output(&approval.status));
     }
 
@@ -548,17 +666,17 @@ async fn escalate_to_server(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
     let wait_url = format!("{base}/api/v1/approvals/{}/wait", approval.id);
 
-    eprintln!(
+    write_bounded_stderr(&format!(
         "[info] waiting for approval (id={}, timeout={}s) — approve or deny in the web UI",
         approval.id, args.timeout
-    );
+    ));
 
     let cancel_url = format!("{base}/api/v1/approvals/{}/resolve", approval.id);
 
     tokio::select! {
         result = poll_for_decision(&client, &wait_url, args.token.as_ref(), deadline, args.timeout) => result,
         _ = shutdown_signal() => {
-            eprintln!("[info] received shutdown signal, cancelling approval {}", approval.id);
+            write_bounded_stderr(&format!("[info] received shutdown signal, cancelling approval {}", approval.id));
             // Best-effort cancel — don't let this block shutdown for long.
             let _ = authenticated(args.token.as_ref(), client.post(&cancel_url))
                 .json(&serde_json::json!({"decision": "cancel"}))
@@ -583,7 +701,9 @@ async fn poll_for_decision(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            eprintln!("[error] approval timed out after {timeout_secs}s with no decision");
+            write_bounded_stderr(&format!(
+                "[error] approval timed out after {timeout_secs}s with no decision"
+            ));
             return Err(deadline_error(last_wait_was_healthy));
         }
 
@@ -601,7 +721,9 @@ async fn poll_for_decision(
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[warn] wait request failed (attempt {attempt}, retrying in 2s): {e}");
+                write_bounded_stderr(&format!(
+                    "[warn] wait request failed (attempt {attempt}, retrying in 2s): {e}"
+                ));
                 last_wait_was_healthy = false;
                 await_approval_deadline(
                     deadline,
@@ -619,16 +741,16 @@ async fn poll_for_decision(
         // are not retryable. Everything else (5xx, network weirdness) is.
         if !http_status.is_success() {
             if http_status.is_client_error() {
-                eprintln!(
+                write_bounded_stderr(&format!(
                     "[error] server returned {http_status} for approval wait — approval may have expired"
-                );
+                ));
                 return Err(ApprovalFlowError::Pipeline(format!(
                     "server returned {http_status} for approval wait"
                 )));
             }
-            eprintln!(
+            write_bounded_stderr(&format!(
                 "[warn] server returned {http_status} for approval wait (attempt {attempt}, retrying in 2s)"
-            );
+            ));
             last_wait_was_healthy = false;
             await_approval_deadline(
                 deadline,
@@ -643,9 +765,9 @@ async fn poll_for_decision(
         let body = match body {
             Ok(b) => b,
             Err(e) => {
-                eprintln!(
+                write_bounded_stderr(&format!(
                     "[warn] failed to read wait response body (attempt {attempt}, retrying in 2s): {e}"
-                );
+                ));
                 last_wait_was_healthy = false;
                 await_approval_deadline(
                     deadline,
@@ -660,9 +782,10 @@ async fn poll_for_decision(
         let wait: ApprovalWaitResponse = match serde_json::from_str(&body) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!(
-                    "[warn] failed to parse wait response (attempt {attempt}, retrying in 2s): {e} — body: {body}"
-                );
+                write_bounded_stderr(&format!(
+                    "[warn] failed to parse wait response (attempt {attempt}, retrying in 2s): {e}; body_bytes={}",
+                    body.len()
+                ));
                 last_wait_was_healthy = false;
                 await_approval_deadline(
                     deadline,
@@ -684,9 +807,9 @@ async fn poll_for_decision(
             }
             last_wait_was_healthy = true;
             let secs_remaining = remaining.as_secs();
-            eprintln!(
+            write_bounded_stderr(&format!(
                 "[info] approval still pending (attempt {attempt}, {secs_remaining}s remaining)"
-            );
+            ));
             // No sleep — server already held the connection open for its long-poll window.
             continue;
         }
@@ -697,7 +820,10 @@ async fn poll_for_decision(
             ));
         }
 
-        eprintln!("[info] approval resolved: status={:?}", wait.status);
+        write_bounded_stderr(&format!(
+            "[info] approval resolved: status={}",
+            approval_status_kind(&wait.status)
+        ));
         return Ok(status_to_output(&wait.status));
     }
 }
@@ -781,11 +907,13 @@ fn status_to_output(status: &ApprovalStatus) -> HookOutput {
             message: None,
         },
         ApprovalStatus::Cancelled => HookOutput {
-            status: DecisionStatus::PipelineError,
+            status: DecisionStatus::PipelineError(
+                "approval was cancelled without a decision".into(),
+            ),
             message: None,
         },
         ApprovalStatus::Pending => HookOutput {
-            status: DecisionStatus::PipelineError,
+            status: DecisionStatus::PipelineError("approval remained pending unexpectedly".into()),
             message: None,
         },
     }
@@ -847,7 +975,7 @@ mod tests {
         for status in [ApprovalStatus::Cancelled, ApprovalStatus::Pending] {
             assert!(matches!(
                 status_to_output(&status).status,
-                DecisionStatus::PipelineError
+                DecisionStatus::PipelineError(_)
             ));
         }
     }

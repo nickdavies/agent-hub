@@ -100,11 +100,38 @@ pub enum DecisionStatus {
     Denied,
     DeniedWithReason(String),
     TimedOut,
-    PipelineError,
+    PipelineError(String),
 }
 
-pub const APPROVAL_TIMEOUT_MESSAGE: &str = "Your approval request timed out because the operator was away. This is not a denial. Feel free to retry if you still need this.";
-pub const APPROVAL_PIPELINE_ERROR_MESSAGE: &str = "There was an error in the approvals pipeline. This is a null answer: it is neither an approval nor a rejection of your intended action. Do not take this as a signal that your intended path is unwanted. Try again; if the error recurs, abort and report it to the operator.";
+pub const APPROVAL_TIMEOUT_MESSAGE: &str = "Agent Hub denied tool execution because the approval request timed out before an operator decision.";
+pub const APPROVAL_PIPELINE_ERROR_MESSAGE: &str =
+    "Agent Hub denied tool execution because the approval pipeline failed";
+pub const MAX_GATEWAY_DIAGNOSTIC_BYTES: usize = 4096;
+
+pub fn bounded_gateway_message(value: &str) -> String {
+    bounded_message(value, MAX_GATEWAY_DIAGNOSTIC_BYTES)
+}
+
+pub(crate) fn bounded_message(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let suffix = " <truncated>";
+    if limit < suffix.len() {
+        return String::new();
+    }
+    let mut end = limit - suffix.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &value[..end])
+}
+
+pub fn approval_pipeline_error_message(detail: &str) -> String {
+    bounded_gateway_message(&format!(
+        "{APPROVAL_PIPELINE_ERROR_MESSAGE} (gateway): {detail}"
+    ))
+}
 
 /// The final decision produced by the gateway's approval flow.
 ///

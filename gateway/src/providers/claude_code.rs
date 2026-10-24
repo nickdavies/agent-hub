@@ -1,6 +1,6 @@
 use crate::types::{
-    APPROVAL_PIPELINE_ERROR_MESSAGE, APPROVAL_TIMEOUT_MESSAGE, DecisionStatus, HookOutput,
-    ParseError, ToolHookEvent, build_display_name,
+    APPROVAL_TIMEOUT_MESSAGE, DecisionStatus, HookOutput, ParseError, ToolHookEvent,
+    approval_pipeline_error_message, bounded_gateway_message, build_display_name,
 };
 use protocol::{
     ClaudeCodeHookInput, ClaudePermissionBehavior, ClaudePermissionRequestDecision,
@@ -34,14 +34,18 @@ impl TryFrom<ClaudeCodeHookInput> for ToolHookEvent {
 
 /// Format a HookOutput into Claude Code's wire format (stdout JSON).
 pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
-    match event.hook_event_name.to_ascii_lowercase().as_str() {
+    format_for_event(&event.hook_event_name, decision)
+}
+
+fn format_for_event(hook_event_name: &str, decision: &HookOutput) -> String {
+    match hook_event_name.to_ascii_lowercase().as_str() {
         "permissionrequest" => {
             let (behavior, message) = match &decision.status {
                 DecisionStatus::Approved => (PermissionDecision::Allow, None),
                 DecisionStatus::Denied
                 | DecisionStatus::DeniedWithReason(_)
                 | DecisionStatus::TimedOut
-                | DecisionStatus::PipelineError => {
+                | DecisionStatus::PipelineError(_) => {
                     (PermissionDecision::Deny, Some(deny_message(decision)))
                 }
             };
@@ -64,14 +68,16 @@ pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
                 DecisionStatus::Denied => {
                     (PermissionDecision::Deny, "denied by policy".to_string())
                 }
-                DecisionStatus::DeniedWithReason(r) => (PermissionDecision::Deny, r.clone()),
+                DecisionStatus::DeniedWithReason(r) => {
+                    (PermissionDecision::Deny, bounded_gateway_message(r))
+                }
                 DecisionStatus::TimedOut => (
                     PermissionDecision::Deny,
                     APPROVAL_TIMEOUT_MESSAGE.to_string(),
                 ),
-                DecisionStatus::PipelineError => (
+                DecisionStatus::PipelineError(detail) => (
                     PermissionDecision::Deny,
-                    APPROVAL_PIPELINE_ERROR_MESSAGE.to_string(),
+                    approval_pipeline_error_message(detail),
                 ),
             };
             let output = ClaudePreToolUseOutput {
@@ -86,12 +92,29 @@ pub fn format_output(event: &ToolHookEvent, decision: &HookOutput) -> String {
     }
 }
 
+pub fn format_blocking_denial(raw: &str, reason: &str) -> Option<String> {
+    let hook_event_name = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()?
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("PreToolUse")
+        .to_string();
+    Some(format_for_event(
+        &hook_event_name,
+        &HookOutput {
+            status: DecisionStatus::DeniedWithReason(bounded_gateway_message(reason)),
+            message: None,
+        },
+    ))
+}
+
 fn deny_message(decision: &HookOutput) -> String {
     match &decision.status {
-        DecisionStatus::DeniedWithReason(r) => r.clone(),
+        DecisionStatus::Denied => "denied by policy".to_string(),
+        DecisionStatus::DeniedWithReason(r) => bounded_gateway_message(r),
         DecisionStatus::TimedOut => APPROVAL_TIMEOUT_MESSAGE.to_string(),
-        DecisionStatus::PipelineError => APPROVAL_PIPELINE_ERROR_MESSAGE.to_string(),
-        _ => decision
+        DecisionStatus::PipelineError(detail) => approval_pipeline_error_message(detail),
+        DecisionStatus::Approved => decision
             .message
             .clone()
             .unwrap_or_else(|| "denied via remote approval".to_string()),
@@ -195,8 +218,8 @@ mod tests {
                 crate::types::APPROVAL_TIMEOUT_MESSAGE,
             ),
             (
-                DecisionStatus::PipelineError,
-                crate::types::APPROVAL_PIPELINE_ERROR_MESSAGE,
+                DecisionStatus::PipelineError("test failure".into()),
+                "Agent Hub denied tool execution because the approval pipeline failed (gateway): test failure",
             ),
         ] {
             let output = outcome(status);

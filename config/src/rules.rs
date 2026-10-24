@@ -422,11 +422,7 @@ pub fn resolve_action_with_input(
         None
     };
 
-    eprintln!(
-        "agent-hub-gateway: [debug] tool={tool_name} workspace_roots={workspace_roots:?} path_in_workspace={path_in_workspace:?}"
-    );
-
-    for (i, rule) in config.rules.iter().enumerate() {
+    for rule in &config.rules {
         if let Some(in_cwds) = &rule.in_cwds {
             let Some(cwd) = cwd else {
                 continue;
@@ -469,10 +465,6 @@ pub fn resolve_action_with_input(
             .iter()
             .any(|m| m.matches(tool_name, resolved_args))
         {
-            eprintln!(
-                "agent-hub-gateway: [debug] matched rule[{i}]: {}",
-                rule.source_json
-            );
             return match &rule.action {
                 ResolvedAction::Allow => ConfigAction::Decision(ConfigDecision::Allow),
                 ResolvedAction::Deny => {
@@ -483,7 +475,6 @@ pub fn resolve_action_with_input(
             };
         }
     }
-    eprintln!("agent-hub-gateway: [debug] no rule matched, using default");
     default_to_resolved(&config.default)
 }
 
