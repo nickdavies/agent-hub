@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use tokio::sync::RwLock;
 use tower_sessions::{MemoryStore, SessionManagerLayer};
 use uuid::Uuid;
@@ -26,7 +26,7 @@ use crate::error::AppError;
 use crate::mcp;
 use approvals::{ApprovalRegistry, ApprovalStatus};
 use config::{
-    ApprovalFeatureMode, AuthMode, NotifyConfig, NotifyConfigUpdate, ServerConfig,
+    ApprovalFeatureMode, AuthMode, NotifyConfig, NotifyConfigUpdate, Role, ServerConfig,
     SharedNotifyConfig,
 };
 use hooks::PendingNotifications;
@@ -40,6 +40,7 @@ use sessions::{EffectiveSessionStatus, SessionConfigUpdate, SessionRegistry, Ses
 use protocol::{
     ApprovalDecision, ApprovalModeResponse, ApprovalResolveRequest, ApprovalWaitResponse,
     ConfigResponse, QuestionDecision, QuestionResolveRequest, QuestionWaitResponse, SessionId,
+    WhoAmIResponse,
 };
 
 pub struct AppState<N: Notifier> {
@@ -78,26 +79,31 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
         Arc::clone(&state.presence),
     );
 
-    let mut api_v1 = Router::new()
+    // Routes any authenticated principal may call. Agents raise, monitor and
+    // cancel requests here; the resolve handlers enforce per-decision roles.
+    let mut agent_api = Router::new()
         .route("/hooks/stop", post(hooks::stop::<N>))
         .route("/hooks/notification", post(hooks::notification::<N>))
         .route("/hooks/session-end", post(hooks::session_end::<N>))
         .route("/hooks/status", post(hooks::status::<N>))
+        .route("/whoami", get(handle_whoami))
+        .nest_service("/mcp", mcp_service);
+
+    // Routes only reviewers (humans, CLI) may call.
+    let mut reviewer_api = Router::new()
         .route("/presence", post(handle_presence_update::<N>))
         .route("/sessions", get(handle_list_sessions::<N>))
         .route("/sessions/{id}", put(handle_update_session::<N>))
         .route(
             "/config",
             get(handle_get_config::<N>).put(handle_put_config::<N>),
-        )
-        .nest_service("/mcp", mcp_service);
+        );
 
     // Mount approval API routes only when approval mode is not disabled
     if state.config.approval_mode != ApprovalFeatureMode::Disabled {
-        api_v1 = api_v1
+        agent_api = agent_api
             .route("/hooks/approval", post(hooks::approval::<N>))
             .route("/hooks/question", post(hooks::question::<N>))
-            .route("/approvals/pending", get(handle_list_pending::<N>))
             .route("/approvals/{id}", get(handle_get_approval::<N>))
             .route("/approvals/{id}/wait", get(handle_approval_wait::<N>))
             .route(
@@ -107,7 +113,6 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
                     require_approval_readwrite::<N>,
                 )),
             )
-            .route("/questions/pending", get(handle_list_questions::<N>))
             .route("/questions/{id}", get(handle_get_question::<N>))
             .route("/questions/{id}/wait", get(handle_question_wait::<N>))
             .route(
@@ -121,10 +126,17 @@ pub fn router<N: Notifier>(state: AppState<N>) -> Router {
                 "/sessions/{id}/approval-mode",
                 get(handle_get_approval_mode::<N>),
             );
+        reviewer_api = reviewer_api
+            .route("/approvals/pending", get(handle_list_pending::<N>))
+            .route("/questions/pending", get(handle_list_questions::<N>));
     }
 
+    let api_v1 = agent_api.merge(reviewer_api.route_layer(from_fn(auth::require_reviewer)));
+
     let api_v1 = if state.config.auth_mode == AuthMode::None {
-        api_v1.with_state(state.clone())
+        api_v1
+            .layer(Extension(auth::Principal::anonymous()))
+            .with_state(state.clone())
     } else {
         api_v1
             .layer(from_fn_with_state(state.clone(), auth::require_auth::<N>))
@@ -209,6 +221,12 @@ pub(crate) fn resolve_effective_status(
     }
     // Pending approvals always win — they're actionable in the UI
     if let Some(approval) = pending_approval {
+        // External request content is shown only on the approval page.
+        if approval.request_type.is_external() {
+            return EffectiveSessionStatus::Waiting {
+                reason: Some(format!("Pending approval: {}", approval.tool)),
+            };
+        }
         let input_str = approval.tool_input.to_string();
         let truncated = if input_str.len() > 60 {
             let end = input_str
@@ -284,6 +302,24 @@ async fn build_session_views<N: Notifier>(state: &AppState<N>) -> Vec<sessions::
         });
     }
     views
+}
+
+async fn handle_whoami(Extension(principal): Extension<auth::Principal>) -> Json<WhoAmIResponse> {
+    Json(WhoAmIResponse {
+        label: principal.label,
+        role: principal.role,
+    })
+}
+
+/// Agents may only cancel requests; resolving them requires a reviewer.
+fn ensure_can_resolve(principal: &auth::Principal, is_cancel: bool) -> Result<(), AppError> {
+    if is_cancel || principal.role == Role::Reviewer {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(format!(
+        "'{}' has role {:?} and may only cancel",
+        principal.label, principal.role
+    )))
 }
 
 async fn handle_presence_update<N: Notifier>(
@@ -403,8 +439,11 @@ async fn handle_approval_wait<N: Notifier>(
 async fn handle_approval_resolve<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Extension(principal): Extension<auth::Principal>,
     Json(req): Json<ApprovalResolveRequest>,
 ) -> Result<Json<approvals::Approval>, AppError> {
+    ensure_can_resolve(&principal, req.decision == ApprovalDecision::Cancel)?;
+
     let new_status = match req.decision {
         ApprovalDecision::Approve => ApprovalStatus::Approved {
             message: req.message,
@@ -504,8 +543,11 @@ async fn handle_question_wait<N: Notifier>(
 async fn handle_question_resolve<N: Notifier>(
     axum::extract::State(state): axum::extract::State<AppState<N>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Extension(principal): Extension<auth::Principal>,
     Json(req): Json<QuestionResolveRequest>,
 ) -> Result<Json<questions::PendingQuestion>, AppError> {
+    ensure_can_resolve(&principal, req.decision == QuestionDecision::Cancel)?;
+
     let new_status = match req.decision {
         QuestionDecision::Answer => questions::QuestionStatus::Answered {
             answers: req.answers.unwrap_or_default(),
@@ -583,9 +625,9 @@ mod integration_tests {
     use sessions::SessionApprovalMode;
     use tower::ServiceExt; // for oneshot
 
-    /// Build a test router with auth disabled (no Bearer tokens needed).
-    fn test_app_with_mode(approval_mode: ApprovalFeatureMode) -> Router {
-        let config = ServerConfig {
+    /// Config with auth disabled (no Bearer tokens needed).
+    fn no_auth_config(approval_mode: ApprovalFeatureMode) -> ServerConfig {
+        ServerConfig {
             auth_mode: AuthMode::None,
             tokens: vec![],
             listen_addr: "127.0.0.1:0".into(),
@@ -595,13 +637,120 @@ mod integration_tests {
             approval_mode,
             base_url: Some("http://localhost:8080".into()),
             default_approval_mode: SessionApprovalMode::Remote,
-        };
-        let state = AppState::new(config, NullNotifier, None);
-        router(state)
+        }
+    }
+
+    /// Build a test router with auth disabled (no Bearer tokens needed).
+    fn test_app_with_mode(approval_mode: ApprovalFeatureMode) -> Router {
+        router(AppState::new(
+            no_auth_config(approval_mode),
+            NullNotifier,
+            None,
+        ))
+    }
+
+    /// Notifier that forwards each push message to a channel.
+    struct RecordingNotifier(tokio::sync::mpsc::UnboundedSender<String>);
+
+    impl Notifier for RecordingNotifier {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn send(
+            &self,
+            _title: &str,
+            message: &str,
+            _url: Option<&str>,
+        ) -> Result<(), notifier::NotifyError> {
+            let _ = self.0.send(message.to_string());
+            Ok(())
+        }
+    }
+
+    /// Build a no-auth test router whose push messages arrive on the receiver.
+    fn test_app_recording() -> (Router, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            no_auth_config(ApprovalFeatureMode::Readwrite),
+            RecordingNotifier(tx),
+            None,
+        );
+        (router(state), rx)
+    }
+
+    /// Wait briefly for the next push; `None` if none was sent.
+    async fn next_push(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Option<String> {
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     fn test_app() -> Router {
         test_app_with_mode(ApprovalFeatureMode::Readwrite)
+    }
+
+    const AGENT_TOKEN: &str = "agent-secret";
+    const REVIEWER_TOKEN: &str = "reviewer-secret";
+
+    /// Build a test router with token auth: one agent and one reviewer token.
+    fn test_app_with_tokens() -> Router {
+        test_app_with_tokens_and_mode(ApprovalFeatureMode::Readwrite)
+    }
+
+    fn test_app_with_tokens_and_mode(approval_mode: ApprovalFeatureMode) -> Router {
+        let config = ServerConfig {
+            auth_mode: AuthMode::Token,
+            tokens: vec![
+                Token {
+                    label: "agent".into(),
+                    secret: protocol::Secret::new(AGENT_TOKEN),
+                    role: Role::Agent,
+                },
+                Token {
+                    label: "cli".into(),
+                    secret: protocol::Secret::new(REVIEWER_TOKEN),
+                    role: Role::Reviewer,
+                },
+            ],
+            listen_addr: "127.0.0.1:0".into(),
+            presence_ttl_secs: 120,
+            session_ttl_secs: 7200,
+            notification_delay_secs: 0,
+            approval_mode,
+            base_url: Some("http://localhost:8080".into()),
+            default_approval_mode: SessionApprovalMode::Remote,
+        };
+        router(AppState::new(config, NullNotifier, None))
+    }
+
+    /// Helper: send a request with an optional bearer token and JSON body;
+    /// return (status_code, body_string).
+    async fn send(
+        app: &Router,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&str>,
+    ) -> (AxumStatus, String) {
+        let mut req = Request::builder().method(method).uri(path);
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
     /// Helper: POST JSON to a path and return the status code.
@@ -801,21 +950,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn mobile_approval_queue_requires_web_auth() {
-        let config = ServerConfig {
-            auth_mode: AuthMode::Token,
-            tokens: vec![Token {
-                label: "test".into(),
-                secret: protocol::Secret::new("secret"),
-            }],
-            listen_addr: "127.0.0.1:0".into(),
-            presence_ttl_secs: 120,
-            session_ttl_secs: 7200,
-            notification_delay_secs: 0,
-            approval_mode: ApprovalFeatureMode::Readwrite,
-            base_url: Some("http://localhost:8080".into()),
-            default_approval_mode: SessionApprovalMode::Remote,
-        };
-        let app = router(AppState::new(config, NullNotifier, None));
+        let app = test_app_with_tokens();
 
         let request = Request::builder()
             .uri("/approvals/queue")
@@ -1202,5 +1337,604 @@ mod integration_tests {
             sess.waiting_reason.is_none(),
             "waiting_reason should be cleared after reset"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Token roles — agents raise/monitor/cancel, reviewers resolve
+    // ---------------------------------------------------------------
+
+    /// Register an approval with the given token and return its id.
+    async fn register_approval(app: &Router, token: &str, request_id: &str) -> String {
+        let body = format!(
+            r#"{{
+                "id": "{request_id}",
+                "session_id": "ses_roles",
+                "session_display_name": "Roles",
+                "cwd": "/tmp/proj",
+                "tool_name": "Bash",
+                "tool_input": {{"command": "ls"}},
+                "provider": "opencode",
+                "request_type": "tool_use",
+                "context": {{"workspace_roots": ["/tmp/proj"], "hook_event_name": "permission.ask"}}
+            }}"#
+        );
+        let (status, body) = send(
+            app,
+            "POST",
+            "/api/v1/hooks/approval",
+            Some(token),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            AxumStatus::OK,
+            "approval registration failed: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    /// Register a question with the given token and return its id.
+    async fn register_question(app: &Router, token: &str, request_id: &str) -> String {
+        let body = format!(
+            r#"{{
+                "id": "{request_id}",
+                "session_id": "ses_roles",
+                "session_display_name": "Roles",
+                "cwd": "/tmp/proj",
+                "question_request_id": "oc-{request_id}",
+                "questions": [{{"question":"Continue?","header":"Plan","options":[{{"label":"Yes","description":"Go"}}]}}],
+                "provider": "opencode"
+            }}"#
+        );
+        let (status, body) = send(
+            app,
+            "POST",
+            "/api/v1/hooks/question",
+            Some(token),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            AxumStatus::OK,
+            "question registration failed: {body}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_token_is_unauthorized() {
+        let app = test_app_with_tokens();
+
+        let (status, _) = send(&app, "GET", "/api/v1/whoami", None, None).await;
+        assert_eq!(status, AxumStatus::UNAUTHORIZED);
+
+        let (status, _) = send(&app, "GET", "/api/v1/whoami", Some("wrong"), None).await;
+        assert_eq!(status, AxumStatus::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_token_role() {
+        let app = test_app_with_tokens();
+
+        let (status, body) = send(&app, "GET", "/api/v1/whoami", Some(AGENT_TOKEN), None).await;
+        assert_eq!(status, AxumStatus::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["label"], "agent");
+        assert_eq!(v["role"], "agent");
+
+        let (_, body) = send(&app, "GET", "/api/v1/whoami", Some(REVIEWER_TOKEN), None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["role"], "reviewer");
+    }
+
+    #[tokio::test]
+    async fn agent_cannot_resolve_approval_but_can_cancel() {
+        let app = test_app_with_tokens();
+        let id = register_approval(&app, AGENT_TOKEN, "req-agent-1").await;
+        let resolve = format!("/api/v1/approvals/{id}/resolve");
+
+        for decision in ["approve", "deny"] {
+            let body = format!(r#"{{"decision":"{decision}"}}"#);
+            let (status, _) = send(&app, "POST", &resolve, Some(AGENT_TOKEN), Some(&body)).await;
+            assert_eq!(status, AxumStatus::FORBIDDEN, "agent must not {decision}");
+        }
+
+        let (status, body) = send(
+            &app,
+            "GET",
+            &format!("/api/v1/approvals/{id}"),
+            Some(AGENT_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["status"]["type"], "pending",
+            "approval must still be pending: {body}"
+        );
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            &resolve,
+            Some(AGENT_TOKEN),
+            Some(r#"{"decision":"cancel"}"#),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn reviewer_can_resolve_approvals() {
+        let app = test_app_with_tokens();
+        for (decision, expected) in [
+            ("approve", "approved"),
+            ("deny", "denied"),
+            ("cancel", "cancelled"),
+        ] {
+            let id =
+                register_approval(&app, AGENT_TOKEN, &format!("req-reviewer-{decision}")).await;
+            let (status, _) = send(
+                &app,
+                "POST",
+                &format!("/api/v1/approvals/{id}/resolve"),
+                Some(REVIEWER_TOKEN),
+                Some(&format!(r#"{{"decision":"{decision}"}}"#)),
+            )
+            .await;
+            assert_eq!(status, AxumStatus::OK);
+            let (_, body) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/approvals/{id}"),
+                Some(AGENT_TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"]["type"],
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_cannot_answer_question_but_can_cancel() {
+        let app = test_app_with_tokens();
+        let id = register_question(&app, AGENT_TOKEN, "req-agent-q1").await;
+        let resolve = format!("/api/v1/questions/{id}/resolve");
+
+        for body in [
+            r#"{"decision":"answer","answers":[["Yes"]]}"#,
+            r#"{"decision":"reject"}"#,
+        ] {
+            let (status, _) = send(&app, "POST", &resolve, Some(AGENT_TOKEN), Some(body)).await;
+            assert_eq!(
+                status,
+                AxumStatus::FORBIDDEN,
+                "agent must not resolve with {body}"
+            );
+        }
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            &resolve,
+            Some(AGENT_TOKEN),
+            Some(r#"{"decision":"cancel"}"#),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+    }
+
+    #[tokio::test]
+    async fn reviewer_can_resolve_questions() {
+        let app = test_app_with_tokens();
+        for (decision, expected) in [
+            ("answer", "answered"),
+            ("reject", "rejected"),
+            ("cancel", "cancelled"),
+        ] {
+            let id =
+                register_question(&app, AGENT_TOKEN, &format!("req-reviewer-{decision}")).await;
+            let (status, _) = send(
+                &app,
+                "POST",
+                &format!("/api/v1/questions/{id}/resolve"),
+                Some(REVIEWER_TOKEN),
+                Some(&format!(
+                    r#"{{"decision":"{decision}","answers":[["Yes"]]}}"#
+                )),
+            )
+            .await;
+            assert_eq!(status, AxumStatus::OK);
+            let (_, body) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/questions/{id}"),
+                Some(AGENT_TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"]["type"],
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_overrides_agent_and_reviewer_resolution_without_mutation() {
+        let app = test_app_with_tokens_and_mode(ApprovalFeatureMode::Readonly);
+        let approval_id = register_approval(&app, AGENT_TOKEN, "readonly-role-approval").await;
+        let question_id = register_question(&app, AGENT_TOKEN, "readonly-role-question").await;
+        for (kind, id, decisions) in [
+            ("approvals", approval_id, ["approve", "deny", "cancel"]),
+            ("questions", question_id, ["answer", "reject", "cancel"]),
+        ] {
+            let path = format!("/api/v1/{kind}/{id}/resolve");
+            for token in [None, Some("wrong-token")] {
+                assert_eq!(
+                    send(&app, "POST", &path, token, Some(r#"{"decision":"cancel"}"#))
+                        .await
+                        .0,
+                    AxumStatus::UNAUTHORIZED
+                );
+            }
+            for token in [AGENT_TOKEN, REVIEWER_TOKEN] {
+                for decision in decisions {
+                    let (status, body) = send(
+                        &app,
+                        "POST",
+                        &path,
+                        Some(token),
+                        Some(&format!(
+                            r#"{{"decision":"{decision}","answers":[["Yes"]]}}"#
+                        )),
+                    )
+                    .await;
+                    assert_eq!(status, AxumStatus::FORBIDDEN);
+                    assert_eq!(body, "approval resolution is disabled in read-only mode");
+                }
+            }
+            let (status, body) = send(
+                &app,
+                "GET",
+                &format!("/api/v1/{kind}/{id}"),
+                Some(AGENT_TOKEN),
+                None,
+            )
+            .await;
+            assert_eq!(status, AxumStatus::OK);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"]["type"],
+                "pending"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_display_metadata_round_trips_in_safe_page_json() {
+        let app = test_app();
+        let payload = "</script><script>window.pwned=true</script>&<>\u{2028}\u{2029}";
+        let mut request: serde_json::Value =
+            serde_json::from_str(&external_body("external-script-metadata", CALENDAR_DISPLAY))
+                .unwrap();
+        request["tool_input"]["title"] = serde_json::json!(payload);
+        request["tool_input"]["unlisted"] = serde_json::json!({"nested":payload});
+        request["display"]["heading"] = serde_json::json!(payload);
+        request["display"]["fields"][0]["label"] = serde_json::json!(payload);
+        request["session_display_name"] = serde_json::json!(payload);
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&request.to_string()),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, body) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
+        let approval: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for (path, element_id, expected) in [
+            (
+                format!("/approvals/{id}"),
+                "approval-data",
+                approval.clone(),
+            ),
+            (
+                "/approvals".to_string(),
+                "approvals-data",
+                serde_json::json!([approval]),
+            ),
+        ] {
+            let (status, html) = get_json(&app, &path).await;
+            assert_eq!(status, AxumStatus::OK);
+            let start = format!(r#"<script type="application/json" id="{element_id}">"#);
+            let embedded = html
+                .split_once(&start)
+                .unwrap()
+                .1
+                .split_once("</script>")
+                .unwrap()
+                .0;
+            assert!(!embedded.contains(['<', '>', '&', '\u{2028}', '\u{2029}']));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(embedded).unwrap(),
+                expected
+            );
+            assert!(!html.contains("</script><script>window.pwned=true</script>"));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_is_forbidden_from_reviewer_routes() {
+        let app = test_app_with_tokens();
+
+        for (method, path, body) in [
+            ("GET", "/api/v1/approvals/pending", None),
+            ("GET", "/api/v1/questions/pending", None),
+            ("GET", "/api/v1/sessions", None),
+            (
+                "PUT",
+                "/api/v1/sessions/ses_roles",
+                Some(r#"{"stop_enabled":false}"#),
+            ),
+            ("GET", "/api/v1/config", None),
+            ("PUT", "/api/v1/config", Some(r#"{"stop_enabled":false}"#)),
+            ("POST", "/api/v1/presence", Some(r#"{"state":"away"}"#)),
+        ] {
+            let (status, _) = send(&app, method, path, Some(AGENT_TOKEN), body).await;
+            assert_eq!(status, AxumStatus::FORBIDDEN, "agent {method} {path}");
+
+            let (status, body) = send(&app, method, path, Some(REVIEWER_TOKEN), body).await;
+            assert_ne!(
+                status,
+                AxumStatus::FORBIDDEN,
+                "reviewer {method} {path}: {body}"
+            );
+            assert_ne!(
+                status,
+                AxumStatus::UNAUTHORIZED,
+                "reviewer {method} {path}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_none_grants_reviewer_access() {
+        let app = test_app();
+
+        let (status, body) = send(&app, "GET", "/api/v1/whoami", None, None).await;
+        assert_eq!(status, AxumStatus::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["role"], "reviewer");
+    }
+
+    // ---------------------------------------------------------------
+    // External requests — content never leaves the approval page
+    // ---------------------------------------------------------------
+
+    const SECRET_TITLE: &str = "Lunch with secret-attendee";
+
+    fn external_body(request_id: &str, display: &str) -> String {
+        format!(
+            r#"{{
+                "id": "{request_id}",
+                "session_id": "pipeline:calendar",
+                "session_display_name": "calendar",
+                "cwd": "/pipelines/calendar",
+                "tool_name": "calendar.create_event",
+                "tool_input": {{"title": "{SECRET_TITLE}", "start": "2026-10-24T12:00:00Z", "attendees": ["a@example.com"]}},
+                "provider": "assistant-pipelines",
+                "request_type": "external",
+                "context": {{"workspace_roots": [], "hook_event_name": "pipeline.proposal"}}
+                {display}
+            }}"#
+        )
+    }
+
+    const CALENDAR_DISPLAY: &str = r#", "display": {
+        "heading": "Create calendar event",
+        "fields": [
+            {"key": "title", "label": "Title"},
+            {"key": "start", "label": "Start", "format": "datetime"},
+            {"key": "attendees", "format": "list"}
+        ],
+        "summary": ["title", "start"]
+    }"#;
+
+    #[tokio::test]
+    async fn external_push_omits_content() {
+        let (app, mut pushes) = test_app_recording();
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&external_body("ext-1", CALENDAR_DISPLAY)),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK, "{body}");
+
+        let push = next_push(&mut pushes).await.expect("push should be sent");
+        assert_eq!(push, "[calendar] calendar.create_event — approval pending");
+    }
+
+    #[tokio::test]
+    async fn tool_use_push_still_includes_input() {
+        let (app, mut pushes) = test_app_recording();
+        register_approval(&app, REVIEWER_TOKEN, "tool-1").await;
+
+        let push = next_push(&mut pushes).await.expect("push should be sent");
+        assert!(push.contains(r#"{"command":"ls"}"#), "got: {push}");
+    }
+
+    #[tokio::test]
+    async fn reposting_existing_request_does_not_push_again() {
+        let (app, mut pushes) = test_app_recording();
+        let first = register_approval(&app, REVIEWER_TOKEN, "dup-1").await;
+        assert!(next_push(&mut pushes).await.is_some());
+
+        let second = register_approval(&app, REVIEWER_TOKEN, "dup-1").await;
+        assert_eq!(first, second, "idempotent register should return same id");
+        assert_eq!(next_push(&mut pushes).await, None);
+    }
+
+    #[tokio::test]
+    async fn display_rejected_on_unknown_key_or_non_external() {
+        let app = test_app();
+
+        let unknown_key = external_body("ext-bad", r#", "display": {"fields": [{"key": "nope"}]}"#);
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&unknown_key),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST, "{body}");
+
+        let unknown_summary = external_body(
+            "ext-bad-summary",
+            r#", "display": {"fields": [], "summary": ["nope"]}"#,
+        );
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&unknown_summary),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST, "{body}");
+
+        let tool_use = external_body("tool-bad", CALENDAR_DISPLAY).replace(
+            r#""request_type": "external""#,
+            r#""request_type": "tool_use""#,
+        );
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&tool_use),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn external_session_status_omits_content() {
+        let app = test_app();
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&external_body("ext-status", "")),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK, "{body}");
+
+        let (_, body) = get_json(&app, "/api/v1/sessions").await;
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let sess = sessions
+            .iter()
+            .find(|s| s["session_id"] == "pipeline:calendar")
+            .unwrap();
+        assert_eq!(
+            sess["status"]["reason"],
+            "Pending approval: calendar.create_event"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_external_request_drops_content_but_keeps_decision() {
+        let app = test_app();
+        let (_, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&external_body("ext-resolve", CALENDAR_DISPLAY)),
+        )
+        .await;
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (_, body) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
+        assert!(body.contains(SECRET_TITLE), "pending request shows content");
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/approvals/{id}/resolve"),
+            None,
+            Some(r#"{"decision":"approve","message":null}"#),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+
+        let (status, body) = get_json(&app, &format!("/api/v1/approvals/{id}/wait")).await;
+        assert_eq!(status, AxumStatus::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["type"],
+            "approved"
+        );
+
+        let (_, body) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
+        let approval: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(approval["tool_input"].is_null(), "got: {body}");
+        assert!(approval.get("display").is_none(), "got: {body}");
+    }
+
+    /// Approval JSON embedded in the dashboard and detail pages must not be
+    /// able to close its <script> tag.
+    #[tokio::test]
+    async fn embedded_approval_json_cannot_close_script_tag() {
+        let app = test_app();
+        let payload = "</script><script>alert(1)</script>";
+        let body = format!(
+            r#"{{
+                "id": "xss-1",
+                "session_id": "ses_xss",
+                "session_display_name": "x",
+                "cwd": "/tmp/x",
+                "tool_name": "Bash",
+                "tool_input": {{"command": "{payload}"}},
+                "provider": "claude-code",
+                "request_type": "tool_use",
+                "context": {{"workspace_roots": [], "hook_event_name": "PreToolUse"}}
+            }}"#
+        );
+        let (_, body) = send(&app, "POST", "/api/v1/hooks/approval", None, Some(&body)).await;
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for path in [format!("/approvals/{id}"), "/approvals".to_string()] {
+            let (status, html) = get_json(&app, &path).await;
+            assert_eq!(status, AxumStatus::OK, "{path}");
+            assert!(!html.contains(payload), "{path} embeds raw payload");
+            assert!(
+                html.contains(r"\u003c/script\u003e\u003cscript\u003ealert(1)"),
+                "{path} should embed escaped payload"
+            );
+        }
     }
 }

@@ -14,6 +14,12 @@ pub enum AppError {
 
     #[error("question not found: {0}")]
     QuestionNotFound(String),
+
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("bad request: {0}")]
+    BadRequest(String),
 }
 
 impl IntoResponse for AppError {
@@ -22,6 +28,8 @@ impl IntoResponse for AppError {
             AppError::SessionNotFound(_) => StatusCode::NOT_FOUND,
             AppError::ApprovalNotFound(_) => StatusCode::NOT_FOUND,
             AppError::QuestionNotFound(_) => StatusCode::NOT_FOUND,
+            AppError::Forbidden(_) => StatusCode::FORBIDDEN,
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()

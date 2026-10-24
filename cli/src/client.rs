@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use protocol::{
     ApprovalDecision, ApprovalResolveRequest, PendingQuestion, QuestionDecision,
-    QuestionResolveRequest, Secret,
+    QuestionResolveRequest, Secret, WhoAmIResponse,
 };
 use uuid::Uuid;
 
@@ -147,15 +147,20 @@ impl Client {
         Ok(())
     }
 
-    /// Check that the server accepts our auth token by hitting an authenticated endpoint.
-    /// Returns the HTTP status code on success, or an error string on connection failure.
-    pub async fn check_auth(&self) -> Result<u16, String> {
-        let url = format!("{}/api/v1/sessions", self.base_url);
+    /// Check that the server accepts our auth token and report who it identifies as.
+    pub async fn check_auth(&self) -> Result<WhoAmIResponse, String> {
+        let url = format!("{}/api/v1/whoami", self.base_url);
         let req = self.auth(self.http.get(&url));
         let resp = req
             .send()
             .await
             .map_err(|e| format!("connection failed: {e}"))?;
-        Ok(resp.status().as_u16())
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("rejected: {url} -> {}", status.as_u16()));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("invalid whoami response: {e}"))
     }
 }

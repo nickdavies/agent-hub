@@ -90,18 +90,11 @@ pub async fn run(config_path: String, server: Option<String>, token: Option<Stri
                     // Phase B: auth check (only if --token provided)
                     match &token {
                         Some(_) => match client.check_auth().await {
-                            Ok(status) if (200..300).contains(&status) => {
+                            Ok(who) => {
                                 println!(
-                                    "[OK]   Auth valid: {}/api/v1/sessions -> {}",
-                                    server_url, status
+                                    "[OK]   Auth valid: token '{}' has role {:?}",
+                                    who.label, who.role
                                 );
-                            }
-                            Ok(status) => {
-                                println!(
-                                    "[FAIL] Auth rejected: {}/api/v1/sessions -> {}",
-                                    server_url, status
-                                );
-                                failures += 1;
                             }
                             Err(e) => {
                                 println!("[FAIL] Auth check failed: {}", e);

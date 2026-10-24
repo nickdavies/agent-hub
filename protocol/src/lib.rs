@@ -7,6 +7,7 @@
 //! be generated for TypeScript plugin consumption.
 
 pub mod approval;
+pub mod auth;
 pub mod config;
 pub mod gateway;
 pub mod hooks;
@@ -20,9 +21,10 @@ pub mod tool_call;
 // Re-export the most commonly used types at the crate root for convenience.
 pub use approval::{
     Approval, ApprovalContext, ApprovalDecision, ApprovalRequest, ApprovalResolveRequest,
-    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, ExtraContext, HookEventName,
-    KnownHookEvent, RequestType,
+    ApprovalResponse, ApprovalStatus, ApprovalWaitResponse, DisplayField, DisplaySpec,
+    ExtraContext, FieldFormat, HookEventName, KnownHookEvent, RequestType,
 };
+pub use auth::{Role, WhoAmIResponse};
 pub use config::{ConfigResponse, NotifyConfig, NotifyConfigUpdate};
 pub use gateway::{
     ClaudeCodeHookInput, ClaudePermissionBehavior, ClaudePermissionRequestDecision,

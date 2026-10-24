@@ -29,6 +29,7 @@ struct DashboardTemplate {
     email: String,
     sessions: Vec<SessionView>,
     pending_approvals: Vec<Approval>,
+    pending_approvals_json: String,
     readwrite: bool,
     has_auth: bool,
 }
@@ -117,6 +118,7 @@ pub async fn dashboard<N: Notifier>(
     let email = session_email(&session).await;
     let sessions = super::build_session_views(&state).await;
     let pending_approvals = state.approvals.list_pending().await;
+    let pending_approvals_json = script_safe_json(&pending_approvals);
     let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
 
@@ -124,6 +126,7 @@ pub async fn dashboard<N: Notifier>(
         email,
         sessions,
         pending_approvals,
+        pending_approvals_json,
         readwrite,
         has_auth,
     })

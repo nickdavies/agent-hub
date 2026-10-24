@@ -116,7 +116,9 @@ impl QuestionRegistry {
             return Some(entry.question.clone());
         }
         entry.question.status = status.clone();
-        let _ = entry.tx.send(status);
+        // send_replace stores the status even when no waiter is subscribed,
+        // so a later /wait still sees it.
+        entry.tx.send_replace(status);
         Some(entry.question.clone())
     }
 

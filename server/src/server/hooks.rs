@@ -20,6 +20,7 @@ use super::AppState;
 use super::approvals;
 use super::notifier::Notifier;
 use super::questions;
+use crate::error::AppError;
 use crate::server::presence::PresenceState;
 
 /// Tracks pending delayed notifications so they can be cancelled.
@@ -179,7 +180,19 @@ pub async fn notification<N: Notifier>(
 pub async fn approval<N: Notifier>(
     State(state): State<AppState<N>>,
     Json(req): Json<ApprovalRequest>,
-) -> Json<ApprovalResponse> {
+) -> Result<Json<ApprovalResponse>, AppError> {
+    let external = req.request_type.is_external();
+    if let Some(display) = &req.display {
+        if !external {
+            return Err(AppError::BadRequest(
+                "display is only allowed on external requests".into(),
+            ));
+        }
+        display
+            .validate(&req.tool_input)
+            .map_err(AppError::BadRequest)?;
+    }
+
     let project = state
         .sessions
         .get_or_register(&req.session_id, &req.cwd, None)
@@ -193,7 +206,7 @@ pub async fn approval<N: Notifier>(
             .await;
     }
 
-    let approval = state
+    let (approval, created) = state
         .approvals
         .register(approvals::RegisterApproval {
             request_id: req.id,
@@ -205,30 +218,35 @@ pub async fn approval<N: Notifier>(
             provider: req.provider,
             request_type: req.request_type,
             context: req.context,
+            display: req.display,
         })
         .await;
 
-    // Send push notification with link if pending and base_url configured
-    if !approval.status.is_resolved()
-        && let Some(base_url) = &state.config.base_url
-    {
+    // Send push notification with link for newly registered approvals when
+    // base_url is configured. External request content never leaves the
+    // authenticated UI, so their push names only the tool.
+    if created && let Some(base_url) = &state.config.base_url {
         let url = format!("{}/approvals/{}", base_url, approval.id);
         let notifier = Arc::clone(&state.notifier);
         let title = "Agent Hub (approval)".to_string();
-        let message = format!(
-            "[{project}] {} — {}",
-            req.tool,
-            truncate_input(&req.tool_input)
-        );
+        let message = if external {
+            format!("[{project}] {} — approval pending", req.tool)
+        } else {
+            format!(
+                "[{project}] {} — {}",
+                req.tool,
+                truncate_input(&req.tool_input)
+            )
+        };
         tokio::spawn(async move {
             fire_and_forget(&*notifier, &title, &message, Some(&url)).await;
         });
     }
 
-    Json(ApprovalResponse {
+    Ok(Json(ApprovalResponse {
         id: approval.id,
         status: approval.status,
-    })
+    }))
 }
 
 fn truncate_input(input: &serde_json::Value) -> String {

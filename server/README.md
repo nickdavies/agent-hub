@@ -225,7 +225,7 @@ Hook payloads should include `session_id` and `cwd`. Sessions are auto-registere
 | GET | `/health` | Liveness/readiness (no auth) |
 | POST | `/mcp` | MCP Streamable HTTP transport |
 
-All endpoints except `/health` require a valid Bearer token.
+All endpoints except `/health` require a valid Bearer token. Management endpoints require the `reviewer` role (see below).
 
 ## Authentication
 
@@ -237,21 +237,29 @@ Generate tokens with `openssl`:
 openssl rand -hex 32
 ```
 
-Then set `AGENT_HUB_TOKENS` as a comma-separated list of `label:token` pairs:
+Then set `AGENT_HUB_TOKENS` as a comma-separated list of `label:token:role` entries:
 
 ```sh
-export AGENT_HUB_TOKENS="desktop:$(openssl rand -hex 32),sensor:$(openssl rand -hex 32)"
+export AGENT_HUB_TOKENS="desktop:$(openssl rand -hex 32):agent,sensor:$(openssl rand -hex 32):reviewer,cli:$(openssl rand -hex 32):reviewer"
 ```
 
-The label is an arbitrary name for logging — it identifies which client made a request. If you omit the label (just a bare token), the token itself is used as the identifier in logs.
+The label is an arbitrary name for logging — it identifies which client made a request. The role is required; the server refuses to start if any entry is missing one.
+
+| Role | Can do |
+|------|--------|
+| `agent` | Hook endpoints, raise approvals/questions, get/wait on them by id, **cancel** them, `/mcp`, `/whoami`. Cannot approve, deny, answer or reject. |
+| `reviewer` | Everything: approve/deny/answer/reject, pending queues, `/sessions`, `/config`, `/presence`. |
+
+Users logged into the web UI (OIDC or basic auth) are always reviewers.
 
 Give each client its corresponding token:
 
-- **Claude Code** — set `AGENT_HUB_TOKEN` in your shell profile to the `desktop` token
-- **Motion sensor** — configure it with the `sensor` token
-- **Other machines** — add more `label:token` entries as needed
+- **Claude Code / gateway / agents** — set `AGENT_HUB_TOKEN` to an `agent` token
+- **`cli review`** — a `reviewer` token
+- **Motion sensor** — a `reviewer` token (it needs `/presence`)
+- **Other machines** — add more `label:token:role` entries as needed
 
-All endpoints except `/health` require a valid `Authorization: Bearer <token>` header. Invalid or missing tokens return 401.
+All endpoints except `/health` require a valid `Authorization: Bearer <token>` header. Invalid or missing tokens return 401; a valid token without the required role returns 403. `GET /api/v1/whoami` returns the caller's label and role (`agent-hub validate` uses it).
 
 ## Presence
 

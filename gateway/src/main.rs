@@ -645,6 +645,7 @@ async fn escalate_to_server(
             provider: provider_name.to_string(),
             request_type: RequestType::ToolUse,
             context,
+            display: None,
         })
         .timeout(Duration::from_secs(10))
         .send()
