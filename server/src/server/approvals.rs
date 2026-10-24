@@ -38,6 +38,7 @@ pub struct RegisterApproval {
     pub provider: String,
     pub request_type: protocol::RequestType,
     pub context: ApprovalContext,
+    pub display: Option<protocol::DisplaySpec>,
 }
 
 impl ApprovalRegistry {
@@ -50,14 +51,15 @@ impl ApprovalRegistry {
     }
 
     /// Register a new approval or return existing one if request_id matches.
-    pub async fn register(&self, params: RegisterApproval) -> Approval {
+    /// The flag is true when a new approval was created.
+    pub async fn register(&self, params: RegisterApproval) -> (Approval, bool) {
         // Idempotency: if request_id already registered, return existing
         {
             let by_req = self.by_request_id.read().await;
             if let Some(&existing_id) = by_req.get(&params.request_id) {
                 let entries = self.entries.read().await;
                 if let Some(entry) = entries.get(&existing_id) {
-                    return entry.approval.clone();
+                    return (entry.approval.clone(), false);
                 }
             }
         }
@@ -74,6 +76,7 @@ impl ApprovalRegistry {
             provider: params.provider,
             request_type: params.request_type,
             context: params.context,
+            display: params.display,
             created_at: Utc::now(),
             status: ApprovalStatus::Pending,
         };
@@ -99,7 +102,7 @@ impl ApprovalRegistry {
         }
 
         info!(approval_id = %id, "approval registered");
-        approval
+        (approval, true)
     }
 
     /// Get an approval by id.
@@ -116,6 +119,9 @@ impl ApprovalRegistry {
     }
 
     /// Resolve an approval (approve/deny/cancel).
+    ///
+    /// External requests drop their content here; the status stays so a
+    /// waiter that polls after the decision still receives it.
     pub async fn resolve(&self, id: Uuid, status: ApprovalStatus) -> Option<Approval> {
         let mut entries = self.entries.write().await;
         let entry = entries.get_mut(&id)?;
@@ -124,8 +130,13 @@ impl ApprovalRegistry {
             return Some(entry.approval.clone());
         }
         entry.approval.status = status.clone();
-        // Notify all watchers
-        let _ = entry.tx.send(status);
+        if entry.approval.request_type.is_external() {
+            entry.approval.tool_input = serde_json::Value::Null;
+            entry.approval.display = None;
+        }
+        // send_replace stores the status even when no waiter is subscribed,
+        // so a later /wait still sees it.
+        entry.tx.send_replace(status);
         Some(entry.approval.clone())
     }
 
@@ -216,11 +227,13 @@ impl ApprovalRegistry {
     }
 
     /// Export pending approvals for persistence, sorted by creation time.
+    /// External requests are never persisted; their source re-raises them.
     pub async fn snapshot(&self) -> Vec<Approval> {
         let entries = self.entries.read().await;
         let mut pending: Vec<Approval> = entries
             .values()
             .filter(|e| !e.approval.status.is_resolved())
+            .filter(|e| !e.approval.request_type.is_external())
             .map(|e| e.approval.clone())
             .collect();
         pending.sort_by_key(|a| a.created_at);
@@ -254,5 +267,61 @@ impl ApprovalRegistry {
             by_sess.entry(session_id).or_default().insert(id);
             info!(approval_id = %id, "approval restored");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{HookEventName, RequestType};
+
+    fn params(request_id: &str, request_type: RequestType) -> RegisterApproval {
+        RegisterApproval {
+            request_id: request_id.into(),
+            session_id: "s1".into(),
+            session_display_name: String::new(),
+            project: "p".into(),
+            tool: protocol::Tool::Bash,
+            tool_input: serde_json::json!({"command": "ls"}),
+            provider: "test".into(),
+            request_type,
+            context: ApprovalContext {
+                workspace_roots: vec![],
+                hook_event_name: HookEventName::Other("test".into()),
+                extra: None,
+            },
+            display: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn register_reports_whether_created() {
+        let registry = ApprovalRegistry::new();
+        let (first, created) = registry.register(params("r1", RequestType::ToolUse)).await;
+        assert!(created);
+        let (second, created) = registry.register(params("r1", RequestType::ToolUse)).await;
+        assert!(!created);
+        assert_eq!(first.id, second.id);
+    }
+
+    #[tokio::test]
+    async fn snapshot_excludes_external() {
+        let registry = ApprovalRegistry::new();
+        let (tool_use, _) = registry.register(params("r1", RequestType::ToolUse)).await;
+        registry.register(params("r2", RequestType::External)).await;
+
+        let ids: Vec<Uuid> = registry.snapshot().await.iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![tool_use.id]);
+    }
+
+    #[tokio::test]
+    async fn resolve_keeps_tool_use_content() {
+        let registry = ApprovalRegistry::new();
+        let (a, _) = registry.register(params("r1", RequestType::ToolUse)).await;
+        let resolved = registry
+            .resolve(a.id, ApprovalStatus::Cancelled)
+            .await
+            .unwrap();
+        assert_eq!(resolved.tool_input, serde_json::json!({"command": "ls"}));
     }
 }

@@ -197,6 +197,12 @@ pub(crate) fn resolve_effective_status(
     }
     // Pending approvals always win — they're actionable in the UI
     if let Some(approval) = pending_approval {
+        // External request content is shown only on the approval page.
+        if approval.request_type.is_external() {
+            return EffectiveSessionStatus::Waiting {
+                reason: Some(format!("Pending approval: {}", approval.tool)),
+            };
+        }
         let input_str = approval.tool_input.to_string();
         let truncated = if input_str.len() > 60 {
             let end = input_str
@@ -595,9 +601,9 @@ mod integration_tests {
     use sessions::SessionApprovalMode;
     use tower::ServiceExt; // for oneshot
 
-    /// Build a test router with auth disabled (no Bearer tokens needed).
-    fn test_app_with_mode(approval_mode: ApprovalFeatureMode) -> Router {
-        let config = ServerConfig {
+    /// Config with auth disabled (no Bearer tokens needed).
+    fn no_auth_config(approval_mode: ApprovalFeatureMode) -> ServerConfig {
+        ServerConfig {
             auth_mode: AuthMode::None,
             tokens: vec![],
             listen_addr: "127.0.0.1:0".into(),
@@ -607,9 +613,54 @@ mod integration_tests {
             approval_mode,
             base_url: Some("http://localhost:8080".into()),
             default_approval_mode: SessionApprovalMode::Remote,
-        };
-        let state = AppState::new(config, NullNotifier, None);
-        router(state)
+        }
+    }
+
+    /// Build a test router with auth disabled (no Bearer tokens needed).
+    fn test_app_with_mode(approval_mode: ApprovalFeatureMode) -> Router {
+        router(AppState::new(
+            no_auth_config(approval_mode),
+            NullNotifier,
+            None,
+        ))
+    }
+
+    /// Notifier that forwards each push message to a channel.
+    struct RecordingNotifier(tokio::sync::mpsc::UnboundedSender<String>);
+
+    impl Notifier for RecordingNotifier {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn send(
+            &self,
+            _title: &str,
+            message: &str,
+            _url: Option<&str>,
+        ) -> Result<(), notifier::NotifyError> {
+            let _ = self.0.send(message.to_string());
+            Ok(())
+        }
+    }
+
+    /// Build a no-auth test router whose push messages arrive on the receiver.
+    fn test_app_recording() -> (Router, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = AppState::new(
+            no_auth_config(ApprovalFeatureMode::Readwrite),
+            RecordingNotifier(tx),
+            None,
+        );
+        (router(state), rx)
+    }
+
+    /// Wait briefly for the next push; `None` if none was sent.
+    async fn next_push(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Option<String> {
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     fn test_app() -> Router {
@@ -1350,5 +1401,172 @@ mod integration_tests {
         assert_eq!(status, AxumStatus::OK);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["role"], "reviewer");
+    }
+
+    // ---------------------------------------------------------------
+    // External requests — content never leaves the approval page
+    // ---------------------------------------------------------------
+
+    const SECRET_TITLE: &str = "Lunch with secret-attendee";
+
+    fn external_body(request_id: &str, display: &str) -> String {
+        format!(
+            r#"{{
+                "id": "{request_id}",
+                "session_id": "pipeline:calendar",
+                "session_display_name": "calendar",
+                "cwd": "/pipelines/calendar",
+                "tool_name": "calendar.create_event",
+                "tool_input": {{"title": "{SECRET_TITLE}", "start": "2026-10-24T12:00:00Z", "attendees": ["a@example.com"]}},
+                "provider": "assistant-pipelines",
+                "request_type": "external",
+                "context": {{"workspace_roots": [], "hook_event_name": "pipeline.proposal"}}
+                {display}
+            }}"#
+        )
+    }
+
+    const CALENDAR_DISPLAY: &str = r#", "display": {
+        "heading": "Create calendar event",
+        "fields": [
+            {"key": "title", "label": "Title"},
+            {"key": "start", "label": "Start", "format": "datetime"},
+            {"key": "attendees", "format": "list"}
+        ]
+    }"#;
+
+    #[tokio::test]
+    async fn external_push_omits_content() {
+        let (app, mut pushes) = test_app_recording();
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&external_body("ext-1", CALENDAR_DISPLAY)),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK, "{body}");
+
+        let push = next_push(&mut pushes).await.expect("push should be sent");
+        assert_eq!(push, "[calendar] calendar.create_event — approval pending");
+    }
+
+    #[tokio::test]
+    async fn tool_use_push_still_includes_input() {
+        let (app, mut pushes) = test_app_recording();
+        register_approval(&app, REVIEWER_TOKEN, "tool-1").await;
+
+        let push = next_push(&mut pushes).await.expect("push should be sent");
+        assert!(push.contains(r#"{"command":"ls"}"#), "got: {push}");
+    }
+
+    #[tokio::test]
+    async fn reposting_existing_request_does_not_push_again() {
+        let (app, mut pushes) = test_app_recording();
+        let first = register_approval(&app, REVIEWER_TOKEN, "dup-1").await;
+        assert!(next_push(&mut pushes).await.is_some());
+
+        let second = register_approval(&app, REVIEWER_TOKEN, "dup-1").await;
+        assert_eq!(first, second, "idempotent register should return same id");
+        assert_eq!(next_push(&mut pushes).await, None);
+    }
+
+    #[tokio::test]
+    async fn display_rejected_on_unknown_key_or_non_external() {
+        let app = test_app();
+
+        let unknown_key = external_body("ext-bad", r#", "display": {"fields": [{"key": "nope"}]}"#);
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&unknown_key),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST, "{body}");
+
+        let tool_use = external_body("tool-bad", CALENDAR_DISPLAY).replace(
+            r#""request_type": "external""#,
+            r#""request_type": "tool_use""#,
+        );
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&tool_use),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn external_session_status_omits_content() {
+        let app = test_app();
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&external_body("ext-status", "")),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK, "{body}");
+
+        let (_, body) = get_json(&app, "/api/v1/sessions").await;
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let sess = sessions
+            .iter()
+            .find(|s| s["session_id"] == "pipeline:calendar")
+            .unwrap();
+        assert_eq!(
+            sess["status"]["reason"],
+            "Pending approval: calendar.create_event"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_external_request_drops_content_but_keeps_decision() {
+        let app = test_app();
+        let (_, body) = send(
+            &app,
+            "POST",
+            "/api/v1/hooks/approval",
+            None,
+            Some(&external_body("ext-resolve", CALENDAR_DISPLAY)),
+        )
+        .await;
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (_, body) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
+        assert!(body.contains(SECRET_TITLE), "pending request shows content");
+
+        let (status, _) = send(
+            &app,
+            "POST",
+            &format!("/api/v1/approvals/{id}/resolve"),
+            None,
+            Some(r#"{"decision":"approve","message":null}"#),
+        )
+        .await;
+        assert_eq!(status, AxumStatus::OK);
+
+        let (status, body) = get_json(&app, &format!("/api/v1/approvals/{id}/wait")).await;
+        assert_eq!(status, AxumStatus::OK);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["type"],
+            "approved"
+        );
+
+        let (_, body) = get_json(&app, &format!("/api/v1/approvals/{id}")).await;
+        let approval: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(approval["tool_input"].is_null(), "got: {body}");
+        assert!(approval.get("display").is_none(), "got: {body}");
     }
 }

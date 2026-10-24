@@ -50,6 +50,77 @@ pub enum RequestType {
     ToolUse,
     /// A plan-mode question proxied from opencode's question tool.
     PlanQuestion,
+    /// A request from a non-agent source (e.g. assistant-pipelines), named by
+    /// `provider`. Its content is confidential: it is shown only on the
+    /// authenticated approval page, never in notifications or session status,
+    /// is not persisted, and is dropped from memory once resolved. It may carry
+    /// a [`DisplaySpec`].
+    External,
+}
+
+impl RequestType {
+    pub fn is_external(self) -> bool {
+        self == RequestType::External
+    }
+}
+
+// ===========================================================================
+// DisplaySpec — caller-provided presentation for external requests
+// ===========================================================================
+
+/// How to present an external request's `tool_input` for review.
+///
+/// It controls presentation only, never values: every field key must exist in
+/// `tool_input`, and keys not listed are still shown after the listed ones. What
+/// the reviewer sees is therefore always the input that gets approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DisplaySpec {
+    /// Heading shown above the fields. Must come from the caller's code (e.g.
+    /// the action type), never from model-written content.
+    #[serde(default)]
+    pub heading: Option<String>,
+    pub fields: Vec<DisplayField>,
+}
+
+/// One `tool_input` field, in display order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DisplayField {
+    /// Top-level key in `tool_input`.
+    pub key: String,
+    /// Label to show instead of the key.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub format: FieldFormat,
+}
+
+/// How to render a field's value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldFormat {
+    #[default]
+    Text,
+    /// Preserve line breaks.
+    Multiline,
+    /// An RFC 3339 timestamp, shown in local time alongside the raw value.
+    Datetime,
+    /// An array, shown one item per line.
+    List,
+}
+
+impl DisplaySpec {
+    /// Check that every field refers to a top-level key of `tool_input`.
+    pub fn validate(&self, tool_input: &serde_json::Value) -> Result<(), String> {
+        let obj = tool_input
+            .as_object()
+            .ok_or("display requires tool_input to be an object")?;
+        for field in &self.fields {
+            if !obj.contains_key(&field.key) {
+                return Err(format!("display field '{}' not in tool_input", field.key));
+            }
+        }
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -161,6 +232,9 @@ pub struct Approval {
     /// Request type; currently always "tool_use". "plan_question" is Phase 2.
     pub request_type: RequestType,
     pub context: ApprovalContext,
+    /// Presentation for external requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplaySpec>,
     pub created_at: DateTime<Utc>,
     pub status: ApprovalStatus,
 }
@@ -201,6 +275,9 @@ pub struct ApprovalRequest {
     /// Request type: "tool_use" (Phase 2 will add "plan_question")
     pub request_type: RequestType,
     pub context: ApprovalContext,
+    /// Presentation hints; only allowed when `request_type` is "external".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplaySpec>,
 }
 
 /// POST /api/v1/hooks/approval — response from the server.

@@ -21,6 +21,8 @@
         .smart-view dt { color: var(--pico-primary); font-weight: bold; margin-top: 0.6rem; }
         .smart-view dd { margin-left: 0; overflow-wrap: anywhere; }
         .smart-view dd pre { margin: 0; }
+        .smart-view .display-heading { margin: 0 0 0.4rem; }
+        .smart-view .other-fields { margin: 1rem 0 0; font-size: 0.9rem; color: var(--pico-muted-color); }
         pre { max-height: none; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
         pre code { white-space: inherit; overflow-wrap: inherit; }
         .view-heading { align-items: center; display: flex; justify-content: space-between; gap: 1rem; }
@@ -286,9 +288,54 @@
         return ordered;
     }
 
-    function renderSmartInput(input, toolName, extra) {
+    // Format a value per a DisplaySpec field format. The result is always
+    // derived from the value itself, so the display never diverges from input.
+    function formatDisplayValue(value, format) {
+        if (format === 'datetime' && typeof value === 'string') {
+            const date = new Date(value);
+            return isNaN(date.getTime()) ? value : date.toLocaleString() + ' (' + value + ')';
+        }
+        if (format === 'list' && Array.isArray(value)) {
+            return value.map(v => typeof v === 'string' ? v : JSON.stringify(v)).join('\n');
+        }
+        return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    }
+
+    // Render an external request through its DisplaySpec: listed fields first,
+    // then every unlisted key so nothing in the input is hidden.
+    function renderDisplaySpec(container, input, display) {
+        if (display.heading) {
+            const heading = document.createElement('h4');
+            heading.className = 'display-heading';
+            heading.textContent = display.heading;
+            container.appendChild(heading);
+        }
+        const listed = new Set();
+        const list = document.createElement('dl');
+        for (const field of display.fields) {
+            if (!Object.prototype.hasOwnProperty.call(input, field.key)) continue;
+            listed.add(field.key);
+            list.appendChild(createSmartEntry(field.label || field.key, formatDisplayValue(input[field.key], field.format)));
+        }
+        container.appendChild(list);
+        const others = Object.entries(input).filter(([key]) => !listed.has(key));
+        if (others.length > 0) {
+            const heading = document.createElement('p');
+            heading.className = 'other-fields';
+            heading.textContent = 'Other fields';
+            const otherList = document.createElement('dl');
+            for (const [key, value] of others) otherList.appendChild(createSmartEntry(key, value));
+            container.append(heading, otherList);
+        }
+    }
+
+    function renderSmartInput(input, toolName, extra, display) {
         const container = document.getElementById('smart-view');
         container.replaceChildren();
+        if (display && input !== null && typeof input === 'object' && !Array.isArray(input)) {
+            renderDisplaySpec(container, input, display);
+            return;
+        }
         if (input === null || typeof input !== 'object' || Array.isArray(input)) {
             const pre = document.createElement('pre');
             const code = document.createElement('code');
@@ -321,7 +368,7 @@
         setText('session', approval.session_display_name || approval.session_id || 'Unknown session');
         setText('provider', approval.provider || 'Unknown provider');
         const extra = approval.context && approval.context.extra;
-        renderSmartInput(approval.tool_input, approval.tool_name, extra);
+        renderSmartInput(approval.tool_input, approval.tool_name, extra, approval.display);
         setText('raw-content', JSON.stringify(approval.tool_input, null, 2));
         document.getElementById('smart-view').hidden = false;
         document.getElementById('raw-view').hidden = true;
