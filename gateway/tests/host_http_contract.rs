@@ -436,7 +436,12 @@ async fn native_parser_config_and_delegate_failures_block_without_provider_branc
         assert!(native_denial(&output, provider, hook).contains("failed to parse config"));
         let script = policy.0.join("failure.sh");
         let detail = "界".repeat(5000);
-        std::fs::write(&script, format!("printf '%s' '{detail}' >&2\nexit 1\n")).unwrap();
+        // Consume the canonical payload before exercising exit-status handling.
+        std::fs::write(
+            &script,
+            format!("cat > /dev/null\nprintf '%s' '{detail}' >&2\nexit 1\n"),
+        )
+        .unwrap();
         policy.write(json!({"version":1,"default":"deny","rules":[{"tools":["Bash"],"action":"delegate","command":format!("sh {}", script.display())}]}));
         let output = policy
             .run_native(
@@ -448,8 +453,14 @@ async fn native_parser_config_and_delegate_failures_block_without_provider_branc
             )
             .await;
         let reason = native_denial(&output, provider, hook);
-        assert!(reason.contains("delegate exited"));
-        assert!(reason.ends_with(" <truncated>"));
+        assert!(
+            reason.contains("delegate exited"),
+            "{provider} {hook}: {reason}"
+        );
+        assert!(
+            reason.ends_with(" <truncated>"),
+            "{provider} {hook}: {reason}"
+        );
         assert!(server.state.calls.lock().unwrap().is_empty());
     }
 }
