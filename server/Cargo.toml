@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-askama = "0.15"
+askama = { version = "0.15", features = ["serde_json"] }
 askama_web = { version = "0.15", features = ["axum-0.8"] }
 axum = "0.8"
 capabilities = { path = "../capabilities" }

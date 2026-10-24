@@ -170,7 +170,7 @@
     </div>
 </div>
 
-<script type="application/json" id="approvals-data">{{ approvals_json|safe }}</script>
+<script type="application/json" id="approvals-data">{{ pending_approvals|json|safe }}</script>
 <script>
 (function() {
     const READWRITE = {{ readwrite }};

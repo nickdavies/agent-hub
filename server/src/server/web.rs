@@ -29,7 +29,6 @@ struct DashboardTemplate {
     email: String,
     sessions: Vec<SessionView>,
     pending_approvals: Vec<Approval>,
-    approvals_json: String,
     readwrite: bool,
     has_auth: bool,
 }
@@ -40,7 +39,6 @@ struct ApprovalDetailTemplate {
     email: String,
     approval: Approval,
     tool_input_pretty: String,
-    approval_json: String,
     readwrite: bool,
     has_auth: bool,
 }
@@ -106,7 +104,6 @@ pub async fn dashboard<N: Notifier>(
     let email = session_email(&session).await;
     let sessions = super::build_session_views(&state).await;
     let pending_approvals = state.approvals.list_pending().await;
-    let approvals_json = script_json(&pending_approvals);
     let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
 
@@ -114,7 +111,6 @@ pub async fn dashboard<N: Notifier>(
         email,
         sessions,
         pending_approvals,
-        approvals_json,
         readwrite,
         has_auth,
     })
@@ -142,7 +138,6 @@ pub async fn approval_detail<N: Notifier>(
 
     let tool_input_pretty =
         serde_json::to_string_pretty(&approval.tool_input).unwrap_or_else(|_| "{}".to_string());
-    let approval_json = script_json(&approval);
     let readwrite = state.config.approval_mode == ApprovalFeatureMode::Readwrite;
     let has_auth = state.config.auth_mode != crate::server::config::AuthMode::None;
 
@@ -150,22 +145,9 @@ pub async fn approval_detail<N: Notifier>(
         email,
         approval,
         tool_input_pretty,
-        approval_json,
         readwrite,
         has_auth,
     })
-}
-
-/// Serialize `value` for embedding in a `<script type="application/json">`
-/// block. `<`, `>` and `&` only occur inside JSON strings, so escaping them as
-/// `\u` sequences keeps the JSON identical while stopping content such as
-/// `</script>` from closing the tag.
-fn script_json<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "null".to_string())
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
 }
 
 /// Extract email from session. Middleware guarantees this exists on authed routes.

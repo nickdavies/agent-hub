@@ -98,7 +98,7 @@
     </div>
 </div>
 
-<script type="application/json" id="approval-data">{{ approval_json|safe }}</script>
+<script type="application/json" id="approval-data">{{ approval|json|safe }}</script>
 <script>
 (function() {
     const READWRITE = {{ readwrite }};
